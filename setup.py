@@ -18,8 +18,9 @@ with open(os.path.join(this_directory, "README.md")) as f:
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name, source_dir=""):
+    def __init__(self, name, target_name, source_dir=""):
         Extension.__init__(self, name, sources=[])
+        self.target_name = target_name
         self.source_dir = os.path.abspath(source_dir)
 
 
@@ -33,6 +34,7 @@ class CMakeBuild(build_ext):
             extension_dir += os.path.sep
 
         cmake_args = [
+            # f"-DPYTHON_TARGET_NAME={ext.target_name}",
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}",
             f"-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={extension_dir}",
             f"-DPYTHON_EXECUTABLE={sys.executable}",
