@@ -1,3 +1,8 @@
+/**
+ * @brief   Epoll-based backend for UCall.
+ * @author  Ash Vardanian
+ */
+
 #include <arpa/inet.h> // `inet_addr`
 #include <fcntl.h>
 #include <netinet/in.h> // `sockaddr_in`
@@ -284,7 +289,7 @@ template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_event
             epoll_ctl(ctx->epoll, EPOLL_CTL_DEL, connection->descriptor, NULL);
         }
 
-        if (ep_events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR) && data.active) { // Reset
+        if ((ep_events[i].events & (EPOLLRDHUP | EPOLLHUP | EPOLLERR)) && data.active) { // Reset
             events[completed].connection_ptr = connection;
             events[completed].result = -ECONNRESET;
             data.active = false;

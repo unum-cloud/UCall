@@ -1,7 +1,8 @@
 /**
- * @file ucall.h
- * @author Ashot Vardanian
- * @date Feb 3, 2023
+ * @file        ucall.h
+ * @author      Ash Vardanian
+ * @date        Feb 3, 2023
+ *
  * @addtogroup C
  *
  * @brief Binary Interface for UCall.

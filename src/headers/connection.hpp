@@ -133,7 +133,7 @@ struct connection_t {
             input = static_cast<char const*>(input) + consumed;
         }
         if (res != -1 && work_buf.off > 0) {
-            printf("WB: %i\n", work_buf.off);
+            printf("WB: %zu\n", work_buf.off);
             pipes.drop_last_input(received_amount);
             std::memcpy(pipes.next_input_address(), work_buf.base, work_buf.off);
             pipes.absorb_input(work_buf.off);

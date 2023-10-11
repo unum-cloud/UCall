@@ -1,6 +1,6 @@
 /**
- * @brief JSON-RPC implementation for TCP/IP stack with POSIX calls.
- * @author Ashot Vardanian
+ * @brief   POSIX-based backend for UCall.
+ * @author  Ash Vardanian
  */
 
 #if defined(WIN32) || defined(_WIN32) || defined(__WIN32__) || defined(__NT__)
@@ -253,11 +253,11 @@ void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_
 
 bool network_engine_t::is_canceled(ssize_t res, unum::ucall::connection_t const& conn) noexcept {
     return res == -ECANCELED || res == -EWOULDBLOCK || res == -EAGAIN;
-};
+}
 
 bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const& conn) noexcept {
     return res == -EBADF || res == -EPIPE;
-};
+}
 
 template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
     posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);

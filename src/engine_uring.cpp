@@ -1,5 +1,6 @@
 /**
- * @brief JSON-RPC implementation for TCP/IP stack with `io_uring`.
+ * @brief   IO Uring-based backend for UCall.
+ * @author  Ash Vardanian
  *
  * Supports:
  * > Thousands of concurrent stateful connections.
@@ -34,8 +35,6 @@
  * - `io_uring_register_files_sparse` > 5.19, or `io_uring_register_files` before that.
  * - `IORING_SETUP_COOP_TASKRUN` > 5.19.
  * - `IORING_SETUP_SINGLE_ISSUER` > 6.0.
- *
- * @author Ashot Vardanian
  *
  * @see Notable links:
  * https://man7.org/linux/man-pages/dir_by_project.html#liburing
@@ -352,9 +351,8 @@ bool network_engine_t::is_canceled(ssize_t res, unum::ucall::connection_t const&
 bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const& conn) noexcept {
     // Since the socket operates in blocking mode, a return value of 0 is unlikely,
     // but just in case allow the possibility of occasional occurrences.
-
     return res == -EBADF || res == -EPIPE || (res == 0 && conn.empty_transmits > 8);
-};
+}
 
 template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
     uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
@@ -369,6 +367,7 @@ template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_event
         ++passed;
         if (!uring_cqe->user_data)
             continue;
+
         events[completed].connection_ptr = (connection_t*)uring_cqe->user_data;
         events[completed].result = uring_cqe->res;
         ++completed;
