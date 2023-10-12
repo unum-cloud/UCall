@@ -50,48 +50,37 @@ if (NOT CMAKE_BUILD_TYPE)
   set (CMAKE_BUILD_TYPE Release)
 endif ()
 
-if (NOT CMAKE_BINARY_DIR OR ${CMAKE_SOURCE_DIR} STREQUAL ${CMAKE_BINARY_DIR})
-  set (CMAKE_BINARY_DIR "${CMAKE_SOURCE_DIR}/build")
+# Make Release by default
+if (NOT CMAKE_BUILD_TYPE)
+  set (
+    CMAKE_BUILD_TYPE
+    Release
+    CACHE STRING "Build type" FORCE
+  )
 endif ()
-set (CMAKE_CACHEFILE_DIR ${CMAKE_BINARY_DIR})
-set (
-  CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-  "${CMAKE_BINARY_DIR}/lib"
-  CACHE PATH "Path to static libs"
-)
-set (
-  CMAKE_LIBRARY_OUTPUT_DIRECTORY
-  "${CMAKE_BINARY_DIR}/lib"
-  CACHE PATH "Path to shared libs"
-)
+
+# Set binary and library output directories
+set (CMAKE_BINARY_DIR "${CMAKE_SOURCE_DIR}/build")
 set (CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
+set (CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+set (CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/lib")
+
+# Set position independent code property
 set (CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+# Set compiler flags
 if (MSVC)
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
-  set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /DEBUG")
-  set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2")
-  set (CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /DEBUG")
+  add_compile_options (/W3 /O2)
 else ()
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
-  set (CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
-  set (CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+  add_compile_options (-pedantic -fPIC -fno-exceptions -O3)
 endif ()
 
 if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fmax-errors=1")
+  add_compile_options (-fmax-errors=1)
 endif ()
 
-# Check if we are running on Linux
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set (LINUX TRUE)
-endif ()
-
+# Supporting Universal Binaries on MacOS
 if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  set (CMAKE_OSX_DEPLOYMENT_TARGET "11")
-  set (CMAKE_OSX_SYSROOT CACHE STRING "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
   set (
     CMAKE_OSX_DEPLOYMENT_TARGET
     "11"
@@ -99,13 +88,11 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   )
   set (
     CMAKE_OSX_ARCHITECTURES
-    "x86_64" "universal2" "arm64"
-    CACHE STRING "Minimum OS X deployment version"
+    "x86_64;arm64"
+    CACHE STRING "Target architectures"
   )
-  set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -std=c++17")
+  add_compile_options (-stdlib=libc++ -std=c++17)
 endif ()
-
-include_directories (include/ src/headers)
 
 include (FetchContent)
 include (ExternalProject)
@@ -148,63 +135,15 @@ FetchContent_Declare (
 FetchContent_MakeAvailable (tb64)
 include_directories (${tb64_SOURCE_DIR})
 
-if (NOT CMAKE_BUILD_TYPE STREQUAL Debug)
-  FetchContent_Declare (
-    OpenSSL URL https://ftp.openbsd.org/pub/OpenBSD/LibreSSL/libressl-3.7.3.tar.gz OVERRIDE_FIND_PACKAGE
-  )
-
-  FetchContent_MakeAvailable (OpenSSL)
-  if (IS_DIRECTORY "${LibreSSL_SOURCE_DIR}")
-    set_property (DIRECTORY ${LibreSSL_SOURCE_DIR} PROPERTY EXCLUDE_FROM_ALL YES)
-  endif ()
-  set (OPENSSL_INCLUDE_DIR ${LibreSSL_SOURCE_DIR}/include)
-  set (OPENSSL_VERSION "1.1.1")
-  set (OPENSSL_FOUND true)
-  include_directories (${OPENSSL_INCLUDE_DIR})
-  list (GET OPENSSL_CRYPTO_LIBRARIES 0 OPENSSL_ONE_LIB_PATH)
-  get_filename_component (OPENSSL_LIBDIR "${OPENSSL_ONE_LIB_PATH}" DIRECTORY)
-endif ()
-
-if (MSVC)
-  set (PICOTLS_DIR ${CMAKE_BINARY_DIR}/_deps/picotls-ep)
-  set (PICOTLSVS_DIR ${PICOTLS_DIR}/picotlsvs)
-
-  ExternalProject_Add (
-    picotls
-    GIT_REPOSITORY https://github.com/h2o/picotls.git
-    GIT_TAG master
-    DEPENDS crypto
-    PREFIX ${CMAKE_BINARY_DIR}/_deps/
-    SOURCE_DIR ${PICOTLS_DIR}
-    CONFIGURE_COMMAND ""
-    BUILD_COMMAND
-      cd ${PICOTLSVS_DIR} && MSBuild.exe picotlsvs.sln -target:picotls-core -target:picotls-openssl
-      -p:OPENSSL64DIR=${LibreSSL_SOURCE_DIR} -p:Configuration=Release -p:PlatformToolset=v141
-      -p:WindowsTargetPlatformVersion=10.0.17763.0
-    INSTALL_COMMAND ""
-    UPDATE_COMMAND ""
-  )
-  add_library (picotls-core STATIC IMPORTED GLOBAL)
-  add_dependencies (picotls-core picotls)
-  set_property (TARGET picotls-core PROPERTY IMPORTED_LOCATION ${PICOTLSVS_DIR}/x64/Release/picotls-core.lib)
-  add_library (picotls-openssl STATIC IMPORTED GLOBAL)
-  add_dependencies (picotls-openssl picotls)
-  set_property (TARGET picotls-openssl PROPERTY IMPORTED_LOCATION ${PICOTLSVS_DIR}/x64/Release/picotls-openssl.lib)
-
-  include_directories (${PICOTLS_DIR}/include/ ${PICOTLSVS_DIR}/picotls)
-else ()
-  FetchContent_Declare (
-    picotls
-    GIT_REPOSITORY https://github.com/h2o/picotls.git
-    GIT_TAG master
-  )
-
-  FetchContent_MakeAvailable (picotls)
-  if (IS_DIRECTORY "${picotls_SOURCE_DIR}")
-    set_property (DIRECTORY ${picotls_SOURCE_DIR} PROPERTY EXCLUDE_FROM_ALL YES)
-  endif ()
-  include_directories (${picotls_SOURCE_DIR}/include)
-endif ()
+# OpenSSL content
+FetchContent_Declare (
+  OpenSSL
+  GIT_REPOSITORY https://github.com/openssl/openssl.git
+  GIT_TAG openssl-3.1.3
+  GIT_SHALLOW 1
+)
+FetchContent_MakeAvailable (OpenSSL)
+find_package (OpenSSL REQUIRED)
 
 # LibUring
 if (UCALL_BUILD_URING)
@@ -233,9 +172,11 @@ endif ()
 find_package (Threads REQUIRED)
 
 # `crypto` comes from LibreSSL if it is built, otherwise from system libssl
-set (UCALL_DEPS_TLS picotls-core picotls-openssl crypto)
+set (UCALL_DEPS_TLS OpenSSL::SSL OpenSSL::Crypto)
 set (UCALL_DEPS_PARSING simdjson::simdjson Threads::Threads)
 set (UCALL_DEPS_PYTHON base64)
+
+include_directories (include/ src/headers)
 
 #[[
   Build all requested server backends:
@@ -262,7 +203,7 @@ if (UCALL_BUILD_URING)
 endif ()
 
 #[[
-  Build Python binfings to every requested backend:
+  Build Python bindings to every requested backend:
   1. UCALL_TARGET_NAME_PY_POSIX, which defaults to "py_ucall_posix"
   2. UCALL_TARGET_NAME_PY_EPOLL, which defaults to "py_ucall_epoll"
   3. UCALL_TARGET_NAME_PY_URING, which defaults to "py_ucall_uring"
@@ -300,6 +241,12 @@ if (UCALL_BUILD_PYTHON)
   endif ()
 endif ()
 
+#[[
+  Build example servers for every one of the requested backends:
+  1. ucall_example_login_${backend_name}: a simple login server, that uses JSON-RPC
+  2. ucall_example_rest_${backend_name}:
+  3. ucall_example_redis_${backend_name}: an hash-table over REST API
+]]
 if (UCALL_BUILD_EXAMPLES)
 
   foreach (backend IN LISTS UCALL_BUILD_SERVER_TARGETS)

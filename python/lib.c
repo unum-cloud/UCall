@@ -1,16 +1,14 @@
 /**
- * @file python.c
- * @author Ashot Vardanian
- * @date 2023-01-30
- * @copyright Copyright (c) 2023
+ *  @brief       Pure CPython bindings for UCall.
+ *  @file        lib.c
+ *  @author      Ashot Vardanian
+ *  @date        January 30, 2023
  *
- * @brief Pure CPython bindings for UCall.
- *
- * @see Reading Materials
- * https://pythoncapi.readthedocs.io/type_object.html
- * https://numpy.org/doc/stable/reference/c-api/types-and-structures.html
- * https://pythonextensionpatterns.readthedocs.io/en/latest/refcount.html
- * https://docs.python.org/3/extending/newtypes_tutorial.html#adding-data-and-methods-to-the-basic-example
+ *  @see Reading Materials
+ *  https://pythoncapi.readthedocs.io/type_object.html
+ *  https://numpy.org/doc/stable/reference/c-api/types-and-structures.html
+ *  https://pythonextensionpatterns.readthedocs.io/en/latest/refcount.html
+ *  https://docs.python.org/3/extending/newtypes_tutorial.html#adding-data-and-methods-to-the-basic-example
  */
 #include <time.h>
 
