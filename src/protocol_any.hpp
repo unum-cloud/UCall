@@ -2,13 +2,10 @@
 
 #include <variant>
 
-#include "containers.hpp"
-#include "parse/protocol/http.hpp"
-#include "parse/protocol/jsonrpc.hpp"
-#include "parse/protocol/rest.hpp"
-#include "parse/protocol/tcp.hpp"
-#include "shared.hpp"
-#include "ucall/ucall.h"
+#include "protocol_http.hpp"
+#include "protocol_jsonrpc.hpp"
+#include "protocol_rest.hpp"
+#include "protocol_tcp.hpp"
 
 namespace unum::ucall {
 
