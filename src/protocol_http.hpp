@@ -29,7 +29,7 @@ struct http_protocol_t {
     size_t count_headers = http_max_headers_k;
 
     std::string_view get_content() const noexcept;
-    request_type_t get_request_type() const noexcept;
+    ucall_verb_t get_request_type() const noexcept;
     any_param_t get_param(size_t) const noexcept;
     any_param_t get_param(std::string_view) const noexcept;
     std::string_view get_header(std::string_view) const noexcept;
@@ -52,8 +52,8 @@ struct http_protocol_t {
     inline std::optional<default_error_t> parse_headers(std::string_view body) noexcept;
     inline std::optional<default_error_t> parse_content() noexcept { return std::nullopt; };
 
-    template <typename calle_at>
-    std::optional<default_error_t> populate_response(exchange_pipes_t&, calle_at) noexcept {
+    template <typename callee_at>
+    std::optional<default_error_t> populate_response(exchange_pipes_t&, callee_at) noexcept {
         return std::nullopt;
     }
 };
@@ -88,7 +88,7 @@ void http_protocol_t::reset() noexcept { content_length.reset(); }
 
 std::string_view http_protocol_t::get_content() const noexcept { return parsed.body; }
 
-inline request_type_t http_protocol_t::get_request_type() const noexcept { return parsed.type; }
+inline ucall_verb_t http_protocol_t::get_request_type() const noexcept { return parsed.type; }
 
 inline any_param_t http_protocol_t::get_param(size_t) const noexcept { return any_param_t(); }
 

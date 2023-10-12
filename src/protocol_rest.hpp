@@ -30,7 +30,7 @@ struct rest_protocol_t {
     inline any_param_t as_variant(sj::simdjson_result<sjd::element> const& elm) const noexcept;
 
     inline std::string_view get_content() const noexcept;
-    request_type_t get_request_type() const noexcept;
+    ucall_verb_t get_request_type() const noexcept;
 
     inline any_param_t get_param(std::string_view name) const noexcept;
 
@@ -52,7 +52,8 @@ struct rest_protocol_t {
     inline std::optional<default_error_t> parse_headers(std::string_view body) noexcept;
     inline std::optional<default_error_t> parse_content() noexcept;
 
-    template <typename calle_at> std::optional<default_error_t> populate_response(exchange_pipes_t&, calle_at) noexcept;
+    template <typename callee_at>
+    std::optional<default_error_t> populate_response(exchange_pipes_t&, callee_at) noexcept;
 };
 
 inline void rest_protocol_t::prepare_response(exchange_pipes_t& pipes) noexcept { base_proto.prepare_response(pipes); }
@@ -135,7 +136,7 @@ inline any_param_t rest_protocol_t::as_variant(sj::simdjson_result<sjd::element>
 
 inline std::string_view rest_protocol_t::get_content() const noexcept { return base_proto.get_content(); }
 
-inline request_type_t rest_protocol_t::get_request_type() const noexcept { return base_proto.get_request_type(); }
+inline ucall_verb_t rest_protocol_t::get_request_type() const noexcept { return base_proto.get_request_type(); }
 
 inline any_param_t rest_protocol_t::get_param(std::string_view name) const noexcept {
     char json_pointer[json_pointer_capacity_k]{};
@@ -167,9 +168,9 @@ inline std::string_view rest_protocol_t::get_header(std::string_view header_name
     return base_proto.get_header(header_name);
 }
 
-template <typename calle_at>
+template <typename callee_at>
 inline std::optional<default_error_t> rest_protocol_t::populate_response(exchange_pipes_t& pipes,
-                                                                         calle_at find_and_call) noexcept {
+                                                                         callee_at find_and_call) noexcept {
     // if (std::holds_alternative<sjd::array>(elements)) {
     //     for (auto const& elm : std::get<sjd::array>(elements)) {
     //         set_to(elm);

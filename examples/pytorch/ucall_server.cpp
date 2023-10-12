@@ -15,24 +15,24 @@
 
 static std::unordered_map<std::string, std::string> store;
 
-static void summarize(ucall_call_t call) {
+static void summarize(ucall_message_t call) {
     char const* text_ptr{};
     size_t text_len{};
-    bool text_found = ucall_param_named_str(call, "text", 3, &text_ptr, &text_len);
+    bool text_found = ucall_request_param(call, "text", 3, &text_ptr, &text_len);
     if (!text_found)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
-    return ucall_call_reply_content(call, "OK", 2);
+    return ucall_reply_content(call, "OK", 2);
 }
 
-static void continue_(ucall_call_t call) {
+static void continue_(ucall_message_t call) {
     char const* text_ptr{};
     size_t text_len{};
-    bool text_found = ucall_param_named_str(call, "text", 4, &text_ptr, &text_len);
+    bool text_found = ucall_request_param(call, "text", 4, &text_ptr, &text_len);
     if (!text_found)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
-    return ucall_call_reply_content(call, "", 0);
+    return ucall_reply_content(call, "", 0);
 }
 
 int main(int argc, char** argv) {
@@ -46,8 +46,8 @@ int main(int argc, char** argv) {
     }
 
     std::printf("Initialized server!\n");
-    ucall_add_procedure(server, "summarize", &summarize);
-    ucall_add_procedure(server, "continue", &continue_);
+    ucall_add_endpoint(server, "summarize", &summarize);
+    ucall_add_endpoint(server, "continue", &continue_);
 
     ucall_take_calls(server, 0);
     ucall_free(server);

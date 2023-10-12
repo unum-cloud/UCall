@@ -8,16 +8,16 @@ The minimal sum example could look like this.
 ```c
 #include <ucall/ucall.h>
 
-static void sum(ucall_call_t call, ucall_callback_tag_t) {
+static void sum(ucall_message_t call, ucall_endpoint_tag_t) {
     int64_t a{}, b{};
     char c_str[256]{};
     bool got_a = ucall_param_named_i64(call, "a", 0, &a);
     bool got_b = ucall_param_named_i64(call, "b", 0, &b);
     if (!got_a || !got_b)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
     std::to_chars_result print = std::to_chars(&c_str[0], &c_str[0] + sizeof(c_str), a + b, 10);
-    ucall_call_reply_content(call, &c_str[0], print.ptr - &c_str[0]);
+    ucall_reply_content(call, &c_str[0], print.ptr - &c_str[0]);
 }
 
 int main(int argc, char** argv) {
@@ -26,7 +26,7 @@ int main(int argc, char** argv) {
     ucall_config_t config{};
 
     ucall_init(&config, &server);
-    ucall_add_procedure(server, "sum", &sum, post_k, NULL);
+    ucall_add_endpoint(server, "sum", &sum, post_k, NULL);
     ucall_take_calls(server, 0);
     ucall_free(server);
     return 0;

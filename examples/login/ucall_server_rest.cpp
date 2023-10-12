@@ -11,10 +11,10 @@
 
 #include "ucall/ucall.h"
 
-static bool get_param_int_from_path(ucall_call_t call, char const* name, int64_t* res) {
-    ucall_str_t param_str;
+static bool get_param_int_from_path(ucall_message_t call, char const* name, int64_t* res) {
+    ucall_string_t param_str;
     size_t param_str_len;
-    if (!ucall_param_named_str(call, name, 0, &param_str, &param_str_len))
+    if (!ucall_request_param(call, name, 0, &param_str, &param_str_len))
         return false;
 
     char* endptr = nullptr;
@@ -24,7 +24,7 @@ static bool get_param_int_from_path(ucall_call_t call, char const* name, int64_t
     return true;
 }
 
-static void validate_session(ucall_call_t call, ucall_callback_tag_t) {
+static void validate_session(ucall_message_t call, ucall_endpoint_tag_t) {
 
     int64_t a{}, b{};
     char c_str[256]{};
@@ -32,13 +32,13 @@ static void validate_session(ucall_call_t call, ucall_callback_tag_t) {
     bool got_a = ucall_param_named_i64(call, "user_id", 0, &a);
     bool got_b = get_param_int_from_path(call, "session_id", &b);
     if (!got_a || !got_b)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
     const char* res = ((a ^ b) % 23 == 0) ? "{\"response\": true}" : "{\"response\": false}";
-    ucall_call_reply_content(call, res, strlen(res));
+    ucall_reply_content(call, res, strlen(res));
 }
 
-static void upload_binary(ucall_call_t call, ucall_callback_tag_t) {
+static void upload_binary(ucall_message_t call, ucall_endpoint_tag_t) {
     char const* user_agent = nullptr;
     char const* binary = nullptr;
     char const* path = nullptr;
@@ -46,17 +46,17 @@ static void upload_binary(ucall_call_t call, ucall_callback_tag_t) {
     size_t binary_len = 0;
     size_t path_len = 0;
 
-    bool got_path = ucall_param_named_str(call, "path", 0, &path, &path_len);
-    bool got_bin = ucall_get_request_body(call, &binary, &binary_len);
-    bool got_head = ucall_get_request_header(call, "User-Agent", 0, &user_agent, &user_agent_len);
+    bool got_path = ucall_request_param(call, "path", 0, &path, &path_len);
+    bool got_bin = ucall_request_body(call, &binary, &binary_len);
+    bool got_head = ucall_request_header(call, "User-Agent", 0, &user_agent, &user_agent_len);
     if (!got_bin || !got_head)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
     std::string res = "{\"uploaded_binary_size\": " + std::to_string(binary_len) + "}";
-    ucall_call_reply_content(call, res.data(), res.size());
+    ucall_reply_content(call, res.data(), res.size());
 }
 
-static void get_books(ucall_call_t call, ucall_callback_tag_t punned_books) noexcept {
+static void get_books(ucall_message_t call, ucall_endpoint_tag_t punned_books) noexcept {
     auto* books = reinterpret_cast<std::map<std::size_t, std::string>*>(punned_books);
     std::string response = "{ \"books\": [";
     for (auto const& book : *books)
@@ -65,45 +65,45 @@ static void get_books(ucall_call_t call, ucall_callback_tag_t punned_books) noex
         response.pop_back();
     response += "]}";
 
-    ucall_call_reply_content(call, response.data(), response.size());
+    ucall_reply_content(call, response.data(), response.size());
 }
 
-static void get_book_by_id(ucall_call_t call, ucall_callback_tag_t punned_books) noexcept {
+static void get_book_by_id(ucall_message_t call, ucall_endpoint_tag_t punned_books) noexcept {
     auto* books = reinterpret_cast<std::map<std::size_t, std::string>*>(punned_books);
     int64_t book_id;
     bool got_id = get_param_int_from_path(call, "id", &book_id);
     if (!got_id)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
     auto found_book = books->find(static_cast<size_t>(book_id));
 
     if (found_book == books->end())
-        return ucall_call_reply_error(call, 404, "Book not found", 14);
+        return ucall_reply_error(call, 404, "Book not found", 14);
 
     std::string response = "{ \"book\": \"" + found_book->second + "\" }";
 
-    ucall_call_reply_content(call, response.data(), response.size());
+    ucall_reply_content(call, response.data(), response.size());
 }
 
-static void add_book(ucall_call_t call, ucall_callback_tag_t punned_books) noexcept {
+static void add_book(ucall_message_t call, ucall_endpoint_tag_t punned_books) noexcept {
     auto* books = reinterpret_cast<std::map<std::size_t, std::string>*>(punned_books);
-    ucall_str_t new_book;
+    ucall_string_t new_book;
     size_t new_book_len = 0;
     int64_t book_id = 0;
-    bool got_book = ucall_param_named_str(call, "book_name", 0, &new_book, &new_book_len);
+    bool got_book = ucall_request_param(call, "book_name", 0, &new_book, &new_book_len);
     bool got_id = ucall_param_named_i64(call, "book_id", 0, &book_id);
     if (!got_book || !got_id)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
     std::string_view book_name(new_book, new_book_len);
     auto added_book = books->emplace(static_cast<size_t>(book_id), book_name);
 
     if (!added_book.second)
-        return ucall_call_reply_error(call, 409, "Book with given Id already exists", 33);
+        return ucall_reply_error(call, 409, "Book with given Id already exists", 33);
 
     std::string response = "{ \"book\": \"" + std::string(book_name) + "\" }";
 
-    ucall_call_reply_content(call, response.data(), response.size());
+    ucall_reply_content(call, response.data(), response.size());
 }
 
 int main(int argc, char** argv) {
@@ -132,7 +132,7 @@ int main(int argc, char** argv) {
     config.max_lifetime_exchanges = UINT32_MAX;
     config.logs_file_descriptor = result["silent"].as<bool>() ? -1 : fileno(stdin);
     config.logs_format = "human";
-    config.protocol = protocol_type_t::rest_k;
+    config.protocol = protocol_kind_t::rest_k;
     // config.ssl_private_key_path = "./examples/login/certs/main.key";
     // const char* crts[] = {"./examples/login/certs/srv.crt", "./examples/login/certs/cas.pem"};
     // config.ssl_certificates_paths = crts;
@@ -153,13 +153,13 @@ int main(int argc, char** argv) {
     std::map<std::size_t, std::string> books;
 
     // Add all the callbacks we need
-    ucall_add_procedure(server, "/books", &get_books, request_type_t::get_k, &books);
-    ucall_add_procedure(server, "/books", &add_book, request_type_t::post_k, &books);
-    ucall_add_procedure(server, "/books/{id}", &get_book_by_id, request_type_t::get_k, &books);
+    ucall_add_endpoint(server, "/books", &get_books, ucall_verb_t::get_k, &books);
+    ucall_add_endpoint(server, "/books", &add_book, ucall_verb_t::post_k, &books);
+    ucall_add_endpoint(server, "/books/{id}", &get_book_by_id, ucall_verb_t::get_k, &books);
 
-    ucall_add_procedure(server, "/validate_session/{session_id}", &validate_session, request_type_t::get_k, nullptr);
+    ucall_add_endpoint(server, "/validate_session/{session_id}", &validate_session, ucall_verb_t::get_k, nullptr);
 
-    ucall_add_procedure(server, "/upload_binary/{path}", &upload_binary, request_type_t::put_k, nullptr);
+    ucall_add_endpoint(server, "/upload_binary/{path}", &upload_binary, ucall_verb_t::put_k, nullptr);
 
     if (config.max_threads > 1) {
         std::vector<std::thread> threads;

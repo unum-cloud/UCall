@@ -10,16 +10,16 @@
 
 #include "ucall/ucall.h"
 
-static void validate_session(ucall_call_t call, ucall_callback_tag_t) {
+static void validate_session(ucall_message_t call, ucall_endpoint_tag_t) {
     int64_t a{}, b{};
     char c_str[256]{};
     bool got_a = ucall_param_named_i64(call, "user_id", 0, &a);
     bool got_b = ucall_param_named_i64(call, "session_id", 0, &b);
     if (!got_a || !got_b)
-        return ucall_call_reply_error_invalid_params(call);
+        return ucall_reply_error_invalid_params(call);
 
     const char* res = ((a ^ b) % 23 == 0) ? "true" : "false";
-    ucall_call_reply_content(call, res, strlen(res));
+    ucall_reply_content(call, res, strlen(res));
 }
 
 int main(int argc, char** argv) {
@@ -48,7 +48,7 @@ int main(int argc, char** argv) {
     config.max_lifetime_exchanges = UINT32_MAX;
     config.logs_file_descriptor = result["silent"].as<bool>() ? -1 : fileno(stdin);
     config.logs_format = "human";
-    config.protocol = protocol_type_t::jsonrpc_http_k;
+    config.protocol = protocol_kind_t::jsonrpc_http_k;
     // config.ssl_private_key_path = "./examples/login/certs/main.key";
     // const char* crts[] = {"./examples/login/certs/srv.crt", "./examples/login/certs/cas.pem"};
     // config.ssl_certificates_paths = crts;
@@ -67,7 +67,7 @@ int main(int argc, char** argv) {
         std::printf("- silent\n");
 
     // Add all the callbacks we need
-    ucall_add_procedure(server, "validate_session", &validate_session, request_type_t::post_k, nullptr);
+    ucall_add_endpoint(server, "validate_session", &validate_session, ucall_verb_t::post_k, nullptr);
 
     if (config.max_threads > 1) {
         std::vector<std::thread> threads;

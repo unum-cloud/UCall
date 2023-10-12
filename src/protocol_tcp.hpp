@@ -14,7 +14,7 @@ struct tcp_protocol_t {
     parsed_request_t parsed{};
 
     std::string_view get_content() const noexcept;
-    request_type_t get_request_type() const noexcept;
+    ucall_verb_t get_request_type() const noexcept;
     any_param_t get_param(size_t) const noexcept;
     any_param_t get_param(std::string_view) const noexcept;
     std::string_view get_header(std::string_view) const noexcept;
@@ -33,15 +33,15 @@ struct tcp_protocol_t {
     inline std::optional<default_error_t> parse_headers(std::string_view body) noexcept;
     inline std::optional<default_error_t> parse_content() noexcept;
 
-    template <typename calle_at>
-    std::optional<default_error_t> populate_response(exchange_pipes_t&, calle_at) noexcept {
+    template <typename callee_at>
+    std::optional<default_error_t> populate_response(exchange_pipes_t&, callee_at) noexcept {
         return std::nullopt;
     }
 };
 
 std::string_view tcp_protocol_t::get_content() const noexcept { return parsed.body; }
 
-inline request_type_t tcp_protocol_t::get_request_type() const noexcept { return request_type_t::post_k; }
+inline ucall_verb_t tcp_protocol_t::get_request_type() const noexcept { return ucall_verb_t::post_k; }
 
 inline any_param_t tcp_protocol_t::get_param(size_t) const noexcept { return any_param_t(); }
 

@@ -29,7 +29,7 @@ template <typename base_protocol_t> struct jsonrpc_protocol_t {
     inline any_param_t as_variant(sj::simdjson_result<sjd::element> const& elm) const noexcept;
 
     inline std::string_view get_content() const noexcept;
-    request_type_t get_request_type() const noexcept;
+    ucall_verb_t get_request_type() const noexcept;
 
     inline any_param_t get_param(std::string_view name) const noexcept;
 
@@ -53,7 +53,8 @@ template <typename base_protocol_t> struct jsonrpc_protocol_t {
     inline std::optional<default_error_t> parse_headers(std::string_view body) noexcept;
     inline std::optional<default_error_t> parse_content() noexcept;
 
-    template <typename calle_at> std::optional<default_error_t> populate_response(exchange_pipes_t&, calle_at) noexcept;
+    template <typename callee_at>
+    std::optional<default_error_t> populate_response(exchange_pipes_t&, callee_at) noexcept;
 };
 
 template <typename base_protocol_t>
@@ -178,7 +179,7 @@ inline std::string_view jsonrpc_protocol_t<base_protocol_t>::get_content() const
 }
 
 template <typename base_protocol_t>
-inline request_type_t jsonrpc_protocol_t<base_protocol_t>::get_request_type() const noexcept {
+inline ucall_verb_t jsonrpc_protocol_t<base_protocol_t>::get_request_type() const noexcept {
     return base_proto.get_request_type();
 }
 
@@ -253,9 +254,9 @@ std::optional<default_error_t> jsonrpc_protocol_t<base_protocol_t>::set_to(sjd::
 }
 
 template <typename base_protocol_t>
-template <typename calle_at>
+template <typename callee_at>
 inline std::optional<default_error_t>
-jsonrpc_protocol_t<base_protocol_t>::populate_response(exchange_pipes_t& pipes, calle_at find_and_call) noexcept {
+jsonrpc_protocol_t<base_protocol_t>::populate_response(exchange_pipes_t& pipes, callee_at find_and_call) noexcept {
     if (std::holds_alternative<sjd::array>(elements)) {
         for (auto const& elm : std::get<sjd::array>(elements)) {
             set_to(elm);

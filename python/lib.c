@@ -70,7 +70,7 @@ typedef struct {
     py_server_t* server;
     PyObject* args;
     PyObject* fn;
-    request_type_t request_type;
+    ucall_verb_t request_type;
 } py_decorator_self_t;
 
 static int prepare_wrapper(PyObject* callable, py_wrapper_t* wrap) {
@@ -199,8 +199,8 @@ static int prepare_wrapper(PyObject* callable, py_wrapper_t* wrap) {
     return 0;
 }
 
-static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
-    py_wrapper_t* wrap = (py_wrapper_t*)(callback_tag);
+static void wrapper(ucall_message_t call, ucall_endpoint_tag_t endpoint_tag) {
+    py_wrapper_t* wrap = (py_wrapper_t*)(endpoint_tag);
     PyObject* args = PyTuple_New(wrap->params_cnt);
 
     for (size_t i = 0; i < wrap->params_cnt; ++i) {
@@ -210,7 +210,7 @@ static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
         bool may_have_pos = (kind & POSITIONAL_OR_KEYWORD) | (kind & POSITIONAL_ONLY) | (kind & VAR_POSITIONAL);
         bool got_named = false;
         Py_ssize_t name_len = wrap->u_params[i].name_len;
-        ucall_str_t name = wrap->u_params[i].name;
+        ucall_string_t name = wrap->u_params[i].name;
 
         if (PyType_IsSubtype(type, &PyBool_Type)) {
             bool res;
@@ -219,7 +219,7 @@ static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_bool(call, i, &res))
-                return ucall_call_reply_error_invalid_params(call);
+                return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, res ? Py_True : Py_False);
         } else if (PyType_IsSubtype(type, &PyLong_Type)) {
@@ -229,7 +229,7 @@ static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_i64(call, i, &res))
-                return ucall_call_reply_error_invalid_params(call);
+                return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, PyLong_FromSsize_t(res));
         } else if (PyType_IsSubtype(type, &PyFloat_Type)) {
@@ -239,30 +239,30 @@ static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_f64(call, i, &res))
-                return ucall_call_reply_error_invalid_params(call);
+                return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, PyFloat_FromDouble(res));
         } else if (PyType_IsSubtype(type, &PyUnicode_Type)) {
-            ucall_str_t res;
+            ucall_string_t res;
             size_t len;
             if (may_have_name && name_len > 0)
-                got_named = ucall_param_named_str(call, name, name_len, &res, &len);
+                got_named = ucall_request_param(call, name, name_len, &res, &len);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_str(call, i, &res, &len))
-                return ucall_call_reply_error_invalid_params(call);
+                return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, PyUnicode_FromStringAndSize(res, len));
         } else {
             // For non native type, assume binary.
-            ucall_str_t res;
+            ucall_string_t res;
             size_t len;
             if (may_have_name && name_len > 0)
-                got_named = ucall_param_named_str(call, name, name_len, &res, &len);
+                got_named = ucall_request_param(call, name, name_len, &res, &len);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_str(call, i, &res, &len))
-                return ucall_call_reply_error_invalid_params(call);
+                return ucall_reply_error_invalid_params(call);
 
             len = tb64dec((unsigned char const*)res, len, (unsigned char*)res);
             PyTuple_SetItem(args, i, PyBytes_FromStringAndSize(res, len));
@@ -276,11 +276,11 @@ static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
         if (ptype != NULL) {
             PyObject* pvalue_str = PyObject_Str(pvalue);
             size_t sz = 0;
-            ucall_str_t error_str = PyUnicode_AsUTF8AndSize(pvalue_str, &sz);
-            ucall_call_reply_error(call, 500, error_str, sz);
+            ucall_string_t error_str = PyUnicode_AsUTF8AndSize(pvalue_str, &sz);
+            ucall_reply_error(call, 500, error_str, sz);
             Py_DECREF(pvalue_str);
         } else
-            ucall_call_reply_error_unknown(call);
+            ucall_reply_error_unknown(call);
         Py_XDECREF(ptype);
         Py_XDECREF(pvalue);
         Py_XDECREF(ptraceback);
@@ -290,17 +290,17 @@ static void wrapper(ucall_call_t call, ucall_callback_tag_t callback_tag) {
     size_t sz = calculate_size_as_str(response);
     char* parsed_response = (char*)(malloc(sz * sizeof(char)));
     if (!parsed_response)
-        return ucall_call_reply_error_out_of_memory(call);
+        return ucall_reply_error_out_of_memory(call);
     size_t len = 0;
     int res = to_string(response, &parsed_response[0], &len);
-    ucall_call_reply_content(call, &parsed_response[0], len);
+    ucall_reply_content(call, &parsed_response[0], len);
 }
 
 static PyObject* __add_procedure(py_decorator_self_t* decorated, PyObject* args) {
     // Take a function object, introspect its arguments,
     // register them inside of a higher-level function,
     // which on every call requests them via `ucall_param_named_...`
-    // from the `ucall_call_t` context, then wraps them into native
+    // from the `ucall_message_t` context, then wraps them into native
     // Python objects and passes to the original function.
     // The result of that function call must then be returned via
     // the `ucall_call_send_content` call.
@@ -330,7 +330,7 @@ static PyObject* __add_procedure(py_decorator_self_t* decorated, PyObject* args)
     if (path == NULL)
         path = PyUnicode_AsUTF8(PyObject_GetAttrString(wrap.callable, "__name__"));
 
-    ucall_add_procedure(server->server, path, wrapper, decorated->request_type, &server->wrappers[server->count_added]);
+    ucall_add_endpoint(server->server, path, wrapper, decorated->request_type, &server->wrappers[server->count_added]);
 
     ++server->count_added;
     Py_INCREF(wrap.callable);
@@ -341,7 +341,7 @@ static PyObject* __add_procedure(py_decorator_self_t* decorated, PyObject* args)
     return wrap.callable;
 }
 
-static PyObject* procedure_decorator(py_server_t* self, PyObject* args, request_type_t req_type) {
+static PyObject* procedure_decorator(py_server_t* self, PyObject* args, ucall_verb_t req_type) {
     static PyMethodDef methd = {"__add_procedure", __add_procedure, METH_VARARGS,
                                 "Actual function that registers procedure"};
     PyObject* name = PyUnicode_FromString(methd.ml_name);

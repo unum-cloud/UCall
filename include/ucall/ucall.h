@@ -1,32 +1,19 @@
 /**
- * @file        ucall.h
- * @author      Ash Vardanian
- * @date        Feb 3, 2023
+ *   @file        ucall.h
+ *   @author      Ash Vardanian
+ *   @date        Feb 3, 2023
  *
- * @addtogroup C
+ *   @addtogroup C
  *
- * @brief Binary Interface for UCall.
+ *   @brief Binary C99 interface for UCall.
  *
- * ## Basic Usage
+ *   For basic usage you are gonna need:
  *
- * To use UCall, at the very least you need the following few functions:
- *
- * - `ucall_init()` - to start a server,
- * - `ucall_add_procedure()` - to register a callback,
- * - `ucall_call_reply_content()` - to submit a reply from inside the callback,
- * - `ucall_take_calls()` - to run the polling loop,
- * - `ucall_free()` - to shut down.
- *
- * Assuming the C language has no reflection, and we want to avoid dynamic
- * memory allocations, there are a few functions to fetch the function arguments
- * from inside the callback. For named arguments those are:
- *
- * - `ucall_param_named_bool()`.
- * - `ucall_param_named_i64()`.
- * - `ucall_param_named_f64()`.
- * - `ucall_param_named_str()`.
- *
- * Similarly there is a `positional` counterpart to every `named` function.
+ *   - `ucall_init()` - to start a server.
+ *   - `ucall_add_endpoint()` - to register a callback.
+ *   - `ucall_reply_content()` - to submit a reply from inside the callback.
+ *   - `ucall_take_calls()` - to run the polling loop, or manually repeat `ucall_take_call()`.
+ *   - `ucall_free()` - to shut down.
  */
 
 #pragma once
@@ -39,173 +26,225 @@ extern "C" {
 #include <stddef.h>  // `size_t`
 #include <stdint.h>  // `int64_t`
 
+/**
+ * @brief A handle to the UCall server instance.
+ */
 typedef void* ucall_server_t;
-typedef void* ucall_call_t;
-typedef void* ucall_callback_tag_t;
-typedef char const* ucall_str_t;
-
-typedef void (*ucall_callback_t)(ucall_call_t, ucall_callback_tag_t);
 
 /**
- * @brief Represents the types of protocols that can be used.
+ * @brief A handle to a message instance processed by the UCall server.
  */
-typedef enum protocol_type_t {
-    tcp_k,          ///< Raw Transmission Control Protocol (TCP)
-    http_k,         ///< Raw Hypertext Transfer Protocol (HTTP)
-    jsonrpc_tcp_k,  ///< JSON-RPC over TCP
-    jsonrpc_http_k, ///< JSON-RPC over HTTP
-    rest_k          ///< REST over HTTP
-} protocol_type_t;
+typedef void* ucall_message_t;
 
 /**
- * @brief Represents the types of callbacks/Requests.
+ * @brief A handle to an endpoint tag which may contain additional metadata for the callback.
  */
-typedef enum request_type_t {
-    get_k,   ///< GET Request
-    put_k,   ///< PUT Request
-    post_k,  ///< POST Request
-    delete_k ///< DELETE Request
-} request_type_t;
+typedef void* ucall_endpoint_tag_t;
 
 /**
- * @brief Configuration parameters for `ucall_init()`.
+ * @brief A type alias for a constant string.
+ */
+typedef char const* ucall_string_t;
+
+/**
+ * @brief A function pointer type for callback functions to be registered with the UCall server.
+ *
+ * Most callbacks are expected to be synchronous ~ blocking. So by the time their scope is finished,
+ * the server will automatically send the response back to the client. So, in most cases, the
+ * callback will trigger `ucall_reply_content` or `ucall_reply_error`.
+ *
+ * Alternatively, for async or batch execution, you should notify the server using `ucall_reply_async`.
+ * This will preserve the context, allowing you to return to the callback later, and submit the response.
+ *
+ * @param call The message being processed.
+ * @param endpoint_tag An optional tag containing additional metadata for the callback.
+ */
+typedef void (*ucall_callback_t)(ucall_message_t call, ucall_endpoint_tag_t);
+
+/**
+ * @brief Enumeration representing the types of HTTP requests that can be processed.
+ */
+typedef enum ucall_verb_t {
+    get_k,   ///< Represents an HTTP GET request.
+    put_k,   ///< Represents an HTTP PUT request.
+    post_k,  ///< Represents an HTTP POST request.
+    delete_k ///< Represents an HTTP DELETE request.
+} ucall_verb_t;
+
+/**
+ * @brief Struct containing configuration parameters for initializing a UCall server instance.
  */
 typedef struct ucall_config_t {
-    char const* hostname;
-    uint16_t port;
-    uint16_t queue_depth;
-    uint16_t max_callbacks;
-    uint16_t max_threads;
+    char const* hostname;   ///< The hostname on which the server will run.
+    uint16_t port;          ///< The port on which the server will listen for incoming connections.
+    uint16_t queue_depth;   ///< The depth of the queue for pending connections.
+    uint16_t max_callbacks; ///< The maximum number of callbacks that can be registered with the server.
+    uint16_t max_threads;   ///< The maximum number of threads that can be spawned by the server.
 
-    /// @brief Common choices, aside from a TCP socket are:
-    /// > STDOUT_FILENO: console output.
-    /// > STDERR_FILENO: errors.
+    /// @brief The file descriptor to which logs will be written.
+    /// Common choices, aside from a TCP socket are:
+    /// > STDOUT_FILENO: for console output.
+    /// > STDERR_FILENO: for error output.
     int32_t logs_file_descriptor;
-    /// @brief Can be:
-    /// > "human" will print human-readable unit-normalized lines.
-    /// > "json" will output newline-delimited JSONs documents.
+
+    /// @brief The format in which logs will be written.
+    /// Can be:
+    /// > "human": will print human-readable unit-normalized lines.
+    /// > "json": will output newline-delimited JSON documents.
     char const* logs_format;
 
-    uint16_t max_batch_size;
-    uint32_t max_concurrent_connections;
-    uint32_t max_lifetime_micro_seconds;
-    uint32_t max_lifetime_exchanges;
+    uint16_t max_batch_size;             ///< The maximum batch size for processing requests.
+    uint32_t max_concurrent_connections; ///< The maximum number of concurrent connections the server can handle.
+    uint32_t max_lifetime_micro_seconds; ///< The maximum lifetime of a connection in microseconds.
+    uint32_t max_lifetime_exchanges;     ///< The maximum number of exchanges allowed for a connection.
 
-    /// @brief Connection Protocol.
-    protocol_type_t protocol;
-
-    /// @brief Private Key required for SSL.
+    /// @brief The path to the private key file required for SSL.
     char const* ssl_private_key_path;
-    /// @brief At least one certificate is required for SSL.
+
+    /// @brief An array of paths to certificate files required for SSL.
     char const** ssl_certificates_paths;
-    /// @brief Certificates count.
+
+    /// @brief The count of certificates provided in `ssl_certificates_paths`.
     size_t ssl_certificates_count;
 } ucall_config_t;
 
+#pragma region Setup
+
 /**
- * @param config Input and output argument, that will be updated to export set configuration.
- * @param server Output variable, which, on success, will be an initialized server.
- * Don't forget to free its memory with `ucall_free()` at the end.
+ *   @param config Input and output argument, that will be updated to export set configuration.
+ *   @param server Output variable, which, on success, will be an initialized server.
+ *   Don't forget to free its memory with `ucall_free()` at the end.
  */
 void ucall_init(ucall_config_t* config, ucall_server_t* server);
 
 void ucall_free(ucall_server_t);
 
 /**
- * @brief Registers a function callback to be triggered by the server,
- * when a matching request arrives.
+ *   @brief Registers a function callback to be triggered by the server,
+ *   when a matching request arrives.
  *
- * @param server Must be pre-initialized with `ucall_init()`.
- * @param name The string to be matched against "method" in every JSON request.
- * @param callback Function pointer to the callback.
- * @param callback_type Type of the request the callback is registered for.
- * @param callback_tag Optional payload/tag, often pointing to metadata about
- * expected "params", mostly used for higher-level runtimes, like CPython.
+ *   @param server Must be pre-initialized with `ucall_init()`.
+ *   @param name The string to be matched against "method" in every JSON request.
+ *   @param verb Type of the request the callback is registered for.
+ *   @param callback Function pointer to the callback.
+ *   @param endpoint_tag Optional payload/tag, often pointing to metadata about
+ *   expected "params", mostly used for higher-level runtimes, like CPython.
  */
-void ucall_add_procedure(         //
-    ucall_server_t server,        //
-    ucall_str_t name,             //
-    ucall_callback_t callback,    //
-    request_type_t callback_type, //
-    ucall_callback_tag_t callback_tag);
+void ucall_add_endpoint(ucall_server_t server, ucall_string_t name, ucall_verb_t verb, ucall_callback_t callback,
+                        ucall_endpoint_tag_t endpoint_tag);
+
+#pragma endregion
+
+#pragma region Event Loop
 
 /**
- * @brief Perform a single blocking round of polling on the current calling thread.
+ *   @brief Perform a single blocking round of polling on the current calling thread.
  *
- * @param thread_idx Assuming that the `::server` itself has memory reserves for every
- * thread, the caller must provide a `::thread_idx` uniquely identifying current thread
- * with a number from zero to `::ucall_config_t::max_threads`.
+ *   @param thread_idx Assuming that the `::server` itself has memory reserves for every
+ *   thread, the caller must provide a `::thread_idx` uniquely identifying current thread
+ *   with a number from zero to `::ucall_config_t::max_threads`.
  */
 void ucall_take_call(ucall_server_t server, uint16_t thread_idx);
 
 /**
- * @brief Blocks current thread, replying to requests in a potentially more efficient
- * way, than just a `while` loop calling `ucall_take_call()`.
+ *   @brief Blocks current thread, replying to requests in a potentially more efficient
+ *   way, than just a `while` loop calling `ucall_take_call()`.
  *
- * @param thread_idx Assuming that the `::server` itself has memory reserves for every
- * thread, the caller must provide a `::thread_idx` uniquely identifying current thread
- * with a number from zero to `::ucall_config_t::max_threads`.
+ *   @param thread_idx Assuming that the `::server` itself has memory reserves for every
+ *   thread, the caller must provide a `::thread_idx` uniquely identifying current thread
+ *   with a number from zero to `::ucall_config_t::max_threads`.
  */
 void ucall_take_calls(ucall_server_t server, uint16_t thread_idx);
 
-bool ucall_param_named_bool(  //
-    ucall_call_t call,        //
-    ucall_str_t param_name,   //
-    size_t param_name_length, //
-    bool* output);
+#pragma endregion
 
-bool ucall_param_named_i64(   //
-    ucall_call_t call,        //
-    ucall_str_t param_name,   //
-    size_t param_name_length, //
-    int64_t* output);
-
-bool ucall_param_named_f64(   //
-    ucall_call_t call,        //
-    ucall_str_t param_name,   //
-    size_t param_name_length, //
-    double* output);
-
-bool ucall_param_named_str(   //
-    ucall_call_t call,        //
-    ucall_str_t param_name,   //
-    size_t param_name_length, //
-    ucall_str_t* output, size_t* output_length);
-
-bool ucall_param_positional_bool(ucall_call_t, size_t, bool*);
-bool ucall_param_positional_i64(ucall_call_t, size_t, int64_t*);
-bool ucall_param_positional_f64(ucall_call_t, size_t, double*);
-bool ucall_param_positional_str(ucall_call_t, size_t, ucall_str_t*, size_t*);
-
-bool ucall_get_request_header(ucall_call_t call,         //
-                              ucall_str_t header_name,   //
-                              size_t header_name_length, //
-                              ucall_str_t* output, size_t* output_length);
-
-bool ucall_get_request_body(ucall_call_t call, //
-                            ucall_str_t* output, size_t* output_length);
+#pragma region Inspecting Requests
 
 /**
- * @param call Encapsulates the context and the arguments of the current request.
- * @param json_reply The response to send, which must be a valid JSON string.
- * @param json_reply_length An option length of `::json_reply`.
+ *  @brief Retrieves the decrypted version of the message from the specified call.
+ *
+ *  @param call The message whose decrypted version is to be retrieved.
+ *  @param output The buffer where the decrypted message will be stored.
+ *  @param output_length The length of the decrypted message.
+ *  @return true on success, false on failure.
  */
-void ucall_call_reply_content(ucall_call_t call, ucall_str_t json_reply, size_t json_reply_length);
+bool ucall_request_decrypted(ucall_message_t call, ucall_string_t* output, size_t* output_length);
 
 /**
- * @param call Encapsulates the context and the arguments of the current request.
- * @param error_message An optional string.
- * @param error_message_length An option length of `::json_reply`.
+ *  @brief Retrieves the value of a specified header from the message of the specified call.
+ *
+ *  @param call The call whose message's header value is to be retrieved.
+ *  @param header_name The name of the header to retrieve.
+ *  @param header_name_length The length of the header name string.
+ *  @param output The buffer where the header value will be stored.
+ *  @param output_length The length of the header value.
+ *  @return true on success, false on failure.
  */
-void ucall_call_reply_error(ucall_call_t call, int error_code, ucall_str_t error_message, size_t error_message_length);
+bool ucall_request_header(ucall_message_t call, ucall_string_t header_name, size_t header_name_length,
+                          ucall_string_t* output, size_t* output_length);
 
-void ucall_call_reply_error_invalid_params(ucall_call_t);
-void ucall_call_reply_error_out_of_memory(ucall_call_t);
-void ucall_call_reply_error_unknown(ucall_call_t);
+/**
+ *  @brief Retrieves the body of the message from the specified call.
+ *
+ *  @param call The call whose message body is to be retrieved.
+ *  @param output The buffer where the body will be stored.
+ *  @param output_length The length of the body.
+ *  @return true on success, false on failure.
+ */
+bool ucall_request_body(ucall_message_t call, ucall_string_t* output, size_t* output_length);
 
-bool ucall_param_named_json(ucall_call_t, ucall_str_t, size_t, ucall_str_t*, size_t*); // TODO
-bool ucall_param_positional_json(ucall_call_t, size_t, ucall_str_t*, size_t*);         // TODO
+/**
+ *  @brief Retrieves the value of a specified parameter from the message of the specified call.
+ *
+ *  @param call The call whose message's parameter value is to be retrieved.
+ *  @param param_name The name of the parameter to retrieve.
+ *  @param param_name_length The length of the parameter name string.
+ *  @param output The buffer where the parameter value will be stored.
+ *  @param output_length The length of the parameter value.
+ *  @return true on success, false on failure.
+ */
+bool ucall_request_param(ucall_message_t call, ucall_string_t param_name, size_t param_name_length,
+                         ucall_string_t* output, size_t* output_length);
+
+#pragma endregion
+
+#pragma region Submitting Responses
+
+/**
+ *  @brief Sends a response message to the specified call.
+ *
+ *  @param call The call to respond to.
+ *  @param reply The content of the response message.
+ *  @param reply_length The length of the response message.
+ *  @param content_type The MIME type of the content being sent.
+ *  @param content_type_length The length of the content_type string.
+ */
+void ucall_reply_content(ucall_message_t call, ucall_string_t reply, size_t reply_length, ucall_string_t content_type,
+                         size_t content_type_length);
+
+/**
+ *  @brief Sends an error response to the specified call.
+ *
+ *  @param call The call to respond to.
+ *  @param error_code The error code to be sent.
+ *  @param error_message The error message to be sent.
+ *  @param error_message_length The length of the error message.
+ */
+void ucall_reply_error(ucall_message_t call, int error_code, ucall_string_t error_message, size_t error_message_length);
+
+/**
+ *  @brief Notifies the server, that a long-running task was started, and emits an async execution token.
+ *
+ *  @param call The call to respond to.
+ */
+void ucall_reply_async(ucall_message_t call);
+
+void ucall_reply_error_invalid_params(ucall_message_t);
+void ucall_reply_error_out_of_memory(ucall_message_t);
+void ucall_reply_error_unknown(ucall_message_t);
+
+#pragma endregion
 
 #ifdef __cplusplus
-} /* end extern "C" */
+} /*   end extern "C" */
 #endif

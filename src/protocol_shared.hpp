@@ -92,7 +92,7 @@ template <std::size_t step_ak> constexpr std::size_t round_up_to(std::size_t n) 
 }
 
 struct parsed_request_t {
-    request_type_t type{};
+    ucall_verb_t type{};
     std::string_view path{};
     std::string_view content_type{};
     std::string_view content_length{};
@@ -460,7 +460,27 @@ class exchange_pipes_t {
         return output_.dynamic.size() ? output_.embedded_used : output_.embedded_used - output_submitted_;
     }
 
-    bool append_outputs(std::string_view) noexcept;
+    bool append_outputs(std::string_view body) noexcept {
+        bool was_in_embedded = !output_.dynamic.size();
+        bool fit_into_embedded = output_.embedded_used + body.size() < ram_page_size_k;
+
+        if (was_in_embedded && fit_into_embedded) {
+            memcpy(output_.embedded + output_.embedded_used, body.data(), body.size());
+            output_.embedded_used += body.size();
+            return true;
+        } else {
+            if (!output_.dynamic.reserve(output_.dynamic.size() + output_.embedded_used + body.size()))
+                return false;
+            if (was_in_embedded) {
+                if (!output_.dynamic.append_n(output_.embedded, output_.embedded_used))
+                    return false;
+                output_.embedded_used = 0;
+            }
+            if (!output_.dynamic.append_n(body.data(), body.size()))
+                return false;
+            return true;
+        }
+    }
 
 #pragma endregion
 
@@ -490,28 +510,6 @@ class exchange_pipes_t {
 #pragma endregion
 };
 
-bool exchange_pipes_t::append_outputs(std::string_view body) noexcept {
-    bool was_in_embedded = !output_.dynamic.size();
-    bool fit_into_embedded = output_.embedded_used + body.size() < ram_page_size_k;
-
-    if (was_in_embedded && fit_into_embedded) {
-        memcpy(output_.embedded + output_.embedded_used, body.data(), body.size());
-        output_.embedded_used += body.size();
-        return true;
-    } else {
-        if (!output_.dynamic.reserve(output_.dynamic.size() + output_.embedded_used + body.size()))
-            return false;
-        if (was_in_embedded) {
-            if (!output_.dynamic.append_n(output_.embedded, output_.embedded_used))
-                return false;
-            output_.embedded_used = 0;
-        }
-        if (!output_.dynamic.append_n(body.data(), body.size()))
-            return false;
-        return true;
-    }
-}
-
 struct number_and_suffix_t {
     float number{};
     char suffix{};
@@ -527,6 +525,9 @@ inline number_and_suffix_t printable(std::size_t n) noexcept {
     return {n + 0.0f, ' '};
 }
 
+/**
+ *  @brief Struct to gather and log statistical data, in both human-readable form and JSON.
+ */
 struct stats_t {
 
     static constexpr std::size_t default_frequency_secs_k{5};
@@ -538,6 +539,14 @@ struct stats_t {
     std::atomic<std::size_t> packets_received{};
     std::atomic<std::size_t> packets_sent{};
 
+    /**
+     *  @brief Logs statistical data in a human-readable format, normalized for a time period.
+     *
+     *  @param buffer Pointer to the buffer where the log string will be written.
+     *  @param buffer_capacity Size of the buffer.
+     *  @param seconds Time span over which the statistics were collected.
+     *  @return The number of characters written to the buffer.
+     */
     inline std::size_t log_human_readable(char* buffer, std::size_t buffer_capacity, std::size_t seconds) noexcept {
         auto& s = *this;
         auto printable_normalized = [=](std::atomic<std::size_t>& i) noexcept {
@@ -567,6 +576,13 @@ struct stats_t {
         return static_cast<std::size_t>(len);
     }
 
+    /**
+     *  @brief Logs statistical data in a JSON format.
+     *
+     *  @param buffer Pointer to the buffer where the log string will be written.
+     *  @param buffer_capacity Size of the buffer.
+     *  @return The number of characters written to the buffer.
+     */
     inline std::size_t log_json(char* buffer, std::size_t buffer_capacity) noexcept {
         auto& s = *this;
         auto added_connections = s.added_connections.exchange(0, std::memory_order_relaxed);
@@ -594,8 +610,8 @@ struct stats_t {
 struct named_callback_t {
     std::string_view name{};
     ucall_callback_t callback{};
-    request_type_t type{};
-    ucall_callback_tag_t callback_tag{};
+    ucall_verb_t type{};
+    ucall_endpoint_tag_t endpoint_tag{};
 
     bool method_matches(std::string_view) const noexcept;
 };
@@ -605,21 +621,21 @@ struct engine_t {
     /// @brief An array of function callbacks. Can be in dozens.
     array_gt<named_callback_t> callbacks{};
 
-    void raise_request(exchange_pipes_t&, protocol_t&, ucall_call_t) const noexcept;
+    void raise_request(exchange_pipes_t&, protocol_t&, ucall_message_t) const noexcept;
 
     void try_add_callback(named_callback_t&&) noexcept;
 };
 
-void engine_t::raise_request(exchange_pipes_t& pipes, protocol_t& protocol, ucall_call_t call) const noexcept {
+void engine_t::raise_request(exchange_pipes_t& pipes, protocol_t& protocol, ucall_message_t call) const noexcept {
 
     if (auto error_ptr = protocol.parse_headers(pipes.input_span()); error_ptr)
-        return ucall_call_reply_error(call, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
+        return ucall_reply_error(call, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
 
     if (auto error_ptr = protocol.parse_content(); error_ptr)
-        return ucall_call_reply_error(call, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
+        return ucall_reply_error(call, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
 
     protocol.prepare_response(pipes);
-    auto error_ptr = protocol.populate_response(pipes, [&](std::string_view& method_name, request_type_t req_type) {
+    auto error_ptr = protocol.populate_response(pipes, [&](std::string_view& method_name, ucall_verb_t req_type) {
         auto callbacks_end = callbacks.data() + callbacks.size();
         auto callback_it =
             std::find_if(callbacks.data(), callbacks_end, [&](named_callback_t const& callback) noexcept {
@@ -630,11 +646,11 @@ void engine_t::raise_request(exchange_pipes_t& pipes, protocol_t& protocol, ucal
 
         named_callback_t named_callback = *callback_it;
         method_name = named_callback.name;
-        named_callback.callback(call, named_callback.callback_tag);
+        named_callback.callback(call, named_callback.endpoint_tag);
         return true;
     });
     if (error_ptr)
-        return ucall_call_reply_error(call, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
+        return ucall_reply_error(call, error_ptr->code, error_ptr->note.data(), error_ptr->note.size());
     protocol.finalize_response(pipes);
 }
 
@@ -665,8 +681,11 @@ bool named_callback_t::method_matches(std::string_view dynamic_name) const noexc
     return first2 == end2 && first1 == end1;
 }
 
+/**
+ * @brief   Represents a connection, handling TLS/SSL operations, buffering, and
+ *          state management using OpenSSL.
+ */
 struct connection_t {
-
     /// @brief Exchange buffers to pipe information in both directions.
     exchange_pipes_t pipes{};
 
@@ -684,18 +703,23 @@ struct connection_t {
     std::size_t exchanges{};
     std::size_t empty_transmits{};
 
-    /// @brief TLS related data
-    ptls_t* tls_ctx{};
-    ptls_buffer_t work_buf{};
-    uint8_t ptls_buf[ram_page_size_k];
-    ptls_handshake_properties_t hand_props{};
+    /// @brief TLS/SSL related data
+    SSL* ssl_ctx{};   ///< OpenSSL SSL context for this connection.
+    BIO* read_bio{};  ///< Memory BIO for reading.
+    BIO* write_bio{}; ///< Memory BIO for writing.
 
     /// @brief Relative time set for the last wake-up call.
     ssize_t next_wakeup = wakeup_initial_frequency_ns_k;
 
-    void make_tls(ptls_context_t* ssl_ctx) noexcept {
-        tls_ctx = ptls_new(ssl_ctx, true);
-        ptls_buffer_init(&work_buf, ptls_buf, ram_page_size_k);
+    /**
+     * @brief Initializes the SSL context for this connection.
+     * @param ctx The global SSL_CTX context.
+     */
+    void make_tls(SSL_CTX* ctx) noexcept {
+        ssl_ctx = SSL_new(ctx);
+        read_bio = BIO_new(BIO_s_mem());
+        write_bio = BIO_new(BIO_s_mem());
+        SSL_set_bio(ssl_ctx, read_bio, write_bio);
     }
 
     void record_activity() noexcept {
@@ -707,7 +731,7 @@ struct connection_t {
                max_inactive_duration_ns_k;
     }
 
-    bool is_ready() const noexcept { return tls_ctx == nullptr || ptls_handshake_is_complete(tls_ctx); }
+    bool is_ready() const noexcept { return SSL_is_init_finished(ssl_ctx); }
 
     bool must_close() const noexcept {
         auto conn = protocol.get_header("Connection");
@@ -718,58 +742,41 @@ struct connection_t {
         if (is_ready())
             return true;
 
-        ssize_t ret = 0;
-        work_buf.off = 0;
-        const char* in_buf = pipes.input_span().data();
-        size_t in_len = pipes.input_span().size();
+        int ret = SSL_do_handshake(ssl_ctx);
+        if (ret == 1)
+            return true; // Handshake was successful
+        int err = SSL_get_error(ssl_ctx, ret);
+        if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE)
+            return false; // Want more data, keep going
 
-        ret = ptls_handshake(tls_ctx, &work_buf, in_buf, &in_len, &hand_props);
-        pipes.append_outputs({(char*)work_buf.base, work_buf.off});
-        if (ret != PTLS_ERROR_IN_PROGRESS && ret != PTLS_ALERT_CLOSE_NOTIFY)
-            return false;
-
-        if (ptls_handshake_is_complete(tls_ctx)) {
-            pipes.drop_embedded_n(in_len);
-            return true;
-        }
         return false;
     }
 
     void encrypt() noexcept {
-        if (tls_ctx == nullptr || !ptls_handshake_is_complete(tls_ctx))
+        if (!is_ready())
             return;
 
-        work_buf.off = 0;
-        int res = ptls_send(tls_ctx, &work_buf, pipes.output_span().data(), pipes.output_span().size());
-        if (res != -1) {
+        char outbuf[4096];
+        int ret = SSL_write(ssl_ctx, pipes.output_span().data(), pipes.output_span().size());
+        if (ret > 0) {
             pipes.release_outputs();
-            pipes.append_outputs({(char*)work_buf.base, work_buf.off});
+            int pending = BIO_read(write_bio, outbuf, sizeof(outbuf));
+            if (pending > 0) {
+                pipes.append_outputs({outbuf, static_cast<size_t>(pending)});
+            }
         }
     }
 
     void decrypt(size_t received_amount) noexcept {
-        if (tls_ctx == nullptr || !ptls_handshake_is_complete(tls_ctx))
+        if (!is_ready())
             return;
 
-        work_buf.off = 0;
-        int res = 0;
-        size_t in_len = pipes.input_span().size();
-        void const* input = pipes.input_span().data();
-        if (received_amount != in_len) {
-            input = static_cast<char const*>(input) + (in_len - received_amount);
-            in_len = received_amount;
-        }
-        while (in_len != 0 && res != -1) {
-            size_t consumed = in_len;
-            res = ptls_receive(tls_ctx, &work_buf, input, &consumed);
-            in_len -= consumed;
-            input = static_cast<char const*>(input) + consumed;
-        }
-        if (res != -1 && work_buf.off > 0) {
-            printf("WB: %zu\n", work_buf.off);
-            pipes.drop_last_input(received_amount);
-            std::memcpy(pipes.next_input_address(), work_buf.base, work_buf.off);
-            pipes.absorb_input(work_buf.off);
+        char inbuf[4096];
+        BIO_write(read_bio, pipes.input_span().data(), received_amount);
+        int ret = SSL_read(ssl_ctx, inbuf, sizeof(inbuf));
+        while (ret > 0) {
+            pipes.absorb_input(ret);
+            ret = SSL_read(ssl_ctx, inbuf, sizeof(inbuf));
         }
     }
 
@@ -780,78 +787,62 @@ struct connection_t {
         pipes.release_inputs();
         pipes.release_outputs();
 
-        if (tls_ctx) {
-            ptls_free(tls_ctx);
-            tls_ctx = nullptr;
-            ptls_buffer_dispose(&work_buf);
+        if (ssl_ctx) {
+            SSL_free(ssl_ctx);
+            ssl_ctx = nullptr;
+            // No need to free read_bio and write_bio since SSL_free() takes care of it
         }
 
         exchanges = 0;
         empty_transmits = 0;
         next_wakeup = wakeup_initial_frequency_ns_k;
-    };
+    }
 };
 
+/**
+ * @brief   A smart-pointer to the OpenSSL context, handling the initialization,
+ *          loading keys, and certificates.
+ */
 struct ssl_context_t {
+    SSL_CTX* ctx;
 
-    constexpr ssl_context_t() noexcept : certs(), sign_certificate(), verify_certificate(), ssl() {
-        ssl.random_bytes = ptls_openssl_random_bytes;
-        ssl.get_time = &ptls_get_time;
-        ssl.key_exchanges = ptls_openssl_key_exchanges;
-        ssl.cipher_suites = ptls_openssl_cipher_suites;
-        ssl.certificates = {certs, 0};
-        ssl.sign_certificate = &sign_certificate.super;
-    };
+    ssl_context_t() noexcept {
+        OpenSSL_add_ssl_algorithms();
+        ctx = SSL_CTX_new(TLS_server_method());
+    }
 
-    ssl_context_t(ssl_context_t const& other) = delete;
-    ssl_context_t(ssl_context_t&& other) = delete;
-    ssl_context_t& operator=(ssl_context_t const&) = delete;
-    ssl_context_t& operator=(ssl_context_t&&) = delete;
+    ~ssl_context_t() {
+        SSL_CTX_free(ctx);
+        EVP_cleanup();
+    }
 
-    int init(const char* pk_path, const char** crts_path, size_t crts_cnt) noexcept {
-        FILE* fp;
-        X509* cert;
-
-        // Read Certificates
-        for (size_t i = 0; i < crts_cnt; ++i) {
-            if ((fp = fopen(crts_path[i], "r")) == nullptr)
-                return -1;
-
-            while ((cert = PEM_read_X509(fp, nullptr, nullptr, nullptr)) != nullptr) {
-                ptls_iovec_t* dst = ssl.certificates.list + ssl.certificates.count++;
-                dst->len = i2d_X509(cert, &dst->base);
-            }
-
-            fclose(fp);
+    /**
+     * @brief Initializes the SSL context with a private key and certificates.
+     * @param private_key_path Path to the private key `.pem` file.
+     * @param certificates_paths Array of paths to certificate files.
+     * @param certificates_count Count of certificate files.
+     * @return 0 on success, -1 on failure.
+     */
+    int init(char const* private_key_path, char const** certificates_paths, size_t certificates_count) noexcept {
+        if (SSL_CTX_use_PrivateKey_file(ctx, private_key_path, SSL_FILETYPE_PEM) <= 0) {
+            ERR_print_errors_fp(stderr);
+            return -1;
         }
-        if (ptls_openssl_init_verify_certificate(&verify_certificate, nullptr) != 0)
-            return -1;
 
-        if (ssl.certificates.count == 0)
-            return -1;
-        ssl.verify_certificate = &verify_certificate.super;
-
-        if ((fp = fopen(pk_path, "r")) == nullptr)
-            return -1;
-
-        EVP_PKEY* pkey = PEM_read_PrivateKey(fp, nullptr, nullptr, nullptr);
-        fclose(fp);
-
-        if (pkey == nullptr)
-            return -1;
-
-        int rv = ptls_openssl_init_sign_certificate(&sign_certificate, pkey);
-        EVP_PKEY_free(pkey);
-        if (rv)
-            return -1;
+        for (size_t i = 0; i < certificates_count; ++i) {
+            if (SSL_CTX_use_certificate_file(ctx, certificates_paths[i], SSL_FILETYPE_PEM) <= 0) {
+                ERR_print_errors_fp(stderr);
+                return -1;
+            }
+        }
 
         return 0;
     }
 
-    ptls_iovec_t certs[16];
-    ptls_openssl_sign_certificate_t sign_certificate;
-    ptls_openssl_verify_certificate_t verify_certificate;
-    ptls_context_t ssl;
+    ssl_context_t(ssl_context_t const& other) = delete;
+    ssl_context_t(ssl_context_t&& other) = delete;
+    ssl_context_t& operator=(ssl_context_t const& other) = delete;
+    ssl_context_t& operator=(ssl_context_t&& other) = delete;
 };
 
 struct completed_event_t {
@@ -878,7 +869,7 @@ struct server_t {
     descriptor_t socket{};
     network_engine_t network_engine{};
     engine_t engine{};
-    protocol_type_t protocol_type{};
+    protocol_kind_t protocol_type{};
     std::unique_ptr<ssl_context_t> ssl_ctx{};
 
     std::atomic<std::size_t> active_connections{};
@@ -952,6 +943,9 @@ bool server_t::consider_accepting_new_connection() noexcept {
     return true;
 }
 
+/**
+ *  @brief  A class that suggests transitions from one `connection.stage` to another.
+ */
 struct automata_t {
     server_t& server;
     connection_t& connection;
@@ -1053,7 +1047,7 @@ void automata_t::operator()() noexcept {
         connection.empty_transmits = 0;
         connection.record_activity();
         if (!connection.pipes.absorb_input(completed_result)) {
-            ucall_call_reply_error_out_of_memory(this);
+            ucall_reply_error_out_of_memory(this);
             return send_next();
         }
 
@@ -1087,7 +1081,7 @@ void automata_t::operator()() noexcept {
         }
         // We may fail to allocate memory to receive the next input
         else {
-            ucall_call_reply_error_out_of_memory(this);
+            ucall_reply_error_out_of_memory(this);
             return send_next();
         }
 
