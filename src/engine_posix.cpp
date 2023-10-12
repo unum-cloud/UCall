@@ -224,12 +224,13 @@ void network_engine_t::close_connection_gracefully(connection_t& connection) noe
     ctx->queue_mutex.unlock();
 }
 
-void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buf_len, size_t buf_index) noexcept {
+void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
+                                   size_t buf_index) noexcept {
     posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
     conn_ctx_t coctx{&connection};
     ssize_t res = 0;
 
-    res = send(connection.descriptor, (const char*)buffer, buf_len, MSG_NOSIGNAL);
+    res = send(connection.descriptor, (const char*)buffer, buffer_length, MSG_NOSIGNAL);
     coctx.res = (res == -1) ? -errno : res;
 
     ctx->queue_mutex.lock();
@@ -237,13 +238,14 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
     ctx->queue_mutex.unlock();
 }
 
-void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buf_len, size_t buf_index) noexcept {
+void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
+                                   size_t buf_index) noexcept {
     posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
 
     conn_ctx_t coctx{&connection};
     ssize_t res = 0;
 
-    res = recv(connection.descriptor, (char*)buffer, buf_len, MSG_NOSIGNAL);
+    res = recv(connection.descriptor, (char*)buffer, buffer_length, MSG_NOSIGNAL);
     coctx.res = (res == -1) ? -errno : res;
 
     ctx->queue_mutex.lock();

@@ -3,12 +3,12 @@
  * @author  Ash Vardanian
  */
 
-#include <arpa/inet.h> // `inet_addr`
-#include <fcntl.h>
+#include <arpa/inet.h>  // `inet_addr`
+#include <fcntl.h>      // `fcntl`
 #include <netinet/in.h> // `sockaddr_in`
-#include <sys/epoll.h>
+#include <sys/epoll.h>  // `epoll_ctl`
 #include <sys/socket.h>
-#include <sys/timerfd.h>
+#include <sys/timerfd.h> // `itimerspec`
 #include <sys/types.h>
 #include <unistd.h>
 
@@ -23,15 +23,15 @@ using namespace unum::ucall;
 struct event_data_t {
     connection_t* connection{};
     void* buffer{};
-    size_t buf_len{};
+    size_t buffer_length{};
     bool active{false};
-    descriptor_t timer_fd{invalid_descriptor_k};
+    descriptor_t timer_file{invalid_descriptor_k};
 
     void reset() noexcept {
         connection = nullptr;
-        timer_fd = invalid_descriptor_k;
+        timer_file = invalid_descriptor_k;
         buffer = nullptr;
-        buf_len = 0;
+        buffer_length = 0;
         active = false;
     }
 };
@@ -43,15 +43,15 @@ struct epoll_ctx_t {
     event_data_t& data_at(descriptor_t fd) noexcept { return event_log[fd % event_log.capacity()]; }
 };
 
-static int set_nonblock(int sockfd) {
-    return fcntl(sockfd, F_SETFD, fcntl(sockfd, F_GETFD, 0) | O_NONBLOCK) == -1 ? -1 : 0;
+static int set_nonblock(int socket_descriptor) {
+    return fcntl(socket_descriptor, F_SETFD, fcntl(socket_descriptor, F_GETFD, 0) | O_NONBLOCK) == -1 ? -1 : 0;
 }
 
-static int epoll_ctl_add(int epfd, int op, int fd, int keep_fd = -1) {
+static int epoll_ctl_add(int epoll_descriptor, int op, int fd, int keep_fd = -1) {
     struct epoll_event ev;
     ev.events = op;
     ev.data.fd = keep_fd == -1 ? fd : keep_fd;
-    int res = epoll_ctl(epfd, EPOLL_CTL_ADD, fd, &ev);
+    int res = epoll_ctl(epoll_descriptor, EPOLL_CTL_ADD, fd, &ev);
     return res;
 }
 
@@ -207,37 +207,39 @@ bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const
 
 void network_engine_t::close_connection_gracefully(connection_t& connection) noexcept {
 
-    descriptor_t timer_fd = timerfd_create(CLOCK_MONOTONIC, 0);
+    descriptor_t timer_file = timerfd_create(CLOCK_MONOTONIC, 0);
     itimerspec timer_spec;
     timer_spec.it_value.tv_sec = 0;
     timer_spec.it_value.tv_nsec = 1;
     timer_spec.it_interval.tv_sec = 0;
     timer_spec.it_interval.tv_nsec = 0;
-    timerfd_settime(timer_fd, 0, &timer_spec, NULL);
+    timerfd_settime(timer_file, 0, &timer_spec, NULL);
 
     epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
     event_data_t& data = ctx->data_at(connection.descriptor);
-    data.timer_fd = timer_fd;
-    epoll_ctl_add(ctx->epoll, EPOLLIN | EPOLLONESHOT, timer_fd, connection.descriptor);
+    data.timer_file = timer_file;
+    epoll_ctl_add(ctx->epoll, EPOLLIN | EPOLLONESHOT, timer_file, connection.descriptor);
 }
 
-void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buf_len, size_t buf_index) noexcept {
+void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
+                                   size_t buf_index) noexcept {
     epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
     event_data_t& data = ctx->data_at(connection.descriptor);
     if (!data.active)
         return;
     data.buffer = buffer;
-    data.buf_len = buf_len;
+    data.buffer_length = buffer_length;
     epoll_ctl_add(ctx->epoll, EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLONESHOT, connection.descriptor);
 }
 
-void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buf_len, size_t buf_index) noexcept {
+void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
+                                   size_t buf_index) noexcept {
     epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
     event_data_t& data = ctx->data_at(connection.descriptor);
     if (!data.active)
         return;
     data.buffer = buffer;
-    data.buf_len = buf_len;
+    data.buffer_length = buffer_length;
     epoll_ctl_add(ctx->epoll, EPOLLIN | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLONESHOT, connection.descriptor);
 }
 
@@ -267,24 +269,24 @@ template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_event
             ++completed;
             continue;
         } else if (ep_events[i].events & EPOLLIN) {
-            if (data.timer_fd != invalid_descriptor_k) { // Close
-                epoll_ctl(ctx->epoll, EPOLL_CTL_DEL, data.timer_fd, NULL);
+            if (data.timer_file != invalid_descriptor_k) { // Close
+                epoll_ctl(ctx->epoll, EPOLL_CTL_DEL, data.timer_file, NULL);
                 epoll_ctl(ctx->epoll, EPOLL_CTL_DEL, connection->descriptor, NULL);
                 events[completed].connection_ptr = connection;
                 events[completed].result = close(connection->descriptor);
-                close(data.timer_fd);
+                close(data.timer_file);
                 ++completed;
                 data.reset();
                 continue;
             } else { // Recv
                 events[completed].connection_ptr = connection;
-                events[completed].result = recv(connection->descriptor, data.buffer, data.buf_len, MSG_NOSIGNAL);
+                events[completed].result = recv(connection->descriptor, data.buffer, data.buffer_length, MSG_NOSIGNAL);
                 ++completed;
                 epoll_ctl(ctx->epoll, EPOLL_CTL_DEL, connection->descriptor, NULL);
             }
         } else if (ep_events[i].events & EPOLLOUT) { // Send
             events[completed].connection_ptr = connection;
-            events[completed].result = send(connection->descriptor, data.buffer, data.buf_len, MSG_NOSIGNAL);
+            events[completed].result = send(connection->descriptor, data.buffer, data.buffer_length, MSG_NOSIGNAL);
             ++completed;
             epoll_ctl(ctx->epoll, EPOLL_CTL_DEL, connection->descriptor, NULL);
         }

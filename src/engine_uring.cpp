@@ -293,7 +293,8 @@ void network_engine_t::close_connection_gracefully(connection_t& connection) noe
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buf_len, size_t buf_index) noexcept {
+void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
+                                   size_t buf_index) noexcept {
     uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
     io_uring* uring = &ctx->uring;
     ctx->submission_mutex.lock();
@@ -301,9 +302,9 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
 
     // TODO: Test and benchmark the `send_zc option`.
     // if (io_check_send_zc()) {
-    //     io_uring_prep_send_zc_fixed(uring_sqe, int(connection.descriptor), buffer, buf_len, 0, 0, buf_index);
+    //     io_uring_prep_send_zc_fixed(uring_sqe, int(connection.descriptor), buffer, buffer_length, 0, 0, buf_index);
     // } else {
-    io_uring_prep_send(uring_sqe, int(connection.descriptor), buffer, buf_len, 0);
+    io_uring_prep_send(uring_sqe, int(connection.descriptor), buffer, buffer_length, 0);
     uring_sqe->flags |= IOSQE_FIXED_FILE;
     uring_sqe->buf_index = buf_index;
     // }
@@ -313,7 +314,8 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buf_len, size_t buf_index) noexcept {
+void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
+                                   size_t buf_index) noexcept {
     uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
     ctx->submission_mutex.lock();
     io_uring* uring = &ctx->uring;
@@ -327,7 +329,7 @@ void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_
     //
     // In this case we are waiting for an actual data, not some artificial wakeup.
     io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
-    io_uring_prep_read_fixed(uring_sqe, int(connection.descriptor), buffer, buf_len, 0, buf_index);
+    io_uring_prep_read_fixed(uring_sqe, int(connection.descriptor), buffer, buffer_length, 0, buf_index);
     io_uring_sqe_set_data(uring_sqe, &connection);
     io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_LINK);
 
