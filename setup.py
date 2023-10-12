@@ -18,9 +18,10 @@ with open(os.path.join(this_directory, "README.md")) as f:
 
 
 class CMakeExtension(Extension):
-    def __init__(self, name, target_name, source_dir=""):
-        Extension.__init__(self, name, sources=[])
+    def __init__(self, target_name, *cmake_args, source_dir="."):
+        Extension.__init__(self, "ucall." + target_name, sources=[])
         self.target_name = target_name
+        self.cmake_args = list(cmake_args)
         self.source_dir = os.path.abspath(source_dir)
 
 
@@ -33,11 +34,13 @@ class CMakeBuild(build_ext):
         if not extension_dir.endswith(os.path.sep):
             extension_dir += os.path.sep
 
-        cmake_args = [
-            # f"-DPYTHON_TARGET_NAME={ext.target_name}",
-            f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}",
-            f"-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={extension_dir}",
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
+        cmake_args = ext.cmake_args
+        cmake_args += [
+            f"CMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}",
+            f"CMAKE_ARCHIVE_OUTPUT_DIRECTORY={extension_dir}",
+            f"PYTHON_EXECUTABLE={sys.executable}",
+            "UCALL_BUILD_AUTO=0",
+            "UCALL_BUILD_PYTHON=1",
         ]
 
         # Adding CMake arguments set as environment variable
@@ -49,7 +52,7 @@ class CMakeBuild(build_ext):
             # Cross-compile support for macOS - respect ARCHFLAGS if set
             archs = re.findall(r"-arch (\S+)", os.environ.get("ARCHFLAGS", ""))
             if archs:
-                cmake_args += ["-DCMAKE_OSX_ARCHITECTURES={}".format(";".join(archs))]
+                cmake_args += ["CMAKE_OSX_ARCHITECTURES={}".format(";".join(archs))]
 
         # Set CMAKE_BUILD_PARALLEL_LEVEL to control the parallel build level
         # across all generators.
@@ -63,11 +66,9 @@ class CMakeBuild(build_ext):
             if hasattr(self, "parallel") and self.parallel:
                 build_args += [f"-j{self.parallel}"]
 
+        cmake_args = ["-D" + arg for arg in cmake_args]
         subprocess.check_call(["cmake", ext.source_dir] + cmake_args)
-        subprocess.check_call(
-            ["cmake", "--build", ".", "--target", "py_" + ext.name.replace(".", "_")]
-            + build_args
-        )
+        subprocess.check_call(["cmake", "--build", "."] + build_args)
 
     def run(self):
         build_ext.run(self)
@@ -77,17 +78,37 @@ extensions = []
 
 if platform.system() == "Linux":
     extensions += [
-        CMakeExtension("py_ucall_uring", "ucall/uring"),
-        CMakeExtension("py_ucall_epoll", "ucall/epoll"),
-        CMakeExtension("py_ucall_posix", "ucall/posix"),
+        CMakeExtension(
+            "uring",
+            "UCALL_TARGET_NAME_PY_POSIX=uring",
+            "UCALL_BUILD_POSIX=1",
+        ),
+        CMakeExtension(
+            "epoll",
+            "UCALL_TARGET_NAME_PY_EPOLL=epoll",
+            "UCALL_BUILD_EPOLL=1",
+        ),
+        CMakeExtension(
+            "posix",
+            "UCALL_TARGET_NAME_PY_URING=posix",
+            "UCALL_BUILD_URING=1",
+        ),
     ]
 elif platform.system() == "Darwin":
     extensions += [
-        CMakeExtension("py_ucall_posix", "ucall/posix"),
+        CMakeExtension(
+            "posix",
+            "CALL_TARGET_NAME_PY_POSIX=posix",
+            "UCALL_BUILD_POSIX=1",
+        ),
     ]
 elif platform.system() == "Windows":
     extensions += [
-        CMakeExtension("py_ucall_posix", "ucall/posix"),
+        CMakeExtension(
+            "posix",
+            "CALL_TARGET_NAME_PY_POSIX=posix",
+            "UCALL_BUILD_POSIX=1",
+        ),
     ]
 
 

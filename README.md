@@ -1,7 +1,7 @@
 <h1 align="center">UCall</h1>
 <h3 align="center">
-Remote Procedure Calls Library<br/>
-Up to 100x Faster than FastAPI and gRPC<br/>
+Remote Procedure Calls for your Backend<br/>
+Up to 70x ⬆️ Throughput and 50x ⬆️ Latency than FastAPI and gRPC<br/>
 </h3>
 <br/>
 
@@ -25,6 +25,8 @@ RESTful API • JSON-RPC / HTTPS • HTTP • TCP
 <a href="https://unum-cloud.github.io/ucall/javascript">JavaScript</a> 🔜
 <br/>
 Linux • MacOS • Windows • WebAssembly
+<br/>
+<code>posix</code> • <code>epoll</code> • <code>io_uring</code>
 </p>
 
 ---

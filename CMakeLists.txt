@@ -9,28 +9,41 @@ set (CMAKE_C_STANDARD 99)
 set (CMAKE_C_STANDARD_REQUIRED YES)
 set (CMAKE_C_EXTENSIONS NO)
 
-set (UCALL_BACKEND_SUPPORTED_POSIX ON)
+set (UCALL_BACKEND_SUPPORTED_POSIX OFF)
 set (UCALL_BACKEND_SUPPORTED_EPOLL OFF)
 set (UCALL_BACKEND_SUPPORTED_URING OFF)
 
-if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
-  set (UCALL_BACKEND_SUPPORTED_EPOLL ON)
-  execute_process (
-    COMMAND uname -r
-    OUTPUT_VARIABLE KERNEL_VERSION
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  if (${KERNEL_VERSION} VERSION_GREATER_EQUAL "5.19")
-    set (UCALL_BACKEND_SUPPORTED_URING ON)
+set (UCALL_TARGET_NAME_PY_POSIX "py_ucall_posix")
+set (UCALL_TARGET_NAME_PY_EPOLL "py_ucall_epoll")
+set (UCALL_TARGET_NAME_PY_URING "py_ucall_uring")
+
+set (UCALL_TARGET_NAME_CPP_POSIX "ucall_server_posix")
+set (UCALL_TARGET_NAME_CPP_EPOLL "ucall_server_epoll")
+set (UCALL_TARGET_NAME_CPP_URING "ucall_server_uring")
+
+# If the user enables `UCALL_BUILD_AUTO=1`, we will auto-detect supported backends. That's the default behaviour.
+option (UCALL_BUILD_AUTO "Builds the POSIX server backend" ON)
+if (UCALL_BUILD_AUTO)
+  set (UCALL_BACKEND_SUPPORTED_POSIX ON)
+  if (${CMAKE_SYSTEM_NAME} STREQUAL "Linux")
+    set (UCALL_BACKEND_SUPPORTED_EPOLL ON)
+    execute_process (
+      COMMAND uname -r
+      OUTPUT_VARIABLE KERNEL_VERSION
+      OUTPUT_STRIP_TRAILING_WHITESPACE
+    )
+    if (${KERNEL_VERSION} VERSION_GREATER_EQUAL "5.19")
+      set (UCALL_BACKEND_SUPPORTED_URING ON)
+    endif ()
   endif ()
 endif ()
 
-option (UCALL_BACKEND_POSIX "Builds the POSIX server backend" ${UCALL_BACKEND_SUPPORTED_POSIX})
-option (UCALL_BACKEND_EPOLL "Builds the EPOLL server backend" ${UCALL_BACKEND_SUPPORTED_EPOLL})
-option (UCALL_BACKEND_URING "Builds the I/O URING server backend" ${UCALL_BACKEND_SUPPORTED_URING})
+option (UCALL_BUILD_POSIX "Builds the POSIX server backend" ${UCALL_BACKEND_SUPPORTED_POSIX})
+option (UCALL_BUILD_EPOLL "Builds the EPOLL server backend" ${UCALL_BACKEND_SUPPORTED_EPOLL})
+option (UCALL_BUILD_URING "Builds the I/O URING server backend" ${UCALL_BACKEND_SUPPORTED_URING})
 
-option (UCALL_BUILD_BENCHMARKS "Builds simple server targets for benchmarking purposes" OFF)
-option (UCALL_BUILD_EXAMPLES "Builds examples for Redis-like server and PyTorch deployment" OFF)
+option (UCALL_BUILD_PYTHON "Builds Python bindings for UCall server targets" OFF)
+option (UCALL_BUILD_EXAMPLES "Builds examples, that can be used for benchmarking and tutorials" OFF)
 
 # Make Release by default
 if (NOT CMAKE_BUILD_TYPE)
@@ -92,17 +105,6 @@ if (CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set (CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -std=c++17")
 endif ()
 
-# Pull the version of Linux kernel, to check if io_uring is available
-if (LINUX)
-  execute_process (
-    COMMAND uname -r
-    OUTPUT_VARIABLE UNAME_RESULT
-    OUTPUT_STRIP_TRAILING_WHITESPACE
-  )
-  message (-- " Linux Kernel version: " ${UNAME_RESULT})
-  string (REGEX MATCH "[0-9]+.[0-9]+" LINUX_KERNEL_VERSION ${UNAME_RESULT})
-endif ()
-
 include_directories (include/ src/headers)
 
 include (FetchContent)
@@ -116,24 +118,6 @@ FetchContent_Declare (
 )
 FetchContent_MakeAvailable (simdjson)
 include_directories (${simdjson_SOURCE_DIR}/include)
-
-if (${UCALL_BUILD_BENCHMARKS})
-  set (BENCHMARK_ENABLE_TESTING OFF)
-  set (BENCHMARK_ENABLE_INSTALL OFF)
-  set (BENCHMARK_ENABLE_DOXYGEN OFF)
-  set (BENCHMARK_INSTALL_DOCS OFF)
-  set (BENCHMARK_DOWNLOAD_DEPENDENCIES ON)
-  set (BENCHMARK_ENABLE_GTEST_TESTS OFF)
-  set (BENCHMARK_USE_BUNDLED_GTEST ON)
-  FetchContent_Declare (
-    benchmark
-    GIT_REPOSITORY https://github.com/google/benchmark
-    GIT_TAG v1.7.0
-    GIT_SHALLOW 1
-  )
-  FetchContent_MakeAvailable (benchmark)
-  include_directories (${benchmark_SOURCE_DIR}/include)
-endif ()
 
 # CLI
 FetchContent_Declare (
@@ -208,7 +192,6 @@ if (MSVC)
   set_property (TARGET picotls-openssl PROPERTY IMPORTED_LOCATION ${PICOTLSVS_DIR}/x64/Release/picotls-openssl.lib)
 
   include_directories (${PICOTLS_DIR}/include/ ${PICOTLSVS_DIR}/picotls)
-  set (URING_LIBS uring_internal)
 else ()
   FetchContent_Declare (
     picotls
@@ -223,11 +206,8 @@ else ()
   include_directories (${picotls_SOURCE_DIR}/include)
 endif ()
 
-# `crypto` comes from LibreSSL if it is built, otherwise from system libssl
-set (tls_LIBS picotls-core picotls-openssl crypto)
-
 # LibUring
-if (LINUX)
+if (UCALL_BUILD_URING)
   set (URING_DIR ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
   ExternalProject_Add (
     liburing-ep
@@ -252,62 +232,100 @@ endif ()
 
 find_package (Threads REQUIRED)
 
-add_library (ucall_server_posix src/engine_posix.cpp)
-target_link_libraries (ucall_server_posix simdjson::simdjson Threads::Threads ${tls_LIBS})
-set (CPP_BACKENDS ucall_server_posix)
+# `crypto` comes from LibreSSL if it is built, otherwise from system libssl
+set (UCALL_DEPS_TLS picotls-core picotls-openssl crypto)
+set (UCALL_DEPS_PARSING simdjson::simdjson Threads::Threads)
+set (UCALL_DEPS_PYTHON base64)
 
-if (LINUX)
-  add_library (ucall_server_epoll src/engine_epoll.cpp)
-  target_link_libraries (ucall_server_epoll simdjson::simdjson Threads::Threads ${tls_LIBS})
-
-  add_library (ucall_server_uring src/engine_uring.cpp)
-  target_link_libraries (ucall_server_uring simdjson::simdjson Threads::Threads ${URING_LIBS} ${tls_LIBS})
-
-  set (CPP_BACKENDS ${CPP_BACKENDS} ucall_server_epoll ucall_server_uring)
+#[[
+  Build all requested server backends:
+  1. UCALL_TARGET_NAME_CPP_POSIX, which defaults to "ucall_server_posix"
+  2. UCALL_TARGET_NAME_CPP_EPOLL, which defaults to "ucall_server_epoll"
+  3. UCALL_TARGET_NAME_CPP_URING, which defaults to "ucall_server_uring"
+]]
+if (UCALL_BUILD_POSIX)
+  add_library (${UCALL_TARGET_NAME_CPP_POSIX} src/engine_posix.cpp)
+  target_link_libraries (${UCALL_TARGET_NAME_CPP_POSIX} ${UCALL_DEPS_PARSING} ${UCALL_DEPS_TLS})
+  set (UCALL_BUILD_SERVER_TARGETS ${UCALL_BUILD_SERVER_TARGETS} ${UCALL_TARGET_NAME_CPP_POSIX})
 endif ()
 
-foreach (backend IN LISTS CPP_BACKENDS)
-  string (FIND "${backend}" "_" last_underscore REVERSE)
-  math (EXPR substring_length "${last_underscore} + 1")
-  string (SUBSTRING "${backend}" ${substring_length} -1 backend_name)
+if (UCALL_BUILD_EPOLL)
+  add_library (${UCALL_TARGET_NAME_CPP_EPOLL} src/engine_epoll.cpp)
+  target_link_libraries (${UCALL_TARGET_NAME_CPP_EPOLL} ${UCALL_DEPS_PARSING} ${UCALL_DEPS_TLS})
+  set (UCALL_BUILD_SERVER_TARGETS ${UCALL_BUILD_SERVER_TARGETS} ${UCALL_TARGET_NAME_CPP_EPOLL})
+endif ()
 
-  set (jsonrpc_example_name "ucall_example_login_${backend_name}")
-  set (rest_example_name "ucall_example_rest_${backend_name}")
+if (UCALL_BUILD_URING)
+  add_library (${UCALL_TARGET_NAME_CPP_URING} src/engine_uring.cpp)
+  target_link_libraries (${UCALL_TARGET_NAME_CPP_URING} ${UCALL_DEPS_PARSING} ${URING_LIBS} ${UCALL_DEPS_TLS})
+  set (UCALL_BUILD_SERVER_TARGETS ${UCALL_BUILD_SERVER_TARGETS} ${UCALL_TARGET_NAME_CPP_EPOLL})
+endif ()
 
-  add_executable (${jsonrpc_example_name} examples/login/ucall_server.cpp)
-  target_link_libraries (${jsonrpc_example_name} ${backend} cxxopts)
-  target_compile_options (${jsonrpc_example_name} PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+#[[
+  Build Python binfings to every requested backend:
+  1. UCALL_TARGET_NAME_PY_POSIX, which defaults to "py_ucall_posix"
+  2. UCALL_TARGET_NAME_PY_EPOLL, which defaults to "py_ucall_epoll"
+  3. UCALL_TARGET_NAME_PY_URING, which defaults to "py_ucall_uring"
+]]
+if (UCALL_BUILD_PYTHON)
+  find_package (Python3 REQUIRED Development.Module)
+  include_directories (${Python_INCLUDE_DIRS})
 
-  add_executable (${rest_example_name} examples/login/ucall_server_rest.cpp)
-  target_link_libraries (${rest_example_name} ${backend} cxxopts)
-  target_compile_options (${rest_example_name} PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
-endforeach ()
+  if (UCALL_BUILD_POSIX)
+    add_library (${UCALL_TARGET_NAME_PY_POSIX} SHARED src/python.c)
+    target_include_directories (${UCALL_TARGET_NAME_PY_POSIX} PUBLIC src/ include/)
+    target_compile_definitions (${UCALL_TARGET_NAME_PY_POSIX} PRIVATE UCALL_PYTHON_MODULE_NAME=posix)
+    target_link_libraries (${UCALL_TARGET_NAME_PY_POSIX} ${UCALL_TARGET_NAME_CPP_POSIX} ${UCALL_DEPS_PYTHON})
+    set_target_properties (${UCALL_TARGET_NAME_PY_POSIX} PROPERTIES PREFIX "")
+    set_target_properties (${UCALL_TARGET_NAME_PY_POSIX} PROPERTIES OUTPUT_NAME ${UCALL_TARGET_NAME_PY_POSIX})
+
+  endif ()
+
+  if (UCALL_BUILD_EPOLL)
+    add_library (${UCALL_TARGET_NAME_PY_EPOLL} SHARED src/python.c)
+    target_include_directories (${UCALL_TARGET_NAME_PY_EPOLL} PUBLIC src/ include/)
+    target_compile_definitions (${UCALL_TARGET_NAME_PY_POSIX} PRIVATE UCALL_PYTHON_MODULE_NAME=epoll)
+    target_link_libraries (${UCALL_TARGET_NAME_PY_EPOLL} ${UCALL_TARGET_NAME_CPP_EPOLL} ${UCALL_DEPS_PYTHON})
+    set_target_properties (${UCALL_TARGET_NAME_PY_EPOLL} PROPERTIES PREFIX "")
+    set_target_properties (${UCALL_TARGET_NAME_PY_EPOLL} PROPERTIES OUTPUT_NAME ${UCALL_TARGET_NAME_PY_EPOLL})
+  endif ()
+
+  if (UCALL_BUILD_URING)
+    add_library (${UCALL_TARGET_NAME_PY_URING} SHARED src/python.c)
+    target_include_directories (${UCALL_TARGET_NAME_PY_URING} PUBLIC src/ include/)
+    target_compile_definitions (${UCALL_TARGET_NAME_PY_POSIX} PRIVATE UCALL_PYTHON_MODULE_NAME=uring)
+    target_link_libraries (${UCALL_TARGET_NAME_PY_URING} ${UCALL_TARGET_NAME_CPP_URING} ${UCALL_DEPS_PYTHON})
+    set_target_properties (${UCALL_TARGET_NAME_PY_URING} PROPERTIES PREFIX "")
+    set_target_properties (${UCALL_TARGET_NAME_PY_URING} PROPERTIES OUTPUT_NAME ${UCALL_TARGET_NAME_PY_URING})
+  endif ()
+endif ()
 
 if (UCALL_BUILD_EXAMPLES)
-  add_executable (ucall_example_redis examples/redis/ucall_server.cpp)
-  target_link_libraries (ucall_example_redis ucall_server_posix)
 
-  find_package (Torch)
-  add_executable (ucall_example_pytorch examples/pytorch/ucall_server.cpp)
-  target_link_libraries (ucall_example_pytorch ucall_server_posix "${TORCH_LIBRARIES}")
+  foreach (backend IN LISTS UCALL_BUILD_SERVER_TARGETS)
+    string (FIND "${backend}" "_" last_underscore REVERSE)
+    math (EXPR substring_length "${last_underscore} + 1")
+    string (SUBSTRING "${backend}" ${substring_length} -1 backend_name)
+
+    set (jsonrpc_example_name "ucall_example_login_${backend_name}")
+    set (rest_example_name "ucall_example_rest_${backend_name}")
+    set (redis_example_name "ucall_example_redis_${backend_name}")
+
+    add_executable (${jsonrpc_example_name} examples/login/ucall_server.cpp)
+    target_link_libraries (${jsonrpc_example_name} ${backend} cxxopts)
+    target_compile_options (${jsonrpc_example_name} PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+
+    add_executable (${rest_example_name} examples/login/ucall_server_rest.cpp)
+    target_link_libraries (${rest_example_name} ${backend} cxxopts)
+    target_compile_options (${rest_example_name} PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+
+    add_executable (${redis_example_name} examples/redis/ucall_server.cpp)
+    target_link_libraries (${redis_example_name} ${backend} cxxopts)
+    target_compile_options (${redis_example_name} PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+
+  endforeach ()
+
 endif ()
-
-# Python bindings
-find_package (Python3 REQUIRED Development.Module)
-include_directories (${Python_INCLUDE_DIRS})
-
-foreach (backend IN LISTS CPP_BACKENDS)
-  string (FIND "${backend}" "_" last_underscore REVERSE)
-  math (EXPR substring_length "${last_underscore} + 1")
-  string (SUBSTRING "${backend}" ${substring_length} -1 backend_name)
-
-  set (py_lib_name "py_ucall_${backend_name}")
-  python3_add_library (${py_lib_name} src/python.c)
-  target_include_directories (${py_lib_name} PUBLIC src/ include/)
-  target_link_libraries (${py_lib_name} PRIVATE ${backend} base64)
-  set_target_properties (${py_lib_name} PROPERTIES OUTPUT_NAME ${py_lib_name})
-  target_compile_definitions (${py_lib_name} PRIVATE UCALL_PYTHON_MODULE_NAME=${backend_name})
-endforeach ()
 
 get_directory_property (_targets DIRECTORY ${CMAKE_SOURCE_DIR} BUILDSYSTEM_TARGETS)
 foreach (_target IN LISTS _targets)
