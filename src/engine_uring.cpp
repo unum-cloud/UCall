@@ -36,10 +36,12 @@
  *  - `IORING_SETUP_COOP_TASKRUN` > 5.19.
  *  - `IORING_SETUP_SINGLE_ISSUER` > 6.0.
  *
- *  @see Notable links:
- *  https://man7.org/linux/man-pages/dir_by_project.html#liburing
- *  https://jvns.ca/blog/2017/06/03/async-io-on-linux--select--poll--and-epoll/
- *  https://stackoverflow.com/a/17665015/2766161
+ * @author Ash Vardanian
+ *
+ * @see Notable links:
+ * https://man7.org/linux/man-pages/dir_by_project.html#liburing
+ * https://jvns.ca/blog/2017/06/03/async-io-on-linux--select--poll--and-epoll/
+ * https://stackoverflow.com/a/17665015/2766161
  */
 #include <arpa/inet.h>  // `inet_addr`
 #include <netinet/in.h> // `sockaddr_in`
@@ -98,7 +100,7 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     int uring_result{-1};
     uring_server_t* uctx = new uring_server_t();
     struct io_uring* uring = &uctx->uring;
-    struct io_uring_params uring_params {};
+    struct io_uring_params uring_params{};
     struct io_uring_sqe* uring_sqe{};
     struct io_uring_cqe* uring_cqe{};
     uring_params.features |= IORING_FEAT_FAST_POLL;
@@ -114,7 +116,7 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     std::unique_ptr<ssl_context_t> ssl_context{};
 
     // By default, let's open TCP port for IPv4.
-    struct sockaddr_in address {};
+    struct sockaddr_in address{};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = inet_addr(config.hostname);
     address.sin_port = htons(config.port);
@@ -223,9 +225,211 @@ void ucall_free(ucall_server_t punned_server) {
     delete ctx;
 }
 
-bool io_check_send_zc() noexcept {
-    io_uring_probe* probe = io_uring_get_probe();
-    if (!probe)
+void ucall_take_calls(ucall_server_t server, uint16_t thread_idx) {
+    engine_t& engine = *reinterpret_cast<engine_t*>(server);
+    if (!thread_idx && engine.logs_file_descriptor > 0)
+        engine.submit_stats_heartbeat();
+    while (true) {
+        ucall_take_call(server, thread_idx);
+    }
+}
+
+void ucall_take_call(ucall_server_t server, uint16_t thread_idx) {
+    // Unlike the classical synchronous interface, this implements only a part of the connection machine,
+    // is responsible for checking if a specific request has been completed. All of the submitted
+    // memory must be preserved until we get the confirmation.
+    engine_t& engine = *reinterpret_cast<engine_t*>(server);
+    if (!thread_idx)
+        engine.consider_accepting_new_connection();
+
+    constexpr std::size_t completed_max_k{16};
+    completed_event_t completed_events[completed_max_k]{};
+    std::size_t completed_count = engine.pop_completed<completed_max_k>(completed_events);
+
+    for (std::size_t i = 0; i != completed_count; ++i) {
+        completed_event_t& completed = completed_events[i];
+        automata_t automata{
+            engine, //
+            engine.spaces[thread_idx],
+            *completed.connection_ptr,
+            completed.stage,
+            completed.result,
+        };
+
+        // If everything is fine, let automata work in its normal regime.
+        automata();
+    }
+}
+
+void ucall_call_reply_content(ucall_call_t call, ucall_str_t body, size_t body_len) {
+    automata_t& automata = *reinterpret_cast<automata_t*>(call);
+    connection_t& connection = automata.connection;
+    scratch_space_t& scratch = automata.scratch;
+    // No response is needed for "id"-less notifications.
+    if (scratch.dynamic_id.empty())
+        return;
+
+    body_len = string_length(body, body_len);
+    struct iovec iovecs[iovecs_for_content_k]{};
+    fill_with_content(iovecs, scratch.dynamic_id, std::string_view(body, body_len), true);
+    connection.pipes.append_outputs<iovecs_for_content_k>(iovecs);
+}
+
+void ucall_call_reply_error(ucall_call_t call, int code_int, ucall_str_t note, size_t note_len) {
+    automata_t& automata = *reinterpret_cast<automata_t*>(call);
+    connection_t& connection = automata.connection;
+    scratch_space_t& scratch = automata.scratch;
+    // No response is needed for "id"-less notifications.
+    if (scratch.dynamic_id.empty())
+        return;
+
+    note_len = string_length(note, note_len);
+    char code[max_integer_length_k]{};
+    std::to_chars_result res = std::to_chars(code, code + max_integer_length_k, code_int);
+    auto code_len = res.ptr - code;
+    if (res.ec != std::error_code())
+        return ucall_call_reply_error_unknown(call);
+
+    struct iovec iovecs[iovecs_for_error_k]{};
+    fill_with_error(iovecs, scratch.dynamic_id, std::string_view(code, code_len), std::string_view(note, note_len),
+                    true);
+    if (!connection.pipes.append_outputs<iovecs_for_error_k>(iovecs))
+        return ucall_call_reply_error_out_of_memory(call);
+}
+
+void ucall_call_reply_error_invalid_params(ucall_call_t call) {
+    return ucall_call_reply_error(call, -32602, "Invalid method param(s).", 24);
+}
+
+void ucall_call_reply_error_unknown(ucall_call_t call) {
+    return ucall_call_reply_error(call, -32603, "Unknown error.", 14);
+}
+
+void ucall_call_reply_error_out_of_memory(ucall_call_t call) {
+    return ucall_call_reply_error(call, -32000, "Out of memory.", 14);
+}
+
+bool ucall_param_named_bool(ucall_call_t call, ucall_str_t name, size_t name_len, bool* result_ptr) {
+    if (auto value = param_at(call, name, name_len); value.is_bool()) {
+        *result_ptr = value.get_bool().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_named_i64(ucall_call_t call, ucall_str_t name, size_t name_len, int64_t* result_ptr) {
+    if (auto value = param_at(call, name, name_len); value.is_int64()) {
+        *result_ptr = value.get_int64().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_named_f64(ucall_call_t call, ucall_str_t name, size_t name_len, double* result_ptr) {
+    if (auto value = param_at(call, name, name_len); value.is_double()) {
+        *result_ptr = value.get_double().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_named_str(ucall_call_t call, ucall_str_t name, size_t name_len, ucall_str_t* result_ptr,
+                           size_t* result_len_ptr) {
+    if (auto value = param_at(call, name, name_len); value.is_string()) {
+        *result_ptr = value.get_string().value_unsafe().data();
+        *result_len_ptr = value.get_string_length().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_positional_bool(ucall_call_t call, size_t position, bool* result_ptr) {
+    if (auto value = param_at(call, position); value.is_bool()) {
+        *result_ptr = value.get_bool().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_positional_i64(ucall_call_t call, size_t position, int64_t* result_ptr) {
+    if (auto value = param_at(call, position); value.is_int64()) {
+        *result_ptr = value.get_int64().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_positional_f64(ucall_call_t call, size_t position, double* result_ptr) {
+    if (auto value = param_at(call, position); value.is_double()) {
+        *result_ptr = value.get_double().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+bool ucall_param_positional_str(ucall_call_t call, size_t position, ucall_str_t* result_ptr, size_t* result_len_ptr) {
+    if (auto value = param_at(call, position); value.is_string()) {
+        *result_ptr = value.get_string().value_unsafe().data();
+        *result_len_ptr = value.get_string_length().value_unsafe();
+        return true;
+    } else
+        return false;
+}
+
+#pragma endregion C Definitions
+#pragma region Cpp Declarations
+
+bool connection_t::expired() const noexcept {
+    if (sleep_ns > max_inactive_duration_ns_k)
+        return true;
+
+    return false;
+}
+
+void connection_t::reset() noexcept {
+
+    stage = stage_t::unknown_k;
+    client_address = {};
+
+    pipes.release_inputs();
+    pipes.release_outputs();
+
+    keep_alive.reset();
+    content_length.reset();
+    content_type.reset();
+
+    sleep_ns = 0;
+    empty_transmits = 0;
+    exchanges = 0;
+    next_wakeup.tv_nsec = wakeup_initial_frequency_ns_k;
+}
+
+bool automata_t::should_release() const noexcept {
+    return connection.expired() || engine.dismissed_connections || connection.empty_transmits > 100;
+}
+
+bool automata_t::received_full_request() const noexcept {
+
+    auto span = connection.pipes.input_span();
+    // if (!connection.content_length) {
+    size_t bytes_expected = 0;
+
+    auto json_or_error = split_body_headers(std::string_view(span.data(), span.size()));
+    if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr)
+        return true;
+    parsed_request_t request = std::get<parsed_request_t>(json_or_error);
+
+    auto res = std::from_chars(request.content_length.begin(), request.content_length.end(), bytes_expected);
+    bytes_expected += (request.body.begin() - span.data());
+
+    if (res.ec == std::errc::invalid_argument || bytes_expected <= 0)
+        // TODO: Maybe not a HTTP request, What to do?
+        return true;
+
+    connection.content_length = bytes_expected;
+    // }
+
+    if (span.size() < *connection.content_length)
         return false;
 
     // Available since 6.0.

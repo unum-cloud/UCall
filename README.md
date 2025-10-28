@@ -6,28 +6,15 @@ Up to 70x ⬆️ Throughput and 50x ⬆️ Latency than FastAPI and gRPC<br/>
 <br/>
 
 <p align="center">
-<a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/ustore/raw/main/assets/icons/discord.svg" alt="Discord"></a>
+<a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/ustore/raw/main/assets/icons/linkedin.svg" alt="LinkedIn"></a>
+<a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/ustore/raw/main/assets/icons/twitter.svg" alt="Twitter"></a>
+<a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/ustore/raw/main/assets/icons/blog.svg" alt="Blog"></a>
+<a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
 &nbsp;&nbsp;&nbsp;
-<a href="https://github.com/unum-cloud/ucall"><img height="25" src="https://github.com/unum-cloud/ustore/raw/main/assets/icons/github.svg" alt="GitHub"></a>
-</p>
-
-<p align="center">
-RESTful API • JSON-RPC • HTTP • TCP
-<br/>
-<a href="https://unum-cloud.github.io/ucall/c">C 99</a> •
-<a href="https://unum-cloud.github.io/ucall/python">Python 3</a> •
-<a href="https://unum-cloud.github.io/ucall/rust">Rust</a> •
-<a href="https://unum-cloud.github.io/ucall/javascript">JavaScript</a> 🔜
-<br/>
-Linux • MacOS • Windows • iOS • Android
-<br/>
-<code>posix</code> • <code>epoll</code> • <code>io_uring</code>
+<a href="https://github.com/unum-cloud/usearch"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
 </p>
 
 ---
@@ -86,7 +73,7 @@ uvicorn.run(...)
 <td>
 
 ```python
-from ucall.server import Server
+from ucall import Server
 
 server = Server()
 
@@ -104,7 +91,7 @@ server.run()
 ## 📈 Performance Metrics
 
 It takes over a millisecond to handle a trivial FastAPI call on a recent 8-core CPU.
-In that time, light could have traveled 300 km through optics to the neighboring city or country, in my case.
+In that time, light could have traveled 300 km through optics to the neighboring city or country.
 How does UCall compare to FastAPI and gRPC?
 
 | Setup                   |   🔁   | Server |     Protocol     | Latency w 1 client | Throughput w 32 clients |
@@ -141,17 +128,8 @@ These specific numbers were obtained on `c7g.metal` beefy instances with Gravito
 How can a tiny pet-project with just a couple thousand lines of code compete with two of the most established networking libraries?
 __UCall stands on the shoulders of Giants__:
 
-- `io_uring` for interrupt-less IO.
-  - `io_uring_prep_read_fixed` on 5.1+.
-  - `io_uring_prep_accept_direct` on 5.19+.
-  - `io_uring_register_files_sparse` on 5.19+.
-  - `IORING_SETUP_COOP_TASKRUN` optional on 5.19+.
-  - `IORING_SETUP_SINGLE_ISSUER` optional on 6.0+.
-
-- SIMD-accelerated parsers with manual memory control.
-  - [`simdjson`][simdjson] to parse JSON faster than gRPC can unpack `ProtoBuf`.
-  - [`Turbo-Base64`][base64] to decode binary values from a `Base64` form.
-  - [`picohttpparser`][picohttpparser] to navigate HTTP headers.
+- UCall uses `io_uring` for interrupt-less IO. It mainly relies on `io_uring_prep_read_fixed` (5.1+), `io_uring_prep_accept_direct` (5.19+), `io_uring_register_files_sparse` (5.19+), `IORING_SETUP_COOP_TASKRUN` optional (5.19+), `IORING_SETUP_SINGLE_ISSUER` optional (6.0+).
+- SIMD-accelerated parsers with manual memory control. [`simdjson`][simdjson] to parse JSON faster than gRPC can unpack `ProtoBuf`. [`simdutf`][base64] to decode binary values from a `Base64` form. [`stringzilla`][stringzilla] to navigate HTTP headers. [`ada`][ada] to parse URI endpoints.
 
 You have already seen the latency of the round trip..., the throughput in requests per second..., want to see the bandwidth?
 Try yourself!
@@ -168,7 +146,7 @@ FastAPI supports native types, while UCall also supports `numpy.ndarray`, `PIL.I
 This comes handy when you build real applications or want to deploy Multi-Modal AI, like we do with [UForm](https://github.com/unum-cloud/uform).
 
 ```python
-from ucall.server import Server
+from ucall import Server
 import ufrom
 
 server = Server()
@@ -188,7 +166,7 @@ def vectorize(description: str, photo: PIL.Image.Image) -> numpy.ndarray:
 UCall offers a Python `Client` class and a CLI tool for easy interaction with UCall servers.
 
 ```python
-from ucall.client import Client
+from ucall import Client
 
 client = Client()
 # Explicit JSON-RPC call:
@@ -269,7 +247,7 @@ This library is so fast, that it doesn't need more than 1 core, so you can run a
 | UCall with io_uring     |   ✅   |   C    |   32    |          - |  88'455 rps |
 
 In this case, every server was bombarded by requests from 1 or a fleet of 32 other instances in the same availability zone.
-If you want to reproduce those benchmarks, check out the [`sum` examples on GitHub][sum-examples].
+If you want to reproduce those benchmarks, check out the [examples on GitHub][examples].
 
 ## 📝 C API Example
 

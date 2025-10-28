@@ -72,8 +72,8 @@ class Server:
         if isinstance(res, Image.Image):
             buf = BytesIO()
             if not res.format:
-                res.format = 'tiff'
-            res.save(buf, res.format, compression='raw', compression_level=0)
+                res.format = "tiff"
+            res.save(buf, res.format, compression="raw", compression_level=0)
 
             return buf.getvalue()
 
@@ -95,6 +95,10 @@ class Server:
             new_kwargs = {}
 
             for arg, hint in zip(args, hints.values()):
+<<<<<<<< HEAD:python/ucall/server.py
+========
+                assert isinstance(hint, type), "Hint must be a type!"
+>>>>>>>> f8ac7f0998e2e6ef82fa078a5a6dbedea981f18a:python/ucall/_server.py
                 if isinstance(arg, bytes):
                     new_args.append(self.unpack(arg, hint))
                 else:
