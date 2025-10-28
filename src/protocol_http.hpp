@@ -49,11 +49,10 @@ struct http_protocol_t {
      * @brief Analyzes the contents of the packet, bifurcating pure JSON-RPC from HTTP1-based.
      * @warning This doesn't check the headers for validity or additional metadata.
      */
-    inline std::optional<default_error_t> parse_headers(std::string_view body) noexcept;
-    inline std::optional<default_error_t> parse_content() noexcept { return std::nullopt; };
+    inline std::optional<status_t> parse_headers(std::string_view body) noexcept;
+    inline std::optional<status_t> parse_content() noexcept { return std::nullopt; };
 
-    template <typename callee_at>
-    std::optional<default_error_t> populate_response(exchange_pipes_t&, callee_at) noexcept {
+    template <typename callee_at> std::optional<status_t> populate_response(exchange_pipes_t&, callee_at) noexcept {
         return std::nullopt;
     }
 };
@@ -127,7 +126,7 @@ bool http_protocol_t::is_input_complete(span_gt<char> input) noexcept {
  * @brief Analyzes the contents of the packet, bifurcating pure JSON-RPC from HTTP1-based.
  * @warning This doesn't check the headers for validity or additional metadata.
  */
-inline std::optional<default_error_t> http_protocol_t::parse_headers(std::string_view body) noexcept {
+inline std::optional<status_t> http_protocol_t::parse_headers(std::string_view body) noexcept {
 
     char const* method{};
     size_t method_len{};
@@ -140,10 +139,10 @@ inline std::optional<default_error_t> http_protocol_t::parse_headers(std::string
                                 headers, &count_headers, 0);
 
     if (res == -2)
-        return default_error_t{206, "Partial HTTP request"};
+        return status_t{206, "Partial HTTP request"};
 
     if (res < 0)
-        return default_error_t{400, "Not a HTTP request"};
+        return status_t{400, "Not a HTTP request"};
 
     parsed.path = std::string_view(path, path_len);
     auto type_str = std::string_view(method, method_len);
@@ -156,7 +155,7 @@ inline std::optional<default_error_t> http_protocol_t::parse_headers(std::string
     else if (type_str == "DELETE")
         parsed.type = delete_k;
     else
-        return default_error_t{405, "Unsupported request type"};
+        return status_t{405, "Unsupported request type"};
 
     for (std::size_t i = 0; i < count_headers; ++i) {
         if (headers[i].name_len == 0)

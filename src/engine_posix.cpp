@@ -30,14 +30,10 @@
 #include <unistd.h>
 #endif
 
-#include <queue>
-
-#include "engine_common.hpp"
+#include "protocol_shared.hpp"
 
 #pragma region Cpp Declaration
 
-namespace sj = simdjson;
-namespace sjd = sj::dom;
 using namespace unum::ucall;
 
 static constexpr std::size_t initial_buffer_size_k = ram_page_size_k * 4;
@@ -47,7 +43,13 @@ struct conn_ctx_t {
     ssize_t res;
 };
 
-struct posix_ctx_t {
+/**
+ *  @brief A POSIX-specific implementation of the UCall server, that augments `server_state_t`
+ *  with a LIFO queue of
+ */
+struct posix_server_t {
+    server_state_t state;
+
     std::queue<conn_ctx_t> res_queue; // TODO replace with custom
     mutex_t queue_mutex;
     memory_map_t fixed_buffers{};
@@ -81,12 +83,10 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     // Allocate
     int socket_options{1};
     int socket_descriptor{-1};
-    int uring_result{-1};
-    posix_ctx_t* uctx = new posix_ctx_t();
-    server_t* server_ptr{};
+    posix_server_t* posix_server = new posix_server_t();
     pool_gt<connection_t> connections{};
-    array_gt<named_callback_t> callbacks{};
-    std::unique_ptr<ssl_context_t> ssl_ctx{};
+    array_gt<endpoint_t> callbacks{};
+    ssl_context_t ssl_context{};
 
     // By default, let's open TCP port for IPv4.
     struct sockaddr_in address {};
@@ -95,19 +95,19 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     address.sin_port = htons(config.port);
 
     // Try allocating all the necessary memory.
-    server_ptr = (server_t*)std::malloc(sizeof(server_t));
+    server_ptr = (server_state_t*)std::malloc(sizeof(server_state_t));
     if (!server_ptr)
         goto cleanup;
     if (!callbacks.reserve(config.max_callbacks))
         goto cleanup;
-    if (!uctx->fixed_buffers.reserve(ram_page_size_k * 2u * config.max_concurrent_connections))
+    if (!posix_server->fixed_buffers.reserve(ram_page_size_k * 2u * config.max_concurrent_connections))
         goto cleanup;
     if (!connections.reserve(config.max_concurrent_connections))
         goto cleanup;
 
     for (std::size_t i = 0; i != config.max_concurrent_connections; ++i) {
         auto& connection = connections.at_offset(i);
-        auto inputs = uctx->fixed_buffers.ptr + ram_page_size_k * 2u * i;
+        auto inputs = posix_server->fixed_buffers.ptr + ram_page_size_k * 2u * i;
         auto outputs = inputs + ram_page_size_k;
         connection.pipes.mount(inputs, outputs);
     }
@@ -134,17 +134,17 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     if (listen(socket_descriptor, config.queue_depth) < 0)
         goto cleanup;
     if (config.ssl_certificates_count != 0) {
-        ssl_ctx = std::make_unique<ssl_context_t>();
-        if (ssl_ctx->init(config.ssl_private_key_path, config.ssl_certificates_paths, config.ssl_certificates_count) !=
-            0)
+        ssl_context = std::make_unique<ssl_context_t>();
+        if (ssl_context->init(config.ssl_private_key_path, config.ssl_certificates_paths,
+                              config.ssl_certificates_count) != 0)
             goto cleanup;
     }
 
     // Initialize all the members.
-    new (server_ptr) server_t();
-    server_ptr->network_engine.network_data = uctx;
+    new (server_ptr) server_state_t();
+    server_ptr->network_engine.network_data = posix_server;
     server_ptr->socket = descriptor_t{socket_descriptor};
-    server_ptr->ssl_ctx = std::move(ssl_ctx);
+    server_ptr->ssl_context = std::move(ssl_context);
     server_ptr->protocol_type = config.protocol;
     server_ptr->max_lifetime_micro_seconds = config.max_lifetime_micro_seconds;
     server_ptr->max_lifetime_exchanges = config.max_lifetime_exchanges;
@@ -160,7 +160,7 @@ cleanup:
     if (socket_descriptor >= 0)
         close(socket_descriptor);
     std::free(server_ptr);
-    delete uctx;
+    delete posix_server;
     *server_out = nullptr;
 }
 
@@ -168,20 +168,20 @@ void ucall_free(ucall_server_t punned_server) {
     if (!punned_server)
         return;
 
-    server_t& server = *reinterpret_cast<server_t*>(punned_server);
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(server.network_engine.network_data);
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(server.network_engine.network_data);
     close(server.socket);
-    server.~server_t();
+    server.~server_state_t();
     std::free(punned_server);
     delete ctx;
 }
 
 int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) noexcept {
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
+
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
 
     conn_ctx_t coctx{&connection};
 
-    coctx.res = accept(socket, &connection.client_address, &connection.client_address_len);
+    coctx.res = accept(socket, &connection.client_address, &connection.client_address_length);
     if (coctx.res == -1)
         coctx.res = -errno;
     else {
@@ -202,7 +202,8 @@ int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) 
 }
 
 void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
+
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
 
     conn_ctx_t coctx{&connection, 0};
     // TODO what?
@@ -213,7 +214,7 @@ void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {
 }
 
 void network_engine_t::close_connection_gracefully(connection_t& connection) noexcept {
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
 
     conn_ctx_t coctx{&connection, close(connection.descriptor)};
     if (coctx.res == -1)
@@ -225,8 +226,7 @@ void network_engine_t::close_connection_gracefully(connection_t& connection) noe
 }
 
 void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
-                                   size_t buf_index) noexcept {
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
     conn_ctx_t coctx{&connection};
     ssize_t res = 0;
 
@@ -239,8 +239,7 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
 }
 
 void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
-                                   size_t buf_index) noexcept {
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
 
     conn_ctx_t coctx{&connection};
     ssize_t res = 0;
@@ -262,7 +261,8 @@ bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const
 }
 
 template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
-    posix_ctx_t* ctx = reinterpret_cast<posix_ctx_t*>(network_data);
+
+    posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
 
     size_t completed = 0;
 

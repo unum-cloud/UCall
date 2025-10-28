@@ -25,12 +25,12 @@ unum::ucall::any_param_t param_at(ucall_message_t call, size_t position) noexcep
 
 void ucall_add_endpoint(ucall_server_t punned_server, ucall_string_t name, ucall_callback_t callback,
                         ucall_verb_t callback_type, ucall_endpoint_tag_t endpoint_tag) {
-    unum::ucall::server_t& server = *reinterpret_cast<unum::ucall::server_t*>(punned_server);
+    unum::ucall::server_state_t& server = *reinterpret_cast<unum::ucall::server_state_t*>(punned_server);
     server.engine.try_add_callback({{name, strlen(name)}, callback, callback_type, endpoint_tag});
 }
 
 void ucall_take_calls(ucall_server_t punned_server, uint16_t thread_idx) {
-    unum::ucall::server_t* server = reinterpret_cast<unum::ucall::server_t*>(punned_server);
+    unum::ucall::server_state_t* server = reinterpret_cast<unum::ucall::server_state_t*>(punned_server);
     if (!thread_idx && server->logs_file_descriptor > 0)
         server->submit_stats_heartbeat();
     while (true) {
@@ -42,7 +42,7 @@ void ucall_take_call(ucall_server_t punned_server, uint16_t thread_idx) {
     // Unlike the classical synchronous interface, this implements only a part of the connection machine,
     // is responsible for checking if a specific request has been completed. All of the submitted
     // memory must be preserved until we get the confirmation.
-    unum::ucall::server_t* server = reinterpret_cast<unum::ucall::server_t*>(punned_server);
+    unum::ucall::server_state_t* server = reinterpret_cast<unum::ucall::server_state_t*>(punned_server);
     if (thread_idx == 0)
         server->consider_accepting_new_connection();
 

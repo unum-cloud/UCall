@@ -60,7 +60,8 @@ namespace sj = simdjson;
 namespace sjd = sj::dom;
 using namespace unum::ucall;
 
-struct uring_ctx_t {
+struct uring_server_t {
+    server_state_t state;
     mutex_t submission_mutex{};
     memory_map_t fixed_buffers{};
     io_uring uring{};
@@ -95,7 +96,7 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     int socket_options{1};
     int socket_descriptor{-1};
     int uring_result{-1};
-    uring_ctx_t* uctx = new uring_ctx_t();
+    uring_server_t* uctx = new uring_server_t();
     struct io_uring* uring = &uctx->uring;
     struct io_uring_params uring_params {};
     struct io_uring_sqe* uring_sqe{};
@@ -106,11 +107,11 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     uring_params.flags |= IORING_SETUP_SQPOLL;
     uring_params.sq_thread_idle = wakeup_initial_frequency_ns_k;
     // uring_params.flags |= config.max_threads == 1 ? IORING_SETUP_SINGLE_ISSUER : 0; // 6.0+
-    server_t* server_ptr{};
+    server_state_t* server_ptr{};
     pool_gt<connection_t> connections{};
-    array_gt<named_callback_t> callbacks{};
+    array_gt<endpoint_t> callbacks{};
     buffer_gt<struct iovec> registered_buffers{};
-    std::unique_ptr<ssl_context_t> ssl_ctx{};
+    std::unique_ptr<ssl_context_t> ssl_context{};
 
     // By default, let's open TCP port for IPv4.
     struct sockaddr_in address {};
@@ -124,7 +125,7 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
         goto cleanup;
 
     // Try allocating all the necessary memory.
-    server_ptr = (server_t*)std::malloc(sizeof(server_t));
+    server_ptr = (server_state_t*)std::malloc(sizeof(server_state_t));
     if (!server_ptr)
         goto cleanup;
     if (!callbacks.reserve(config.max_callbacks))
@@ -176,17 +177,17 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     if (listen(socket_descriptor, config.queue_depth) < 0)
         goto cleanup;
     if (config.ssl_certificates_count != 0) {
-        ssl_ctx = std::make_unique<ssl_context_t>();
-        if (ssl_ctx->init(config.ssl_private_key_path, config.ssl_certificates_paths, config.ssl_certificates_count) !=
-            0)
+        ssl_context = std::make_unique<ssl_context_t>();
+        if (ssl_context->init(config.ssl_private_key_path, config.ssl_certificates_paths,
+                              config.ssl_certificates_count) != 0)
             goto cleanup;
     }
 
     // Initialize all the members.
-    new (server_ptr) server_t();
+    new (server_ptr) server_state_t();
     server_ptr->network_engine.network_data = uctx;
     server_ptr->socket = descriptor_t{socket_descriptor};
-    server_ptr->ssl_ctx = std::move(ssl_ctx);
+    server_ptr->ssl_context = std::move(ssl_context);
     server_ptr->protocol_type = config.protocol;
     server_ptr->max_lifetime_micro_seconds = config.max_lifetime_micro_seconds;
     server_ptr->max_lifetime_exchanges = config.max_lifetime_exchanges;
@@ -212,12 +213,12 @@ void ucall_free(ucall_server_t punned_server) {
     if (!punned_server)
         return;
 
-    server_t& server = *reinterpret_cast<server_t*>(punned_server);
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(server.network_engine.network_data);
+    server_state_t& server = *reinterpret_cast<server_state_t*>(punned_server);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(server.network_engine.network_data);
     io_uring_unregister_buffers(&ctx->uring);
     io_uring_queue_exit(&ctx->uring);
     close(server.socket);
-    server.~server_t();
+    server.~server_state_t();
     std::free(punned_server);
     delete ctx;
 }
@@ -234,12 +235,12 @@ bool io_check_send_zc() noexcept {
 }
 
 int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) noexcept {
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     io_uring* uring = &ctx->uring;
     io_uring_sqe* uring_sqe{};
     ctx->submission_mutex.lock();
     uring_sqe = io_uring_get_sqe(uring);
-    io_uring_prep_accept_direct(uring_sqe, socket, &connection.client_address, &connection.client_address_len, 0,
+    io_uring_prep_accept_direct(uring_sqe, socket, &connection.client_address, &connection.client_address_length, 0,
                                 IORING_FILE_INDEX_ALLOC);
     io_uring_sqe_set_data(uring_sqe, &connection);
 
@@ -255,7 +256,7 @@ int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) 
 }
 
 void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     __kernel_timespec wakeup{0, connection.next_wakeup};
     io_uring* uring = &ctx->uring;
     ctx->submission_mutex.lock();
@@ -267,7 +268,7 @@ void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {
 }
 
 void network_engine_t::close_connection_gracefully(connection_t& connection) noexcept {
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     // The operations are not expected to complete in exactly the same order
     // as their submissions. So to stop all existing communication on the
     // socket, we can cancel everything related to its "file descriptor",
@@ -295,7 +296,7 @@ void network_engine_t::close_connection_gracefully(connection_t& connection) noe
 
 void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     io_uring* uring = &ctx->uring;
     ctx->submission_mutex.lock();
     io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
@@ -316,7 +317,7 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
 
 void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     ctx->submission_mutex.lock();
     io_uring* uring = &ctx->uring;
 
@@ -357,7 +358,7 @@ bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const
 }
 
 template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
-    uring_ctx_t* ctx = reinterpret_cast<uring_ctx_t*>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     io_uring* uring = &ctx->uring;
     unsigned uring_head = 0;
     unsigned completed = 0;

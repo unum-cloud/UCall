@@ -91,15 +91,15 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     address.sin_addr.s_addr = inet_addr(config.hostname);
     address.sin_port = htons(config.port);
 
-    server_t* server_ptr{};
+    server_state_t* server_ptr{};
     pool_gt<connection_t> connections{};
-    array_gt<named_callback_t> callbacks{};
+    array_gt<endpoint_t> callbacks{};
     buffer_gt<struct iovec> registered_buffers{};
     memory_map_t fixed_buffers{};
-    std::unique_ptr<ssl_context_t> ssl_ctx{};
+    std::unique_ptr<ssl_context_t> ssl_context{};
 
     // Try allocating all the necessary memory.
-    server_ptr = (server_t*)std::malloc(sizeof(server_t));
+    server_ptr = (server_state_t*)std::malloc(sizeof(server_state_t));
     if (!server_ptr)
         goto cleanup;
     if (!callbacks.reserve(config.max_callbacks))
@@ -140,17 +140,17 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     if (ectx->epoll < 0)
         goto cleanup;
     if (config.ssl_certificates_count != 0) {
-        ssl_ctx = std::make_unique<ssl_context_t>();
-        if (ssl_ctx->init(config.ssl_private_key_path, config.ssl_certificates_paths, config.ssl_certificates_count) !=
-            0)
+        ssl_context = std::make_unique<ssl_context_t>();
+        if (ssl_context->init(config.ssl_private_key_path, config.ssl_certificates_paths,
+                              config.ssl_certificates_count) != 0)
             goto cleanup;
     }
 
     // Initialize all the members.
-    new (server_ptr) server_t();
+    new (server_ptr) server_state_t();
     server_ptr->network_engine.network_data = ectx;
     server_ptr->socket = descriptor_t{socket_descriptor};
-    server_ptr->ssl_ctx = std::move(ssl_ctx);
+    server_ptr->ssl_context = std::move(ssl_context);
     server_ptr->protocol_type = config.protocol;
     server_ptr->max_lifetime_micro_seconds = config.max_lifetime_micro_seconds;
     server_ptr->max_lifetime_exchanges = config.max_lifetime_exchanges;
@@ -174,10 +174,10 @@ void ucall_free(ucall_server_t punned_server) {
     if (!punned_server)
         return;
 
-    server_t& server = *reinterpret_cast<server_t*>(punned_server);
+    server_state_t& server = *reinterpret_cast<server_state_t*>(punned_server);
     epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(server.network_engine.network_data);
     close(server.socket);
-    server.~server_t();
+    server.~server_state_t();
     std::free(punned_server);
     delete ctx;
 }
@@ -256,7 +256,7 @@ template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_event
 
         if (fd != connection->descriptor) { // Accept
             descriptor_t conn_sock =
-                accept(fd, (struct sockaddr*)&connection->client_address, &connection->client_address_len);
+                accept(fd, (struct sockaddr*)&connection->client_address, &connection->client_address_length);
             set_nonblock(conn_sock);
             events[completed].connection_ptr = connection;
             events[completed].result = conn_sock;
