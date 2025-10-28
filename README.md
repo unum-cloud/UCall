@@ -1,6 +1,6 @@
 <h1 align="center">UCall</h1>
 <h3 align="center">
-Remote Procedure Calls for your Backend<br/>
+Remote Procedure Calls Client and Server<br/>
 Up to 70x ⬆️ Throughput and 50x ⬆️ Latency than FastAPI and gRPC<br/>
 </h3>
 <br/>
@@ -18,13 +18,14 @@ Up to 70x ⬆️ Throughput and 50x ⬆️ Latency than FastAPI and gRPC<br/>
 </p>
 
 <p align="center">
-RESTful API • JSON-RPC / HTTPS • HTTP • TCP
+RESTful API • JSON-RPC • HTTP • TCP
 <br/>
 <a href="https://unum-cloud.github.io/ucall/c">C 99</a> •
 <a href="https://unum-cloud.github.io/ucall/python">Python 3</a> •
+<a href="https://unum-cloud.github.io/ucall/rust">Rust</a> •
 <a href="https://unum-cloud.github.io/ucall/javascript">JavaScript</a> 🔜
 <br/>
-Linux • MacOS • Windows • WebAssembly
+Linux • MacOS • Windows • iOS • Android
 <br/>
 <code>posix</code> • <code>epoll</code> • <code>io_uring</code>
 </p>
@@ -32,7 +33,16 @@ Linux • MacOS • Windows • WebAssembly
 ---
 
 Tired of slow REST backends or overly complex gRPC setups?
-UCall aims to be as approachable as FastAPI but significantly faster and more broadly applicable.
+UCall aims to be as approachable as FastAPI but significantly faster and more broadly applicable, implemented as an extremely thin layer between your application code and the networking device:
+
+1. Compatible with HTTP over TCP and JSON-RPC protocols
+2. Uses light-weight Noise instead of bloated TLS for encryption
+3. Provides a unified solution for both client and server sides
+4. Leverages io_uring to avoid system calls and context switches
+5. Transparently handles batching for high-latency (GPU) endpoints
+
+- ✅ Aggregate multiple backend call before execution, to maximize throughput in AI inference applications.
+- ✅ Relay TCP requests, broadcasting them over UDP within internal network.
 
 ## 📊 FastAPI UX Comparison
 
@@ -110,8 +120,8 @@ How does UCall compare to FastAPI and gRPC?
 <details>
   <summary>Table legend</summary>
 
-All benchmarks were conducted on AWS on general purpose instances with **Ubuntu 22.10 AMI**.
-It is the first major AMI to come with **Linux Kernel 5.19**, featuring much wider `io_uring` support for networking operations.
+All benchmarks were conducted on AWS on general purpose instances with __Ubuntu 22.10 AMI__.
+It is the first major AMI to come with __Linux Kernel 5.19__, featuring much wider `io_uring` support for networking operations.
 These specific numbers were obtained on `c7g.metal` beefy instances with Graviton 3 chips.
 
 - The 🔁 column marks, if the TCP/IP connection is being reused during subsequent requests.
@@ -121,14 +131,15 @@ These specific numbers were obtained on `c7g.metal` beefy instances with Gravito
 
 > ¹ FastAPI couldn't process concurrent requests with WebSockets.
 
-> ² We tried generating C++ backends with gRPC, but its numbers, suspiciously, weren't better. There is also an async gRPC option, that wasn't tried.
+> ² We tried generating C++ backends with gRPC, but its numbers, suspiciously, weren't better.
+> There is also an async gRPC option, that wasn't tried.
 
 </details>
 
 ## 🛠 How Does UCall Achieve This?
 
 How can a tiny pet-project with just a couple thousand lines of code compete with two of the most established networking libraries?
-**UCall stands on the shoulders of Giants**:
+__UCall stands on the shoulders of Giants__:
 
 - `io_uring` for interrupt-less IO.
   - `io_uring_prep_read_fixed` on 5.1+.
@@ -151,7 +162,7 @@ def echo(data: bytes):
     return data
 ```
 
-## 🎨 Rich Type Pallete
+## 🎨 Rich Type Palette
 
 FastAPI supports native types, while UCall also supports `numpy.ndarray`, `PIL.Image` and other custom types.
 This comes handy when you build real applications or want to deploy Multi-Modal AI, like we do with [UForm](https://github.com/unum-cloud/uform).
@@ -296,7 +307,7 @@ static void sum(ucall_message_t call, ucall_endpoint_tag_t) {
     ucall_reply_content(call, printed_sum, len);
 }
 
-int main(int argc, char** argv) {
+int main(int argc, char__ argv) {
 
     ucall_server_t server{};
     ucall_config_t config{};
