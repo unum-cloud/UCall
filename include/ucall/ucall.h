@@ -78,6 +78,7 @@ typedef void *ucall_message_t;
  *  - @c IK: Client knows server's public key in advance (Identity Known).
  *  - @c KK: Both parties know each other's public keys (Known Known).
  *
+ *  @note Use @c http+noise:// or @c ws+noise:// URL schemes to enable Noise transport.
  *  @see https://noiseprotocol.org/noise.html for pattern specifications.
  */
 typedef enum ucall_security_mode_t {
@@ -271,7 +272,8 @@ typedef struct ucall_request_options_t {
 /**
  *  @brief Performs an asynchronous HTTP request.
  *  @param[in] client Pre-initialized client handle.
- *  @param[in] url Full URL to request, like "http://localhost:8080/sum?a=1&b=2".
+ *  @param[in] url Full URL with scheme: @c http://, @c ws://, @c http+noise://, or @c ws+noise://.
+ *    Example: "http://localhost:8080/sum?a=1&b=2" or "http+noise://api.example.com/rpc".
  *  @param[in] verb HTTP method, like @c ucall_verb_get_k or @c ucall_verb_post_k, etc.
  *  @param[in] headers Array of @b non-system headers to include in the request.
  *  @param[in] headers_lengths Optional array of lengths for each string (NULL if terminated).
@@ -383,7 +385,7 @@ ucall_status_t ucall_client_request(                                            
 /**
  *  @brief Establishes a WebSocket connection to the specified URL.
  *  @param[in] client Pre-initialized client handle.
- *  @param[in] url The URL to connect to.
+ *  @param[in] url WebSocket URL with scheme: @c ws:// or @c ws+noise://.
  *  @param[in] options Optional request options.
  *  @param[in] callback Callback function to handle WebSocket events (receiving messages).
  *  @param[in] context User-defined context pointer for the @p callback.

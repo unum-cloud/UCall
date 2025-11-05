@@ -155,6 +155,7 @@ There is a better way... that is broadly deployed, but little known.
 The Noise Protocol Framework!
 
 It's used by WhatsApp, WireGuard VPN, and the Lightning Network for faster off-chain transactions on top of Bitcoin.
+UCall uses a `protocol+transport` URL scheme convention (like Docker's `http+unix://`) to explicitly specify the transport: `http://`, `ws://`, `http+noise://`, and `ws+noise://`.
 It also uses a Diffie-Hellman __(DH)__ key exchange to establish a shared secret between the client and server, but it's much simpler, easier to implement, audit, and reason about than TLS.
 Several handshake patterns are defined, each suitable for different use cases:
 
