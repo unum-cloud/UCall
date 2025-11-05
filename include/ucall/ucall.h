@@ -723,6 +723,45 @@ typedef struct ucall_server_batch_endpoint_options_t {
  *  @param[in] context Optional payload/tag for metadata (e.g., for CPython runtime).
  *  @return Status code (duplicate endpoint, invalid template, out of memory).
  *
+ *  @par Example
+ *  @code{.c}
+ *  void inference_batch(ucall_received_batch_http_request_t batch, void *context) {
+ *      size_t count = ucall_server_batch_size(server, batch);
+ *      float *inputs = malloc(count * INPUT_DIM * sizeof(float));
+ *
+ *      // Unpack all requests and prepare batch input
+ *      for (size_t i = 0; i < count; i++) {
+ *          ucall_received_http_request_t request;
+ *          ucall_server_batch_unpack(server, batch, i, &request);
+ *
+ *          ucall_string_t body;
+ *          size_t body_len;
+ *          ucall_server_request_body(server, request, &body, &body_len);
+ *          memcpy(&inputs[i * INPUT_DIM], body, INPUT_DIM * sizeof(float));
+ *      }
+ *
+ *      // Single GPU kernel call for entire batch
+ *      float *outputs = run_gpu_inference(inputs, count);
+ *
+ *      // Reply to each request individually
+ *      for (size_t i = 0; i < count; i++) {
+ *          ucall_received_http_request_t request;
+ *          ucall_server_batch_unpack(server, batch, i, &request);
+ *          ucall_server_reply_content(server, request, NULL, NULL, 0,
+ *            (char*)&outputs[i * OUTPUT_DIM], OUTPUT_DIM * sizeof(float));
+ *      }
+ *      free(inputs); free(outputs);
+ *  }
+ *
+ *  ucall_server_batch_endpoint_options_t opts = {
+ *      .min_batch_size = 8,      // Wait for at least 8 requests
+ *      .max_batch_size = 64,     // Process max 64 at once
+ *      .max_latency_micro_seconds = 5000  // Wait max 5ms
+ *  };
+ *  ucall_server_add_batch_endpoint(server, "/inference", ucall_verb_post_k,
+ *    &opts, inference_batch, NULL);
+ *  @endcode
+ *
  *  @sa To extract the number of calls in the batch - @c ucall_server_batch_size().
  *  @sa To enumerate separate calls from within the batch - @c ucall_server_batch_unpack().
  */
