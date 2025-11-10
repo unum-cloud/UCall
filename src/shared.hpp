@@ -9,11 +9,13 @@
  *  @date January 18, 2023
  */
 #pragma once
+#include <cassert>     // `assert`
 #include <cstdlib>     // `std::malloc`, `std::free`, `std::realloc`
 #include <cstring>     // `std::strlen`, `std::memset`, `std::memcpy`
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
+#include <utility>     // `std::exchange`, `std::swap`
 
 #if defined(__linux__)
 #define UCALL_OS_LINUX_
@@ -114,10 +116,11 @@ inline timestamp_t cpu_cycle() noexcept {
  *  @brief Returns string length, using provided length or computing with strlen.
  *  @param[in] c_str The C string to measure.
  *  @param[in] optional_length Pre-computed length, or 0 to compute with strlen.
- *  @return Length of the string.
+ *  @return Length of the string, or 0 if c_str is null.
  */
 inline std::size_t string_length(char const *c_str, std::size_t optional_length) noexcept {
-    return c_str && !optional_length ? std::strlen(c_str) : optional_length;
+    if (!c_str) return 0;
+    return optional_length ? optional_length : std::strlen(c_str);
 }
 
 /**
@@ -142,24 +145,34 @@ class round_robin {
     using value_type = element_t;
 
     round_robin() = default;
-    round_robin(round_robin &&) = delete;
     round_robin(round_robin const &) = delete;
     round_robin &operator=(round_robin const &) = delete;
 
-    inline ~round_robin() noexcept {
-        if (circle_) {
-            if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(circle_, capacity_);
-            std::free(circle_);
-        }
+    inline round_robin(round_robin &&other) noexcept
+        : circle_(std::exchange(other.circle_, nullptr)), count_(std::exchange(other.count_, 0)),
+          capacity_(std::exchange(other.capacity_, 0)), idx_newest_(std::exchange(other.idx_newest_, 0)),
+          idx_oldest_(std::exchange(other.idx_oldest_, 0)), idx_to_poll_(std::exchange(other.idx_to_poll_, 0)) {}
+
+    void reset() noexcept {
+        if (!circle_) return;
+        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(circle_, capacity_);
+        std::free(circle_);
+        circle_ = nullptr;
+        count_ = capacity_ = 0;
+        idx_newest_ = idx_oldest_ = idx_to_poll_ = 0;
     }
 
+    inline ~round_robin() noexcept { reset(); }
+
     inline round_robin &operator=(round_robin &&other) noexcept {
-        std::swap(circle_, other.circle_);
-        std::swap(count_, other.count_);
-        std::swap(capacity_, other.capacity_);
-        std::swap(idx_newest_, other.idx_newest_);
-        std::swap(idx_oldest_, other.idx_oldest_);
-        std::swap(idx_to_poll_, other.idx_to_poll_);
+        if (this == &other) return *this;
+        reset();
+        circle_ = std::exchange(other.circle_, nullptr);
+        count_ = std::exchange(other.count_, 0);
+        capacity_ = std::exchange(other.capacity_, 0);
+        idx_newest_ = std::exchange(other.idx_newest_, 0);
+        idx_oldest_ = std::exchange(other.idx_oldest_, 0);
+        idx_to_poll_ = std::exchange(other.idx_to_poll_, 0);
         return *this;
     }
 
@@ -174,6 +187,7 @@ class round_robin {
     }
 
     inline element_t &drop_tail() noexcept {
+        assert(count_ > 0 && "drop_tail() called on empty round_robin");
         element_t &dropped = circle_[idx_oldest_];
         idx_to_poll_ = idx_to_poll_ == idx_oldest_ ? (idx_to_poll_ + 1) % capacity_ : idx_to_poll_;
         idx_oldest_ = (idx_oldest_ + 1) % capacity_;
@@ -182,6 +196,7 @@ class round_robin {
     }
 
     inline element_t &push_ahead() noexcept {
+        assert(count_ < capacity_ && "push_ahead() called on full round_robin");
         element_t &added = circle_[idx_newest_];
         idx_newest_ = (idx_newest_ + 1) % capacity_;
         count_++;
@@ -189,14 +204,21 @@ class round_robin {
     }
 
     inline element_t &poll() noexcept {
+        assert(capacity_ > 0 && "poll() called on unallocated round_robin");
         element_t &result = circle_[idx_to_poll_];
         auto idx_to_poll_following = (idx_to_poll_ + 1) % capacity_;
         idx_to_poll_ = idx_to_poll_following == idx_newest_ ? idx_oldest_ : idx_to_poll_following;
         return result;
     }
 
-    inline element_t &tail() noexcept { return circle_[idx_oldest_]; }
-    inline element_t &head() noexcept { return circle_[idx_newest_ > 0 ? idx_newest_ - 1 : capacity_ - 1]; }
+    inline element_t &tail() noexcept {
+        assert(count_ > 0 && "tail() called on empty round_robin");
+        return circle_[idx_oldest_];
+    }
+    inline element_t &head() noexcept {
+        assert(count_ > 0 && "head() called on empty round_robin");
+        return circle_[idx_newest_ > 0 ? idx_newest_ - 1 : capacity_ - 1];
+    }
     inline std::size_t size() const noexcept { return count_; }
     inline std::size_t capacity() const noexcept { return capacity_; }
 };
@@ -325,20 +347,29 @@ class buffer {
     using value_type = element_t;
 
     buffer() noexcept = default;
-    buffer(buffer &&) = delete;
     buffer(buffer const &) = delete;
     buffer &operator=(buffer const &) = delete;
 
+    buffer(buffer &&other) noexcept
+        : elements_(std::exchange(other.elements_, nullptr)), capacity_(std::exchange(other.capacity_, 0)) {}
+
     buffer &operator=(buffer &&other) noexcept {
-        std::swap(elements_, other.elements_);
-        std::swap(capacity_, other.capacity_);
+        if (this == &other) return *this;
+        reset();
+        elements_ = std::exchange(other.elements_, nullptr);
+        capacity_ = std::exchange(other.capacity_, 0);
         return *this;
     }
+
+    void reset() noexcept {
+        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
+        std::free(elements_);
+        elements_ = nullptr;
+        capacity_ = 0;
+    }
+
     [[nodiscard]] bool resize(std::size_t n) noexcept {
-        if (elements_) {
-            if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-            std::free(elements_);
-        }
+        reset();
         elements_ = (element_t *)std::malloc(sizeof(element_t) * n);
         if (!elements_) {
             capacity_ = 0;
@@ -348,19 +379,21 @@ class buffer {
         std::uninitialized_default_construct(elements_, elements_ + capacity_);
         return true;
     }
-    ~buffer() noexcept {
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        std::free(elements_);
-        elements_ = nullptr;
-    }
+    ~buffer() noexcept { reset(); }
     [[nodiscard]] element_t const *data() const noexcept { return elements_; }
     [[nodiscard]] element_t *data() noexcept { return elements_; }
     [[nodiscard]] element_t *begin() noexcept { return elements_; }
     [[nodiscard]] element_t *end() noexcept { return elements_ + capacity_; }
     [[nodiscard]] std::size_t size() const noexcept { return capacity_; }
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-    [[nodiscard]] element_t &operator[](std::size_t i) noexcept { return elements_[i]; }
-    [[nodiscard]] element_t const &operator[](std::size_t i) const noexcept { return elements_[i]; }
+    [[nodiscard]] element_t &operator[](std::size_t i) noexcept {
+        assert(i < capacity_ && "buffer::operator[] index out of bounds");
+        return elements_[i];
+    }
+    [[nodiscard]] element_t const &operator[](std::size_t i) const noexcept {
+        assert(i < capacity_ && "buffer::operator[] index out of bounds");
+        return elements_[i];
+    }
 };
 
 /**
@@ -383,19 +416,35 @@ class pool {
     using value_type = element_t;
 
     pool() = default;
-    pool(pool &&) = delete;
     pool(pool const &) = delete;
     pool &operator=(pool const &) = delete;
 
+    pool(pool &&other) noexcept
+        : capacity_(std::exchange(other.capacity_, 0)), free_count_(std::exchange(other.free_count_, 0)),
+          elements_(std::exchange(other.elements_, nullptr)),
+          free_offsets_(std::exchange(other.free_offsets_, nullptr)) {}
+
     pool &operator=(pool &&other) noexcept {
-        std::swap(capacity_, other.capacity_);
-        std::swap(free_count_, other.free_count_);
-        std::swap(elements_, other.elements_);
-        std::swap(free_offsets_, other.free_offsets_);
+        if (this == &other) return *this;
+        reset();
+        capacity_ = std::exchange(other.capacity_, 0);
+        free_count_ = std::exchange(other.free_count_, 0);
+        elements_ = std::exchange(other.elements_, nullptr);
+        free_offsets_ = std::exchange(other.free_offsets_, nullptr);
         return *this;
     }
 
+    void reset() noexcept {
+        if (!elements_) return;
+        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
+        std::free(elements_);
+        elements_ = nullptr;
+        free_offsets_ = nullptr;
+        capacity_ = free_count_ = 0;
+    }
+
     [[nodiscard]] bool reserve(std::size_t n) noexcept {
+        assert(!elements_ && "pool::reserve() called on already-initialized pool");
         auto mem = std::malloc((sizeof(element_t) + sizeof(std::size_t)) * n);
         if (!mem) return false;
         elements_ = (element_t *)mem;
@@ -406,15 +455,16 @@ class pool {
         return true;
     }
 
-    ~pool() noexcept {
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        std::free(elements_);
-        elements_ = nullptr;
-    }
+    ~pool() noexcept { reset(); }
     [[nodiscard]] element_t *alloc() noexcept {
         return free_count_ ? elements_ + free_offsets_[--free_count_] : nullptr;
     }
-    void release(element_t *released) noexcept { free_offsets_[free_count_++] = released - elements_; }
+    void release(element_t *released) noexcept {
+        assert(released && "pool::release() called with null pointer");
+        assert(released >= elements_ && released < elements_ + capacity_ && "pool::release() pointer out of bounds");
+        assert(free_count_ < capacity_ && "pool::release() called too many times (double-free?)");
+        free_offsets_[free_count_++] = released - elements_;
+    }
     [[nodiscard]] std::size_t offset_of(element_t &element) const noexcept { return &element - elements_; }
     [[nodiscard]] element_t &at_offset(std::size_t i) const noexcept { return elements_[i]; }
 };
@@ -440,8 +490,14 @@ class span {
     [[nodiscard]] element_t *begin() noexcept { return begin_; }
     [[nodiscard]] element_t *end() noexcept { return end_; }
     [[nodiscard]] std::size_t size() const noexcept { return end_ - begin_; }
-    [[nodiscard]] element_t &operator[](std::size_t i) noexcept { return begin_[i]; }
-    [[nodiscard]] element_t const &operator[](std::size_t i) const noexcept { return begin_[i]; }
+    [[nodiscard]] element_t &operator[](std::size_t i) noexcept {
+        assert(i < size() && "span::operator[] index out of bounds");
+        return begin_[i];
+    }
+    [[nodiscard]] element_t const &operator[](std::size_t i) const noexcept {
+        assert(i < size() && "span::operator[] index out of bounds");
+        return begin_[i];
+    }
     operator std::basic_string_view<element_t>() const noexcept { return {data(), size()}; }
 };
 
@@ -466,14 +522,19 @@ class array {
     using value_type = element_t;
 
     array() = default;
-    array(array &&) = delete;
     array(array const &) = delete;
     array &operator=(array const &) = delete;
 
+    array(array &&other) noexcept
+        : elements_(std::exchange(other.elements_, nullptr)), count_(std::exchange(other.count_, 0)),
+          capacity_(std::exchange(other.capacity_, 0)) {}
+
     array &operator=(array &&other) noexcept {
-        std::swap(elements_, other.elements_);
-        std::swap(count_, other.count_);
-        std::swap(capacity_, other.capacity_);
+        if (this == &other) return *this;
+        reset();
+        elements_ = std::exchange(other.elements_, nullptr);
+        count_ = std::exchange(other.count_, 0);
+        capacity_ = std::exchange(other.capacity_, 0);
         return *this;
     }
     [[nodiscard]] bool reserve(std::size_t n) noexcept {
@@ -494,7 +555,8 @@ class array {
     }
     ~array() noexcept { reset(); }
     void reset() noexcept {
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, count_);
+        if (!elements_) return;
+        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
         std::free(elements_);
         elements_ = nullptr;
         capacity_ = count_ = 0;
@@ -505,15 +567,119 @@ class array {
     [[nodiscard]] element_t *end() noexcept { return elements_ + count_; }
     [[nodiscard]] std::size_t size() const noexcept { return count_; }
     [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-    [[nodiscard]] element_t &operator[](std::size_t i) noexcept { return elements_[i]; }
+    [[nodiscard]] element_t &operator[](std::size_t i) noexcept {
+        assert(i < count_ && "array::operator[] index out of bounds");
+        return elements_[i];
+    }
 
-    void push_back_reserved(element_t element) noexcept { new (elements_ + count_++) element_t(std::move(element)); }
-    void pop_back(std::size_t n = 1) noexcept { count_ -= n; }
+    void push_back_reserved(element_t element) noexcept {
+        assert(count_ < capacity_ && "push_back_reserved() called on full array");
+        elements_[count_++] = std::move(element);
+    }
+    void pop_back(std::size_t n = 1) noexcept {
+        assert(count_ >= n && "pop_back() would underflow array");
+        count_ -= n;
+    }
     [[nodiscard]] bool append_n(element_t const *elements, std::size_t n) noexcept {
         if (!reserve(size() + n)) return false;
         std::memcpy(end(), elements, n * sizeof(element_t));
         count_ += n;
         return true;
+    }
+};
+
+struct number_and_suffix_t {
+    float number {};
+    char suffix {};
+};
+
+inline number_and_suffix_t printable(std::size_t n) noexcept {
+    if (n > 1'000'000'000) return {n / 1'000'000'000.0f, 'G'};
+    if (n > 1'000'000) return {n / 1'000'000.0f, 'M'};
+    if (n > 1'000) return {n / 1'000.0f, 'K'};
+    return {n + 0.0f, ' '};
+}
+
+/**
+ *  @brief Tracks aggregate network traffic (connections, bytes, packets) for periodic logging.
+ */
+struct traffic_stats_t {
+
+    static constexpr std::size_t default_frequency_secs_k {5};
+
+    std::atomic<std::size_t> added_connections {};
+    std::atomic<std::size_t> closed_connections {};
+    std::atomic<std::size_t> bytes_received {};
+    std::atomic<std::size_t> bytes_sent {};
+    std::atomic<std::size_t> packets_received {};
+    std::atomic<std::size_t> packets_sent {};
+
+    /**
+     *  @brief Logs statistical data in a human-readable format, normalized for a time period.
+     *
+     *  @param[in] buffer Pointer to the buffer where the log string will be written.
+     *  @param[in] buffer_capacity Size of the buffer.
+     *  @param[in] seconds Time span over which the statistics were collected.
+     *  @return The number of characters written to the buffer.
+     */
+    inline std::size_t log_human_readable(char *buffer, std::size_t buffer_capacity, std::size_t seconds) noexcept {
+        if (seconds == 0) seconds = 1; // Prevent division by zero
+        auto &s = *this;
+        auto printable_normalized = [=](std::atomic<std::size_t> &i) noexcept {
+            return printable(double(i.exchange(0, std::memory_order_relaxed)) / seconds);
+        };
+        auto added_connections = printable_normalized(s.added_connections);
+        auto closed_connections = printable_normalized(s.closed_connections);
+        auto bytes_received = printable_normalized(s.bytes_received);
+        auto bytes_sent = printable_normalized(s.bytes_sent);
+        auto packets_received = printable_normalized(s.packets_received);
+        auto packets_sent = printable_normalized(s.packets_sent);
+        auto len = snprintf( //
+            buffer, buffer_capacity,
+            "connections: +%.1f %c/s, "
+            "-%.1f %c/s, "
+            "RX: %.1f %c msgs/s, "
+            "%.1f %cb/s, "
+            "TX: %.1f %c msgs/s, "
+            "%.1f %cb/s. \n",
+            added_connections.number, added_connections.suffix,   //
+            closed_connections.number, closed_connections.suffix, //
+            packets_received.number, packets_received.suffix,     //
+            bytes_received.number, bytes_received.suffix,         //
+            packets_sent.number, packets_sent.suffix,             //
+            bytes_sent.number, bytes_sent.suffix                  //
+        );
+        return static_cast<std::size_t>(len);
+    }
+
+    /**
+     *  @brief Logs statistical data in a JSON format.
+     *
+     *  @param[in] buffer Pointer to the buffer where the log string will be written.
+     *  @param[in] buffer_capacity Size of the buffer.
+     *  @return The number of characters written to the buffer.
+     */
+    inline std::size_t log_json(char *buffer, std::size_t buffer_capacity) noexcept {
+        auto &s = *this;
+        auto added_connections = s.added_connections.exchange(0, std::memory_order_relaxed);
+        auto closed_connections = s.closed_connections.exchange(0, std::memory_order_relaxed);
+        auto bytes_received = s.bytes_received.exchange(0, std::memory_order_relaxed);
+        auto bytes_sent = s.bytes_sent.exchange(0, std::memory_order_relaxed);
+        auto packets_received = s.packets_received.exchange(0, std::memory_order_relaxed);
+        auto packets_sent = s.packets_sent.exchange(0, std::memory_order_relaxed);
+        auto format =
+            R"( {"add":%zu,"close":%zu,"recv_bytes":%zu,"sent_bytes":%zu,"recv_packs":%zu,"sent_packs":%zu} \n )";
+        auto len = snprintf(         //
+            buffer, buffer_capacity, //
+            format,                  //
+            added_connections,       //
+            closed_connections,      //
+            bytes_received,          //
+            bytes_sent,              //
+            packets_received,        //
+            packets_sent             //
+        );
+        return static_cast<std::size_t>(len);
     }
 };
 
