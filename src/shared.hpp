@@ -235,58 +235,76 @@ class alignas(align_k) mutex_t {
 class memory_map_t {
     byte_t *data_ {};
     std::size_t size_ {};
+#if defined(UCALL_OS_WINDOWS_)
+    HANDLE mapping_handle_ {};
+#endif
 
   public:
     memory_map_t() = default;
     memory_map_t(memory_map_t const &) = delete;
     memory_map_t &operator=(memory_map_t const &) = delete;
+    ~memory_map_t() noexcept { reset(); }
 
-    inline memory_map_t(memory_map_t &&other) noexcept {
-        std::swap(data_, other.data_);
-        std::swap(size_, other.size_);
-    }
+#if defined(UCALL_OS_WINDOWS_)
+    inline memory_map_t(memory_map_t &&other) noexcept
+        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)),
+          mapping_handle_(std::exchange(other.mapping_handle_, nullptr)) {}
+#else
+    inline memory_map_t(memory_map_t &&other) noexcept
+        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
+#endif
 
     inline memory_map_t &operator=(memory_map_t &&other) noexcept {
-        std::swap(data_, other.data_);
-        std::swap(size_, other.size_);
+        if (this == &other) return *this;
+        reset();
+        data_ = std::exchange(other.data_, nullptr);
+        size_ = std::exchange(other.size_, 0);
+#if defined(UCALL_OS_WINDOWS_)
+        mapping_handle_ = std::exchange(other.mapping_handle_, nullptr);
+#endif
         return *this;
     }
 
     inline byte_t *data() const noexcept { return data_; }
     inline std::size_t size() const noexcept { return size_; }
 
-    bool reserve(std::size_t size) noexcept {
-#if defined(UCALL_IS_WINDOWS)
-        HANDLE hFile = INVALID_HANDLE_VALUE;
-        HANDLE hMap = CreateFileMapping(hFile, nullptr, PAGE_READWRITE, 0, size, nullptr);
-        if (hMap == nullptr) return false;
+    void reset() noexcept {
+        if (!data_) return;
 
-        byte_t *new_ptr = (byte_t *)MapViewOfFile(hMap, FILE_MAP_ALL_ACCESS, 0, 0, size); // Map a view of the file
+#if defined(UCALL_OS_WINDOWS_)
+        UnmapViewOfFile(data_);
+        if (mapping_handle_) CloseHandle(mapping_handle_);
+        mapping_handle_ = nullptr;
+#else
+        munmap(data_, size_);
+#endif
+        data_ = nullptr;
+        size_ = 0;
+    }
+
+    bool remap(std::size_t size) noexcept {
+        reset();
+
+#if defined(UCALL_OS_WINDOWS_)
+        HANDLE file_handle = INVALID_HANDLE_VALUE;
+        mapping_handle_ = CreateFileMapping(file_handle, nullptr, PAGE_READWRITE, 0, size, nullptr);
+        if (mapping_handle_ == nullptr) return false;
+
+        byte_t *new_ptr = (byte_t *)MapViewOfFile(mapping_handle_, FILE_MAP_ALL_ACCESS, 0, 0, size);
         if (new_ptr == nullptr) {
-            CloseHandle(hMap);
+            CloseHandle(mapping_handle_);
+            mapping_handle_ = nullptr;
             return false;
         }
 #else
         // Use `mmap` for Linux and other POSIX systems
-        // Make sure that the `size` is a multiple of `page_size`
-        // auto page_size = sysconf(_SC_PAGE_SIZE);
-        byte_t *new_ptr = (byte_t *)mmap(data_, size, PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+        byte_t *new_ptr = (byte_t *)mmap(nullptr, size, PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (new_ptr == MAP_FAILED) return false;
 #endif
         std::memset(new_ptr, 0, size);
         data_ = new_ptr;
         size_ = size;
         return true;
-    }
-
-    ~memory_map_t() noexcept {
-#if defined(UCALL_IS_WINDOWS)
-        if (data_) UnmapViewOfFile(data_); // Unmap the view of the file
-#else
-        if (data_) munmap(data_, size_);
-#endif
-        data_ = nullptr;
-        size_ = 0;
     }
 };
 
