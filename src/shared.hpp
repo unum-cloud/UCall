@@ -128,6 +128,8 @@ inline std::size_t string_length(char const *c_str, std::size_t optional_length)
  *
  *  Maintains a circular queue with oldest/newest tracking and polling support for
  *  fair connection scheduling.
+ *
+ *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible.
  */
 template <typename element_type_>
 class round_robin {
@@ -186,6 +188,7 @@ class round_robin {
         return true;
     }
 
+    /** @brief Removes and returns oldest element. Requires non-empty buffer. */
     inline element_t &drop_tail() noexcept {
         assert(count_ > 0 && "drop_tail() called on empty round_robin");
         element_t &dropped = circle_[idx_oldest_];
@@ -195,6 +198,7 @@ class round_robin {
         return dropped;
     }
 
+    /** @brief Adds element at head position. Requires non-full buffer. */
     inline element_t &push_ahead() noexcept {
         assert(count_ < capacity_ && "push_ahead() called on full round_robin");
         element_t &added = circle_[idx_newest_];
@@ -203,6 +207,7 @@ class round_robin {
         return added;
     }
 
+    /** @brief Returns current element and advances polling index for fair round-robin iteration. */
     inline element_t &poll() noexcept {
         assert(capacity_ > 0 && "poll() called on unallocated round_robin");
         element_t &result = circle_[idx_to_poll_];
@@ -211,10 +216,12 @@ class round_robin {
         return result;
     }
 
+    /** @brief Returns oldest element. Requires non-empty buffer. */
     inline element_t &tail() noexcept {
         assert(count_ > 0 && "tail() called on empty round_robin");
         return circle_[idx_oldest_];
     }
+    /** @brief Returns newest element. Requires non-empty buffer. */
     inline element_t &head() noexcept {
         assert(count_ > 0 && "head() called on empty round_robin");
         return circle_[idx_newest_ > 0 ? idx_newest_ - 1 : capacity_ - 1];
@@ -252,7 +259,13 @@ class alignas(align_k) mutex_t {
  *  @brief RAII wrapper for memory-mapped pages, portable between UNIX and Windows.
  *
  *  Uses @c mmap on POSIX systems and @c MapViewOfFile on Windows for anonymous memory mapping.
- *  Automatically unmaps on destruction.
+ *  Automatically unmaps on destruction. Provides zero-initialized memory pages suitable for
+ *  large allocations that benefit from virtual memory backing.
+ *
+ *  Platform Differences:
+ *  - On POSIX - uses @c mmap with @c MAP_ANONYMOUS flag.
+ *  - On Windows - uses @c CreateFileMapping / @c MapViewOfFile with page file backing.
+ *  Both provide similar semantics: zero-initialized, anonymous memory regions.
  */
 class memory_map_t {
     byte_t *data_ {};
@@ -333,8 +346,11 @@ class memory_map_t {
 /**
  *  @brief Fixed-size buffer with manual memory management.
  *
- *  Non-resizable buffer allocated once with @c resize(). Does not support reallocation.
- *  Elements must be nothrow default-constructible.
+ *  Simple buffer container that allocates a fixed number of elements via @c resize(). Unlike
+ *  @c array, does not support growing or partial filling - capacity is always equal to the
+ *  number of constructed elements. Suitable for fixed-size working buffers.
+ *
+ *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible.
  */
 template <typename element_type_>
 class buffer {
@@ -399,9 +415,17 @@ class buffer {
 /**
  *  @brief Object pool for efficient allocation/deallocation of fixed-size elements.
  *
- *  Maintains a free list of element indices for O(1) allocation and deallocation.
- *  All elements are default-constructed on @c reserve(). Elements must be nothrow
- *  default-constructible.
+ *  Maintains a free list for O(1) operations. All elements remain constructed for the pool's
+ *  lifetime, enabling fast reuse without construction overhead.
+ *
+ *  @tparam element_type_ Type of pooled elements. Must be nothrow default-constructible.
+ *
+ *  @code
+ *  pool<connection_t> conn_pool;
+ *  conn_pool.reserve(100);
+ *  connection_t* conn = conn_pool.alloc();
+ *  if (conn) { conn->reset(); conn_pool.release(conn); }
+ *  @endcode
  */
 template <typename element_type_>
 class pool {
@@ -443,6 +467,7 @@ class pool {
         capacity_ = free_count_ = 0;
     }
 
+    /** @brief Initializes pool with n elements. Can only be called once. */
     [[nodiscard]] bool reserve(std::size_t n) noexcept {
         assert(!elements_ && "pool::reserve() called on already-initialized pool");
         auto mem = std::malloc((sizeof(element_t) + sizeof(std::size_t)) * n);
@@ -456,9 +481,11 @@ class pool {
     }
 
     ~pool() noexcept { reset(); }
+    /** @brief Returns pointer to available element, or nullptr if pool exhausted. */
     [[nodiscard]] element_t *alloc() noexcept {
         return free_count_ ? elements_ + free_offsets_[--free_count_] : nullptr;
     }
+    /** @brief Returns element to pool. Pointer must be valid, within bounds, and not double-freed. */
     void release(element_t *released) noexcept {
         assert(released && "pool::release() called with null pointer");
         assert(released >= elements_ && released < elements_ + capacity_ && "pool::release() pointer out of bounds");
@@ -472,7 +499,11 @@ class pool {
 /**
  *  @brief Non-owning view over a contiguous sequence of elements.
  *
- *  Similar to @c std::span (C++20) but simplified. Does not own the memory.
+ *  Similar to @c std::span (C++20) but simplified. Provides a lightweight reference to a
+ *  contiguous memory region without ownership. Does not allocate, deallocate, or manage
+ *  the referenced memory in any way.
+ *
+ *  @tparam element_type_ Type of elements in the view. Can be const-qualified for read-only views.
  */
 template <typename element_type_>
 class span {
@@ -504,9 +535,11 @@ class span {
 /**
  *  @brief Dynamic array with manual memory management.
  *
- *  Similar to @c std::vector but uses @c malloc / @c realloc instead of allocators. Supports
- *  growing with @c reserve(). Elements must be nothrow default-constructible and trivially
- *  copy-constructible (to allow @c realloc and @c memcpy).
+ *  Similar to @c std::vector but uses @c malloc / @c realloc for amortized O(1) growth.
+ *  Maintains both capacity (allocated) and count (active) for efficient growing.
+ *
+ *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible and
+ *    trivially copyable (required for @c realloc and @c memcpy to work correctly).
  */
 template <typename element_type_>
 class array {
@@ -537,6 +570,7 @@ class array {
         capacity_ = std::exchange(other.capacity_, 0);
         return *this;
     }
+    /** @brief Grows capacity to at least n elements. Never shrinks. Preserves existing elements. */
     [[nodiscard]] bool reserve(std::size_t n) noexcept {
         if (n <= capacity_) return true;
         if (!elements_) {
@@ -572,10 +606,12 @@ class array {
         return elements_[i];
     }
 
+    /** @brief Adds element to pre-allocated space. Requires capacity > count. */
     void push_back_reserved(element_t element) noexcept {
         assert(count_ < capacity_ && "push_back_reserved() called on full array");
         elements_[count_++] = std::move(element);
     }
+    /** @brief Decrements count by n. Does not destroy elements or deallocate. */
     void pop_back(std::size_t n = 1) noexcept {
         assert(count_ >= n && "pop_back() would underflow array");
         count_ -= n;
