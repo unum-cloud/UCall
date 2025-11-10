@@ -9,22 +9,41 @@
  *  @date January 18, 2023
  */
 #pragma once
-
-#if defined(__linux__) // iovec required only for uring
-#define UCALL_IS_LINUX
-#include <sys/uio.h> // `struct iovec`
-#endif
-
-#include <memory>      // `std::malloc`
+#include <cstdlib>     // `std::malloc`, `std::free`, `std::realloc`
+#include <cstring>     // `std::strlen`, `std::memset`, `std::memcpy`
+#include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
 
-#if defined(__x86_64__)
-#ifdef _MSC_VER
-#include <intrin.h>
-#else
-#include <x86intrin.h>
+#if defined(__linux__)
+#define UCALL_OS_LINUX_
+#elif defined(__APPLE__)
+#define UCALL_OS_MACOS_
+#elif defined(_WIN32) || defined(_WIN64)
+#define UCALL_OS_WINDOWS_
 #endif
+
+#if defined(_MSC_VER)
+#define UCALL_COMPILER_MSVC_
+#elif defined(__GNUC__)
+#define UCALL_COMPILER_GCC_
+#elif defined(__clang__)
+#define UCALL_COMPILER_CLANG_
+#endif
+
+#if defined(__x86_64__) || defined(_M_X64)
+#define UCALL_ARCH_X86_64_
+#elif defined(__aarch64__)
+#define UCALL_ARCH_ARM64_
+#endif
+
+#if defined(UCALL_OS_LINUX_)
+#include <sys/uio.h>  // `struct iovec`
+#include <sys/mman.h> // `mmap`, `munmap`
+#endif
+
+#if defined(UCALL_OS_MACOS_)
+#include <sys/mman.h> // `mmap`, `munmap`, `PROT_*`, `MAP_*`
 #endif
 
 #include "ucall/ucall.h" // `ucall_callback_t`
@@ -57,16 +76,16 @@ static constexpr std::size_t align_k = 64;
 constexpr std::size_t cpu_cycles_per_micro_second_k = 3'000;
 
 /** @brief File descriptor type-safe wrapper. */
-enum descriptor_t : std::ssize_t {};
+enum descriptor_t : ssize_t {};
 
 /** @brief Invalid file descriptor constant. */
 static constexpr descriptor_t bad_descriptor_k {-1};
 
 /** @brief Groups server-side endpoint information needed to register a callback. */
 struct named_callback_t {
-    ucall_str_t name_template {};
-    ucall_callback_t callback {};
-    ucall_callback_tag_t callback_tag {};
+    ucall_string_t name_template {};
+    void (*callback)(void *) {};
+    void *callback_tag {};
 };
 
 /** @brief Timestamp in CPU cycles for low-overhead time measurements. */
@@ -170,10 +189,10 @@ class round_robin {
     }
 
     inline element_t &poll() noexcept {
-        auto connection_ptr = &circle_[idx_to_poll_];
+        element_t &result = circle_[idx_to_poll_];
         auto idx_to_poll_following = (idx_to_poll_ + 1) % capacity_;
         idx_to_poll_ = idx_to_poll_following == idx_newest_ ? idx_oldest_ : idx_to_poll_following;
-        return circle_[idx_to_poll_];
+        return result;
     }
 
     inline element_t &tail() noexcept { return circle_[idx_oldest_]; }
@@ -421,8 +440,8 @@ class array {
     std::size_t count_ {};
     std::size_t capacity_ {};
     static_assert(std::is_nothrow_default_constructible<element_type_>());
-    static_assert(std::is_trivially_copy_constructible<element_type_>(),
-                  "Elements must be trivially copy-constructible for realloc");
+    static_assert(std::is_trivially_copyable<element_type_>(),
+                  "Elements must be trivially copyable for realloc and memcpy");
 
   public:
     using element_t = element_type_;
