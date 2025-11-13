@@ -81,6 +81,7 @@ message(STATUS "Building py_ucall_posix: ${UCALL_BUILD_PYTHON_POSIX}")
 message(STATUS "Building py_ucall_uring: ${UCALL_BUILD_PYTHON_URING}")
 message(STATUS "Building benchmarks: ${UCALL_BUILD_BENCHMARKS}")
 message(STATUS "Building examples: ${UCALL_BUILD_EXAMPLES}")
+message(STATUS "Building tests: ${UCALL_BUILD_TESTS}")
 
 # Make Release by default
 if(NOT CMAKE_BUILD_TYPE)
@@ -145,7 +146,7 @@ find_package(Threads REQUIRED)
 FetchContent_Declare(
   simdjson
   GIT_REPOSITORY https://github.com/simdjson/simdjson.git
-  GIT_TAG v3.9.4
+  GIT_TAG v4.2.2
   GIT_SHALLOW 1)
 FetchContent_MakeAvailable(simdjson)
 include_directories(${simdjson_SOURCE_DIR}/include)
@@ -153,10 +154,10 @@ include_directories(${simdjson_SOURCE_DIR}/include)
 FetchContent_Declare(
   ada
   GIT_REPOSITORY https://github.com/ada-url/ada
-  GIT_TAG v2.8.0
+  GIT_TAG v3.3.0
   GIT_SHALLOW 1)
-FetchContent_MakeAvailable(simdjson)
-include_directories(${simdjson_SOURCE_DIR}/include)
+FetchContent_MakeAvailable(ada)
+include_directories(${ada_SOURCE_DIR}/include)
 
 # Parsing HTTP headers On MacOS you may need to locate headers here: export
 # CPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/
@@ -173,7 +174,7 @@ include_directories(${cxxopts_SOURCE_DIR}/include)
 FetchContent_Declare(
   stringzilla
   GIT_REPOSITORY https://github.com/ashvardanian/stringzilla.git
-  GIT_TAG v3.8.4
+  GIT_TAG v4.2.3
   GIT_SHALLOW 1)
 FetchContent_MakeAvailable(stringzilla)
 include_directories(${stringzilla_SOURCE_DIR})
@@ -182,7 +183,7 @@ include_directories(${stringzilla_SOURCE_DIR})
 FetchContent_Declare(
   simdutf
   GIT_REPOSITORY https://github.com/simdutf/simdutf
-  GIT_TAG v5.2.8
+  GIT_TAG v7.5.0
   GIT_SHALLOW 1)
 FetchContent_MakeAvailable(simdutf)
 include_directories(${simdutf_SOURCE_DIR}/include)
@@ -195,7 +196,7 @@ if(UCALL_BUILD_LIB_URING)
   ExternalProject_Add(
     liburing-ep
     GIT_REPOSITORY https://github.com/axboe/liburing.git
-    GIT_TAG liburing-2.3
+    GIT_TAG liburing-2.12
     GIT_SHALLOW 1
     PREFIX ${CMAKE_BINARY_DIR}/_deps/
     SOURCE_DIR ${URING_DIR}
@@ -231,6 +232,44 @@ if(UCALL_BUILD_BENCHMARKS)
   include_directories(${benchmark_SOURCE_DIR}/include)
 endif()
 
+# Noise Protocol Framework for secure communication
+set(NOISE_DIR ${CMAKE_BINARY_DIR}/_deps/noise-c-ep)
+ExternalProject_Add(
+  noise-c-ep
+  GIT_REPOSITORY https://github.com/rweather/noise-c.git
+  GIT_TAG master
+  GIT_SHALLOW 1
+  PREFIX ${CMAKE_BINARY_DIR}/_deps/
+  SOURCE_DIR ${NOISE_DIR}
+  CONFIGURE_COMMAND
+  echo Configuring Noise-C && cd ${NOISE_DIR} && autoreconf -i && ./configure
+  --prefix=${NOISE_DIR}/install --with-libsodium=no --with-openssl=no
+  BUILD_COMMAND cd ${NOISE_DIR} && make
+  INSTALL_COMMAND cd ${NOISE_DIR} && make install
+  UPDATE_COMMAND "")
+add_library(noise_internal STATIC IMPORTED GLOBAL)
+add_dependencies(noise_internal noise-c-ep)
+set_property(TARGET noise_internal PROPERTY IMPORTED_LOCATION
+  ${NOISE_DIR}/install/lib/libnoise.a)
+
+include_directories(${NOISE_DIR}/install/include/)
+set(NOISE_LIBRARIES noise_internal)
+
+if(UCALL_BUILD_TESTS)
+  # GoogleTest for unit testing
+  FetchContent_Declare(
+    googletest
+    GIT_REPOSITORY https://github.com/google/googletest.git
+    GIT_TAG v1.17.0
+    GIT_SHALLOW 1)
+  # For Windows: Prevent overriding the parent project's compiler/linker settings
+  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
+  FetchContent_MakeAvailable(googletest)
+  include_directories(${googletest_SOURCE_DIR}/googletest/include)
+  enable_testing()
+  message(STATUS "Building unit tests")
+endif()
+
 if(UCALL_BUILD_EXAMPLES)
   # CLI
   FetchContent_Declare(
@@ -246,15 +285,16 @@ include_directories(include/ src/)
 
 if(UCALL_BUILD_LIB_POSIX)
   add_library(ucall_server_posix src/engine_posix.cpp)
-  target_link_libraries(ucall_server_posix simdjson::simdjson simdutf::simdutf Threads::Threads)
+  target_link_libraries(ucall_server_posix simdjson::simdjson simdutf::simdutf
+    Threads::Threads ${NOISE_LIBRARIES})
   set(PYTHON_BACKEND ucall_server_posix)
 endif()
 
 if(UCALL_BUILD_LIB_URING)
   add_library(ucall_server_uring src/engine_uring.cpp)
   set(PYTHON_BACKEND ucall_server_uring)
-  target_link_libraries(ucall_server_uring simdjson::simdjson simdutf::simdutf Threads::Threads
-    ${URING_LIBS})
+  target_link_libraries(ucall_server_uring simdjson::simdjson simdutf::simdutf
+    Threads::Threads ${URING_LIBS} ${NOISE_LIBRARIES})
 endif()
 
 # Python bindings
@@ -303,4 +343,29 @@ if(UCALL_BUILD_EXAMPLES AND UCALL_BUILD_LIB_URING)
     fmt::fmt)
   target_compile_options(ucall_example_server_uring
     PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+endif()
+
+# Unit tests
+if(UCALL_BUILD_TESTS)
+  # Test: Container utilities (pool, array, mutex, etc.)
+  add_executable(test_shared scripts/test_shared.cpp)
+  target_include_directories(test_shared PRIVATE include/ src/)
+  target_link_libraries(test_shared PRIVATE GTest::gtest GTest::gtest_main Threads::Threads)
+  add_test(NAME test_shared COMMAND test_shared)
+  message(STATUS "Building test_shared")
+
+  # Test: URI routing trie
+  add_executable(test_routes scripts/test_routes.cpp)
+  target_include_directories(test_routes PRIVATE include/ src/)
+  target_link_libraries(test_routes PRIVATE GTest::gtest GTest::gtest_main Threads::Threads)
+  add_test(NAME test_routes COMMAND test_routes)
+  message(STATUS "Building test_routes")
+
+  # Test: Protocol state machine and Noise encryption
+  add_executable(test_protocol scripts/test_protocol.cpp)
+  target_include_directories(test_protocol PRIVATE include/ src/)
+  target_link_libraries(test_protocol PRIVATE GTest::gtest GTest::gtest_main
+    Threads::Threads ${NOISE_LIBRARIES})
+  add_test(NAME test_protocol COMMAND test_protocol)
+  message(STATUS "Building test_protocol")
 endif()
