@@ -385,6 +385,27 @@ In TCP, if a packet is lost, all subsequent packets are held back until the lost
 On reliable networks, there should be no noticeable difference.
 In the future, WebRTC DataChannels may be added.
 
+### What About HTTP/2?
+
+UCall currently only supports HTTP/1.1 with an upgrade path to WebSockets.
+HTTP/2 adds several important features:
+
+- `CONNECT` verb for tunneling in both directions to eliminate the need for traditional WebSockets.
+- Multiplexing multiple streams over a single TCP connection to improve resource utilization.
+- Header compression using `HPACK` to reduce bandwidth usage for common and repetitive headers.
+
+Those are all useful features.
+Still, maintaining dynamic decompression tables for `HPACK` isn't trivial.
+Moreover, the `CONNECT` has its own nested state machine inside each stream.
+Many such streams can be active simultaneously within the same TCP connection.
+All of that increases the attack surface and the potential for bugs and didn't align with UCall's design goals.
+
+### Why not HTTP/3 and QUIC?
+
+UCall currently only operates on top of TCP.
+Building around UDP has been a long-standing ambition for Unum since inception in 2015, and a QUIC-like protocol with Noise encryption makes a lot of sense, but it's far less compatible with existing infrastructure.
+So for now, UCall focuses on high-performance TCP-based communication and interoperability with existing HTTP/1.1 and WebSocket ecosystems.
+
 ### What Will You Miss From FastAPI?
 
 FastAPI comes with a rich ecosystem of plugins and extensions for authentication, database integration, OpenAPI schema generation, and more.
