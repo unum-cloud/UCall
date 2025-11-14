@@ -8,7 +8,7 @@ For coding guidelines, please refer to [ashvardanian/CONTRIBUTING.md](https://gi
 Release build:
 
 ```bash
-cmake -D CMAKE_BUILD_TYPE=Release -B build_release
+cmake -D CMAKE_BUILD_TYPE=Release -B build_release -D UCALL_BUILD_TESTS=1
 cmake --build build_release --config Release --parallel
 build_release/ucall_test_posix
 ```

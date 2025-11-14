@@ -64,84 +64,69 @@ using namespace unum::ucall;
 
 struct uring_server_t {
     server_state_t state;
-    mutex_t submission_mutex{};
-    memory_map_t fixed_buffers{};
-    io_uring uring{};
+    mutex_t submission_mutex {};
+    memory_map_t fixed_buffers {};
+    io_uring uring {};
 };
 
-void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
+void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
 
     // Simple sanity check
-    if (!server_out && !config_inout)
-        return;
+    if (!server_out && !config_inout) return;
 
     // Retrieve configs, if present
-    ucall_config_t& config = *config_inout;
-    if (!config.port)
-        config.port = 8545u;
-    if (!config.queue_depth)
-        config.queue_depth = 4096u;
-    if (!config.max_callbacks)
-        config.max_callbacks = 128u;
-    if (!config.max_concurrent_connections)
-        config.max_concurrent_connections = 1024u;
-    if (!config.max_threads)
-        config.max_threads = 1u;
-    if (!config.max_lifetime_micro_seconds)
-        config.max_lifetime_micro_seconds = 100'000u;
-    if (!config.max_lifetime_exchanges)
-        config.max_lifetime_exchanges = 100u;
-    if (!config.hostname)
-        config.hostname = "0.0.0.0";
+    ucall_config_t &config = *config_inout;
+    if (!config.port) config.port = 8545u;
+    if (!config.queue_depth) config.queue_depth = 4096u;
+    if (!config.max_callbacks) config.max_callbacks = 128u;
+    if (!config.max_concurrent_connections) config.max_concurrent_connections = 1024u;
+    if (!config.max_threads) config.max_threads = 1u;
+    if (!config.max_lifetime_micro_seconds) config.max_lifetime_micro_seconds = 100'000u;
+    if (!config.max_lifetime_exchanges) config.max_lifetime_exchanges = 100u;
+    if (!config.hostname) config.hostname = "0.0.0.0";
 
     // Allocate
-    int socket_options{1};
-    int socket_descriptor{-1};
-    int uring_result{-1};
-    uring_server_t* uctx = new uring_server_t();
-    struct io_uring* uring = &uctx->uring;
-    struct io_uring_params uring_params{};
-    struct io_uring_sqe* uring_sqe{};
-    struct io_uring_cqe* uring_cqe{};
+    int socket_options {1};
+    int socket_descriptor {-1};
+    int uring_result {-1};
+    uring_server_t *uctx = new uring_server_t();
+    struct io_uring *uring = &uctx->uring;
+    struct io_uring_params uring_params {};
+    struct io_uring_sqe *uring_sqe {};
+    struct io_uring_cqe *uring_cqe {};
     uring_params.features |= IORING_FEAT_FAST_POLL;
     uring_params.features |= IORING_FEAT_SQPOLL_NONFIXED;
     // uring_params.flags |= IORING_SETUP_COOP_TASKRUN;
     uring_params.flags |= IORING_SETUP_SQPOLL;
     uring_params.sq_thread_idle = wakeup_initial_frequency_ns_k;
     // uring_params.flags |= config.max_threads == 1 ? IORING_SETUP_SINGLE_ISSUER : 0; // 6.0+
-    server_state_t* server_ptr{};
-    pool_gt<connection_t> connections{};
-    array_gt<endpoint_t> callbacks{};
-    buffer_gt<struct iovec> registered_buffers{};
-    std::unique_ptr<ssl_context_t> ssl_context{};
+    server_state_t *server_ptr {};
+    pool<connection_t> connections {};
+    array<endpoint_t> callbacks {};
+    buffer<struct iovec> registered_buffers {};
+    std::unique_ptr<ssl_context_t> ssl_context {};
 
     // By default, let's open TCP port for IPv4.
-    struct sockaddr_in address{};
+    struct sockaddr_in address {};
     address.sin_family = AF_INET;
     address.sin_addr.s_addr = inet_addr(config.hostname);
     address.sin_port = htons(config.port);
 
     // Initialize `io_uring` first, it is the most likely to fail.
     uring_result = io_uring_queue_init_params(config.queue_depth, uring, &uring_params);
-    if (uring_result != 0)
-        goto cleanup;
+    if (uring_result != 0) goto cleanup;
 
     // Try allocating all the necessary memory.
-    server_ptr = (server_state_t*)std::malloc(sizeof(server_state_t));
-    if (!server_ptr)
-        goto cleanup;
-    if (!callbacks.reserve(config.max_callbacks))
-        goto cleanup;
-    if (!uctx->fixed_buffers.reserve(ram_page_size_k * 2u * config.max_concurrent_connections))
-        goto cleanup;
-    if (!connections.reserve(config.max_concurrent_connections))
-        goto cleanup;
+    server_ptr = (server_state_t *)std::malloc(sizeof(server_state_t));
+    if (!server_ptr) goto cleanup;
+    if (!callbacks.reserve(config.max_callbacks)) goto cleanup;
+    if (!uctx->fixed_buffers.reserve(ram_page_size_k * 2u * config.max_concurrent_connections)) goto cleanup;
+    if (!connections.reserve(config.max_concurrent_connections)) goto cleanup;
 
     // Additional `io_uring` setup.
-    if (!registered_buffers.resize(config.max_concurrent_connections * 2u))
-        goto cleanup;
+    if (!registered_buffers.resize(config.max_concurrent_connections * 2u)) goto cleanup;
     for (std::size_t i = 0; i != config.max_concurrent_connections; ++i) {
-        auto& connection = connections.at_offset(i);
+        auto &connection = connections.at_offset(i);
         auto inputs = uctx->fixed_buffers.ptr + ram_page_size_k * 2u * i;
         auto outputs = inputs + ram_page_size_k;
         connection.pipes.mount(inputs, outputs);
@@ -152,12 +137,10 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
         registered_buffers[i * 2u + 1u].iov_len = ram_page_size_k;
     }
     uring_result = io_uring_register_files_sparse(uring, config.max_concurrent_connections);
-    if (uring_result != 0)
-        goto cleanup;
+    if (uring_result != 0) goto cleanup;
     uring_result =
         io_uring_register_buffers(uring, registered_buffers.data(), static_cast<unsigned>(registered_buffers.size()));
-    if (uring_result != 0)
-        goto cleanup;
+    if (uring_result != 0) goto cleanup;
 
     // Configure the socket.
 
@@ -166,18 +149,15 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     uring_result = io_uring_submit_and_wait(uring, 1);
     uring_result = io_uring_wait_cqe(uring, &uring_cqe);
     socket_descriptor = uring_cqe->res;
-    if (socket_descriptor < 0)
-        goto cleanup;
+    if (socket_descriptor < 0) goto cleanup;
     // Not sure if this is required, after we have a kernel with `IORING_OP_SENDMSG_ZC` support, we can check.
     // if (setsockopt(socket_descriptor, SOL_SOCKET, SO_ZEROCOPY, &socket_options, sizeof(socket_options)) == -1)
     //     goto cleanup;
     if (setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-                   reinterpret_cast<char const*>(&socket_options), sizeof(socket_options)) == -1)
+                   reinterpret_cast<char const *>(&socket_options), sizeof(socket_options)) == -1)
         errno;
-    if (bind(socket_descriptor, (struct sockaddr*)&address, sizeof(address)) < 0)
-        goto cleanup;
-    if (listen(socket_descriptor, config.queue_depth) < 0)
-        goto cleanup;
+    if (bind(socket_descriptor, (struct sockaddr *)&address, sizeof(address)) < 0) goto cleanup;
+    if (listen(socket_descriptor, config.queue_depth) < 0) goto cleanup;
     if (config.ssl_certificates_count != 0) {
         ssl_context = std::make_unique<ssl_context_t>();
         if (ssl_context->init(config.ssl_private_key_path, config.ssl_certificates_paths,
@@ -188,7 +168,7 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
     // Initialize all the members.
     new (server_ptr) server_state_t();
     server_ptr->network_engine.network_data = uctx;
-    server_ptr->socket = descriptor_t{socket_descriptor};
+    server_ptr->socket = descriptor_t {socket_descriptor};
     server_ptr->ssl_context = std::move(ssl_context);
     server_ptr->protocol_type = config.protocol;
     server_ptr->max_lifetime_micro_seconds = config.max_lifetime_micro_seconds;
@@ -202,21 +182,18 @@ void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
 
 cleanup:
     errno;
-    if (uring->ring_fd)
-        io_uring_queue_exit(uring);
-    if (socket_descriptor >= 0)
-        close(socket_descriptor);
+    if (uring->ring_fd) io_uring_queue_exit(uring);
+    if (socket_descriptor >= 0) close(socket_descriptor);
     std::free(server_ptr);
     delete uctx;
     *server_out = nullptr;
 }
 
 void ucall_free(ucall_server_t punned_server) {
-    if (!punned_server)
-        return;
+    if (!punned_server) return;
 
-    server_state_t& server = *reinterpret_cast<server_state_t*>(punned_server);
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(server.network_engine.network_data);
+    server_state_t &server = *reinterpret_cast<server_state_t *>(punned_server);
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(server.network_engine.network_data);
     io_uring_unregister_buffers(&ctx->uring);
     io_uring_queue_exit(&ctx->uring);
     close(server.socket);
@@ -226,29 +203,25 @@ void ucall_free(ucall_server_t punned_server) {
 }
 
 void ucall_take_calls(ucall_server_t server, uint16_t thread_idx) {
-    engine_t& engine = *reinterpret_cast<engine_t*>(server);
-    if (!thread_idx && engine.logs_file_descriptor > 0)
-        engine.submit_stats_heartbeat();
-    while (true) {
-        ucall_take_call(server, thread_idx);
-    }
+    engine_t &engine = *reinterpret_cast<engine_t *>(server);
+    if (!thread_idx && engine.logs_file_descriptor > 0) engine.submit_stats_heartbeat();
+    while (true) { ucall_take_call(server, thread_idx); }
 }
 
 void ucall_take_call(ucall_server_t server, uint16_t thread_idx) {
     // Unlike the classical synchronous interface, this implements only a part of the connection machine,
     // is responsible for checking if a specific request has been completed. All of the submitted
     // memory must be preserved until we get the confirmation.
-    engine_t& engine = *reinterpret_cast<engine_t*>(server);
-    if (!thread_idx)
-        engine.consider_accepting_new_connection();
+    engine_t &engine = *reinterpret_cast<engine_t *>(server);
+    if (!thread_idx) engine.consider_accepting_new_connection();
 
-    constexpr std::size_t completed_max_k{16};
-    completed_event_t completed_events[completed_max_k]{};
+    constexpr std::size_t completed_max_k {16};
+    completed_event_t completed_events[completed_max_k] {};
     std::size_t completed_count = engine.pop_completed<completed_max_k>(completed_events);
 
     for (std::size_t i = 0; i != completed_count; ++i) {
-        completed_event_t& completed = completed_events[i];
-        automata_t automata{
+        completed_event_t &completed = completed_events[i];
+        automata_t automata {
             engine, //
             engine.spaces[thread_idx],
             *completed.connection_ptr,
@@ -262,39 +235,35 @@ void ucall_take_call(ucall_server_t server, uint16_t thread_idx) {
 }
 
 void ucall_call_reply_content(ucall_call_t call, ucall_str_t body, size_t body_len) {
-    automata_t& automata = *reinterpret_cast<automata_t*>(call);
-    connection_t& connection = automata.connection;
-    scratch_space_t& scratch = automata.scratch;
+    automata_t &automata = *reinterpret_cast<automata_t *>(call);
+    connection_t &connection = automata.connection;
+    scratch_space_t &scratch = automata.scratch;
     // No response is needed for "id"-less notifications.
-    if (scratch.dynamic_id.empty())
-        return;
+    if (scratch.dynamic_id.empty()) return;
 
     body_len = string_length(body, body_len);
-    struct iovec iovecs[iovecs_for_content_k]{};
+    struct iovec iovecs[iovecs_for_content_k] {};
     fill_with_content(iovecs, scratch.dynamic_id, std::string_view(body, body_len), true);
     connection.pipes.append_outputs<iovecs_for_content_k>(iovecs);
 }
 
 void ucall_call_reply_error(ucall_call_t call, int code_int, ucall_str_t note, size_t note_len) {
-    automata_t& automata = *reinterpret_cast<automata_t*>(call);
-    connection_t& connection = automata.connection;
-    scratch_space_t& scratch = automata.scratch;
+    automata_t &automata = *reinterpret_cast<automata_t *>(call);
+    connection_t &connection = automata.connection;
+    scratch_space_t &scratch = automata.scratch;
     // No response is needed for "id"-less notifications.
-    if (scratch.dynamic_id.empty())
-        return;
+    if (scratch.dynamic_id.empty()) return;
 
     note_len = string_length(note, note_len);
-    char code[max_integer_length_k]{};
+    char code[max_integer_length_k] {};
     std::to_chars_result res = std::to_chars(code, code + max_integer_length_k, code_int);
     auto code_len = res.ptr - code;
-    if (res.ec != std::error_code())
-        return ucall_call_reply_error_unknown(call);
+    if (res.ec != std::error_code()) return ucall_call_reply_error_unknown(call);
 
-    struct iovec iovecs[iovecs_for_error_k]{};
+    struct iovec iovecs[iovecs_for_error_k] {};
     fill_with_error(iovecs, scratch.dynamic_id, std::string_view(code, code_len), std::string_view(note, note_len),
                     true);
-    if (!connection.pipes.append_outputs<iovecs_for_error_k>(iovecs))
-        return ucall_call_reply_error_out_of_memory(call);
+    if (!connection.pipes.append_outputs<iovecs_for_error_k>(iovecs)) return ucall_call_reply_error_out_of_memory(call);
 }
 
 void ucall_call_reply_error_invalid_params(ucall_call_t call) {
@@ -309,79 +278,78 @@ void ucall_call_reply_error_out_of_memory(ucall_call_t call) {
     return ucall_call_reply_error(call, -32000, "Out of memory.", 14);
 }
 
-bool ucall_param_named_bool(ucall_call_t call, ucall_str_t name, size_t name_len, bool* result_ptr) {
+bool ucall_param_named_bool(ucall_call_t call, ucall_str_t name, size_t name_len, bool *result_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_bool()) {
         *result_ptr = value.get_bool().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_named_i64(ucall_call_t call, ucall_str_t name, size_t name_len, int64_t* result_ptr) {
+bool ucall_param_named_i64(ucall_call_t call, ucall_str_t name, size_t name_len, int64_t *result_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_int64()) {
         *result_ptr = value.get_int64().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_named_f64(ucall_call_t call, ucall_str_t name, size_t name_len, double* result_ptr) {
+bool ucall_param_named_f64(ucall_call_t call, ucall_str_t name, size_t name_len, double *result_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_double()) {
         *result_ptr = value.get_double().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_named_str(ucall_call_t call, ucall_str_t name, size_t name_len, ucall_str_t* result_ptr,
-                           size_t* result_len_ptr) {
+bool ucall_param_named_str(ucall_call_t call, ucall_str_t name, size_t name_len, ucall_str_t *result_ptr,
+                           size_t *result_len_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_string()) {
         *result_ptr = value.get_string().value_unsafe().data();
         *result_len_ptr = value.get_string_length().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_positional_bool(ucall_call_t call, size_t position, bool* result_ptr) {
+bool ucall_param_positional_bool(ucall_call_t call, size_t position, bool *result_ptr) {
     if (auto value = param_at(call, position); value.is_bool()) {
         *result_ptr = value.get_bool().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_positional_i64(ucall_call_t call, size_t position, int64_t* result_ptr) {
+bool ucall_param_positional_i64(ucall_call_t call, size_t position, int64_t *result_ptr) {
     if (auto value = param_at(call, position); value.is_int64()) {
         *result_ptr = value.get_int64().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_positional_f64(ucall_call_t call, size_t position, double* result_ptr) {
+bool ucall_param_positional_f64(ucall_call_t call, size_t position, double *result_ptr) {
     if (auto value = param_at(call, position); value.is_double()) {
         *result_ptr = value.get_double().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
-bool ucall_param_positional_str(ucall_call_t call, size_t position, ucall_str_t* result_ptr, size_t* result_len_ptr) {
+bool ucall_param_positional_str(ucall_call_t call, size_t position, ucall_str_t *result_ptr, size_t *result_len_ptr) {
     if (auto value = param_at(call, position); value.is_string()) {
         *result_ptr = value.get_string().value_unsafe().data();
         *result_len_ptr = value.get_string_length().value_unsafe();
         return true;
-    } else
-        return false;
+    }
+    else return false;
 }
 
 #pragma endregion C Definitions
 #pragma region Cpp Declarations
 
 bool connection_t::expired() const noexcept {
-    if (sleep_ns > max_inactive_duration_ns_k)
-        return true;
+    if (sleep_ns > max_inactive_duration_ns_k) return true;
 
     return false;
 }
@@ -415,8 +383,7 @@ bool automata_t::received_full_request() const noexcept {
     size_t bytes_expected = 0;
 
     auto json_or_error = split_body_headers(std::string_view(span.data(), span.size()));
-    if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr)
-        return true;
+    if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr) return true;
     parsed_request_t request = std::get<parsed_request_t>(json_or_error);
 
     auto res = std::from_chars(request.content_length.begin(), request.content_length.end(), bytes_expected);
@@ -429,8 +396,7 @@ bool automata_t::received_full_request() const noexcept {
     connection.content_length = bytes_expected;
     // }
 
-    if (span.size() < *connection.content_length)
-        return false;
+    if (span.size() < *connection.content_length) return false;
 
     // Available since 6.0.
     bool res = io_uring_opcode_supported(probe, IORING_OP_SEND_ZC);
@@ -438,10 +404,10 @@ bool automata_t::received_full_request() const noexcept {
     return res;
 }
 
-int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) noexcept {
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
-    io_uring* uring = &ctx->uring;
-    io_uring_sqe* uring_sqe{};
+int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) noexcept {
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+    io_uring *uring = &ctx->uring;
+    io_uring_sqe *uring_sqe {};
     ctx->submission_mutex.lock();
     uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_accept_direct(uring_sqe, socket, &connection.client_address, &connection.client_address_length, 0,
@@ -459,27 +425,27 @@ int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) 
     return res;
 }
 
-void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
-    __kernel_timespec wakeup{0, connection.next_wakeup};
-    io_uring* uring = &ctx->uring;
+void network_engine_t::set_stats_heartbeat(connection_t &connection) noexcept {
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+    __kernel_timespec wakeup {0, connection.next_wakeup};
+    io_uring *uring = &ctx->uring;
     ctx->submission_mutex.lock();
-    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_timeout(uring_sqe, &wakeup, 0, 0);
     io_uring_sqe_set_data(uring_sqe, &connection);
     io_uring_submit(uring);
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::close_connection_gracefully(connection_t& connection) noexcept {
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
+void network_engine_t::close_connection_gracefully(connection_t &connection) noexcept {
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
     // The operations are not expected to complete in exactly the same order
     // as their submissions. So to stop all existing communication on the
     // socket, we can cancel everything related to its "file descriptor",
     // and then close.
-    io_uring* uring = &ctx->uring;
+    io_uring *uring = &ctx->uring;
     ctx->submission_mutex.lock();
-    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_cancel_fd(uring_sqe, int(connection.descriptor), 0);
     io_uring_sqe_set_data(uring_sqe, NULL);
     io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_HARDLINK);
@@ -498,12 +464,12 @@ void network_engine_t::close_connection_gracefully(connection_t& connection) noe
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
+void network_engine_t::send_packet(connection_t &connection, void *buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
-    io_uring* uring = &ctx->uring;
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+    io_uring *uring = &ctx->uring;
     ctx->submission_mutex.lock();
-    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
 
     // TODO: Test and benchmark the `send_zc option`.
     // if (io_check_send_zc()) {
@@ -519,11 +485,11 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
+void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
     ctx->submission_mutex.lock();
-    io_uring* uring = &ctx->uring;
+    io_uring *uring = &ctx->uring;
 
     // Choosing between `recv` and `read` system calls:
     // > If a zero-length datagram is pending, read(2) and recv() with a
@@ -533,7 +499,7 @@ void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_
     // https://man7.org/linux/man-pages/man2/recv.2.html
     //
     // In this case we are waiting for an actual data, not some artificial wakeup.
-    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_read_fixed(uring_sqe, int(connection.descriptor), buffer, buffer_length, 0, buf_index);
     io_uring_sqe_set_data(uring_sqe, &connection);
     io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_LINK);
@@ -543,7 +509,7 @@ void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_
     // on this operation.
     // The `io_uring_prep_link_timeout` is a convenience method for poorly documented `IORING_OP_LINK_TIMEOUT`.
     uring_sqe = io_uring_get_sqe(uring);
-    __kernel_timespec wakeup{0, connection.next_wakeup};
+    __kernel_timespec wakeup {0, connection.next_wakeup};
     io_uring_prep_link_timeout(uring_sqe, &wakeup, 0);
     io_uring_sqe_set_data(uring_sqe, NULL);
     io_uring_sqe_set_flags(uring_sqe, 0);
@@ -551,35 +517,34 @@ void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_
     ctx->submission_mutex.unlock();
 }
 
-bool network_engine_t::is_canceled(ssize_t res, unum::ucall::connection_t const& conn) noexcept {
+bool network_engine_t::is_canceled(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
     return res == -ECANCELED;
 }
 
-bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const& conn) noexcept {
+bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
     // Since the socket operates in blocking mode, a return value of 0 is unlikely,
     // but just in case allow the possibility of occasional occurrences.
     return res == -EBADF || res == -EPIPE || (res == 0 && conn.empty_transmits > 8);
 }
 
-template <size_t max_count_ak> std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
-    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
-    io_uring* uring = &ctx->uring;
+template <size_t max_count_ak>
+std::size_t network_engine_t::pop_completed_events(completed_event_t *events) noexcept {
+    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+    io_uring *uring = &ctx->uring;
     unsigned uring_head = 0;
     unsigned completed = 0;
     unsigned passed = 0;
-    io_uring_cqe* uring_cqe{};
+    io_uring_cqe *uring_cqe {};
 
     ctx->submission_mutex.lock();
     io_uring_for_each_cqe(uring, uring_head, uring_cqe) {
         ++passed;
-        if (!uring_cqe->user_data)
-            continue;
+        if (!uring_cqe->user_data) continue;
 
-        events[completed].connection_ptr = (connection_t*)uring_cqe->user_data;
+        events[completed].connection_ptr = (connection_t *)uring_cqe->user_data;
         events[completed].result = uring_cqe->res;
         ++completed;
-        if (completed == max_count_ak)
-            break;
+        if (completed == max_count_ak) break;
     }
 
     io_uring_cq_advance(uring, passed);

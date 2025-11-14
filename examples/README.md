@@ -1,4 +1,17 @@
-# UCall Example & Benchmark
+# UCall Examples
+
+There are several obvious and more fun `./examples/`:
+
+- Trivial `echo` servers and clients
+- Redis-like in-memory key-value store for `set` and `get` operations
+- Coordination center for an emulated drone fleet using WebSockets
+- Matrix-Multiplication as a Service (MMaaS) with authentication & rate limits
+
+There are also several specialized attacks:
+
+- Slowloris-like DoS attack using many half-open connections
+
+---
 
 This folder implements a group of different servers with identical functionality, but using different RPC frameworks, including:
 
@@ -73,6 +86,7 @@ python examples/bench.py "fastapi_client.ClientWebSocket" --threads 8
 
 UCall can produce both a POSIX compliant old-school server, and a modern `io_uring`-based version for Linux kernel 5.19 and newer.
 You would either run `ucall_example_server_posix` or `ucall_example_server_uring`.
+UCall supports four URL schemes: `http://`, `ws://`, `http+noise://`, and `ws+noise://`.
 
 ```sh
 sudo apt-get install cmake g++ build-essential

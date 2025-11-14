@@ -82,10 +82,10 @@ typedef void *ucall_message_t;
  *  @see https://noiseprotocol.org/noise.html for pattern specifications.
  */
 typedef enum ucall_security_mode_t {
-    ucall_security_none_k,     // ? No encryption, plain TCP/IP.
-    ucall_security_noise_xx_k, // ? Trust on first use - no pre-shared keys needed.
-    ucall_security_noise_ik_k, // ? Client knows server's public key in advance.
-    ucall_security_noise_kk_k  // ? Both know each other's public keys in advance.
+    ucall_security_none_k,     // No encryption, plain TCP/IP.
+    ucall_security_noise_xx_k, // Trust on first use - no pre-shared keys needed.
+    ucall_security_noise_ik_k, // Client knows server's public key in advance.
+    ucall_security_noise_kk_k  // Both know each other's public keys in advance.
 } ucall_security_mode_t;
 
 /**
@@ -99,13 +99,13 @@ typedef uint8_t ucall_noise_key_t[32];
  *  For JSON-RPC all requests are typically sent via HTTP @c POST.
  */
 typedef enum ucall_verb_t {
-    ucall_verb_get_k,    // ? HTTP "GET" method for retrieving resources.
-    ucall_verb_post_k,   // ? HTTP "POST" method for creating resources.
-    ucall_verb_put_k,    // ? HTTP "PUT" method for updating resources.
-    ucall_verb_delete_k, // ? HTTP "DELETE" method for removing resources.
-    ucall_verb_patch_k,  // ? HTTP "PATCH" method for partial updates.
-    ucall_verb_head_k,   // ? HTTP "HEAD" method for retrieving headers only.
-    ucall_verb_options_k // ? HTTP "OPTIONS" method for retrieving supported methods.
+    ucall_verb_get_k,    // HTTP "GET" method for retrieving resources.
+    ucall_verb_post_k,   // HTTP "POST" method for creating resources.
+    ucall_verb_put_k,    // HTTP "PUT" method for updating resources.
+    ucall_verb_delete_k, // HTTP "DELETE" method for removing resources.
+    ucall_verb_patch_k,  // HTTP "PATCH" method for partial updates.
+    ucall_verb_head_k,   // HTTP "HEAD" method for retrieving headers only.
+    ucall_verb_options_k // HTTP "OPTIONS" method for retrieving supported methods.
 } ucall_verb_t;
 
 /**
@@ -115,9 +115,9 @@ typedef enum ucall_verb_t {
  *  Can be configured per-endpoint or globally.
  */
 typedef enum ucall_params_source_t {
-    ucall_params_from_uri_k,  // ? Parse parameters from URL query string (e.g., /sum?a=10&b=20).
-    ucall_params_from_path_k, // ? Parse parameters from URL path (e.g., /sum/{10}/{20}).
-    ucall_params_from_json_k  // ? Parse parameters from JSON body payload (e.g., {"a": 10, "b": 20}).
+    ucall_params_from_uri_k,  // Parse parameters from URL query string (e.g., /sum?a=10&b=20).
+    ucall_params_from_path_k, // Parse parameters from URL path (e.g., /sum/{10}/{20}).
+    ucall_params_from_json_k  // Parse parameters from JSON body payload (e.g., {"a": 10, "b": 20}).
 } ucall_params_source_t;
 
 /**
@@ -127,17 +127,17 @@ typedef enum ucall_params_source_t {
  *  For HTTP-specific status codes (200, 404, 500), use @c ucall_http_status_t.
  */
 typedef enum ucall_status_t {
-    ucall_status_ok_k = 0,      // ? Operation completed successfully
-    ucall_status_pending_k = 1, // ? Async operation still in progress
+    ucall_status_ok_k = 0,      // Operation completed successfully
+    ucall_status_pending_k = 1, // Async operation still in progress
 
-    ucall_status_invalid_argument_k = 2,  // ? Invalid function parameters (NULL pointers, invalid values)
-    ucall_status_out_of_memory_k = 3,     // ? Memory allocation failed
-    ucall_status_connection_failed_k = 4, // ? Failed to establish connection (DNS, TCP, or Noise handshake)
-    ucall_status_connection_closed_k = 5, // ? Connection closed unexpectedly
-    ucall_status_timeout_k = 6,           // ? Operation exceeded configured timeout
+    ucall_status_invalid_argument_k = 2,  // Invalid function parameters (NULL pointers, invalid values)
+    ucall_status_out_of_memory_k = 3,     // Memory allocation failed
+    ucall_status_connection_failed_k = 4, // Failed to establish connection (DNS, TCP, or Noise handshake)
+    ucall_status_connection_closed_k = 5, // Connection closed unexpectedly
+    ucall_status_timeout_k = 6,           // Operation exceeded configured timeout
 
-    ucall_status_not_found_k = 7,    // ? Requested resource/header/parameter not found
-    ucall_status_invalid_data_k = 8, // ? Malformed or invalid protocol data
+    ucall_status_not_found_k = 7,    // Requested resource/header/parameter not found
+    ucall_status_invalid_data_k = 8, // Malformed or invalid protocol data
 
 } ucall_status_t;
 
@@ -180,10 +180,10 @@ typedef enum ucall_http_status_t {
  *  @brief WebSocket event types, shared between client and server.
  */
 typedef enum ucall_websocket_event_t {
-    ucall_websocket_open_k,    // ? Connection established.
-    ucall_websocket_message_k, // ? Message received.
-    ucall_websocket_error_k,   // ? Error occurred.
-    ucall_websocket_close_k    // ? Connection closed.
+    ucall_websocket_open_k,    // Connection established.
+    ucall_websocket_message_k, // Message received.
+    ucall_websocket_error_k,   // Error occurred.
+    ucall_websocket_close_k    // Connection closed.
 } ucall_websocket_event_t;
 
 /**
@@ -227,16 +227,16 @@ typedef void (*ucall_websocket_callback_t)(                                     
  */
 typedef struct ucall_client_config_t {
 
-    uint32_t max_concurrent_connections;    // ? Default: 100
-    uint32_t connect_timeout_micro_seconds; // ? Default: 5'000'000
-    uint32_t request_timeout_micro_seconds; // ? Default: 30'000'000
+    uint32_t max_concurrent_connections;    // Default: 100
+    uint32_t connect_timeout_micro_seconds; // Default: 5'000'000
+    uint32_t request_timeout_micro_seconds; // Default: 30'000'000
 
-    ucall_noise_key_t const *noise_private_key; // ? Optional for client auth
+    ucall_noise_key_t const *noise_private_key; // Optional for client auth
 
-    int32_t logs_file_descriptor; // ? Default: STDERR_FILENO
-    char const *logs_format;      // ? Default: "human"
+    int32_t logs_file_descriptor; // Default: STDERR_FILENO
+    char const *logs_format;      // Default: "human"
 
-    uint16_t queue_depth; // ? Default: 128
+    uint16_t queue_depth; // Default: 128
 } ucall_client_config_t;
 
 /**
@@ -260,13 +260,13 @@ void ucall_client_free(ucall_client_t client);
  *  headers of individual requests.
  */
 typedef struct ucall_request_options_t {
-    uint32_t timeout_micro_seconds; // ? Default: 5'000'000
-    uint8_t max_retries;            // ? Default: 3
-    uint8_t max_redirects;          // ? Default: 5
+    uint32_t timeout_micro_seconds; // Default: 5'000'000
+    uint8_t max_retries;            // Default: 3
+    uint8_t max_redirects;          // Default: 5
 
-    ucall_security_mode_t security;      // ? Default: ucall_security_none_k
-    ucall_noise_key_t const *client_key; // ? Needed for KK security mode
-    ucall_noise_key_t const *server_key; // ? Needed for IK and KK security modes
+    ucall_security_mode_t security;      // Default: ucall_security_none_k
+    ucall_noise_key_t const *client_key; // Needed for KK security mode
+    ucall_noise_key_t const *server_key; // Needed for IK and KK security modes
 } ucall_request_options_t;
 
 /**
@@ -477,8 +477,8 @@ typedef enum ucall_log_level_t {
 } ucall_log_level_t;
 
 typedef enum ucall_log_mode_t {
-    ucall_log_mode_human_k, // ? Human-readable unit-normalized lines
-    ucall_log_mode_json_k,  // ? Newline-delimited JSONs documents
+    ucall_log_mode_human_k, // Human-readable unit-normalized lines
+    ucall_log_mode_json_k,  // Newline-delimited JSONs documents
 } ucall_log_mode_t;
 
 /**
@@ -503,21 +503,21 @@ typedef enum ucall_log_mode_t {
  *  @endcode
  */
 typedef struct ucall_server_config_t {
-    char const *bind_address;                   // ? Server address in "host:port" format. Default: "0.0.0.0:8545"
-    ucall_security_mode_t security_mode;        // ? Encryption mode for all connections. Default: ucall_security_none_k
-    ucall_noise_key_t const *noise_private_key; // ? Server identity for handshakes. Required for secure connections.
+    char const *bind_address;                   // Server address in "host:port" format. Default: "0.0.0.0:8545"
+    ucall_security_mode_t security_mode;        // Encryption mode for all connections. Default: ucall_security_none_k
+    ucall_noise_key_t const *noise_private_key; // Server identity for handshakes. Required for secure connections.
 
-    uint16_t max_threads;                // ? Thread pool size. Default: CPU count.
-    uint16_t max_concurrent_connections; // ? Connection limit. Default: 1024.
-    uint16_t queue_depth;                // ? Pending connections queue. Default: 128.
+    uint16_t max_threads;                // Thread pool size. Default: CPU count.
+    uint16_t max_concurrent_connections; // Connection limit. Default: 1024.
+    uint16_t queue_depth;                // Pending connections queue. Default: 128.
 
-    char const *logs_output_path; // ? Log file path. NULL redirects to stderr. Default: NULL.
-    ucall_log_mode_t log_mode;    // ? Log format. Default: ucall_log_mode_human_k.
+    char const *logs_output_path; // Log file path. NULL redirects to stderr. Default: NULL.
+    ucall_log_mode_t log_mode;    // Log format. Default: ucall_log_mode_human_k.
 
-    char const *metrics_address; // ? StatsD UDP endpoint "host:port". NULL = disabled. Default: NULL.
-    float metrics_sample_rate;   // ? Sampling rate [0.0, 1.0]. Default: 1.0.
-    char const *metrics_prefix;  // ? Metric name prefix. Default: "ucall".
-    char const *metrics_tags;    // ? Global tags "key:val,key:val". Default: NULL.
+    char const *metrics_address; // StatsD UDP endpoint "host:port". NULL = disabled. Default: NULL.
+    float metrics_sample_rate;   // Sampling rate [0.0, 1.0]. Default: 1.0.
+    char const *metrics_prefix;  // Metric name prefix. Default: "ucall".
+    char const *metrics_tags;    // Global tags "key:val,key:val". Default: NULL.
 } ucall_server_config_t;
 
 /**
@@ -562,8 +562,8 @@ typedef void (*ucall_received_http_request_callback_t)(ucall_received_http_reque
  *
  *  @see RFC 6570 Section 3.2.2 for simple string expansion specification.
  */
-ucall_status_t ucall_server_add_http_endpoint(                         //
-    ucall_server_t server, ucall_string_t template, ucall_verb_t verb, //
+ucall_status_t ucall_server_add_http_endpoint(                             //
+    ucall_server_t server, ucall_string_t uri_template, ucall_verb_t verb, //
     ucall_received_http_request_callback_t callback, void *context);
 
 /**
@@ -699,9 +699,9 @@ typedef void (*ucall_received_batch_http_request_callback_t)( //
  *  by accumulating multiple requests and processing them together.
  */
 typedef struct ucall_server_batch_endpoint_options_t {
-    size_t min_batch_size;            // ? Optimal batch size. Dispatch immediately when reached. Default: 1.
-    size_t max_batch_size;            // ? Maximum requests per batch. Force dispatch when reached. Default: 32.
-    size_t max_latency_micro_seconds; // ? Maximum wait time for partial batches. Default: 10'000 (10ms).
+    size_t min_batch_size;            // Optimal batch size. Dispatch immediately when reached. Default: 1.
+    size_t max_batch_size;            // Maximum requests per batch. Force dispatch when reached. Default: 32.
+    size_t max_latency_micro_seconds; // Maximum wait time for partial batches. Default: 10'000 (10ms).
 } ucall_server_batch_endpoint_options_t;
 
 /**
@@ -769,7 +769,7 @@ typedef struct ucall_server_batch_endpoint_options_t {
  */
 ucall_status_t ucall_server_add_batch_endpoint(            //
     ucall_server_t server,                                 //
-    ucall_string_t template, ucall_verb_t verb,            //
+    ucall_string_t uri_template, ucall_verb_t verb,        //
     ucall_server_batch_endpoint_options_t const *options,  //
     ucall_received_batch_http_request_callback_t callback, //
     void *context);
@@ -807,8 +807,8 @@ ucall_status_t ucall_server_batch_unpack(                             //
  *  @param[in] context Optional user-defined context pointer passed to all event callbacks.
  *  @return Status code (duplicate endpoint, invalid template, out of memory).
  */
-ucall_status_t ucall_server_add_websocket_endpoint( //
-    ucall_server_t server, ucall_string_t template, //
+ucall_status_t ucall_server_add_websocket_endpoint(     //
+    ucall_server_t server, ucall_string_t uri_template, //
     ucall_websocket_callback_t callback, void *context);
 
 /**
@@ -839,6 +839,54 @@ ucall_status_t ucall_server_websocket_send(             //
 void ucall_server_websocket_close(ucall_server_t server, ucall_websocket_t websocket);
 
 #pragma endregion Servers
+
+#pragma region Utilities
+
+typedef void *ucall_table_t;
+
+enum ucall_table_column_type_t {
+    ucall_table_column_int8_k,
+    ucall_table_column_int16_k,
+    ucall_table_column_int32_k,
+    ucall_table_column_int64_k,
+    ucall_table_column_uint8_k,
+    ucall_table_column_uint16_k,
+    ucall_table_column_uint32_k,
+    ucall_table_column_uint64_k,
+    ucall_table_column_float32_k,
+    ucall_table_column_float64_k,
+    ucall_table_column_string_k
+};
+
+size_t ucall_table_add_column(   //
+    ucall_table_t table,         //
+    ucall_string_t json_pointer, //
+    size_t json_pointer_length,  //
+    ucall_table_column_type_t type);
+
+size_t ucall_table_length(ucall_table_t table);
+size_t ucall_table_width(ucall_table_t table);
+
+bool ucall_table_get(    //
+    ucall_table_t table, //
+    size_t column,       //
+    ucall_table_column_type_t type);
+
+/**
+ *  @brief Parses a newline-delimited JSON (NDJSON) string into a table structure
+ *    using SIMD-JSON, materializing all documents and exporting into columnar format.
+ *
+ *  Each line in the input string should be a valid JSON object.
+ *
+ *  @param[in] json Input NDJSON string.
+ *  @param[in] json_length Length of the input string in bytes.
+ *  @param[out] table Output table structure populated with parsed data.
+ */
+void ucall_parse_table_from_ndjson(          //
+    ucall_string_t json, size_t json_length, //
+    ucall_table_t *table);
+
+#pragma endregion Utilities
 
 #ifdef __cplusplus
 } /* end extern "C" */
