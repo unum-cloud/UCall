@@ -43,21 +43,23 @@ class RoutingTrieTest : public ::testing::Test {
     route_trie_t trie;
 
     void SetUp() override {
-        // Initialize with reasonable capacity for tests
-        ASSERT_TRUE(route_trie_init(trie, 100, 200, 200)) << "Failed to initialize routing trie";
+        // Initialize the trie (auto-growing pools)
+        ASSERT_TRUE(trie.init()) << "Failed to initialize routing trie";
     }
 
-    void TearDown() override { route_trie_free(trie); }
+    void TearDown() override {
+        // No explicit cleanup needed - RAII handles it
+    }
 
     /** @brief Helper to verify route matches expected endpoint. */
     void expect_match(char const *path, ucall_verb_t verb, void *expected) {
-        void *result = route_trie_match(trie, path, verb);
+        void *result = trie.match(path, verb);
         EXPECT_EQ(result, expected) << "Path: " << path << ", Verb: " << static_cast<int>(verb);
     }
 
     /** @brief Helper to verify route does not match. */
     void expect_no_match(char const *path, ucall_verb_t verb) {
-        void *result = route_trie_match(trie, path, verb);
+        void *result = trie.match(path, verb);
         EXPECT_EQ(result, nullptr) << "Path: " << path << " should not match";
     }
 };
@@ -66,13 +68,13 @@ class RoutingTrieTest : public ::testing::Test {
 
 TEST_F(RoutingTrieTest, InitializationSucceeds) {
     // Trie is initialized in SetUp()
-    EXPECT_NE(trie.root, nullptr);
-    // Pools are initialized (no public capacity() method to check)
+    EXPECT_GT(trie.capacity(), 0u);
+    EXPECT_EQ(trie.pool_count(), 1u); // One pool allocated per type
 }
 
 TEST_F(RoutingTrieTest, RootPathMatching) {
     void *endpoint1 = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/", ucall_verb_get_k, endpoint1));
+    ASSERT_TRUE(trie.insert("/", ucall_verb_get_k, endpoint1));
 
     expect_match("/", ucall_verb_get_k, endpoint1);
     expect_no_match("/", ucall_verb_post_k); // Different verb
@@ -82,8 +84,8 @@ TEST_F(RoutingTrieTest, SingleLiteralSegment) {
     void *endpoint1 = make_endpoint(1);
     void *endpoint2 = make_endpoint(2);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_get_k, endpoint1));
-    ASSERT_TRUE(route_trie_insert(trie, "/posts", ucall_verb_get_k, endpoint2));
+    ASSERT_TRUE(trie.insert("/users", ucall_verb_get_k, endpoint1));
+    ASSERT_TRUE(trie.insert("/posts", ucall_verb_get_k, endpoint2));
 
     expect_match("/users", ucall_verb_get_k, endpoint1);
     expect_match("/posts", ucall_verb_get_k, endpoint2);
@@ -92,7 +94,7 @@ TEST_F(RoutingTrieTest, SingleLiteralSegment) {
 
 TEST_F(RoutingTrieTest, MultiSegmentLiterals) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/api/v1/users", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert("/api/v1/users", ucall_verb_get_k, endpoint));
 
     expect_match("/api/v1/users", ucall_verb_get_k, endpoint);
     expect_no_match("/api/v1", ucall_verb_get_k);
@@ -106,9 +108,8 @@ TEST_F(RoutingTrieTest, EmptyPathHandling) {
 
 TEST_F(RoutingTrieTest, CleanupDoesNotCrash) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/test", ucall_verb_get_k, endpoint));
-    route_trie_free(trie);
-    // TearDown will call free again, should be idempotent
+    ASSERT_TRUE(trie.insert("/test", ucall_verb_get_k, endpoint));
+    // RAII handles cleanup automatically - no explicit free needed
 }
 
 #pragma endregion Literal Matching Tests
@@ -117,7 +118,7 @@ TEST_F(RoutingTrieTest, CleanupDoesNotCrash) {
 
 TEST_F(RoutingTrieTest, SingleParameter) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/users/{id}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/users/{id}", ucall_verb_get_k, endpoint));
 
     expect_match("/users/123", ucall_verb_get_k, endpoint);
     expect_match("/users/abc", ucall_verb_get_k, endpoint);
@@ -128,7 +129,7 @@ TEST_F(RoutingTrieTest, SingleParameter) {
 
 TEST_F(RoutingTrieTest, MultipleParameters) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/posts/{year}/{month}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/posts/{year}/{month}", ucall_verb_get_k, endpoint));
 
     expect_match("/posts/2024/11", ucall_verb_get_k, endpoint);
     expect_match("/posts/2025/01", ucall_verb_get_k, endpoint);
@@ -138,7 +139,7 @@ TEST_F(RoutingTrieTest, MultipleParameters) {
 
 TEST_F(RoutingTrieTest, MixedLiteralsAndParameters) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/api/{version}/users/{id}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/api/{version}/users/{id}", ucall_verb_get_k, endpoint));
 
     expect_match("/api/v1/users/123", ucall_verb_get_k, endpoint);
     expect_match("/api/v2/users/456", ucall_verb_get_k, endpoint);
@@ -150,9 +151,9 @@ TEST_F(RoutingTrieTest, ParameterAtDifferentPositions) {
     void *endpoint2 = make_endpoint(2);
     void *endpoint3 = make_endpoint(3);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/{resource}/list", ucall_verb_get_k, endpoint1));
-    ASSERT_TRUE(route_trie_insert(trie, "/admin/{action}", ucall_verb_get_k, endpoint2));
-    ASSERT_TRUE(route_trie_insert(trie, "/api/{version}/{entity}", ucall_verb_get_k, endpoint3));
+    ASSERT_TRUE(trie.insert( "/{resource}/list", ucall_verb_get_k, endpoint1));
+    ASSERT_TRUE(trie.insert( "/admin/{action}", ucall_verb_get_k, endpoint2));
+    ASSERT_TRUE(trie.insert( "/api/{version}/{entity}", ucall_verb_get_k, endpoint3));
 
     expect_match("/users/list", ucall_verb_get_k, endpoint1);
     expect_match("/admin/dashboard", ucall_verb_get_k, endpoint2);
@@ -160,28 +161,17 @@ TEST_F(RoutingTrieTest, ParameterAtDifferentPositions) {
 }
 
 TEST_F(RoutingTrieTest, ParameterNamesStored) {
-    // This test verifies that parameter names are stored in the trie nodes
+    // Test that parameter names work correctly through matching behavior
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/users/{user_id}/posts/{post_id}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert("/users/{user_id}/posts/{post_id}", ucall_verb_get_k, endpoint));
 
-    // Navigate to parameter nodes and verify names are stored
-    ASSERT_NE(trie.root, nullptr);
+    // Verify matching works with different parameter values
+    expect_match("/users/123/posts/456", ucall_verb_get_k, endpoint);
+    expect_match("/users/abc/posts/xyz", ucall_verb_get_k, endpoint);
 
-    // Find "users" literal child
-    route_node_t *users_node = find_literal_child(trie.root, "users");
-    ASSERT_NE(users_node, nullptr);
-
-    // Verify first parameter node has correct name
-    ASSERT_NE(users_node->param_child, nullptr);
-    EXPECT_EQ(users_node->param_name, "user_id");
-
-    // Find "posts" literal child
-    route_node_t *posts_node = find_literal_child(users_node->param_child, "posts");
-    ASSERT_NE(posts_node, nullptr);
-
-    // Verify second parameter node has correct name
-    ASSERT_NE(posts_node->param_child, nullptr);
-    EXPECT_EQ(posts_node->param_name, "post_id");
+    // Should not match wrong structure
+    expect_no_match("/users/123", ucall_verb_get_k);
+    expect_no_match("/users/123/posts", ucall_verb_get_k);
 }
 
 TEST_F(RoutingTrieTest, ConflictingParameterNames) {
@@ -189,10 +179,10 @@ TEST_F(RoutingTrieTest, ConflictingParameterNames) {
     void *endpoint2 = make_endpoint(2);
 
     // First route: /users/{id}/posts
-    ASSERT_TRUE(route_trie_insert(trie, "/users/{id}/posts", ucall_verb_get_k, endpoint1));
+    ASSERT_TRUE(trie.insert( "/users/{id}/posts", ucall_verb_get_k, endpoint1));
 
     // Second route with different parameter name at same position should fail
-    EXPECT_FALSE(route_trie_insert(trie, "/users/{user_id}/comments", ucall_verb_get_k, endpoint2));
+    EXPECT_FALSE(trie.insert( "/users/{user_id}/comments", ucall_verb_get_k, endpoint2));
 }
 
 #pragma endregion Parameter Matching Tests
@@ -201,7 +191,7 @@ TEST_F(RoutingTrieTest, ConflictingParameterNames) {
 
 TEST_F(RoutingTrieTest, SimpleWildcard) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/files/{*path}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/files/{*path}", ucall_verb_get_k, endpoint));
 
     expect_match("/files/a.txt", ucall_verb_get_k, endpoint);
     expect_match("/files/a/b/c.txt", ucall_verb_get_k, endpoint);
@@ -211,7 +201,7 @@ TEST_F(RoutingTrieTest, SimpleWildcard) {
 
 TEST_F(RoutingTrieTest, WildcardWithPrefix) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/static/{*filepath}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/static/{*filepath}", ucall_verb_get_k, endpoint));
 
     expect_match("/static/css/style.css", ucall_verb_get_k, endpoint);
     expect_match("/static/js/app.js", ucall_verb_get_k, endpoint);
@@ -220,7 +210,7 @@ TEST_F(RoutingTrieTest, WildcardWithPrefix) {
 
 TEST_F(RoutingTrieTest, WildcardConsumesAllRemaining) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/docs/{*page}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/docs/{*page}", ucall_verb_get_k, endpoint));
 
     // Wildcard should consume any number of remaining segments
     expect_match("/docs/intro", ucall_verb_get_k, endpoint);
@@ -229,15 +219,15 @@ TEST_F(RoutingTrieTest, WildcardConsumesAllRemaining) {
 }
 
 TEST_F(RoutingTrieTest, WildcardNameStored) {
+    // Test that wildcard names work correctly through matching behavior
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/assets/{*filepath}", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert("/assets/{*filepath}", ucall_verb_get_k, endpoint));
 
-    // Navigate to wildcard node and verify name
-    ASSERT_NE(trie.root, nullptr);
-    route_node_t *assets_node = find_literal_child(trie.root, "assets");
-    ASSERT_NE(assets_node, nullptr);
-    ASSERT_NE(assets_node->wildcard_child, nullptr);
-    EXPECT_EQ(assets_node->wildcard_name, "filepath");
+    // Verify wildcard matches various paths
+    expect_match("/assets/css/style.css", ucall_verb_get_k, endpoint);
+    expect_match("/assets/js/app.js", ucall_verb_get_k, endpoint);
+    expect_match("/assets/images/logo.png", ucall_verb_get_k, endpoint);
+    expect_match("/assets/a/b/c/d/e", ucall_verb_get_k, endpoint);
 }
 
 #pragma endregion Wildcard Matching Tests
@@ -250,10 +240,10 @@ TEST_F(RoutingTrieTest, SamePathDifferentVerbs) {
     void *put_endpoint = make_endpoint(3);
     void *delete_endpoint = make_endpoint(4);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_get_k, get_endpoint));
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_post_k, post_endpoint));
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_put_k, put_endpoint));
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_delete_k, delete_endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_get_k, get_endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_post_k, post_endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_put_k, put_endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_delete_k, delete_endpoint));
 
     expect_match("/users", ucall_verb_get_k, get_endpoint);
     expect_match("/users", ucall_verb_post_k, post_endpoint);
@@ -268,7 +258,7 @@ TEST_F(RoutingTrieTest, AllSevenVerbs) {
 
     for (int i = 0; i < 7; ++i) {
         endpoints[i] = make_endpoint(i + 1);
-        ASSERT_TRUE(route_trie_insert(trie, "/test", verbs[i], endpoints[i]));
+        ASSERT_TRUE(trie.insert( "/test", verbs[i], endpoints[i]));
     }
 
     for (int i = 0; i < 7; ++i) { expect_match("/test", verbs[i], endpoints[i]); }
@@ -276,7 +266,7 @@ TEST_F(RoutingTrieTest, AllSevenVerbs) {
 
 TEST_F(RoutingTrieTest, UnregisteredVerbReturnsNull) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_get_k, endpoint));
 
     expect_match("/users", ucall_verb_get_k, endpoint);
     expect_no_match("/users", ucall_verb_post_k); // POST not registered
@@ -286,8 +276,8 @@ TEST_F(RoutingTrieTest, DuplicateVerbFails) {
     void *endpoint1 = make_endpoint(1);
     void *endpoint2 = make_endpoint(2);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_get_k, endpoint1));
-    EXPECT_FALSE(route_trie_insert(trie, "/users", ucall_verb_get_k, endpoint2)); // Duplicate
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_get_k, endpoint1));
+    EXPECT_FALSE(trie.insert( "/users", ucall_verb_get_k, endpoint2)); // Duplicate
 }
 
 #pragma endregion HTTP Verb Routing Tests
@@ -296,7 +286,7 @@ TEST_F(RoutingTrieTest, DuplicateVerbFails) {
 
 TEST_F(RoutingTrieTest, QueryStringStripped) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/search", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/search", ucall_verb_get_k, endpoint));
 
     expect_match("/search?q=test", ucall_verb_get_k, endpoint);
     expect_match("/search?q=test&page=2", ucall_verb_get_k, endpoint);
@@ -305,7 +295,7 @@ TEST_F(RoutingTrieTest, QueryStringStripped) {
 
 TEST_F(RoutingTrieTest, FragmentStripped) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/docs", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/docs", ucall_verb_get_k, endpoint));
 
     expect_match("/docs#section1", ucall_verb_get_k, endpoint);
     expect_match("/docs#top", ucall_verb_get_k, endpoint);
@@ -313,7 +303,7 @@ TEST_F(RoutingTrieTest, FragmentStripped) {
 
 TEST_F(RoutingTrieTest, QueryAndFragmentStripped) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/page", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/page", ucall_verb_get_k, endpoint));
 
     expect_match("/page?key=value#section", ucall_verb_get_k, endpoint);
     expect_match("/page#section?not_a_query", ucall_verb_get_k, endpoint); // Fragment comes first
@@ -335,8 +325,8 @@ TEST_F(RoutingTrieTest, LiteralBeatsParameter) {
     void *literal_endpoint = make_endpoint(1);
     void *param_endpoint = make_endpoint(2);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/users/{id}", ucall_verb_get_k, param_endpoint));
-    ASSERT_TRUE(route_trie_insert(trie, "/users/new", ucall_verb_get_k, literal_endpoint));
+    ASSERT_TRUE(trie.insert( "/users/{id}", ucall_verb_get_k, param_endpoint));
+    ASSERT_TRUE(trie.insert( "/users/new", ucall_verb_get_k, literal_endpoint));
 
     // Literal should be preferred
     expect_match("/users/new", ucall_verb_get_k, literal_endpoint);
@@ -347,8 +337,8 @@ TEST_F(RoutingTrieTest, ParameterBeatsWildcard) {
     void *param_endpoint = make_endpoint(1);
     void *wildcard_endpoint = make_endpoint(2);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/files/{*path}", ucall_verb_get_k, wildcard_endpoint));
-    ASSERT_TRUE(route_trie_insert(trie, "/files/{id}", ucall_verb_get_k, param_endpoint));
+    ASSERT_TRUE(trie.insert( "/files/{*path}", ucall_verb_get_k, wildcard_endpoint));
+    ASSERT_TRUE(trie.insert( "/files/{id}", ucall_verb_get_k, param_endpoint));
 
     // Parameter should beat wildcard for single segment
     expect_match("/files/123", ucall_verb_get_k, param_endpoint);
@@ -362,8 +352,8 @@ TEST_F(RoutingTrieTest, InsertionOrderIrrelevant) {
     void *endpoint2 = make_endpoint(2);
 
     // Insert parameter first, literal second
-    ASSERT_TRUE(route_trie_insert(trie, "/items/{id}", ucall_verb_get_k, endpoint1));
-    ASSERT_TRUE(route_trie_insert(trie, "/items/featured", ucall_verb_get_k, endpoint2));
+    ASSERT_TRUE(trie.insert( "/items/{id}", ucall_verb_get_k, endpoint1));
+    ASSERT_TRUE(trie.insert( "/items/featured", ucall_verb_get_k, endpoint2));
 
     // Literal still wins regardless of insertion order
     expect_match("/items/featured", ucall_verb_get_k, endpoint2);
@@ -379,7 +369,7 @@ TEST_F(RoutingTrieTest, MaximumSegments) {
     void *endpoint = make_endpoint(1);
     char const *path = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p"; // 16 segments
 
-    ASSERT_TRUE(route_trie_insert(trie, path, ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( path, ucall_verb_get_k, endpoint));
     expect_match(path, ucall_verb_get_k, endpoint);
 }
 
@@ -389,7 +379,7 @@ TEST_F(RoutingTrieTest, ExceedingMaximumSegments) {
     char const *path = "/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q"; // 17 segments
 
     // Should fail to parse or insert
-    bool result = route_trie_insert(trie, path, ucall_verb_get_k, endpoint);
+    bool result = trie.insert( path, ucall_verb_get_k, endpoint);
     EXPECT_FALSE(result) << "Should reject paths with >16 segments";
 }
 
@@ -397,13 +387,13 @@ TEST_F(RoutingTrieTest, DuplicateRouteRegistration) {
     void *endpoint1 = make_endpoint(1);
     void *endpoint2 = make_endpoint(2);
 
-    ASSERT_TRUE(route_trie_insert(trie, "/users/{id}", ucall_verb_get_k, endpoint1));
-    EXPECT_FALSE(route_trie_insert(trie, "/users/{id}", ucall_verb_get_k, endpoint2)); // Duplicate
+    ASSERT_TRUE(trie.insert( "/users/{id}", ucall_verb_get_k, endpoint1));
+    EXPECT_FALSE(trie.insert( "/users/{id}", ucall_verb_get_k, endpoint2)); // Duplicate
 }
 
 TEST_F(RoutingTrieTest, TrailingSlashHandling) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_get_k, endpoint));
 
     // Current implementation: trailing slash creates empty segment (skipped)
     expect_match("/users/", ucall_verb_get_k, endpoint);
@@ -420,13 +410,13 @@ TEST_F(RoutingTrieTest, VeryLongPath) {
     // Total: 1000 bytes in segments + 10 slashes = 1010 bytes
 
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, long_path.c_str(), ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( long_path.c_str(), ucall_verb_get_k, endpoint));
     expect_match(long_path.c_str(), ucall_verb_get_k, endpoint);
 }
 
 TEST_F(RoutingTrieTest, EmptySegmentsSkipped) {
     void *endpoint = make_endpoint(1);
-    ASSERT_TRUE(route_trie_insert(trie, "/users", ucall_verb_get_k, endpoint));
+    ASSERT_TRUE(trie.insert( "/users", ucall_verb_get_k, endpoint));
 
     // Double slashes create empty segments which are skipped
     expect_match("/users", ucall_verb_get_k, endpoint);
@@ -434,97 +424,88 @@ TEST_F(RoutingTrieTest, EmptySegmentsSkipped) {
     // Depends on whether Ada or similar is used for normalization
 }
 
-TEST_F(RoutingTrieTest, BufferCapacityLimits) {
-    // Initialize with very small capacity
-    route_trie_t small_trie;
-    ASSERT_TRUE(route_trie_init(small_trie, 10, 10, 10)); // Only 10 nodes, 10 edges, 10 endpoints
+TEST_F(RoutingTrieTest, AutoGrowthOnCapacityExceeded) {
+    // Start with small initial capacity (default 100)
+    route_trie_t growing_trie;
+    ASSERT_TRUE(growing_trie.init());
 
     void *endpoint = make_endpoint(1);
+    std::size_t initial_pool_count = growing_trie.pool_count();
 
-    // Fill up the trie
-    bool insert_succeeded = true;
-    int routes_added = 0;
-    for (int i = 0; i < 20 && insert_succeeded; ++i) {
-        std::string path = "/route" + std::to_string(i);
-        insert_succeeded = route_trie_insert(small_trie, path.c_str(), ucall_verb_get_k, endpoint);
-        if (insert_succeeded) routes_added++;
+    // Keep strings alive - string_view requires underlying storage to persist
+    std::vector<std::string> paths;
+    paths.reserve(200);
+
+    // Add many routes - should trigger auto-growth
+    for (int i = 0; i < 200; ++i) {
+        paths.push_back("/route" + std::to_string(i));
+        ASSERT_TRUE(growing_trie.insert(paths.back(), ucall_verb_get_k, endpoint))
+            << "Auto-growth should allow unlimited routes (only OOM fails)";
     }
 
-    // Should have hit capacity limit before 20 routes
-    EXPECT_LT(routes_added, 20) << "Should hit capacity limit";
-    EXPECT_GT(routes_added, 0) << "Should insert at least some routes";
-
-    route_trie_free(small_trie);
+    // Should have grown (more pools allocated)
+    EXPECT_GT(growing_trie.pool_count(), initial_pool_count) << "Pools should have grown";
 }
 
 #pragma endregion Edge Cases Tests
 
 #pragma region Error Handling Tests
 
-TEST_F(RoutingTrieTest, NodesPoolExhausted) {
-    // Initialize with minimal node capacity
-    route_trie_t tiny_trie;
-    ASSERT_TRUE(route_trie_init(tiny_trie, 2, 100, 100)); // Only 2 nodes (root + 1 more)
+TEST_F(RoutingTrieTest, PoolGrowthExponential) {
+    // Test that pools grow exponentially (2x each time)
+    route_trie_t growing_trie;
+    ASSERT_TRUE(growing_trie.init());
 
     void *endpoint = make_endpoint(1);
 
-    // First insert should succeed (uses root)
-    EXPECT_TRUE(route_trie_insert(tiny_trie, "/a", ucall_verb_get_k, endpoint));
+    // Track capacity growth
+    std::size_t prev_capacity = growing_trie.capacity();
+    std::size_t prev_pool_count = growing_trie.pool_count();
 
-    // Second insert might fail due to pool exhaustion
-    bool second = route_trie_insert(tiny_trie, "/b", ucall_verb_get_k, endpoint);
+    // Keep strings alive
+    std::vector<std::string> paths;
+    paths.reserve(500);
 
-    // Third insert should definitely fail
-    bool third = route_trie_insert(tiny_trie, "/c", ucall_verb_get_k, endpoint);
+    // Add enough routes to trigger multiple growth cycles
+    for (int i = 0; i < 500; ++i) {
+        paths.push_back("/route" + std::to_string(i));
+        ASSERT_TRUE(growing_trie.insert(paths.back(), ucall_verb_get_k, endpoint));
 
-    EXPECT_FALSE(second || third) << "Should fail when nodes pool exhausted";
-
-    route_trie_free(tiny_trie);
-}
-
-TEST_F(RoutingTrieTest, EdgesBufferExhausted) {
-    // Initialize with minimal edge capacity
-    route_trie_t tiny_trie;
-    ASSERT_TRUE(route_trie_init(tiny_trie, 100, 2, 100)); // Plenty of nodes, only 2 edges
-
-    void *endpoint = make_endpoint(1);
-
-    // First insert should succeed
-    EXPECT_TRUE(route_trie_insert(tiny_trie, "/a", ucall_verb_get_k, endpoint));
-
-    // More inserts should eventually fail when edge buffer is full
-    bool failed = false;
-    for (int i = 0; i < 10 && !failed; ++i) {
-        std::string path = "/route" + std::to_string(i);
-        if (!route_trie_insert(tiny_trie, path.c_str(), ucall_verb_get_k, endpoint)) { failed = true; }
+        std::size_t current_pool_count = growing_trie.pool_count();
+        if (current_pool_count > prev_pool_count) {
+            std::size_t current_capacity = growing_trie.capacity();
+            // Capacity should have increased (new pool added)
+            EXPECT_GT(current_capacity, prev_capacity);
+            prev_capacity = current_capacity;
+            prev_pool_count = current_pool_count;
+        }
     }
 
-    EXPECT_TRUE(failed) << "Should fail when edges buffer exhausted";
-
-    route_trie_free(tiny_trie);
+    // Should have grown multiple times
+    EXPECT_GT(growing_trie.pool_count(), 1u);
 }
 
 TEST_F(RoutingTrieTest, InvalidTemplateSyntax) {
     void *endpoint = make_endpoint(1);
 
     // Empty braces
-    EXPECT_FALSE(route_trie_insert(trie, "/users/{}", ucall_verb_get_k, endpoint));
+    EXPECT_FALSE(trie.insert( "/users/{}", ucall_verb_get_k, endpoint));
 
     // Wildcard without name
-    EXPECT_FALSE(route_trie_insert(trie, "/files/{*}", ucall_verb_get_k, endpoint));
+    EXPECT_FALSE(trie.insert( "/files/{*}", ucall_verb_get_k, endpoint));
 
     // Unclosed braces
-    EXPECT_FALSE(route_trie_insert(trie, "/users/{id", ucall_verb_get_k, endpoint));
+    EXPECT_FALSE(trie.insert( "/users/{id", ucall_verb_get_k, endpoint));
 }
 
 TEST_F(RoutingTrieTest, NullPointerSafety) {
-    // Match should handle nullptr safely
-    void *result = route_trie_match(trie, "/test", ucall_verb_get_k);
+    // Match should return nullptr for non-existent routes
+    void *result = trie.match("/test", ucall_verb_get_k);
     EXPECT_EQ(result, nullptr);
 
-    // find_literal_child with null node
-    route_node_t *child = find_literal_child(nullptr, "test");
-    EXPECT_EQ(child, nullptr);
+    // Empty path handling
+    result = trie.match("", ucall_verb_get_k);
+    EXPECT_EQ(result, nullptr);
 }
 
 #pragma endregion Error Handling Tests

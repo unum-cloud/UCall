@@ -1,5 +1,4 @@
 /**
- *  @file protocol_shared.hpp
  *  @brief Protocol-specific shared logic for HTTP and WebSockets including Noise Protocol encryption,
  *         memory buffers, exchange pipes, and URI routing.
  *
@@ -16,6 +15,7 @@
  *  @note This file doesn't contain general-purpose utilities - those belong in @c shared.hpp.
  *        It only focuses on network protocol-related shared logic.
  *
+ *  @file src/protocol_shared.hpp
  *  @author Ash Vardanian
  *  @date January 13, 2025
  */
@@ -127,8 +127,8 @@ struct exchange_pipe_t {
  *  @brief Manages bidirectional data exchange with hybrid embedded/dynamic buffering.
  *
  *  Each connection has two pipes (input/output) with two-tier memory management:
- *  - **Embedded buffers** (4KB): Stack-allocated, zero-allocation fast path for small messages
- *  - **Dynamic buffers**: Heap-allocated fallback for large messages
+ *  - @b Embedded buffers (4KB): Stack-allocated, zero-allocation fast path for small messages
+ *  - @b Dynamic buffers: Heap-allocated fallback for large messages
  *
  *  Data flow:
  *  1. Incoming data lands in embedded input buffer
@@ -139,11 +139,13 @@ struct exchange_pipe_t {
  *  @note Non-copyable and non-movable to maintain buffer pointer stability.
  */
 class exchange_pipes_t {
-    /// @brief A combination of an embedded and dynamic memory pool for content reception.
-    /// We always absorb new packets in the embedded part, later moving them into dynamic memory,
-    /// if any more data is expected. Requires @b padding at the end, to accelerate parsing.
+    /**
+     *  @brief A combination of an embedded and dynamic memory pool for content reception.
+     *  We always absorb new packets in the embedded part, later moving them into dynamic memory,
+     *  if any more data is expected. Requires @b padding at the end, to accelerate parsing.
+     */
     exchange_pipe_t input_ {};
-    /// @brief A combination of an embedded and dynamic memory pool for response content.
+    /**  @brief A combination of an embedded and dynamic memory pool for response content. */
     exchange_pipe_t output_ {};
     std::size_t output_submitted_ {};
 
@@ -294,7 +296,7 @@ struct connection_stats_t {
 
 /**
  *  @brief Represents a connection with Noise Protocol encryption, buffering,
- *         and state management for secure communication.
+ *    and state management for secure communication.
  */
 struct connection_t {
     /// @brief Exchange buffers to pipe information in both directions.
@@ -648,7 +650,7 @@ parsed_request_t parse_request(std::string_view) {
 [[nodiscard]] inline bool server_state_t::register_endpoint( //
     std::string_view uri_template, ucall_verb_t verb,        //
     ucall_callback_t callback, void *callback_tag = nullptr) noexcept {
-    return route_trie_insert(routes, uri_template, verb, (void *)callback, callback_tag);
+    return routes.insert(uri_template, verb, (void *)callback, callback_tag);
 }
 
 void server_state_t::submit_stats_heartbeat() noexcept {

@@ -47,13 +47,14 @@
  *  Path normalization (percent-decoding, slash collapsing) is handled by the URL parser
  *  before routing.
  *
- *  @file routes.hpp
+ *  @file src/routes.hpp
  *  @author Ash Vardanian
  *  @date January 10, 2025
  */
 #pragma once
 
 #include <cstring>
+#include <optional>
 #include <string_view>
 
 #include "shared.hpp"
@@ -76,55 +77,157 @@ struct parsed_segment_t {
     std::string_view content; // For literals: the segment text; for params: the parameter name
 };
 
-// Forward declarations to resolve circular dependencies
-struct route_node_t;
-struct route_endpoint_t;
-struct route_edge_t;
-
 /**
- *  @brief Endpoint handler for a specific HTTP verb at a route.
- *    Stored in pool and linked as a list to support multiple verbs per path.
+ *  @brief Object-oriented routing trie for efficient URI template matching.
+ *
+ *  Implements a segment-level trie with automatic growth via successive_pools.
+ *  Routes are immutable after registration - designed for lock-free concurrent matching.
+ *
+ *  Usage:
+ *  @code
+ *  auto trie = route_trie_t::make(100);  // Estimated routes
+ *  if (!trie) return error;
+ *  trie->insert("/users/{id}", ucall_verb_get_k, callback);
+ *  void* handler = trie->match("/users/123", ucall_verb_get_k);
+ *  @endcode
  */
-struct route_endpoint_t {
-    ucall_verb_t verb;      // HTTP verb for this endpoint
-    void *callback;         // Callback function pointer
-    void *callback_tag;     // User context pointer
-    route_endpoint_t *next; // Next endpoint in list (or nullptr)
-};
+class route_trie_t {
+  private:
+    // Forward declarations for internal structures
+    struct route_node_t;
+    struct route_endpoint_t;
+    struct route_edge_t;
 
-/**
- *  @brief Literal edge connecting parent to child node.
- *    Stored in pool and linked as a list of sibling edges from the same parent.
- */
-struct route_edge_t {
-    std::string_view segment; // Literal segment name
-    route_node_t *child;      // Non-owning pointer to child node
-    route_edge_t *next;       // Next sibling edge (or nullptr)
-};
+    /**
+     *  @brief Endpoint handler for a specific HTTP verb at a route.
+     *    Stored in pool and linked as a list to support multiple verbs per path.
+     */
+    struct route_endpoint_t {
+        ucall_verb_t verb;      // HTTP verb for this endpoint
+        void *callback;         // Callback function pointer
+        void *callback_tag;     // User context pointer
+        route_endpoint_t *next; // Next endpoint in list (or nullptr)
+    };
 
-/**
- *  @brief Trie node representing one level in the path hierarchy.
- *    All pointers are non-owning - actual objects live in pools.
- */
-struct route_node_t {
-    route_edge_t *literal_children; // Head of literal edges list (or nullptr)
-    route_node_t *param_child;      // Single {param} child (or nullptr)
-    std::string_view param_name;    // Parameter name for param_child
-    route_node_t *wildcard_child;   // Single {*wildcard} child (or nullptr)
-    std::string_view wildcard_name; // Wildcard name for wildcard_child
-    route_endpoint_t *endpoints;    // Head of endpoints list (or nullptr)
-};
+    /**
+     *  @brief Literal edge connecting parent to child node.
+     *    Stored in pool and linked as a list of sibling edges from the same parent.
+     */
+    struct route_edge_t {
+        std::string_view segment; // Literal segment name
+        route_node_t *child;      // Non-owning pointer to child node
+        route_edge_t *next;       // Next sibling edge (or nullptr)
+    };
 
-/**
- *  @brief Main routing trie container with immutable routes.
- *    All memory owned by three pools. Routes are registered during initialization
- *    and never modified during request processing.
- */
-struct route_trie_t {
-    pool<route_node_t> nodes {};         // Pre-allocated pool of trie nodes
-    pool<route_edge_t> edges {};         // Pre-allocated pool of literal edges
-    pool<route_endpoint_t> endpoints {}; // Pre-allocated pool of endpoint handlers
-    route_node_t *root {};               // Root node (empty path)
+    /**
+     *  @brief Trie node representing one level in the path hierarchy.
+     *    All pointers are non-owning - actual objects live in pools.
+     */
+    struct route_node_t {
+        route_edge_t *literal_children; // Head of literal edges list (or nullptr)
+        route_node_t *param_child;      // Single {param} child (or nullptr)
+        std::string_view param_name;    // Parameter name for param_child
+        route_node_t *wildcard_child;   // Single {*wildcard} child (or nullptr)
+        std::string_view wildcard_name; // Wildcard name for wildcard_child
+        route_endpoint_t *endpoints;    // Head of endpoints list (or nullptr)
+    };
+
+    // Member data - growable pools for automatic capacity management
+    successive_pools<route_node_t> nodes_;
+    successive_pools<route_edge_t> edges_;
+    successive_pools<route_endpoint_t> endpoints_;
+    route_node_t *root_;
+
+  public:
+    route_trie_t() noexcept : nodes_(), edges_(), endpoints_(), root_(nullptr) {}
+
+    route_trie_t(route_trie_t const &) = delete;
+    route_trie_t &operator=(route_trie_t const &) = delete;
+    route_trie_t(route_trie_t &&) noexcept = default;
+    route_trie_t &operator=(route_trie_t &&) noexcept = default;
+    ~route_trie_t() noexcept = default;
+
+    /**
+     *  @brief Initializes the routing trie by allocating the root node.
+     *  @return True if initialization succeeded, false on allocation failure.
+     *
+     *  Must be called once before using insert() or match(). Safe to call multiple
+     *  times (subsequent calls are no-ops if root already exists).
+     */
+    [[nodiscard]] bool init() noexcept {
+        if (root_) return true; // Already initialized
+
+        // Allocate and initialize root node
+        root_ = nodes_.alloc();
+        if (!root_) return false;
+
+        root_->literal_children = nullptr;
+        root_->param_child = nullptr;
+        root_->wildcard_child = nullptr;
+        root_->endpoints = nullptr;
+
+        return true;
+    }
+
+    /**
+     *  @brief Factory method to create and initialize a routing trie.
+     *  @param[in] estimated_routes Estimated number of routes (default 100).
+     *  @return Initialized trie, or nullopt on allocation failure.
+     *
+     *  Convenience method that creates a trie and calls init() automatically.
+     *  The trie starts with pools sized for ~2x the estimated routes and grows
+     *  automatically (2x each time) when capacity is exhausted.
+     */
+    [[nodiscard]] static std::optional<route_trie_t> make(std::size_t estimated_routes = 100) noexcept {
+        route_trie_t trie;
+        trie.nodes_ = successive_pools<route_node_t>(estimated_routes * 2);
+        trie.edges_ = successive_pools<route_edge_t>(estimated_routes * 2);
+        trie.endpoints_ = successive_pools<route_endpoint_t>(estimated_routes * 2);
+
+        if (!trie.init()) return std::nullopt;
+        return trie;
+    }
+
+    /**
+     *  @brief Inserts an endpoint into the routing trie.
+     *  @param[in] template_str The URI template (e.g., "/users/{id}").
+     *  @param[in] verb The HTTP verb for this endpoint.
+     *  @param[in] callback The callback function pointer.
+     *  @param[in] callback_tag User context pointer for the callback (defaults to nullptr).
+     *  @return True if insertion succeeded, false on error (duplicate, invalid template, etc.).
+     *
+     *  @warning The @p template_str string_view must remain valid for the lifetime of the trie.
+     */
+    [[nodiscard]] bool insert(std::string_view template_str, ucall_verb_t verb, void *callback,
+                              void *callback_tag = nullptr) noexcept;
+
+    /**
+     *  @brief Matches a request path against the routing trie.
+     *  @param[in] path The request path (e.g., "/users/123").
+     *  @param[in] verb The HTTP verb.
+     *  @param[in] callback_tag Optional output pointer for callback context (or nullptr).
+     *  @return Callback function pointer if matched, or nullptr if no match.
+     *
+     *  @note This function is lock-free and safe for concurrent access since routes are immutable.
+     */
+    [[nodiscard]] void *match(std::string_view path, ucall_verb_t verb, void **callback_tag = nullptr) const noexcept;
+
+    /** @brief Returns total capacity across all pools. */
+    [[nodiscard]] std::size_t capacity() const noexcept {
+        return nodes_.capacity() + edges_.capacity() + endpoints_.capacity();
+    }
+
+    /** @brief Returns number of pools allocated for growth tracking. */
+    [[nodiscard]] std::size_t pool_count() const noexcept { return nodes_.pool_count(); }
+
+  private:
+    /**
+     *  @brief Finds a literal child node by segment name.
+     *  @param[in] node The node to search.
+     *  @param[in] segment The segment name to find.
+     *  @return Pointer to the child node, or nullptr if not found.
+     */
+    [[nodiscard]] route_node_t *find_literal_child(route_node_t const *node, std::string_view segment) const noexcept;
 };
 
 #pragma endregion Data Structures
@@ -243,7 +346,7 @@ inline bool parse_segment(std::string_view segment, parsed_segment_t &result) no
  *  @param[out] segments Pre-allocated array to store parsed segments.
  *  @param[in] max_segments Maximum number of segments to extract.
  *  @return Number of segments parsed. Returns 0 for root path "/" (not an error).
- *    Returns SIZE_MAX on parse error or if segment count exceeds max_segments.
+ *    Returns SIZE_MAX on parse error or if segment count exceeds @p max_segments.
  */
 inline std::size_t parse_uri_template(std::string_view template_str, parsed_segment_t *segments,
                                       std::size_t max_segments) noexcept {
@@ -253,10 +356,9 @@ inline std::size_t parse_uri_template(std::string_view template_str, parsed_segm
     // Root path "/" has 0 segments - this is valid
     if (total_count == 0) {
         // But make sure it's actually "/" not empty string
-        if (template_str.empty() || (template_str != "/" && template_str != "")) {
+        if (template_str.empty() || (template_str != "/" && template_str != ""))
             return SIZE_MAX; // Error: empty or invalid template
-        }
-        return 0; // Valid root path
+        return 0;            // Valid root path
     }
 
     // Check if we exceed the limit BEFORE parsing
@@ -282,68 +384,14 @@ inline std::size_t parse_uri_template(std::string_view template_str, parsed_segm
 
 #pragma endregion URI Template Parsing
 
-#pragma region Trie Management
-
-/**
- *  @brief Initializes a routing trie with pre-allocated pools.
- *  @param[out] trie The trie to initialize.
- *  @param[in] estimated_nodes Estimated number of trie nodes needed.
- *  @param[in] estimated_edges Estimated number of literal edges needed.
- *  @param[in] estimated_endpoints Estimated number of endpoint handlers needed.
- *  @return True if initialization succeeded, false on allocation failure.
- *
- *  Typical sizing for a REST API with 100 routes:
- *  - Nodes: ~200 (avg 2 segments per route)
- *  - Edges: ~200 (avg 1-2 literal children per node with children)
- *  - Endpoints: ~100-200 (1-2 verbs per route)
- *
- *  @sa route_trie_free() to release resources when done.
- */
-[[nodiscard]] inline bool route_trie_init(route_trie_t &trie, std::size_t estimated_nodes, std::size_t estimated_edges,
-                                          std::size_t estimated_endpoints) noexcept {
-    if (!trie.nodes.reserve(estimated_nodes)) return false;
-    if (!trie.edges.reserve(estimated_edges)) return false;
-    if (!trie.endpoints.reserve(estimated_endpoints)) return false;
-
-    trie.root = trie.nodes.alloc();
-    if (!trie.root) return false;
-
-    // Initialize root node (pool already default-constructs, but be explicit)
-    trie.root->literal_children = nullptr;
-    trie.root->param_child = nullptr;
-    trie.root->wildcard_child = nullptr;
-    trie.root->endpoints = nullptr;
-
-    return true;
-}
-
-/**
- *  @brief Frees resources allocated by the routing trie.
- *  @param[inout] trie The trie to free.
- *
- *  @note @c pool destructors handle cleanup automatically, but this function provides
- *  explicit resource release if needed.
- */
-inline void route_trie_free(route_trie_t &trie) noexcept {
-    // pool<> destructors handle cleanup automatically
-    trie.root = nullptr;
-}
-
-#pragma endregion Trie Management
-
-#pragma region Routing Operations
+#pragma region Routing Operations - Member Function Implementations
 
 /**
  *  @brief Finds a literal child node by segment name.
- *  @param[in] node The node to search.
- *  @param[in] segment The segment name to find.
- *  @return Pointer to the child node, or nullptr if not found.
- *
  *  @note Walks linked list of literal edges - O(children) complexity.
- *  @sa route_trie_insert() uses this to navigate the trie during insertion.
- *  @sa route_trie_match() uses this to find matching paths during routing.
  */
-[[nodiscard]] inline route_node_t *find_literal_child(route_node_t const *node, std::string_view segment) noexcept {
+[[nodiscard]] inline route_trie_t::route_node_t *route_trie_t::find_literal_child(
+    route_node_t const *node, std::string_view segment) const noexcept {
     if (!node) return nullptr;
 
     route_edge_t const *edge = node->literal_children;
@@ -355,24 +403,15 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
 }
 
 /**
- *  @brief Inserts an endpoint into the routing trie.
- *  @param[inout] trie The routing trie.
- *  @param[in] template_str The URI template (e.g., @c "/users/{id}").
- *  @param[in] verb The HTTP verb for this endpoint.
- *  @param[in] callback The callback function pointer.
- *  @param[in] callback_tag User context pointer for the callback (defaults to nullptr).
- *  @return True if insertion succeeded, false on error (duplicate, allocation failure, etc.).
- *
- *  @warning Routes are immutable - this function should only be called during initialization.
- *  @warning The @p template_str string_view must remain valid for the lifetime of the trie.
+ *  @brief Inserts an endpoint into the routing trie - member function implementation.
  */
-[[nodiscard]] inline bool route_trie_insert(route_trie_t &trie, std::string_view template_str, ucall_verb_t verb,
-                                            void *callback, void *callback_tag = nullptr) noexcept {
+[[nodiscard]] inline bool route_trie_t::insert(std::string_view template_str, ucall_verb_t verb, void *callback,
+                                               void *callback_tag) noexcept {
     parsed_segment_t segments[16];
     std::size_t segment_count = parse_uri_template(template_str, segments, 16);
     if (segment_count == SIZE_MAX) return false; // Parse error
 
-    route_node_t *current = trie.root;
+    route_node_t *current = root_;
     for (std::size_t i = 0; i < segment_count; ++i) {
         auto &segment = segments[i];
 
@@ -380,7 +419,7 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
             route_node_t *child = find_literal_child(current, segment.content);
             if (!child) {
                 // Allocate new child node
-                child = trie.nodes.alloc();
+                child = nodes_.alloc();
                 if (!child) return false;
 
                 // Initialize child
@@ -390,7 +429,7 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
                 child->endpoints = nullptr;
 
                 // Allocate edge and prepend to parent's literal_children list
-                route_edge_t *edge = trie.edges.alloc();
+                route_edge_t *edge = edges_.alloc();
                 if (!edge) return false;
 
                 edge->segment = segment.content;
@@ -402,7 +441,7 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
         }
         else if (segment.type == segment_type_t::param_k) {
             if (!current->param_child) {
-                current->param_child = trie.nodes.alloc();
+                current->param_child = nodes_.alloc();
                 if (!current->param_child) return false;
 
                 current->param_child->literal_children = nullptr;
@@ -411,15 +450,13 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
                 current->param_child->endpoints = nullptr;
                 current->param_name = segment.content;
             }
-            else if (current->param_name != segment.content) {
-                // Conflicting parameter names at same position
-                return false;
-            }
+            // Conflicting parameter names at same position
+            else if (current->param_name != segment.content) return false;
             current = current->param_child;
         }
         else if (segment.type == segment_type_t::wildcard_k) {
             if (!current->wildcard_child) {
-                current->wildcard_child = trie.nodes.alloc();
+                current->wildcard_child = nodes_.alloc();
                 if (!current->wildcard_child) return false;
 
                 current->wildcard_child->literal_children = nullptr;
@@ -440,7 +477,7 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
     }
 
     // Allocate and prepend new endpoint
-    route_endpoint_t *new_endpoint = trie.endpoints.alloc();
+    route_endpoint_t *new_endpoint = endpoints_.alloc();
     if (!new_endpoint) return false;
 
     new_endpoint->verb = verb;
@@ -453,19 +490,10 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
 }
 
 /**
- *  @brief Matches a request path against the routing trie.
- *  @param[in] trie The routing trie.
- *  @param[in] path The request path (e.g., @c "/users/123").
- *  @param[in] verb The HTTP verb.
- *  @param[out] callback_tag Optional output pointer for callback context (or nullptr).
- *  @return Callback function pointer if matched, or nullptr if no match.
- *
- *  @note This function is lock-free and safe for concurrent access since routes are immutable.
- *  @note Query strings and fragments are stripped automatically by @c extract_path_component.
- *  @note Walks endpoint list to find matching verb - O(verbs_per_route) complexity.
+ *  @brief Matches a request path against the routing trie - member function implementation.
  */
-[[nodiscard]] inline void *route_trie_match(route_trie_t const &trie, std::string_view path, ucall_verb_t verb,
-                                            void **callback_tag = nullptr) noexcept {
+[[nodiscard]] inline void *route_trie_t::match(std::string_view path, ucall_verb_t verb,
+                                               void **callback_tag) const noexcept {
     // Strip query and fragment if present
     path = extract_path_component(path);
 
@@ -473,7 +501,7 @@ inline void route_trie_free(route_trie_t &trie) noexcept {
     std::size_t segment_count = split_path(path, segments, 16);
 
     // Find the matching node
-    route_node_t const *current = trie.root;
+    route_node_t const *current = root_;
     if (!current) return nullptr;
 
     for (std::size_t i = 0; i < segment_count; ++i) {
