@@ -5,6 +5,10 @@ Up to 70x Higher Throughput and 50x Lower Latency than FastAPI and gRPC<br/>
 </h3>
 <br/>
 
+> The web's encryption layer was designed in 1995.
+> gRPC and FastAPI just keep making the problems worse.
+> UCall is what networking looks like when you start fresh with Noise, io_uring, and SIMD — 50x faster, 10x simpler, actually auditable.
+
 <p align="center">
 <a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
 &nbsp;&nbsp;&nbsp;
@@ -173,10 +177,99 @@ The suite defines four standard combinations optimized for different use cases:
 | `25519_AESGCM_SHA256`      |   Curve25519 |       AES-256-GCM | SHA-256 |
 | `448_ChaChaPoly_SHA512`    |     Curve448 | ChaCha20-Poly1305 | SHA-512 |
 
-UCall implements the very first `25519_ChaChaPoly_SHA256`.
+UCall implements the very first `25519_AESGCM_SHA256`.
 First, it uses the [Curve25519](https://en.wikipedia.org/wiki/Curve25519) elliptic curve for the DH asymmetric key exchange to produce a shared secret.
-Then, it uses the [ChaCha20-Poly1305](https://en.wikipedia.org/wiki/ChaCha20-Poly1305) authenticated symmetric cipher for encrypting and decrypting the data.
+Then, it uses the [AES-256-GCM](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard) authenticated symmetric cipher for encrypting and decrypting the data.
 Finally, it uses the [SHA-256](https://en.wikipedia.org/wiki/SHA-2) hash function for hashing operations during the handshake and key derivation.
+
+### Authentication: Macaroons, Biscuits, and Other Pastries
+
+The standard web authentication flow involves OAuth2 tokens, JWTs, and session cookies - all designed around the assumption that a central server validates every request against a database.
+This works, but it means every API call requires a database lookup, and delegating access (giving a third-party app limited access to your data) requires complex OAuth flows with redirect URIs and consent screens.
+
+There is a better way, pioneered by Google in 2014: [Macaroons][macaroons].
+A Macaroon is a bearer token built on chained HMACs that supports __attenuation__ - anyone holding a token can add restrictions to it, but nobody can remove them.
+No database lookup required for verification, just the server's secret key.
+
+```
+Original token:  user=alice, account=12345
+                        ↓
+Alice restricts: user=alice, account=12345, time < 2025-01-01, method = GET
+                        ↓
+Alice gives to Bob - Bob can only read, only until January
+                        ↓
+Bob restricts:   user=alice, account=12345, time < 2025-01-01, method = GET, path = /api/reports/*
+                        ↓
+Bob gives to Carol - Carol can only read reports, nothing else
+```
+
+The cryptography (HMAC chain) guarantees that restrictions can never be removed - only added.
+The server verifies the signature, then evaluates each restriction against the current request.
+No round-trip to a database, no OAuth dance for delegation.
+
+[Biscuit][biscuit] is the modern successor, replacing free-form restriction strings with a proper [Datalog][datalog] query language and swapping HMAC (symmetric) for Ed25519 (asymmetric).
+This means verification requires only the server's __public__ key - multiple services can verify tokens without sharing secrets.
+
+```datalog
+// Biscuit token with Datalog restrictions
+user("alice");
+role("viewer");
+check if time($t), $t < 2025-01-01T00:00:00Z;
+check if operation($op), ["read", "list"].contains($op);
+check if resource($r), $r.starts_with("/api/");
+```
+
+UCall supports both formats natively, with built-in parsers for common restriction types: time bounds, path patterns, HTTP methods, IP ranges, and rate limits.
+Custom restrictions are evaluated by user-provided callbacks.
+The `Authorization` header format is straightforward: `Authorization: Macaroon <base64>` or `Authorization: Biscuit <base64>`.
+
+Why "pastries"?
+Because capability-based tokens are delicious - they're self-contained, offline-verifiable, and delegation-friendly.
+Macaroons are used by the Lightning Network for Bitcoin payments.
+Biscuits power Clever Cloud's infrastructure.
+Both are battle-tested at scale.
+
+[macaroons]: https://research.google/pubs/macaroons-cookies-with-contextual-caveats-for-decentralized-authorization-in-the-cloud/
+[biscuit]: https://biscuitsec.org
+[datalog]: https://en.wikipedia.org/wiki/Datalog
+
+### Protocol Identity: SPIFFE
+
+Authentication tokens answer "what can this request do?" but not "who is making it?"
+In traditional deployments, workloads authenticate using static credentials - API keys, service account tokens, or certificates manually provisioned by operators.
+These secrets end up in config files, environment variables, and CI/CD pipelines, creating a sprawling attack surface.
+
+[SPIFFE][spiffe] (Secure Production Identity Framework for Everyone) takes a different approach: workloads prove their identity through __attestation__, not secrets.
+Instead of "here's my password", it's "here's cryptographic proof of what I am" - verified by inspecting process attributes, Kubernetes pod labels, AWS instance metadata, or other environmental signals.
+
+A SPIFFE identity is a URI: `spiffe://example.com/service/api-server`.
+The workload receives a short-lived certificate (SVID - SPIFFE Verifiable Identity Document) from a local agent, automatically rotated every hour.
+No secrets in config files.
+No manual certificate management.
+If the workload dies and restarts, it re-attests and gets fresh credentials.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│  Traditional: Static secrets in config                          │
+│  API_KEY=sk_live_abc123... ← Leaked? Game over.                 │
+├─────────────────────────────────────────────────────────────────┤
+│  SPIFFE: Identity from attestation                              │
+│  Process starts → Agent inspects (PID, UID, k8s labels)         │
+│                 → Issues certificate valid for 1 hour           │
+│                 → Auto-rotates before expiry                    │
+│  No secrets to leak. Identity is "what you are", not "what you  │
+│  know".                                                         │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+UCall integrates SPIFFE with Noise in a natural way: the SPIFFE identity (SVID) binds to the Noise static key.
+After the Noise handshake establishes an encrypted channel, both parties exchange their SPIFFE identities over that channel.
+The server can then authorize based on the client's SPIFFE ID pattern: `spiffe://prod.example.com/service/*` allows any production service, while `spiffe://prod.example.com/service/payment-*` restricts to payment services only.
+
+This combination - Noise for encryption, SPIFFE for identity, Macaroons/Biscuits for capabilities - provides a complete security stack without the complexity of TLS certificates, OAuth servers, or secret management systems.
+It's what zero-trust networking looks like when you start from first principles.
+
+[spiffe]: https://spiffe.io
 
 ### Engineered for Performance
 
@@ -295,7 +388,7 @@ The more popular alternative to Tus.io for resumable uploads is Streaming Multip
 Those are also natively supported by UCall, but not recommended for large files or unreliable connections, as they require re-sending all data after a failure - no continuation is possible.
 
 When using `io_uring` as the backend, it's recommended to use large chunk sizes in multiples of default SSD page sizes.
-In that case we can further reduce the number of transparent file copies in the OS and system calls by performing `O_DIRECT` zero-copy IO.
+In that case we can further reduce the number of transparent file copies in the OS and system calls by performing `O_DIRECT` zero-copy IO by splicing data directly between the network socket and the file descriptor.
 
 ### Other Functional HTTP Headers
 
