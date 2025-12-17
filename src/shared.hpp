@@ -481,10 +481,12 @@ class pool {
     }
 
     ~pool() noexcept { reset(); }
+
     /** @brief Returns pointer to available element, or nullptr if pool exhausted. */
     [[nodiscard]] element_t *alloc() noexcept {
         return free_count_ ? elements_ + free_offsets_[--free_count_] : nullptr;
     }
+
     /** @brief Returns element to pool. Pointer must be valid, within bounds, and not double-freed. */
     void release(element_t *released) noexcept {
         assert(released && "pool::release() called with null pointer");
@@ -492,8 +494,191 @@ class pool {
         assert(free_count_ < capacity_ && "pool::release() called too many times (double-free?)");
         free_offsets_[free_count_++] = released - elements_;
     }
+
     [[nodiscard]] std::size_t offset_of(element_t &element) const noexcept { return &element - elements_; }
     [[nodiscard]] element_t &at_offset(std::size_t i) const noexcept { return elements_[i]; }
+    [[nodiscard]] element_t const *data() const noexcept { return elements_; }
+
+    /** @brief Checks if pointer is within this pool's allocated range. */
+    [[nodiscard]] bool contains(element_t const *ptr) const noexcept {
+        return ptr >= elements_ && ptr < elements_ + capacity_;
+    }
+};
+
+/**
+ *  @brief Growable pool allocator with pointer stability guarantee.
+ *
+ *  Manages a linked list of fixed-size pools. When a pool is exhausted, allocates
+ *  a new pool at 2x the previous capacity. Pointers remain valid for the lifetime
+ *  of the successive_pools instance since individual pools are never reallocated.
+ *
+ *  Allocation strategy:
+ *  - Tries to allocate from newest (largest) pool first for better cache locality
+ *  - Falls back to older pools if newest is exhausted
+ *  - Allocates new pool (2x previous size) if all pools are full
+ *
+ *  Memory overhead:
+ *  - Each pool stores a linked-list pointer (8 bytes per pool)
+ *  - With exponential growth, total overhead is ~2x the final capacity
+ *
+ *  Example growth pattern (initial_capacity = 100):
+ *  - Pool 0: 100 elements
+ *  - Pool 1: 200 elements (if pool 0 fills)
+ *  - Pool 2: 400 elements (if pool 1 fills)
+ *  - Pool 3: 800 elements ...
+ *
+ *  @tparam element_type_ Type of pooled elements. Must be nothrow default-constructible.
+ *
+ *  @code
+ *  successive_pools<connection_t> conn_pools(100);
+ *  connection_t* conn = conn_pools.alloc();  // Auto-grows if needed
+ *  if (conn) { conn->reset(); conn_pools.release(conn); }
+ *  @endcode
+ */
+template <typename element_type_>
+class successive_pools {
+    struct pool_node {
+        pool<element_type_> pool_ {};
+        std::size_t capacity_ {};
+        pool_node *next_ {}; // Singly linked list, newer pools first
+
+        pool_node(std::size_t cap) noexcept : capacity_(cap), next_(nullptr) {}
+    };
+
+    pool_node *head_ {}; // Newest pool (tried first)
+    std::size_t initial_capacity_ {};
+    std::size_t total_capacity_ {};
+    std::size_t allocated_count_ {}; // Track total allocations for statistics
+
+  public:
+    using element_t = element_type_;
+    using value_type = element_t;
+
+    /**
+     *  @brief Constructs with initial pool capacity.
+     *  @param initial_capacity Number of elements in first pool (default 100).
+     */
+    explicit successive_pools(std::size_t initial_capacity = 100) noexcept
+        : head_(nullptr), initial_capacity_(initial_capacity), total_capacity_(0), allocated_count_(0) {}
+
+    // Disable copying, allow moving
+    successive_pools(successive_pools const &) = delete;
+    successive_pools &operator=(successive_pools const &) = delete;
+
+    successive_pools(successive_pools &&other) noexcept
+        : head_(std::exchange(other.head_, nullptr)), initial_capacity_(std::exchange(other.initial_capacity_, 0)),
+          total_capacity_(std::exchange(other.total_capacity_, 0)),
+          allocated_count_(std::exchange(other.allocated_count_, 0)) {}
+
+    successive_pools &operator=(successive_pools &&other) noexcept {
+        if (this == &other) return *this;
+        reset();
+        head_ = std::exchange(other.head_, nullptr);
+        initial_capacity_ = std::exchange(other.initial_capacity_, 0);
+        total_capacity_ = std::exchange(other.total_capacity_, 0);
+        allocated_count_ = std::exchange(other.allocated_count_, 0);
+        return *this;
+    }
+
+    ~successive_pools() noexcept { reset(); }
+
+    /**
+     *  @brief Allocates an element from the pool, growing if necessary.
+     *  @return Pointer to element, or nullptr on allocation failure (OOM).
+     *
+     *  Tries pools in reverse order (newest first) for better cache locality.
+     *  If all pools exhausted, allocates new pool at 2x the previous capacity.
+     */
+    [[nodiscard]] element_t *alloc() noexcept {
+        // Try existing pools (newest to oldest)
+        for (pool_node *node = head_; node != nullptr; node = node->next_) {
+            element_t *elem = node->pool_.alloc();
+            if (elem) {
+                ++allocated_count_;
+                return elem;
+            }
+        }
+
+        // All pools exhausted - grow
+        std::size_t new_capacity = head_ ? head_->capacity_ * 2 : initial_capacity_;
+        if (!grow(new_capacity)) return nullptr;
+
+        // Try allocation from newly created pool
+        element_t *elem = head_->pool_.alloc();
+        if (elem) ++allocated_count_;
+        return elem;
+    }
+
+    /**
+     *  @brief Returns element to its pool for reuse.
+     *  @param released Pointer to element (must be from this successive_pools instance).
+     *
+     *  Automatically determines which pool owns the pointer based on address range.
+     */
+    void release(element_t *released) noexcept {
+        if (!released) return;
+
+        // Find which pool owns this pointer
+        for (pool_node *node = head_; node != nullptr; node = node->next_) {
+            if (node->pool_.contains(released)) {
+                node->pool_.release(released);
+                --allocated_count_;
+                return;
+            }
+        }
+
+        assert(false && "successive_pools::release() pointer not from this pool");
+    }
+
+    /** @brief Returns total capacity across all pools. */
+    [[nodiscard]] std::size_t capacity() const noexcept { return total_capacity_; }
+
+    /** @brief Returns number of currently allocated elements. */
+    [[nodiscard]] std::size_t allocated() const noexcept { return allocated_count_; }
+
+    /** @brief Returns number of pools currently allocated. */
+    [[nodiscard]] std::size_t pool_count() const noexcept {
+        std::size_t count = 0;
+        for (pool_node *node = head_; node != nullptr; node = node->next_) ++count;
+        return count;
+    }
+
+    /** @brief Releases all pools and resets to empty state. */
+    void reset() noexcept {
+        pool_node *current = head_;
+        while (current) {
+            pool_node *next = current->next_;
+            delete current;
+            current = next;
+        }
+        head_ = nullptr;
+        total_capacity_ = 0;
+        allocated_count_ = 0;
+    }
+
+  private:
+    /**
+     *  @brief Grows pool list by adding a new pool at the head.
+     *  @param capacity Capacity for the new pool.
+     *  @return True on success, false on allocation failure.
+     */
+    [[nodiscard]] bool grow(std::size_t capacity) noexcept {
+        pool_node *new_node = new (std::nothrow) pool_node(capacity);
+        if (!new_node) return false;
+
+        // Reserve the pool capacity
+        if (!new_node->pool_.reserve(capacity)) {
+            delete new_node;
+            return false;
+        }
+
+        // Prepend to linked list (newest first)
+        new_node->next_ = head_;
+        head_ = new_node;
+        total_capacity_ += capacity;
+
+        return true;
+    }
 };
 
 /**
