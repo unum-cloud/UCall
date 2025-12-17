@@ -42,9 +42,9 @@ option(UCALL_BUILD_PYTHON_POSIX
 
 # Options depending on SUPPORTS_IO_URING
 option(UCALL_BUILD_LIB_URING "Builds the C library for the `uring` backend"
-  ${SUPPORTS_IO_URING})
+  OFF)
 option(UCALL_BUILD_PYTHON_URING
-  "Builds CPython bindings for the `uring` backend" ${SUPPORTS_IO_URING})
+  "Builds CPython bindings for the `uring` backend" OFF)
 
 option(UCALL_BUILD_BENCHMARKS
   "Builds all available backend for the summation server to run benchmarks"
@@ -55,14 +55,15 @@ option(UCALL_BUILD_TESTS "Builds unit tests for the C library" OFF)
 option(UCALL_BUILD_ALL "Builds all supported target" OFF)
 
 # Enforce options based on SUPPORTS_IO_URING after its value is known
-if(SUPPORTS_IO_URING)
-  set(UCALL_BUILD_LIB_URING
-    ON
-    CACHE BOOL "Force enable UCALL_BUILD_LIB_URING" FORCE)
-  set(UCALL_BUILD_PYTHON_URING
-    ON
-    CACHE BOOL "Force enable UCALL_BUILD_PYTHON_URING" FORCE)
-endif()
+# Disabled for now to focus on testing protocol_shared.hpp
+# if(SUPPORTS_IO_URING)
+#   set(UCALL_BUILD_LIB_URING
+#     ON
+#     CACHE BOOL "Force enable UCALL_BUILD_LIB_URING" FORCE)
+#   set(UCALL_BUILD_PYTHON_URING
+#     ON
+#     CACHE BOOL "Force enable UCALL_BUILD_PYTHON_URING" FORCE)
+# endif()
 
 if(UCALL_BUILD_PYTHON_URING)
   set(UCALL_BUILD_LIB_URING ON)
@@ -136,28 +137,34 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
   set(CMAKE_OSX_ARCHITECTURES
     "x86_64" "universal2" "arm64"
     CACHE STRING "Minimum OS X deployment version")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++ -std=c++17")
+  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
 endif()
 
 include(FetchContent)
 include(ExternalProject)
 find_package(Threads REQUIRED)
 
+# Silence warnings from third-party dependencies
+set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
+set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
+
 FetchContent_Declare(
   simdjson
   GIT_REPOSITORY https://github.com/simdjson/simdjson.git
   GIT_TAG v4.2.2
-  GIT_SHALLOW 1)
+  GIT_SHALLOW 1
+  SYSTEM)
 FetchContent_MakeAvailable(simdjson)
-include_directories(${simdjson_SOURCE_DIR}/include)
+include_directories(SYSTEM ${simdjson_SOURCE_DIR}/include)
 
 FetchContent_Declare(
   ada
   GIT_REPOSITORY https://github.com/ada-url/ada
   GIT_TAG v3.3.0
-  GIT_SHALLOW 1)
+  GIT_SHALLOW 1
+  SYSTEM)
 FetchContent_MakeAvailable(ada)
-include_directories(${ada_SOURCE_DIR}/include)
+include_directories(SYSTEM ${ada_SOURCE_DIR}/include)
 
 # Parsing HTTP headers On MacOS you may need to locate headers here: export
 # CPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/
@@ -165,9 +172,10 @@ FetchContent_Declare(
   cxxopts
   GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
   GIT_TAG v3.2.0
-  GIT_SHALLOW 1)
+  GIT_SHALLOW 1
+  SYSTEM)
 FetchContent_MakeAvailable(cxxopts)
-include_directories(${cxxopts_SOURCE_DIR}/include)
+include_directories(SYSTEM ${cxxopts_SOURCE_DIR}/include)
 
 # Parsing HTTP headers On MacOS you may need to locate headers here: export
 # CPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/
@@ -175,18 +183,22 @@ FetchContent_Declare(
   stringzilla
   GIT_REPOSITORY https://github.com/ashvardanian/stringzilla.git
   GIT_TAG v4.2.3
-  GIT_SHALLOW 1)
+  GIT_SHALLOW 1
+  SYSTEM)
 FetchContent_MakeAvailable(stringzilla)
-include_directories(${stringzilla_SOURCE_DIR})
+include_directories(SYSTEM ${stringzilla_SOURCE_DIR})
 
 # Base64 decoding
+set(SIMDUTF_TOOLS OFF CACHE BOOL "Disable simdutf tools" FORCE)
+set(SIMDUTF_TESTS OFF CACHE BOOL "Disable simdutf tests" FORCE)
 FetchContent_Declare(
   simdutf
   GIT_REPOSITORY https://github.com/simdutf/simdutf
   GIT_TAG v7.5.0
-  GIT_SHALLOW 1)
+  GIT_SHALLOW 1
+  SYSTEM)
 FetchContent_MakeAvailable(simdutf)
-include_directories(${simdutf_SOURCE_DIR}/include)
+include_directories(SYSTEM ${simdutf_SOURCE_DIR}/include)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
@@ -201,9 +213,8 @@ if(UCALL_BUILD_LIB_URING)
     PREFIX ${CMAKE_BINARY_DIR}/_deps/
     SOURCE_DIR ${URING_DIR}
     CONFIGURE_COMMAND
-    echo Configuring LibUring && cd ${URING_DIR} && ./configure --nolibc
-    --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER};
-    BUILD_COMMAND cd ${URING_DIR} && make;
+    bash -c "cd ${URING_DIR} && ./configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER} 2>&1 | grep -v '^Configuring'"
+    BUILD_COMMAND bash -c "cd ${URING_DIR} && make -s 2>&1 | grep -v warning || true"
     INSTALL_COMMAND ""
     UPDATE_COMMAND "")
   add_library(uring_internal STATIC IMPORTED GLOBAL)
@@ -242,10 +253,9 @@ ExternalProject_Add(
   PREFIX ${CMAKE_BINARY_DIR}/_deps/
   SOURCE_DIR ${NOISE_DIR}
   CONFIGURE_COMMAND
-  echo Configuring Noise-C && cd ${NOISE_DIR} && autoreconf -i && ./configure
-  --prefix=${NOISE_DIR}/install --with-libsodium=no --with-openssl=no
-  BUILD_COMMAND cd ${NOISE_DIR} && make
-  INSTALL_COMMAND cd ${NOISE_DIR} && make install
+  bash -c "cd ${NOISE_DIR} && (autoreconf -i 2>/dev/null || true) && ./configure --prefix=${NOISE_DIR}/install --with-libsodium=no --with-openssl=no 2>&1 | grep -v '^checking' | grep -v '^configure:'"
+  BUILD_COMMAND bash -c "cd ${NOISE_DIR} && make -s 2>&1 | grep -v warning || true"
+  INSTALL_COMMAND bash -c "cd ${NOISE_DIR} && make install -s 2>&1 | grep -v 'Nothing to be done' || true"
   UPDATE_COMMAND "")
 add_library(noise_internal STATIC IMPORTED GLOBAL)
 add_dependencies(noise_internal noise-c-ep)
@@ -284,14 +294,14 @@ endif()
 include_directories(include/ src/)
 
 if(UCALL_BUILD_LIB_POSIX)
-  add_library(ucall_server_posix src/engine_posix.cpp)
+  add_library(ucall_server_posix src/server_posix.cpp)
   target_link_libraries(ucall_server_posix simdjson::simdjson simdutf::simdutf
     Threads::Threads ${NOISE_LIBRARIES})
   set(PYTHON_BACKEND ucall_server_posix)
 endif()
 
 if(UCALL_BUILD_LIB_URING)
-  add_library(ucall_server_uring src/engine_uring.cpp)
+  add_library(ucall_server_uring src/server_uring.cpp)
   set(PYTHON_BACKEND ucall_server_uring)
   target_link_libraries(ucall_server_uring simdjson::simdjson simdutf::simdutf
     Threads::Threads ${URING_LIBS} ${NOISE_LIBRARIES})
