@@ -1,6 +1,17 @@
 /**
- * @brief   JSON-RPC implementation for TCP/IP stack with POSIX calls.
- * @author  Ash Vardanian
+ *  @brief Server backend implementation for HTTP 1.1, WebSockets, and Noise Protocol
+ *    over TCP/IP for POSIX systems.
+ *
+ *  This is the simplest baseline server implementation used as a self-contained reference
+ *  for future implementations of epoll and io_uring backends on Linux, and IOCP on Windows.
+ *
+ *  Requests and responses are handled in a blocking manner, one at a time, per connection.
+ *  Batch-capable endpoints come with dynamically growing buffers, to dispatch only once a
+ *  critical number of requests is collected or a timeout is reached.
+ *
+ *  @file src/server_posix.cpp
+ *  @author Ash Vardanian
+ *  @date November 14, 2025
  */
 
 #if defined(WIN32) || defined(_WIN32) || defined(__WIN32__) || defined(__NT__)
@@ -12,9 +23,8 @@
 #define SHUT_WR SD_SEND
 #define SHUT_RD SD_RECEIVE
 #define SHUT_RDWR SD_BOTH
-// SO_REUSEPORT, MSG_NOSIGNAL is not supported on Windows.
-#define SO_REUSEPORT 0
-#define MSG_NOSIGNAL 0
+#define SO_REUSEPORT 0 // `SO_REUSEPORT` is not supported on Windows
+#define MSG_NOSIGNAL 0 // `MSG_NOSIGNAL` is not supported on Windows
 #pragma comment(lib, "Ws2_32.lib")
 #define UNICODE
 
@@ -35,31 +45,42 @@
 #include <charconv> // `std::to_chars`
 #include <chrono>   // `std::chrono`
 
-#include "ucall/ucall.h"
-
-#include "helpers/log.hpp"
-#include "helpers/parse.hpp"
-#include "helpers/reply.hpp"
-#include "helpers/shared.hpp"
+#include <ucall/ucall.h>
+#include "routes.hpp"
 
 using namespace unum::ucall;
+using namespace unum;
+namespace sj = simdjson;
+namespace sjd = simdjson::dom;
 
 static constexpr std::size_t initial_buffer_size_k = ram_page_size_k * 4;
 
-struct engine_t {
-    ~engine_t() noexcept {}
+/**
+ *  @brief A POSIX-specific implementation of a connection to a specific client.
+ *    The @c posix_server_t will have one such structure per active connection.
+ */
+struct posix_connection_t {
 
+    /** @brief The file descriptor of the stateful connection over TCP. */
+    descriptor_t connection {};
+
+    /** @brief A small memory buffer to store small requests. */
+    alignas(align_k) char packet_buffer[ram_page_size_k + sj::SIMDJSON_PADDING] {};
+};
+
+struct posix_server_t {
+    ~posix_server_t() noexcept {}
+
+    /** @brief The file descriptor of the listening socket. */
     descriptor_t socket {};
 
-    /// @brief The file descriptor of the stateful connection over TCP.
-    descriptor_t connection {};
-    /// @brief A small memory buffer to store small requests.
-    alignas(align_k) char packet_buffer[ram_page_size_k + sj::SIMDJSON_PADDING] {};
-    /// @brief An array of function callbacks. Can be in dozens.
-    array<named_callback_t> callbacks {};
-    /// @brief Statically allocated memory to process small requests.
-    scratch_space_t scratch {};
-    /// @brief For batch-requests in synchronous connections we need a place to
+    /** @brief A trie of endpoints mapping to function callbacks. Can be in hundreds. */
+    route_trie_t endpoints {};
+
+    /** @brief Statically allocated memory to process small requests. */
+    array<byte_t> scratch {};
+
+    /** @brief Separate dynamic buffer for every batch endpoint with per-request TTL. */
     array<char> buffer {};
 
     traffic_stats_t stats {};
@@ -69,19 +90,19 @@ struct engine_t {
 };
 
 sj::simdjson_result<sjd::element> param_at(ucall_call_t call, ucall_str_t name, size_t name_len) noexcept {
-    engine_t &engine = *reinterpret_cast<engine_t *>(call);
+    posix_server_t &engine = *reinterpret_cast<posix_server_t *>(call);
     scratch_space_t &scratch = engine.scratch;
     name_len = string_length(name, name_len);
     return scratch.point_to_param({name, name_len});
 }
 
 sj::simdjson_result<sjd::element> param_at(ucall_call_t call, size_t position) noexcept {
-    engine_t &engine = *reinterpret_cast<engine_t *>(call);
+    posix_server_t &engine = *reinterpret_cast<posix_server_t *>(call);
     scratch_space_t &scratch = engine.scratch;
     return scratch.point_to_param(position);
 }
 
-void send_message(engine_t &engine, array<char> const &message) noexcept {
+void send_message(posix_server_t &engine, array<char> const &message) noexcept {
     char const *buf = message.data();
     size_t const len = message.size();
     long idx = 0;
@@ -97,7 +118,7 @@ void send_message(engine_t &engine, array<char> const &message) noexcept {
     engine.stats.packets_sent++;
 }
 
-void forward_call(engine_t &engine) noexcept {
+void forward_call(posix_server_t &engine) noexcept {
     scratch_space_t &scratch = engine.scratch;
     auto callback_or_error = find_callback(engine.callbacks, scratch);
     if (auto error_ptr = std::get_if<default_error_t>(&callback_or_error); error_ptr)
@@ -156,7 +177,7 @@ struct posix_server_t {
     }
 }
 
-void forward_packet(engine_t& engine) noexcept {
+void forward_packet(posix_server_t& engine) noexcept {
     scratch_space_t &scratch = engine.scratch;
     auto json_or_error = split_body_headers(scratch.dynamic_packet);
     if (auto error_ptr = std::get_if<default_error_t>(&json_or_error); error_ptr)
@@ -168,7 +189,7 @@ void forward_packet(engine_t& engine) noexcept {
     return forward_call_or_calls(engine);
 }
 
-int recv_all(engine_t &engine, char *buf, size_t len) {
+int recv_all(posix_server_t &engine, char *buf, size_t len) {
     size_t idx = 0;
     int res = 0;
 
@@ -178,7 +199,7 @@ int recv_all(engine_t &engine, char *buf, size_t len) {
 }
 
 void ucall_take_call(ucall_server_t server, uint16_t) {
-    engine_t &engine = *reinterpret_cast<engine_t *>(server);
+    posix_server_t &engine = *reinterpret_cast<posix_server_t *>(server);
     scratch_space_t &scratch = engine.scratch;
 
     // Log stats, if enough time has passed since last call.
@@ -294,7 +315,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     // Allocate
     int socket_options {1};
     int socket_descriptor {-1};
-    engine_t *server_ptr = nullptr;
+    posix_server_t *server_ptr = nullptr;
     array<char> buffer;
     array<named_callback_t> embedded_callbacks;
     sjd::parser parser;
@@ -373,7 +394,7 @@ void ucall_free(ucall_server_t punned_server) {
     delete ctx;
 }
 
-int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) noexcept {
+int posix_server_t::try_accept(descriptor_t socket, connection_t &connection) noexcept {
 
     posix_server_t *ctx = reinterpret_cast<posix_server_t *>(network_data);
 
@@ -398,7 +419,7 @@ int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) 
     return 0;
 }
 
-void network_engine_t::set_stats_heartbeat(connection_t &connection) noexcept {
+void posix_server_t::set_stats_heartbeat(connection_t &connection) noexcept {
 
     posix_server_t *ctx = reinterpret_cast<posix_server_t *>(network_data);
 
@@ -410,7 +431,7 @@ void network_engine_t::set_stats_heartbeat(connection_t &connection) noexcept {
     ctx->queue_mutex.unlock();
 }
 
-void network_engine_t::close_connection_gracefully(connection_t &connection) noexcept {
+void posix_server_t::close_connection_gracefully(connection_t &connection) noexcept {
     posix_server_t *ctx = reinterpret_cast<posix_server_t *>(network_data);
 
     conn_ctx_t coctx {&connection, close(connection.descriptor)};
@@ -421,7 +442,7 @@ void network_engine_t::close_connection_gracefully(connection_t &connection) noe
     ctx->queue_mutex.unlock();
 }
 
-void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
+void posix_server_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
     posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
     conn_ctx_t coctx{&connection};
     ssize_t res = 0;
@@ -434,7 +455,7 @@ void network_engine_t::send_packet(connection_t& connection, void* buffer, size_
     ctx->queue_mutex.unlock();
 }
 
-void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
+void posix_server_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
     posix_server_t* ctx = reinterpret_cast<posix_server_t*>(network_data);
 
     conn_ctx_t coctx{&connection};
@@ -448,16 +469,16 @@ void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_
     ctx->queue_mutex.unlock();
 }
 
-bool network_engine_t::is_canceled(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
+bool posix_server_t::is_canceled(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
     return res == -ECANCELED || res == -EWOULDBLOCK || res == -EAGAIN;
 }
 
-bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
+bool posix_server_t::is_corrupted(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
     return res == -EBADF || res == -EPIPE;
 }
 
 template <size_t max_count_ak>
-std::size_t network_engine_t::pop_completed_events(completed_event_t *events) noexcept {
+std::size_t posix_server_t::pop_completed_events(completed_event_t *events) noexcept {
 
     posix_server_t *ctx = reinterpret_cast<posix_server_t *>(network_data);
 
