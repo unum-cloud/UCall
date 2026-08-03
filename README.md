@@ -71,7 +71,7 @@ def sum(a: int, b: int):
     return a + b
 
 import uvicorn
-uvicorn.run(server, host='0.0.0.0', port=8000)    
+uvicorn.run(server, host='0.0.0.0', port=8000)
 ```
 
 </td>
@@ -86,7 +86,7 @@ server = Server()
 def sum(a: int, b: int):
     return a + b
 
-server.run()    
+server.run()
 ```
 
 </td>
@@ -146,7 +146,15 @@ You can declare an endpoint as batchable, and UCall will accumulate requests for
 This is especially useful for GPU-backed AI inference endpoints, where the batch processing is much more efficient than single-item processing.
 Another common use case is OLAP-style database queries or search queries, where multiple queries can be grouped and executed together.
 
-> If you are triggering many async operations inside your batchable endpoint, UCall provides additional performance optimizing APIs to allow recursively calling `ucall_take_calls()` inside your endpoint handler to process pending requests while waiting for IO or other async operations to complete.
+> If you are triggering many async operations inside your batchable endpoint, UCall provides additional performance optimizing APIs to allow recursively calling `ucall_server_take_calls()` inside your endpoint handler to process pending requests while waiting for IO or other async operations to complete.
+
+### Clients Make One Call at a Time
+
+The same principle governs the client side.
+`ucall_client_call()` blocks until the response arrives, and concurrency comes from running more threads rather than from futures, promises, or an event loop.
+When calling out to another service from _inside_ an endpoint, re-enter `ucall_server_take_calls()` to keep serving other requests while you wait.
+
+An asynchronous client may follow if the synchronous one proves insufficient, but it is not planned today.
 
 ### Encryption: From TLS to Noise
 
@@ -172,15 +180,44 @@ The suite defines four standard combinations optimized for different use cases:
 
 | Name                       | Key exchange |            Cipher |    Hash |
 | :------------------------- | -----------: | ----------------: | ------: |
+| `25519_AESGCM_SHA256`      |   Curve25519 |       AES-256-GCM | SHA-256 |
 | `25519_ChaChaPoly_SHA256`  |   Curve25519 | ChaCha20-Poly1305 | SHA-256 |
 | `25519_ChaChaPoly_BLAKE2s` |   Curve25519 | ChaCha20-Poly1305 | BLAKE2s |
-| `25519_AESGCM_SHA256`      |   Curve25519 |       AES-256-GCM | SHA-256 |
 | `448_ChaChaPoly_SHA512`    |     Curve448 | ChaCha20-Poly1305 | SHA-512 |
 
-UCall implements the very first `25519_AESGCM_SHA256`.
+UCall implements exclusively the `25519_AESGCM_SHA256`.
 First, it uses the [Curve25519](https://en.wikipedia.org/wiki/Curve25519) elliptic curve for the DH asymmetric key exchange to produce a shared secret.
 Then, it uses the [AES-256-GCM](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard) authenticated symmetric cipher for encrypting and decrypting the data.
 Finally, it uses the [SHA-256](https://en.wikipedia.org/wiki/SHA-2) hash function for hashing operations during the handshake and key derivation.
+
+Why not one of the three ChaCha20-Poly1305 suites?
+Because UCall targets modern silicon, where AES is not a software algorithm at all:
+
+- __Both halves of the AEAD are single instructions.__
+`AES-NI` and `PCLMULQDQ` on x86 since 2010, `AESE`/`AESMC` and `PMULL` on every server Arm — Neoverse, Graviton, Ampere, Apple Silicon.
+ChaCha20 and Poly1305 have no such path and must be assembled from general-purpose SIMD.
+- __The gap widens every generation.__
+ChaCha20 scales only with vector width, which is already saturated.
+AES gained `VAES` on Ice Lake and Zen 3, encrypting four blocks per instruction, and vendors keep widening that path.
+- __It is the only AEAD anyone offloads.__
+NIC inline crypto, IPsec engines, Intel QAT, and DPUs all implement AES-GCM; none implement ChaCha20-Poly1305.
+That is the only realistic route to eventually combining encryption with the zero-copy paths described below.
+- __Constant-time by construction.__
+The hardware instructions perform no data-dependent table lookups, so the cache-timing attacks that plague table-driven software AES simply do not apply.
+- __It is the only NIST-shaped suite of the four.__
+AES-256-GCM, SHA-256, and X25519 are all NIST-approved; ChaCha20-Poly1305 and BLAKE2s are not.
+That is a hard gate in regulated deployments, not a preference.
+- __Both primitives ship in [`stringzilla`][stringzilla].__
+AES-256-GCM and SHA-256 dispatch across x86 `AES-NI`, `VAES`, and `SHA-NI`, ARMv8 `AES` and `SHA2`, and RISC-V `Zvknh`.
+
+WireGuard, WhatsApp, and the Lightning Network all chose ChaCha20-Poly1305 because they run on phones where AES instructions are not guaranteed.
+UCall runs in datacenters, so the tradeoff inverts.
+
+UCall therefore refuses to start without `AES-NI` or the ARMv8 cryptographic extensions, never falling back to table-driven software AES.
+And because AES-GCM's margin degrades with volume encrypted under one key, the transport rekeys on a fixed schedule.
+
+Noise itself sits __beneath__ HTTP and WebSockets, where TLS sits in `https://` and `wss://`, so one transport serves both.
+Payloads split into independently authenticated 16 KB records, invisible to the protocols above.
 
 ### Authentication: Macaroons, Biscuits, and Other Pastries
 
@@ -286,14 +323,15 @@ Equally important, all of the packet encryption, decryption, serialization, and 
 All of them come with "dynamic dispatch" logic to pick the best available CPU instructions at runtime, so that UCall can run blazingly fast on both old and new hardware.
 Namely, UCall uses:
 
-- [`libsodium`][libsodium] for cryptographic operations.
-- [`stringzilla`][stringzilla] for string manipulations.
+- [`stringzilla`][stringzilla] for string manipulations, and for the AES-256-GCM and SHA-256 primitives behind Noise.
 - [`simdjson`][simdjson] to parse JSON text faster than gRPC can load a binary `ProtoBuf`.
 - [`simdutf`][simdutf] for fast UTF-8 validation and conversion.
 - [`turbo-base64`][turbobase64] to decode binary values from Base64 form.
 - [`ada`][ada] to parse URI endpoints.
 
-[libsodium]: https://github.com/jedisct1/libsodium
+There is no OpenSSL, no libsodium, and no third-party Noise implementation.
+The only vendored cryptographic code is a single-file Curve25519, which is the one primitive that has no place in a string library.
+
 [stringzilla]: https://github.com/ashvardanian/StringZilla
 [simdjson]: https://github.com/simdjson/simdjson
 [simdutf]: https://github.com/simdutf/simdutf
@@ -309,7 +347,7 @@ You can configure how  and where each parameter is extracted from:
 - __Query Parameters__: Extract from query string, e.g., `/search?q=rust&limit=10`
 - __JSON Body__: Extract from request body, e.g., `{"temperature": 0.7, "max_tokens": 100}`
 - __Multipart Body__: Files + metadata in one request
-  
+
 This flexibility allows you to build both traditional REST APIs (using query params) and modern JSON-based APIs with the same codebase.
 Why support JSON-RPC?
 
@@ -390,6 +428,11 @@ Those are also natively supported by UCall, but not recommended for large files 
 When using `io_uring` as the backend, it's recommended to use large chunk sizes in multiples of default SSD page sizes.
 In that case we can further reduce the number of transparent file copies in the OS and system calls by performing `O_DIRECT` zero-copy IO by splicing data directly between the network socket and the file descriptor.
 
+Splicing and encryption are __mutually exclusive__.
+Moving bytes kernel-side means never seeing them in user space, and Noise has to see them to encrypt them.
+So the zero-copy path serves `http://` and `ws://` only, and connections using `http+noise://` or `ws+noise://` fall back to a buffered copy.
+Terminating Noise on a NIC that offloads AES-GCM would lift that restriction, which is part of why the cipher was chosen.
+
 ### Other Functional HTTP Headers
 
 UCall supports standard HTTP headers for production deployments.
@@ -440,8 +483,9 @@ But you are not required or expected to form a response for each message inside 
 
 ### Observability & Metrics
 
-UCall provides minimal overhead observability out of the box, using the same kernel-bypass techniques to output metrics.
-It sends metrics in StatsD/DogStatsD format over UDP to `localhost:8125` by default - enabled automatically with zero configuration.
+UCall provides minimal overhead observability, using the same kernel-bypass techniques to output metrics.
+Metrics are __opt-in__: point `metrics_address` at a StatsD/DogStatsD endpoint such as `127.0.0.1:8125` to enable them, and leave it `NULL` — the default — to emit nothing at all.
+A server should never send packets to a port its operator didn't ask for.
 This is the most lightweight approach for high-throughput servers: fire-and-forget UDP packets add ~100ns overhead per request.
 
 Metrics are automatically tagged with endpoint, method, and status code for easy debugging:
@@ -457,10 +501,11 @@ ucall.errors:1|c|#endpoint:/sum,error:timeout
 For high-throughput scenarios (>500K rps), sampling can be configured to reduce UDP traffic:
 
 ```c
-ucall_config_t config = {
-    .metrics_sample_rate = 0.1,  // Sample 10% of requests, StatsD will multiply counts
-    .metrics_prefix = "myapp",   // Metric names become "myapp.requests", etc.
-    .metrics_tags = "env:prod,region:us-east"  // Global tags for all metrics
+ucall_server_config_t config = {
+    .metrics_address = "127.0.0.1:8125", // Enables metrics; NULL keeps them off
+    .metrics_sample_rate = 0.1,          // Sample 10% of requests, StatsD will multiply counts
+    .metrics_prefix = "myapp",           // Metric names become "myapp.requests", etc.
+    .metrics_tags = "env:prod,region:us-east", // Global tags for all metrics
 };
 ```
 The StatsD format works universally with all major observability platforms via collectors: Datadog Agent, OTel Collector, Telegraf, and Prometheus StatsD Exporter.

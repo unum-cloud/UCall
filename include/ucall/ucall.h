@@ -28,9 +28,19 @@ extern "C" {
 typedef char const *ucall_string_t;
 
 /**
+ *  @brief A non-owning view of a contiguous byte range.
+ *
+ *  Used for scatter-gather replies, avoiding a dependency on POSIX @c iovec,
+ *  which is unavailable on Windows.
+ */
+typedef struct ucall_buffer_t {
+    void const *data;
+    size_t length;
+} ucall_buffer_t;
+
+/**
  *  @brief Opaque type-punned server handle.
- *  @sa Deals with @c ucall_received_http_request_t, @c ucall_received_batch_http_request_t,
- *    @c ucall_planned_http_response_t.
+ *  @sa Deals with @c ucall_received_http_request_t and @c ucall_received_batch_http_request_t.
  *  @sa Use with @c ucall_server_init() and @c ucall_server_free() for lifetime.
  *  @sa Use @c ucall_server_add_http_endpoint() and @c ucall_server_take_calls() for logic.
  */
@@ -38,9 +48,9 @@ typedef void *ucall_server_t;
 
 /**
  *  @brief Opaque type-punned client handle.
- *  @sa Deals with @c ucall_planned_http_request_t, @c ucall_received_http_response_t.
+ *  @sa Deals with @c ucall_received_http_response_t.
  *  @sa Use with @c ucall_client_init() and @c ucall_client_free() for lifetime.
- *  @sa Use @c ucall_client_send_request() for logic.
+ *  @sa Use @c ucall_client_call() for logic.
  *
  *  At a high level, a @b client is responsible for:
  *
@@ -49,26 +59,14 @@ typedef void *ucall_server_t;
  */
 typedef void *ucall_client_t;
 
-/**
- *  @brief Opaque type-punned handle for a planned Remote Procedure Call on the @b client side.
- *  @sa Created by @c ucall_client_request() and polled with @c ucall_planned_http_request_ready().
- */
-typedef void *ucall_planned_http_request_t;
-
 /** @brief Opaque type-punned handle for a single Remote Procedure Call on the @b server side. */
 typedef void *ucall_received_http_request_t;
 
 /** @brief Opaque type-punned handle for several batched Remote Procedure Calls on the @b server side. */
 typedef void *ucall_received_batch_http_request_t;
 
-/** @brief Opaque type-punned handle for a single Remote Procedure Call reply on the @b server side. */
-typedef void *ucall_planned_http_response_t;
-
 /** @brief Opaque type-punned handle for a single Remote Procedure Call reply on the @b client side. */
 typedef void *ucall_received_http_response_t;
-
-/** @brief Opaque type-punned handle for a message (same as call for server context). */
-typedef void *ucall_message_t;
 
 /**
  *  @brief Security modes for UCall server and client.
@@ -82,10 +80,14 @@ typedef void *ucall_message_t;
  *  @see https://noiseprotocol.org/noise.html for pattern specifications.
  */
 typedef enum ucall_security_mode_t {
-    ucall_security_none_k,     // No encryption, plain TCP/IP.
-    ucall_security_noise_xx_k, // Trust on first use - no pre-shared keys needed.
-    ucall_security_noise_ik_k, // Client knows server's public key in advance.
-    ucall_security_noise_kk_k  // Both know each other's public keys in advance.
+    /** @brief No encryption, plain TCP/IP. */
+    ucall_security_none_k,
+    /** @brief Trust on first use - no pre-shared keys needed. */
+    ucall_security_noise_xx_k,
+    /** @brief Client knows server's public key in advance. */
+    ucall_security_noise_ik_k,
+    /** @brief Both know each other's public keys in advance. */
+    ucall_security_noise_kk_k
 } ucall_security_mode_t;
 
 /**
@@ -94,31 +96,41 @@ typedef enum ucall_security_mode_t {
 typedef uint8_t ucall_noise_key_t[32];
 
 /**
+ *  @brief Decides whether a peer presenting a given static key may proceed past the handshake.
+ *  @param[in] peer_static_key The remote party's 32-byte Curve25519 static public key.
+ *  @param[in] context User-supplied context from the server or client configuration.
+ *  @return True to accept the peer, false to abort with @c ucall_status_peer_rejected_k.
+ *
+ *  Required for @c ucall_security_noise_xx_k, where keys are learned during the handshake
+ *  rather than known in advance. Called after the key is authenticated, before any payload.
+ */
+typedef bool (*ucall_peer_authorizer_t)(ucall_noise_key_t const *peer_static_key, void *context);
+
+/**
  *  @brief HTTP request methods/verbs for endpoint routing.
  *
  *  For JSON-RPC all requests are typically sent via HTTP @c POST.
  */
 typedef enum ucall_verb_t {
-    ucall_verb_get_k,    // HTTP "GET" method for retrieving resources.
-    ucall_verb_post_k,   // HTTP "POST" method for creating resources.
-    ucall_verb_put_k,    // HTTP "PUT" method for updating resources.
-    ucall_verb_delete_k, // HTTP "DELETE" method for removing resources.
-    ucall_verb_patch_k,  // HTTP "PATCH" method for partial updates.
-    ucall_verb_head_k,   // HTTP "HEAD" method for retrieving headers only.
-    ucall_verb_options_k // HTTP "OPTIONS" method for retrieving supported methods.
+    /** @brief Unrecognized or not yet parsed. The zero-initialized default. */
+    ucall_verb_unknown_k = 0,
+    /** @brief HTTP "GET" method for retrieving resources. */
+    ucall_verb_get_k,
+    /** @brief HTTP "POST" method for creating resources. */
+    ucall_verb_post_k,
+    /** @brief HTTP "PUT" method for updating resources. */
+    ucall_verb_put_k,
+    /** @brief HTTP "DELETE" method for removing resources. */
+    ucall_verb_delete_k,
+    /** @brief HTTP "PATCH" method for partial updates. */
+    ucall_verb_patch_k,
+    /** @brief HTTP "HEAD" method for retrieving headers only. */
+    ucall_verb_head_k,
+    /** @brief HTTP "OPTIONS" method for retrieving supported methods. */
+    ucall_verb_options_k,
+    /** @brief Matches every method. Valid only when registering an endpoint. */
+    ucall_verb_any_k
 } ucall_verb_t;
-
-/**
- *  @brief Parameter parsing mode for HTTP requests.
- *
- *  Determines how the server extracts parameters from incoming HTTP requests.
- *  Can be configured per-endpoint or globally.
- */
-typedef enum ucall_params_source_t {
-    ucall_params_from_uri_k,  // Parse parameters from URL query string (e.g., /sum?a=10&b=20).
-    ucall_params_from_path_k, // Parse parameters from URL path (e.g., /sum/{10}/{20}).
-    ucall_params_from_json_k  // Parse parameters from JSON body payload (e.g., {"a": 10, "b": 20}).
-} ucall_params_source_t;
 
 /**
  *  @brief Library-level status codes for UCall operations.
@@ -127,17 +139,33 @@ typedef enum ucall_params_source_t {
  *  For HTTP-specific status codes (200, 404, 500), use @c ucall_http_status_t.
  */
 typedef enum ucall_status_t {
-    ucall_status_ok_k = 0,      // Operation completed successfully
-    ucall_status_pending_k = 1, // Async operation still in progress
+    /** @brief Operation completed successfully. */
+    ucall_status_ok_k = 0,
+    /** @brief Async operation still in progress. */
+    ucall_status_pending_k = 1,
 
-    ucall_status_invalid_argument_k = 2,  // Invalid function parameters (NULL pointers, invalid values)
-    ucall_status_out_of_memory_k = 3,     // Memory allocation failed
-    ucall_status_connection_failed_k = 4, // Failed to establish connection (DNS, TCP, or Noise handshake)
-    ucall_status_connection_closed_k = 5, // Connection closed unexpectedly
-    ucall_status_timeout_k = 6,           // Operation exceeded configured timeout
+    /** @brief Invalid function parameters - NULL pointers or out-of-range values. */
+    ucall_status_invalid_argument_k = 2,
+    /** @brief Memory allocation failed. */
+    ucall_status_out_of_memory_k = 3,
+    /** @brief Failed to establish connection at the DNS, TCP, or Noise handshake stage. */
+    ucall_status_connection_failed_k = 4,
+    /** @brief Connection closed unexpectedly. */
+    ucall_status_connection_closed_k = 5,
+    /** @brief Operation exceeded configured timeout. */
+    ucall_status_timeout_k = 6,
 
-    ucall_status_not_found_k = 7,    // Requested resource/header/parameter not found
-    ucall_status_invalid_data_k = 8, // Malformed or invalid protocol data
+    /** @brief Requested resource/header/parameter not found. */
+    ucall_status_not_found_k = 7,
+    /** @brief Malformed or invalid protocol data. */
+    ucall_status_invalid_data_k = 8,
+
+    /** @brief Noise handshake failed - key mismatch, bad pattern, or bad tag. */
+    ucall_status_handshake_failed_k = 9,
+    /** @brief Peer static key declined by @c ucall_peer_authorizer_t. */
+    ucall_status_peer_rejected_k = 10,
+    /** @brief Non-blocking operation had no progress to report. */
+    ucall_status_would_block_k = 11,
 
 } ucall_status_t;
 
@@ -148,31 +176,46 @@ typedef enum ucall_status_t {
  *  For library-level operations, use @c ucall_status_t instead.
  */
 typedef enum ucall_http_status_t {
-    // 2xx Success
+    /** @brief Request succeeded. */
     ucall_http_ok_k = 200,
+    /** @brief Resource created. */
     ucall_http_created_k = 201,
+    /** @brief Success with an empty body. */
     ucall_http_no_content_k = 204,
 
-    // 3xx Redirection
+    /** @brief Resource has a new permanent URL. */
     ucall_http_moved_permanently_k = 301,
+    /** @brief Resource is temporarily at a different URL. */
     ucall_http_found_k = 302,
+    /** @brief Cached copy is still fresh. */
     ucall_http_not_modified_k = 304,
 
-    // 4xx Client errors
+    /** @brief Malformed request syntax. */
     ucall_http_bad_request_k = 400,
+    /** @brief Authentication required or failed. */
     ucall_http_unauthorized_k = 401,
+    /** @brief Authenticated, but not permitted. */
     ucall_http_forbidden_k = 403,
+    /** @brief No endpoint matches the request path. */
     ucall_http_not_found_k = 404,
+    /** @brief Endpoint exists, but not for this verb. */
     ucall_http_method_not_allowed_k = 405,
+    /** @brief Client took too long to send the request. */
     ucall_http_timeout_k = 408,
+    /** @brief Request conflicts with current resource state. */
     ucall_http_conflict_k = 409,
+    /** @brief Request body exceeds the configured limit. */
     ucall_http_payload_too_large_k = 413,
+    /** @brief Rate limit exceeded. */
     ucall_http_too_many_requests_k = 429,
 
-    // 5xx Server errors
+    /** @brief Unhandled failure inside an endpoint. */
     ucall_http_internal_error_k = 500,
+    /** @brief Verb or feature not supported. */
     ucall_http_not_implemented_k = 501,
+    /** @brief Server is overloaded or shutting down. */
     ucall_http_service_unavailable_k = 503,
+    /** @brief Upstream dependency timed out. */
     ucall_http_gateway_timeout_k = 504,
 } ucall_http_status_t;
 
@@ -180,10 +223,14 @@ typedef enum ucall_http_status_t {
  *  @brief WebSocket event types, shared between client and server.
  */
 typedef enum ucall_websocket_event_t {
-    ucall_websocket_open_k,    // Connection established.
-    ucall_websocket_message_k, // Message received.
-    ucall_websocket_error_k,   // Error occurred.
-    ucall_websocket_close_k    // Connection closed.
+    /** @brief Connection established. */
+    ucall_websocket_open_k,
+    /** @brief Message received. */
+    ucall_websocket_message_k,
+    /** @brief Error occurred. */
+    ucall_websocket_error_k,
+    /** @brief Connection closed. */
+    ucall_websocket_close_k
 } ucall_websocket_event_t;
 
 /**
@@ -227,16 +274,28 @@ typedef void (*ucall_websocket_callback_t)(                                     
  */
 typedef struct ucall_client_config_t {
 
-    uint32_t max_concurrent_connections;    // Default: 100
-    uint32_t connect_timeout_micro_seconds; // Default: 5'000'000
-    uint32_t request_timeout_micro_seconds; // Default: 30'000'000
+    /** @brief Maximum simultaneously open connections. Default: 100. */
+    uint32_t max_concurrent_connections;
+    /** @brief Time budget for establishing a connection. Default: 5'000'000. */
+    uint32_t connect_timeout_micro_seconds;
+    /** @brief Time budget for a full request-response exchange. Default: 30'000'000. */
+    uint32_t request_timeout_micro_seconds;
 
-    ucall_noise_key_t const *noise_private_key; // Optional for client auth
+    /** @brief Client identity for handshakes. Optional, needed only when the server authenticates clients. */
+    ucall_noise_key_t const *noise_private_key;
 
-    int32_t logs_file_descriptor; // Default: STDERR_FILENO
-    char const *logs_format;      // Default: "human"
+    /** @brief Vets server static keys. Required for XX. Default: NULL. */
+    ucall_peer_authorizer_t peer_authorizer;
+    /** @brief Passed verbatim to @c peer_authorizer. */
+    void *peer_authorizer_context;
 
-    uint16_t queue_depth; // Default: 128
+    /** @brief Descriptor receiving log output. Default: STDERR_FILENO. */
+    int32_t logs_file_descriptor;
+    /** @brief Log format name. Default: "human". */
+    char const *logs_format;
+
+    /** @brief Depth of the submission queue backing the client. Default: 128. */
+    uint16_t queue_depth;
 } ucall_client_config_t;
 
 /**
@@ -244,12 +303,16 @@ typedef struct ucall_client_config_t {
  *  @param[inout] config Input/output argument updated to export the final configuration.
  *  @param[out] client Output variable, which on success will be an initialized client.
  *    Free with @c ucall_client_free() at the end.
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_client_call().
  */
 ucall_status_t ucall_client_init(ucall_client_config_t *config, ucall_client_t *client);
 
 /**
  *  @brief Frees the client state.
  *  @param[in] client Must be pre-initialized with @c ucall_client_init().
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_client_call().
  */
 void ucall_client_free(ucall_client_t client);
 
@@ -260,17 +323,23 @@ void ucall_client_free(ucall_client_t client);
  *  headers of individual requests.
  */
 typedef struct ucall_request_options_t {
-    uint32_t timeout_micro_seconds; // Default: 5'000'000
-    uint8_t max_retries;            // Default: 3
-    uint8_t max_redirects;          // Default: 5
+    /** @brief Time budget for this call. Default: 5'000'000. */
+    uint32_t timeout_micro_seconds;
+    /** @brief Retries attempted on transport failure. Default: 3. */
+    uint8_t max_retries;
+    /** @brief Redirect hops followed before failing. Default: 5. */
+    uint8_t max_redirects;
 
-    ucall_security_mode_t security;      // Default: ucall_security_none_k
-    ucall_noise_key_t const *client_key; // Needed for KK security mode
-    ucall_noise_key_t const *server_key; // Needed for IK and KK security modes
+    /** @brief Transport security for this call. Default: ucall_security_none_k. */
+    ucall_security_mode_t security;
+    /** @brief Needed for KK security mode. */
+    ucall_noise_key_t const *client_key;
+    /** @brief Needed for IK and KK security modes. */
+    ucall_noise_key_t const *server_key;
 } ucall_request_options_t;
 
 /**
- *  @brief Performs an asynchronous HTTP request.
+ *  @brief Makes a single HTTP call and blocks until the response arrives.
  *  @param[in] client Pre-initialized client handle.
  *  @param[in] url Full URL with scheme: @c http://, @c ws://, @c http+noise://, or @c ws+noise://.
  *    Example: "http://localhost:8080/sum?a=1&b=2" or "http+noise://api.example.com/rpc".
@@ -281,8 +350,22 @@ typedef struct ucall_request_options_t {
  *  @param[in] body Request body, can be @c NULL for @c GET, @c HEAD, or @c DELETE.
  *  @param[in] body_length Length of @p body in bytes.
  *  @param[in] options Per-request options for timeouts, retries, redirects, and security.
- *  @param[out] planned_http_request Output handle for the planned request.
+ *  @param[out] response Output handle for the received response.
+ *    Free with @c ucall_received_http_response_free() once done.
  *  @return Status code indicating success or failure.
+ *
+ *  @note @b Thread-safe. One call is in flight per calling thread.
+ *
+ *  @par Synchronous by Design
+ *
+ *  One call at a time, blocking until it completes. There are no futures, promises, or
+ *  polling loops - concurrency comes from running more threads, each with its own call
+ *  in flight. This mirrors @c ucall_server_take_calls() on the server side, where
+ *  asynchrony lives inside the library and never in the application's control flow.
+ *
+ *  When calling out to another service from @b inside a server endpoint, this blocks the
+ *  worker thread. To keep serving other requests while waiting, re-enter the server loop
+ *  by calling @c ucall_server_take_calls() from within the handler.
  *
  *  @par Headers
  *
@@ -305,107 +388,78 @@ typedef struct ucall_request_options_t {
  *  - @b 303: After @c POST submission - redirect to result page via @c GET (prevents duplicate submissions).
  *  - @b 304: Not Modified - cached version is still fresh, saves bandwidth.
  *
- *  Redirect chains occur when multiple redirects happen in sequence (e.g., http://site.com →
- *  https://site.com → https://www.site.com). Most browsers follow up to 20-30 redirects before
- *  stopping. Googlebot stops after 5 hops, treating longer chains as soft 404s.
+ *  Redirect chains occur when multiple redirects happen in sequence, for example
+ *  http://site.com → https://site.com → https://www.site.com. Chains longer than
+ *  @c ucall_request_options_t::max_redirects fail with @c ucall_status_invalid_data_k.
  *
- *  @par Minimal Blocking Example
- *
- *  There are several ways to use this function, depending on the efficiency/complexity constraints.
- *  The simplest way is to call it, then immediately poll for readiness of the response:
+ *  @par Example
  *
  *  @code{.c}
  *  ucall_client_t client;
  *  ucall_client_config_t config = {0};
  *  ucall_client_init(&config, &client);
- *
- *  ucall_planned_http_request_t request;
- *  ucall_request_options_t options = {0};
- *  ucall_client_request(client, "http://localhost:8080/sum?a=1&b=2", ucall_verb_get_k,
- *      NULL, NULL, 0,          // ! no custom headers
- *      NULL, 0,                // ! no body
- *      &options, &request);
  *
  *  ucall_received_http_response_t response;
- *  ucall_status_t status;
- *  do { status = ucall_planned_http_request_ready(request, &response); }
- *  while (status == ucall_status_pending_k);
- *  // process `response`...
- *  ucall_received_http_response_free(response);
- *  ucall_client_free(client);
- *  @endcode
- *
- *  @par Futures & Promises API
- *
- *  Unlike the server-side and WebSocket APIs, the client-side API is designed around
- *  a "Futures & Promises" asynchronous programming model. The reason is that clients
- *  often need to issue many concurrent requests to different servers, generally expecting
- *  high and non-uniform latencies from each.
- *
- *  @par Complex Batch Asynchronous Example
- *
- *  Using the Futures & Promises model, we can issue multiple requests concurrently, potentially
- *  with different security constraints, and then wait for each to complete as needed:
- *
- *  @code{.c}
- *  ucall_client_t client;
- *  ucall_client_config_t config = {0};
- *  ucall_client_init(&config, &client);
- *
- *  ucall_planned_http_request_t requests[3];
  *  ucall_request_options_t options = {0};
- *  ucall_client_request(client, "https://api.github.com/users/unum-cloud", ucall_verb_get_k,
- *      NULL, NULL, 0, NULL, 0, &options, &requests[0]);
- *  ucall_client_request(client, "https://api.weather.com/forecast", ucall_verb_post_k,
- *      NULL, NULL, 0, "{\"city\":\"New York\"}", 20, &options, &requests[1]);
- *  ucall_client_request(client, "https://localhost:8080/sum?a=1&b=2", ucall_verb_get_k,
- *      NULL, NULL, 0, NULL, 0, &options, &requests[2]);
+ *  ucall_status_t status = ucall_client_call(client,
+ *      "http://localhost:8080/sum?a=1&b=2", ucall_verb_get_k,
+ *      NULL, NULL, 0,          // ! no custom headers
+ *      NULL, 0,                // ! no body
+ *      &options, &response);
  *
- *  size_t requests_remaining = 3;
- *  while (requests_remaining > 0) {
- *      for (size_t i = 0; i < 3; i++) {
- *          ucall_received_http_response_t response;
- *          ucall_status_t status = ucall_planned_http_request_ready(requests[i], &response);
- *          if (status == ucall_status_pending_k) continue;
- *          // process `response`...
- *          ucall_received_http_response_free(response);
- *          requests_remaining--;
- *      }
+ *  if (status == ucall_status_ok_k) {
+ *      ucall_string_t body;
+ *      size_t body_length;
+ *      ucall_received_http_response_body(client, response, &body, &body_length);
+ *      // process `body`...
+ *      ucall_received_http_response_free(client, response);
  *  }
  *  ucall_client_free(client);
  *  @endcode
  */
-ucall_status_t ucall_client_request(                                                    //
+ucall_status_t ucall_client_call(                                                       //
     ucall_client_t client, ucall_string_t url, ucall_verb_t verb,                       //
     ucall_string_t const *headers, size_t const *headers_lengths, size_t headers_count, //
     ucall_string_t body, size_t body_length,                                            //
     ucall_request_options_t const *options,                                             //
-    ucall_planned_http_request_t *planned_http_request);
+    ucall_received_http_response_t *response);
 
 /**
- *  @brief Establishes a WebSocket connection to the specified URL.
+ *  @brief Establishes a WebSocket connection and blocks until the handshake completes.
  *  @param[in] client Pre-initialized client handle.
  *  @param[in] url WebSocket URL with scheme: @c ws:// or @c ws+noise://.
  *  @param[in] options Optional request options.
- *  @param[in] callback Callback function to handle WebSocket events (receiving messages).
- *  @param[in] context User-defined context pointer for the @p callback.
- *  @param[out] websocket Output variable to hold the WebSocket handle (sending messages).
+ *  @param[out] websocket Output variable to hold the WebSocket handle.
+ *
+ *  @note @b Thread-safe.
  */
-ucall_status_t ucall_client_websocket(                  //
-    ucall_client_t client, ucall_string_t url,          //
-    ucall_request_options_t const *options,             //
-    ucall_websocket_callback_t callback, void *context, //
+ucall_status_t ucall_client_websocket_connect( //
+    ucall_client_t client, ucall_string_t url, //
+    ucall_request_options_t const *options,    //
     ucall_websocket_t *websocket);
 
 /**
- *  @brief Non-blocking thread-safe check if the planned request is ready.
- *  @param[in] request The planned request from @c ucall_client_request() to check.
- *  @param[out] response Output variable to hold the received response handle.
+ *  @brief Blocks until a message arrives on an established WebSocket connection.
+ *  @param[in] client Client handle from @c ucall_client_init().
+ *  @param[in] websocket WebSocket handle from @c ucall_client_websocket_connect().
+ *  @param[out] opcode Output variable for the received message type.
+ *  @param[out] data Output pointer for the message payload. Valid until the next call.
+ *  @param[out] data_length Output length of the message payload.
+ *  @param[in] timeout_micro_seconds Maximum time to block. Zero returns immediately.
+ *  @return @c ucall_status_timeout_k if no message arrived, @c ucall_status_connection_closed_k
+ *    once the peer closes the connection.
  *
- *  Once complete, @p request becomes invalid. All context transfers to @p response.
+ *  @note @b Thread-safe against @c ucall_client_websocket_send() on the same @p websocket,
+ *    so one thread may receive while another sends. Two threads must not receive concurrently.
+ *
+ *  Unlike the server side, which dispatches to @c ucall_websocket_callback_t from within its
+ *  own loop, the client receives on a loop the application owns.
  */
-ucall_status_t ucall_planned_http_request_ready(ucall_planned_http_request_t request,
-                                                ucall_received_http_response_t *response);
+ucall_status_t ucall_client_websocket_receive(          //
+    ucall_client_t client, ucall_websocket_t websocket, //
+    ucall_websocket_opcode_t *opcode,                   //
+    ucall_string_t *data, size_t *data_length,          //
+    uint32_t timeout_micro_seconds);
 
 /**
  *  @brief Extracts the named string header from the received response.
@@ -413,12 +467,15 @@ ucall_status_t ucall_planned_http_request_ready(ucall_planned_http_request_t req
  *  Header name matching is case-insensitive per RFC 7230.
  *
  *  @param[in] client Client handle from @c ucall_client_init().
- *  @param[in] response The received response from @c ucall_planned_http_request_ready().
+ *  @param[in] response The received response from @c ucall_client_call().
  *  @param[in] header_name The name of the HTTP header to extract (case-insensitive).
  *  @param[in] header_name_length The length of the @p header_name string.
  *  @param[out] output Output pointer for the start of the header value string.
  *  @param[out] output_length Output length of the header value string.
  *  @return Status code indicating success or failure (header not found).
+ *
+ *  @note @b Thread-safe across responses. Two threads must not operate on the
+ *    @b same @p response concurrently.
  */
 ucall_status_t ucall_received_http_response_header(                 //
     ucall_client_t client, ucall_received_http_response_t response, //
@@ -428,10 +485,13 @@ ucall_status_t ucall_received_http_response_header(                 //
 /**
  *  @brief Extracts the body content from the received response.
  *  @param[in] client Client handle from @c ucall_client_init().
- *  @param[in] response The received response from @c ucall_planned_http_request_ready().
+ *  @param[in] response The received response from @c ucall_client_call().
  *  @param[out] output Output pointer for the start of the body content.
  *  @param[out] output_length Output length of the body content.
  *  @return Status code indicating success or failure.
+ *
+ *  @note @b Thread-safe across responses. Two threads must not operate on the
+ *    @b same @p response concurrently.
  */
 ucall_status_t ucall_received_http_response_body(                   //
     ucall_client_t client, ucall_received_http_response_t response, //
@@ -440,18 +500,23 @@ ucall_status_t ucall_received_http_response_body(                   //
 /**
  *  @brief Frees the received response handle.
  *  @param[in] client Client handle from @c ucall_client_init().
- *  @param[in] response The received response from @c ucall_planned_http_request_ready().
+ *  @param[in] response The received response from @c ucall_client_call().
+ *
+ *  @note @b Thread-safe across responses. Two threads must not operate on the
+ *    @b same @p response concurrently.
  */
 void ucall_received_http_response_free(ucall_client_t client, ucall_received_http_response_t response);
 
 /**
  *  @brief Sends a message over an established WebSocket connection.
  *  @param[in] client Client handle from @c ucall_client_init().
- *  @param[in] websocket WebSocket connection handle from @c ucall_client_websocket().
+ *  @param[in] websocket WebSocket connection handle from @c ucall_client_websocket_connect().
  *  @param[in] opcode Message type (text, binary, ping, pong).
  *  @param[in] data Message payload.
  *  @param[in] data_length Length of the message payload in bytes.
  *  @return Status code indicating success or failure.
+ *
+ *  @note @b Thread-safe.
  */
 ucall_status_t ucall_client_websocket_send(             //
     ucall_client_t client, ucall_websocket_t websocket, //
@@ -461,6 +526,8 @@ ucall_status_t ucall_client_websocket_send(             //
  *  @brief Closes a WebSocket connection.
  *  @param[in] client Client handle from @c ucall_client_init().
  *  @param[in] websocket WebSocket connection handle to close.
+ *
+ *  @note @b Thread-safe.
  */
 void ucall_client_websocket_close(ucall_client_t client, ucall_websocket_t websocket);
 
@@ -477,9 +544,24 @@ typedef enum ucall_log_level_t {
 } ucall_log_level_t;
 
 typedef enum ucall_log_mode_t {
-    ucall_log_mode_human_k, // Human-readable unit-normalized lines
-    ucall_log_mode_json_k,  // Newline-delimited JSONs documents
+    /** @brief Human-readable unit-normalized lines. */
+    ucall_log_mode_human_k,
+    /** @brief Newline-delimited JSONs documents. */
+    ucall_log_mode_json_k,
 } ucall_log_mode_t;
+
+/**
+ *  @brief Notifies the application that the shared receive buffer pool has been mapped.
+ *  @param[in] base Start of the pool. Page-aligned and contiguous for the server's lifetime.
+ *  @param[in] length Size of the pool in bytes.
+ *  @param[in] context User-supplied context from the server configuration.
+ *  @return True to proceed with startup, false to abort @c ucall_server_init().
+ *
+ *  Invoked once during @c ucall_server_init(). Lets an application page-lock the pool for
+ *  accelerator transfers - by calling @c cudaHostRegister() or an equivalent - without UCall
+ *  itself depending on any accelerator runtime.
+ */
+typedef bool (*ucall_buffer_pool_callback_t)(void *base, size_t length, void *context);
 
 /**
  *  @brief Configuration parameters for the UCall server.
@@ -503,21 +585,43 @@ typedef enum ucall_log_mode_t {
  *  @endcode
  */
 typedef struct ucall_server_config_t {
-    char const *bind_address;                   // Server address in "host:port" format. Default: "0.0.0.0:8545"
-    ucall_security_mode_t security_mode;        // Encryption mode for all connections. Default: ucall_security_none_k
-    ucall_noise_key_t const *noise_private_key; // Server identity for handshakes. Required for secure connections.
+    /** @brief Server address in "host:port" format. Default: "0.0.0.0:8545" */
+    char const *bind_address;
+    /** @brief Encryption mode for all connections. Default: ucall_security_none_k. */
+    ucall_security_mode_t security_mode;
+    /** @brief Server identity for handshakes. Required for secure connections. */
+    ucall_noise_key_t const *noise_private_key;
 
-    uint16_t max_threads;                // Thread pool size. Default: CPU count.
-    uint16_t max_concurrent_connections; // Connection limit. Default: 1024.
-    uint16_t queue_depth;                // Pending connections queue. Default: 128.
+    /** @brief Vets client static keys. Required for XX. Default: NULL. */
+    ucall_peer_authorizer_t peer_authorizer;
+    /** @brief Passed verbatim to @c peer_authorizer. */
+    void *peer_authorizer_context;
 
-    char const *logs_output_path; // Log file path. NULL redirects to stderr. Default: NULL.
-    ucall_log_mode_t log_mode;    // Log format. Default: ucall_log_mode_human_k.
+    /** @brief Notified once the pool is mapped. Default: NULL. */
+    ucall_buffer_pool_callback_t buffer_pool_callback;
+    /** @brief Passed verbatim to @c buffer_pool_callback. */
+    void *buffer_pool_context;
 
-    char const *metrics_address; // StatsD UDP endpoint "host:port". NULL = disabled. Default: NULL.
-    float metrics_sample_rate;   // Sampling rate [0.0, 1.0]. Default: 1.0.
-    char const *metrics_prefix;  // Metric name prefix. Default: "ucall".
-    char const *metrics_tags;    // Global tags "key:val,key:val". Default: NULL.
+    /** @brief Thread pool size. Default: CPU count. */
+    uint16_t max_threads;
+    /** @brief Connection limit. Default: 1024. */
+    uint16_t max_concurrent_connections;
+    /** @brief Depth of the submission queue backing the client. Default: 128. */
+    uint16_t queue_depth;
+
+    /** @brief Log file path. NULL redirects to stderr. Default: NULL. */
+    char const *logs_output_path;
+    /** @brief Log format. Default: ucall_log_mode_human_k. */
+    ucall_log_mode_t log_mode;
+
+    /** @brief StatsD UDP endpoint "host:port". NULL = disabled. Default: NULL. */
+    char const *metrics_address;
+    /** @brief Sampling rate [0.0, 1.0]. Default: 1.0. */
+    float metrics_sample_rate;
+    /** @brief Metric name prefix. Default: "ucall". */
+    char const *metrics_prefix;
+    /** @brief Global tags "key:val,key:val". Default: NULL. */
+    char const *metrics_tags;
 } ucall_server_config_t;
 
 /**
@@ -526,14 +630,20 @@ typedef struct ucall_server_config_t {
  *  @param[out] server Output variable, which on success will be an initialized server.
  *    Free with @c ucall_server_free() at the end.
  *  @return Status code indicating success or failure.
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
  */
 ucall_status_t ucall_server_init(ucall_server_config_t *config, ucall_server_t *server);
 
 /**
  *  @brief Frees the server state.
  *  @param[in] server Must be pre-initialized with @c ucall_server_init().
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
  */
 void ucall_server_free(ucall_server_t server);
+
+#pragma region Endpoint Registration
 
 /**
  *  @brief Callback type for handling incoming requests on the server side.
@@ -561,128 +671,12 @@ typedef void (*ucall_received_http_request_callback_t)(ucall_received_http_reque
  *  @return Status code (duplicate endpoint, invalid template, out of memory).
  *
  *  @see RFC 6570 Section 3.2.2 for simple string expansion specification.
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
  */
 ucall_status_t ucall_server_add_http_endpoint(                             //
     ucall_server_t server, ucall_string_t uri_template, ucall_verb_t verb, //
     ucall_received_http_request_callback_t callback, void *context);
-
-/**
- *  @brief Performs a single blocking round of polling on the current calling thread.
- *  @param[in] server Must be pre-initialized with @c ucall_server_init().
- *  @param[in] thread_index Unique thread identifier within @c ucall_server_config_t::max_threads.
- */
-void ucall_server_take_call(ucall_server_t server, uint16_t thread_index);
-
-/**
- *  @brief Blocks current thread, more efficient than a @c while loop with @c ucall_server_take_call().
- *
- *  @param[in] server Must be pre-initialized with @c ucall_server_init().
- *  @param[in] thread_index Unique thread identifier within @c ucall_server_config_t::max_threads.
- */
-void ucall_server_take_calls(ucall_server_t server, uint16_t thread_index);
-
-/**
- *  @brief Extracts the number of path components from the received request.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
- *  @param[in] index The zero-based index of the path component to extract.
- *  @param[out] count Output pointer for the number of path components.
- */
-ucall_status_t ucall_server_request_path_components_count(                      //
-    ucall_server_t server, ucall_received_http_request_t request, size_t index, //
-    size_t *count);
-
-/**
- *  @brief Extracts an indexed path component from the received request.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
- *  @param[in] index The zero-based index of the path component to extract.
- *  @param[out] output Output pointer for the start of the path component string.
- *  @param[out] output_length Output length of the path component string.
- *
- *  Useful for RESTful APIs with path parameters, e.g., "/users/{id}/posts/{postId}".
- */
-ucall_status_t ucall_server_request_path_component(                             //
-    ucall_server_t server, ucall_received_http_request_t request, size_t index, //
-    ucall_string_t *output, size_t *output_length);
-
-/**
- *  @brief Extracts the named string parameter from the received request.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
- *  @param[in] param_name The @b case-sensitive name of the parameter to extract.
- *  @param[in] param_name_length The length of the @p param_name string.
- *  @param[out] output Output pointer for the start of the parameter value string.
- *  @param[out] output_length Output length of the parameter value string.
- *
- *  Unlike HTTP headers, query parameters are case-sensitive by specification, but server-dependent
- *  in practice. An example would be ASP.NET / IIS, which treats "?id" and "?ID" as same parameters.
- */
-ucall_status_t ucall_server_request_parameter(                    //
-    ucall_server_t server, ucall_received_http_request_t request, //
-    ucall_string_t param_name, size_t param_name_length,          //
-    ucall_string_t *output, size_t *output_length);
-
-/**
- *  @brief Extracts the named string header from the received request.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t callback.
- *  @param[in] header_name The name of the HTTP header to extract (case-insensitive).
- *  @param[in] header_name_length The length of the @p header_name string.
- *  @param[out] output Output pointer for the start of the header value string.
- *  @param[out] output_length Output length of the header value string.
- */
-ucall_status_t ucall_server_request_header(                       //
-    ucall_server_t server, ucall_received_http_request_t request, //
-    ucall_string_t header_name, size_t header_name_length,        //
-    ucall_string_t *output, size_t *output_length);
-
-/**
- *  @brief Extracts the body content from the received request.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
- *  @param[out] output Output pointer for the start of the body content.
- *  @param[out] output_length Output length of the body content.
- */
-ucall_status_t ucall_server_request_body(                         //
-    ucall_server_t server, ucall_received_http_request_t request, //
-    ucall_string_t *output, size_t *output_length);
-
-/**
- *  @brief Sends an HTTP response with custom headers and body.
- *
- *  Automatically sets standard headers: @c Content-Length, @c Date, @c Server.
- *
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request to reply to.
- *  @param[in] headers Array of custom headers ("Content-Type", "application/json", "X-Foo", "bar").
- *  @param[in] headers_lengths Optional array of lengths (NULL = use strlen).
- *  @param[in] headers_count Number of header name-value pairs (total strings / 2).
- *  @param[in] body Response body content. Can be NULL for empty body.
- *  @param[in] body_length Length of body in bytes.
- *  @return Status code indicating success or failure.
- */
-ucall_status_t ucall_server_reply_content(                                              //
-    ucall_server_t server, ucall_received_http_request_t request,                       //
-    ucall_string_t const *headers, size_t const *headers_lengths, size_t headers_count, //
-    ucall_string_t body, size_t body_length);
-
-/**
- *  @brief Sends an error response with plain text message.
- *
- *  Automatically sets @c Content-Type: @c text/plain.
- *  For errors requiring custom headers, use @c ucall_server_reply_content() instead.
- *
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] request The received request to reply to.
- *  @param[in] status_code HTTP error status code (400, 404, 500, etc.).
- *  @param[in] message Error message text.
- *  @param[in] message_length Length of message in bytes.
- *  @return Status code indicating success or failure.
- */
-ucall_status_t ucall_server_reply_error(                          //
-    ucall_server_t server, ucall_received_http_request_t request, //
-    int status_code, ucall_string_t message, size_t message_length);
 
 /**
  *  @brief Callback type for handling batched requests on the server side.
@@ -699,9 +693,12 @@ typedef void (*ucall_received_batch_http_request_callback_t)( //
  *  by accumulating multiple requests and processing them together.
  */
 typedef struct ucall_server_batch_endpoint_options_t {
-    size_t min_batch_size;            // Optimal batch size. Dispatch immediately when reached. Default: 1.
-    size_t max_batch_size;            // Maximum requests per batch. Force dispatch when reached. Default: 32.
-    size_t max_latency_micro_seconds; // Maximum wait time for partial batches. Default: 10'000 (10ms).
+    /** @brief Optimal batch size. Dispatch immediately when reached. Default: 1. */
+    size_t min_batch_size;
+    /** @brief Maximum requests per batch. Force dispatch when reached. Default: 32. */
+    size_t max_batch_size;
+    /** @brief Maximum wait time for partial batches. Default: 10'000, i.e. 10 milliseconds. */
+    size_t max_latency_micro_seconds;
 } ucall_server_batch_endpoint_options_t;
 
 /**
@@ -766,6 +763,8 @@ typedef struct ucall_server_batch_endpoint_options_t {
  *
  *  @sa To extract the number of calls in the batch - @c ucall_server_batch_size().
  *  @sa To enumerate separate calls from within the batch - @c ucall_server_batch_unpack().
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
  */
 ucall_status_t ucall_server_add_batch_endpoint(            //
     ucall_server_t server,                                 //
@@ -773,26 +772,6 @@ ucall_status_t ucall_server_add_batch_endpoint(            //
     ucall_server_batch_endpoint_options_t const *options,  //
     ucall_received_batch_http_request_callback_t callback, //
     void *context);
-
-/**
- *  @brief Returns the number of individual requests in a batch.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] batch Batch request handle from batch callback.
- *  @return Number of requests in the batch (always >= 1).
- */
-size_t ucall_server_batch_size(ucall_server_t server, ucall_received_batch_http_request_t batch);
-
-/**
- *  @brief Unpacks an individual request from a batch by index.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] batch Batch request handle from batch callback.
- *  @param[in] index Zero-based index of the request to extract (must be < batch size).
- *  @param[out] call Output variable to hold the extracted request handle.
- *  @return Status code indicating success or failure (invalid index).
- */
-ucall_status_t ucall_server_batch_unpack(                             //
-    ucall_server_t server, ucall_received_batch_http_request_t batch, //
-    size_t index, ucall_received_http_request_t *call);
 
 /**
  *  @brief Registers a WebSocket endpoint to accept incoming connections.
@@ -806,10 +785,410 @@ ucall_status_t ucall_server_batch_unpack(                             //
  *  @param[in] callback Function pointer to handle WebSocket events.
  *  @param[in] context Optional user-defined context pointer passed to all event callbacks.
  *  @return Status code (duplicate endpoint, invalid template, out of memory).
+ *
+ *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
  */
 ucall_status_t ucall_server_add_websocket_endpoint(     //
     ucall_server_t server, ucall_string_t uri_template, //
     ucall_websocket_callback_t callback, void *context);
+
+#pragma endregion Endpoint Registration
+
+#pragma region Event Loop
+
+/**
+ *  @brief Performs a single blocking round of polling on the current calling thread.
+ *  @param[in] server Must be pre-initialized with @c ucall_server_init().
+ *  @param[in] thread_index Unique thread identifier within @c ucall_server_config_t::max_threads.
+ *
+ *  @note @b Thread-safe when every caller passes a distinct @p thread_index below
+ *    @c ucall_server_config_t::max_threads. Reusing an index corrupts server state.
+ */
+void ucall_server_take_call(ucall_server_t server, uint16_t thread_index);
+
+/**
+ *  @brief Blocks current thread, more efficient than a @c while loop with @c ucall_server_take_call().
+ *
+ *  @param[in] server Must be pre-initialized with @c ucall_server_init().
+ *  @param[in] thread_index Unique thread identifier within @c ucall_server_config_t::max_threads.
+ *
+ *  @note @b Thread-safe when every caller passes a distinct @p thread_index below
+ *    @c ucall_server_config_t::max_threads. Reusing an index corrupts server state.
+ */
+void ucall_server_take_calls(ucall_server_t server, uint16_t thread_index);
+
+#pragma endregion Event Loop
+
+#pragma region Received Requests
+
+/**
+ *  @brief Extracts the HTTP method of the received request.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[out] verb Output pointer for the method. Never @c ucall_verb_any_k.
+ *
+ *  Needed by endpoints registered with @c ucall_verb_any_k, which match every method.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_verb(                         //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_verb_t *verb);
+
+/**
+ *  @brief Extracts the number of path components from the received request.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[out] count Output pointer for the number of path components.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_path_segments_count(          //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    size_t *count);
+
+/**
+ *  @brief Extracts an indexed path component from the received request.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[in] index The zero-based index of the path component to extract.
+ *  @param[out] output Output pointer for the start of the path component string.
+ *  @param[out] output_length Output length of the path component string.
+ *
+ *  Useful for RESTful APIs with path parameters, e.g., "/users/{id}/posts/{postId}".
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_path_segment(                               //
+    ucall_server_t server, ucall_received_http_request_t request, size_t index, //
+    ucall_string_t *output, size_t *output_length);
+
+/**
+ *  @brief Extracts a named path parameter captured by the endpoint's URI template.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[in] name The @b case-sensitive placeholder name, without braces.
+ *  @param[in] name_length The length of the @p name string.
+ *  @param[out] output Output pointer for the start of the captured value.
+ *  @param[out] output_length Output length of the captured value.
+ *
+ *  For an endpoint registered as @c "/users/{id}/posts/{post_id}" receiving @c "/users/7/posts/3",
+ *  a @p name of @c "id" yields @c "7". A greedy wildcard @c {*path} captures the remaining segments
+ *  including separators.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_path_parameter(               //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_string_t name, size_t name_length,                      //
+    ucall_string_t *output, size_t *output_length);
+
+/**
+ *  @brief Extracts the named string parameter from the received request.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[in] param_name The @b case-sensitive name of the parameter to extract.
+ *  @param[in] param_name_length The length of the @p param_name string.
+ *  @param[out] output Output pointer for the start of the parameter value string.
+ *  @param[out] output_length Output length of the parameter value string.
+ *
+ *  Unlike HTTP headers, query parameters are case-sensitive by specification, but server-dependent
+ *  in practice. An example would be ASP.NET / IIS, which treats "?id" and "?ID" as same parameters.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_query_parameter(              //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_string_t param_name, size_t param_name_length,          //
+    ucall_string_t *output, size_t *output_length);
+
+/**
+ *  @brief Extracts the named string header from the received request.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t callback.
+ *  @param[in] header_name The name of the HTTP header to extract (case-insensitive).
+ *  @param[in] header_name_length The length of the @p header_name string.
+ *  @param[out] output Output pointer for the start of the header value string.
+ *  @param[out] output_length Output length of the header value string.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_header(                       //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_string_t header_name, size_t header_name_length,        //
+    ucall_string_t *output, size_t *output_length);
+
+/**
+ *  @brief Extracts the body content from the received request.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[out] output Output pointer for the start of the body content.
+ *  @param[out] output_length Output length of the body content.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_body(                         //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_string_t *output, size_t *output_length);
+
+/**
+ *  @brief Pulls the next chunk of a request body that is still arriving.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[out] chunk Output pointer for the start of the chunk. Aliases the receive buffer.
+ *  @param[out] chunk_length Output length of the chunk. Zero when no data is available yet.
+ *  @param[out] has_more Output flag, false once the final chunk has been delivered.
+ *  @return @c ucall_status_would_block_k if more data is expected but none has arrived.
+ *
+ *  Endpoints registered as streaming are invoked as soon as headers are parsed, before the body
+ *  is complete. Without this, a multi-gigabyte upload must be buffered in full before the handler
+ *  runs, which is both a memory hazard and a denial-of-service vector.
+ *
+ *  @warning The returned @p chunk is valid only until the next call on this @p request.
+ *  @sa Use @c ucall_server_request_body() for endpoints that are not registered as streaming.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_body_chunk(                   //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_string_t *chunk, size_t *chunk_length, bool *has_more);
+
+/**
+ *  @brief Returns the number of parts in a @c multipart/form-data request body.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[out] count Output pointer for the number of parts. Zero if the body is not multipart.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_part_count(                   //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    size_t *count);
+
+/**
+ *  @brief Extracts one part of a @c multipart/form-data request body by index.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request inside the @c ucall_received_http_request_callback_t.
+ *  @param[in] index Zero-based index of the part, below @c ucall_server_request_part_count().
+ *  @param[out] name Output pointer for the part name from @c Content-Disposition.
+ *  @param[out] name_length Output length of the part name.
+ *  @param[out] content_type Output pointer for the part's @c Content-Type. Empty if absent.
+ *  @param[out] content_type_length Output length of the content type.
+ *  @param[out] data Output pointer for the part payload. Aliases the receive buffer, never copied.
+ *  @param[out] data_length Output length of the part payload.
+ *
+ *  The payload is handed over without decoding. Media formats are the application's concern -
+ *  pass @p data straight to an image or video decoder to keep the path copy-free.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_request_part_at(                                    //
+    ucall_server_t server, ucall_received_http_request_t request, size_t index, //
+    ucall_string_t *name, size_t *name_length,                                  //
+    ucall_string_t *content_type, size_t *content_type_length,                  //
+    ucall_string_t *data, size_t *data_length);
+
+/**
+ *  @brief Returns the number of individual requests in a batch.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] batch Batch request handle from batch callback.
+ *  @return Number of requests in the batch (always >= 1).
+ *
+ *  @note @b Thread-safe across batches. Two threads must not operate on the
+ *    @b same @p batch concurrently.
+ */
+size_t ucall_server_batch_size(ucall_server_t server, ucall_received_batch_http_request_t batch);
+
+/**
+ *  @brief Unpacks an individual request from a batch by index.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] batch Batch request handle from batch callback.
+ *  @param[in] index Zero-based index of the request to extract (must be < batch size).
+ *  @param[out] call Output variable to hold the extracted request handle.
+ *  @return Status code indicating success or failure (invalid index).
+ *
+ *  @note @b Thread-safe across batches. Two threads must not operate on the
+ *    @b same @p batch concurrently.
+ */
+ucall_status_t ucall_server_batch_unpack(                             //
+    ucall_server_t server, ucall_received_batch_http_request_t batch, //
+    size_t index, ucall_received_http_request_t *call);
+
+#pragma endregion Received Requests
+
+#pragma region Planned Replies
+
+/**
+ *  @brief Sends an HTTP response with custom headers and body.
+ *
+ *  Automatically sets standard headers: @c Content-Length, @c Date, @c Server.
+ *
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request to reply to.
+ *  @param[in] headers Array of custom headers ("Content-Type", "application/json", "X-Foo", "bar").
+ *  @param[in] headers_lengths Optional array of lengths (NULL = use strlen).
+ *  @param[in] headers_count Number of header name-value pairs (total strings / 2).
+ *  @param[in] body Response body content. Can be NULL for empty body.
+ *  @param[in] body_length Length of body in bytes.
+ *  @return Status code indicating success or failure.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_content(                                              //
+    ucall_server_t server, ucall_received_http_request_t request,                       //
+    ucall_string_t const *headers, size_t const *headers_lengths, size_t headers_count, //
+    ucall_string_t body, size_t body_length);
+
+/**
+ *  @brief Sends an error response with plain text message.
+ *
+ *  Automatically sets @c Content-Type: @c text/plain.
+ *  For errors requiring custom headers, use @c ucall_server_reply_content() instead.
+ *
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request to reply to.
+ *  @param[in] status_code HTTP error status code (400, 404, 500, etc.).
+ *  @param[in] message Error message text.
+ *  @param[in] message_length Length of message in bytes.
+ *  @return Status code indicating success or failure.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_error(                          //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    int status_code, ucall_string_t message, size_t message_length);
+
+/**
+ *  @brief Sends a response assembled from several non-contiguous buffers.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request to reply to.
+ *  @param[in] headers Array of custom headers ("Content-Type", "application/json").
+ *  @param[in] headers_lengths Optional array of lengths (NULL = use strlen).
+ *  @param[in] headers_count Number of header name-value pairs (total strings / 2).
+ *  @param[in] parts Array of buffers concatenated, in order, to form the body.
+ *  @param[in] parts_count Number of entries in @p parts.
+ *
+ *  Lets a handler reply with a header, a tensor, and a trailer without concatenating them
+ *  into a staging buffer first.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_vectored(                                             //
+    ucall_server_t server, ucall_received_http_request_t request,                       //
+    ucall_string_t const *headers, size_t const *headers_lengths, size_t headers_count, //
+    ucall_buffer_t const *parts, size_t parts_count);
+
+#pragma region Streaming and Zero Copy Replies
+
+/**
+ *  @brief Begins a streamed response, emitting the status line and headers.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request to reply to.
+ *  @param[in] status_code HTTP status code for the response.
+ *  @param[in] headers Array of custom headers. Omit @c Content-Length to use chunked encoding.
+ *  @param[in] headers_lengths Optional array of lengths (NULL = use strlen).
+ *  @param[in] headers_count Number of header name-value pairs (total strings / 2).
+ *
+ *  Must be followed by zero or more @c ucall_server_reply_chunk() calls and exactly one
+ *  @c ucall_server_reply_end(). Supplying @c Content-Length switches to identity encoding,
+ *  which is what @c Range responses need.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_begin(                          //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    int status_code,                                              //
+    ucall_string_t const *headers, size_t const *headers_lengths, size_t headers_count);
+
+/**
+ *  @brief Appends one chunk to a response opened with @c ucall_server_reply_begin().
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request being replied to.
+ *  @param[in] data Chunk payload. Copied before returning.
+ *  @param[in] data_length Length of the chunk in bytes.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_chunk(                          //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    ucall_string_t data, size_t data_length);
+
+/**
+ *  @brief Completes a response opened with @c ucall_server_reply_begin().
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request being replied to. Invalid once this returns.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_end(ucall_server_t server, ucall_received_http_request_t request);
+
+/**
+ *  @brief Replies with a byte range of an open file, bypassing user space entirely.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request to reply to.
+ *  @param[in] file_descriptor An open, readable, seekable descriptor. @b Ownership transfers to UCall.
+ *  @param[in] offset Byte offset within the file at which to start.
+ *  @param[in] length Number of bytes to send. Zero sends through end of file.
+ *
+ *  On the @c io_uring backend this splices the file straight into the socket, so payload bytes
+ *  never enter user space. UCall closes @p file_descriptor once the reply completes or fails,
+ *  because the caller cannot otherwise know when the asynchronous send is done.
+ *
+ *  @warning Mutually exclusive with Noise. Encryption requires the payload in user space, so
+ *    connections using @c ucall_security_noise_* fall back to a buffered copy.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_file(                           //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    int file_descriptor, uint64_t offset, uint64_t length);
+
+/**
+ *  @brief Replies with a byte range of a file named relative to a directory descriptor.
+ *  @param[in] server Server handle from @c ucall_server_init().
+ *  @param[in] request The received request to reply to.
+ *  @param[in] directory_descriptor An open directory acting as the containment root.
+ *  @param[in] relative_path Path resolved beneath @p directory_descriptor.
+ *  @param[in] relative_path_length Length of @p relative_path.
+ *  @param[in] offset Byte offset within the file at which to start.
+ *  @param[in] length Number of bytes to send. Zero sends through end of file.
+ *
+ *  Preferred over @c ucall_server_reply_file() on the @c io_uring backend, where the open,
+ *  splice, and close are chained into one submission and the handler thread issues no syscalls.
+ *  Resolution is confined beneath @p directory_descriptor, so a @c "../" in @p relative_path
+ *  fails rather than escaping. UCall retains no reference to @p directory_descriptor.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the
+ *    @b same @p request concurrently.
+ */
+ucall_status_t ucall_server_reply_path(                           //
+    ucall_server_t server, ucall_received_http_request_t request, //
+    int directory_descriptor,                                     //
+    ucall_string_t relative_path, size_t relative_path_length,    //
+    uint64_t offset, uint64_t length);
+
+#pragma endregion Streaming and Zero Copy Replies
+
+#pragma endregion Planned Replies
+
+#pragma region WebSockets
 
 /**
  *  @brief Sends a message to a connected WebSocket client.
@@ -822,6 +1201,8 @@ ucall_status_t ucall_server_add_websocket_endpoint(     //
  *  @param[in] data Message payload.
  *  @param[in] data_length Length of the message payload.
  *  @return Status code indicating success or failure.
+ *
+ *  @note @b Thread-safe.
  */
 ucall_status_t ucall_server_websocket_send(             //
     ucall_server_t server, ucall_websocket_t websocket, //
@@ -835,58 +1216,27 @@ ucall_status_t ucall_server_websocket_send(             //
  *
  *  @param[in] server Server handle from @c ucall_server_init().
  *  @param[in] websocket WebSocket connection handle to close.
+ *
+ *  @note @b Thread-safe.
  */
 void ucall_server_websocket_close(ucall_server_t server, ucall_websocket_t websocket);
 
+#pragma endregion WebSockets
+
 #pragma endregion Servers
 
-#pragma region Utilities
-
-typedef void *ucall_table_t;
-
-enum ucall_table_column_type_t {
-    ucall_table_column_int8_k,
-    ucall_table_column_int16_k,
-    ucall_table_column_int32_k,
-    ucall_table_column_int64_k,
-    ucall_table_column_uint8_k,
-    ucall_table_column_uint16_k,
-    ucall_table_column_uint32_k,
-    ucall_table_column_uint64_k,
-    ucall_table_column_float32_k,
-    ucall_table_column_float64_k,
-    ucall_table_column_string_k
-};
-
-size_t ucall_table_add_column(   //
-    ucall_table_t table,         //
-    ucall_string_t json_pointer, //
-    size_t json_pointer_length,  //
-    ucall_table_column_type_t type);
-
-size_t ucall_table_length(ucall_table_t table);
-size_t ucall_table_width(ucall_table_t table);
-
-bool ucall_table_get(    //
-    ucall_table_t table, //
-    size_t column,       //
-    ucall_table_column_type_t type);
+#pragma region Diagnostics
 
 /**
- *  @brief Parses a newline-delimited JSON (NDJSON) string into a table structure
- *    using SIMD-JSON, materializing all documents and exporting into columnar format.
+ *  @brief Returns a static human-readable description of a status code.
+ *  @param[in] status The status code to describe.
+ *  @return A @c NULL -terminated string with static storage duration. Never @c NULL.
  *
- *  Each line in the input string should be a valid JSON object.
- *
- *  @param[in] json Input NDJSON string.
- *  @param[in] json_length Length of the input string in bytes.
- *  @param[out] table Output table structure populated with parsed data.
+ *  @note @b Thread-safe.
  */
-void ucall_parse_table_from_ndjson(          //
-    ucall_string_t json, size_t json_length, //
-    ucall_table_t *table);
+ucall_string_t ucall_status_description(ucall_status_t status);
 
-#pragma endregion Utilities
+#pragma endregion Diagnostics
 
 #ifdef __cplusplus
 } /* end extern "C" */
