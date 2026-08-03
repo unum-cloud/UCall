@@ -66,15 +66,19 @@ namespace unum::ucall {
 
 /** @brief Types of path segments in URI templates. */
 enum class segment_type_t : std::uint8_t {
-    literal_k,  // Exact match segment (e.g., "users")
-    param_k,    // Named parameter segment (e.g., "{id}")
-    wildcard_k, // Greedy wildcard segment (e.g., "{*path}")
+    /** @brief Exact match segment, e.g. "users". */
+    literal_k,
+    /** @brief Named parameter segment, e.g. "{id}". */
+    param_k,
+    /** @brief Greedy wildcard segment, e.g. "{*path}". */
+    wildcard_k,
 };
 
 /** @brief Parsed segment from a URI template. */
 struct parsed_segment_t {
     segment_type_t type;
-    std::string_view content; // For literals: the segment text; for params: the parameter name
+    /** @brief For literals, the segment text; for params, the parameter name. */
+    std::string_view content;
 };
 
 /**
@@ -103,10 +107,14 @@ class route_trie_t {
      *    Stored in pool and linked as a list to support multiple verbs per path.
      */
     struct route_endpoint_t {
-        ucall_verb_t verb;      // HTTP verb for this endpoint
-        void *callback;         // Callback function pointer
-        void *callback_tag;     // User context pointer
-        route_endpoint_t *next; // Next endpoint in list (or nullptr)
+        /** @brief HTTP verb for this endpoint. */
+        ucall_verb_t verb;
+        /** @brief Callback function pointer. */
+        void *callback;
+        /** @brief User context pointer. */
+        void *callback_tag;
+        /** @brief Next endpoint in list, or nullptr. */
+        route_endpoint_t *next;
     };
 
     /**
@@ -114,9 +122,12 @@ class route_trie_t {
      *    Stored in pool and linked as a list of sibling edges from the same parent.
      */
     struct route_edge_t {
-        std::string_view segment; // Literal segment name
-        route_node_t *child;      // Non-owning pointer to child node
-        route_edge_t *next;       // Next sibling edge (or nullptr)
+        /** @brief Literal segment name. */
+        std::string_view segment;
+        /** @brief Non-owning pointer to child node. */
+        route_node_t *child;
+        /** @brief Next sibling edge, or nullptr. */
+        route_edge_t *next;
     };
 
     /**
@@ -124,12 +135,18 @@ class route_trie_t {
      *    All pointers are non-owning - actual objects live in pools.
      */
     struct route_node_t {
-        route_edge_t *literal_children; // Head of literal edges list (or nullptr)
-        route_node_t *param_child;      // Single {param} child (or nullptr)
-        std::string_view param_name;    // Parameter name for param_child
-        route_node_t *wildcard_child;   // Single {*wildcard} child (or nullptr)
-        std::string_view wildcard_name; // Wildcard name for wildcard_child
-        route_endpoint_t *endpoints;    // Head of endpoints list (or nullptr)
+        /** @brief Head of literal edges list, or nullptr. */
+        route_edge_t *literal_children;
+        /** @brief Single {param} child, or nullptr. */
+        route_node_t *param_child;
+        /** @brief Parameter name for param_child. */
+        std::string_view param_name;
+        /** @brief Single {*wildcard} child, or nullptr. */
+        route_node_t *wildcard_child;
+        /** @brief Wildcard name for wildcard_child. */
+        std::string_view wildcard_name;
+        /** @brief Head of endpoints list, or nullptr. */
+        route_endpoint_t *endpoints;
     };
 
     // Member data - growable pools for automatic capacity management

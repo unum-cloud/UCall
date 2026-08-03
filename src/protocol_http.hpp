@@ -20,9 +20,9 @@ static constexpr std::size_t http_header_length_capacity_k = 9;
 static constexpr std::size_t http_max_headers_k = 32;
 
 struct http_protocol_t {
-    /// @brief Expected receiving/sending length extracted from HTTP headers.
+    /** @brief Expected receiving/sending length extracted from HTTP headers. */
     std::optional<std::size_t> content_length {};
-    /// @brief Active parsed request
+    /** @brief Active parsed request. */
     parsed_request_t parsed {};
 
     phr_header headers[http_max_headers_k] {};

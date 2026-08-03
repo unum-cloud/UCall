@@ -60,19 +60,25 @@ namespace unum::ucall {
 
 using network_data_t = void *;
 
-/// @brief To avoid dynamic memory allocations on tiny requests,
-/// for every connection we keep a tiny embedded buffer of this capacity.
+/**
+ *  @brief To avoid dynamic memory allocations on tiny requests,
+ *  for every connection we keep a tiny embedded buffer of this capacity.
+ */
 static constexpr std::size_t ram_page_size_k = 4096;
 
-/// @brief Number of bytes in a printed integer.
-/// Used either for error codes, or for request IDs.
+/**
+ *  @brief Number of bytes in a printed integer.
+ *  Used either for error codes, or for request IDs.
+ */
 static constexpr std::size_t max_integer_length_k = 32;
 
-/// @brief Needed for largest-register-aligned memory addressing.
+/** @brief Needed for largest-register-aligned memory addressing. */
 static constexpr std::size_t align_k = 128;
 
-/// @brief Accessing real time from user-space is very expensive.
-/// To approximate we can use CPU cycle counters.
+/**
+ *  @brief Accessing real time from user-space is very expensive.
+ *  To approximate we can use CPU cycle counters.
+ */
 constexpr std::size_t cpu_cycles_per_micro_second_k = 3'000;
 
 static constexpr std::size_t max_inactive_duration_ns_k {10'000'000'000}; // 10 sec
@@ -100,12 +106,18 @@ constexpr std::size_t round_up_to(std::size_t n) noexcept {
  *  @endcode
  */
 enum class stage_t {
-    waiting_to_accept_k = 0,  // Waiting for incoming connection to be accepted
-    expecting_reception_k,    // Waiting to receive data from client
-    responding_in_progress_k, // Sending response data to client
-    waiting_to_close_k,       // Closing connection gracefully
-    log_stats_k,              // Pseudo-connection state for periodic stats logging
-    unknown_k,                // Initial/invalid state
+    /** @brief Waiting for incoming connection to be accepted. */
+    waiting_to_accept_k = 0,
+    /** @brief Waiting to receive data from client. */
+    expecting_reception_k,
+    /** @brief Sending response data to client. */
+    responding_in_progress_k,
+    /** @brief Closing connection gracefully. */
+    waiting_to_close_k,
+    /** @brief Pseudo-connection state for periodic stats logging. */
+    log_stats_k,
+    /** @brief Initial/invalid state. */
+    unknown_k,
 };
 
 /**
@@ -299,39 +311,43 @@ struct connection_stats_t {
  *    and state management for secure communication.
  */
 struct connection_t {
-    /// @brief Exchange buffers to pipe information in both directions.
+    /** @brief Exchange buffers to pipe information in both directions. */
     exchange_pipes_t pipes {};
 
-    /// @brief The file descriptor of the stateful connection over TCP.
+    /** @brief The file descriptor of the stateful connection over TCP. */
     descriptor_t descriptor {bad_descriptor_k};
 
-    /// @brief Current state at which the automata has arrived.
+    /** @brief Current state at which the automata has arrived. */
     stage_t stage {};
 
-    /// @brief The IP address of the client on the opposite end of this connection.
+    /** @brief The IP address of the client on the opposite end of this connection. */
     sockaddr client_address {};
     socklen_t client_address_length {sizeof(client_address)};
 
-    /// @brief Accumulated duration of sleep cycles.
+    /** @brief Accumulated duration of sleep cycles. */
     std::size_t last_active_ns {};
     std::size_t exchanges {};
     std::size_t empty_transmits {};
 
-    /// @brief Relative time set for the last wake-up call.
-    /// This value is incremented for every following wake-up.
+    /**
+     *  @brief Relative time set for the last wake-up call.
+     *  This value is incremented for every following wake-up.
+     */
     ssize_t next_wakeup {wakeup_initial_frequency_ns_k};
 
-    /// @brief Noise Protocol handshake state for secure key exchange.
-    /// Active during handshake phase, freed after transitioning to transport phase.
+    /**
+     *  @brief Noise Protocol handshake state for secure key exchange.
+     *  Active during handshake phase, freed after transitioning to transport phase.
+     */
     NoiseHandshakeState *noise_handshake {};
 
-    /// @brief Send cipher state for encrypting outbound messages in transport phase.
+    /** @brief Send cipher state for encrypting outbound messages in transport phase. */
     NoiseCipherState *noise_send_cipher {};
 
-    /// @brief Receive cipher state for decrypting inbound messages in transport phase.
+    /** @brief Receive cipher state for decrypting inbound messages in transport phase. */
     NoiseCipherState *noise_recv_cipher {};
 
-    /// @brief Flag indicating whether handshake is complete and transport phase has begun.
+    /** @brief Flag indicating whether handshake is complete and transport phase has begun. */
     bool noise_handshake_complete {};
 
     void record_activity() noexcept {
@@ -555,39 +571,43 @@ enum class stats_logs_format_t {
  *
  */
 struct server_state_t {
-    /// @brief Immutable routing trie for URI template matching. Routes registered at startup.
+    /** @brief Immutable routing trie for URI template matching. Routes registered at startup. */
     route_trie_t routes {};
 
     std::uint32_t max_lifetime_micro_seconds {};
     std::uint32_t max_lifetime_exchanges {};
 
-    /// @brief File descriptor of the TCP socket.
+    /** @brief File descriptor of the TCP socket. */
     descriptor_t socket {};
 
-    /// @brief A container of reusable connections. Can be in millions.
+    /** @brief A container of reusable connections. Can be in millions. */
     pool<connection_t> connections_pool {};
 
-    /// @brief A binary heap, with a root, that is the oldest accessed connection.
-    /// When we reach the capacity of `connections_pool`, we pop elements from here,
-    /// until the popped element has a better "importance score", then the next root.
-    /// If the new root is has lower score, the extracted element is returned into the
-    /// heap, and the process continues. Otherwise, the extracted "root" connection is reused.
-    /// To ensure that there are no in-flight messages coming on that socket
+    /**
+     *  @brief A binary heap, with a root, that is the oldest accessed connection.
+     *  When we reach the capacity of `connections_pool`, we pop elements from here,
+     *  until the popped element has a better "importance score", then the next root.
+     *  If the new root is has lower score, the extracted element is returned into the
+     *  heap, and the process continues. Otherwise, the extracted "root" connection is reused.
+     *  To ensure that there are no in-flight messages coming on that socket.
+     */
     span<connection_t *> connections_heap {};
 
-    /// @brief Atomic counter for the number of allocated elements in the `connections_pool` pool.
+    /** @brief Atomic counter for the number of allocated elements in the `connections_pool` pool. */
     std::atomic<std::size_t> active_connections {};
 
-    /// @brief Synchronizes concurrent access to `connections` from different threads.
+    /** @brief Synchronizes concurrent access to `connections` from different threads. */
     mutex_t connections_mutex {};
 
-    /// @brief Pre-allocated buffered for small messages, often registered for
-    /// shared use between this user-space server program and kernel-space NIC driver.
+    /**
+     *  @brief Pre-allocated buffered for small messages, often registered for
+     *  shared use between this user-space server program and kernel-space NIC driver.
+     */
     memory_map_t fixed_buffers {};
 
     traffic_stats_t stats {};
 
-    /// @brief A connection context we use to schedule logging using the same underlying engine.
+    /** @brief A connection context we use to schedule logging using the same underlying engine. */
     connection_t stats_pseudo_connection {};
 
     stats_logs_format_t logs_format {stats_logs_format_t::human_readable_k};
@@ -625,11 +645,16 @@ struct server_state_t {
  *  Valid only while the buffer remains unchanged.
  */
 struct parsed_request_t {
-    ucall_verb_t type {};               // HTTP method (GET, POST, PUT, DELETE, etc.)
-    std::string_view path {};           // Request path (e.g., "/users/123")
-    std::string_view content_type {};   // Content-Type header value
-    std::string_view content_length {}; // Content-Length header value
-    std::string_view body {};           // Request body payload
+    /** @brief HTTP method, e.g. GET, POST, PUT, DELETE. */
+    ucall_verb_t type {};
+    /** @brief Request path, e.g. "/users/123". */
+    std::string_view path {};
+    /** @brief Content-Type header value. */
+    std::string_view content_type {};
+    /** @brief Content-Length header value. */
+    std::string_view content_length {};
+    /** @brief Request body payload. */
+    std::string_view body {};
 };
 
 parsed_request_t parse_request(std::string_view) {

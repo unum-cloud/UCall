@@ -540,15 +540,18 @@ class successive_pools {
     struct pool_node {
         pool<element_type_> pool_ {};
         std::size_t capacity_ {};
-        pool_node *next_ {}; // Singly linked list, newer pools first
+        /** @brief Singly linked list, newer pools first. */
+        pool_node *next_ {};
 
         pool_node(std::size_t cap) noexcept : capacity_(cap), next_(nullptr) {}
     };
 
-    pool_node *head_ {}; // Newest pool (tried first)
+    /** @brief Newest pool, tried first. */
+    pool_node *head_ {};
     std::size_t initial_capacity_ {};
     std::size_t total_capacity_ {};
-    std::size_t allocated_count_ {}; // Track total allocations for statistics
+    /** @brief Tracks total allocations for statistics. */
+    std::size_t allocated_count_ {};
 
   public:
     using element_t = element_type_;
