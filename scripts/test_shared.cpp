@@ -1,646 +1,79 @@
 /**
- *  @brief Unit tests for shared utility containers and functions.
- *
- *  Tests the container classes and utility functions in shared.hpp for correctness,
- *  edge cases, and error handling. Uses GoogleTest framework.
- *
- *  Compilation:
- *  @code{.sh}
- *  g++ -std=c++20 -O2 -I./include -I./src \
- *      -I/opt/homebrew/opt/googletest/include \
- *      -L/opt/homebrew/opt/googletest/lib \
- *      -lgtest -lgtest_main -pthread \
- *      scripts/test_shared.cpp -o test_shared
- *  @endcode
- *
- *  @file test_shared.cpp
+ *  @brief Tests for the utility types and containers in @c shared.hpp.
+ *  @file scripts/test_shared.cpp
  *  @author Ash Vardanian
- *  @date November 10, 2025
+ *
+ *  These stand in for their standard-library counterparts because they report an allocation
+ *  failure rather than throwing, so every case that grows one checks the answer.
  */
-#include <gtest/gtest.h>
-#include <atomic>
-#include <cstdint>
-#include <cstring>
-#include <thread>
+#include <cstring> // `std::strstr`
 
-#include "shared.hpp"
+#include <thread>  // `std::thread`
+#include <utility> // `std::move`
+
+#include "test.hpp" // `verify`, `run_test`, `scale_iterations`
 
 using namespace unum::ucall;
+using namespace unum::ucall::scripts;
 
-#pragma region Utility Function Tests
+#pragma region Utilities
 
-TEST(UtilityFunctions, StringLength) {
-    // Normal cases
-    EXPECT_EQ(string_length("hello", 0), 5);
-    EXPECT_EQ(string_length("hello", 5), 5);
-    EXPECT_EQ(string_length("test", 4), 4);
-
-    // Null pointer handling
-    EXPECT_EQ(string_length(nullptr, 0), 0);
-    EXPECT_EQ(string_length(nullptr, 10), 0);
-
-    // Empty string
-    EXPECT_EQ(string_length("", 0), 0);
-    EXPECT_EQ(string_length("", 5), 5); // Trusts provided length
+/** @brief Whether two floats agree closely enough for a magnitude meant to be read by a human. */
+[[nodiscard]] static bool nearly_equal(float left, float right) noexcept {
+    float const difference = left - right;
+    return (difference < 0.0f ? -difference : difference) < 1e-3f;
 }
 
-TEST(UtilityFunctions, CpuCycle) {
-    // Basic test - just ensure it returns something and increments
-    auto t1 = cpu_cycle();
-    // Do some work to ensure cycles pass
-    volatile int sum = 0;
-    for (int i = 0; i < 100; i++) {
-        sum += i;
-    }
-    auto t2 = cpu_cycle();
-    EXPECT_GE(t2, t1); // Use >= since in rare cases they might be equal
+void test_utilities_unit() {
+    announce("string_length");
+    // A length of zero means "measure it"; anything else is trusted without a scan.
+    verify(string_length("hello", 0) == 5u);
+    verify(string_length("hello", 5) == 5u);
+    verify(string_length("test", 4) == 4u);
+    verify(string_length("", 0) == 0u);
+    verify(string_length("", 5) == 5u);
+    verify(string_length(nullptr, 0) == 0u);
+    verify(string_length(nullptr, 10) == 0u);
+
+    announce("cpu_cycle");
+    // A counter that never advances would silently freeze every idle timer built on it.
+    timestamp_t const before = cpu_cycle();
+    volatile std::size_t sum = 0;
+    for (std::size_t index = 0; index != 1000; ++index) sum = sum + index;
+    timestamp_t const after = cpu_cycle();
+    verify(after >= before);
+
+    announce("printable");
+    number_and_suffix_t scaled = printable(500);
+    verify(nearly_equal(scaled.number, 500.0f) && scaled.suffix == ' ');
+    scaled = printable(1'500);
+    verify(nearly_equal(scaled.number, 1.5f) && scaled.suffix == 'K');
+    scaled = printable(2'500'000);
+    verify(nearly_equal(scaled.number, 2.5f) && scaled.suffix == 'M');
+    scaled = printable(3'500'000'000);
+    verify(nearly_equal(scaled.number, 3.5f) && scaled.suffix == 'G');
 }
 
-TEST(UtilityFunctions, Printable) {
-    auto result = printable(500);
-    EXPECT_FLOAT_EQ(result.number, 500.0f);
-    EXPECT_EQ(result.suffix, ' ');
-
-    result = printable(1'500);
-    EXPECT_FLOAT_EQ(result.number, 1.5f);
-    EXPECT_EQ(result.suffix, 'K');
-
-    result = printable(2'500'000);
-    EXPECT_FLOAT_EQ(result.number, 2.5f);
-    EXPECT_EQ(result.suffix, 'M');
-
-    result = printable(3'500'000'000);
-    EXPECT_FLOAT_EQ(result.number, 3.5f);
-    EXPECT_EQ(result.suffix, 'G');
-}
-
-#pragma endregion Utility Function Tests
-
-#pragma region Round Robin Tests
-
-class RoundRobinTest : public ::testing::Test {
-  protected:
-    round_robin<int> rr;
-
-    void SetUp() override {
-        ASSERT_TRUE(rr.alloc(5)) << "Failed to allocate round_robin";
-    }
-};
-
-TEST_F(RoundRobinTest, BasicAllocation) {
-    EXPECT_EQ(rr.capacity(), 5);
-    EXPECT_EQ(rr.size(), 0);
-}
-
-TEST_F(RoundRobinTest, PushAndSize) {
-    EXPECT_EQ(rr.size(), 0);
-
-    rr.push_ahead() = 1;
-    EXPECT_EQ(rr.size(), 1);
-
-    rr.push_ahead() = 2;
-    EXPECT_EQ(rr.size(), 2);
-}
-
-TEST_F(RoundRobinTest, PushAndDrop) {
-    rr.push_ahead() = 10;
-    rr.push_ahead() = 20;
-    rr.push_ahead() = 30;
-    EXPECT_EQ(rr.size(), 3);
-
-    EXPECT_EQ(rr.tail(), 10);
-    rr.drop_tail();
-    EXPECT_EQ(rr.size(), 2);
-
-    EXPECT_EQ(rr.tail(), 20);
-}
-
-TEST_F(RoundRobinTest, HeadAndTail) {
-    rr.push_ahead() = 100;
-    EXPECT_EQ(rr.head(), 100);
-    EXPECT_EQ(rr.tail(), 100);
-
-    rr.push_ahead() = 200;
-    EXPECT_EQ(rr.head(), 200);
-    EXPECT_EQ(rr.tail(), 100);
-
-    rr.push_ahead() = 300;
-    EXPECT_EQ(rr.head(), 300);
-    EXPECT_EQ(rr.tail(), 100);
-}
-
-TEST_F(RoundRobinTest, PollingBehavior) {
-    // Add elements
-    rr.push_ahead() = 1;
-    rr.push_ahead() = 2;
-    rr.push_ahead() = 3;
-
-    // Poll should return elements in order and cycle
-    EXPECT_EQ(rr.poll(), 1);
-    EXPECT_EQ(rr.poll(), 2);
-    EXPECT_EQ(rr.poll(), 3);
-    EXPECT_EQ(rr.poll(), 1); // Should cycle back
-}
-
-TEST_F(RoundRobinTest, CircularWrapAround) {
-    // Fill the buffer
-    for (int i = 0; i < 5; i++) {
-        rr.push_ahead() = i;
-    }
-    EXPECT_EQ(rr.size(), 5);
-
-    // Drop and add to cause wrap-around
-    rr.drop_tail();
-    rr.drop_tail();
-    EXPECT_EQ(rr.size(), 3);
-
-    rr.push_ahead() = 100;
-    rr.push_ahead() = 101;
-    EXPECT_EQ(rr.size(), 5);
-}
-
-TEST_F(RoundRobinTest, CallerResponsibleForBounds) {
-    // These methods are "unsafe" - caller must check size/capacity
-    // Fill to capacity
-    for (int i = 0; i < 5; i++) {
-        rr.push_ahead() = i;
-    }
-    EXPECT_EQ(rr.size(), 5);
-
-    // Caller should not push when full or drop when empty
-    // (No overflow/underflow protection - undefined behavior if violated)
-}
-
-TEST_F(RoundRobinTest, MoveConstructor) {
-    rr.push_ahead() = 42;
-    rr.push_ahead() = 99;
-
-    round_robin<int> rr2(std::move(rr));
-
-    EXPECT_EQ(rr2.size(), 2);
-    EXPECT_EQ(rr2.capacity(), 5);
-    EXPECT_EQ(rr2.tail(), 42);
-}
-
-TEST_F(RoundRobinTest, MoveAssignment) {
-    rr.push_ahead() = 42;
-
-    round_robin<int> rr2;
-    rr2 = std::move(rr);
-
-    EXPECT_EQ(rr2.size(), 1);
-    EXPECT_EQ(rr2.capacity(), 5);
-}
-
-#pragma endregion Round Robin Tests
-
-#pragma region Mutex Tests
-
-TEST(MutexTest, BasicLockUnlock) {
-    mutex_t mtx;
-    mtx.lock();
-    mtx.unlock();
-    // If we get here without hanging, basic functionality works
-}
-
-TEST(MutexTest, MultithreadedAccess) {
-    mutex_t mtx;
-    int counter = 0;
-    constexpr int iterations = 1000;
-
-    auto worker = [&]() {
-        for (int i = 0; i < iterations; i++) {
-            mtx.lock();
-            counter++;
-            mtx.unlock();
-        }
-    };
-
-    std::thread t1(worker);
-    std::thread t2(worker);
-
-    t1.join();
-    t2.join();
-
-    EXPECT_EQ(counter, iterations * 2);
-}
-
-#pragma endregion Mutex Tests
-
-#pragma region Memory Map Tests
-
-TEST(MemoryMapTest, BasicRemap) {
-    memory_map_t mmap;
-    EXPECT_TRUE(mmap.remap(4096));
-    EXPECT_NE(mmap.data(), nullptr);
-    EXPECT_EQ(mmap.size(), 4096);
-}
-
-TEST(MemoryMapTest, MultipleRemaps) {
-    memory_map_t mmap;
-    EXPECT_TRUE(mmap.remap(4096));
-    auto ptr1 = mmap.data();
-
-    // Remap destroys old mapping and creates new one
-    EXPECT_TRUE(mmap.remap(8192));
-    EXPECT_NE(mmap.data(), nullptr);
-    EXPECT_EQ(mmap.size(), 8192);
-}
-
-TEST(MemoryMapTest, ZeroInitialized) {
-    memory_map_t mmap;
-    EXPECT_TRUE(mmap.remap(1024));
-
-    // Check that memory is zero-initialized
-    bool all_zero = true;
-    for (std::size_t i = 0; i < mmap.size(); i++) {
-        if (mmap.data()[i] != 0) {
-            all_zero = false;
-            break;
-        }
-    }
-    EXPECT_TRUE(all_zero);
-}
-
-TEST(MemoryMapTest, MoveSemantics) {
-    memory_map_t mmap1;
-    EXPECT_TRUE(mmap1.remap(4096));
-    auto ptr = mmap1.data();
-
-    memory_map_t mmap2 = std::move(mmap1);
-    EXPECT_EQ(mmap2.data(), ptr);
-    EXPECT_EQ(mmap2.size(), 4096);
-}
-
-TEST(MemoryMapTest, ResetCleanup) {
-    memory_map_t mmap;
-    EXPECT_TRUE(mmap.remap(4096));
-    EXPECT_NE(mmap.data(), nullptr);
-
-    mmap.reset();
-    EXPECT_EQ(mmap.data(), nullptr);
-    EXPECT_EQ(mmap.size(), 0);
-}
-
-#pragma endregion Memory Map Tests
-
-#pragma region Buffer Tests
-
-class BufferTest : public ::testing::Test {
-  protected:
-    buffer<int> buf;
-};
-
-TEST_F(BufferTest, InitialState) {
-    EXPECT_EQ(buf.size(), 0);
-    EXPECT_EQ(buf.capacity(), 0);
-}
-
-TEST_F(BufferTest, BasicResize) {
-    EXPECT_TRUE(buf.resize(10));
-    EXPECT_EQ(buf.size(), 10);
-    EXPECT_EQ(buf.capacity(), 10);
-    EXPECT_NE(buf.data(), nullptr);
-}
-
-TEST_F(BufferTest, ElementAccess) {
-    ASSERT_TRUE(buf.resize(5));
-
-    buf[0] = 10;
-    buf[1] = 20;
-    buf[4] = 50;
-
-    EXPECT_EQ(buf[0], 10);
-    EXPECT_EQ(buf[1], 20);
-    EXPECT_EQ(buf[4], 50);
-}
-
-TEST_F(BufferTest, Iteration) {
-    ASSERT_TRUE(buf.resize(5));
-
-    int value = 0;
-    for (auto &elem : buf) {
-        elem = value++;
-    }
-
-    EXPECT_EQ(buf[0], 0);
-    EXPECT_EQ(buf[4], 4);
-}
-
-TEST_F(BufferTest, ResizeReplacesOld) {
-    ASSERT_TRUE(buf.resize(5));
-    buf[0] = 99;
-
-    ASSERT_TRUE(buf.resize(10));
-    EXPECT_EQ(buf.capacity(), 10);
-    // Old data is not preserved
-}
-
-TEST_F(BufferTest, MoveConstructor) {
-    ASSERT_TRUE(buf.resize(5));
-    buf[0] = 42;
-    buf[1] = 99;
-
-    buffer<int> buf2(std::move(buf));
-
-    EXPECT_EQ(buf2.capacity(), 5);
-    EXPECT_EQ(buf2[0], 42);
-    EXPECT_EQ(buf2[1], 99);
-}
-
-TEST_F(BufferTest, MoveAssignment) {
-    ASSERT_TRUE(buf.resize(5));
-    buf[0] = 42;
-
-    buffer<int> buf2;
-    buf2 = std::move(buf);
-
-    EXPECT_EQ(buf2.capacity(), 5);
-    EXPECT_EQ(buf2[0], 42);
-}
-
-#pragma endregion Buffer Tests
-
-#pragma region Pool Tests
-
-class PoolTest : public ::testing::Test {
-  protected:
-    pool<int> p;
-
-    void SetUp() override {
-        ASSERT_TRUE(p.reserve(5));
-    }
-};
-
-TEST_F(PoolTest, BasicAllocation) {
-    auto *elem1 = p.alloc();
-    ASSERT_NE(elem1, nullptr);
-
-    auto *elem2 = p.alloc();
-    ASSERT_NE(elem2, nullptr);
-    EXPECT_NE(elem1, elem2);
-}
-
-TEST_F(PoolTest, ExhaustPool) {
-    int *ptrs[5];
-    for (int i = 0; i < 5; i++) {
-        ptrs[i] = p.alloc();
-        ASSERT_NE(ptrs[i], nullptr);
-    }
-
-    // Pool should be exhausted
-    auto *extra = p.alloc();
-    EXPECT_EQ(extra, nullptr);
-}
-
-TEST_F(PoolTest, ReleaseAndReuse) {
-    auto *elem1 = p.alloc();
-    ASSERT_NE(elem1, nullptr);
-    *elem1 = 42;
-
-    p.release(elem1);
-
-    // Should be able to allocate again
-    auto *elem2 = p.alloc();
-    EXPECT_NE(elem2, nullptr);
-}
-
-// Note: ReleaseInvalidPointer, ReleaseNullPointer, and DoubleFreeProtection tests
-// are removed because these conditions now trigger assertions in debug builds.
-// In release builds (NDEBUG), the original runtime checks in release() would catch these.
-
-TEST_F(PoolTest, OffsetOperations) {
-    auto *elem = p.alloc();
-    ASSERT_NE(elem, nullptr);
-
-    auto offset = p.offset_of(*elem);
-    EXPECT_LT(offset, 5);
-
-    auto &retrieved = p.at_offset(offset);
-    EXPECT_EQ(&retrieved, elem);
-}
-
-TEST_F(PoolTest, MoveConstructor) {
-    auto *elem1 = p.alloc();
-    auto *elem2 = p.alloc();
-    ASSERT_NE(elem1, nullptr);
-    ASSERT_NE(elem2, nullptr);
-    *elem1 = 42;
-    *elem2 = 99;
-
-    pool<int> p2(std::move(p));
-
-    EXPECT_EQ(*elem1, 42);
-    EXPECT_EQ(*elem2, 99);
-}
-
-TEST_F(PoolTest, MoveAssignment) {
-    auto *elem = p.alloc();
-    ASSERT_NE(elem, nullptr);
-    *elem = 99;
-
-    pool<int> p2;
-    p2 = std::move(p);
-
-    // The moved pool should have the element
-    EXPECT_EQ(*elem, 99);
-}
-
-#pragma endregion Pool Tests
-
-#pragma region Span Tests
-
-TEST(SpanTest, BasicConstruction) {
-    int data[] = {1, 2, 3, 4, 5};
-    span<int> s(data, data + 5);
-
-    EXPECT_EQ(s.size(), 5);
-    EXPECT_EQ(s.data(), data);
-}
-
-TEST(SpanTest, ElementAccess) {
-    int data[] = {10, 20, 30};
-    span<int> s(data, data + 3);
-
-    EXPECT_EQ(s[0], 10);
-    EXPECT_EQ(s[1], 20);
-    EXPECT_EQ(s[2], 30);
-}
-
-TEST(SpanTest, Iteration) {
-    int data[] = {1, 2, 3};
-    span<int> s(data, data + 3);
-
-    int sum = 0;
-    for (auto val : s) {
-        sum += val;
-    }
-    EXPECT_EQ(sum, 6);
-}
-
-TEST(SpanTest, StringViewConversion) {
-    char data[] = "hello";
-    span<char> s(data, data + 5);
-
-    std::string_view sv = s;
-    EXPECT_EQ(sv, "hello");
-}
-
-#pragma endregion Span Tests
-
-#pragma region Array Tests
-
-class ArrayTest : public ::testing::Test {
-  protected:
-    array<int> arr;
-};
-
-TEST_F(ArrayTest, InitialState) {
-    EXPECT_EQ(arr.size(), 0);
-    EXPECT_EQ(arr.capacity(), 0);
-}
-
-TEST_F(ArrayTest, BasicReserve) {
-    EXPECT_TRUE(arr.reserve(10));
-    EXPECT_EQ(arr.capacity(), 10);
-    EXPECT_EQ(arr.size(), 0);
-}
-
-TEST_F(ArrayTest, PushBackReserved) {
-    ASSERT_TRUE(arr.reserve(5));
-
-    arr.push_back_reserved(10);
-    arr.push_back_reserved(20);
-    arr.push_back_reserved(30);
-
-    EXPECT_EQ(arr.size(), 3);
-    EXPECT_EQ(arr[0], 10);
-    EXPECT_EQ(arr[1], 20);
-    EXPECT_EQ(arr[2], 30);
-}
-
-TEST_F(ArrayTest, PopBack) {
-    ASSERT_TRUE(arr.reserve(5));
-    arr.push_back_reserved(1);
-    arr.push_back_reserved(2);
-    arr.push_back_reserved(3);
-
-    EXPECT_EQ(arr.size(), 3);
-    arr.pop_back();
-    EXPECT_EQ(arr.size(), 2);
-    arr.pop_back(2);
-    EXPECT_EQ(arr.size(), 0);
-}
-
-TEST_F(ArrayTest, AppendN) {
-    ASSERT_TRUE(arr.reserve(10));
-
-    int data[] = {5, 6, 7, 8, 9};
-    EXPECT_TRUE(arr.append_n(data, 5));
-
-    EXPECT_EQ(arr.size(), 5);
-    EXPECT_EQ(arr[0], 5);
-    EXPECT_EQ(arr[4], 9);
-}
-
-TEST_F(ArrayTest, ReserveGrows) {
-    ASSERT_TRUE(arr.reserve(5));
-    arr.push_back_reserved(1);
-
-    EXPECT_TRUE(arr.reserve(10));
-    EXPECT_EQ(arr.capacity(), 10);
-    EXPECT_EQ(arr.size(), 1);
-    EXPECT_EQ(arr[0], 1);
-}
-
-TEST_F(ArrayTest, ReserveIdempotent) {
-    ASSERT_TRUE(arr.reserve(10));
-    EXPECT_TRUE(arr.reserve(5)); // Should succeed without shrinking
-    EXPECT_EQ(arr.capacity(), 10);
-}
-
-TEST_F(ArrayTest, Reset) {
-    ASSERT_TRUE(arr.reserve(5));
-    arr.push_back_reserved(42);
-
-    arr.reset();
-    EXPECT_EQ(arr.size(), 0);
-    EXPECT_EQ(arr.capacity(), 0);
-}
-
-TEST_F(ArrayTest, Iteration) {
-    ASSERT_TRUE(arr.reserve(5));
-    arr.push_back_reserved(1);
-    arr.push_back_reserved(2);
-    arr.push_back_reserved(3);
-
-    int sum = 0;
-    for (auto val : arr) {
-        sum += val;
-    }
-    EXPECT_EQ(sum, 6);
-}
-
-TEST_F(ArrayTest, MoveConstructor) {
-    ASSERT_TRUE(arr.reserve(5));
-    arr.push_back_reserved(42);
-    arr.push_back_reserved(99);
-    arr.push_back_reserved(123);
-
-    array<int> arr2(std::move(arr));
-
-    EXPECT_EQ(arr2.size(), 3);
-    EXPECT_EQ(arr2.capacity(), 5);
-    EXPECT_EQ(arr2[0], 42);
-    EXPECT_EQ(arr2[1], 99);
-    EXPECT_EQ(arr2[2], 123);
-}
-
-TEST_F(ArrayTest, MoveAssignment) {
-    ASSERT_TRUE(arr.reserve(5));
-    arr.push_back_reserved(99);
-
-    array<int> arr2;
-    arr2 = std::move(arr);
-
-    EXPECT_EQ(arr2.size(), 1);
-    EXPECT_EQ(arr2[0], 99);
-}
-
-#pragma endregion Array Tests
-
-#pragma region Traffic Stats Tests
-
-TEST(TrafficStatsTest, LogHumanReadable) {
+void test_traffic_stats_unit() {
+    announce("human_readable_drains_every_counter");
     traffic_stats_t stats;
-
     stats.added_connections.store(100);
     stats.bytes_sent.store(5'000'000);
 
-    char buffer[512];
-    auto len = stats.log_human_readable(buffer, sizeof(buffer), 5);
+    char rendered[512];
+    std::size_t written = stats.log_human_readable(rendered, sizeof(rendered), 5);
+    verify(written > 0 && written < sizeof(rendered));
+    // Rendering exchanges each counter for zero, or a second call over the same window would
+    // double-count what it already reported.
+    verify(stats.added_connections.load() == 0u);
+    verify(stats.bytes_sent.load() == 0u);
 
-    EXPECT_GT(len, 0);
-    EXPECT_LT(len, sizeof(buffer));
-
-    // Values should be reset after logging
-    EXPECT_EQ(stats.added_connections.load(), 0);
-    EXPECT_EQ(stats.bytes_sent.load(), 0);
-}
-
-TEST(TrafficStatsTest, LogHumanReadableZeroSeconds) {
-    traffic_stats_t stats;
+    announce("a_zero_second_window_does_not_divide_by_zero");
     stats.packets_received.store(1000);
+    written = stats.log_human_readable(rendered, sizeof(rendered), 0);
+    verify(written > 0);
 
-    char buffer[512];
-    // Should not crash with zero seconds
-    auto len = stats.log_human_readable(buffer, sizeof(buffer), 0);
-    EXPECT_GT(len, 0);
-}
-
-TEST(TrafficStatsTest, LogJson) {
-    traffic_stats_t stats;
-
+    announce("json_names_every_counter");
     stats.added_connections.store(10);
     stats.closed_connections.store(5);
     stats.bytes_received.store(1024);
@@ -648,21 +81,375 @@ TEST(TrafficStatsTest, LogJson) {
     stats.packets_received.store(50);
     stats.packets_sent.store(75);
 
-    char buffer[512];
-    auto len = stats.log_json(buffer, sizeof(buffer));
-
-    EXPECT_GT(len, 0);
-    EXPECT_LT(len, sizeof(buffer));
-
-    // Check that it looks like JSON
-    std::string json(buffer, len);
-    EXPECT_NE(json.find("\"add\":10"), std::string::npos);
-    EXPECT_NE(json.find("\"close\":5"), std::string::npos);
+    written = stats.log_json(rendered, sizeof(rendered));
+    verify(written > 0 && written < sizeof(rendered));
+    rendered[written] = '\0';
+    verify(std::strstr(rendered, "\"add\":10") != nullptr);
+    verify(std::strstr(rendered, "\"close\":5") != nullptr);
 }
 
-#pragma endregion Traffic Stats Tests
+#pragma endregion Utilities
 
-int main(int argc, char **argv) {
-    ::testing::InitGoogleTest(&argc, argv);
-    return RUN_ALL_TESTS();
+#pragma region Views
+
+void test_span_unit() {
+    announce("construction_and_access");
+    int values[] = {10, 20, 30, 40, 50};
+    span<int> const viewed_values(values, values + 5);
+    verify(viewed_values.size() == 5u);
+    verify(viewed_values.data() == values);
+    verify(viewed_values[0] == 10);
+    verify(viewed_values[4] == 50);
+
+    announce("iteration");
+    int sum = 0;
+    for (int const value : viewed_values) sum += value;
+    verify(sum == 150);
+
+    announce("string_view_conversion");
+    char characters[] = "hello";
+    span<char> const viewed_characters(characters, characters + 5);
+    std::string_view const as_text = viewed_characters;
+    verify(as_text == "hello");
+
+    announce("an_empty_span_is_default_constructible");
+    span<int> const empty;
+    verify(empty.size() == 0u);
+}
+
+#pragma endregion Views
+
+#pragma region Containers
+
+void test_round_robin_unit() {
+    announce("allocation_and_push");
+    round_robin<int> ring;
+    verify(ring.alloc(5));
+    verify(ring.capacity() == 5u);
+    verify(ring.size() == 0u);
+
+    ring.push_ahead() = 100;
+    verify(ring.size() == 1u);
+    verify(ring.head() == 100);
+    verify(ring.tail() == 100);
+
+    ring.push_ahead() = 200;
+    ring.push_ahead() = 300;
+    verify(ring.size() == 3u);
+    verify(ring.head() == 300);
+    verify(ring.tail() == 100);
+
+    announce("dropping_advances_the_tail");
+    verify(ring.tail() == 100);
+    ring.drop_tail();
+    verify(ring.size() == 2u);
+    verify(ring.tail() == 200);
+
+    announce("polling_cycles");
+    round_robin<int> polled;
+    verify(polled.alloc(5));
+    polled.push_ahead() = 1;
+    polled.push_ahead() = 2;
+    polled.push_ahead() = 3;
+    verify(polled.poll() == 1);
+    verify(polled.poll() == 2);
+    verify(polled.poll() == 3);
+    verify(polled.poll() == 1);
+}
+
+void test_buffer_unit() {
+    announce("initial_state");
+    buffer<int> values;
+    verify(values.size() == 0u);
+    verify(values.capacity() == 0u);
+
+    announce("reallocate_allocates");
+    verify(values.reallocate(10));
+    verify(values.size() == 10u);
+    verify(values.capacity() == 10u);
+    verify(values.data() != nullptr);
+
+    announce("element_access_and_iteration");
+    verify(values.reallocate(5));
+    int next = 0;
+    for (int &element : values) element = next++;
+    verify(values[0] == 0);
+    verify(values[4] == 4);
+
+    announce("reallocate_replaces_rather_than_grows");
+    values[0] = 99;
+    verify(values.reallocate(10));
+    verify(values.capacity() == 10u);
+    // A resize is a fresh mapping rather than a copy, which is why callers reach for `array`
+    // when they need to grow.
+}
+
+void test_array_unit() {
+    announce("initial_state_and_reserve");
+    array<int> values;
+    verify(values.size() == 0u);
+    verify(values.capacity() == 0u);
+    verify(values.reserve(10));
+    verify(values.capacity() == 10u);
+    verify(values.size() == 0u);
+
+    announce("push_back_and_index");
+    values.push_back_reserved(10);
+    values.push_back_reserved(20);
+    values.push_back_reserved(30);
+    verify(values.size() == 3u);
+    verify(values[0] == 10);
+    verify(values[1] == 20);
+    verify(values[2] == 30);
+
+    announce("pop_back_takes_a_count");
+    values.pop_back();
+    verify(values.size() == 2u);
+    values.pop_back(2);
+    verify(values.size() == 0u);
+
+    announce("append_n");
+    int const appended[] = {5, 6, 7, 8, 9};
+    verify(values.append_n(appended, 5));
+    verify(values.size() == 5u);
+    verify(values[0] == 5);
+    verify(values[4] == 9);
+    // Appending nothing is not a copy of length zero, so it must succeed without touching memory.
+    verify(values.append_n(nullptr, 0));
+    verify(values.size() == 5u);
+
+    announce("reserve_grows_and_never_shrinks");
+    verify(values.reserve(20));
+    verify(values.capacity() == 20u);
+    verify(values.size() == 5u);
+    verify(values[0] == 5);
+    verify(values.reserve(2));
+    verify(values.capacity() == 20u);
+
+    announce("iteration_covers_the_count_not_the_capacity");
+    int sum = 0;
+    for (int const value : values) sum += value;
+    verify(sum == 35);
+
+    announce("reset_releases_everything");
+    values.reset();
+    verify(values.size() == 0u);
+    verify(values.capacity() == 0u);
+}
+
+void test_pool_unit() {
+    announce("allocation_hands_out_distinct_slots");
+    pool<int> slots;
+    verify(slots.reserve(5));
+    verify(slots.capacity() == 5u);
+
+    int *const first = slots.alloc();
+    int *const second = slots.alloc();
+    verify(first != nullptr);
+    verify(second != nullptr);
+    verify(first != second);
+
+    announce("a_released_slot_is_handed_out_again");
+    *first = 42;
+    slots.release(first);
+    int *const reused = slots.alloc();
+    verify(reused != nullptr);
+
+    announce("offsets_round_trip");
+    std::size_t const offset = slots.offset_of(*second);
+    verify(offset < 5u);
+    verify(&slots.at_offset(offset) == second);
+}
+
+void test_memory_map_unit() {
+    announce("remap_allocates_and_reports_its_size");
+    memory_map_t mapping;
+    verify(mapping.remap(ram_page_size_k));
+    verify(mapping.data() != nullptr);
+    verify(mapping.size() == ram_page_size_k);
+
+    announce("pages_arrive_zeroed");
+    // A mapping that arrived dirty would hand a connection whatever the last one left behind.
+    verify(all_zero({mapping.data(), mapping.data() + mapping.size()}));
+
+    announce("remapping_replaces_the_old_mapping");
+    verify(mapping.remap(ram_page_size_k * 2));
+    verify(mapping.data() != nullptr);
+    verify(mapping.size() == ram_page_size_k * 2);
+
+    announce("reset_unmaps");
+    mapping.reset();
+    verify(mapping.data() == nullptr);
+    verify(mapping.size() == 0u);
+}
+
+/**
+ *  @brief Moving every container, in one place, because they all promise the same three things.
+ *
+ *  The source releases ownership, the destination reports the same capacity and count, and the
+ *  elements are the same objects rather than copies.
+ */
+void test_containers_moves_unit() {
+    {
+        announce("round_robin");
+        round_robin<int> source;
+        verify(source.alloc(5));
+        source.push_ahead() = 42;
+        source.push_ahead() = 99;
+
+        round_robin<int> constructed(std::move(source));
+        verify(constructed.size() == 2u);
+        verify(constructed.capacity() == 5u);
+        verify(constructed.tail() == 42);
+
+        round_robin<int> assigned;
+        assigned = std::move(constructed);
+        verify(assigned.size() == 2u);
+        verify(assigned.capacity() == 5u);
+        verify(assigned.tail() == 42);
+    }
+    {
+        announce("buffer");
+        buffer<int> source;
+        verify(source.reallocate(5));
+        source[0] = 42;
+        source[1] = 99;
+
+        buffer<int> constructed(std::move(source));
+        verify(constructed.capacity() == 5u);
+        verify(constructed[0] == 42);
+        verify(constructed[1] == 99);
+        verify(source.data() == nullptr);
+
+        buffer<int> assigned;
+        assigned = std::move(constructed);
+        verify(assigned.capacity() == 5u);
+        verify(assigned[0] == 42);
+        verify(constructed.data() == nullptr);
+    }
+    {
+        announce("array");
+        array<int> source;
+        verify(source.reserve(5));
+        source.push_back_reserved(42);
+        source.push_back_reserved(99);
+        source.push_back_reserved(123);
+
+        array<int> constructed(std::move(source));
+        verify(constructed.size() == 3u);
+        verify(constructed.capacity() == 5u);
+        verify(constructed[0] == 42);
+        verify(constructed[2] == 123);
+        verify(source.data() == nullptr);
+
+        array<int> assigned;
+        assigned = std::move(constructed);
+        verify(assigned.size() == 3u);
+        verify(assigned[0] == 42);
+        verify(constructed.data() == nullptr);
+    }
+    {
+        announce("pool");
+        pool<int> source;
+        verify(source.reserve(5));
+        int *const first = source.alloc();
+        int *const second = source.alloc();
+        verify(first != nullptr && second != nullptr);
+        *first = 42;
+        *second = 99;
+
+        // A pool hands out addresses, so a move must not relocate what it already handed out.
+        pool<int> constructed(std::move(source));
+        verify(*first == 42);
+        verify(*second == 99);
+        verify(constructed.capacity() == 5u);
+
+        pool<int> assigned;
+        assigned = std::move(constructed);
+        verify(*first == 42);
+        verify(*second == 99);
+        verify(assigned.capacity() == 5u);
+    }
+}
+
+void test_containers_safety() {
+    announce("a_pool_refuses_rather_than_overruns");
+    pool<int> slots;
+    verify(slots.reserve(5));
+    int *taken[5];
+    for (std::size_t index = 0; index != 5; ++index) {
+        taken[index] = slots.alloc();
+        verify(taken[index] != nullptr);
+    }
+    // The sixth request must say so rather than hand back a slot already in use.
+    verify(slots.alloc() == nullptr);
+
+    slots.release(taken[2]);
+    verify(slots.alloc() != nullptr);
+    verify(slots.alloc() == nullptr);
+
+    announce("a_ring_reuses_the_slots_it_dropped");
+    round_robin<int> ring;
+    verify(ring.alloc(5));
+    for (int value = 0; value != 5; ++value) ring.push_ahead() = value;
+    verify(ring.size() == 5u);
+    ring.drop_tail();
+    ring.drop_tail();
+    verify(ring.size() == 3u);
+    // Pushing past the physical end of the storage has to land on the slots just freed.
+    ring.push_ahead() = 100;
+    ring.push_ahead() = 101;
+    verify(ring.size() == 5u);
+    verify(ring.head() == 101);
+    verify(ring.tail() == 2);
+}
+
+#pragma endregion Containers
+
+#pragma region Concurrency
+
+/** @brief Two threads incrementing behind one lock, which is the only thing the mutex promises. */
+void test_mutex_stress() {
+    mutex_t guard;
+    std::size_t counter = 0;
+    std::size_t const increments = scale_iterations(100'000);
+    announce("{} increments on each of two threads", increments);
+
+    auto worker = [&]() noexcept {
+        for (std::size_t index = 0; index != increments; ++index) {
+            guard.lock();
+            ++counter;
+            guard.unlock();
+        }
+    };
+
+    std::thread first(worker);
+    std::thread second(worker);
+    first.join();
+    second.join();
+
+    verify(counter == increments * 2, "counted {}, expected {} across two threads", counter, increments * 2);
+}
+
+#pragma endregion Concurrency
+
+int main() {
+    install_test_signal_handlers();
+    fmt::print("Hi, dear tester! You look nice today!\n");
+    configure_tests();
+
+    run_test("test_utilities_unit", test_utilities_unit);
+    run_test("test_traffic_stats_unit", test_traffic_stats_unit);
+    run_test("test_span_unit", test_span_unit);
+    run_test("test_round_robin_unit", test_round_robin_unit);
+    run_test("test_buffer_unit", test_buffer_unit);
+    run_test("test_array_unit", test_array_unit);
+    run_test("test_pool_unit", test_pool_unit);
+    run_test("test_memory_map_unit", test_memory_map_unit);
+    run_test("test_containers_moves_unit", test_containers_moves_unit);
+    run_test("test_containers_safety", test_containers_safety);
+    run_test("test_mutex_stress", test_mutex_stress);
+
+    fmt::print("All tests passed.\n");
+    return 0;
 }

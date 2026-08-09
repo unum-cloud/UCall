@@ -1,5 +1,7 @@
 /**
  *  @brief A secure tunnel: one state machine, driven identically by every IO backend.
+ *  @file src/secure_tunnel.hpp
+ *  @author Ash Vardanian
  *
  *  @section What a Tunnel Is
  *
@@ -76,9 +78,6 @@
  *  handshake and close messages @c advance writes, which are generated from key material rather
  *  than transformed from anything. Hence @c advance takes no output buffer, and the span it
  *  returns is valid exactly as long as the caller's obligation to send it - until the next call.
- *
- *  @file src/secure_tunnel.hpp
- *  @author Ash Vardanian
  */
 #pragma once
 
@@ -117,6 +116,9 @@ enum class secure_tunnel_mode_t : std::uint8_t {
     return "unknown";
 }
 
+/** @brief Lets `{}` print a mode by name. */
+[[nodiscard]] inline auto format_as(secure_tunnel_mode_t value) noexcept { return secure_tunnel_mode_name(value); }
+
 /**
  *  @brief True when a mode frames and encrypts, false when bytes pass through.
  *
@@ -141,6 +143,9 @@ enum class secure_tunnel_role_t : std::uint8_t { initiator_k, responder_k };
 [[nodiscard]] inline char const *secure_tunnel_role_name(secure_tunnel_role_t role) noexcept {
     return role == secure_tunnel_role_t::initiator_k ? "initiator" : "responder";
 }
+
+/** @brief Lets `{}` print a role by name. */
+[[nodiscard]] inline auto format_as(secure_tunnel_role_t value) noexcept { return secure_tunnel_role_name(value); }
 
 /**
  *  @brief What the caller wants of the pump: its half of the control channel.
@@ -218,6 +223,9 @@ enum class secure_tunnel_state_t : std::uint8_t {
     return "unknown";
 }
 
+/** @brief Lets `{}` print a state by name. */
+[[nodiscard]] inline auto format_as(secure_tunnel_state_t value) noexcept { return secure_tunnel_state_name(value); }
+
 /**
  *  @brief Why an operation failed, so a log can tell a bad key from an attack.
  *
@@ -251,6 +259,9 @@ enum class secure_tunnel_fault_t : std::uint8_t {
     }
     return "unknown";
 }
+
+/** @brief Lets `{}` print a fault by name. */
+[[nodiscard]] inline auto format_as(secure_tunnel_fault_t value) noexcept { return secure_tunnel_fault_name(value); }
 
 /**
  *  @brief What a record carries, from the byte sealed inside its authenticated encryption.

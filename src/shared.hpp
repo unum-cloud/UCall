@@ -1,18 +1,18 @@
 /**
  *  @brief Trivial utility types, functions, and containers shared across protocols.
- *
- *  The containers replace STL counterparts to avoid dynamic memory allocations and provide
- *  safe error handling - as opposed to exceptions on resize/reserve failures.
- *
  *  @file shared.hpp
  *  @author Ash Vardanian
  *  @date January 18, 2023
+ *
+ *  The containers replace STL counterparts to avoid dynamic memory allocations and provide
+ *  safe error handling - as opposed to exceptions on resize/reserve failures.
  */
 #pragma once
+#include <cassert> // `assert`
+#include <cstdlib> // `std::malloc`, `std::free`, `std::realloc`
+#include <cstring> // `std::strlen`, `std::memset`, `std::memcpy`
+
 #include <atomic>      // `std::atomic`
-#include <cassert>     // `assert`
-#include <cstdlib>     // `std::malloc`, `std::free`, `std::realloc`
-#include <cstring>     // `std::strlen`, `std::memset`, `std::memcpy`
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
@@ -27,12 +27,14 @@
 #define UCALL_OS_WINDOWS_
 #endif
 
+/*  Clang is probed before GCC because it also defines `__GNUC__` for compatibility, so the
+ *  reverse order can never reach the Clang branch. */
 #if defined(_MSC_VER)
 #define UCALL_COMPILER_MSVC_
-#elif defined(__GNUC__)
-#define UCALL_COMPILER_GCC_
 #elif defined(__clang__)
 #define UCALL_COMPILER_CLANG_
+#elif defined(__GNUC__)
+#define UCALL_COMPILER_GCC_
 #endif
 
 #if defined(__x86_64__) || defined(_M_X64)
@@ -42,12 +44,21 @@
 #endif
 
 #if defined(UCALL_OS_LINUX_)
-#include <sys/uio.h>  // `struct iovec`
 #include <sys/mman.h> // `mmap`, `munmap`
+#include <unistd.h>   // `sysconf`, `_SC_LEVEL1_DCACHE_LINESIZE`
 #endif
 
 #if defined(UCALL_OS_MACOS_)
-#include <sys/mman.h> // `mmap`, `munmap`, `PROT_*`, `MAP_*`
+#include <sys/mman.h>   // `mmap`, `munmap`, `PROT_*`, `MAP_*`
+#include <sys/sysctl.h> // `sysctlbyname`
+#endif
+
+/*  `<winsock2.h>` has to precede `<windows.h>`, which otherwise drags in the Winsock 1.1
+ *  declarations and leaves the socket backends with two incompatible definitions of each. */
+#if defined(UCALL_OS_WINDOWS_)
+#define WIN32_LEAN_AND_MEAN
+#include <winsock2.h>
+#include <windows.h> // `HANDLE`, `CreateFileMapping`, `MapViewOfFile`
 #endif
 
 #include "ucall/ucall.h" // `ucall_callback_t`
@@ -56,41 +67,36 @@ namespace unum::ucall {
 
 using byte_t = unsigned char;
 
-/** @brief Embedded buffer size for tiny requests, avoiding dynamic allocations. */
+/**
+ *  @brief Default width of one connection's embedded buffers.
+ *
+ *  Four kilobytes because that is a page on the platforms this ships to, not because anything here
+ *  requires one: `mmap` rounds to page granularity itself, and the rest are plain arrays. Apple's
+ *  arm64 pages are sixteen kilobytes and Linux on arm64 can be built for any of three sizes, so
+ *  reading this as the MMU's answer would be wrong. It is a buffer width, and it has to stay a
+ *  constant - `client_posix.cpp` sizes a stack array with it, and `payload_width_t` an enumerator.
+ */
 static constexpr std::size_t ram_page_size_k = 4096;
 
-/** @brief Expected maximum length of HTTP headers. */
-static constexpr std::size_t http_head_max_size_k = 1024;
-
 /**
- *  @brief Maximum length of JSON-Pointer for parameter lookup in nested requests.
+ *  @brief Bytes to keep between things two threads write, so neither steals the other's line.
  *
- *  Performance-oriented APIs have maximum depth of 1 token. Some may use up to 5 tokens,
- *  or roughly 50 characters.
+ *  Not 64. Apple's arm64 cores use 128-byte lines, and x86 pulls adjacent lines in pairs for the
+ *  prefetcher, so 64 leaves two hot fields sharing a fetch on both of the architectures we target.
+ *  `alignas` needs a constant expression, so this is the conservative upper bound rather than
+ *  whatever the machine in front of you reports.
+ *
+ *  Deliberately not @c std::hardware_destructive_interference_size: libstdc++ reports 64 for
+ *  x86-64, which is the number this exists to correct, and GCC warns on its use in any layout
+ *  that crosses a translation unit.
  */
-static constexpr std::size_t json_pointer_capacity_k = 256;
-
-/** @brief Number of bytes in a printed integer (for error codes or request IDs). */
-static constexpr std::size_t max_integer_length_k = 32;
-
-/** @brief Alignment for largest-register-aligned memory addressing. */
-static constexpr std::size_t align_k = 64;
-
-/** @brief Approximate CPU cycles per microsecond (real-time access is expensive). */
-constexpr std::size_t cpu_cycles_per_micro_second_k = 3'000;
+static constexpr std::size_t false_sharing_bytes_k = 128;
 
 /** @brief File descriptor type-safe wrapper. */
 enum descriptor_t : ssize_t {};
 
 /** @brief Invalid file descriptor constant. */
 static constexpr descriptor_t bad_descriptor_k {-1};
-
-/** @brief Groups server-side endpoint information needed to register a callback. */
-struct named_callback_t {
-    ucall_string_t name_template {};
-    void (*callback)(void *) {};
-    void *callback_tag {};
-};
 
 /** @brief Timestamp in CPU cycles for low-overhead time measurements. */
 using timestamp_t = std::uint64_t;
@@ -239,7 +245,7 @@ class round_robin {
  *  Uses a test-and-test-and-set pattern to reduce cache coherency traffic.
  *  For high contention scenarios, consider using @c std::mutex instead.
  */
-class alignas(align_k) mutex_t {
+class alignas(false_sharing_bytes_k) mutex_t {
     std::atomic<bool> flag {false};
 
   public:
@@ -319,7 +325,18 @@ class memory_map_t {
         size_ = 0;
     }
 
-    bool remap(std::size_t size) noexcept {
+    /**
+     *  @brief Reserves @p size bytes of anonymous, zeroed address space.
+     *  @return False when the kernel refuses the mapping.
+     *
+     *  Reserves rather than commits: neither backend is asked to touch a page here, so the
+     *  physical page behind an address is allocated by the thread that first writes to it and
+     *  lands on that thread's NUMA node. Committing from the builder thread instead - which is
+     *  what an eager @c memset does - places every worker's buffers on whichever node ran
+     *  @c ucall_server_init. Both @c mmap and @c CreateFileMapping already guarantee the pages
+     *  read as zero, so nothing is lost by not writing them.
+     */
+    [[nodiscard]] bool remap(std::size_t size) noexcept {
         reset();
 
 #if defined(UCALL_OS_WINDOWS_)
@@ -338,7 +355,6 @@ class memory_map_t {
         byte_t *new_ptr = (byte_t *)mmap(nullptr, size, PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
         if (new_ptr == MAP_FAILED) return false;
 #endif
-        std::memset(new_ptr, 0, size);
         data_ = new_ptr;
         size_ = size;
         return true;
@@ -348,7 +364,7 @@ class memory_map_t {
 /**
  *  @brief Fixed-size buffer with manual memory management.
  *
- *  Simple buffer container that allocates a fixed number of elements via @c resize(). Unlike
+ *  Simple buffer container that allocates a fixed number of elements via @c reallocate(). Unlike
  *  @c array, does not support growing or partial filling - capacity is always equal to the
  *  number of constructed elements. Suitable for fixed-size working buffers.
  *
@@ -386,7 +402,8 @@ class buffer {
         capacity_ = 0;
     }
 
-    [[nodiscard]] bool resize(std::size_t n) noexcept {
+    /** @brief Allocates exactly @p n elements, @b discarding whatever the buffer held. */
+    [[nodiscard]] bool reallocate(std::size_t n) noexcept {
         reset();
         elements_ = (element_t *)std::malloc(sizeof(element_t) * n);
         if (!elements_) {
@@ -842,7 +859,13 @@ class array {
         // Appending nothing is not a copy of length zero - it is not a copy, and `memcpy` with a
         // null destination is undefined even when it moves no bytes.
         if (!n) return true;
-        if (!reserve(count_ + n)) return false;
+        // Doubling here rather than inside `reserve`, so an explicit `reserve(n)` still means
+        // exactly `n` and only the growth an append implies is amortized. Without it, a message
+        // assembled a read at a time reallocates once per read.
+        if (count_ + n > capacity_) {
+            std::size_t const doubled = capacity_ * 2;
+            if (!reserve(count_ + n > doubled ? count_ + n : doubled)) return false;
+        }
         // `reserve` guarantees room for `count_ + n`, but the optimiser cannot always follow that
         // through its two inlined branches and warns about writing into a region it believes is
         // empty. Stating the invariant costs one predictable branch and keeps the build silent.
@@ -866,9 +889,12 @@ inline number_and_suffix_t printable(std::size_t n) noexcept {
 }
 
 /**
- *  @brief Tracks aggregate network traffic (connections, bytes, packets) for periodic logging.
+ *  @brief Aggregate network traffic, for periodic logging.
+ *
+ *  Atomic because the logging thread drains these while the engines keep counting. Nothing on the
+ *  request path touches it.
  */
-struct traffic_stats_t {
+struct alignas(false_sharing_bytes_k) traffic_stats_t {
 
     static constexpr std::size_t default_frequency_secs_k {5};
 
