@@ -9,6 +9,7 @@
  *  @date January 18, 2023
  */
 #pragma once
+#include <atomic>      // `std::atomic`
 #include <cassert>     // `assert`
 #include <cstdlib>     // `std::malloc`, `std::free`, `std::realloc`
 #include <cstring>     // `std::strlen`, `std::memset`, `std::memcpy`
@@ -499,6 +500,9 @@ class pool {
     [[nodiscard]] element_t &at_offset(std::size_t i) const noexcept { return elements_[i]; }
     [[nodiscard]] element_t const *data() const noexcept { return elements_; }
 
+    /** @brief Slots this pool was reserved with, allocated or not. */
+    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
+
     /** @brief Checks if pointer is within this pool's allocated range. */
     [[nodiscard]] bool contains(element_t const *ptr) const noexcept {
         return ptr >= elements_ && ptr < elements_ + capacity_;
@@ -702,20 +706,26 @@ class span {
     using element_t = element_type_;
     using value_type = element_t;
 
+    /** @brief An empty span, so a member or a default argument can simply be `{}`. */
+    span() = default;
     span(element_t *b, element_t *e) noexcept : begin_(b), end_(e) {}
 
-    [[nodiscard]] element_t const *data() const noexcept { return begin_; }
-    [[nodiscard]] element_t *data() noexcept { return begin_; }
-    [[nodiscard]] element_t *begin() noexcept { return begin_; }
-    [[nodiscard]] element_t *end() noexcept { return end_; }
+    /**
+     *  @brief Access is const, and deliberately does not propagate to the bytes.
+     *
+     *  A span is a view, so its own constness says the view will not be repointed - not that what
+     *  it points at is read-only. That is what `element_type_` is for: `span<byte_t const>` is the
+     *  read-only one. Propagating instead makes a `const span<byte_t>` useless as an output
+     *  parameter and forces callers to drop the `const` to write through it, which `std::span`
+     *  avoids for the same reason.
+     */
+    [[nodiscard]] element_t *data() const noexcept { return begin_; }
+    [[nodiscard]] element_t *begin() const noexcept { return begin_; }
+    [[nodiscard]] element_t *end() const noexcept { return end_; }
     [[nodiscard]] std::size_t size() const noexcept { return end_ - begin_; }
-    [[nodiscard]] element_t &operator[](std::size_t i) noexcept {
-        assert(i < size() && "span::operator[] index out of bounds");
-        return begin_[i];
-    }
-    [[nodiscard]] element_t const &operator[](std::size_t i) const noexcept {
-        assert(i < size() && "span::operator[] index out of bounds");
-        return begin_[i];
+    [[nodiscard]] element_t &operator[](std::size_t index) const noexcept {
+        assert(index < size() && "span::operator[] index out of bounds");
+        return begin_[index];
     }
     operator std::basic_string_view<element_t>() const noexcept { return {data(), size()}; }
 };
@@ -799,14 +809,22 @@ class array {
         assert(count_ < capacity_ && "push_back_reserved() called on full array");
         elements_[count_++] = std::move(element);
     }
+
     /** @brief Decrements count by n. Does not destroy elements or deallocate. */
     void pop_back(std::size_t n = 1) noexcept {
         assert(count_ >= n && "pop_back() would underflow array");
         count_ -= n;
     }
     [[nodiscard]] bool append_n(element_t const *elements, std::size_t n) noexcept {
-        if (!reserve(size() + n)) return false;
-        std::memcpy(end(), elements, n * sizeof(element_t));
+        // Appending nothing is not a copy of length zero - it is not a copy, and `memcpy` with a
+        // null destination is undefined even when it moves no bytes.
+        if (!n) return true;
+        if (!reserve(count_ + n)) return false;
+        // `reserve` guarantees room for `count_ + n`, but the optimiser cannot always follow that
+        // through its two inlined branches and warns about writing into a region it believes is
+        // empty. Stating the invariant costs one predictable branch and keeps the build silent.
+        if (!elements_) return false;
+        std::memcpy(elements_ + count_, elements, n * sizeof(element_t));
         count_ += n;
         return true;
     }
