@@ -1,5 +1,7 @@
 /**
  *  @brief Curve25519 scalar multiplication, the one Noise primitive with no home elsewhere.
+ *  @file src/crypto_x25519.hpp
+ *  @author Ash Vardanian
  *
  *  @section Why Vendored
  *
@@ -18,6 +20,17 @@
  *  and NSS ship. A subtly wrong field multiply still produces a shared secret that looks
  *  random.
  *
+ *  @section Tiers
+ *
+ *  Three field backends, chosen at runtime. @c saturated is four saturated limbs in plain C++ and
+ *  runs wherever this file compiles; @c radix51 is five limbs over 128-bit products, so it needs
+ *  @c __int128 ; @c adx is @c saturated recompiled with @c target("adx,bmi2") , which lets the
+ *  compiler emit @c MULX and makes it illegal on x86-64 without BMI2.
+ *
+ *  @c saturated is the baseline and carries no switch: one that can be compiled out is not a
+ *  baseline. The two switches follow StringZilla's @c SZ_USE_* - always defined to 1 or 0, so
+ *  @c \#if never reads an undefined identifier as zero and silently drops a tier.
+ *
  *  @section Cost
  *
  *  One scalar multiplication is on the order of 100'000 cycles, and a Noise XX handshake
@@ -27,18 +40,90 @@
  *  selected at runtime. The remaining levers, worth measuring before pulling: the
  *  hand-scheduled @c ADCX / @c ADOX dual-chain assembly BoringSSL ships, which no compiler
  *  synthesizes from C, then batching independent handshakes across AVX-512IFMA lanes.
- *
- *  @file src/crypto_x25519.hpp
- *  @author Ash Vardanian
  */
 #pragma once
 
 #include <cstdint> // `std::uint8_t`
 
+/** @brief Radix-51 limbs over 128-bit products. Absent under MSVC, which has no `__int128`. */
+#if !defined(UCALL_USE_X25519_RADIX51)
+#if defined(__SIZEOF_INT128__)
+#define UCALL_USE_X25519_RADIX51 (1)
+#else
+#define UCALL_USE_X25519_RADIX51 (0)
+#endif
+#endif
+
+/** @brief Saturated limbs recompiled for ADX and BMI2. Needs the attribute those compilers accept. */
+#if !defined(UCALL_USE_X25519_ADX)
+#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+#define UCALL_USE_X25519_ADX (1)
+#else
+#define UCALL_USE_X25519_ADX (0)
+#endif
+#endif
+
 namespace unum::ucall {
 
 /** @brief Length of a Curve25519 scalar, public key, or shared secret, in bytes. */
 static constexpr std::size_t x25519_key_size_k = 32;
+
+/**
+ *  @brief Bitmask over the field-arithmetic tiers this library knows about.
+ *
+ *  A bitmask rather than one enumerator per tier because the useful questions are about sets:
+ *  which tiers a build contains, which this machine favours, and which one it therefore picked.
+ */
+enum class x25519_tiers_t : std::uint8_t {
+    none_k = 0,
+    /** @brief Four limbs over a multiply built from 32-bit products. Always compiled, always runs. */
+    serial_k = 1u << 0,
+    /** @brief Five limbs over 128-bit products. Faster than @c serial_k wherever it compiles. */
+    radix51_k = 1u << 1,
+    /** @brief Four limbs built for ADX and BMI2, so it runs only where CPUID reports them. */
+    adx_k = 1u << 2,
+};
+
+[[nodiscard]] constexpr x25519_tiers_t operator|(x25519_tiers_t left, x25519_tiers_t right) noexcept {
+    return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(left) | static_cast<std::uint8_t>(right));
+}
+
+[[nodiscard]] constexpr x25519_tiers_t operator&(x25519_tiers_t left, x25519_tiers_t right) noexcept {
+    return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(left) & static_cast<std::uint8_t>(right));
+}
+
+/** @brief Whether @p available contains every tier in @p wanted. */
+[[nodiscard]] constexpr bool x25519_has_tiers(x25519_tiers_t available, x25519_tiers_t wanted) noexcept {
+    return (available & wanted) == wanted;
+}
+
+/** @brief The tiers this build compiled in. @c serial_k carries no switch and is always among them. */
+[[nodiscard]] constexpr x25519_tiers_t x25519_tiers_compiled() noexcept {
+    return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(x25519_tiers_t::serial_k) |
+                                       static_cast<std::uint8_t>(x25519_tiers_t::radix51_k) * UCALL_USE_X25519_RADIX51 |
+                                       static_cast<std::uint8_t>(x25519_tiers_t::adx_k) * UCALL_USE_X25519_ADX);
+}
+
+/**
+ *  @brief The tiers this machine can execute, whatever was compiled.
+ *
+ *  Only @c adx_k is conditional. The other two hold no instruction a supported CPU can lack.
+ */
+[[nodiscard]] x25519_tiers_t x25519_tiers_runtime() noexcept;
+
+/** @brief The tiers both compiled in and runnable here. Never empty: @c saturated_k is in both. */
+[[nodiscard]] inline x25519_tiers_t x25519_tiers() noexcept { return x25519_tiers_compiled() & x25519_tiers_runtime(); }
+
+/**
+ *  @brief The single tier @c x25519_scalar_multiply dispatches to on this machine.
+ *
+ *  Exposed because a benchmark that does not name the tier it measured is unreadable, and a test
+ *  cross-checking tiers has to know which one the dispatcher already covered.
+ */
+[[nodiscard]] x25519_tiers_t x25519_tier_preferred() noexcept;
+
+/** @brief Names one tier, for diagnostics. Answers @c "none" for a mask with no bits set. */
+[[nodiscard]] char const *x25519_tier_name(x25519_tiers_t tier) noexcept;
 
 /**
  *  @brief Computes @p out = @p scalar * @p point on Curve25519, per RFC 7748 §5.
@@ -58,17 +143,27 @@ static constexpr std::size_t x25519_key_size_k = 32;
     std::uint8_t const scalar[x25519_key_size_k], //
     std::uint8_t const point[x25519_key_size_k]) noexcept;
 
-/** @brief Radix-51 tier of @c x25519_scalar_multiply. Needs 128-bit integers, so absent under MSVC. */
+/** @brief Baseline tier of @c x25519_scalar_multiply. Always built, and runs on any supported CPU. */
 [[nodiscard]] bool x25519_scalar_multiply_serial( //
     std::uint8_t out[x25519_key_size_k],          //
     std::uint8_t const scalar[x25519_key_size_k], //
     std::uint8_t const point[x25519_key_size_k]) noexcept;
 
-/** @brief Saturated 4-limb tier of @c x25519_scalar_multiply, compiled to MULX carry chains on x86-64. */
+#if UCALL_USE_X25519_RADIX51
+/** @brief Radix-51 tier of @c x25519_scalar_multiply. Needs 128-bit integers, so absent under MSVC. */
+[[nodiscard]] bool x25519_scalar_multiply_radix51( //
+    std::uint8_t out[x25519_key_size_k],           //
+    std::uint8_t const scalar[x25519_key_size_k],  //
+    std::uint8_t const point[x25519_key_size_k]) noexcept;
+#endif
+
+#if UCALL_USE_X25519_ADX
+/** @brief ADX tier of @c x25519_scalar_multiply. Faults where @c x25519_tiers_runtime omits it. */
 [[nodiscard]] bool x25519_scalar_multiply_adx(    //
     std::uint8_t out[x25519_key_size_k],          //
     std::uint8_t const scalar[x25519_key_size_k], //
     std::uint8_t const point[x25519_key_size_k]) noexcept;
+#endif
 
 /**
  *  @brief Derives the public key matching @p scalar, multiplying by the standard base point.

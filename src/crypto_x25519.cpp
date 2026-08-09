@@ -1,5 +1,7 @@
 /**
  *  @brief Curve25519 scalar multiplication per RFC 7748 §5, in two field-arithmetic tiers.
+ *  @file src/crypto_x25519.cpp
+ *  @author Ash Vardanian
  *
  *  @section Tiers
  *
@@ -38,9 +40,6 @@
  *  The ladder in @c montgomery_ladder, the clamping, and the small-order check are
  *  transcribed from RFC 7748 §5's pseudocode with the specification's own variable names,
  *  and are shared by both tiers through the field-backend template parameter.
- *
- *  @file src/crypto_x25519.cpp
- *  @author Ash Vardanian
  */
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
@@ -72,9 +71,14 @@ namespace {
 
 using fiat_25519_uint1_t = unsigned char;
 using fiat_25519_int1_t = signed char;
+
 #if defined(__SIZEOF_INT128__)
-// A typedef rather than a `using` alias because only the former accepts `__extension__`,
-// which silences the pedantic warning about `__int128` being a language extension.
+/**
+ *  @brief The 128-bit accumulator the radix-51 limbs multiply into.
+ *
+ *  A typedef rather than a `using` alias because only the former accepts `__extension__`, which
+ *  silences the pedantic warning about `__int128` being a language extension.
+ */
 __extension__ typedef unsigned __int128 fiat_25519_uint128_t;
 #endif
 
@@ -100,22 +104,46 @@ __extension__ typedef unsigned __int128 fiat_25519_uint128_t;
 }
 
 /**
- *  @brief Full 64x64->128 multiply: @p out1 receives the low half, @p out2 the high.
+ *  @brief Multiplies without any widening operation, from four 32×32 → 64 partial products.
+ *
+ *  The baseline's multiply, slower than the alternative and chosen for a property rather than for
+ *  speed: with no widening operation present there is nothing a compiler can lower to @c MULX , so
+ *  the serial tier stays runnable on every x86-64 however a target region is scoped.
+ */
+struct multiply_serial_t {
+    static void wide(std::uint64_t *out1, std::uint64_t *out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
+        std::uint64_t const arg1_low = arg1 & 0xFFFFFFFFull, arg1_high = arg1 >> 32;
+        std::uint64_t const arg2_low = arg2 & 0xFFFFFFFFull, arg2_high = arg2 >> 32;
+        std::uint64_t partial = arg1_low * arg2_low;
+        std::uint64_t const lowest_word = partial & 0xFFFFFFFFull;
+        partial = arg1_high * arg2_low + (partial >> 32);
+        std::uint64_t const middle_word = partial & 0xFFFFFFFFull;
+        std::uint64_t const middle_carry = partial >> 32;
+        partial = arg1_low * arg2_high + middle_word;
+        *out1 = (partial << 32) | lowest_word;
+        *out2 = arg1_high * arg2_high + middle_carry + (partial >> 32);
+    }
+};
+
+/**
+ *  @brief Multiplies through whatever 64×64 → 128 facility the toolchain offers.
  *  @see BoringSSL origin, main of 2026-08-04:
  *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L44
  */
-inline void fiat_mulx_u64(std::uint64_t *out1, std::uint64_t *out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
+struct multiply_widening_t {
+    static void wide(std::uint64_t *out1, std::uint64_t *out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
 #if defined(__SIZEOF_INT128__)
-    fiat_25519_uint128_t const product = (fiat_25519_uint128_t)arg1 * arg2;
-    *out1 = (std::uint64_t)product, *out2 = (std::uint64_t)(product >> 64);
+        fiat_25519_uint128_t const product = (fiat_25519_uint128_t)arg1 * arg2;
+        *out1 = (std::uint64_t)product, *out2 = (std::uint64_t)(product >> 64);
 #elif defined(_M_X64)
-    *out1 = _umul128(arg1, arg2, out2);
+        *out1 = _umul128(arg1, arg2, out2);
 #elif defined(_M_ARM64)
-    *out1 = arg1 * arg2, *out2 = __umulh(arg1, arg2);
+        *out1 = arg1 * arg2, *out2 = __umulh(arg1, arg2);
 #else
-#error "No 128-bit multiply available: need __int128, _umul128, or __umulh."
+        multiply_serial_t::wide(out1, out2, arg1, arg2);
 #endif
-}
+    }
+};
 
 /**
  *  @brief 64-bit add with carry: @p out1 = @p arg2 + @p arg3 + @p arg1, @p out2 the carry-out.
@@ -181,7 +209,7 @@ inline void fiat_25519_cmovznz_u64(std::uint64_t *out1, fiat_25519_uint1_t arg1,
 
 #pragma endregion Compiler Shims
 
-#if defined(__SIZEOF_INT128__)
+#if UCALL_USE_X25519_RADIX51
 
 #pragma region Radix 51 Field Arithmetic
 
@@ -392,7 +420,7 @@ inline void fiat_25519_from_bytes(std::uint64_t out1[5], std::uint8_t const arg1
  *  carried back to tight bounds before reuse. A tight value always satisfies a loose
  *  precondition, so this is never unsafe, only slower.
  */
-struct field_serial_t {
+struct field_radix51_t {
     struct element_t {
         std::uint64_t limb[5];
     };
@@ -446,296 +474,302 @@ struct field_serial_t {
 
 #pragma endregion Radix 51 Field Arithmetic
 
-#endif // defined(__SIZEOF_INT128__)
+#endif // UCALL_USE_X25519_RADIX51
 
 #pragma region Saturated Field Arithmetic
 
 /**
- *  @brief Multiplies two saturated 4-limb elements mod 2^255-19.
- *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L150
- */
-UCALL_X25519_TARGET_ADX inline void fiat_25519_solinas_mul(std::uint64_t out1[4], std::uint64_t const arg1[4],
-                                                           std::uint64_t const arg2[4]) noexcept {
-    std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22,
-        x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x35, x37, x38, x40, x42, x44, x45, x47, x49, x51, x53,
-        x55, x56, x58, x60, x62, x64, x66, x68, x70, x72, x74, x76, x78, x80, x82, x84, x86, x88, x90, x92, x94, x96,
-        x97, x98, x99, x100, x101, x102, x103, x104, x106, x108, x110, x111, x113, x115, x117, x119, x120, x121, x122,
-        x124, x126, x128, x130, x131;
-    fiat_25519_uint1_t x34, x36, x39, x41, x43, x46, x48, x50, x52, x54, x57, x59, x61, x63, x65, x67, x69, x71, x73,
-        x75, x77, x79, x81, x83, x85, x87, x89, x91, x93, x95, x105, x107, x109, x112, x114, x116, x118, x123, x125,
-        x127, x129, x132;
-    fiat_mulx_u64(&x1, &x2, (arg1[3]), (arg2[3]));
-    fiat_mulx_u64(&x3, &x4, (arg1[3]), (arg2[2]));
-    fiat_mulx_u64(&x5, &x6, (arg1[3]), (arg2[1]));
-    fiat_mulx_u64(&x7, &x8, (arg1[3]), (arg2[0]));
-    fiat_mulx_u64(&x9, &x10, (arg1[2]), (arg2[3]));
-    fiat_mulx_u64(&x11, &x12, (arg1[2]), (arg2[2]));
-    fiat_mulx_u64(&x13, &x14, (arg1[2]), (arg2[1]));
-    fiat_mulx_u64(&x15, &x16, (arg1[2]), (arg2[0]));
-    fiat_mulx_u64(&x17, &x18, (arg1[1]), (arg2[3]));
-    fiat_mulx_u64(&x19, &x20, (arg1[1]), (arg2[2]));
-    fiat_mulx_u64(&x21, &x22, (arg1[1]), (arg2[1]));
-    fiat_mulx_u64(&x23, &x24, (arg1[1]), (arg2[0]));
-    fiat_mulx_u64(&x25, &x26, (arg1[0]), (arg2[3]));
-    fiat_mulx_u64(&x27, &x28, (arg1[0]), (arg2[2]));
-    fiat_mulx_u64(&x29, &x30, (arg1[0]), (arg2[1]));
-    fiat_mulx_u64(&x31, &x32, (arg1[0]), (arg2[0]));
-    fiat_addcarryx_u64(&x33, &x34, 0x0, x28, x7);
-    fiat_addcarryx_u64(&x35, &x36, x34, x26, x5);
-    x37 = (x36 + x18);
-    fiat_addcarryx_u64(&x38, &x39, 0x0, x33, x13);
-    fiat_addcarryx_u64(&x40, &x41, x39, x35, x8);
-    fiat_addcarryx_u64(&x42, &x43, x41, x37, 0x0);
-    x44 = (x43 + x10);
-    fiat_addcarryx_u64(&x45, &x46, 0x0, x30, x15);
-    fiat_addcarryx_u64(&x47, &x48, x46, x38, x16);
-    fiat_addcarryx_u64(&x49, &x50, x48, x40, x11);
-    fiat_addcarryx_u64(&x51, &x52, x50, x42, x3);
-    fiat_addcarryx_u64(&x53, &x54, x52, x44, 0x0);
-    x55 = (x54 + x2);
-    fiat_addcarryx_u64(&x56, &x57, 0x0, x45, x21);
-    fiat_addcarryx_u64(&x58, &x59, x57, x47, x19);
-    fiat_addcarryx_u64(&x60, &x61, x59, x49, x14);
-    fiat_addcarryx_u64(&x62, &x63, x61, x51, x6);
-    fiat_addcarryx_u64(&x64, &x65, x63, x53, 0x0);
-    fiat_addcarryx_u64(&x66, &x67, x65, x55, 0x0);
-    fiat_addcarryx_u64(&x68, &x69, 0x0, x32, x23);
-    fiat_addcarryx_u64(&x70, &x71, x69, x56, x24);
-    fiat_addcarryx_u64(&x72, &x73, x71, x58, x22);
-    fiat_addcarryx_u64(&x74, &x75, x73, x60, x17);
-    fiat_addcarryx_u64(&x76, &x77, x75, x62, x9);
-    fiat_addcarryx_u64(&x78, &x79, x77, x64, x1);
-    fiat_addcarryx_u64(&x80, &x81, x79, x66, 0x0);
-    fiat_addcarryx_u64(&x82, &x83, 0x0, x68, x29);
-    fiat_addcarryx_u64(&x84, &x85, x83, x70, x27);
-    fiat_addcarryx_u64(&x86, &x87, x85, x72, x25);
-    fiat_addcarryx_u64(&x88, &x89, x87, x74, x20);
-    fiat_addcarryx_u64(&x90, &x91, x89, x76, x12);
-    fiat_addcarryx_u64(&x92, &x93, x91, x78, x4);
-    fiat_addcarryx_u64(&x94, &x95, x93, x80, 0x0);
-    fiat_mulx_u64(&x96, &x97, 0x26, x94);
-    fiat_mulx_u64(&x98, &x99, 0x26, x92);
-    fiat_mulx_u64(&x100, &x101, 0x26, x90);
-    fiat_mulx_u64(&x102, &x103, 0x26, x88);
-    fiat_addcarryx_u64(&x104, &x105, 0x0, x82, x100);
-    fiat_addcarryx_u64(&x106, &x107, x105, x84, x98);
-    fiat_addcarryx_u64(&x108, &x109, x107, x86, x96);
-    x110 = (x109 + x97);
-    fiat_addcarryx_u64(&x111, &x112, 0x0, x31, x102);
-    fiat_addcarryx_u64(&x113, &x114, x112, x104, x103);
-    fiat_addcarryx_u64(&x115, &x116, x114, x106, x101);
-    fiat_addcarryx_u64(&x117, &x118, x116, x108, x99);
-    x119 = (x118 + x110);
-    fiat_mulx_u64(&x120, &x121, 0x26, x119);
-    fiat_addcarryx_u64(&x122, &x123, 0x0, x111, x120);
-    fiat_addcarryx_u64(&x124, &x125, x123, x113, 0x0);
-    fiat_addcarryx_u64(&x126, &x127, x125, x115, 0x0);
-    fiat_addcarryx_u64(&x128, &x129, x127, x117, 0x0);
-    fiat_25519_cmovznz_u64(&x130, x129, 0x0, 0x26);
-    fiat_addcarryx_u64(&x131, &x132, 0x0, x130, x122);
-    out1[0] = x131, out1[1] = x124, out1[2] = x126, out1[3] = x128;
-}
-
-/**
- *  @brief Squares a saturated 4-limb element mod 2^255-19.
- *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L369
- */
-UCALL_X25519_TARGET_ADX inline void fiat_25519_solinas_square(std::uint64_t out1[4],
-                                                              std::uint64_t const arg1[4]) noexcept {
-    std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x13, x15, x17, x19, x20, x21, x22, x24, x26, x28, x30,
-        x32, x34, x36, x38, x40, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x53, x55, x57, x59, x61, x63, x65,
-        x66, x67, x68, x69, x70, x71, x72, x73, x75, x77, x79, x80, x82, x84, x86, x88, x89, x90, x91, x93, x95, x97,
-        x99, x100;
-    fiat_25519_uint1_t x12, x14, x16, x18, x23, x25, x27, x29, x31, x33, x35, x37, x39, x41, x52, x54, x56, x58, x60,
-        x62, x64, x74, x76, x78, x81, x83, x85, x87, x92, x94, x96, x98, x101;
-    fiat_mulx_u64(&x1, &x2, (arg1[0]), (arg1[3]));
-    fiat_mulx_u64(&x3, &x4, (arg1[0]), (arg1[2]));
-    fiat_mulx_u64(&x5, &x6, (arg1[0]), (arg1[1]));
-    fiat_mulx_u64(&x7, &x8, (arg1[3]), (arg1[2]));
-    fiat_mulx_u64(&x9, &x10, (arg1[3]), (arg1[1]));
-    fiat_addcarryx_u64(&x11, &x12, 0x0, x6, x3);
-    fiat_addcarryx_u64(&x13, &x14, x12, x4, x1);
-    fiat_addcarryx_u64(&x15, &x16, x14, x2, x9);
-    fiat_addcarryx_u64(&x17, &x18, x16, x10, x7);
-    x19 = (x18 + x8);
-    fiat_mulx_u64(&x20, &x21, (arg1[1]), (arg1[2]));
-    fiat_addcarryx_u64(&x22, &x23, 0x0, x13, x20);
-    fiat_addcarryx_u64(&x24, &x25, x23, x15, x21);
-    fiat_addcarryx_u64(&x26, &x27, x25, x17, 0x0);
-    fiat_addcarryx_u64(&x28, &x29, x27, x19, 0x0);
-    fiat_addcarryx_u64(&x30, &x31, 0x0, x5, x5);
-    fiat_addcarryx_u64(&x32, &x33, x31, x11, x11);
-    fiat_addcarryx_u64(&x34, &x35, x33, x22, x22);
-    fiat_addcarryx_u64(&x36, &x37, x35, x24, x24);
-    fiat_addcarryx_u64(&x38, &x39, x37, x26, x26);
-    fiat_addcarryx_u64(&x40, &x41, x39, x28, x28);
-    x42 = (((std::uint64_t)x41 + x29) + (std::uint64_t)x29);
-    fiat_mulx_u64(&x43, &x44, (arg1[3]), (arg1[3]));
-    fiat_mulx_u64(&x45, &x46, (arg1[2]), (arg1[2]));
-    fiat_mulx_u64(&x47, &x48, (arg1[1]), (arg1[1]));
-    fiat_mulx_u64(&x49, &x50, (arg1[0]), (arg1[0]));
-    fiat_addcarryx_u64(&x51, &x52, 0x0, x30, x50);
-    fiat_addcarryx_u64(&x53, &x54, x52, x32, x47);
-    fiat_addcarryx_u64(&x55, &x56, x54, x34, x48);
-    fiat_addcarryx_u64(&x57, &x58, x56, x36, x45);
-    fiat_addcarryx_u64(&x59, &x60, x58, x38, x46);
-    fiat_addcarryx_u64(&x61, &x62, x60, x40, x43);
-    fiat_addcarryx_u64(&x63, &x64, x62, x42, x44);
-    fiat_mulx_u64(&x65, &x66, 0x26, x63);
-    fiat_mulx_u64(&x67, &x68, 0x26, x61);
-    fiat_mulx_u64(&x69, &x70, 0x26, x59);
-    fiat_mulx_u64(&x71, &x72, 0x26, x57);
-    fiat_addcarryx_u64(&x73, &x74, 0x0, x51, x69);
-    fiat_addcarryx_u64(&x75, &x76, x74, x53, x67);
-    fiat_addcarryx_u64(&x77, &x78, x76, x55, x65);
-    x79 = (x78 + x66);
-    fiat_addcarryx_u64(&x80, &x81, 0x0, x49, x71);
-    fiat_addcarryx_u64(&x82, &x83, x81, x73, x72);
-    fiat_addcarryx_u64(&x84, &x85, x83, x75, x70);
-    fiat_addcarryx_u64(&x86, &x87, x85, x77, x68);
-    x88 = (x87 + x79);
-    fiat_mulx_u64(&x89, &x90, 0x26, x88);
-    fiat_addcarryx_u64(&x91, &x92, 0x0, x80, x89);
-    fiat_addcarryx_u64(&x93, &x94, x92, x82, 0x0);
-    fiat_addcarryx_u64(&x95, &x96, x94, x84, 0x0);
-    fiat_addcarryx_u64(&x97, &x98, x96, x86, 0x0);
-    fiat_25519_cmovznz_u64(&x99, x98, 0x0, 0x26);
-    fiat_addcarryx_u64(&x100, &x101, 0x0, x99, x91);
-    out1[0] = x100, out1[1] = x93, out1[2] = x95, out1[3] = x97;
-}
-
-/**
- *  @brief Adds saturated 4-limb elements mod 2^255-19.
- *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L169
- */
-UCALL_X25519_TARGET_ADX inline void fe4_add(std::uint64_t out1[4], std::uint64_t const arg1[4],
-                                            std::uint64_t const arg2[4]) noexcept {
-    std::uint64_t x1, x3, x5, x7, x9, x10, x12, x14, x16, x18, x19;
-    fiat_25519_uint1_t x2, x4, x6, x8, x11, x13, x15, x17, x20;
-    fiat_addcarryx_u64(&x1, &x2, 0x0, (arg1[0]), (arg2[0]));
-    fiat_addcarryx_u64(&x3, &x4, x2, (arg1[1]), (arg2[1]));
-    fiat_addcarryx_u64(&x5, &x6, x4, (arg1[2]), (arg2[2]));
-    fiat_addcarryx_u64(&x7, &x8, x6, (arg1[3]), (arg2[3]));
-    fiat_25519_cmovznz_u64(&x9, x8, 0x0, 0x26);
-    fiat_addcarryx_u64(&x10, &x11, 0x0, x1, x9);
-    fiat_addcarryx_u64(&x12, &x13, x11, x3, 0x0);
-    fiat_addcarryx_u64(&x14, &x15, x13, x5, 0x0);
-    fiat_addcarryx_u64(&x16, &x17, x15, x7, 0x0);
-    fiat_25519_cmovznz_u64(&x18, x17, 0x0, 0x26);
-    fiat_addcarryx_u64(&x19, &x20, 0x0, x10, x18);
-    out1[0] = x19, out1[1] = x12, out1[2] = x14, out1[3] = x16;
-}
-
-/**
- *  @brief Subtracts saturated 4-limb elements mod 2^255-19.
- *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L215
- */
-UCALL_X25519_TARGET_ADX inline void fe4_sub(std::uint64_t out1[4], std::uint64_t const arg1[4],
-                                            std::uint64_t const arg2[4]) noexcept {
-    std::uint64_t x1, x2, x4, x5, x7, x8, x10, x11, x13, x14, x16, x18, x20, x22, x23;
-    fiat_25519_uint1_t x3, x6, x9, x12, x15, x17, x19, x21, x24;
-    x1 = (arg2[0]);
-    fiat_subborrowx_u64(&x2, &x3, 0x0, (arg1[0]), x1);
-    x4 = (arg2[1]);
-    fiat_subborrowx_u64(&x5, &x6, x3, (arg1[1]), x4);
-    x7 = (arg2[2]);
-    fiat_subborrowx_u64(&x8, &x9, x6, (arg1[2]), x7);
-    x10 = (arg2[3]);
-    fiat_subborrowx_u64(&x11, &x12, x9, (arg1[3]), x10);
-    fiat_25519_cmovznz_u64(&x13, x12, 0x0, 0x26);
-    fiat_subborrowx_u64(&x14, &x15, 0x0, x2, x13);
-    fiat_subborrowx_u64(&x16, &x17, x15, x5, 0x0);
-    fiat_subborrowx_u64(&x18, &x19, x17, x8, 0x0);
-    fiat_subborrowx_u64(&x20, &x21, x19, x11, 0x0);
-    fiat_25519_cmovznz_u64(&x22, x21, 0x0, 0x26);
-    fiat_subborrowx_u64(&x23, &x24, 0x0, x14, x22);
-    out1[0] = x23, out1[1] = x16, out1[2] = x18, out1[3] = x20;
-}
-
-/**
- *  @brief Multiplies a saturated 4-limb element by a small scalar constant, at most 2^58-1.
- *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L269
- */
-UCALL_X25519_TARGET_ADX inline void fe4_scmul(std::uint64_t out1[4], std::uint64_t const arg1[4],
-                                              std::uint64_t arg2) noexcept {
-    std::uint64_t x1, x2, x3, x4, x5, x7, x8, x9, x11, x12, x13, x15, x16, x17, x19, x21, x23, x25, x26;
-    fiat_25519_uint1_t x6, x10, x14, x18, x20, x22, x24, x27;
-    fiat_mulx_u64(&x1, &x2, (arg1[0]), arg2);
-    fiat_mulx_u64(&x3, &x4, (arg1[1]), arg2);
-    fiat_addcarryx_u64(&x5, &x6, 0x0, x2, x3);
-    fiat_mulx_u64(&x7, &x8, (arg1[2]), arg2);
-    fiat_addcarryx_u64(&x9, &x10, x6, x4, x7);
-    fiat_mulx_u64(&x11, &x12, (arg1[3]), arg2);
-    fiat_addcarryx_u64(&x13, &x14, x10, x8, x11);
-    fiat_mulx_u64(&x15, &x16, (x12 + (std::uint64_t)x14), 0x26);
-    fiat_addcarryx_u64(&x17, &x18, 0x0, x1, x15);
-    fiat_addcarryx_u64(&x19, &x20, x18, x5, 0x0);
-    fiat_addcarryx_u64(&x21, &x22, x20, x9, 0x0);
-    fiat_addcarryx_u64(&x23, &x24, x22, x13, 0x0);
-    fiat_25519_cmovznz_u64(&x25, x24, 0x0, 0x26);
-    fiat_addcarryx_u64(&x26, &x27, 0x0, x17, x25);
-    out1[0] = x26, out1[1] = x19, out1[2] = x21, out1[3] = x23;
-}
-
-/**
- *  @brief Reduces a saturated 4-limb element to its canonical representative below 2^255-19.
- *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L324
- */
-UCALL_X25519_TARGET_ADX inline void fe4_canon(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
-    std::uint64_t x1, x3, x5, x7, x9, x10, x11, x12, x13, x15, x17, x19, x21, x22, x23, x24;
-    fiat_25519_uint1_t x2, x4, x6, x8, x14, x16, x18, x20;
-    fiat_subborrowx_u64(&x1, &x2, 0x0, (arg1[0]), 0xffffffffffffffedULL);
-    fiat_subborrowx_u64(&x3, &x4, x2, (arg1[1]), 0xffffffffffffffffULL);
-    fiat_subborrowx_u64(&x5, &x6, x4, (arg1[2]), 0xffffffffffffffffULL);
-    fiat_subborrowx_u64(&x7, &x8, x6, (arg1[3]), 0x7fffffffffffffffULL);
-    fiat_25519_cmovznz_u64(&x9, x8, x1, (arg1[0]));
-    fiat_25519_cmovznz_u64(&x10, x8, x3, (arg1[1]));
-    fiat_25519_cmovznz_u64(&x11, x8, x5, (arg1[2]));
-    fiat_25519_cmovznz_u64(&x12, x8, x7, (arg1[3]));
-    fiat_subborrowx_u64(&x13, &x14, 0x0, x9, 0xffffffffffffffedULL);
-    fiat_subborrowx_u64(&x15, &x16, x14, x10, 0xffffffffffffffffULL);
-    fiat_subborrowx_u64(&x17, &x18, x16, x11, 0xffffffffffffffffULL);
-    fiat_subborrowx_u64(&x19, &x20, x18, x12, 0x7fffffffffffffffULL);
-    fiat_25519_cmovznz_u64(&x21, x20, x13, x9);
-    fiat_25519_cmovznz_u64(&x22, x20, x15, x10);
-    fiat_25519_cmovznz_u64(&x23, x20, x17, x11);
-    fiat_25519_cmovznz_u64(&x24, x20, x19, x12);
-    out1[0] = x21, out1[1] = x22, out1[2] = x23, out1[3] = x24;
-}
-
-/**
- *  @brief Constant-time conditional swap of two saturated 4-limb elements; outputs may alias inputs.
- *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L381
- */
-UCALL_X25519_TARGET_ADX inline void fe4_cswap(std::uint64_t out1[4], std::uint64_t out2[4], fiat_25519_uint1_t arg1,
-                                              std::uint64_t const arg2[4], std::uint64_t const arg3[4]) noexcept {
-    std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8;
-    fiat_25519_cmovznz_u64(&x1, arg1, (arg2[0]), (arg3[0]));
-    fiat_25519_cmovznz_u64(&x2, arg1, (arg2[1]), (arg3[1]));
-    fiat_25519_cmovznz_u64(&x3, arg1, (arg2[2]), (arg3[2]));
-    fiat_25519_cmovznz_u64(&x4, arg1, (arg2[3]), (arg3[3]));
-    fiat_25519_cmovznz_u64(&x5, arg1, (arg3[0]), (arg2[0]));
-    fiat_25519_cmovznz_u64(&x6, arg1, (arg3[1]), (arg2[1]));
-    fiat_25519_cmovznz_u64(&x7, arg1, (arg3[2]), (arg2[2]));
-    fiat_25519_cmovznz_u64(&x8, arg1, (arg3[3]), (arg2[3]));
-    out1[0] = x1, out1[1] = x2, out1[2] = x3, out1[3] = x4, out2[0] = x5, out2[1] = x6, out2[2] = x7, out2[3] = x8;
-}
-
-/**
- *  @brief The saturated field backend: four full 64-bit limbs, little-endian, carry-chained.
+ *  @brief Saturated four-limb arithmetic over 2^255-19, over whichever widening multiply it is given.
  *
- *  `fe4` is fiat's name for this shape - a field element in four limbs. Values stay
- *  unreduced anywhere below 2^256 between operations; @c fe4_canon produces the canonical
- *  representative below 2^255-19 only at serialization.
+ *  The multiply is the only thing that separates the tiers, so it is the only thing parameterised:
+ *  @c multiply_serial_t keeps the kernels free of any widening operation at all, and
+ *  @c multiply_widening_t lets the compiler lower one to @c MULX inside a target region.
  */
-struct field_adx_t {
+template <typename multiply_>
+struct field_saturated {
+
+    /**
+     *  @brief Multiplies two saturated 4-limb elements mod 2^255-19.
+     *  @see Fiat Cryptography origin v0.1.6+137:
+     *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L150
+     */
+    static void fiat_25519_solinas_mul(std::uint64_t out1[4], std::uint64_t const arg1[4],
+                                       std::uint64_t const arg2[4]) noexcept {
+        std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21,
+            x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x35, x37, x38, x40, x42, x44, x45, x47, x49,
+            x51, x53, x55, x56, x58, x60, x62, x64, x66, x68, x70, x72, x74, x76, x78, x80, x82, x84, x86, x88, x90,
+            x92, x94, x96, x97, x98, x99, x100, x101, x102, x103, x104, x106, x108, x110, x111, x113, x115, x117, x119,
+            x120, x121, x122, x124, x126, x128, x130, x131;
+        fiat_25519_uint1_t x34, x36, x39, x41, x43, x46, x48, x50, x52, x54, x57, x59, x61, x63, x65, x67, x69, x71,
+            x73, x75, x77, x79, x81, x83, x85, x87, x89, x91, x93, x95, x105, x107, x109, x112, x114, x116, x118, x123,
+            x125, x127, x129, x132;
+        multiply_::wide(&x1, &x2, (arg1[3]), (arg2[3]));
+        multiply_::wide(&x3, &x4, (arg1[3]), (arg2[2]));
+        multiply_::wide(&x5, &x6, (arg1[3]), (arg2[1]));
+        multiply_::wide(&x7, &x8, (arg1[3]), (arg2[0]));
+        multiply_::wide(&x9, &x10, (arg1[2]), (arg2[3]));
+        multiply_::wide(&x11, &x12, (arg1[2]), (arg2[2]));
+        multiply_::wide(&x13, &x14, (arg1[2]), (arg2[1]));
+        multiply_::wide(&x15, &x16, (arg1[2]), (arg2[0]));
+        multiply_::wide(&x17, &x18, (arg1[1]), (arg2[3]));
+        multiply_::wide(&x19, &x20, (arg1[1]), (arg2[2]));
+        multiply_::wide(&x21, &x22, (arg1[1]), (arg2[1]));
+        multiply_::wide(&x23, &x24, (arg1[1]), (arg2[0]));
+        multiply_::wide(&x25, &x26, (arg1[0]), (arg2[3]));
+        multiply_::wide(&x27, &x28, (arg1[0]), (arg2[2]));
+        multiply_::wide(&x29, &x30, (arg1[0]), (arg2[1]));
+        multiply_::wide(&x31, &x32, (arg1[0]), (arg2[0]));
+        fiat_addcarryx_u64(&x33, &x34, 0x0, x28, x7);
+        fiat_addcarryx_u64(&x35, &x36, x34, x26, x5);
+        x37 = (x36 + x18);
+        fiat_addcarryx_u64(&x38, &x39, 0x0, x33, x13);
+        fiat_addcarryx_u64(&x40, &x41, x39, x35, x8);
+        fiat_addcarryx_u64(&x42, &x43, x41, x37, 0x0);
+        x44 = (x43 + x10);
+        fiat_addcarryx_u64(&x45, &x46, 0x0, x30, x15);
+        fiat_addcarryx_u64(&x47, &x48, x46, x38, x16);
+        fiat_addcarryx_u64(&x49, &x50, x48, x40, x11);
+        fiat_addcarryx_u64(&x51, &x52, x50, x42, x3);
+        fiat_addcarryx_u64(&x53, &x54, x52, x44, 0x0);
+        x55 = (x54 + x2);
+        fiat_addcarryx_u64(&x56, &x57, 0x0, x45, x21);
+        fiat_addcarryx_u64(&x58, &x59, x57, x47, x19);
+        fiat_addcarryx_u64(&x60, &x61, x59, x49, x14);
+        fiat_addcarryx_u64(&x62, &x63, x61, x51, x6);
+        fiat_addcarryx_u64(&x64, &x65, x63, x53, 0x0);
+        fiat_addcarryx_u64(&x66, &x67, x65, x55, 0x0);
+        fiat_addcarryx_u64(&x68, &x69, 0x0, x32, x23);
+        fiat_addcarryx_u64(&x70, &x71, x69, x56, x24);
+        fiat_addcarryx_u64(&x72, &x73, x71, x58, x22);
+        fiat_addcarryx_u64(&x74, &x75, x73, x60, x17);
+        fiat_addcarryx_u64(&x76, &x77, x75, x62, x9);
+        fiat_addcarryx_u64(&x78, &x79, x77, x64, x1);
+        fiat_addcarryx_u64(&x80, &x81, x79, x66, 0x0);
+        fiat_addcarryx_u64(&x82, &x83, 0x0, x68, x29);
+        fiat_addcarryx_u64(&x84, &x85, x83, x70, x27);
+        fiat_addcarryx_u64(&x86, &x87, x85, x72, x25);
+        fiat_addcarryx_u64(&x88, &x89, x87, x74, x20);
+        fiat_addcarryx_u64(&x90, &x91, x89, x76, x12);
+        fiat_addcarryx_u64(&x92, &x93, x91, x78, x4);
+        fiat_addcarryx_u64(&x94, &x95, x93, x80, 0x0);
+        multiply_::wide(&x96, &x97, 0x26, x94);
+        multiply_::wide(&x98, &x99, 0x26, x92);
+        multiply_::wide(&x100, &x101, 0x26, x90);
+        multiply_::wide(&x102, &x103, 0x26, x88);
+        fiat_addcarryx_u64(&x104, &x105, 0x0, x82, x100);
+        fiat_addcarryx_u64(&x106, &x107, x105, x84, x98);
+        fiat_addcarryx_u64(&x108, &x109, x107, x86, x96);
+        x110 = (x109 + x97);
+        fiat_addcarryx_u64(&x111, &x112, 0x0, x31, x102);
+        fiat_addcarryx_u64(&x113, &x114, x112, x104, x103);
+        fiat_addcarryx_u64(&x115, &x116, x114, x106, x101);
+        fiat_addcarryx_u64(&x117, &x118, x116, x108, x99);
+        x119 = (x118 + x110);
+        multiply_::wide(&x120, &x121, 0x26, x119);
+        fiat_addcarryx_u64(&x122, &x123, 0x0, x111, x120);
+        fiat_addcarryx_u64(&x124, &x125, x123, x113, 0x0);
+        fiat_addcarryx_u64(&x126, &x127, x125, x115, 0x0);
+        fiat_addcarryx_u64(&x128, &x129, x127, x117, 0x0);
+        fiat_25519_cmovznz_u64(&x130, x129, 0x0, 0x26);
+        fiat_addcarryx_u64(&x131, &x132, 0x0, x130, x122);
+        out1[0] = x131, out1[1] = x124, out1[2] = x126, out1[3] = x128;
+    }
+
+    /**
+     *  @brief Squares a saturated 4-limb element mod 2^255-19.
+     *  @see Fiat Cryptography origin v0.1.6+137:
+     *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L369
+     */
+    static void fiat_25519_solinas_square(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
+        std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x13, x15, x17, x19, x20, x21, x22, x24, x26, x28,
+            x30, x32, x34, x36, x38, x40, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x53, x55, x57, x59, x61,
+            x63, x65, x66, x67, x68, x69, x70, x71, x72, x73, x75, x77, x79, x80, x82, x84, x86, x88, x89, x90, x91,
+            x93, x95, x97, x99, x100;
+        fiat_25519_uint1_t x12, x14, x16, x18, x23, x25, x27, x29, x31, x33, x35, x37, x39, x41, x52, x54, x56, x58,
+            x60, x62, x64, x74, x76, x78, x81, x83, x85, x87, x92, x94, x96, x98, x101;
+        multiply_::wide(&x1, &x2, (arg1[0]), (arg1[3]));
+        multiply_::wide(&x3, &x4, (arg1[0]), (arg1[2]));
+        multiply_::wide(&x5, &x6, (arg1[0]), (arg1[1]));
+        multiply_::wide(&x7, &x8, (arg1[3]), (arg1[2]));
+        multiply_::wide(&x9, &x10, (arg1[3]), (arg1[1]));
+        fiat_addcarryx_u64(&x11, &x12, 0x0, x6, x3);
+        fiat_addcarryx_u64(&x13, &x14, x12, x4, x1);
+        fiat_addcarryx_u64(&x15, &x16, x14, x2, x9);
+        fiat_addcarryx_u64(&x17, &x18, x16, x10, x7);
+        x19 = (x18 + x8);
+        multiply_::wide(&x20, &x21, (arg1[1]), (arg1[2]));
+        fiat_addcarryx_u64(&x22, &x23, 0x0, x13, x20);
+        fiat_addcarryx_u64(&x24, &x25, x23, x15, x21);
+        fiat_addcarryx_u64(&x26, &x27, x25, x17, 0x0);
+        fiat_addcarryx_u64(&x28, &x29, x27, x19, 0x0);
+        fiat_addcarryx_u64(&x30, &x31, 0x0, x5, x5);
+        fiat_addcarryx_u64(&x32, &x33, x31, x11, x11);
+        fiat_addcarryx_u64(&x34, &x35, x33, x22, x22);
+        fiat_addcarryx_u64(&x36, &x37, x35, x24, x24);
+        fiat_addcarryx_u64(&x38, &x39, x37, x26, x26);
+        fiat_addcarryx_u64(&x40, &x41, x39, x28, x28);
+        x42 = (((std::uint64_t)x41 + x29) + (std::uint64_t)x29);
+        multiply_::wide(&x43, &x44, (arg1[3]), (arg1[3]));
+        multiply_::wide(&x45, &x46, (arg1[2]), (arg1[2]));
+        multiply_::wide(&x47, &x48, (arg1[1]), (arg1[1]));
+        multiply_::wide(&x49, &x50, (arg1[0]), (arg1[0]));
+        fiat_addcarryx_u64(&x51, &x52, 0x0, x30, x50);
+        fiat_addcarryx_u64(&x53, &x54, x52, x32, x47);
+        fiat_addcarryx_u64(&x55, &x56, x54, x34, x48);
+        fiat_addcarryx_u64(&x57, &x58, x56, x36, x45);
+        fiat_addcarryx_u64(&x59, &x60, x58, x38, x46);
+        fiat_addcarryx_u64(&x61, &x62, x60, x40, x43);
+        fiat_addcarryx_u64(&x63, &x64, x62, x42, x44);
+        multiply_::wide(&x65, &x66, 0x26, x63);
+        multiply_::wide(&x67, &x68, 0x26, x61);
+        multiply_::wide(&x69, &x70, 0x26, x59);
+        multiply_::wide(&x71, &x72, 0x26, x57);
+        fiat_addcarryx_u64(&x73, &x74, 0x0, x51, x69);
+        fiat_addcarryx_u64(&x75, &x76, x74, x53, x67);
+        fiat_addcarryx_u64(&x77, &x78, x76, x55, x65);
+        x79 = (x78 + x66);
+        fiat_addcarryx_u64(&x80, &x81, 0x0, x49, x71);
+        fiat_addcarryx_u64(&x82, &x83, x81, x73, x72);
+        fiat_addcarryx_u64(&x84, &x85, x83, x75, x70);
+        fiat_addcarryx_u64(&x86, &x87, x85, x77, x68);
+        x88 = (x87 + x79);
+        multiply_::wide(&x89, &x90, 0x26, x88);
+        fiat_addcarryx_u64(&x91, &x92, 0x0, x80, x89);
+        fiat_addcarryx_u64(&x93, &x94, x92, x82, 0x0);
+        fiat_addcarryx_u64(&x95, &x96, x94, x84, 0x0);
+        fiat_addcarryx_u64(&x97, &x98, x96, x86, 0x0);
+        fiat_25519_cmovznz_u64(&x99, x98, 0x0, 0x26);
+        fiat_addcarryx_u64(&x100, &x101, 0x0, x99, x91);
+        out1[0] = x100, out1[1] = x93, out1[2] = x95, out1[3] = x97;
+    }
+
+    /**
+     *  @brief Adds saturated 4-limb elements mod 2^255-19.
+     *  @see BoringSSL origin, main of 2026-08-04:
+     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L169
+     */
+    static void fe4_add(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t const arg2[4]) noexcept {
+        std::uint64_t x1, x3, x5, x7, x9, x10, x12, x14, x16, x18, x19;
+        fiat_25519_uint1_t x2, x4, x6, x8, x11, x13, x15, x17, x20;
+        fiat_addcarryx_u64(&x1, &x2, 0x0, (arg1[0]), (arg2[0]));
+        fiat_addcarryx_u64(&x3, &x4, x2, (arg1[1]), (arg2[1]));
+        fiat_addcarryx_u64(&x5, &x6, x4, (arg1[2]), (arg2[2]));
+        fiat_addcarryx_u64(&x7, &x8, x6, (arg1[3]), (arg2[3]));
+        fiat_25519_cmovznz_u64(&x9, x8, 0x0, 0x26);
+        fiat_addcarryx_u64(&x10, &x11, 0x0, x1, x9);
+        fiat_addcarryx_u64(&x12, &x13, x11, x3, 0x0);
+        fiat_addcarryx_u64(&x14, &x15, x13, x5, 0x0);
+        fiat_addcarryx_u64(&x16, &x17, x15, x7, 0x0);
+        fiat_25519_cmovznz_u64(&x18, x17, 0x0, 0x26);
+        fiat_addcarryx_u64(&x19, &x20, 0x0, x10, x18);
+        out1[0] = x19, out1[1] = x12, out1[2] = x14, out1[3] = x16;
+    }
+
+    /**
+     *  @brief Subtracts saturated 4-limb elements mod 2^255-19.
+     *  @see BoringSSL origin, main of 2026-08-04:
+     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L215
+     */
+    static void fe4_sub(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t const arg2[4]) noexcept {
+        std::uint64_t x1, x2, x4, x5, x7, x8, x10, x11, x13, x14, x16, x18, x20, x22, x23;
+        fiat_25519_uint1_t x3, x6, x9, x12, x15, x17, x19, x21, x24;
+        x1 = (arg2[0]);
+        fiat_subborrowx_u64(&x2, &x3, 0x0, (arg1[0]), x1);
+        x4 = (arg2[1]);
+        fiat_subborrowx_u64(&x5, &x6, x3, (arg1[1]), x4);
+        x7 = (arg2[2]);
+        fiat_subborrowx_u64(&x8, &x9, x6, (arg1[2]), x7);
+        x10 = (arg2[3]);
+        fiat_subborrowx_u64(&x11, &x12, x9, (arg1[3]), x10);
+        fiat_25519_cmovznz_u64(&x13, x12, 0x0, 0x26);
+        fiat_subborrowx_u64(&x14, &x15, 0x0, x2, x13);
+        fiat_subborrowx_u64(&x16, &x17, x15, x5, 0x0);
+        fiat_subborrowx_u64(&x18, &x19, x17, x8, 0x0);
+        fiat_subborrowx_u64(&x20, &x21, x19, x11, 0x0);
+        fiat_25519_cmovznz_u64(&x22, x21, 0x0, 0x26);
+        fiat_subborrowx_u64(&x23, &x24, 0x0, x14, x22);
+        out1[0] = x23, out1[1] = x16, out1[2] = x18, out1[3] = x20;
+    }
+
+    /**
+     *  @brief Multiplies a saturated 4-limb element by a small scalar constant, at most 2^58-1.
+     *  @see BoringSSL origin, main of 2026-08-04:
+     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L269
+     */
+    static void fe4_scmul(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t arg2) noexcept {
+        std::uint64_t x1, x2, x3, x4, x5, x7, x8, x9, x11, x12, x13, x15, x16, x17, x19, x21, x23, x25, x26;
+        fiat_25519_uint1_t x6, x10, x14, x18, x20, x22, x24, x27;
+        multiply_::wide(&x1, &x2, (arg1[0]), arg2);
+        multiply_::wide(&x3, &x4, (arg1[1]), arg2);
+        fiat_addcarryx_u64(&x5, &x6, 0x0, x2, x3);
+        multiply_::wide(&x7, &x8, (arg1[2]), arg2);
+        fiat_addcarryx_u64(&x9, &x10, x6, x4, x7);
+        multiply_::wide(&x11, &x12, (arg1[3]), arg2);
+        fiat_addcarryx_u64(&x13, &x14, x10, x8, x11);
+        multiply_::wide(&x15, &x16, (x12 + (std::uint64_t)x14), 0x26);
+        fiat_addcarryx_u64(&x17, &x18, 0x0, x1, x15);
+        fiat_addcarryx_u64(&x19, &x20, x18, x5, 0x0);
+        fiat_addcarryx_u64(&x21, &x22, x20, x9, 0x0);
+        fiat_addcarryx_u64(&x23, &x24, x22, x13, 0x0);
+        fiat_25519_cmovznz_u64(&x25, x24, 0x0, 0x26);
+        fiat_addcarryx_u64(&x26, &x27, 0x0, x17, x25);
+        out1[0] = x26, out1[1] = x19, out1[2] = x21, out1[3] = x23;
+    }
+
+    /**
+     *  @brief Reduces a saturated 4-limb element to its canonical representative below 2^255-19.
+     *  @see BoringSSL origin, main of 2026-08-04:
+     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L324
+     */
+    static void fe4_canon(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
+        std::uint64_t x1, x3, x5, x7, x9, x10, x11, x12, x13, x15, x17, x19, x21, x22, x23, x24;
+        fiat_25519_uint1_t x2, x4, x6, x8, x14, x16, x18, x20;
+        fiat_subborrowx_u64(&x1, &x2, 0x0, (arg1[0]), 0xffffffffffffffedULL);
+        fiat_subborrowx_u64(&x3, &x4, x2, (arg1[1]), 0xffffffffffffffffULL);
+        fiat_subborrowx_u64(&x5, &x6, x4, (arg1[2]), 0xffffffffffffffffULL);
+        fiat_subborrowx_u64(&x7, &x8, x6, (arg1[3]), 0x7fffffffffffffffULL);
+        fiat_25519_cmovznz_u64(&x9, x8, x1, (arg1[0]));
+        fiat_25519_cmovznz_u64(&x10, x8, x3, (arg1[1]));
+        fiat_25519_cmovznz_u64(&x11, x8, x5, (arg1[2]));
+        fiat_25519_cmovznz_u64(&x12, x8, x7, (arg1[3]));
+        fiat_subborrowx_u64(&x13, &x14, 0x0, x9, 0xffffffffffffffedULL);
+        fiat_subborrowx_u64(&x15, &x16, x14, x10, 0xffffffffffffffffULL);
+        fiat_subborrowx_u64(&x17, &x18, x16, x11, 0xffffffffffffffffULL);
+        fiat_subborrowx_u64(&x19, &x20, x18, x12, 0x7fffffffffffffffULL);
+        fiat_25519_cmovznz_u64(&x21, x20, x13, x9);
+        fiat_25519_cmovznz_u64(&x22, x20, x15, x10);
+        fiat_25519_cmovznz_u64(&x23, x20, x17, x11);
+        fiat_25519_cmovznz_u64(&x24, x20, x19, x12);
+        out1[0] = x21, out1[1] = x22, out1[2] = x23, out1[3] = x24;
+    }
+
+    /**
+     *  @brief Constant-time conditional swap of two saturated 4-limb elements; outputs may alias inputs.
+     *  @see BoringSSL origin, main of 2026-08-04:
+     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L381
+     */
+    static void fe4_cswap(std::uint64_t out1[4], std::uint64_t out2[4], fiat_25519_uint1_t arg1,
+                          std::uint64_t const arg2[4], std::uint64_t const arg3[4]) noexcept {
+        std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8;
+        fiat_25519_cmovznz_u64(&x1, arg1, (arg2[0]), (arg3[0]));
+        fiat_25519_cmovznz_u64(&x2, arg1, (arg2[1]), (arg3[1]));
+        fiat_25519_cmovznz_u64(&x3, arg1, (arg2[2]), (arg3[2]));
+        fiat_25519_cmovznz_u64(&x4, arg1, (arg2[3]), (arg3[3]));
+        fiat_25519_cmovznz_u64(&x5, arg1, (arg3[0]), (arg2[0]));
+        fiat_25519_cmovznz_u64(&x6, arg1, (arg3[1]), (arg2[1]));
+        fiat_25519_cmovznz_u64(&x7, arg1, (arg3[2]), (arg2[2]));
+        fiat_25519_cmovznz_u64(&x8, arg1, (arg3[3]), (arg2[3]));
+        out1[0] = x1, out1[1] = x2, out1[2] = x3, out1[3] = x4, out2[0] = x5, out2[1] = x6, out2[2] = x7, out2[3] = x8;
+    }
+
+    /**
+     *  @brief The saturated field backend: four full 64-bit limbs, little-endian, carry-chained.
+     *
+     *  `fe4` is fiat's name for this shape - a field element in four limbs. Values stay
+     *  unreduced anywhere below 2^256 between operations; @c fe4_canon produces the canonical
+     *  representative below 2^255-19 only at serialization.
+     */
+
     struct element_t {
         std::uint64_t limb[4];
     };
@@ -788,6 +822,12 @@ struct field_adx_t {
     }
 };
 
+using field_serial_t = field_saturated<multiply_serial_t>;
+#if UCALL_USE_X25519_ADX
+using field_adx_t = field_saturated<multiply_widening_t>;
+#endif
+
+#pragma endregion Saturated Field Arithmetic
 #pragma endregion Saturated Field Arithmetic
 
 #pragma region RFC 7748 Ladder
@@ -939,28 +979,79 @@ template <typename field_type_>
 
 } // namespace
 
-#if defined(__SIZEOF_INT128__)
 bool x25519_scalar_multiply_serial(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
                                    std::uint8_t const point[x25519_key_size_k]) noexcept {
     return scalar_multiply_through<field_serial_t>(out, scalar, point);
 }
+
+#if UCALL_USE_X25519_RADIX51
+bool x25519_scalar_multiply_radix51(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
+                                    std::uint8_t const point[x25519_key_size_k]) noexcept {
+    return scalar_multiply_through<field_radix51_t>(out, scalar, point);
+}
 #endif
 
-bool x25519_scalar_multiply_adx(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
-                                std::uint8_t const point[x25519_key_size_k]) noexcept {
+#if UCALL_USE_X25519_ADX
+#if defined(__clang__)
+#pragma clang attribute push(__attribute__((target("adx,bmi2"))), apply_to = function)
+#else
+#pragma GCC push_options
+#pragma GCC target("adx,bmi2")
+#endif
+
+/*  `flatten` is what makes this tier faster than `serial` rather than merely named differently. A
+ *  target region applies to what is generated inside it, and a template's members are generated
+ *  where the template is defined - outside. Without forcing the kernels into this body they compile
+ *  untargeted: measured 5 `MULX` against 566. Correctness never depended on it, and neither does
+ *  `serial` staying free of `MULX` - the schoolbook multiply has nothing to lower. */
+__attribute__((flatten)) bool x25519_scalar_multiply_adx(std::uint8_t out[x25519_key_size_k],
+                                                         std::uint8_t const scalar[x25519_key_size_k],
+                                                         std::uint8_t const point[x25519_key_size_k]) noexcept {
     return scalar_multiply_through<field_adx_t>(out, scalar, point);
+}
+
+#if defined(__clang__)
+#pragma clang attribute pop
+#else
+#pragma GCC pop_options
+#endif
+#endif
+
+x25519_tiers_t x25519_tiers_runtime() noexcept {
+    auto const always =
+        static_cast<std::uint8_t>(x25519_tiers_t::serial_k) | static_cast<std::uint8_t>(x25519_tiers_t::radix51_k);
+    static bool const accelerated = cpu_supports_adx_and_bmi2();
+    return static_cast<x25519_tiers_t>(always | (accelerated ? static_cast<std::uint8_t>(x25519_tiers_t::adx_k) : 0u));
+}
+
+x25519_tiers_t x25519_tier_preferred() noexcept {
+    x25519_tiers_t const usable = x25519_tiers();
+    if (x25519_has_tiers(usable, x25519_tiers_t::adx_k)) return x25519_tiers_t::adx_k;
+    if (x25519_has_tiers(usable, x25519_tiers_t::radix51_k)) return x25519_tiers_t::radix51_k;
+    return x25519_tiers_t::serial_k;
+}
+
+char const *x25519_tier_name(x25519_tiers_t tier) noexcept {
+    switch (tier) {
+    case x25519_tiers_t::serial_k: return "serial";
+    case x25519_tiers_t::radix51_k: return "radix51";
+    case x25519_tiers_t::adx_k: return "adx";
+    case x25519_tiers_t::none_k: return "none";
+    }
+    return "mixed";
 }
 
 bool x25519_scalar_multiply(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
                             std::uint8_t const point[x25519_key_size_k]) noexcept {
-#if defined(__SIZEOF_INT128__)
-    static bool const use_saturated_tier = cpu_supports_adx_and_bmi2();
-    return use_saturated_tier ? x25519_scalar_multiply_adx(out, scalar, point)
-                              : x25519_scalar_multiply_serial(out, scalar, point);
-#else
-    // Without 128-bit integers only the saturated tier compiles, and it runs on any x86-64.
-    return x25519_scalar_multiply_adx(out, scalar, point);
+    // The chain ends in the baseline, the way every `sz_find_*` chain ends in its serial arm.
+    [[maybe_unused]] x25519_tiers_t const tier = x25519_tier_preferred();
+#if UCALL_USE_X25519_ADX
+    if (tier == x25519_tiers_t::adx_k) return x25519_scalar_multiply_adx(out, scalar, point);
 #endif
+#if UCALL_USE_X25519_RADIX51
+    if (tier == x25519_tiers_t::radix51_k) return x25519_scalar_multiply_radix51(out, scalar, point);
+#endif
+    return x25519_scalar_multiply_serial(out, scalar, point);
 }
 
 void x25519_derive_public(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k]) noexcept {
