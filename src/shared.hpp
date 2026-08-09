@@ -16,6 +16,7 @@
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
+#include <type_traits> // `std::is_convertible_v`
 #include <utility>     // `std::exchange`, `std::swap`
 
 #if defined(__linux__)
@@ -709,6 +710,28 @@ class span {
     /** @brief An empty span, so a member or a default argument can simply be `{}`. */
     span() = default;
     span(element_t *b, element_t *e) noexcept : begin_(b), end_(e) {}
+
+    /**
+     *  @brief Adds constness, as @c std::span does: a `span<T>` is a `span<T const>` for the asking.
+     *
+     *  Constrained on the pointer conversion rather than on the element type, which is @c std::span's
+     *  own formulation: it permits the qualification change and refuses anything that would quietly
+     *  repoint the view at a different type. Without it every read-only argument built from a
+     *  writable buffer needs a conversion written by hand at the call site.
+     */
+    template <typename other_type_>
+        requires(std::is_convertible_v<other_type_ (*)[], element_type_ (*)[]>)
+    span(span<other_type_> const &other) noexcept : begin_(other.data()), end_(other.data() + other.size()) {}
+
+    /**
+     *  @brief Views a C array whole, as @c std::span does, so a table passes as one argument.
+     *
+     *  A `span<T const>` binds a `T[N]` here too, because a reference to a more-qualified array is
+     *  reference-compatible with a less-qualified one. That is what spares every caller a helper
+     *  whose only job was pairing the pointer with the bound the compiler already knew.
+     */
+    template <std::size_t count_>
+    span(element_type_ (&values)[count_]) noexcept : begin_(values), end_(values + count_) {}
 
     /**
      *  @brief Access is const, and deliberately does not propagate to the bytes.
