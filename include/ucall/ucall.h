@@ -564,17 +564,120 @@ typedef enum ucall_log_mode_t {
 typedef bool (*ucall_buffer_pool_callback_t)(void *base, size_t length, void *context);
 
 /**
+ *  @brief One virtualized network interface, and every policy applying to what arrives on it.
+ *
+ *  An interface is an address the server answers on, together with the security posture and
+ *  admission limits for the connections it accepts. Several of them live under one server, which
+ *  is what lets a single server answer VPN-internal Noise traffic and public plaintext at once,
+ *  across as many physical devices as the machine has.
+ *
+ *  Encryption and admission live on the interface rather than on the server, so one server
+ *  serves plaintext on loopback for health checks while requiring Noise on the wire - without
+ *  standing up a second server to do it.
+ *
+ *  @par Example
+ *  @code{.c}
+ *  ucall_network_interface_t interfaces[] = {
+ *      {.address = "127.0.0.1:8545"},
+ *      {.address = "0.0.0.0:8546", .device_name = "eth0",
+ *       .security_mode = ucall_security_noise_xx_k, .noise_private_key = &key},
+ *  };
+ *  ucall_server_config_t config = {.interfaces = interfaces, .interfaces_count = 2};
+ *  @endcode
+ */
+typedef struct ucall_network_interface_t {
+    /** @brief Listening address in "host:port" form. Required. */
+    char const *address;
+    /**
+     *  @brief Physical device to pin this interface to with @c SO_BINDTODEVICE, such as "eth0",
+     *    or @c NULL to bind by address alone.
+     *
+     *  Several interfaces may name one device, and one interface bound to @c 0.0.0.0 spans every
+     *  device the machine has - which is why the two are separate fields rather than one.
+     */
+    char const *device_name;
+
+    /**
+     *  @brief Encryption for connections accepted here. Default: ucall_security_none_k.
+     *  @note Server-side @c ucall_security_noise_kk_k is rejected, since an interface cannot name
+     *    the initiator static key that pattern hashes before the first message.
+     */
+    ucall_security_mode_t security_mode;
+    /** @brief Server identity for handshakes. Required when @c security_mode is not none. */
+    ucall_noise_key_t const *noise_private_key;
+    /** @brief Vets client static keys. Required for XX. Default: NULL. */
+    ucall_peer_authorizer_t peer_authorizer;
+    /** @brief Passed verbatim to @c peer_authorizer. */
+    void *peer_authorizer_context;
+
+    /**
+     *  @brief How many event loops accept on this interface. Default: inferred from the hardware.
+     *
+     *  Zero means @c min(receive queues on @c device_name, physical cores on its memory domain).
+     *  Physical, not logical: hyperthread siblings measure at roughly a third of a core each for
+     *  this workload, not a full one.
+     *
+     *  The server creates the @b maximum across interfaces, never the sum, and clamps it to the
+     *  machine's core count so threads cannot be oversubscribed. Two interfaces on two devices
+     *  each asking for sixteen loops on a sixteen-core host therefore yield sixteen threads
+     *  holding thirty-two listening sockets, not thirty-two threads. An interface asking for
+     *  fewer loops than the server ends up with is served by the first that many; the rest never
+     *  accept on it. Each participating loop gets its own socket in this address's
+     *  @c SO_REUSEPORT group, so no listening socket is ever shared between threads.
+     *
+     *  @sa @c ucall_server_event_loops_count() reports what the server settled on.
+     */
+    size_t event_loops;
+
+    /**
+     *  @brief Submission queue entries this interface needs, on each loop that serves it.
+     *    Default: @c max_concurrent_connections.
+     *
+     *  A loop's ring is sized to the @b sum over the interfaces it serves, because one loop has
+     *  one ring and must hold every outstanding operation across all of them. Sizing it here
+     *  rather than server-wide is what lets an interface hosting thousands of connections ask
+     *  for a deeper ring than one hosting a handful.
+     *
+     *  Meaningful only on backends built around a submission ring, and each imposes its own
+     *  ceiling - Linux @c io_uring allows 32'768 entries and allocates a completion queue of
+     *  twice that, so a sum exceeding it fails @c ucall_server_init() with
+     *  @c ucall_status_connection_failed_k. Below @c max_concurrent_connections the ring merely
+     *  flushes early, costing a system call per burst rather than failing, which is why the
+     *  library raises it to that floor rather than refusing. Backends without a ring ignore
+     *  this field.
+     */
+    size_t queue_depth;
+
+    /**
+     *  @brief Connections this interface may hold open at once, so one cannot starve another.
+     *    Default: 1024.
+     *
+     *  The one independent size on this struct: @c queue_depth and the kernel's listen backlog
+     *  are both derived from it unless overridden. Each connection costs one file descriptor
+     *  and two pages of buffer, so 65'536 connections is roughly half a gigabyte of arena, and
+     *  the descriptor total across every interface and event loop must stay under
+     *  @c RLIMIT_NOFILE - commonly 1024 unraised, 1'048'576 tuned. Exhausting it does not fail
+     *  the server; the interface simply stops accepting until a connection is released, and
+     *  pending handshakes queue in the kernel's backlog behind it.
+     *
+     *  @note The backlog handed to @c listen() is this value, which the operating system then
+     *    clamps to its own ceiling - @c net.core.somaxconn on Linux, 4096 on a modern kernel
+     *    and 128 on an old one. That clamp is silent rather than reported, and once the queue
+     *    overflows a completed handshake is dropped and the client retransmits.
+     */
+    size_t max_concurrent_connections;
+} ucall_network_interface_t;
+
+/**
  *  @brief Configuration parameters for the UCall server.
  *  @sa Initialize with @c ucall_server_init().
  *
  *  @par Example
  *  @code{.c}
+ *  ucall_network_interface_t interfaces[] = {{.address = "0.0.0.0:8080", .queue_depth = 512}};
  *  ucall_server_config_t config = {
- *      .bind_address = "0.0.0.0:8080",
- *      .security_mode = ucall_security_none_k,
- *      .max_threads = 8,
- *      .max_concurrent_connections = 1000,
- *      .queue_depth = 512,
+ *      .interfaces = interfaces,
+ *      .interfaces_count = 1,
  *      .logs_output_path = NULL,  // stderr
  *      .log_mode = ucall_log_mode_json_k,
  *      .metrics_address = "127.0.0.1:8125",
@@ -585,29 +688,20 @@ typedef bool (*ucall_buffer_pool_callback_t)(void *base, size_t length, void *co
  *  @endcode
  */
 typedef struct ucall_server_config_t {
-    /** @brief Server address in "host:port" format. Default: "0.0.0.0:8545" */
-    char const *bind_address;
-    /** @brief Encryption mode for all connections. Default: ucall_security_none_k. */
-    ucall_security_mode_t security_mode;
-    /** @brief Server identity for handshakes. Required for secure connections. */
-    ucall_noise_key_t const *noise_private_key;
-
-    /** @brief Vets client static keys. Required for XX. Default: NULL. */
-    ucall_peer_authorizer_t peer_authorizer;
-    /** @brief Passed verbatim to @c peer_authorizer. */
-    void *peer_authorizer_context;
+    /**
+     *  @brief Interfaces to answer on. At least one is required.
+     *
+     *  The array and every string it points at must outlive the server. Parallelism is
+     *  @c ucall_server_event_loops_count(), not this count.
+     */
+    ucall_network_interface_t const *interfaces;
+    /** @brief Entries in @c interfaces. At least one; zero fails with @c ucall_status_invalid_argument_k. */
+    size_t interfaces_count;
 
     /** @brief Notified once the pool is mapped. Default: NULL. */
     ucall_buffer_pool_callback_t buffer_pool_callback;
     /** @brief Passed verbatim to @c buffer_pool_callback. */
     void *buffer_pool_context;
-
-    /** @brief Thread pool size. Default: CPU count. */
-    uint16_t max_threads;
-    /** @brief Connection limit. Default: 1024. */
-    uint16_t max_concurrent_connections;
-    /** @brief Depth of the submission queue backing the client. Default: 128. */
-    uint16_t queue_depth;
 
     /** @brief Log file path. NULL redirects to stderr. Default: NULL. */
     char const *logs_output_path;
