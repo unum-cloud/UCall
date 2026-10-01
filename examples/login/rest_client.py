@@ -1,15 +1,12 @@
-import os
-import json
 import errno
-import socket
-import base64
+import json
+import os
 import random
+import socket
 import string
-from typing import Optional, List
+from typing import Optional
 
 import requests
-from ucall.client import Client, ClientTLS
-
 
 HTTP_HEADERS = '%s HTTP/1.1\r\nHost: 127.0.0.1:8540\r\nUser-Agent: python-requests/2.27.1\r\nAccept-Encoding: gzip, deflate\r\nAccept: */*\r\nConnection: keep-alive\r\nContent-Length: %i\r\nContent-Type: application/json\r\n\r\n'
 

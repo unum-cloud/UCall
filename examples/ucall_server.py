@@ -11,7 +11,6 @@ import PIL.Image as pil
 
 from ucall.posix import Server
 
-
 # Initialize the RPC server on port 8545
 server = Server(port=8545)
 

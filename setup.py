@@ -3,16 +3,17 @@
 #       1. Build the C server as one library, like `libucall_server_posix.a`
 #       2. Build the C binding, where target `py_ucall_posix` produces `py_ucall_posix.so`
 #       3. Rename binding to `posix.cpython-312-x86_64-linux-gnu.so`
+import glob
+import multiprocessing
 import os
+import platform
+import re
+import subprocess
 import sys
 import sysconfig
-import re
-import glob
-import platform
 from os.path import dirname
-import multiprocessing
-import subprocess
-from setuptools import setup, Extension
+
+from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
 __version__ = open("VERSION", "r").read().strip()

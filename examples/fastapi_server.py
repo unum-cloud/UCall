@@ -1,13 +1,13 @@
 #!/usr/bin/env python
-import io
 import base64
+import io
+import logging
 import random
 from typing import List
-import logging
 
 import numpy as np
+from fastapi import Body, FastAPI, HTTPException
 from PIL import Image
-from fastapi import FastAPI, HTTPException, Body
 from pydantic import BaseModel
 
 app = FastAPI()

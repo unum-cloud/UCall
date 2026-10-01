@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 import base64
 import io
-import pytest
+
 import httpx
-from PIL import Image
 import numpy as np
+import pytest
+from PIL import Image
 
 # Setup base URL
 BASE_URL = "http://localhost:8000"

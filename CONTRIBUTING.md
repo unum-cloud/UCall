@@ -3,6 +3,12 @@
 Thanks for coming here!
 For coding guidelines, please refer to [ashvardanian/CONTRIBUTING.md](https://github.com/ashvardanian/ashvardanian/blob/master/CONTRIBUTING.md).
 
+The repository carries its own hooks, gating the added lines of each staged file against the formatter its language uses:
+
+```bash
+git config core.hooksPath .githooks
+```
+
 ## Compiling C++ Code
 
 Release build:

@@ -1,8 +1,8 @@
 from concurrent import futures
 
 import grpc
-import validate_session_pb2_grpc as pb2_grpc
 import validate_session_pb2 as pb2
+import validate_session_pb2_grpc as pb2_grpc
 
 
 class ValidateServiceService(pb2_grpc.LoginServiceServicer):

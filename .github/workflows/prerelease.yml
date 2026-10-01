@@ -35,7 +35,7 @@ jobs:
       - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
-          pip install pillow numpy
+          python -m pip install --group test
       - name: Add msbuild to PATH
         if: matrix.os == 'windows-2022'
         uses: microsoft/setup-msbuild@v1

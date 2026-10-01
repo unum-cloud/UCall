@@ -1,10 +1,11 @@
 import random
 
-import requests
 import numpy as np
-from PIL import Image
-from ucall.client import Client, ClientTLS
+import requests
 from login.jsonrpc_client import CaseHTTP, CaseHTTPBatches, CaseTCP, CaseTLS
+from PIL import Image
+
+from ucall.client import Client, ClientTLS
 
 
 class ClientGeneric:

@@ -171,9 +171,12 @@ UCall uses a `protocol+transport` URL scheme convention (like Docker's `http+uni
 It also uses a Diffie-Hellman __(DH)__ key exchange to establish a shared secret between the client and server, but it's much simpler, easier to implement, audit, and reason about than TLS.
 Several handshake patterns are defined, each suitable for different use cases:
 
-- __XX__: Full mutual authentication where both parties authenticate each other during the handshake. Best for peer-to-peer scenarios or when the server doesn't have a fixed identity known in advance.
-- __IK__: Client knows the server's public key in advance (Identity Known). Provides faster handshakes and is ideal for typical client-server architectures, similar to TLS with certificate pinning.
-- __KK__: Both parties know each other's public keys beforehand (Known Known). Enables zero round-trip encryption for pre-configured systems with maximum performance.
+- __XX__: Full mutual authentication where both parties authenticate each other during the handshake.
+  Best for peer-to-peer scenarios or when the server doesn't have a fixed identity known in advance.
+- __IK__: Client knows the server's public key in advance (Identity Known).
+  Provides faster handshakes and is ideal for typical client-server architectures, similar to TLS with certificate pinning.
+- __KK__: Both parties know each other's public keys beforehand (Known Known).
+  Enables zero round-trip encryption for pre-configured systems with maximum performance.
 
 Noise can be implemented in several ways, depending on the choice of three cryptographic primitives: Diffie-Hellman key exchange, symmetric cipher, and hash function.
 The suite defines four standard combinations optimized for different use cases:
@@ -508,6 +511,7 @@ ucall_server_config_t config = {
     .metrics_tags = "env:prod,region:us-east", // Global tags for all metrics
 };
 ```
+
 The StatsD format works universally with all major observability platforms via collectors: Datadog Agent, OTel Collector, Telegraf, and Prometheus StatsD Exporter.
 
 ## Design Differences and Limitations

@@ -1,13 +1,13 @@
-import sys
 import os
+import sys
 import time
-from multiprocessing import Process, Value
 from dataclasses import dataclass
 from inspect import cleandoc as I
+from multiprocessing import Process, Value
 from pydoc import locate
 
-from tqdm import tqdm
 import fire
+from tqdm import tqdm
 
 
 @dataclass

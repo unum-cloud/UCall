@@ -1,7 +1,7 @@
+import argparse
+import json
 from pydoc import locate
 from typing import Optional
-import json
-import argparse
 
 from PIL import Image
 

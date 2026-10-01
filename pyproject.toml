@@ -10,11 +10,34 @@
 requires = ["setuptools>=42", "wheel", "cmake>=3.22"]
 build-backend = "setuptools.build_meta"
 
+# Groups rather than extras, so none of this reaches the published wheel's metadata.
+[dependency-groups]
+lint = ["ruff>=0.15.8"]
+# The `examples/test_*.py` suites talk to a running example server through these clients.
+test = ["httpx", "numpy", "pillow", "pytest>=8", "requests"]
+
 [tool.pytest.ini_options]
-minversion = "6.0"
-addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
-xfail_strict = true
+# `-p no:randomly` keeps `<PROJECT>_SEED` in charge wherever pytest-randomly happens to be installed.
+addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config", "-p", "no:randomly"]
 filterwarnings = ["error"]
+minversion = "8.0"
+python_files = ["test_*.py"]
+testpaths = ["examples"]
+xfail_strict = true
+
+[tool.ruff]
+line-length = 120
+target-version = "py39"
+
+[tool.ruff.lint]
+extend-select = ["I", "TID"]
+
+[tool.ruff.lint.flake8-tidy-imports]
+ban-relative-imports = "all"
+
+[tool.ruff.lint.isort]
+known-first-party = ["ucall"]
+combine-as-imports = true
 
 # Avoid running tests, as everything is happening in a super slow container
 # We have already run all the relavent Python tests in `prerelease.yml`
