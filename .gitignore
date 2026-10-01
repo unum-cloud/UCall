@@ -1,53 +1,49 @@
-__pycache__
-build_debug/
-build_release/
-CMakeFiles
-_deps
-build/
-cmake_install.cmake
+# Builds
+/build*/
+_deps/
+CMakeFiles/
 CMakeCache.txt
-Makefile
-*.log
-_deps
-CMakeFiles
-CMakeCache.txt
-*.egg-info
 cmake_install.cmake
 Makefile
 !docs/Makefile
-.DS_Store
-wheelhouse
-package-lock.json
+CMakeUserPresets.json
+/compile_commands.json
+*.log
 
-# Prerequisites
+# Objects and binaries
 *.d
-
-# Compiled Object files
-*.slo
-*.lo
 *.o
 *.obj
-
-# Precompiled Headers
+*.slo
+*.lo
 *.gch
 *.pch
-
-# Compiled Dynamic libraries
 *.so
 *.dylib
 *.dll
-
-# Fortran module files
-*.mod
-*.smod
-
-# Compiled Static libraries
-*.lai
-*.la
 *.a
+*.la
+*.lai
 *.lib
-
-# Executables
 *.exe
 *.out
 *.app
+
+# Python
+__pycache__/
+*.egg-info
+dist/
+wheelhouse/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# JavaScript
+node_modules/
+package-lock.json
+
+# Editors, assistants and language servers
+.DS_Store
+.cache/
+.claude/

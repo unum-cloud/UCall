@@ -15,7 +15,7 @@ To use it with the CMake build system:
 include(FetchContent)
 FetchContent_Declare(
     ucall
-    GIT_REPOSITORY https://github.com/unum-cloud/ucall
+    GIT_REPOSITORY https://github.com/unum-cloud/UCall
     GIT_SHALLOW TRUE
 )
 FetchContent_MakeAvailable(ucall)

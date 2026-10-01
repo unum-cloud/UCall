@@ -5,8 +5,9 @@ project(
   LANGUAGES C CXX
   DESCRIPTION
   "Up to 100x Faster FastAPI. JSON-RPC with io_uring, SIMD-acceleration, and pure CPython bindings"
-  HOMEPAGE_URL "https://github.com/unum-cloud/ucall")
+  HOMEPAGE_URL "https://github.com/unum-cloud/UCall")
 
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 set(CMAKE_C_STANDARD 99)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)

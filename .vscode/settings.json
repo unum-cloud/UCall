@@ -1,4 +1,28 @@
 {
+  "[c]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true,
+    "editor.rulers": [120]
+  },
+  "[cpp]": {
+    "editor.defaultFormatter": "llvm-vs-code-extensions.vscode-clangd",
+    "editor.formatOnSave": true,
+    "editor.rulers": [120]
+  },
+  "[markdown]": {
+    "editor.defaultFormatter": "yzhang.markdown-all-in-one",
+    "editor.formatOnSave": false,
+    "editor.rulers": [120]
+  },
+  "[python]": {
+    "editor.defaultFormatter": "charliermarsh.ruff",
+    "editor.formatOnSave": true,
+    "editor.rulers": [120]
+  },
+  "clangd.arguments": [
+    "--background-index",
+    "--header-insertion=never"
+  ],
   "cSpell.words": [
     "Armv",
     "ashvardanian",
@@ -38,6 +62,8 @@
     "WHATWG"
   ],
   "files.associations": {
+    "*.inc": "cpp",
+    "*.tcc": "cpp",
     "__bit_reference": "cpp",
     "__bits": "cpp",
     "__config": "cpp",
@@ -54,8 +80,6 @@
     "__tree": "cpp",
     "__tuple": "cpp",
     "__verbose_abort": "cpp",
-    "*.inc": "cpp",
-    "*.tcc": "cpp",
     "algorithm": "cpp",
     "any": "cpp",
     "array": "cpp",
