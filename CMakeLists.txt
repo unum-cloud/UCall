@@ -1,7 +1,7 @@
 cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
 project(
   ucall
-  VERSION 0.5.5
+  VERSION 1.0.0
   LANGUAGES C CXX
   DESCRIPTION
   "Up to 100x Faster FastAPI. JSON-RPC with io_uring, SIMD-acceleration, and pure CPython bindings"

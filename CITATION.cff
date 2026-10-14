@@ -5,7 +5,7 @@ authors:
   given-names: "Ash"
   orcid: "https://orcid.org/0000-0002-4882-1815"
 title: "UCall by Unum Cloud"
-version: 0.5.0
+version: 1.0.0-rc.1
 doi: 10.5281/zenodo.7951497
 date-released: 2023-01-03
 url: "https://github.com/unum-cloud/UCall"
