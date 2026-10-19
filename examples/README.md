@@ -1,145 +1,26 @@
 # UCall Examples
 
-There are several obvious and more fun `./examples/`:
+The native examples use the public C ABI and run with any compiled transport backend.
+They bind loopback and accept `--backend`, `--cpu-class`, `--threads`, and `--port`.
+The backend defaults to automatic, the CPU class to serial, and the application polling thread count to one; the port defaults to 8545.
 
-- Trivial `echo` servers and clients
-- Redis-like in-memory key-value store for `set` and `get` operations
-- Coordination center for an emulated drone fleet using WebSockets
-- Matrix-Multiplication as a Service (MMaaS) with authentication & rate limits
+| Example                             | Individual endpoints                                | Batched endpoint                      |
+| :---------------------------------- | :-------------------------------------------------- | :------------------------------------ |
+| [Echo](echo/server.cpp)             | `POST /echo`, `GET /health`                         | `POST /echo/batch`                    |
+| [Key-value store](redis/server.cpp) | `GET`, `PUT`, `DELETE /kv/{key}`                    | The same methods at `/batch/kv/{key}` |
+| [Ledger](ledger/server.cpp)         | `GET /accounts/{id}`, `POST /transfers/{from}/{to}` | `POST /batch/transfers/{from}/{to}`   |
 
-There are also several specialized attacks:
+Each batch callback receives a borrowed array of request handles and its count, and reuses the individual handler for each request.
+These routes coalesce requests ready on one polling loop without waiting for a minimum group size.
+Each request keeps its own response; ledger transfers and key-value operations keep their individual transaction boundaries.
 
-- Slowloris-like DoS attack using many half-open connections
+Build with `UCALL_BUILD_EXAMPLES=ON` and select `ucall_example_echo`, `ucall_example_redis`, or `ucall_example_ledger`.
+Each executable selects among the backends compiled into the single UCall library.
+`--connections` supplies the admission budget, and `--threads` selects the application-owned polling loops.
+The application dispatches those loops through its ForkUnion pool; UCall creates no threads.
+Callbacks run on the polling caller, and the examples stop and join their polling threads on SIGINT or SIGTERM.
+The [benchmark driver](../bench/README.md) measures the same raw HTTP echo workload across backends.
 
----
-
-This folder implements a group of different servers with identical functionality, but using different RPC frameworks, including:
-
-- FastAPI server in Python, compatible with WSGI: `fastapi_server.py`
-- UCall server in Python: `ucall_server.py`
-- UCall server in C++: `ucall_server.cpp`
-- gRPC server in Python: `grpc_server.py`
-
-All of them implement identical endpoints:
-
-- `echo` - return back the payload it received for throughput benchmarks
-- `validate_session` - lightweight operation on two integers, returning a boolean, to benchmark the request latency on tiny tasks
-- `create_user` - more complex operation on flat dictionary input with strings and integers
-- `validate_user_identity` - that validates arguments, raises exceptions, and returns complex nested objects
-- `set` & `get` - key-value store operations, similar to Redis
-- `resize` - batch-capable image processing operation for Base64-encoded images
-- `dot_product` - batch-capable matrix vector-vector multiplication operation
-
-## Reproducing Benchmarks
-
-```sh
-cd examples
-```
-
-### Debugging FastAPI
-
-To start the server:
-
-```sh
-uvicorn fastapi_server:app --port 8000 --reload
-```
-
-To run the client tests using HTTPX:
-
-```sh
-pytest fastapi_client.py -s -x
-pytest fastapi_client.py -s -x -k set_get # for a single test
-```
-
-To run HTTPX stress tests and benchmarks:
-
-```sh
-
-```
-
-### FastAPI
-
-```sh
-pip install uvicorn fastapi websocket-client requests tqdm fire
-
-# To start the server in the background
-uvicorn fastapi_server:app --log-level critical --port 8000 &
-
-# To check if it works as expected
-pytest fastapi_client.py
-
-python bench/http.py "fastapi_client.ClientREST" --progress
-python bench/http.py "fastapi_client.ClientWebSocket" --progress
-kill %%
-```
-
-Want to dispatch more clients and aggregate statistics?
-
-```sh
-python bench/http.py "fastapi_client.ClientREST" --threads 8
-python bench/http.py "fastapi_client.ClientWebSocket" --threads 8
-```
-
-### UCall
-
-UCall can produce both a POSIX compliant old-school server, and a modern `io_uring`-based version for Linux kernel 5.19 and newer.
-You would either run `ucall_example_server_posix` or `ucall_example_server_uring`.
-UCall supports four URL schemes: `http://`, `ws://`, `http+noise://`, and `ws+noise://`.
-
-```sh
-sudo apt-get install cmake g++ build-essential
-cmake -DCMAKE_BUILD_TYPE=Release -B build_release
-cmake --build build_release --config Release
-build_release/build/bin/ucall_example_server_posix &
-build_release/build/bin/ucall_example_server_uring &
-python bench/http.py "jsonrpc_client.CaseTCP" --progress
-python bench/http.py "jsonrpc_client.CaseHTTP" --progress
-python bench/http.py "jsonrpc_client.CaseHTTPBatches" --progress
-kill %%
-```
-
-Want to customize server settings?
-
-```sh
-build_release/build/bin/ucall_example_server_uring --nic=127.0.0.1 --port=8545 --threads=16 --silent=false
-```
-
-Want to dispatch more clients and aggregate more accurate statistics?
-
-```sh
-python bench/http.py "jsonrpc_client.CaseTCP" --threads 32 --seconds 100
-python bench/http.py "jsonrpc_client.CaseHTTP" --threads 32 --seconds 100
-python bench/http.py "jsonrpc_client.CaseHTTPBatches" --threads 32 --seconds 100
-```
-
-A lot has been said about the speed of Python code ~~or the lack of~~.
-To get more accurate numbers for mean request latency, you can use wrk for html requests
-
-```sh
-wrk -t1 -c32 -d2s http://localhost:8545/ -s json.lua
-wrk -t1 -c32 -d2s http://localhost:8545/ -s json16.lua
-```
-
-Or the GoLang version for jsonRPC requests:
-
-```sh
-go run ./examples/login/jsonrpc_client.go -h
-go run ./examples/login/jsonrpc_client.go -b 100
-```
-
-Or push it even further dispatching dozens of processes with GNU `parallel` utility:
-
-```sh
-sudo apt install parallel
-parallel go run ./examples/login/jsonrpc_client.go run ::: {1..32}
-```
-
-### gRPC Results
-
-```sh
-pip install grpcio grpcio-tools
-python ./examples/login/grpc_server.py &
-python bench/http.py "grpc_client.ValidateClient" --progress
-python bench/http.py "grpc_client.ValidateClient" --threads 32
-kill %%
-```
+[fastapi_server.py](fastapi_server.py) exposes the same echo and health routes for a Python comparison.
+Run it with `uvicorn examples.fastapi_server:app --host 127.0.0.1 --port 8545`.
+[fastapi_client.py](fastapi_client.py) checks either server with `python examples/fastapi_client.py`.

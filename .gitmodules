@@ -2,3 +2,11 @@
 	path = stringzilla
 	url = https://github.com/ashvardanian/StringZilla
 	branch = main-v6
+[submodule "forkunion"]
+	path = forkunion
+	url = https://github.com/ashvardanian/ForkUnion
+	branch = main-v4
+[submodule "smashtable"]
+	path = smashtable
+	url = https://github.com/ashvardanian/SmashTable
+	branch = main-v1

@@ -1,24 +1,24 @@
 <h1 align="center">UCall</h1>
 <h3 align="center">
-Simple Secure Web Client and Server Framework<br/>
-Up to 70x Higher Throughput and 50x Lower Latency than FastAPI and gRPC<br/>
+  Simple Secure Web Client and Server Framework<br />
+  Up to 70x Higher Throughput and 50x Lower Latency than FastAPI and gRPC<br />
 </h3>
-<br/>
+<br />
 
 > The web's encryption layer was designed in 1995.
 > gRPC and FastAPI just keep making the problems worse.
 > UCall is what networking looks like when you start fresh with Noise, io_uring, and SIMD — 50x faster, 10x simpler, actually auditable.
 
 <p align="center">
-<a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
-&nbsp;&nbsp;&nbsp;
-<a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
-&nbsp;&nbsp;&nbsp;
-<a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
-&nbsp;&nbsp;&nbsp;
-<a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
-&nbsp;&nbsp;&nbsp;
-<a href="https://github.com/unum-cloud/UCall"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
+  <a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
+  &nbsp;&nbsp;&nbsp;
+  <a href="https://github.com/unum-cloud/UCall"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
 </p>
 
 ---
@@ -95,38 +95,9 @@ server.run()
 
 ## 📈 Performance Metrics
 
-It takes over a millisecond (1,203 μs) to handle a trivial FastAPI call on a recent 8-core CPU.
-In that time, light could have traveled 300 km through optics to the neighboring city or country.
-How does UCall compare to FastAPI and gRPC?
-
-| Setup                   |   🔁   | Server | Protocol | Latency w 1 client | Throughput w 32 clients |
-| :---------------------- | :---: | :----: | :------: | -----------------: | ----------------------: |
-| Fast API over REST      |   ❌   |   🐍    |   REST   |           1'203 μs |               3'184 rps |
-| Fast API over WebSocket |   ✅   |   🐍    |   REST   |              86 μs |            11'356 rps ¹ |
-| gRPC ²                  |   ✅   |   🐍    |   gRPC   |             164 μs |               9'849 rps |
-|                         |       |        |          |                    |                         |
-| UCall with POSIX        |   ✅   |   C    |   HTTP   |              62 μs |              79'000 rps |
-| UCall with io_uring     |   ✅   |   🐍    |   HTTP   |              40 μs |             210'000 rps |
-| UCall with io_uring     |   ✅   |   C    |   HTTP   |              22 μs |             231'000 rps |
-
-<details>
-  <summary>Table legend</summary>
-
-All benchmarks were conducted on AWS on general purpose instances with __Ubuntu 22.10 AMI__.
-It is the first major AMI to come with __Linux Kernel 5.19__, featuring much wider `io_uring` support for networking operations.
-These specific numbers were obtained on `c7g.metal` beefy instances with Graviton 3 chips.
-
-- The 🔁 column marks, if the TCP/IP connection is being reused during subsequent requests.
-- The "server" column defines the programming language in which the server was implemented.
-- The "latency" column reports the amount of time between sending a request and receiving a response. μ (Greek letter mu) represents the prefix 'micro', so μs means microseconds.
-- The "throughput" column reports the number of Requests Per Second when querying the same server application from multiple client processes running on the same machine.
-
-> ¹ FastAPI couldn't process concurrent requests with WebSockets.
-
-> ² We tried generating C++ backends with gRPC, but its numbers, suspiciously, weren't better.
-> There is also an async gRPC option, that wasn't tried.
-
-</details>
+The native [benchmark driver](bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, and latency percentiles.
+Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
+The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, and streaming sections describe planned interfaces.
 
 ## Design Principles
 
@@ -142,19 +113,24 @@ No `async`/`await` keywords or `future`/`promise` handles.
 For lightweight operations it's optimal - no additional bookkeeping overhead.
 For heavy operations, there is no secret pill, but there is a common "latency hiding" trick - batching.
 
-You can declare an endpoint as batchable, and UCall will accumulate requests for a short time window and deliver them to your function as a batch.
-This is especially useful for GPU-backed AI inference endpoints, where the batch processing is much more efficient than single-item processing.
-Another common use case is OLAP-style database queries or search queries, where multiple queries can be grouped and executed together.
+Batch endpoints group independent requests by their configured size and latency budgets.
+Endpoint and batch callbacks run synchronously on the application polling caller; a deadline cannot preempt a callback.
 
-> If you are triggering many async operations inside your batchable endpoint, UCall provides additional performance optimizing APIs to allow recursively calling `ucall_server_take_calls()` inside your endpoint handler to process pending requests while waiting for IO or other async operations to complete.
+### Caller-Owned Polling
 
-### Clients Make One Call at a Time
+Select the backend and CPU class in the server or client configuration.
+The polling threads must support the selected CPU class; `serial` is a conservative choice when their capabilities differ from the initialization thread's.
+UCall creates no threads.
 
-The same principle governs the client side.
-`ucall_client_call()` blocks until the response arrives, and concurrency comes from running more threads rather than from futures, promises, or an event loop.
-When calling out to another service from _inside_ an endpoint, re-enter `ucall_server_take_calls()` to keep serving other requests while you wait.
+Register server routes before polling.
+`ucall_server_take_call()` advances one loop with a bounded wait; a zero timeout performs one nonblocking progress round.
+`ucall_server_take_calls()` drives that loop continuously until shutdown.
+Each loop has one application owner, and `ucall_server_stop()` can wake it from another thread.
 
-An asynchronous client may follow if the synchronous one proves insufficient, but it is not planned today.
+`ucall_client_call()` submits an exchange and returns its acceptance result.
+Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
+Initialize, submit, poll, and free a client on the same owner thread.
+After retrieval, the caller owns each response until `ucall_received_http_response_free()`.
 
 ### Encryption: From TLS to Noise
 
@@ -197,21 +173,21 @@ Why not one of the three ChaCha20-Poly1305 suites?
 Because UCall targets modern silicon, where AES is not a software algorithm at all:
 
 - __Both halves of the AEAD are single instructions.__
-`AES-NI` and `PCLMULQDQ` on x86 since 2010, `AESE`/`AESMC` and `PMULL` on every server Arm — Neoverse, Graviton, Ampere, Apple Silicon.
-ChaCha20 and Poly1305 have no such path and must be assembled from general-purpose SIMD.
+  `AES-NI` and `PCLMULQDQ` on x86 since 2010, `AESE`/`AESMC` and `PMULL` on every server Arm — Neoverse, Graviton, Ampere, Apple Silicon.
+  ChaCha20 and Poly1305 have no such path and must be assembled from general-purpose SIMD.
 - __The gap widens every generation.__
-ChaCha20 scales only with vector width, which is already saturated.
-AES gained `VAES` on Ice Lake and Zen 3, encrypting four blocks per instruction, and vendors keep widening that path.
+  ChaCha20 scales only with vector width, which is already saturated.
+  AES gained `VAES` on Ice Lake and Zen 3, encrypting four blocks per instruction, and vendors keep widening that path.
 - __It is the only AEAD anyone offloads.__
-NIC inline crypto, IPsec engines, Intel QAT, and DPUs all implement AES-GCM; none implement ChaCha20-Poly1305.
-That is the only realistic route to eventually combining encryption with the zero-copy paths described below.
+  NIC inline crypto, IPsec engines, Intel QAT, and DPUs all implement AES-GCM; none implement ChaCha20-Poly1305.
+  That is the only realistic route to eventually combining encryption with the zero-copy paths described below.
 - __Constant-time by construction.__
-The hardware instructions perform no data-dependent table lookups, so the cache-timing attacks that plague table-driven software AES simply do not apply.
+  The hardware instructions perform no data-dependent table lookups, so the cache-timing attacks that plague table-driven software AES simply do not apply.
 - __It is the only NIST-shaped suite of the four.__
-AES-256-GCM, SHA-256, and X25519 are all NIST-approved; ChaCha20-Poly1305 and BLAKE2s are not.
-That is a hard gate in regulated deployments, not a preference.
+  AES-256-GCM, SHA-256, and X25519 are all NIST-approved; ChaCha20-Poly1305 and BLAKE2s are not.
+  That is a hard gate in regulated deployments, not a preference.
 - __Both primitives ship in [`stringzilla`][stringzilla].__
-AES-256-GCM and SHA-256 dispatch across x86 `AES-NI`, `VAES`, and `SHA-NI`, ARMv8 `AES` and `SHA2`, and RISC-V `Zvknh`.
+  AES-256-GCM and SHA-256 dispatch across x86 `AES-NI`, `VAES`, and `SHA-NI`, ARMv8 `AES` and `SHA2`, and RISC-V `Zvknh`.
 
 WireGuard, WhatsApp, and the Lightning Network all chose ChaCha20-Poly1305 because they run on phones where AES instructions are not guaranteed.
 UCall runs in datacenters, so the tradeoff inverts.
@@ -313,24 +289,16 @@ It's what zero-trust networking looks like when you start from first principles.
 
 ### Engineered for Performance
 
-UCall is pedantically designed from the ground up for high performance and so is its every dependency.
-On the IO side, even on Linux, even just for `io_uring`, UCall ships different logic for different Linux kernel versions, as different features were added over time:
+The shared connection automata consume completions and emit I/O requests for POSIX, epoll, Linux io_uring 6.12 or 7.0, kqueue, and IOCP.
+HTTP framing, routing, and Noise stay in templated headers under `include/ucall/`.
+One library exposes the C ABI once; server and client configuration select the backend and a compiled CPU class.
+Per-CPU instantiation units specialize every enabled native engine, while ordinary C calls use their handle's fixed operation table.
 
-- `io_uring_prep_read_fixed` since kernel v5.1
-- `io_uring_prep_accept_direct` since kernel v5.19
-- `io_uring_register_files_sparse` since kernel v5.19
-- `IORING_SETUP_COOP_TASKRUN` optional since kernel v5.19
-- `IORING_SETUP_SINGLE_ISSUER` optional since kernel v6.0
+The implementation uses:
 
-Equally important, all of the packet encryption, decryption, serialization, and deserialization steps are powered by high-performance SIMD-accelerated libraries.
-All of them come with "dynamic dispatch" logic to pick the best available CPU instructions at runtime, so that UCall can run blazingly fast on both old and new hardware.
-Namely, UCall uses:
-
-- [`stringzilla`][stringzilla] for string manipulations, and for the AES-256-GCM and SHA-256 primitives behind Noise.
-- [`simdjson`][simdjson] to parse JSON text faster than gRPC can load a binary `ProtoBuf`.
-- [`simdutf`][simdutf] for fast UTF-8 validation and conversion.
-- [`turbo-base64`][turbobase64] to decode binary values from Base64 form.
-- [`ada`][ada] to parse URI endpoints.
+- [StringZilla](https://github.com/ashvardanian/StringZilla) for SIMD searches, header normalization, SHA-256, and AES-256-GCM.
+- [ForkUnion](https://github.com/ashvardanian/ForkUnion) for capability checks and extended atomic references.
+- [SmashTable](https://github.com/ashvardanian/SmashTable) for fallible containers and the examples' strictly serializable transactions.
 
 There is no OpenSSL, no libsodium, and no third-party Noise implementation.
 The only vendored cryptographic code is a single-file Curve25519, which is the one primitive that has no place in a string library.
@@ -344,7 +312,7 @@ The only vendored cryptographic code is a single-file Curve25519, which is the o
 ### Protocol Flexibility: REST and JSON-RPC
 
 UCall supports flexible parameter extraction for both REST-style APIs and JSON-RPC requests.
-You can configure how  and where each parameter is extracted from:
+You can configure how and where each parameter is extracted from:
 
 - __Path Parameters__: Extract from URL pattern, e.g., `/users/{user_id}/posts/{post_id}`
 - __Query Parameters__: Extract from query string, e.g., `/search?q=rust&limit=10`
@@ -482,7 +450,6 @@ Often small, frequent messages, should be handled differently.
 
 We also provide callback handlers for WebSocket connections that let you handle messages as they arrive.
 But you are not required or expected to form a response for each message inside the callback.
-
 
 ### Observability & Metrics
 

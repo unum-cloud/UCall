@@ -2,29 +2,7 @@
  *  @file c/ucall/types.h
  *  @author Ash Vardanian
  *  @date Feb 3, 2023
- *  @brief Shared handles, counted byte views, statuses, and deferred outcomes.
- *
- *  Every verb that can fail takes one argument struct named after it, as @c ucall_client_call()
- *  takes @c ucall_client_call_t, and returns nothing. Each struct opens with its handle, then @c
- *  outcome, then inputs, outputs, and knobs. Initialize them with designated initializers, so
- *  fields added later stay zero. Getters that cannot fail and @c *_free() stay positional.
- *
- *  Synchronous and asynchronous calls share one shape. A client call carries a @c
- *  ucall_completion_t: zero blocks until the response arrives, and @c ucall_completion_deferred_k
- *  returns once the call is queued, so no verb has an asynchronous twin. The outcome's status is
- *  the one word both sides synchronize on:
- *
- *  - For a deferred call the library stores @c ucall_status_deferred_k, then the message and the
- *    final status with release ordering, even for a call refused at submission, and touches nothing
- *    the struct names after that store.
- *  - The caller reads through @c ucall_outcome_status or @c ucall_outcome_wait, and may reuse the
- *    struct or free its buffers only once the status is final.
- *  - A client tracks a fixed number of deferred calls in flight, and a submission that finds the
- *    table full finishes at once with @c ucall_status_contended_k instead of queueing.
- *
- *  Server verbs called from an endpoint callback finish before they return. Received bytes live in
- *  memory the library owns, a server's receive pool or a client's response, so no allocator,
- *  alignment or memory kind crosses this interface.
+ *  @brief Shared handles, counted byte views, statuses, and outcomes.
  */
 
 #ifndef UNUM_UCALL_TYPES_H
@@ -54,22 +32,56 @@ extern "C" {
 #endif // Windows import or export
 #endif // !defined(UCALL_EXPORT)
 
+/** One byte of raw storage shared by views and cryptographic keys. */
+typedef uint8_t ucall_byte_t;
+
 /** A borrowed run of bytes; text is bytes that happen to decode.
  *
  *  Empty is {NULL, 0}. Length never requests a null-terminator lookup. */
 typedef struct ucall_bytes_view_t {
 
     /** First byte of the run. */
-    uint8_t const* data;
+    ucall_byte_t const* data;
 
     /** Bytes the run spans, with no terminator assumed or written. */
     size_t length;
 
 } ucall_bytes_view_t;
 
+/** A concrete I/O implementation; automatic chooses an available native implementation. */
+typedef enum ucall_io_backend_t {
+    ucall_io_backend_automatic_k = 0,
+    ucall_io_backend_posix_k,
+    ucall_io_backend_linux_epoll_k,
+    ucall_io_backend_linux_uring612_k,
+    ucall_io_backend_linux_uring700_k,
+    ucall_io_backend_macos_kqueue_k,
+    ucall_io_backend_windows_iocp_k
+} ucall_io_backend_t;
+
+/** A CPU kernel bundle, named with the same native classes as the sibling libraries. */
+typedef enum ucall_cpu_class_t {
+    ucall_cpu_class_unknown_k = 0,
+    ucall_cpu_class_serial_k,
+    ucall_cpu_class_intel_haswell_k,
+    ucall_cpu_class_intel_skylake_k,
+    ucall_cpu_class_intel_icelake_k,
+    ucall_cpu_class_intel_alder_k,
+    ucall_cpu_class_intel_sierra_k,
+    ucall_cpu_class_aws_g2_k,
+    ucall_cpu_class_apple_m2_k,
+    ucall_cpu_class_aws_g5_k
+} ucall_cpu_class_t;
+
+/** Returns the stable name of an I/O backend. */
+UCALL_EXPORT char const* ucall_io_backend_name(ucall_io_backend_t backend);
+
+/** Returns the stable name of a CPU kernel class. */
+UCALL_EXPORT char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class);
+
 /**
  *  @brief Opaque server handle.
- *  @sa Deals with @c ucall_received_http_request_t and @c ucall_received_batch_http_request_t.
+ *  @sa Deals with @c ucall_received_http_request_t, individually or in counted arrays.
  *  @sa Use with @c ucall_server_init() and @c ucall_server_free() for lifetime.
  *  @sa Use @c ucall_server_add_http_endpoint() and @c ucall_server_take_calls() for logic.
  */
@@ -85,15 +97,12 @@ typedef struct ucall_server_handle_t* ucall_server_t;
  *
  *  - Establishing connections to one or more servers, reusing encryption keys between requests.
  *  - Following redirects chains automatically, unless disabled.
- *  - Driving every submitted call on a connection thread it owns.
+ *  - Driving accepted calls when the application polls for completions.
  */
 typedef struct ucall_client_handle_t* ucall_client_t;
 
 /** Opaque handle for a single Remote Procedure Call on the @b server side. */
 typedef struct ucall_received_http_request_handle_t* ucall_received_http_request_t;
-
-/** Opaque handle for several batched Remote Procedure Calls on the @b server side. */
-typedef struct ucall_received_batch_http_request_handle_t* ucall_received_batch_http_request_t;
 
 /** Opaque handle for a single Remote Procedure Call reply on the @b client side. */
 typedef struct ucall_received_http_response_handle_t* ucall_received_http_response_t;
@@ -125,7 +134,7 @@ typedef enum ucall_security_mode_t {
 } ucall_security_mode_t;
 
 /** Noise protocol key (32 bytes for Curve25519). */
-typedef uint8_t ucall_noise_key_t[32];
+typedef ucall_byte_t ucall_noise_key_t[32];
 
 /**
  *  @brief Decides whether a peer presenting a given static key may proceed past the handshake.
@@ -175,7 +184,8 @@ typedef enum ucall_verb_t {
  *
  *  These codes represent library/transport-level outcomes. For HTTP-specific status codes (200,
  *  404, 500), use @c ucall_http_status_t. */
-typedef enum ucall_status_t {
+typedef uint32_t ucall_status_t;
+enum {
 
     /** The call succeeded; the outcome message is NULL. */
     ucall_status_success_k = 0,
@@ -195,7 +205,7 @@ typedef enum ucall_status_t {
     /** The engine violated its contract, which points at a defect. */
     ucall_status_internal_k = 10,
 
-    /** A hard design ceiling was reached. */
+    /** The requested size exceeds the representable range. */
     ucall_status_overflow_k = 11,
 
     /** The call needs a handle that was never initialized. */
@@ -234,7 +244,7 @@ typedef enum ucall_status_t {
     /** A nonblocking poll had no progress to report. */
     ucall_status_would_block_k = 25,
 
-} ucall_status_t;
+};
 
 /** Outcome of one call: a status to branch on, and a static message with the detail it cannot
  *  carry.
@@ -276,22 +286,12 @@ UCALL_EXPORT ucall_status_t ucall_outcome_wait(ucall_outcome_t* outcome);
  */
 UCALL_EXPORT ucall_status_t ucall_outcome_status(ucall_outcome_t* outcome);
 
-/** Whether a call returns once its work is done, or once it is queued on the client. */
-typedef enum ucall_completion_t {
-
-    /** Return with the final status stored and the response readable; the default. */
-    ucall_completion_blocking_k = 0,
-
-    /** Return once queued, with the status pending until the call ends; the caller waits or
-     *  polls. */
-    ucall_completion_deferred_k = 1,
-} ucall_completion_t;
-
 /** HTTP status codes for server responses and client results.
  *
- *  Use these when you need HTTP-specific semantics (400, 404, 500, etc.). For library-level
- *  operations, use @c ucall_status_t instead. */
-typedef enum ucall_http_status_t {
+ *  Numeric codes also represent responses absent from the named constants below.
+ *  For library outcomes, use @c ucall_status_t instead. */
+typedef uint32_t ucall_http_status_t;
+enum {
 
     /** Request succeeded. */
     ucall_http_status_ok_k = 200,
@@ -335,7 +335,10 @@ typedef enum ucall_http_status_t {
     /** Request conflicts with current resource state. */
     ucall_http_status_conflict_k = 409,
 
-    /** Request body exceeds the configured limit. */
+    /** A request condition does not match the current resource. */
+    ucall_http_status_precondition_failed_k = 412,
+
+    /** Request body is too large. */
     ucall_http_status_payload_too_large_k = 413,
 
     /** Rate limit exceeded. */
@@ -352,7 +355,7 @@ typedef enum ucall_http_status_t {
 
     /** Upstream dependency timed out. */
     ucall_http_status_gateway_timeout_k = 504,
-} ucall_http_status_t;
+};
 
 /** Severity of a log line, from the most verbose up. */
 typedef enum ucall_log_level_t {
@@ -379,8 +382,8 @@ typedef enum ucall_log_format_t {
  *  @param[in] line The formatted line. Valid only for the duration of the call.
  *  @param[in] context User-supplied context from @c ucall_log_t.
  *
- *  Called on whichever thread produced the line, including event loops and the client's connection
- *  thread, so it must be thread-safe and return quickly.
+ *  Called on whichever thread produced the line, including application polling threads.
+ *  The callback must be thread-safe and return quickly.
  */
 typedef void (*ucall_log_callback_t)(ucall_log_level_t level, ucall_bytes_view_t line, void* context);
 

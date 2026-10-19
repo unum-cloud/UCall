@@ -1,5 +1,4 @@
-========================
 Benchmarks
-========================
+==========
 
-.. mdinclude:: ../examples/login/README.md
+.. mdinclude:: ../bench/README.md

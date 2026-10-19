@@ -19,7 +19,7 @@ extern "C" {
  */
 typedef struct ucall_client_config_t {
 
-    /** Maximum simultaneously open connections. Default: 100. */
+    /** Required positive budget for simultaneously open connections. */
     size_t max_concurrent_connections;
 
     /** Time budget for establishing a connection. Default: 5'000'000. */
@@ -40,8 +40,15 @@ typedef struct ucall_client_config_t {
     /** Where log lines go. Default: nowhere. */
     ucall_log_t log;
 
-    /** Depth of the submission queue backing the client. Default: 128. */
-    size_t queue_depth;
+    /** Accepted calls, including unretrieved completions; zero uses the connection budget. */
+    size_t max_concurrent_calls;
+
+    /** Requested I/O backend; automatic chooses an available native backend. */
+    ucall_io_backend_t backend;
+
+    /** Requested CPU class; unknown selects from the initialization thread's capabilities.
+     *  Polling threads must support the selected class. Serial is the conservative choice. */
+    ucall_cpu_class_t cpu_class;
 
 } ucall_client_config_t;
 
@@ -51,7 +58,7 @@ typedef struct ucall_client_init_t {
     /** Output for the new client. Free with @c ucall_client_free() at the end. */
     ucall_client_t* client;
 
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    /** Synchronous initialization result. */
     ucall_outcome_t* outcome;
 
     /** Requested configuration. Zeroed fields take their documented defaults. */
@@ -60,16 +67,11 @@ typedef struct ucall_client_init_t {
     /** Optional output for @c config with every default filled in. */
     ucall_client_config_t* resolved;
 
-    /** Slots of the fixed in-flight table, one per deferred call not yet final. A deferred call
-     *  finding it full stores @c ucall_status_contended_k as its final status. Zero means a
-     *  default. */
-    size_t deferred_limit;
-
 } ucall_client_init_t;
 
 /**
  *  @brief Initializes the client state.
- *  @note Call during setup only, before any thread enters @c ucall_client_call().
+ *  @note Initialize, submit, poll, and free the client on the same owner thread.
  */
 UCALL_EXPORT void ucall_client_init(ucall_client_init_t* arguments);
 
@@ -77,8 +79,8 @@ UCALL_EXPORT void ucall_client_init(ucall_client_init_t* arguments);
  *  @brief Frees the client state. Does nothing for @c NULL.
  *  @param[in] client Client from @c ucall_client_init(), or @c NULL.
  *
- *  @note Call during setup only, before any thread enters @c ucall_client_call(), and only once the
- *      outcome of every call submitted to it is final.
+ *  @note Cancels accepted calls and discards unretrieved completions. Retrieved responses remain
+ *      caller-owned. Do not submit or poll concurrently with teardown.
  */
 UCALL_EXPORT void ucall_client_free(ucall_client_t client);
 
@@ -88,10 +90,10 @@ UCALL_EXPORT void ucall_client_free(ucall_client_t client);
  *  headers of individual requests. */
 typedef struct ucall_request_options_t {
 
-    /** Time budget for this call. Default: 5'000'000. */
+    /** Time budget including queueing and redirects. Zero uses the client request timeout. */
     size_t timeout_microseconds;
 
-    /** Retries attempted on transport failure. Default: 3. */
+    /** Additional connection attempts before sending the request. Default: 3. */
     size_t max_retries;
 
     /** Redirect hops followed before failing. Default: 5. */
@@ -114,11 +116,8 @@ typedef struct ucall_client_call_t {
     /** The client this call operates on. */
     ucall_client_t client;
 
-    /** Output for the outcome, final once its status leaves @c ucall_status_deferred_k. */
+    /** Synchronous acceptance result. Success guarantees one completion; refusal produces none. */
     ucall_outcome_t* outcome;
-
-    /** Whether the call blocks or returns once queued; zero blocks. */
-    ucall_completion_t completion;
 
     /** Full URL, with an explicit byte length. */
     ucall_bytes_view_t url;
@@ -135,60 +134,69 @@ typedef struct ucall_client_call_t {
     /** Request body; an empty view sends no payload. */
     ucall_bytes_view_t body;
 
-    /** Output for the received response, which owns its headers and body. Free with @c
-     *  ucall_received_http_response_free() once done. */
-    ucall_received_http_response_t* response;
-
     /** Per-request timeouts, retries, redirects, and security. Zeroed fields take their
      *  defaults. */
     ucall_request_options_t options;
 
+    /** Caller cookie returned with the final completion. */
+    void* context;
+
 } ucall_client_call_t;
 
 /**
- *  @brief Makes a single HTTP call, blocking until the response arrives or returning once queued.
- *
- *  @note @b Thread-safe. A blocking call holds its calling thread; deferred calls let one thread
- *      keep any number in flight, each with its own outcome.
- *
- *  @par Blocking and Asynchronous Calls
- *
- *  A blocking call, the default, returns with @c response written and the final status in @c
- *  outcome. A deferred one, with @c completion set to @c ucall_completion_deferred_k, returns at
- *  once and the client's own connection thread drives the exchange: it writes @c response, then
- *  stores the final status in @c outcome. Until then @c outcome->status reads @c
- *  ucall_status_deferred_k, and the caller waits with @c ucall_outcome_wait() or polls with @c
- *  ucall_outcome_status().
- *
- *  A blocking call made inside a server endpoint holds its worker thread until the call finishes.
- *
- *  @par Headers
- *
- *  Some of the standard HTTP headers are automatically managed by UCall, such as:
- *  - @c Host: Set from the @c url field.
- *  - @c Content-Length: Set based on the @c body.length field.
- *  - @c User-Agent: Set to a default value identifying the UCall client.
- *
- *  Those shouldn't be included in the @c headers array. All header names will be normalized to
- *  lower-case before sending.
- *
- *  @par Redirects
- *
- *  HTTP redirects are a two-step protocol mechanism: the server responds with a 3xx status code and
- *  @c Location header, and the client automatically follows by making a new request.
- *
- *  Common redirect codes:
- *  - @b 301/308: Permanent redirects (domain changes, HTTPS migration). Client may cache.
- *  - @b 302/307: Temporary redirects (maintenance, A/B testing). Client shouldn't cache.
- *  - @b 303: After @c POST submission - redirect to result page via @c GET (prevents duplicate
- *    submissions).
- *  - @b 304: Not Modified - cached version is still fresh, saves bandwidth.
- *
- *  Redirect chains occur when multiple redirects happen in sequence, for example
- *      http://site.com → https://site.com → https://www.site.com. Chains longer than
- *  @c ucall_request_options_t::max_redirects fail with @c ucall_status_malformed_k.
+ *  @brief Submits one HTTP exchange without driving network progress.
+ *  @note Success guarantees exactly one record from @c ucall_client_take_completed(). Keep URL,
+ *      headers, body, and security-key inputs alive until that completion is retrieved. The
+ *      argument struct and acceptance outcome may be reused after submission returns.
+ *      One owner submits and polls this client; calls are not internally synchronized.
+ *  @note Host, Content-Length, and User-Agent are generated by the client. Do not supply them in
+ *      the header array. Redirects obey @c ucall_request_options_t::max_redirects.
  */
 UCALL_EXPORT void ucall_client_call(ucall_client_call_t* arguments);
+
+/** A final result for one accepted client call. */
+typedef struct ucall_completed_call_t {
+
+    /** Cookie supplied when the call was submitted. */
+    void* context;
+
+    /** Final network or protocol outcome, independent of the acceptance result. */
+    ucall_outcome_t outcome;
+
+    /** Received response, or NULL on failure. Free with @c ucall_received_http_response_free(). */
+    ucall_received_http_response_t response;
+
+} ucall_completed_call_t;
+
+/** Arguments of @c ucall_client_take_completed(). */
+typedef struct ucall_client_take_completed_t {
+
+    /** Client whose accepted calls to advance. */
+    ucall_client_t client;
+
+    /** Outcome of polling, independently of the completed calls' outcomes. */
+    ucall_outcome_t* outcome;
+
+    /** Caller-owned completion storage. */
+    ucall_completed_call_t* calls;
+
+    /** Entries available in @c calls; zero advances I/O without retrieving completions. */
+    size_t capacity;
+
+    /** Output for the number of retrieved entries. */
+    size_t* count;
+
+    /** Maximum wait for completions; zero performs one bounded nonblocking progress round. */
+    size_t timeout_microseconds;
+
+} ucall_client_take_completed_t;
+
+/**
+ *  @brief Drives client I/O and retrieves a batch of final call results on the calling thread.
+ *  @note Retrieving a completion returns its admission credit. Free its response after use.
+ *      Only one owner may submit or poll this client at a time.
+ */
+UCALL_EXPORT void ucall_client_take_completed(ucall_client_take_completed_t* arguments);
 
 /** Arguments of @c ucall_client_websocket_connect(). */
 typedef struct ucall_client_websocket_connect_t {
@@ -212,7 +220,7 @@ typedef struct ucall_client_websocket_connect_t {
 
 /**
  *  @brief Establishes a WebSocket connection and blocks until the handshake completes.
- *  @note @b Thread-safe.
+ *  @note Call on the client owner thread.
  */
 UCALL_EXPORT void ucall_client_websocket_connect(ucall_client_websocket_connect_t* arguments);
 
@@ -243,13 +251,21 @@ typedef struct ucall_client_websocket_receive_t {
 /**
  *  @brief Blocks until a message arrives on an established WebSocket connection.
  *
- *  @note @b Thread-safe against @c ucall_client_websocket_send() on the same @c websocket, so one
- *      thread may receive while another sends. Two threads must not receive concurrently.
+ *  @note Call on the client owner thread.
  *
  *  Unlike the server side, which dispatches to @c ucall_websocket_callback_t from within its own
  *  loop, the client receives on a loop the application owns.
  */
 UCALL_EXPORT void ucall_client_websocket_receive(ucall_client_websocket_receive_t* arguments);
+
+/**
+ *  @brief Returns the HTTP status of a received response.
+ *  @param[in] client Client that received the response.
+ *  @param[in] response Response from ucall_client_take_completed().
+ *  @return The peer's status code, or zero for a null response.
+ */
+UCALL_EXPORT ucall_http_status_t ucall_received_http_response_status(ucall_client_t client,
+                                                                     ucall_received_http_response_t response);
 
 /** Arguments of @c ucall_received_http_response_header(). */
 typedef struct ucall_received_http_response_header_t {
@@ -260,7 +276,7 @@ typedef struct ucall_received_http_response_header_t {
     /** Receives @c ucall_status_not_found_k if the response has no such header. */
     ucall_outcome_t* outcome;
 
-    /** The received response from @c ucall_client_call(). */
+    /** The received response from @c ucall_client_take_completed(). */
     ucall_received_http_response_t response;
 
     /** The name of the HTTP header to extract (case-insensitive). */
@@ -290,7 +306,7 @@ typedef struct ucall_received_http_response_body_t {
     /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
     ucall_outcome_t* outcome;
 
-    /** The received response from @c ucall_client_call(). */
+    /** The received response from @c ucall_client_take_completed(). */
     ucall_received_http_response_t response;
 
     /** Output for a borrowed view of the body. */
@@ -308,7 +324,7 @@ UCALL_EXPORT void ucall_received_http_response_body(ucall_received_http_response
 
 /**
  *  @brief Frees the received response handle. Does nothing for @c NULL.
- *  @param[in] response The received response from @c ucall_client_call(), or @c NULL.
+ *  @param[in] response The received response from @c ucall_client_take_completed(), or @c NULL.
  *
  *  @note @b Thread-safe across responses. Two threads must not operate on the @b same @p response
  *      concurrently.
@@ -337,7 +353,7 @@ typedef struct ucall_client_websocket_send_t {
 
 /**
  *  @brief Sends a message over an established WebSocket connection.
- *  @note @b Thread-safe.
+ *  @note Call on the client owner thread.
  */
 UCALL_EXPORT void ucall_client_websocket_send(ucall_client_websocket_send_t* arguments);
 
@@ -346,7 +362,7 @@ UCALL_EXPORT void ucall_client_websocket_send(ucall_client_websocket_send_t* arg
  *  @param[in] client Client handle from @c ucall_client_init().
  *  @param[in] websocket WebSocket connection handle to close.
  *
- *  @note @b Thread-safe.
+ *  @note Call on the client owner thread.
  */
 UCALL_EXPORT void ucall_client_websocket_close(ucall_client_t client, ucall_websocket_t websocket);
 

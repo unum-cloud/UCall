@@ -11,8 +11,8 @@
 
 #include <string_view> // `std::string_view`
 
-#include "routes.hpp"  // `route_trie_t`, `extract_path_component`
-#include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
+#include "ucall/routes.hpp" // `route_trie_t`, `extract_path_component`
+#include "harness.hpp"      // `verify`, `run_test`, `scale_iterations`
 
 using namespace unum::ucall;
 using namespace unum::ucall::test;
@@ -261,6 +261,15 @@ void test_routes_unit() {
         routes.must_not_match("/files//", ucall_verb_get_k);
     }
     {
+        routing_case_t routes("precedence_backtracks_from_a_dead_branch");
+        routes.must_add("/files/featured/details", ucall_verb_get_k, first);
+        routes.must_add("/files/{id}/content", ucall_verb_get_k, second);
+        routes.must_add("/files/{*path}", ucall_verb_get_k, third);
+        routes.must_match("/files/featured/details", ucall_verb_get_k, first);
+        routes.must_match("/files/featured/content", ucall_verb_get_k, second);
+        routes.must_match("/files/featured/other", ucall_verb_get_k, third);
+    }
+    {
         routing_case_t routes("precedence_ignores_insertion_order");
         routes.must_add("/items/{id}", ucall_verb_get_k, first);
         routes.must_add("/items/featured", ucall_verb_get_k, second);
@@ -305,12 +314,12 @@ void test_routes_safety() {
         routes.must_refuse("/users/{id}", ucall_verb_get_k, second);
     }
     {
-        // Accepting the last permitted depth and refusing the first forbidden one is what makes
-        // `routes.hpp`'s sixteen a ceiling rather than a guess.
-        routing_case_t routes("the_segment_ceiling_is_exact");
+        routing_case_t routes("path_depth_does_not_truncate_matching");
         routes.must_add("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p", ucall_verb_get_k, first);
+        routes.must_add("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", ucall_verb_get_k, second);
         routes.must_match("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p", ucall_verb_get_k, first);
-        routes.must_refuse("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", ucall_verb_get_k, second);
+        routes.must_match("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q", ucall_verb_get_k, second);
+        routes.must_not_match("/a/b/c/d/e/f/g/h/i/j/k/l/m/n/o/p/q/r", ucall_verb_get_k);
     }
     {
         // A thousand characters, inside RFC 9110's advisory limit and past any fixed segment

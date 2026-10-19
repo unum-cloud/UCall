@@ -1,0 +1,17 @@
+/**
+ *  @file bench/echo.proto
+ *  @author Ash Vardanian
+ *  @date October 19, 2026
+ *  @brief Binary echo workload shared by the Python gRPC adapter and independent load generators.
+ */
+syntax = "proto3";
+
+package ucall.bench;
+
+service Echo {
+    rpc Exchange(Payload) returns (Payload);
+}
+
+message Payload {
+    bytes data = 1;
+}

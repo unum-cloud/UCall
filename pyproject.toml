@@ -6,19 +6,6 @@ build-backend = "setuptools.build_meta"
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
 [dependency-groups]
 lint = ["ruff>=0.15.8", "clang-format==22.*", "cmakelang>=0.6"]
-# The `test/*.py` suites talk to a running example server through these clients.
-test = ["httpx", "numpy", "pillow", "pytest>=8", "requests"]
-
-[tool.pytest.ini_options]
-# `-p no:randomly` keeps `UCALL_SEED` in charge wherever pytest-randomly happens to be installed.
-addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config", "-p", "no:randomly"]
-filterwarnings = ["error"]
-minversion = "8.0"
-python_files = ["*.py"]
-testpaths = ["test"]
-pythonpath = ["test", "examples"]
-xfail_strict = true
-
 [tool.ruff]
 line-length = 120
 target-version = "py312"
@@ -35,7 +22,6 @@ quote-style = "double"
 "python/ucall/__init__.py" = ["F401", "E402"]
 ".cmake-format.py" = ["F821"]
 "cmake-format.py" = ["F821"]
-"examples/login/validate_session_pb2*.py" = ["ALL"]
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

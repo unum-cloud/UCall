@@ -28,6 +28,10 @@ jobs:
           python-version: "3.14"
       - name: Install formatters
         run: python -m pip install --group lint
+      - name: Check Markdown formatting
+        uses: dprint/check@v2
+        with:
+          dprint-version: "0.59.0"
       - name: Check the changed source
         env:
           CHANGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
@@ -49,22 +53,22 @@ jobs:
         include:
           - name: Linux GCC Debug
             os: ubuntu-26.04
-            preset: host_debug
+            preset: debug
             compilers: -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
             config: Debug
           - name: Linux Clang
             os: ubuntu-26.04
-            preset: host_relwithdebinfo
+            preset: relwithdebinfo
             compilers: -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
             config: RelWithDebInfo
           - name: macOS
             os: macos-15
-            preset: host_relwithdebinfo
+            preset: relwithdebinfo
             compilers: ""
             config: RelWithDebInfo
           - name: Windows
             os: windows-2025
-            preset: host_relwithdebinfo
+            preset: relwithdebinfo
             compilers: ""
             config: RelWithDebInfo
     defaults:
@@ -87,7 +91,7 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-15 g++-15 clang-22
       - name: Configure C and C++
-        run: cmake --preset ${{ matrix.preset }} ${{ matrix.compilers }}
+        run: cmake --preset ${{ matrix.preset }} ${{ matrix.compilers }} -DUCALL_BUILD_EXAMPLES=ON -DUCALL_BUILD_BENCH=ON
       - name: Build C and C++
         run: cmake --build --preset ${{ matrix.preset }} --config ${{ matrix.config }} --parallel 4
       - name: Test C and C++

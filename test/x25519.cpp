@@ -13,8 +13,8 @@
 #include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
-#include "crypto_x25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
-#include "harness.hpp"       // `verify`, `run_test`, `from_hex`
+#include "ucall/curve25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
+#include "harness.hpp"          // `verify`, `run_test`, `from_hex`
 
 using namespace unum::ucall;
 using namespace unum::ucall::test;
@@ -104,7 +104,7 @@ struct x25519_backend_t {
 
     /** Which tier must be runnable here, or @c none_k for one that always is. */
     x25519_tiers_t tier;
-    bool (*multiply)(std::uint8_t*, std::uint8_t const*, std::uint8_t const*) noexcept;
+    bool (*multiply)(byte_t*, byte_t const*, byte_t const*) noexcept;
 };
 
 /*  The dispatcher leads, so whatever it picks is checked against the tiers themselves, and the
@@ -113,10 +113,10 @@ struct x25519_backend_t {
 static x25519_backend_t const x25519_backends_k[] = {
     {"dispatched", x25519_tiers_t::none_k, &x25519_scalar_multiply},
     {"serial", x25519_tiers_t::serial_k, &x25519_scalar_multiply_serial},
-#if UCALL_USE_X25519_RADIX51
+#if UCALL_HAS_INT128_
     {"radix51", x25519_tiers_t::radix51_k, &x25519_scalar_multiply_radix51},
 #endif
-#if UCALL_USE_X25519_ADX
+#if UCALL_TARGET_X86_ADX
     {"adx", x25519_tiers_t::adx_k, &x25519_scalar_multiply_adx},
 #endif
 };
@@ -149,7 +149,7 @@ void test_x25519_unit() {
     // own, so they are fixed rather than scaled.
     announce("rfc7748_iterated");
     byte_t scalar[x25519_key_size_k] {}, point[x25519_key_size_k] {};
-    scalar[0] = 9, point[0] = 9;
+    scalar[0] = byte_t {9}, point[0] = byte_t {9};
 
     byte_t after_one[x25519_key_size_k];
     verify(x25519_scalar_multiply(after_one, scalar, point));
@@ -181,7 +181,7 @@ void test_x25519_unit() {
 
     announce("derive_public_matches_base_point");
     byte_t nine[x25519_key_size_k] {};
-    nine[0] = 9;
+    nine[0] = byte_t {9};
     byte_t derived[x25519_key_size_k];
     x25519_derive_public(derived, nine);
     verify_hex(derived, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
@@ -219,7 +219,7 @@ void test_x25519_all() {
         announce("{} along an iterated chain", backend.name);
 
         byte_t scalar[x25519_key_size_k] {}, point[x25519_key_size_k] {};
-        scalar[0] = 9, point[0] = 9;
+        scalar[0] = byte_t {9}, point[0] = byte_t {9};
         for (std::size_t iteration = 0; iteration != scale_iterations(100); ++iteration) {
             byte_t expected[x25519_key_size_k], produced[x25519_key_size_k];
             [[maybe_unused]] bool const reference_usable = x25519_reference_k.multiply(expected, scalar, point);

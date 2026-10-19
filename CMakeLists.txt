@@ -4,7 +4,7 @@ project(
     ucall
     VERSION 1.0.0
     LANGUAGES C CXX
-    DESCRIPTION "Up to 100x Faster FastAPI. JSON-RPC with io_uring, SIMD-acceleration, and pure CPython bindings"
+    DESCRIPTION "HTTP and Noise clients and servers with capability-specialized I/O backends"
     HOMEPAGE_URL "https://github.com/unum-cloud/UCall"
 )
 
@@ -19,54 +19,70 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 
-option(UCALL_BUILD_LIB_POSIX "Builds the legacy POSIX backend pending its C ABI port" OFF)
-option(UCALL_BUILD_PYTHON_POSIX "Builds CPython bindings for the `posix` backend" OFF)
-
-option(UCALL_BUILD_LIB_URING "Builds the C library for the `uring` backend" OFF)
-option(UCALL_BUILD_PYTHON_URING "Builds CPython bindings for the `uring` backend" OFF)
-
-option(UCALL_BUILD_EXAMPLES "Builds examples for Redis-like server and PyTorch deployment" OFF)
-option(UCALL_BUILD_TEST "Builds the C caller and native suites in test/" ${UCALL_IS_MAIN_PROJECT})
-option(UCALL_BUILD_ALL "Builds all supported target" OFF)
-
-if (UCALL_BUILD_PYTHON_POSIX)
-    set(UCALL_BUILD_LIB_POSIX ON)
+set(UCALL_DEFAULT_POSIX OFF)
+set(UCALL_DEFAULT_LINUX OFF)
+set(UCALL_DEFAULT_KQUEUE OFF)
+set(UCALL_DEFAULT_IOCP OFF)
+if (UCALL_IS_MAIN_PROJECT)
+    if (UNIX)
+        set(UCALL_DEFAULT_POSIX ON)
+    endif ()
+    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+        set(UCALL_DEFAULT_LINUX ON)
+    elseif (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+        set(UCALL_DEFAULT_KQUEUE ON)
+    elseif (WIN32)
+        set(UCALL_DEFAULT_IOCP ON)
+    endif ()
 endif ()
 
-if (UCALL_BUILD_PYTHON_URING)
-    set(UCALL_BUILD_LIB_URING ON)
-endif ()
+option(UCALL_WITH_POSIX "Include the portable POSIX backend" ${UCALL_DEFAULT_POSIX})
+option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 7.0 backends" ${UCALL_DEFAULT_LINUX})
+option(UCALL_WITH_LINUX_EPOLL "Include the Linux epoll backend" ${UCALL_DEFAULT_LINUX})
+option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${UCALL_DEFAULT_KQUEUE})
+option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${UCALL_DEFAULT_IOCP})
+option(UCALL_BUILD_PYTHON_POSIX "Build the POSIX Python SDK" OFF)
+option(UCALL_BUILD_PYTHON_URING "Build the io_uring Python SDK" OFF)
+option(UCALL_BUILD_EXAMPLES "Build the echo, ledger, and key-value examples" OFF)
+option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
+option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" ${UCALL_IS_MAIN_PROJECT})
+option(UCALL_BUILD_ALL "Build every target supported on this platform" OFF)
 
 if (UCALL_BUILD_ALL)
     set(UCALL_BUILD_EXAMPLES ON)
+    set(UCALL_BUILD_BENCH ON)
     set(UCALL_BUILD_TEST ON)
 endif ()
-
-message(STATUS "Building ucall_server_posix: ${UCALL_BUILD_LIB_POSIX}")
-message(STATUS "Building ucall_server_uring: ${UCALL_BUILD_LIB_URING}")
-message(STATUS "Building py_ucall_posix: ${UCALL_BUILD_PYTHON_POSIX}")
-message(STATUS "Building py_ucall_uring: ${UCALL_BUILD_PYTHON_URING}")
-message(STATUS "Building examples: ${UCALL_BUILD_EXAMPLES}")
-message(STATUS "Building tests: ${UCALL_BUILD_TEST}")
+if (UCALL_BUILD_PYTHON_POSIX OR UCALL_BUILD_PYTHON_URING)
+    message(FATAL_ERROR "The Python SDK is awaiting migration to the current C ABI; build the native libraries instead")
+endif ()
+if (UCALL_WITH_POSIX AND NOT UNIX)
+    message(FATAL_ERROR "The POSIX backend requires a POSIX platform")
+endif ()
+if ((UCALL_WITH_LINUX_URING OR UCALL_WITH_LINUX_EPOLL) AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The epoll and io_uring backends require Linux")
+endif ()
+if (UCALL_WITH_KQUEUE AND NOT (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD"))
+    message(FATAL_ERROR "The kqueue backend requires macOS or FreeBSD")
+endif ()
+if (UCALL_WITH_IOCP AND NOT WIN32)
+    message(FATAL_ERROR "The IOCP backend requires Windows")
+endif ()
 
 # Make Release by default
 if (NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif ()
 
-set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-    "${CMAKE_BINARY_DIR}/build/lib"
-    CACHE PATH "Path to static libs"
-)
-set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
-    "${CMAKE_BINARY_DIR}/build/lib"
-    CACHE PATH "Path to shared libs"
-)
-set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/bin")
+set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}")
+foreach (configuration_ DEBUG RELEASE RELWITHDEBINFO MINSIZEREL)
+    set(CMAKE_RUNTIME_OUTPUT_DIRECTORY_${configuration_} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY_${configuration_} "${CMAKE_BINARY_DIR}")
+    set(CMAKE_LIBRARY_OUTPUT_DIRECTORY_${configuration_} "${CMAKE_BINARY_DIR}")
+endforeach ()
 
-message(STATUS "Library output directory: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
-message(STATUS "Archive output directory: ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
-message(STATUS "Runtime output directory: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "Running on OS: ${CMAKE_SYSTEM_NAME}")
 
 if (MSVC)
@@ -105,96 +121,71 @@ find_package(Threads REQUIRED)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-if (NOT TARGET stringzilla::static)
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stringzilla/CMakeLists.txt" AND NOT DEFINED
-                                                                            FETCHCONTENT_SOURCE_DIR_STRINGZILLA
+function (ucall_sibling name source_override target url revision)
+    if (TARGET ${target})
+        return()
+    endif ()
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name}/CMakeLists.txt" AND NOT DEFINED
+                                                                        FETCHCONTENT_SOURCE_DIR_${source_override}
     )
-        add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
+        add_subdirectory(${name} EXCLUDE_FROM_ALL)
     else ()
         FetchContent_Declare(
-            stringzilla
-            GIT_REPOSITORY https://github.com/ashvardanian/StringZilla
-            GIT_TAG a87834b78549d9da1e1b824b14e47e7411684f08
+            ${name}
+            GIT_REPOSITORY ${url}
+            GIT_TAG ${revision}
+            EXCLUDE_FROM_ALL
         )
-        FetchContent_MakeAvailable(stringzilla)
+        FetchContent_MakeAvailable(${name})
+    endif ()
+endfunction ()
+
+ucall_sibling(
+    stringzilla STRINGZILLA stringzilla::header https://github.com/ashvardanian/StringZilla
+    a87834b78549d9da1e1b824b14e47e7411684f08
+)
+ucall_sibling(
+    forkunion FORKUNION forkunion::header https://github.com/ashvardanian/ForkUnion
+    c103da31bfc2359ef80315ae0dd52126bb3d3db6
+)
+ucall_sibling(
+    smashtable SMASHTABLE smashtable::header https://github.com/ashvardanian/SmashTable
+    7b169145be44f2baa309c2fee4f7f821df9420e4
+)
+
+# Prefer a current system liburing; source builds are isolated under the build directory.
+if (UCALL_WITH_LINUX_URING)
+    find_package(PkgConfig QUIET)
+    if (PkgConfig_FOUND)
+        pkg_check_modules(UCALL_URING QUIET IMPORTED_TARGET liburing>=2.15)
+    endif ()
+    if (TARGET PkgConfig::UCALL_URING)
+        add_library(uring_internal ALIAS PkgConfig::UCALL_URING)
+    else ()
+        set(URING_DIR ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
+        ExternalProject_Add(
+            liburing-ep
+            GIT_REPOSITORY https://github.com/axboe/liburing.git
+            GIT_TAG liburing-2.15
+            GIT_SHALLOW 1
+            PREFIX ${CMAKE_BINARY_DIR}/_deps/
+            SOURCE_DIR ${URING_DIR}
+            CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
+            BUILD_COMMAND make -C <SOURCE_DIR>/src -s
+            BUILD_BYPRODUCTS ${URING_DIR}/src/liburing.a
+            BUILD_IN_SOURCE 1
+            INSTALL_COMMAND ""
+            UPDATE_COMMAND ""
+        )
+        add_library(uring_internal STATIC IMPORTED GLOBAL)
+        add_dependencies(uring_internal liburing-ep)
+        set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION ${URING_DIR}/src/liburing.a)
+        file(MAKE_DIRECTORY ${URING_DIR}/src/include)
+        set_property(TARGET uring_internal PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${URING_DIR}/src/include)
     endif ()
 endif ()
 
-add_library(ucall_core STATIC src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp)
-add_library(ucall::core ALIAS ucall_core)
-target_include_directories(
-    ucall_core
-    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/c"
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
-)
-target_compile_features(ucall_core PRIVATE cxx_std_20)
-if (NOT MSVC)
-    target_compile_options(ucall_core PRIVATE -fno-strict-aliasing)
-endif ()
-target_compile_definitions(ucall_core PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${UCALL_VERSION_NAME}")
-target_link_libraries(ucall_core PRIVATE stringzilla::static Threads::Threads)
-if (WIN32)
-    target_link_libraries(ucall_core PRIVATE bcrypt)
-    target_compile_definitions(ucall_core PUBLIC UCALL_EXPORT=)
-endif ()
-
-if (UCALL_BUILD_LIB_POSIX OR UCALL_BUILD_LIB_URING)
-    FetchContent_Declare(
-        simdjson
-        GIT_REPOSITORY https://github.com/simdjson/simdjson.git
-        GIT_TAG v5.0.5
-    )
-    FetchContent_MakeAvailable(simdjson)
-    include_directories(SYSTEM ${simdjson_SOURCE_DIR}/include)
-endif ()
-
-if (UCALL_BUILD_LIB_POSIX OR UCALL_BUILD_LIB_URING)
-    # Base64 decoding
-    set(SIMDUTF_TOOLS
-        OFF
-        CACHE BOOL "Disable simdutf tools" FORCE
-    )
-    set(SIMDUTF_TESTS
-        OFF
-        CACHE BOOL "Disable simdutf tests" FORCE
-    )
-    FetchContent_Declare(
-        simdutf
-        GIT_REPOSITORY https://github.com/simdutf/simdutf
-        GIT_TAG v9.3.2
-        GIT_SHALLOW 1
-        SYSTEM
-    )
-    FetchContent_MakeAvailable(simdutf)
-    include_directories(SYSTEM ${simdutf_SOURCE_DIR}/include)
-
-endif ()
-
-# LibUring
-if (UCALL_BUILD_LIB_URING)
-    set(URING_DIR ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
-    ExternalProject_Add(
-        liburing-ep
-        GIT_REPOSITORY https://github.com/axboe/liburing.git
-        GIT_TAG liburing-2.15
-        GIT_SHALLOW 1
-        PREFIX ${CMAKE_BINARY_DIR}/_deps/
-        SOURCE_DIR ${URING_DIR}
-        CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
-        BUILD_COMMAND make -C <SOURCE_DIR> -s
-        BUILD_IN_SOURCE 1
-        INSTALL_COMMAND ""
-        UPDATE_COMMAND ""
-    )
-    add_library(uring_internal STATIC IMPORTED GLOBAL)
-    add_dependencies(uring_internal liburing-ep)
-    set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION ${URING_DIR}/src/liburing.a)
-
-    include_directories(${URING_DIR}/src/include/)
-    set(URING_LIBS uring_internal)
-endif ()
-
-if (UCALL_BUILD_TEST OR UCALL_BUILD_EXAMPLES)
+if (UCALL_BUILD_TEST)
     FetchContent_Declare(
         fmt
         GIT_REPOSITORY https://github.com/fmtlib/fmt.git
@@ -204,66 +195,178 @@ if (UCALL_BUILD_TEST OR UCALL_BUILD_EXAMPLES)
     FetchContent_MakeAvailable(fmt)
 endif ()
 
+# One compiled class per distinct native kernel bundle; flags stay on its instantiation unit.
+include(CheckCXXCompilerFlag)
+
+add_library(ucall STATIC src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp src/variants_serial.cpp)
+add_library(ucall::ucall ALIAS ucall)
+add_library(ucall::header ALIAS ucall)
+target_include_directories(
+    ucall
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/c" "${CMAKE_CURRENT_SOURCE_DIR}/include"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(ucall PUBLIC cxx_std_20)
+target_compile_definitions(
+    ucall
+    PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${UCALL_VERSION_NAME}"
+    PUBLIC UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}> UCALL_WITH_LINUX_EPOLL=$<BOOL:${UCALL_WITH_LINUX_EPOLL}>
+           UCALL_WITH_LINUX_URING=$<BOOL:${UCALL_WITH_LINUX_URING}> UCALL_WITH_KQUEUE=$<BOOL:${UCALL_WITH_KQUEUE}>
+           UCALL_WITH_IOCP=$<BOOL:${UCALL_WITH_IOCP}>
+)
+target_link_libraries(
+    ucall
+    PUBLIC forkunion::header smashtable::header stringzilla::header
+    PRIVATE Threads::Threads
+)
+foreach (capabilities forkunion::cpu_capabilities_compiled stringzilla::cpu_capabilities_compiled)
+    if (TARGET ${capabilities})
+        target_link_libraries(ucall PUBLIC ${capabilities})
+    endif ()
+endforeach ()
+if (NOT MSVC)
+    target_compile_options(ucall PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>)
+endif ()
+if (WIN32)
+    target_compile_definitions(ucall PUBLIC UCALL_EXPORT=)
+    target_link_libraries(ucall PRIVATE bcrypt ws2_32 mswsock)
+endif ()
+if (UCALL_WITH_LINUX_URING)
+    target_link_libraries(ucall PUBLIC uring_internal)
+    if (TARGET liburing-ep)
+        add_dependencies(ucall liburing-ep)
+    endif ()
+endif ()
+
+function (ucall_cpu_variant source target_macro)
+    cmake_parse_arguments(PARSE_ARGV 2 argument "" "FLAGS;MSVC_FLAGS" "REQUIRES")
+    set(enabled TRUE)
+    foreach (requirement IN LISTS argument_REQUIRES)
+        if (NOT ${requirement})
+            set(enabled FALSE)
+        endif ()
+    endforeach ()
+    if (MSVC)
+        set(flags "${argument_MSVC_FLAGS}")
+    else ()
+        set(flags "${argument_FLAGS}")
+    endif ()
+    if (enabled)
+        check_cxx_compiler_flag("${flags}" ${target_macro})
+    else ()
+        set(${target_macro} FALSE)
+    endif ()
+    target_compile_definitions(ucall PUBLIC ${target_macro}=$<BOOL:${${target_macro}}>)
+    if (${target_macro})
+        target_sources(ucall PRIVATE ${source})
+        set_source_files_properties(${source} PROPERTIES COMPILE_FLAGS "${flags}")
+    endif ()
+endfunction ()
+
+ucall_cpu_variant(
+    src/variants_intel_haswell.cpp
+    UCALL_TARGET_INTEL_HASWELL
+    REQUIRES
+    sz_target_haswell_compiles
+    sz_target_westmere_compiles
+    FLAGS
+    "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul"
+    MSVC_FLAGS
+    "/arch:AVX2"
+)
+ucall_cpu_variant(
+    src/variants_intel_skylake.cpp
+    UCALL_TARGET_INTEL_SKYLAKE
+    REQUIRES
+    sz_target_skylake_compiles
+    sz_target_westmere_compiles
+    FLAGS
+    "-mavx2 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mbmi -mbmi2 -mpopcnt -mlzcnt -maes -mpclmul"
+    MSVC_FLAGS
+    "/arch:AVX512"
+)
+ucall_cpu_variant(
+    src/variants_intel_icelake.cpp
+    UCALL_TARGET_INTEL_ICELAKE
+    REQUIRES
+    sz_target_icelake_compiles
+    sz_target_goldmont_compiles
+    FLAGS
+    "-mavx2 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx512vbmi -mavx512vbmi2 -mavx512vnni -mbmi -mbmi2 -mpopcnt -mlzcnt -maes -mvaes -mpclmul -mvpclmulqdq -msha"
+    MSVC_FLAGS
+    "/arch:AVX512"
+)
+ucall_cpu_variant(
+    src/variants_intel_alder.cpp
+    UCALL_TARGET_INTEL_ALDER
+    REQUIRES
+    sz_target_haswell_compiles
+    sz_target_westmere_compiles
+    sz_target_goldmont_compiles
+    FLAGS
+    "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul -msha"
+    MSVC_FLAGS
+    "/arch:AVX2"
+)
+ucall_cpu_variant(
+    src/variants_intel_sierra.cpp
+    UCALL_TARGET_INTEL_SIERRA
+    REQUIRES
+    sz_target_haswell_compiles
+    sz_target_westmere_compiles
+    sz_target_goldmont_compiles
+    fu_target_x86_cmpccxadd_compiles
+    FLAGS
+    "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul -msha"
+    MSVC_FLAGS
+    "/arch:AVX2"
+)
+ucall_cpu_variant(
+    src/variants_aws_g2.cpp
+    UCALL_TARGET_AWS_G2
+    REQUIRES
+    sz_target_neon_compiles
+    sz_target_neonaes_compiles
+    sz_target_neonsha_compiles
+    fu_target_arm64_lse_compiles
+    FLAGS
+    "-march=armv8-a+simd+crypto+aes+sha2+lse"
+)
+ucall_cpu_variant(
+    src/variants_apple_m2.cpp
+    UCALL_TARGET_APPLE_M2
+    REQUIRES
+    sz_target_neon_compiles
+    sz_target_neonaes_compiles
+    sz_target_neonsha_compiles
+    fu_target_arm64_lse_compiles
+    fu_target_arm64_rcpc_compiles
+    FLAGS
+    "-march=armv8-a+simd+crypto+aes+sha2+lse+rcpc"
+)
+ucall_cpu_variant(
+    src/variants_aws_g5.cpp
+    UCALL_TARGET_AWS_G5
+    REQUIRES
+    sz_target_sve_compiles
+    sz_target_sve2_compiles
+    sz_target_sve2aes_compiles
+    sz_target_neonsha_compiles
+    fu_target_arm64_lse_compiles
+    fu_target_arm64_rcpc_compiles
+    FLAGS
+    "-march=armv8.2-a+sve+sve2+sve2-aes+crypto+lse+rcpc"
+)
+
 if (UCALL_BUILD_EXAMPLES)
-    FetchContent_Declare(
-        cxxopts
-        GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
-        GIT_TAG v3.3.1
-    )
-    FetchContent_MakeAvailable(cxxopts)
+    foreach (example echo ledger redis)
+        add_executable(ucall_example_${example} examples/${example}/server.cpp)
+        target_link_libraries(ucall_example_${example} PRIVATE ucall::ucall forkunion::static)
+    endforeach ()
 endif ()
-
-include_directories(c/ src/)
-
-if (UCALL_BUILD_LIB_POSIX)
-    add_library(ucall_server_posix src/server_posix.cpp)
-    target_link_libraries(ucall_server_posix simdjson::simdjson simdutf::simdutf Threads::Threads ucall_core)
-    set(PYTHON_BACKEND ucall_server_posix)
-endif ()
-
-if (UCALL_BUILD_LIB_URING)
-    add_library(ucall_server_uring src/server_uring.cpp)
-    set(PYTHON_BACKEND ucall_server_uring)
-    target_link_libraries(
-        ucall_server_uring simdjson::simdjson simdutf::simdutf Threads::Threads ${URING_LIBS} ucall_core
-    )
-endif ()
-
-# Python bindings
-if (UCALL_BUILD_PYTHON_POSIX OR UCALL_BUILD_PYTHON_URING)
-    find_package(Python3 3.12 REQUIRED Development.Module)
-endif ()
-
-if (UCALL_BUILD_PYTHON_POSIX)
-    python3_add_library(py_ucall_posix python/lib.c)
-    target_include_directories(py_ucall_posix PUBLIC src/ c/)
-    target_link_libraries(py_ucall_posix PRIVATE ucall_server_posix base64)
-
-    # set_target_properties(py_ucall_posix PROPERTIES OUTPUT_NAME posix)
-    target_compile_definitions(py_ucall_posix PRIVATE UCALL_PYTHON_MODULE_NAME=posix)
-    message(STATUS "Building ucall_server_posix with output in ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
-endif ()
-
-if (UCALL_BUILD_PYTHON_URING)
-    python3_add_library(py_ucall_uring python/lib.c)
-    target_include_directories(py_ucall_uring PUBLIC src/ c/)
-    target_link_libraries(py_ucall_uring PRIVATE ucall_server_uring base64)
-
-    # set_target_properties(py_ucall_uring PROPERTIES OUTPUT_NAME uring)
-    target_compile_definitions(py_ucall_uring PRIVATE UCALL_PYTHON_MODULE_NAME=uring)
-    message(STATUS "Building py_ucall_uring with output in ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
-endif ()
-
-if (UCALL_BUILD_EXAMPLES)
-    add_executable(ucall_example_server_posix examples/ucall_server.cpp)
-    target_link_libraries(ucall_example_server_posix ucall_server_posix cxxopts fmt::fmt)
-    target_compile_options(ucall_example_server_posix PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
-endif ()
-
-if (UCALL_BUILD_EXAMPLES AND UCALL_BUILD_LIB_URING)
-    add_executable(ucall_example_server_uring examples/ucall_server.cpp)
-    target_link_libraries(ucall_example_server_uring ucall_server_uring cxxopts fmt::fmt)
-    target_compile_options(ucall_example_server_uring PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+if (UCALL_BUILD_BENCH)
+    add_executable(ucall_bench_http bench/http.cpp)
+    target_link_libraries(ucall_bench_http PRIVATE ucall::ucall forkunion::static)
 endif ()
 
 if (UCALL_BUILD_TEST)

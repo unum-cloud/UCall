@@ -1,0 +1,580 @@
+/**
+ *  @file include/ucall/http.hpp
+ *  @author Ash Vardanian
+ *  @date July 21, 2023
+ *  @brief Incremental HTTP framing and borrowed views, independent of sockets and event loops.
+ */
+#pragma once
+
+#include <charconv>
+#include <limits>
+#include <string_view>
+
+#include <stringzilla/capabilities.h>
+#include <stringzilla/find/serial.h>
+#include <stringzilla/hash/serial.h>
+#include <stringzilla/utf8_uncased_fold/serial.h>
+#if STRINGZILLA_TARGET_NEON
+#include <stringzilla/find/neon.h>
+#include <stringzilla/utf8_uncased_fold/neon.h>
+#endif
+#if STRINGZILLA_TARGET_NEONAES
+#include <stringzilla/hash/neonaes.h>
+#endif
+#if STRINGZILLA_TARGET_SVE
+#include <stringzilla/find/sve.h>
+#endif
+#if STRINGZILLA_TARGET_SVE2
+#include <stringzilla/find/sve2.h>
+#include <stringzilla/utf8_uncased_fold/sve2.h>
+#endif
+#if STRINGZILLA_TARGET_SVE2AES
+#include <stringzilla/hash/sve2aes.h>
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+#include <stringzilla/find/haswell.h>
+#include <stringzilla/utf8_uncased_fold/haswell.h>
+#endif
+#if STRINGZILLA_TARGET_WESTMERE
+#include <stringzilla/hash/westmere.h>
+#endif
+#if STRINGZILLA_TARGET_SKYLAKE
+#include <stringzilla/find/skylake.h>
+#include <stringzilla/hash/skylake.h>
+#endif
+#if STRINGZILLA_TARGET_ICELAKE
+#include <stringzilla/find/icelake.h>
+#include <stringzilla/hash/icelake.h>
+#include <stringzilla/utf8_uncased_fold/icelake.h>
+#endif
+
+#include "ucall/types.hpp"
+
+namespace unum::ucall {
+
+enum class http_role_t { request_k, response_k, head_response_k };
+enum class http_parse_t { incomplete_k, complete_k, malformed_k, unsupported_k, overflow_k };
+enum class http_framing_t { length_k, chunked_k, until_close_k };
+
+/** A received response keeps its bytes independently of the client and its CPU specialization. */
+struct received_response_t : ucall_received_http_response_handle_t {
+    st::basic_vector<byte_t> storage {};
+    std::size_t headers_length {}, body_length {};
+    ucall_http_status_t status {};
+    span<byte_t const> bytes() const noexcept { return span<byte_t const> {storage}; }
+};
+
+template <sz_capability_t capabilities_>
+struct http {
+    static std::string_view text_view(span<byte_t const> bytes) noexcept {
+        return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+    }
+    template <typename element_type_>
+    static std::string_view text_view(st::basic_vector<element_type_> const& bytes) noexcept {
+        static_assert(sizeof(element_type_) == 1);
+        return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+    }
+    static ucall_bytes_view_t c_view(std::string_view text) noexcept {
+        return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
+    }
+    static std::string_view text_view(ucall_bytes_view_t bytes) noexcept {
+        return bytes.length ? std::string_view {reinterpret_cast<char const*>(bytes.data), bytes.length}
+                            : std::string_view {};
+    }
+    static bool valid_view(ucall_bytes_view_t bytes) noexcept { return bytes.data || !bytes.length; }
+    static bool equal(std::string_view left, std::string_view right) noexcept {
+        if (left.size() != right.size()) return false;
+        if (left.empty()) return true;
+#if STRINGZILLA_TARGET_SVE
+        if constexpr (capabilities_ & sz_cap_sve_k) {
+            sz_bool_t same;
+            sz_equal_sve(left.data(), right.data(), left.size(), &same, nullptr);
+            return same;
+        }
+#endif
+#if STRINGZILLA_TARGET_SKYLAKE
+        if constexpr (capabilities_ & sz_cap_skylake_k) {
+            sz_bool_t same;
+            sz_equal_skylake(left.data(), right.data(), left.size(), &same, nullptr);
+            return same;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEON
+        if constexpr (capabilities_ & sz_cap_neon_k) {
+            sz_bool_t same;
+            sz_equal_neon(left.data(), right.data(), left.size(), &same, nullptr);
+            return same;
+        }
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+        if constexpr (capabilities_ & sz_cap_haswell_k) {
+            sz_bool_t same;
+            sz_equal_haswell(left.data(), right.data(), left.size(), &same, nullptr);
+            return same;
+        }
+#endif
+        return sz_equal_serial_(left.data(), right.data(), left.size());
+    }
+    static std::size_t find(std::string_view text, std::string_view needle, std::size_t offset = 0) noexcept {
+        if (offset > text.size()) return std::string_view::npos;
+        if (needle.empty()) return offset;
+        if (needle.size() > text.size() - offset) return std::string_view::npos;
+#if STRINGZILLA_TARGET_SVE
+        if constexpr (capabilities_ & sz_cap_sve_k) {
+            char const* match;
+            sz_find_sve(text.data() + offset, text.size() - offset, needle.data(), needle.size(), &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+#if STRINGZILLA_TARGET_SKYLAKE
+        if constexpr (capabilities_ & sz_cap_skylake_k) {
+            char const* match;
+            sz_find_skylake(text.data() + offset, text.size() - offset, needle.data(), needle.size(), &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEON
+        if constexpr (capabilities_ & sz_cap_neon_k) {
+            char const* match;
+            sz_find_neon(text.data() + offset, text.size() - offset, needle.data(), needle.size(), &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+        if constexpr (capabilities_ & sz_cap_haswell_k) {
+            char const* match;
+            sz_find_haswell(text.data() + offset, text.size() - offset, needle.data(), needle.size(), &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+        auto match = sz_find_serial_(text.data() + offset, text.size() - offset, needle.data(), needle.size());
+        return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+    }
+    static std::size_t find(std::string_view text, char needle, std::size_t offset = 0) noexcept {
+        return find(text, std::string_view {&needle, 1}, offset);
+    }
+    static std::size_t rfind(std::string_view text, char needle) noexcept {
+        if (text.empty()) return std::string_view::npos;
+#if STRINGZILLA_TARGET_SVE
+        if constexpr (capabilities_ & sz_cap_sve_k) {
+            char const* match;
+            sz_rfind_sve(text.data(), text.size(), &needle, 1, &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+#if STRINGZILLA_TARGET_SKYLAKE
+        if constexpr (capabilities_ & sz_cap_skylake_k) {
+            char const* match;
+            sz_rfind_skylake(text.data(), text.size(), &needle, 1, &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEON
+        if constexpr (capabilities_ & sz_cap_neon_k) {
+            char const* match;
+            sz_rfind_neon(text.data(), text.size(), &needle, 1, &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+        if constexpr (capabilities_ & sz_cap_haswell_k) {
+            char const* match;
+            sz_rfind_haswell(text.data(), text.size(), &needle, 1, &match, nullptr);
+            return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+        }
+#endif
+        auto match = sz_rfind_serial_(text.data(), text.size(), &needle, 1);
+        return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
+    }
+    static char const* find_set(std::string_view text, sz_byteset_t const& set) noexcept {
+        if (text.empty()) return nullptr;
+#if STRINGZILLA_TARGET_SVE2
+        if constexpr (capabilities_ & sz_cap_sve2_k) {
+            char const* match;
+            sz_find_byteset_sve2(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+#if STRINGZILLA_TARGET_ICELAKE
+        if constexpr (capabilities_ & sz_cap_icelake_k) {
+            char const* match;
+            sz_find_byteset_icelake(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEON
+        if constexpr (capabilities_ & sz_cap_neon_k) {
+            char const* match;
+            sz_find_byteset_neon(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+        if constexpr (capabilities_ & sz_cap_haswell_k) {
+            char const* match;
+            sz_find_byteset_haswell(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+        return sz_find_byteset_serial_(text.data(), text.size(), &set);
+    }
+    static char const* rfind_set(std::string_view text, sz_byteset_t const& set) noexcept {
+        if (text.empty()) return nullptr;
+#if STRINGZILLA_TARGET_SVE2
+        if constexpr (capabilities_ & sz_cap_sve2_k) {
+            char const* match;
+            sz_rfind_byteset_sve2(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+#if STRINGZILLA_TARGET_ICELAKE
+        if constexpr (capabilities_ & sz_cap_icelake_k) {
+            char const* match;
+            sz_rfind_byteset_icelake(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEON
+        if constexpr (capabilities_ & sz_cap_neon_k) {
+            char const* match;
+            sz_rfind_byteset_neon(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+        if constexpr (capabilities_ & sz_cap_haswell_k) {
+            char const* match;
+            sz_rfind_byteset_haswell(text.data(), text.size(), &set, &match, nullptr);
+            return match;
+        }
+#endif
+        return sz_rfind_byteset_serial_(text.data(), text.size(), &set);
+    }
+    static std::uint64_t hash(std::string_view text, std::uint64_t seed = 0) noexcept {
+#if STRINGZILLA_TARGET_SVE2AES
+        if constexpr (capabilities_ & sz_cap_sve2aes_k) {
+            sz_u64_t result;
+            sz_hash_sve2aes(text.data(), text.size(), seed, &result, nullptr);
+            return result;
+        }
+#endif
+#if STRINGZILLA_TARGET_ICELAKE
+        if constexpr (capabilities_ & sz_cap_icelake_k) {
+            sz_u64_t result;
+            sz_hash_icelake(text.data(), text.size(), seed, &result, nullptr);
+            return result;
+        }
+#endif
+#if STRINGZILLA_TARGET_SKYLAKE
+        if constexpr (capabilities_ & sz_cap_skylake_k) {
+            sz_u64_t result;
+            sz_hash_skylake(text.data(), text.size(), seed, &result, nullptr);
+            return result;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEONAES
+        if constexpr (capabilities_ & sz_cap_neonaes_k) {
+            sz_u64_t result;
+            sz_hash_neonaes(text.data(), text.size(), seed, &result, nullptr);
+            return result;
+        }
+#endif
+#if STRINGZILLA_TARGET_WESTMERE
+        if constexpr (capabilities_ & sz_cap_westmere_k) {
+            sz_u64_t result;
+            sz_hash_westmere(text.data(), text.size(), seed, &result, nullptr);
+            return result;
+        }
+#endif
+        return sz_hash_serial_(text.data(), text.size(), seed);
+    }
+    static bool http_token(std::string_view text) noexcept {
+        static sz_byteset_t const forbidden = [] {
+            sz_byteset_t set {};
+            constexpr std::string_view tokens {
+                "!#$%&'*+-.^_`|~0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"};
+            for (unsigned c = 0; c != 256; ++c)
+                if (tokens.find(static_cast<char>(c)) == std::string_view::npos)
+                    sz_byteset_add_u8(&set, static_cast<sz_u8_t>(c));
+            return set;
+        }();
+        return !text.empty() && !find_set(text, forbidden);
+    }
+    static bool http_value(std::string_view text) noexcept {
+        static sz_byteset_t const forbidden = [] {
+            sz_byteset_t set {};
+            for (unsigned c = 0; c != 32; ++c)
+                if (c != '\t') sz_byteset_add_u8(&set, static_cast<sz_u8_t>(c));
+            sz_byteset_add_u8(&set, 127);
+            return set;
+        }();
+        return !find_set(text, forbidden);
+    }
+    static std::string_view trim_http(std::string_view text) noexcept {
+        sz_byteset_t set {};
+        sz_byteset_add(&set, ' ');
+        sz_byteset_add(&set, '\t');
+        sz_byteset_invert(&set);
+        auto* first = find_set(text, set);
+        if (!first) return text.substr(text.size());
+        auto* last = rfind_set({first, text.size() - (first - text.data())}, set);
+        return {first, static_cast<std::size_t>(last - first) + 1};
+    }
+    static void lowercase_ascii(char* text, std::size_t length) noexcept {
+        sz_size_t written = 0;
+#if STRINGZILLA_TARGET_SVE2
+        if constexpr (capabilities_ & sz_cap_sve2_k) {
+            sz_utf8_uncased_fold_sve2(text, length, text, &written, nullptr);
+            return;
+        }
+#endif
+#if STRINGZILLA_TARGET_ICELAKE
+        if constexpr (capabilities_ & sz_cap_icelake_k) {
+            sz_utf8_uncased_fold_icelake(text, length, text, &written, nullptr);
+            return;
+        }
+#endif
+#if STRINGZILLA_TARGET_NEON
+        if constexpr (capabilities_ & sz_cap_neon_k) {
+            sz_utf8_uncased_fold_neon(text, length, text, &written, nullptr);
+            return;
+        }
+#endif
+#if STRINGZILLA_TARGET_HASWELL
+        if constexpr (capabilities_ & sz_cap_haswell_k) {
+            sz_utf8_uncased_fold_haswell(text, length, text, &written, nullptr);
+            return;
+        }
+#endif
+        sz_utf8_uncased_fold_serial(text, length, text, &written, nullptr);
+    }
+    static bool http_has_token(std::string_view text, std::string_view token) noexcept {
+        while (!text.empty()) {
+            std::size_t end = find(text, ',');
+            if (equal(trim_http(text.substr(0, end)), token)) return true;
+            if (end == std::string_view::npos) break;
+            text.remove_prefix(end + 1);
+        }
+        return false;
+    }
+    static char const* http_verb_name(ucall_verb_t verb) noexcept {
+        switch (verb) {
+        case ucall_verb_get_k: return "GET";
+        case ucall_verb_post_k: return "POST";
+        case ucall_verb_put_k: return "PUT";
+        case ucall_verb_delete_k: return "DELETE";
+        case ucall_verb_patch_k: return "PATCH";
+        case ucall_verb_head_k: return "HEAD";
+        case ucall_verb_options_k: return "OPTIONS";
+        default: return nullptr;
+        }
+    }
+    static ucall_verb_t http_verb(std::string_view name) noexcept {
+        for (int i = ucall_verb_get_k; i < ucall_verb_any_k; ++i)
+            if (name == http_verb_name(static_cast<ucall_verb_t>(i))) return static_cast<ucall_verb_t>(i);
+        return ucall_verb_unknown_k;
+    }
+
+    /** Offsets survive buffer growth; views exist only during message dispatch. */
+    struct http_message_t {
+        std::size_t headers_length {}, body_length {}, wire_length {};
+        std::size_t target_offset {}, target_length {}, cursor {}, decoded_length {};
+        std::size_t content_length {};
+        http_framing_t framing {http_framing_t::length_k};
+        ucall_verb_t verb {ucall_verb_unknown_k};
+        ucall_http_status_t status {};
+        bool keep_alive {}, decoded {};
+
+        std::string_view target(std::string_view bytes) const noexcept {
+            return bytes.substr(target_offset, target_length);
+        }
+        std::string_view body(std::string_view bytes) const noexcept {
+            return bytes.substr(headers_length, body_length);
+        }
+        std::string_view header(std::string_view bytes, std::string_view name) const noexcept {
+            auto start = find(bytes, "\r\n") + 2;
+            while (start + 2 < headers_length) {
+                auto end = find(bytes, "\r\n", start), colon = find(bytes, ':', start);
+                if (colon < end && equal(bytes.substr(start, colon - start), name))
+                    return trim_http(bytes.substr(colon + 1, end - colon - 1));
+                start = end + 2;
+            }
+            return {};
+        }
+    };
+
+    static http_parse_t http_parse(span<byte_t> bytes, http_message_t& message, http_role_t role) noexcept {
+        auto text = text_view(bytes);
+        if (!message.headers_length) {
+            auto end = find(text, "\r\n\r\n");
+            if (end == std::string_view::npos) return http_parse_t::incomplete_k;
+            auto first_end = find(text, "\r\n");
+            auto first = text.substr(0, first_end);
+            auto space = find(first, ' ');
+            if (space == std::string_view::npos) return http_parse_t::malformed_k;
+            std::string_view version;
+            if (role == http_role_t::request_k) {
+                auto second = find(first, ' ', space + 1);
+                if (second == std::string_view::npos) return http_parse_t::malformed_k;
+                message.verb = http_verb(first.substr(0, space));
+                if (!http_token(first.substr(0, space))) return http_parse_t::malformed_k;
+                if (message.verb == ucall_verb_unknown_k) return http_parse_t::unsupported_k;
+                message.target_offset = space + 1;
+                message.target_length = second - space - 1;
+                auto target = first.substr(message.target_offset, message.target_length);
+                if (target.empty() || target.front() != '/' ||
+                    (find(target, ' ') != std::string_view::npos || find(target, '#') != std::string_view::npos ||
+                     find(target, '\t') != std::string_view::npos) ||
+                    !http_value(target))
+                    return http_parse_t::malformed_k;
+                version = first.substr(second + 1);
+            }
+            else {
+                version = first.substr(0, space);
+                auto code = first.substr(space + 1, 3);
+                auto result = std::from_chars(code.data(), code.data() + code.size(), message.status);
+                if (code.size() != 3 || result.ec != std::errc {} || result.ptr != code.data() + 3 ||
+                    message.status < 100 || message.status > 599 ||
+                    (first.size() > space + 4 && first[space + 4] != ' ') || !http_value(first))
+                    return http_parse_t::malformed_k;
+            }
+            if (version != "HTTP/1.1" && version != "HTTP/1.0") return http_parse_t::unsupported_k;
+            message.keep_alive = version == "HTTP/1.1";
+            bool has_length = false, has_transfer = false, has_host = false, has_close = false;
+            std::size_t start = first_end + 2;
+            while (start < end) {
+                auto line_end = find(text, "\r\n", start), colon = find(text, ':', start);
+                if (colon >= line_end) return http_parse_t::malformed_k;
+                auto name = text.substr(start, colon - start),
+                     value = trim_http(text.substr(colon + 1, line_end - colon - 1));
+                if (!http_token(name) || !http_value(value)) return http_parse_t::malformed_k;
+                lowercase_ascii(reinterpret_cast<char*>(bytes.data()) + start, name.size());
+                if (equal(name, "connection") || equal(name, "transfer-encoding")) {
+                    auto tokens = value;
+                    while (!tokens.empty()) {
+                        auto comma = find(tokens, ',');
+                        if (!http_token(trim_http(tokens.substr(0, comma)))) return http_parse_t::malformed_k;
+                        if (comma == std::string_view::npos) break;
+                        tokens.remove_prefix(comma + 1);
+                    }
+                    lowercase_ascii(reinterpret_cast<char*>(bytes.data()) + (value.data() - text.data()), value.size());
+                }
+                if (equal(name, "content-length")) {
+                    if (has_length || value.empty()) return http_parse_t::malformed_k;
+                    auto result = std::from_chars(value.data(), value.data() + value.size(), message.content_length);
+                    if (result.ec != std::errc {} || result.ptr != value.data() + value.size())
+                        return http_parse_t::malformed_k;
+                    has_length = true;
+                }
+                else if (equal(name, "transfer-encoding")) {
+                    if (has_transfer) return http_parse_t::malformed_k;
+                    if (!equal(value, "chunked")) return http_parse_t::unsupported_k;
+                    has_transfer = true;
+                }
+                else if (equal(name, "connection")) {
+                    if (http_has_token(value, "close")) has_close = true;
+                    else if (version == "HTTP/1.0" && http_has_token(value, "keep-alive")) message.keep_alive = true;
+                }
+                else if (equal(name, "host")) {
+                    if (has_host || value.empty()) return http_parse_t::malformed_k;
+                    has_host = true;
+                }
+                start = line_end + 2;
+            }
+            if (has_close) message.keep_alive = false;
+            if (has_length && has_transfer) return http_parse_t::malformed_k;
+            if (role == http_role_t::request_k && version == "HTTP/1.1" && !has_host) return http_parse_t::malformed_k;
+            message.headers_length = end + 4;
+            message.cursor = message.headers_length;
+            message.framing = has_transfer ? http_framing_t::chunked_k : http_framing_t::length_k;
+            if (role != http_role_t::request_k && !has_transfer && !has_length) {
+                message.framing = http_framing_t::until_close_k;
+                message.keep_alive = false;
+            }
+            if (role == http_role_t::head_response_k || (message.status >= 100 && message.status < 200) ||
+                message.status == 204 || message.status == 304) {
+                message.framing = http_framing_t::length_k;
+                message.content_length = 0;
+            }
+        }
+        if (message.framing == http_framing_t::until_close_k) return http_parse_t::incomplete_k;
+        if (message.framing == http_framing_t::length_k) {
+            if (message.content_length > std::numeric_limits<std::size_t>::max() - message.headers_length)
+                return http_parse_t::overflow_k;
+            message.wire_length = message.headers_length + message.content_length;
+            message.body_length = message.content_length;
+            return text.size() >= message.wire_length ? http_parse_t::complete_k : http_parse_t::incomplete_k;
+        }
+        while (message.cursor < text.size()) {
+            auto line_end = find(text, "\r\n", message.cursor);
+            if (line_end == std::string_view::npos) return http_parse_t::incomplete_k;
+            auto line = text.substr(message.cursor, line_end - message.cursor);
+            auto digits = line.substr(0, find(line, ';'));
+            std::size_t length = 0;
+            auto result = std::from_chars(digits.data(), digits.data() + digits.size(), length, 16);
+            if (digits.empty() || result.ec != std::errc {} || result.ptr != digits.data() + digits.size() ||
+                !http_value(line))
+                return http_parse_t::malformed_k;
+            if (length > std::numeric_limits<std::size_t>::max() - message.decoded_length)
+                return http_parse_t::overflow_k;
+            if (!length) {
+                auto trailer = line_end + 2;
+                for (;;) {
+                    auto trailer_end = find(text, "\r\n", trailer);
+                    if (trailer_end == std::string_view::npos) return http_parse_t::incomplete_k;
+                    if (trailer_end == trailer) {
+                        message.wire_length = trailer + 2;
+                        message.body_length = message.decoded_length;
+                        return http_parse_t::complete_k;
+                    }
+                    auto colon = find(text, ':', trailer);
+                    if (colon >= trailer_end || !http_token(text.substr(trailer, colon - trailer)) ||
+                        !http_value(text.substr(colon + 1, trailer_end - colon - 1)))
+                        return http_parse_t::malformed_k;
+                    auto name = text.substr(trailer, colon - trailer);
+                    lowercase_ascii(reinterpret_cast<char*>(bytes.data()) + trailer, name.size());
+                    if (equal(name, "content-length") || equal(name, "transfer-encoding") || equal(name, "host"))
+                        return http_parse_t::malformed_k;
+                    trailer = trailer_end + 2;
+                }
+            }
+            if (length > std::numeric_limits<std::size_t>::max() - 2 || text.size() - line_end - 2 < length + 2)
+                return http_parse_t::incomplete_k;
+            if (text.substr(line_end + 2 + length, 2) != "\r\n") return http_parse_t::malformed_k;
+            message.decoded_length += length;
+            message.cursor = line_end + 2 + length + 2;
+        }
+        return http_parse_t::incomplete_k;
+    }
+
+    static void http_decode_chunks(span<byte_t> bytes, http_message_t& message) noexcept {
+        if (message.framing != http_framing_t::chunked_k || message.decoded) return;
+        auto text = text_view(bytes);
+        std::size_t cursor = message.headers_length, destination = cursor;
+        for (;;) {
+            auto end = find(text, "\r\n", cursor), separator = find(text, ';', cursor);
+            if (separator > end) separator = end;
+            std::size_t length = 0;
+            std::from_chars(text.data() + cursor, text.data() + separator, length, 16);
+            if (!length) break;
+            std::memmove(bytes.data() + destination, bytes.data() + end + 2, length);
+            destination += length;
+            cursor = end + 2 + length + 2;
+        }
+        message.decoded = true;
+    }
+
+    template <typename element_type_>
+    static bool append_text(st::basic_vector<element_type_>& bytes, std::string_view text) noexcept {
+        static_assert(sizeof(element_type_) == 1);
+        auto previous = bytes.size();
+        if (text.size() > std::numeric_limits<std::size_t>::max() - previous ||
+            st::failed(bytes.resize(previous + text.size())))
+            return false;
+        if (!text.empty()) std::memcpy(bytes.data() + previous, text.data(), text.size());
+        return true;
+    }
+    static void drop_bytes(st::basic_vector<byte_t>& bytes, std::size_t count) noexcept { bytes.erase(0, count); }
+};
+
+} // namespace unum::ucall

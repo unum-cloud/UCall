@@ -47,16 +47,19 @@
 #include <fmt/color.h>  // `fmt::text_style`, `fmt::fg`, `fmt::emphasis`
 #include <fmt/format.h> // `fmt::formatter`, `fmt::format_to`
 
-#include "shared.hpp" // `byte_t`, `span`
+#include "ucall/types.hpp" // `byte_t`, `span`
 
-#if defined(UCALL_OS_LINUX_) || defined(UCALL_OS_MACOS_)
+#if UCALL_OS_LINUX_ || UCALL_OS_APPLE_
 #include <unistd.h> // `isatty`, `STDERR_FILENO`
 #endif
-#if defined(UCALL_OS_LINUX_) && defined(__GLIBC__)
+#if UCALL_OS_LINUX_ && defined(__GLIBC__)
 #include <execinfo.h> // `backtrace`, `backtrace_symbols_fd`
 #endif
 
 namespace unum::ucall::test {
+
+/** Scratch extent shared by buffer and record fixtures. */
+inline constexpr std::size_t fixture_buffer_bytes_k = 4096;
 
 #pragma region Spans
 
@@ -77,7 +80,7 @@ template <std::size_t length_>
 inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
     // `memset` with a null destination is undefined even when it writes no bytes, and an empty
     // span carries one - the same hazard `array::append_n` guards against.
-    if (bytes.size()) std::memset(bytes.data(), value, bytes.size());
+    if (bytes.size()) std::memset(bytes.data(), std::to_integer<int>(value), bytes.size());
 }
 
 /** Whether two byte ranges have the same length and the same contents. */
@@ -95,7 +98,7 @@ inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
 }
 
 /** Whether every byte in the range is zero, which is how a wiped secret is recognised. */
-[[nodiscard]] inline bool all_zero(span<byte_t const> bytes) noexcept { return all_equal_to(bytes, 0); }
+[[nodiscard]] inline bool all_zero(span<byte_t const> bytes) noexcept { return all_equal_to(bytes, byte_t {}); }
 
 #pragma endregion Spans
 
@@ -122,7 +125,7 @@ inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
  */
 [[nodiscard]] inline bool from_hex(char const* text, span<byte_t> bytes) noexcept {
     for (std::size_t index = 0; index != bytes.size(); ++index) {
-        byte_t high = 0, low = 0;
+        byte_t high {}, low {};
         if (!parse_hex_nibble_(text[index * 2], high)) return false;
         if (!parse_hex_nibble_(text[index * 2 + 1], low)) return false;
         bytes[index] = static_cast<byte_t>((high << 4) | low);
@@ -143,7 +146,7 @@ enum class hex_match_t : std::uint8_t {
 [[nodiscard]] inline hex_match_t bytes_match_hex_(span<byte_t const> bytes, char const* text) noexcept {
     hex_match_t answer = hex_match_t::matched_k;
     for (std::size_t index = 0; index != bytes.size(); ++index) {
-        byte_t high = 0, low = 0;
+        byte_t high {}, low {};
         if (!parse_hex_nibble_(text[index * 2], high)) return hex_match_t::malformed_literal_k;
         if (!parse_hex_nibble_(text[index * 2 + 1], low)) return hex_match_t::malformed_literal_k;
         if (bytes[index] != static_cast<byte_t>((high << 4) | low)) answer = hex_match_t::differed_k;
@@ -162,7 +165,8 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
     static char const digits[] = "0123456789abcdef";
     std::size_t const shown = bytes.size() < limit ? bytes.size() : limit;
     for (std::size_t index = 0; index != shown; ++index)
-        fmt::print(stderr, "{}{}", digits[bytes[index] >> 4], digits[bytes[index] & 0x0Fu]);
+        fmt::print(stderr, "{}{}", digits[std::to_integer<unsigned>(bytes[index]) >> 4],
+                   digits[std::to_integer<unsigned>(bytes[index]) & 0x0Fu]);
     if (shown < bytes.size()) fmt::print(stderr, "... ({} bytes total)", bytes.size());
 }
 
@@ -172,7 +176,7 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
 
 /** Whether diagnostics may use colour: only when standard error is a terminal. */
 [[nodiscard]] inline bool diagnostics_are_styled_() noexcept {
-#if defined(UCALL_OS_LINUX_) || defined(UCALL_OS_MACOS_)
+#if UCALL_OS_LINUX_ || UCALL_OS_APPLE_
     static bool const styled = isatty(STDERR_FILENO) != 0;
     return styled;
 #else
@@ -407,7 +411,7 @@ inline void seed_generator_for_test_(char const* name) noexcept {
  */
 inline void install_test_signal_handlers() noexcept {
     auto report = [](int signal_number) noexcept {
-#if defined(UCALL_OS_LINUX_) && defined(__GLIBC__)
+#if UCALL_OS_LINUX_ && defined(__GLIBC__)
         void* frames[32];
         int const depth = backtrace(frames, 32);
         fmt::print(stderr, "Caught signal {}, backtrace follows:\n", signal_number);

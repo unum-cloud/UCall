@@ -1,0 +1,14 @@
+{
+  "lineWidth": 120,
+  "newLineKind": "lf",
+  "includes": ["**/*.md"],
+  "excludes": ["**/.git/", "**/build*/", "**/node_modules/", "**/target/", "forkunion/", "smashtable/", "stringzilla/"],
+  "markdown": {
+    "textWrap": "maintain",
+    "strongKind": "underscores",
+    "table.cellPadding": "align",
+    "codeBlock.skipFormat": true,
+    "html.skipFormat": true
+  },
+  "plugins": ["https://plugins.dprint.dev/markdown-0.26.0.wasm"]
+}

@@ -2,36 +2,18 @@
  *  @file test/noise.cpp
  *  @author Ash Vardanian
  *  @date August 9, 2026
- *  @brief Tests for `secure_tunnel.cpp` - the keyed-hash layer, the handshake, and the record
- *      layer.
- *
- *  @section Why This Includes a `.cpp`
- *
- *  Everything below the tunnel's public surface has internal linkage: the primitives live in an
- *  anonymous namespace so that no translation unit which merely @b drives a tunnel can depend on
- *  the layout of a key schedule. That is the property being relied on, and the cost of it is that a
- *  test reaches them by compiling the file rather than linking it. The target must therefore @b not
- *  also list `src/secure_tunnel.cpp`.
- *
- *  @section What Is Pinned Here
- *
- *  The RFC 4231 and RFC 5869 vectors are the only thing standing between us and a tag that looks
- *  well-formed and interoperates with nobody. They are also the named reproducer for the
- *  `-fno-strict-aliasing` flag in `CMakeLists.txt`, so they are carried byte for byte.
- *
- *  Above them, every record-layer and closing case runs against all three handshake patterns. The
- *  record layer is pattern-independent by construction, and running it against one pattern would be
- *  assuming that rather than checking it - `KK` in particular transmits no static key at all, so
- *  its peer is proven at the split rather than by anything it sent.
+ *  @brief Known-answer cryptographic vectors, Noise handshakes, framing, and record authentication.
  */
 #include <cstring> // `std::memcpy`, `std::memmove`, `std::memset`, `std::strlen`
 
 #include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
 
-#include "secure_tunnel.cpp" // private crypto types exercised by the known-answer tests
+#include "ucall/tunnel.hpp"
 
 using namespace unum::ucall;
 using namespace unum::ucall::test;
+
+using crypto_t = secure_tunnel_crypto<sz_cap_serial_k>;
 
 #pragma region Fixtures
 
@@ -71,13 +53,13 @@ enum class payload_width_t : std::uint32_t {
     empty_k = 0,
     single_byte_k = 1,
     typical_request_k = 512,
-    one_page_k = ram_page_size_k,
+    small_buffer_k = fixture_buffer_bytes_k,
     ceiling_k = secure_tunnel_payload_ceiling_k,
 };
 
 static constexpr payload_width_t payload_widths_k[] = {payload_width_t::empty_k, payload_width_t::single_byte_k,
-                                                       payload_width_t::typical_request_k, payload_width_t::one_page_k,
-                                                       payload_width_t::ceiling_k};
+                                                       payload_width_t::typical_request_k,
+                                                       payload_width_t::small_buffer_k, payload_width_t::ceiling_k};
 
 /** Lets `{}` name a payload width rather than print its byte count twice. */
 [[nodiscard]] inline auto format_as(payload_width_t width) noexcept {
@@ -85,7 +67,7 @@ static constexpr payload_width_t payload_widths_k[] = {payload_width_t::empty_k,
     case payload_width_t::empty_k: return "empty";
     case payload_width_t::single_byte_k: return "single_byte";
     case payload_width_t::typical_request_k: return "typical_request";
-    case payload_width_t::one_page_k: return "one_page";
+    case payload_width_t::small_buffer_k: return "small_buffer";
     case payload_width_t::ceiling_k: return "ceiling";
     }
     return "unknown";
@@ -122,7 +104,7 @@ struct keypair_t {
 struct handshake_stream_t {
 
     /** Fixed storage: at most two messages are ever in flight at once. */
-    byte_t bytes[outbound_capacity_k * 4] {};
+    byte_t bytes[crypto_t::outbound_capacity_k * 4] {};
     std::size_t length {};
 
     void append(span<byte_t const> more) noexcept {
@@ -254,9 +236,9 @@ static void seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_
 
 /** Computes one tag into @p digest and returns a view of it. */
 [[nodiscard]] static span<byte_t const> hmac_of(span<byte_t const> key, span<byte_t const> data,
-                                                byte_t digest[hash_size_k]) noexcept {
-    hmac_sha256(key, data, digest);
-    return {digest, digest + hash_size_k};
+                                                byte_t digest[crypto_t::hash_size_k]) noexcept {
+    crypto_t::hmac_sha256(key, data, digest);
+    return {digest, digest + crypto_t::hash_size_k};
 }
 
 #pragma endregion Fixtures
@@ -266,12 +248,12 @@ static void seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_
 void test_hmac_unit() {
     byte_t key_storage[131];
     byte_t data_storage[50];
-    byte_t digest[hash_size_k];
+    byte_t digest[crypto_t::hash_size_k];
 
     // RFC 4231 §4.2-§4.7, byte for byte: the named reproducer for `-fno-strict-aliasing`, so a
     // digest that drifts here is a miscompile rather than a redesign.
     announce("rfc4231_case1");
-    verify_hex(hmac_of(run_of({key_storage, key_storage + 20}, 0x0b), ascii_bytes("Hi There"), digest),
+    verify_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), ascii_bytes("Hi There"), digest),
                "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
 
     announce("rfc4231_case2");
@@ -279,81 +261,84 @@ void test_hmac_unit() {
                "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 
     announce("rfc4231_case3");
-    verify_hex(
-        hmac_of(run_of({key_storage, key_storage + 20}, 0xaa), run_of({data_storage, data_storage + 50}, 0xdd), digest),
-        "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+    verify_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0xaa}),
+                       run_of({data_storage, data_storage + 50}, byte_t {0xdd}), digest),
+               "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
 
     announce("rfc4231_case6_key_longer_than_block");
-    verify_hex(hmac_of(run_of({key_storage, key_storage + 131}, 0xaa),
+    verify_hex(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
                        ascii_bytes("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
                "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
 
     announce("cached_state_matches_one_shot");
-    span<byte_t const> const cached_key = run_of({key_storage, key_storage + 40}, 0x5a);
-    hmac_sha256_t cached;
+    span<byte_t const> const cached_key = run_of({key_storage, key_storage + 40}, byte_t {0x5a});
+    crypto_t::hmac_sha256_t cached;
     cached.reset(cached_key);
     for (char const* message : {"", "a", "the quick brown fox", "0123456789012345678901234567890123456789"}) {
         span<byte_t const> const data = ascii_bytes(message, std::strlen(message));
-        byte_t reused[hash_size_k], fresh[hash_size_k];
+        byte_t reused[crypto_t::hash_size_k], fresh[crypto_t::hash_size_k];
         cached.compute(data, {}, reused);
-        hmac_sha256(cached_key, data, fresh);
+        crypto_t::hmac_sha256(cached_key, data, fresh);
         verify_bytes(reused, fresh);
     }
 
     announce("split_input_matches_concatenated");
     byte_t joined[17];
     std::memcpy(joined, "chaining-material", 17);
-    hmac_sha256_t split_hmac;
-    split_hmac.reset(run_of({key_storage, key_storage + 32}, 0x0b));
-    byte_t split[hash_size_k];
+    crypto_t::hmac_sha256_t split_hmac;
+    split_hmac.reset(run_of({key_storage, key_storage + 32}, byte_t {0x0b}));
+    byte_t split[crypto_t::hash_size_k];
     split_hmac.compute(ascii_bytes("chaining"), ascii_bytes("-material"), split);
-    verify_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, 0x0b), joined, digest));
+    verify_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
 }
 
 void test_hkdf_unit() {
-    byte_t digest[hash_size_k];
+    byte_t digest[crypto_t::hash_size_k];
     byte_t material_storage[22];
-    span<byte_t const> const material = run_of({material_storage, material_storage + 22}, 0x0b);
+    span<byte_t const> const material = run_of({material_storage, material_storage + 22}, byte_t {0x0b});
 
     // Noise's HKDF is RFC 5869 with an empty info string, so the published key applies unchanged.
     announce("rfc5869_case1_extract");
-    byte_t const salt_storage[] = {0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c};
+    byte_t const salt_storage[] = {byte_t {0x00}, byte_t {0x01}, byte_t {0x02}, byte_t {0x03}, byte_t {0x04},
+                                   byte_t {0x05}, byte_t {0x06}, byte_t {0x07}, byte_t {0x08}, byte_t {0x09},
+                                   byte_t {0x0a}, byte_t {0x0b}, byte_t {0x0c}};
     verify_hex(hmac_of(salt_storage, material, digest),
                "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
 
     // With an empty info string, RFC 5869's T(1) reduces to HMAC(PRK, 0x01).
     announce("first_output_is_expand_of_extract");
-    byte_t chaining_key[hash_size_k];
-    for (std::size_t index = 0; index != hash_size_k; ++index) chaining_key[index] = static_cast<byte_t>(index);
+    byte_t chaining_key[crypto_t::hash_size_k];
+    for (std::size_t index = 0; index != crypto_t::hash_size_k; ++index)
+        chaining_key[index] = static_cast<byte_t>(index);
 
-    byte_t outputs[3][hash_size_k];
-    hkdf_sha256(chaining_key, material, 2, outputs);
+    byte_t outputs[3][crypto_t::hash_size_k];
+    crypto_t::hkdf_sha256(chaining_key, material, 2, outputs);
 
-    byte_t pseudo_random_key[hash_size_k];
-    hmac_sha256(chaining_key, material, pseudo_random_key);
-    byte_t const one = 0x01;
-    byte_t expected[hash_size_k];
-    hmac_sha256(pseudo_random_key, {&one, &one + 1}, expected);
+    byte_t pseudo_random_key[crypto_t::hash_size_k];
+    crypto_t::hmac_sha256(chaining_key, material, pseudo_random_key);
+    byte_t const one = byte_t {0x01};
+    byte_t expected[crypto_t::hash_size_k];
+    crypto_t::hmac_sha256(pseudo_random_key, {&one, &one + 1}, expected);
     verify_bytes(outputs[0], expected);
 
     announce("second_output_chains_from_the_first");
-    byte_t empty_chaining_key[hash_size_k] {};
-    byte_t chained[3][hash_size_k];
-    hkdf_sha256(empty_chaining_key, {}, 2, chained);
+    byte_t empty_chaining_key[crypto_t::hash_size_k] {};
+    byte_t chained[3][crypto_t::hash_size_k];
+    crypto_t::hkdf_sha256(empty_chaining_key, {}, 2, chained);
 
-    hmac_sha256(empty_chaining_key, {}, pseudo_random_key);
-    byte_t const two = 0x02;
-    hmac_sha256_t chaining_hmac;
+    crypto_t::hmac_sha256(empty_chaining_key, {}, pseudo_random_key);
+    byte_t const two = byte_t {0x02};
+    crypto_t::hmac_sha256_t chaining_hmac;
     chaining_hmac.reset(pseudo_random_key);
     chaining_hmac.compute(chained[0], {&two, &two + 1}, expected);
     verify_bytes(chained[1], expected);
     verify(!bytes_equal(chained[0], chained[1]));
 
     announce("third_output_only_derived_when_asked");
-    byte_t two_outputs[3][hash_size_k] {};
-    byte_t three_outputs[3][hash_size_k] {};
-    hkdf_sha256(empty_chaining_key, {}, 2, two_outputs);
-    hkdf_sha256(empty_chaining_key, {}, 3, three_outputs);
+    byte_t two_outputs[3][crypto_t::hash_size_k] {};
+    byte_t three_outputs[3][crypto_t::hash_size_k] {};
+    crypto_t::hkdf_sha256(empty_chaining_key, {}, 2, two_outputs);
+    crypto_t::hkdf_sha256(empty_chaining_key, {}, 3, three_outputs);
     verify_bytes(two_outputs[0], three_outputs[0]);
     verify_bytes(two_outputs[1], three_outputs[1]);
     verify(all_zero(two_outputs[2]));
@@ -365,32 +350,32 @@ void test_transcript_unit() {
     std::size_t const name_length = std::strlen(name);
 
     announce("a_short_protocol_name_is_zero_padded");
-    verify(name_length <= hash_size_k);
-    secure_tunnel_transcript_t padded;
+    verify(name_length <= crypto_t::hash_size_k);
+    crypto_t::secure_tunnel_transcript_t padded;
     padded.initialize(name, name_length);
-    byte_t expected[hash_size_k] {};
+    byte_t expected[crypto_t::hash_size_k] {};
     std::memcpy(expected, name, name_length);
     verify_bytes(padded.hash(), expected);
 
     announce("a_long_protocol_name_is_hashed");
     char long_name[40];
     for (char& character : long_name) character = 'x';
-    secure_tunnel_transcript_t hashed;
+    crypto_t::secure_tunnel_transcript_t hashed;
     hashed.initialize(long_name, sizeof(long_name));
 
     sz_sha256_state_t digest_state;
-    sz_sha256_state_init_best(&digest_state, crypto_capabilities(), nullptr);
-    sz_sha256_state_update_best(&digest_state, long_name, sizeof(long_name), crypto_capabilities(), nullptr);
-    byte_t hashed_expected[hash_size_k];
-    sz_sha256_state_digest_best(&digest_state, hashed_expected, crypto_capabilities(), nullptr);
+    crypto_t::sha_init(&digest_state, nullptr);
+    crypto_t::sha_update(&digest_state, long_name, sizeof(long_name), nullptr);
+    byte_t hashed_expected[crypto_t::hash_size_k];
+    crypto_t::sha_digest(&digest_state, reinterpret_cast<sz_u8_t*>(hashed_expected), nullptr);
     verify_bytes(hashed.hash(), hashed_expected);
 
     announce("mixing_is_order_sensitive");
-    secure_tunnel_transcript_t forward, backward;
+    crypto_t::secure_tunnel_transcript_t forward, backward;
     forward.initialize(name, name_length);
     backward.initialize(name, name_length);
-    byte_t const first[4] = {1, 2, 3, 4};
-    byte_t const second[4] = {5, 6, 7, 8};
+    byte_t const first[4] = {byte_t {1}, byte_t {2}, byte_t {3}, byte_t {4}};
+    byte_t const second[4] = {byte_t {5}, byte_t {6}, byte_t {7}, byte_t {8}};
     forward.mix_hash(first);
     forward.mix_hash(second);
     backward.mix_hash(second);
@@ -399,10 +384,10 @@ void test_transcript_unit() {
     verify(!bytes_equal(forward.hash(), backward.hash()));
 
     announce("an_empty_prologue_still_advances_the_transcript");
-    secure_tunnel_transcript_t prologued;
+    crypto_t::secure_tunnel_transcript_t prologued;
     prologued.initialize(name, name_length);
-    byte_t before[hash_size_k];
-    std::memcpy(before, prologued.hash().data(), hash_size_k);
+    byte_t before[crypto_t::hash_size_k];
+    std::memcpy(before, prologued.hash().data(), crypto_t::hash_size_k);
     prologued.mix_hash({});
     verify(!bytes_equal(prologued.hash(), before));
 }
@@ -412,8 +397,8 @@ void test_entropy_unit() {
     // destroy every ephemeral key.
     announce("distinct_and_never_all_zero");
     byte_t first[32] {}, second[32] {};
-    verify(secure_random_bytes(first, sizeof(first)));
-    verify(secure_random_bytes(second, sizeof(second)));
+    verify(crypto_t::secure_random_bytes(first, sizeof(first)));
+    verify(crypto_t::secure_random_bytes(second, sizeof(second)));
     verify(!all_zero(first));
     verify(!bytes_equal(first, second));
 }
@@ -488,10 +473,9 @@ void test_config_safety() {
 /**
  *  @brief What a bind's `max_payload` does and does not bound.
  *
- *  A bind sets it to bound per-connection memory, and `protocol_shared.hpp:289` sizes the
- *  connection's record buffer from `geometry().record_size()`. But `open` bounds an incoming record
- *  by `max_message_k` alone, so a peer that never agreed to the smaller cap can make
- *  `bytes_until_boundary` demand far more than that buffer can ever hold.
+ *  The sender sizes records from `geometry().record_size()`. Ingress accepts the wire ceiling,
+ *  so a peer with a larger outgoing record can make `bytes_until_boundary` request more bytes
+ *  than the local sender's record buffer holds.
  *
  *  Pinned as it behaves today. If ingress is ever bounded too, this is the case that says so.
  */
@@ -531,7 +515,7 @@ void test_geometry_safety() {
 
         span<byte_t> const window = client.payload_window(wire.whole());
         verify(window.size() == secure_tunnel_payload_ceiling_k);
-        fill_with(window, 'X');
+        fill_with(window, byte_t {'X'});
         wire.length = client.seal(wire.whole(), window.size()).size();
         verify(wire.length > server_buffer, "the capped side was not the smaller one");
 
@@ -617,21 +601,21 @@ void test_handshake_unit() {
     // Forward secrecy: an attacker who later takes the static key, or reads this process's
     // memory, must not be able to reconstruct session keys for traffic already sent.
     announce("ephemeral_secrets_are_destroyed_at_the_split");
-    secure_tunnel_noise_t noise;
+    crypto_t::secure_tunnel_noise_t noise;
     noise.role = secure_tunnel_role_t::initiator_k;
     std::memset(noise.local_ephemeral_private, 0xAB, sizeof(noise.local_ephemeral_private));
     std::memset(noise.remote_ephemeral, 0xCD, sizeof(noise.remote_ephemeral));
     std::memset(noise.local_static_private, 0xEF, sizeof(noise.local_static_private));
     std::memset(noise.remote_static, 0x22, sizeof(noise.remote_static));
-    noise.remote_static_state = remote_static_t::authenticated_k;
+    noise.remote_static_state = crypto_t::remote_static_t::authenticated_k;
 
-    finish_handshake(noise);
+    crypto_t::finish_handshake(noise);
 
     verify(all_zero(noise.local_ephemeral_private));
     verify(all_zero(noise.remote_ephemeral));
     verify(all_zero(noise.local_static_private));
     // The peer's public half survives - it is the answer `peer_key` exists to give.
-    verify(all_equal_to(noise.remote_static, 0x22));
+    verify(all_equal_to(noise.remote_static, byte_t {0x22}));
     verify(noise.sending.has_key());
     verify(noise.receiving.has_key());
 }
@@ -681,7 +665,8 @@ void test_handshake_safety() {
         // Too short for the ephemeral is malformed, not hostile; the faults must differ.
         secure_tunnel_t truncated_responder;
         verify(truncated_responder.make(server_config) == secure_tunnel_fault_t::none_k);
-        byte_t const truncated[] = {0x00, 0x04, 0xde, 0xad, 0xbe, 0xef};
+        byte_t const truncated[] = {byte_t {0x00}, byte_t {0x04}, byte_t {0xde},
+                                    byte_t {0xad}, byte_t {0xbe}, byte_t {0xef}};
         secure_tunnel_step_t const refused = truncated_responder.advance(truncated);
         verify(refused.state == secure_tunnel_state_t::broken_k);
         verify(truncated_responder.fault() == secure_tunnel_fault_t::malformed_k);
@@ -783,7 +768,7 @@ void test_records_unit() {
         // would run off the end of the plaintext.
         seal_into(pair.client, {}, wire);
         verify(wire.length == secure_tunnel_headroom_k + secure_tunnel_tailroom_k);
-        verify(declared_length(wire) == tag_size_k + kind_size_k);
+        verify(declared_length(wire) == crypto_t::tag_size_k + crypto_t::kind_size_k);
         secure_tunnel_opened_t const empty = open_from(pair.server, wire);
         verify(empty.consumed > 0u);
         verify(empty.payload.size() == 0u);
@@ -809,14 +794,14 @@ void test_records_unit() {
     array<byte_t> payload;
     verify(payload.reserve(secure_tunnel_payload_ceiling_k));
     span<byte_t> const widest_scratch {payload.data(), payload.data() + secure_tunnel_payload_ceiling_k};
-    fill_with(widest_scratch, 'M');
+    fill_with(widest_scratch, byte_t {'M'});
     span<byte_t const> const widest = widest_scratch;
 
     connected_pair_t widest_pair;
     widest_pair.connect(secure_tunnel_mode_t::noise_xx_k, secure_tunnel_payload_ceiling_k);
     seal_into(widest_pair.client, widest, wire);
-    verify(declared_length(wire) == max_message_k);
-    verify(wire.length == secure_tunnel_headroom_k + max_message_k);
+    verify(declared_length(wire) == crypto_t::max_message_k);
+    verify(wire.length == secure_tunnel_headroom_k + crypto_t::max_message_k);
     verify(widest_pair.server.bytes_until_boundary(wire.received()) == 0u);
     secure_tunnel_opened_t const opened = open_from(widest_pair.server, wire);
     verify(opened.consumed > 0u);
@@ -845,7 +830,7 @@ void test_records_unit() {
     span<byte_t> const modest_window = modest_pair.client.payload_window(modest.whole());
     verify(modest_window.size() == 1024u, "a {}-byte buffer offered a {}-byte window", modest.storage.capacity(),
            modest_window.size());
-    fill_with(modest_window, 'm');
+    fill_with(modest_window, byte_t {'m'});
     modest.length = modest_pair.client.seal(modest.whole(), modest_window.size()).size();
     verify(modest.length == modest.storage.capacity(), "a capped record did not fill its exact buffer");
     verify(open_from(modest_pair.server, modest).payload.size() == 1024u);
@@ -874,10 +859,10 @@ void test_records_unit() {
     for (std::size_t index = 0; index != sizeof(key); ++index) key[index] = static_cast<byte_t>(index * 7u + 1u);
 
     auto seal_from_a_fresh_sender = [&key](byte_t* record) {
-        secure_tunnel_noise_t sender;
+        crypto_t::secure_tunnel_noise_t sender;
         sender.sending.initialize(key);
         std::memcpy(record + secure_tunnel_headroom_k, "bound", 5);
-        std::size_t const produced = seal_record(sender, record, 5, secure_tunnel_record_t::application_k);
+        std::size_t const produced = crypto_t::seal_record(sender, record, 5, secure_tunnel_record_t::application_k);
         verify(produced > 0u, "a fresh sender refused a five-byte payload");
         return produced;
     };
@@ -888,14 +873,14 @@ void test_records_unit() {
     verify(bytes_equal({first_record, first_record + written}, {second_record, second_record + written}),
            "identical senders sealing identical payloads must agree byte for byte");
 
-    std::size_t const body_size = 5 + kind_size_k;
-    secure_tunnel_cipher_t honest;
+    std::size_t const body_size = 5 + crypto_t::kind_size_k;
+    crypto_t::secure_tunnel_cipher_t honest;
     honest.initialize(key);
     verify(honest.open({first_record, first_record + secure_tunnel_headroom_k},
                        {first_record + secure_tunnel_headroom_k, first_record + secure_tunnel_headroom_k + body_size},
                        first_record + secure_tunnel_headroom_k + body_size));
 
-    secure_tunnel_cipher_t forgetful;
+    crypto_t::secure_tunnel_cipher_t forgetful;
     forgetful.initialize(key);
     verify(!forgetful.open(
         {}, {second_record + secure_tunnel_headroom_k, second_record + secure_tunnel_headroom_k + body_size},
@@ -913,7 +898,8 @@ void test_records_safety() {
             connected_pair_t pair;
             pair.connect(mode);
             seal_into(pair.client, ascii_bytes("authentic"), wire);
-            wire.bytes()[wire.length - 1] ^= 0x01u;
+            auto* bytes = wire.bytes();
+            bytes[wire.length - 1] ^= byte_t {0x01u};
             verify(open_from(pair.server, wire).consumed == 0u);
             verify(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
             verify(pair.server.state() == secure_tunnel_state_t::broken_k);
@@ -925,7 +911,8 @@ void test_records_safety() {
             connected_pair_t pair;
             pair.connect(mode);
             seal_into(pair.client, ascii_bytes("prefix authenticated"), wire);
-            --wire.bytes()[1];
+            auto* bytes = wire.bytes();
+            bytes[1] = byte_t {static_cast<unsigned char>(std::to_integer<unsigned>(bytes[1]) - 1)};
             verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
             verify(open_from(pair.server, wire).consumed == 0u);
             verify(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
@@ -935,7 +922,8 @@ void test_records_safety() {
             connected_pair_t pair;
             pair.connect(mode);
             std::memset(wire.bytes(), 0, 2 + 16);
-            wire.bytes()[1] = 16;
+            auto* bytes = wire.bytes();
+            bytes[1] = byte_t {16};
             wire.length = 2 + 16;
             verify(open_from(pair.server, wire).consumed == 0u);
             verify(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
@@ -950,33 +938,15 @@ void test_records_safety() {
             verify(pair.client.state() == secure_tunnel_state_t::broken_k);
         }
         {
-            // Each empty record costs a decryption and resets the idle timer, so an unbounded run
-            // holds a connection open forever at nineteen bytes apiece.
-            announce("{} consecutive_empty_records_are_bounded", mode);
+            announce("{} empty_records_do_not_impose_a_connection_quota", mode);
             connected_pair_t pair;
             pair.connect(mode);
-            for (std::size_t index = 0; index != empty_record_limit_k; ++index) {
+            for (std::size_t index = 0; index != 64; ++index) {
                 seal_into(pair.client, {}, wire);
                 verify(open_from(pair.server, wire).consumed > 0u);
             }
-            seal_into(pair.client, {}, wire);
-            verify(open_from(pair.server, wire).consumed == 0u);
-            verify(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
-        }
-        {
-            // Without the reset a long-lived connection eventually trips the limit on legitimate
-            // traffic.
-            announce("{} a_carrying_record_resets_the_empty_run", mode);
-            connected_pair_t pair;
-            pair.connect(mode);
-            for (std::size_t cycle = 0; cycle != 3; ++cycle) {
-                for (std::size_t index = 0; index != empty_record_limit_k - 1; ++index) {
-                    seal_into(pair.client, {}, wire);
-                    verify(open_from(pair.server, wire).consumed > 0u);
-                }
-                seal_into(pair.client, ascii_bytes("x"), wire);
-                verify(open_from(pair.server, wire).consumed > 0u);
-            }
+            seal_into(pair.client, ascii_bytes("still open"), wire);
+            verify(open_from(pair.server, wire).consumed > 0u);
         }
         {
             // Re-delivering a record the peer already opened is what a retrying proxy does. The
@@ -1274,11 +1244,7 @@ void test_tunnel_stress() {
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k)
         for (payload_width_t const width : payload_widths_k) {
-            // Past `empty_record_limit_k` the tunnel shuts the connection; that refusal is
-            // `test_records_safety`'s case, not this one's.
-            std::size_t const rounds = width == payload_width_t::empty_k
-                                           ? (exchanges < empty_record_limit_k ? exchanges : empty_record_limit_k)
-                                           : exchanges;
+            std::size_t const rounds = exchanges;
             announce("{} {} x{}", mode, width, rounds);
 
             std::size_t const filled = static_cast<std::size_t>(width);

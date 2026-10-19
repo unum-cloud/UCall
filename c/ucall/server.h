@@ -52,59 +52,21 @@ typedef struct ucall_network_interface_t {
     void* peer_authorizer_context;
 
     /**
-     *  How many event loops accept on this interface. Default: inferred from the hardware.
+     *  Event loops accepting on this interface. Zero uses one loop for an address, or the
+     *  receive-queue count for a named Linux device, bounded by the connection budget.
      *
-     *  Zero means @c min(receive queues on @c device_name, physical cores on its memory domain).
-     *  Physical, not logical: hyperthread siblings measure at roughly a third of a core each for
-     *  this workload, not a full one.
-     *
-     *  The server creates the @b maximum across interfaces, never the sum, and clamps it to the
-     *  machine's core count so threads cannot be oversubscribed. Two interfaces on two devices each
-     *  asking for sixteen loops on a sixteen-core host therefore yield sixteen threads holding
-     *  thirty-two listening sockets, not thirty-two threads. An interface asking for fewer loops
-     *  than the server ends up with is served by the first that many; the rest never accept on it.
-     *  Each participating loop gets its own socket in this address's @c SO_REUSEPORT group, so no
-     *  listening socket is ever shared between threads.
-     *
-     *  @sa @c ucall_server_init_t::resolved reports what the server settled on.
+     *  Each loop has one application polling owner; UCall creates no threads.
+     *  POSIX readiness backends and io_uring share one listen queue through a descriptor per loop.
+     *  IOCP currently accepts one loop per interface because a socket belongs to one completion
+     *  port; requesting more returns @c ucall_status_unsupported_k.
+     *  @sa @c ucall_server_init_t::resolved reports the chosen counts.
      */
     size_t event_loops;
 
-    /** Submission queue entries this interface needs, on each loop that serves it. Default: @c
-     *  max_concurrent_connections.
-     *
-     *  A loop's ring is sized to the @b sum over the interfaces it serves, because one loop has
-     *  one ring and must hold every outstanding operation across all of them. Sizing it here
-     *  rather than server-wide is what lets an interface hosting thousands of connections ask
-     *  for a deeper ring than one hosting a handful.
-     *
-     *  Meaningful only on backends built around a submission ring, and each imposes its own
-     *  ceiling
-     *  - Linux @c io_uring allows 32'768 entries and allocates a completion queue of twice that,
-     *    so a sum exceeding it fails @c ucall_server_init() with @c
-     *    ucall_status_connection_failed_k. Below @c max_concurrent_connections the ring merely
-     *    flushes early, costing a system call per burst rather than failing, which is why the
-     *    library raises it to that floor rather than refusing. Backends without a ring ignore
-     *    this field. */
-    size_t queue_depth;
-
-    /**
-     *  Connections this interface may hold open at once, so one cannot starve another. Default:
-     *  1024.
-     *
-     *  The one independent size on this struct: @c queue_depth and the kernel's listen backlog are
-     *  both derived from it unless overridden. Each connection costs one file descriptor and two
-     *  pages of buffer, so 65'536 connections is roughly half a gigabyte of arena, and the
-     *  descriptor total across every interface and event loop must stay under @c RLIMIT_NOFILE -
-     *  commonly 1024 unraised, 1'048'576 tuned. Exhausting it does not fail the server; the
-     *  interface simply stops accepting until a connection is released, and pending handshakes
-     *  queue in the kernel's backlog behind it.
-     *
-     *  @note The backlog handed to @c listen() is this value, which the operating system then
-     *      clamps to its own ceiling - @c net.core.somaxconn on Linux, 4096 on a modern kernel and
-     *      128 on an old one. That clamp is silent rather than reported, and once the queue
-     *      overflows a completed handshake is dropped and the client retransmits.
-     */
+    /** Required open-connection budget across this interface's loops.
+     *  Accept operations reserve this budget before submission; releasing a connection wakes
+     *  the other loops to resume admission. The OS separately bounds the listen backlog and
+     *  descriptor resources. Receive storage grows with the actual framed message. */
     size_t max_concurrent_connections;
 
 } ucall_network_interface_t;
@@ -117,8 +79,9 @@ typedef struct ucall_server_config_t {
 
     /** Interfaces to answer on. At least one is required.
      *
-     *  The array and every string it points at must outlive the server. Parallelism is the
-     *  largest @c event_loops among the resolved interfaces, not this count. */
+     *  Configuration and identity keys are copied during initialization. Callback contexts must
+     *  outlive the server. Parallelism is the largest @c event_loops among the resolved
+     *  interfaces, not this count. */
     ucall_network_interface_t const* interfaces;
 
     /** Entries in @c interfaces. At least one; zero fails with @c
@@ -140,6 +103,13 @@ typedef struct ucall_server_config_t {
     /** Global tags "key:val,key:val". Default: NULL. */
     char const* metrics_tags;
 
+    /** Requested I/O backend; automatic chooses an available native backend. */
+    ucall_io_backend_t backend;
+
+    /** Requested CPU class; unknown selects from the initialization thread's capabilities.
+     *  Polling threads must support the selected class. Serial is the conservative choice. */
+    ucall_cpu_class_t cpu_class;
+
 } ucall_server_config_t;
 
 /** Arguments of @c ucall_server_init(). */
@@ -148,7 +118,7 @@ typedef struct ucall_server_init_t {
     /** Output for the new server. Free with @c ucall_server_free() at the end. */
     ucall_server_t* server;
 
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    /** Synchronous initialization result. */
     ucall_outcome_t* outcome;
 
     /** Requested configuration. Zeroed fields take their documented defaults. */
@@ -163,21 +133,64 @@ typedef struct ucall_server_init_t {
 
 /**
  *  @brief Initializes the server state.
- *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
+ *  @note Call during setup only, before any loop is polled.
  */
 UCALL_EXPORT void ucall_server_init(ucall_server_init_t* arguments);
 
 /**
- *  @brief Frees the server state. Does nothing for @c NULL.
+ *  @brief Frees the server state after its polling callers have returned. Does nothing for @c NULL.
  *  @param[in] server Server from @c ucall_server_init(), or @c NULL.
  *
- *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
+ *  @note Stop and join polling threads, and finish application use of retained requests before
+ *      teardown. Remaining request handles become invalid. Native I/O retirement can block.
  */
 UCALL_EXPORT void ucall_server_free(ucall_server_t server);
 
+/** Requests shutdown and wakes blocked polling callers.
+ *  Safe from an endpoint callback or a separate thread. */
+UCALL_EXPORT void ucall_server_stop(ucall_server_t server);
+
+/** Arguments of @c ucall_server_take_call(). */
+typedef struct ucall_server_take_call_t {
+
+    /** Initialized server whose routes are ready. */
+    ucall_server_t server;
+
+    /** Outcome of this polling round. */
+    ucall_outcome_t* outcome;
+
+    /** Zero-based loop index; each loop has one polling owner. */
+    size_t event_loop_index;
+
+    /** Maximum wait; zero performs one bounded nonblocking progress round. */
+    size_t timeout_microseconds;
+
+} ucall_server_take_call_t;
+
+/** Advances one server loop and invokes ready callbacks on the calling thread.
+ *  Callbacks run synchronously; the timeout cannot preempt them. */
+UCALL_EXPORT void ucall_server_take_call(ucall_server_take_call_t* arguments);
+
+/** Arguments of @c ucall_server_take_calls(). */
+typedef struct ucall_server_take_calls_t {
+
+    /** Initialized server whose routes are ready. */
+    ucall_server_t server;
+
+    /** Final outcome after polling stops or fails. */
+    ucall_outcome_t* outcome;
+
+    /** Zero-based loop index; each loop has one polling owner. */
+    size_t event_loop_index;
+
+} ucall_server_take_calls_t;
+
+/** Drives one server loop until @c ucall_server_stop() or an I/O failure. */
+UCALL_EXPORT void ucall_server_take_calls(ucall_server_take_calls_t* arguments);
+
 /**
  *  @brief Callback type for handling incoming requests on the server side.
- *  @param[in] request The received request handle.
+ *  @param[in] request Retained until a reply consumes it or the server is freed.
  *  @param[in] context User-supplied context pointer from the endpoint registration.
  */
 typedef void (*ucall_received_http_request_callback_t)(ucall_received_http_request_t request, void* context);
@@ -217,17 +230,20 @@ typedef struct ucall_server_add_http_endpoint_t {
  *
  *  @see RFC 6570 Section 3.2.2 for simple string expansion specification.
  *
- *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
+ *  @note Call during setup only, before any loop is polled.
  */
 UCALL_EXPORT void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments);
 
 /**
  *  @brief Callback type for handling batched requests on the server side.
- *  @param[in] batch The batched request handle.
+ *  @param[in] requests Borrowed array of retained request handles; copy the handles to defer work.
+ *  @param[in] count Number of requests in the array; always positive.
  *  @param[in] context User-defined context pointer.
+ *  @note The array is valid only during the callback. Each request stays valid until a reply
+ *      consumes it or the server is freed, independently of the array and the other requests.
  */
 typedef void (*ucall_received_batch_http_request_callback_t)( //
-    ucall_received_batch_http_request_t batch, void* context);
+    ucall_received_http_request_t const* requests, size_t count, void* context);
 
 /** Arguments of @c ucall_server_add_batch_endpoint().
  *
@@ -277,10 +293,10 @@ typedef struct ucall_server_add_batch_endpoint_t {
  *  - Batch size >= @c max_batch_size: Force dispatch (prevent unbounded growth).
  *
  *
- *  @sa To extract the number of calls in the batch - @c ucall_server_batch_size().
- *  @sa To enumerate separate calls from within the batch - @c ucall_server_batch_unpack().
+ *  The callback receives a counted array of request handles on the polling caller. Copy the
+ *  handles into application-owned storage to process them later; received bytes need no copy.
  *
- *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
+ *  @note Call during setup only, before any loop is polled.
  */
 UCALL_EXPORT void ucall_server_add_batch_endpoint(ucall_server_add_batch_endpoint_t* arguments);
 
@@ -308,46 +324,11 @@ typedef struct ucall_server_add_websocket_endpoint_t {
  *  @brief Registers a WebSocket endpoint to accept incoming connections.
  *
  *  On HTTP Upgrade request, establishes a WebSocket connection and invokes @c callback for all
- *  events (open, message, error, close) on a server worker thread.
+ *  events (open, message, error, close) on the application polling caller.
  *
- *  @note Call during setup only, before any thread enters @c ucall_server_take_calls().
+ *  @note Call during setup only, before any loop is polled.
  */
 UCALL_EXPORT void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* arguments);
-
-/** Arguments of @c ucall_server_take_call. */
-typedef struct ucall_server_take_call_t {
-
-    /** The server whose connections are advanced. */
-    ucall_server_t server;
-
-    /** Output for the outcome of this poll. */
-    ucall_outcome_t* outcome;
-
-    /** The event loop reserved for this thread, below the largest resolved interface loop count. */
-    size_t event_loop_index;
-
-} ucall_server_take_call_t;
-
-/** Advances one event loop through a blocking round of polling. Each loop has one owner thread;
- *  two threads must not advance the same loop concurrently. */
-UCALL_EXPORT void ucall_server_take_call(ucall_server_take_call_t* arguments);
-
-/** Arguments of @c ucall_server_take_calls. */
-typedef struct ucall_server_take_calls_t {
-
-    /** The server whose connections are advanced. */
-    ucall_server_t server;
-
-    /** Output for the outcome if the loop stops on a failure. */
-    ucall_outcome_t* outcome;
-
-    /** The event loop reserved for this thread, below the largest resolved interface loop count. */
-    size_t event_loop_index;
-
-} ucall_server_take_calls_t;
-
-/** Advances one event loop continuously on its owner thread until an I/O failure stops it. */
-UCALL_EXPORT void ucall_server_take_calls(ucall_server_take_calls_t* arguments);
 
 /**
  *  @brief Returns the HTTP method of the received request. Never @c ucall_verb_any_k.
@@ -601,45 +582,6 @@ typedef struct ucall_server_request_part_at_t {
  */
 UCALL_EXPORT void ucall_server_request_part_at(ucall_server_request_part_at_t* arguments);
 
-/**
- *  @brief Returns the number of individual requests in a batch.
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] batch Batch request handle from batch callback.
- *  @return Number of requests in the batch (always >= 1).
- *
- *  @note @b Thread-safe across batches. Two threads must not operate on the @b same @p batch
- *      concurrently.
- */
-UCALL_EXPORT size_t ucall_server_batch_size(ucall_server_t server, ucall_received_batch_http_request_t batch);
-
-/** Arguments of @c ucall_server_batch_unpack(). */
-typedef struct ucall_server_batch_unpack_t {
-
-    /** The server this call operates on. */
-    ucall_server_t server;
-
-    /** Receives @c ucall_status_invalid_argument_k when @c index is not below the batch size. */
-    ucall_outcome_t* outcome;
-
-    /** Batch request handle from batch callback. */
-    ucall_received_batch_http_request_t batch;
-
-    /** Zero-based index of the request to extract. */
-    size_t index;
-
-    /** Output for the extracted request handle. */
-    ucall_received_http_request_t* request;
-
-} ucall_server_batch_unpack_t;
-
-/**
- *  @brief Unpacks an individual request from a batch by index.
- *
- *  @note @b Thread-safe across batches. Two threads must not operate on the @b same @c batch
- *      concurrently.
- */
-UCALL_EXPORT void ucall_server_batch_unpack(ucall_server_batch_unpack_t* arguments);
-
 /** Arguments of @c ucall_server_reply_content(). */
 typedef struct ucall_server_reply_content_t {
 
@@ -655,11 +597,14 @@ typedef struct ucall_server_reply_content_t {
     /** Every HTTP header line, each as a counted byte view. */
     ucall_bytes_view_t const* headers;
 
-    /** Number of header name-value pairs (total strings / 2). */
+    /** Number of counted header lines. */
     size_t headers_count;
 
     /** Response body content. Can be NULL for empty body. */
     ucall_bytes_view_t body;
+
+    /** Response status. Zero sends @c ucall_http_status_ok_k. */
+    ucall_http_status_t http_status;
 
 } ucall_server_reply_content_t;
 
@@ -719,7 +664,7 @@ typedef struct ucall_server_reply_vectored_t {
     /** Every HTTP header line, each as a counted byte view. */
     ucall_bytes_view_t const* headers;
 
-    /** Number of header name-value pairs (total strings / 2). */
+    /** Number of counted header lines. */
     size_t headers_count;
 
     /** Array of buffers concatenated, in order, to form the body. */
@@ -759,7 +704,7 @@ typedef struct ucall_server_reply_begin_t {
     /** Every HTTP header line, each as a counted byte view. */
     ucall_bytes_view_t const* headers;
 
-    /** Number of header name-value pairs (total strings / 2). */
+    /** Number of counted header lines. */
     size_t headers_count;
 
 } ucall_server_reply_begin_t;

@@ -52,18 +52,7 @@
 #include <cpuid.h> // `__get_cpuid_count`
 #endif
 
-#include "crypto_x25519.hpp"
-
-/*
- *  A function attribute cannot hide behind a `using` alias or a template, so this one macro
- *  is unavoidable: it lets GCC and Clang emit MULX/ADCX/ADOX in the saturated kernels while
- *  expanding to nothing under MSVC and on non-x86 targets. It is #undef-ed at end of file.
- */
-#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
-#define UCALL_X25519_TARGET_ADX __attribute__((target("adx,bmi2")))
-#else
-#define UCALL_X25519_TARGET_ADX
-#endif
+#include "ucall/curve25519.hpp"
 
 namespace unum::ucall {
 namespace {
@@ -214,7 +203,7 @@ inline void fiat_25519_cmovznz_u64(std::uint64_t* out1, fiat_25519_uint1_t arg1,
 
 #pragma endregion Compiler Shims
 
-#if UCALL_USE_X25519_RADIX51
+#if UCALL_HAS_INT128_
 
 #pragma region Radix 51 Field Arithmetic
 
@@ -479,7 +468,7 @@ struct field_radix51_t {
 
 #pragma endregion Radix 51 Field Arithmetic
 
-#endif // UCALL_USE_X25519_RADIX51
+#endif // UCALL_HAS_INT128_
 
 #pragma region Saturated Field Arithmetic
 
@@ -830,7 +819,7 @@ struct field_saturated {
 };
 
 using field_serial_t = field_saturated<multiply_serial_t>;
-#if UCALL_USE_X25519_ADX
+#if UCALL_TARGET_X86_ADX
 using field_adx_t = field_saturated<multiply_widening_t>;
 #endif
 
@@ -984,19 +973,23 @@ template <typename field_type_>
 
 } // namespace
 
-bool x25519_scalar_multiply_serial(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
-                                   std::uint8_t const point[x25519_key_size_k]) noexcept {
-    return scalar_multiply_through<field_serial_t>(out, scalar, point);
+bool x25519_scalar_multiply_serial(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k],
+                                   byte_t const point[x25519_key_size_k]) noexcept {
+    return scalar_multiply_through<field_serial_t>(reinterpret_cast<std::uint8_t*>(out),
+                                                   reinterpret_cast<std::uint8_t const*>(scalar),
+                                                   reinterpret_cast<std::uint8_t const*>(point));
 }
 
-#if UCALL_USE_X25519_RADIX51
-bool x25519_scalar_multiply_radix51(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
-                                    std::uint8_t const point[x25519_key_size_k]) noexcept {
-    return scalar_multiply_through<field_radix51_t>(out, scalar, point);
+#if UCALL_HAS_INT128_
+bool x25519_scalar_multiply_radix51(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k],
+                                    byte_t const point[x25519_key_size_k]) noexcept {
+    return scalar_multiply_through<field_radix51_t>(reinterpret_cast<std::uint8_t*>(out),
+                                                    reinterpret_cast<std::uint8_t const*>(scalar),
+                                                    reinterpret_cast<std::uint8_t const*>(point));
 }
 #endif
 
-#if UCALL_USE_X25519_ADX
+#if UCALL_TARGET_X86_ADX
 #if defined(__clang__)
 #pragma clang attribute push(__attribute__((target("adx,bmi2"))), apply_to = function)
 #else
@@ -1009,10 +1002,12 @@ bool x25519_scalar_multiply_radix51(std::uint8_t out[x25519_key_size_k], std::ui
  *  where the template is defined - outside. Without forcing the kernels into this body they compile
  *  untargeted: measured 5 `MULX` against 566. Correctness never depended on it, and neither does
  *  `serial` staying free of `MULX` - the schoolbook multiply has nothing to lower. */
-__attribute__((flatten)) bool x25519_scalar_multiply_adx(std::uint8_t out[x25519_key_size_k],
-                                                         std::uint8_t const scalar[x25519_key_size_k],
-                                                         std::uint8_t const point[x25519_key_size_k]) noexcept {
-    return scalar_multiply_through<field_adx_t>(out, scalar, point);
+__attribute__((flatten)) bool x25519_scalar_multiply_adx(byte_t out[x25519_key_size_k],
+                                                         byte_t const scalar[x25519_key_size_k],
+                                                         byte_t const point[x25519_key_size_k]) noexcept {
+    return scalar_multiply_through<field_adx_t>(reinterpret_cast<std::uint8_t*>(out),
+                                                reinterpret_cast<std::uint8_t const*>(scalar),
+                                                reinterpret_cast<std::uint8_t const*>(point));
 }
 
 #if defined(__clang__)
@@ -1020,7 +1015,7 @@ __attribute__((flatten)) bool x25519_scalar_multiply_adx(std::uint8_t out[x25519
 #else
 #pragma GCC pop_options
 #endif
-#endif
+#endif // UCALL_TARGET_X86_ADX
 
 x25519_tiers_t x25519_tiers_runtime() noexcept {
     auto const always = static_cast<std::uint8_t>(x25519_tiers_t::serial_k) |
@@ -1046,25 +1041,23 @@ char const* x25519_tier_name(x25519_tiers_t tier) noexcept {
     return "mixed";
 }
 
-bool x25519_scalar_multiply(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k],
-                            std::uint8_t const point[x25519_key_size_k]) noexcept {
+bool x25519_scalar_multiply(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k],
+                            byte_t const point[x25519_key_size_k]) noexcept {
     // The chain ends in the baseline, the way every `sz_find_*` chain ends in its serial arm.
     [[maybe_unused]] x25519_tiers_t const tier = x25519_tier_preferred();
-#if UCALL_USE_X25519_ADX
+#if UCALL_TARGET_X86_ADX
     if (tier == x25519_tiers_t::adx_k) return x25519_scalar_multiply_adx(out, scalar, point);
 #endif
-#if UCALL_USE_X25519_RADIX51
+#if UCALL_HAS_INT128_
     if (tier == x25519_tiers_t::radix51_k) return x25519_scalar_multiply_radix51(out, scalar, point);
 #endif
     return x25519_scalar_multiply_serial(out, scalar, point);
 }
 
-void x25519_derive_public(std::uint8_t out[x25519_key_size_k], std::uint8_t const scalar[x25519_key_size_k]) noexcept {
-    static constexpr std::uint8_t base_point_k[x25519_key_size_k] = {9};
+void x25519_derive_public(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k]) noexcept {
+    static constexpr byte_t base_point_k[x25519_key_size_k] = {byte_t {9}};
     // The standard base point has prime order, so a clamped scalar never maps it to zero.
     [[maybe_unused]] bool const nonzero = x25519_scalar_multiply(out, scalar, base_point_k);
 }
 
 } // namespace unum::ucall
-
-#undef UCALL_X25519_TARGET_ADX

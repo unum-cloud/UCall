@@ -7,9 +7,7 @@
 #include <cstddef> // `std::size_t`
 #include <cstring> // `std::strlen`, `std::memcmp`
 
-#include <atomic>      // `std::atomic_ref`
-#include <bit>         // `std::bit_cast`
-#include <type_traits> // `std::underlying_type_t`
+#include <atomic> // `std::atomic_ref`
 
 #include "ucall/types.h"
 
@@ -29,7 +27,7 @@ ucall_status_t ucall_outcome_wait(ucall_outcome_t* outcome) {
 }
 
 char const* ucall_status_name(ucall_status_t status) {
-    switch (std::bit_cast<std::underlying_type_t<ucall_status_t>>(status)) {
+    switch (status) {
     case ucall_status_success_k: return "success";
     case ucall_status_deferred_k: return "deferred";
     case ucall_status_out_of_memory_k: return "out-of-memory";

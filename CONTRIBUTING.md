@@ -6,14 +6,25 @@ They check staged additions, Doxygen and docstring structure, imports, naming, a
 
 ## Compiling C and C++
 
+Building takes CMake 3.28 and a C++20 compiler.
+Initialize the sibling submodules before configuring:
+
 ```bash
-cmake --preset host_debug
-cmake --build --preset host_debug
-ctest --preset host_debug
+git submodule update --init --recursive
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
 ```
 
-The `host_relwithdebinfo` and `host_release` presets build the same suites with optimization.
-StringZilla resolves from its submodule or a pinned fetch; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA` selects an existing checkout.
+The `relwithdebinfo` and `release` presets build the same suites with optimization.
+StringZilla, ForkUnion, and SmashTable resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, and `FETCHCONTENT_SOURCE_DIR_SMASHTABLE` select existing checkouts.
+The build exposes one library as `ucall::ucall`.
+`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLL`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
+CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
+
+`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_echo`, `ucall_example_ledger`, and `ucall_example_redis`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http`.
+Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
+Python and Rust SDK builds await migration to the current C ABI.
 
 ## Running Tests
 
@@ -21,7 +32,50 @@ Native suites live in `test/`, the C caller in `c/test.c`, and benchmark clients
 `UCALL_SEED` selects an unsigned 32-bit seed or `random`, `UCALL_FILTER` selects cases, and `UCALL_MULTIPLIER` scales native sweeps.
 
 ```bash
-UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset host_debug
+UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset debug
 ```
 
-The Python integration suites in `test/` require the example servers they exercise.
+Python comparison adapters exercise explicitly started benchmark services.
+
+## Code Clarity
+
+Use the vocabulary already established by the sibling libraries: variants, CPU classes, capability ladders, and outcomes.
+A name identifies the resource or operation it represents; do not introduce another wrapper to rename an existing concept.
+Class and variable templates have bare names, template parameters end in an underscore, concrete types use `_t`, and concrete constants use `_k`.
+
+Every mutable object has one owner and one authoritative state.
+Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
+That owner holds its connections, protocol transitions, deadlines, and backend operation records.
+Endpoint and batch callbacks execute synchronously on the polling caller.
+Cross-thread retained replies and server shutdown publish state atomically rather than changing the loop's I/O records directly.
+Public contracts say when inputs may be reused, when an outcome becomes final, and which owner must outlive which handle.
+Cancellation requests work to stop; only retirement permits its storage to be reused.
+
+Keep scalar control in the state machine and bulk byte work in capability-selected StringZilla kernels.
+An explicit CPU instantiation exists only when its selected kernels, atomics, or waits differ from its parent.
+Use ForkUnion references for cross-thread admission and publication; keep single-owner counters local.
+Do not add an abstraction, wrapper, flag, or dedicated file for symmetry or a possible future use.
+
+### Capacities and Bounds
+
+Derive storage from a caller's admission budget, protocol geometry, or an actual operating-system or hardware property.
+An I/O transfer limit segments an operation; it does not become a message-size limit.
+Exhausted resources apply backpressure or report allocation failure rather than truncating input.
+Do not tune constants until one benchmark looks good.
+
+### Comments and Formatting
+
+Public C and C++ contracts use Doxygen tags; Python public functions and modules describe their purpose in docstrings.
+A code comment explains a non-obvious reason rather than narrating an operation.
+Keep source headers, attribution, and original creation dates consistent with the file's history.
+
+Begin each Markdown sentence on a separate source line and align table columns.
+Run `dprint fmt` for Markdown, `clang-format` for C and C++, and Ruff for Python.
+The staged-file hooks check these conventions and reject template suffixes even with brace initialization.
+
+### Review and Measurements
+
+A commit message explains the resulting behavior, why the change matters, and how it was checked.
+Stage a concrete review candidate with a proposed title and body; staging does not authorize committing.
+Performance reports name the backend, CPU class, build, placement, workload, admission budgets, and load generator.
+Traced timings explain costs and are not throughput measurements.

@@ -36,14 +36,6 @@ void test_utilities_unit() {
     verify(string_length(nullptr, 0) == 0u);
     verify(string_length(nullptr, 10) == 0u);
 
-    announce("cpu_cycle");
-    // A counter that never advances would silently freeze every idle timer built on it.
-    timestamp_t const before = cpu_cycle();
-    volatile std::size_t sum = 0;
-    for (std::size_t index = 0; index != 1000; ++index) sum = sum + index;
-    timestamp_t const after = cpu_cycle();
-    verify(after >= before);
-
     announce("printable");
     number_and_suffix_t scaled = printable(500);
     verify(nearly_equal(scaled.number, 500.0f) && scaled.suffix == ' ');
@@ -90,31 +82,6 @@ void test_traffic_stats_unit() {
 }
 
 #pragma endregion Utilities
-
-void test_span_unit() {
-    announce("construction_and_access");
-    int values[] = {10, 20, 30, 40, 50};
-    span<int> const viewed_values(values, values + 5);
-    verify(viewed_values.size() == 5u);
-    verify(viewed_values.data() == values);
-    verify(viewed_values[0] == 10);
-    verify(viewed_values[4] == 50);
-
-    announce("iteration");
-    int sum = 0;
-    for (int const value : viewed_values) sum += value;
-    verify(sum == 150);
-
-    announce("string_view_conversion");
-    char characters[] = "hello";
-    span<char> const viewed_characters(characters, characters + 5);
-    std::string_view const as_text = viewed_characters;
-    verify(as_text == "hello");
-
-    announce("an_empty_span_is_default_constructible");
-    span<int> const empty;
-    verify(empty.size() == 0u);
-}
 
 #pragma region Containers
 
@@ -261,18 +228,18 @@ void test_pool_unit() {
 void test_memory_map_unit() {
     announce("remap_allocates_and_reports_its_size");
     memory_map_t mapping;
-    verify(mapping.remap(ram_page_size_k));
+    verify(mapping.remap(fixture_buffer_bytes_k));
     verify(mapping.data() != nullptr);
-    verify(mapping.size() == ram_page_size_k);
+    verify(mapping.size() == fixture_buffer_bytes_k);
 
     announce("pages_arrive_zeroed");
     // A mapping that arrived dirty would hand a connection whatever the last one left behind.
     verify(all_zero({mapping.data(), mapping.data() + mapping.size()}));
 
     announce("remapping_replaces_the_old_mapping");
-    verify(mapping.remap(ram_page_size_k * 2));
+    verify(mapping.remap(fixture_buffer_bytes_k * 2));
     verify(mapping.data() != nullptr);
-    verify(mapping.size() == ram_page_size_k * 2);
+    verify(mapping.size() == fixture_buffer_bytes_k * 2);
 
     announce("reset_unmaps");
     mapping.reset();
@@ -449,7 +416,6 @@ int main() {
 
     run_test("test_utilities_unit", test_utilities_unit);
     run_test("test_traffic_stats_unit", test_traffic_stats_unit);
-    run_test("test_span_unit", test_span_unit);
     run_test("test_round_robin_unit", test_round_robin_unit);
     run_test("test_buffer_unit", test_buffer_unit);
     run_test("test_array_unit", test_array_unit);

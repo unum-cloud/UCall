@@ -3,38 +3,38 @@
   "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
   "configurePresets": [
     {
-      "name": "host",
+      "name": "base",
       "hidden": true,
       "binaryDir": "${sourceDir}/build_${presetName}",
       "cacheVariables": {"UCALL_BUILD_TEST": "ON"}
     },
     {
-      "name": "host_debug",
-      "inherits": "host",
+      "name": "debug",
+      "inherits": "base",
       "displayName": "Host Debug",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
     },
     {
-      "name": "host_relwithdebinfo",
-      "inherits": "host",
+      "name": "relwithdebinfo",
+      "inherits": "base",
       "displayName": "Host RelWithDebInfo",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}
     },
     {
-      "name": "host_release",
-      "inherits": "host",
+      "name": "release",
+      "inherits": "base",
       "displayName": "Host Release",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
     }
   ],
   "buildPresets": [
-    {"name": "host_debug", "configurePreset": "host_debug"},
-    {"name": "host_relwithdebinfo", "configurePreset": "host_relwithdebinfo"},
-    {"name": "host_release", "configurePreset": "host_release"}
+    {"name": "debug", "configurePreset": "debug"},
+    {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
+    {"name": "release", "configurePreset": "release"}
   ],
   "testPresets": [
-    {"name": "host_debug", "configurePreset": "host_debug", "output": {"outputOnFailure": true}},
-    {"name": "host_relwithdebinfo", "configurePreset": "host_relwithdebinfo", "output": {"outputOnFailure": true}},
-    {"name": "host_release", "configurePreset": "host_release", "output": {"outputOnFailure": true}}
+    {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
+    {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": {"outputOnFailure": true}},
+    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}}
   ]
 }

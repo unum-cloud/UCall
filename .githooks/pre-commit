@@ -713,7 +713,7 @@ check_template_type_suffixes() {
         # A `static` member of a class template is not a variable template, though an unchanged `struct` line between
         # them leaves only the `template` line and the member among the added lines.
         function suffixed(line) {
-            return line ~ /constexpr[[:space:]][^=(]*[[:space:]][A-Za-z0-9_]*_[kt][[:space:]]*=/ && line !~ /[[:space:]]static[[:space:]]/
+            return line ~ /constexpr[[:space:]][^=({]*[[:space:]][A-Za-z0-9_]*_[kt][[:space:]]*[={]/ && line !~ /[[:space:]]static[[:space:]]/
         }
         /^\+[[:space:]]*template[[:space:]]*</ { if (suffixed($0)) print; else pending = 1; next }
         pending && /^\+[[:space:]]*requires/ { next }
@@ -1234,6 +1234,13 @@ judge_path() {
         check_blank_line_runs
         check_glued_arrows
         check_sibling_justification
+        if command -v dprint > /dev/null 2>&1; then
+            if ! dprint fmt --config "$PWD/.dprint.json" --stdin "$file" < "$staged_blob" \
+                > "$results_directory/$ordinal.md" 2> /dev/null ||
+                ! cmp -s "$staged_blob" "$results_directory/$ordinal.md"; then
+                fail "$file" "Run dprint fmt on the staged Markdown source."
+            fi
+        fi
         ;;
     *.py | *.pyi)
         check_sibling_justification
@@ -1287,11 +1294,24 @@ run_tree_checks() {
             fail "Cargo.toml" "Run cargo +nightly fmt."
         fi
     fi
-    recorded=$(git ls-files --stage -- stringzilla | awk '$1 == "160000" { print $2 }')
-    pinned=$(git show :CMakeLists.txt | sed -nE 's/^[[:space:]]*GIT_TAG ([0-9a-f]{40}).*/\1/p')
-    if [ -n "$pinned" ] && [ "$recorded" != "$pinned" ]; then
-        fail "stringzilla" "The CMake pin and the staged submodule must name the same commit."
-    fi
+    for sibling in stringzilla forkunion smashtable; do
+        recorded=$(git ls-files --stage -- "$sibling" | awk '$1 == "160000" { print $2 }')
+        pinned=$(git show :CMakeLists.txt | awk -v sibling="$sibling" '
+            /^ucall_sibling\(/ { in_call = 1; name = "" }
+            in_call {
+                for (i = 1; i <= NF; ++i) {
+                    token = $i; gsub(/[()]/, "", token)
+                    if (token == "ucall_sibling") continue
+                    if (name == "") name = token
+                    if (name == sibling && token ~ /^[0-9a-f]+$/ && length(token) == 40) print token
+                }
+                if (/\)/) in_call = 0
+            }
+        ')
+        if [ -z "$pinned" ] || [ "$recorded" != "$pinned" ]; then
+            fail "$sibling" "The CMake pin and the staged submodule must name the same commit."
+        fi
+    done
 }
 
 lint_base=${UCALL_LINT_BASE:-HEAD}
