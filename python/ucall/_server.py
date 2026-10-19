@@ -1,32 +1,30 @@
-import platform
+"""Registers Python endpoint handlers on the native UCall server."""
+
 import inspect
-from typing import Callable, Union, get_type_hints
+import platform
+from collections.abc import Callable
 from functools import wraps
 from io import BytesIO
+from typing import get_type_hints
 
 import numpy as np
 from PIL import Image
 
 
 def supports_io_uring() -> bool:
-    if platform.system() != 'Linux':
+    if platform.system() != "Linux":
         return False
-    major, minor, _ = platform.release().split('.', 3)
+    major, minor, _ = platform.release().split(".", 3)
     major = int(major)
     minor = int(minor)
-    if major > 5 or (major == 5 and minor >= 19):
-        return True
-    return False
+    return bool(major > 5 or major == 5 and minor >= 19)
 
 
 def only_native_types(hints: dict[str, type]) -> bool:
-    for hint in hints.values():
-        if not isinstance(hint, Union[bool, int, float, str]):
-            return False
-    return True
+    return all(hint in (bool, int, float, str) for hint in hints.values())
 
 
-class Protocol():
+class Protocol:
     TCP = 0
     HTTP = 1
     JSONRPC_TCP = 2
@@ -35,11 +33,10 @@ class Protocol():
 
 
 class Server:
-
     def __init__(self, uring_if_possible=True, epoll_if_possible=False, **kwargs) -> None:
         if uring_if_possible and supports_io_uring():
             from ucall import uring as backend
-        elif epoll_if_possible and platform.system() == 'Linux':
+        elif epoll_if_possible and platform.system() == "Linux":
             from ucall import epoll as backend
         else:
             from ucall import posix as backend
@@ -53,7 +50,7 @@ class Server:
         return self.native.run(max_cycles, max_seconds)
 
     def unpack(self, arg: bytes, hint: type):
-        if hint == bytes or hint == bytearray:
+        if hint in (bytes, bytearray):
             return arg
 
         bin = BytesIO(arg)
@@ -82,7 +79,7 @@ class Server:
     def route(self, func: Callable):
         hints = get_type_hints(func)
         for name, hint in hints.items():
-            assert isinstance(hint, type), f'Hint for {name} must be a type!'
+            assert isinstance(hint, type), f"Hint for {name} must be a type!"
 
         # Let's optimize, avoiding the need for the second layer of decorators:
         if only_native_types(hints):
@@ -94,11 +91,8 @@ class Server:
             new_args = []
             new_kwargs = {}
 
-            for arg, hint in zip(args, hints.values()):
-<<<<<<<< HEAD:python/ucall/server.py
-========
+            for arg, hint in zip(args, hints.values(), strict=False):
                 assert isinstance(hint, type), "Hint must be a type!"
->>>>>>>> f8ac7f0998e2e6ef82fa078a5a6dbedea981f18a:python/ucall/_server.py
                 if isinstance(arg, bytes):
                     new_args.append(self.unpack(arg, hint))
                 else:

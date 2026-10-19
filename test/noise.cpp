@@ -1,15 +1,17 @@
 /**
- *  @brief Tests for `secure_tunnel.cpp` - the keyed-hash layer, the handshake, and the record layer.
- *  @file scripts/test_noise.cpp
+ *  @file test/noise.cpp
  *  @author Ash Vardanian
+ *  @date August 9, 2026
+ *  @brief Tests for `secure_tunnel.cpp` - the keyed-hash layer, the handshake, and the record
+ *      layer.
  *
  *  @section Why This Includes a `.cpp`
  *
  *  Everything below the tunnel's public surface has internal linkage: the primitives live in an
  *  anonymous namespace so that no translation unit which merely @b drives a tunnel can depend on
- *  the layout of a key schedule. That is the property being relied on, and the cost of it is that
- *  a test reaches them by compiling the file rather than linking it. The target must therefore
- *  @b not also list `src/secure_tunnel.cpp`.
+ *  the layout of a key schedule. That is the property being relied on, and the cost of it is that a
+ *  test reaches them by compiling the file rather than linking it. The target must therefore @b not
+ *  also list `src/secure_tunnel.cpp`.
  *
  *  @section What Is Pinned Here
  *
@@ -17,35 +19,39 @@
  *  well-formed and interoperates with nobody. They are also the named reproducer for the
  *  `-fno-strict-aliasing` flag in `CMakeLists.txt`, so they are carried byte for byte.
  *
- *  Above them, every record-layer and closing case runs against all three handshake patterns.
- *  The record layer is pattern-independent by construction, and running it against one pattern
- *  would be assuming that rather than checking it - `KK` in particular transmits no static key at
- *  all, so its peer is proven at the split rather than by anything it sent.
+ *  Above them, every record-layer and closing case runs against all three handshake patterns. The
+ *  record layer is pattern-independent by construction, and running it against one pattern would be
+ *  assuming that rather than checking it - `KK` in particular transmits no static key at all, so
+ *  its peer is proven at the split rather than by anything it sent.
  */
 #include <cstring> // `std::memcpy`, `std::memmove`, `std::memset`, `std::strlen`
 
-#include "test.hpp" // `verify`, `run_test`, `scale_iterations`
+#include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
 
-#include "secure_tunnel.cpp" // the implementation, compiled into this test
+#include "secure_tunnel.cpp" // private crypto types exercised by the known-answer tests
 
 using namespace unum::ucall;
-using namespace unum::ucall::scripts;
+using namespace unum::ucall::test;
 
 #pragma region Fixtures
 
-/** @brief Why a handshake stopped, which one @c bool cannot distinguish. */
+/** Why a handshake stopped, which one @c bool cannot distinguish. */
 enum class handshake_outcome_t : std::uint8_t {
-    /** @brief Both ends reached @c ready_k. */
+
+    /** Both ends reached @c ready_k. */
     settled_k,
-    /** @brief One end reported a fault and stopped. */
+
+    /** One end reported a fault and stopped. */
     broken_k,
-    /** @brief Neither end faulted, and neither reached @c ready_k within the pattern's messages. */
+
+    /** Neither end faulted, and neither reached @c ready_k within the pattern's messages. */
     stalled_k,
-    /** @brief A key could not be drawn, or @c make refused the configuration. */
+
+    /** A key could not be drawn, or @c make refused the configuration. */
     misconfigured_k,
 };
 
-/** @brief Lets `{}` name an outcome, so a failed handshake reads as a sentence. */
+/** Lets `{}` name an outcome, so a failed handshake reads as a sentence. */
 [[nodiscard]] inline auto format_as(handshake_outcome_t outcome) noexcept {
     switch (outcome) {
     case handshake_outcome_t::settled_k: return "settled";
@@ -56,11 +62,11 @@ enum class handshake_outcome_t : std::uint8_t {
     return "unknown";
 }
 
-/** @brief Every pattern, in table form, so a sweep is a loop and not a copy-paste. */
+/** Every pattern, in table form, so a sweep is a loop and not a copy-paste. */
 static constexpr secure_tunnel_mode_t tunnel_modes_k[] = {
     secure_tunnel_mode_t::noise_xx_k, secure_tunnel_mode_t::noise_ik_k, secure_tunnel_mode_t::noise_kk_k};
 
-/** @brief Payload widths worth distinguishing, spelled out - never a raw count at a call site. */
+/** Payload widths worth distinguishing, spelled out - never a raw count at a call site. */
 enum class payload_width_t : std::uint32_t {
     empty_k = 0,
     single_byte_k = 1,
@@ -73,7 +79,7 @@ static constexpr payload_width_t payload_widths_k[] = {payload_width_t::empty_k,
                                                        payload_width_t::typical_request_k, payload_width_t::one_page_k,
                                                        payload_width_t::ceiling_k};
 
-/** @brief Lets `{}` name a payload width rather than print its byte count twice. */
+/** Lets `{}` name a payload width rather than print its byte count twice. */
 [[nodiscard]] inline auto format_as(payload_width_t width) noexcept {
     switch (width) {
     case payload_width_t::empty_k: return "empty";
@@ -85,24 +91,24 @@ static constexpr payload_width_t payload_widths_k[] = {payload_width_t::empty_k,
     return "unknown";
 }
 
-/** @brief One driver's record buffer: reserved once, written in place, never copied out of. */
+/** One driver's record buffer: reserved once, written in place, never copied out of. */
 struct wire_t {
     array<byte_t> storage {};
     std::size_t length {};
 
-    /** @brief Room for the widest record the wire format can name. */
+    /** Room for the widest record the wire format can name. */
     [[nodiscard]] bool reserve() noexcept { return storage.reserve(secure_tunnel_max_record_k); }
 
-    /** @brief Room for exactly @p capacity bytes, as a driver sizing from @c record_size would. */
+    /** Room for exactly @p capacity bytes, as a driver sizing from @c record_size would. */
     [[nodiscard]] bool reserve(std::size_t capacity) noexcept { return storage.reserve(capacity); }
     [[nodiscard]] span<byte_t> whole() noexcept { return {storage.data(), storage.data() + storage.capacity()}; }
     [[nodiscard]] span<byte_t> arrived() noexcept { return {storage.data(), storage.data() + length}; }
     [[nodiscard]] span<byte_t const> received() const noexcept { return {storage.data(), storage.data() + length}; }
-    [[nodiscard]] byte_t *bytes() noexcept { return storage.data(); }
-    [[nodiscard]] byte_t const *bytes() const noexcept { return storage.data(); }
+    [[nodiscard]] byte_t* bytes() noexcept { return storage.data(); }
+    [[nodiscard]] byte_t const* bytes() const noexcept { return storage.data(); }
 };
 
-/** @brief A Curve25519 keypair, drawn through the same call a bind or a client handle uses. */
+/** A Curve25519 keypair, drawn through the same call a bind or a client handle uses. */
 struct keypair_t {
     byte_t secret[secure_tunnel_key_size_k] {};
     byte_t shared[secure_tunnel_key_size_k] {};
@@ -112,9 +118,10 @@ struct keypair_t {
     [[nodiscard]] span<byte_t const> public_half() const noexcept { return shared; }
 };
 
-/** @brief One direction of the in-memory wire between two handshaking ends. */
+/** One direction of the in-memory wire between two handshaking ends. */
 struct handshake_stream_t {
-    /** @brief Fixed storage: at most two messages are ever in flight at once. */
+
+    /** Fixed storage: at most two messages are ever in flight at once. */
     byte_t bytes[outbound_capacity_k * 4] {};
     std::size_t length {};
 
@@ -128,7 +135,8 @@ struct handshake_stream_t {
         if (count && count != length) std::memmove(bytes, bytes + count, length - count);
         length -= count;
     }
-    /** @brief What the peer sent and this end has not yet consumed. */
+
+    /** What the peer sent and this end has not yet consumed. */
     [[nodiscard]] span<byte_t const> pending() const noexcept { return {bytes, bytes + length}; }
 };
 
@@ -136,15 +144,15 @@ struct handshake_stream_t {
  *  @brief Drives both ends of a handshake to completion over an in-memory wire.
  *
  *  @c advance promises neither side loops, so each end is driven exactly once per round. Needing
- *  more rounds than the pattern has messages would break that promise, which is why running out
- *  is reported apart from either side breaking.
+ *  more rounds than the pattern has messages would break that promise, which is why running out is
+ *  reported apart from either side breaking.
  */
-[[nodiscard]] static handshake_outcome_t complete_handshake(secure_tunnel_t &initiator,
-                                                            secure_tunnel_t &responder) noexcept {
+[[nodiscard]] static handshake_outcome_t complete_handshake(secure_tunnel_t& initiator,
+                                                            secure_tunnel_t& responder) noexcept {
     handshake_stream_t toward_responder, toward_initiator;
 
-    auto pump = [](secure_tunnel_t &tunnel, handshake_stream_t &inbound,
-                   handshake_stream_t &outbound) noexcept -> secure_tunnel_state_t {
+    auto pump = [](secure_tunnel_t& tunnel, handshake_stream_t& inbound,
+                   handshake_stream_t& outbound) noexcept -> secure_tunnel_state_t {
         secure_tunnel_step_t const step = tunnel.advance(inbound.pending());
         inbound.consume(step.consumed);
         outbound.append(step.outbound);
@@ -162,22 +170,22 @@ struct handshake_stream_t {
     return handshake_outcome_t::stalled_k;
 }
 
-/** @brief A connected pair in the given pattern, with fresh static keys on both sides. */
+/** A connected pair in the given pattern, with fresh static keys on both sides. */
 struct connected_pair_t {
     keypair_t client_keys, server_keys;
     secure_tunnel_t client, server;
 
-    /** @brief Completes a handshake in @p mode, naming the pattern and the failure if one comes. */
+    /** Completes a handshake in @p mode, naming the pattern and the failure if one comes. */
     void connect(secure_tunnel_mode_t mode, std::size_t max_payload = 0) {
         handshake_outcome_t const outcome = attempt(mode, max_payload);
         verify(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
     }
 
-    /** @brief Whether @c attempt draws fresh static keys or uses the ones already in place. */
+    /** Whether @c attempt draws fresh static keys or uses the ones already in place. */
     enum class keys_t : bool { fresh_k, supplied_k };
 
-    /** @brief Reconnects on keys the caller already holds, for the cases about identity reuse. */
-    void connect_with(secure_tunnel_mode_t mode, keypair_t const &client_identity, keypair_t const &server_identity) {
+    /** Reconnects on keys the caller already holds, for the cases about identity reuse. */
+    void connect_with(secure_tunnel_mode_t mode, keypair_t const& client_identity, keypair_t const& server_identity) {
         client_keys = client_identity;
         server_keys = server_identity;
         handshake_outcome_t const outcome = attempt(mode, 0, keys_t::supplied_k);
@@ -214,8 +222,8 @@ struct connected_pair_t {
     }
 };
 
-/** @brief Seals one payload into @p wire, in place, as a driver would. Aborts if the tunnel refuses. */
-static void seal_into(secure_tunnel_t &tunnel, span<byte_t const> payload, wire_t &wire) {
+/** Seals one payload into @p wire, in place, as a driver would. Aborts if the tunnel refuses. */
+static void seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_t& wire) {
     span<byte_t> const window = tunnel.payload_window(wire.whole());
     verify(window.size() >= payload.size(), "a {}-byte window cannot hold {} bytes", window.size(), payload.size());
     if (payload.size()) std::memcpy(window.data(), payload.data(), payload.size());
@@ -223,28 +231,28 @@ static void seal_into(secure_tunnel_t &tunnel, span<byte_t const> payload, wire_
     verify(wire.length > 0u, "the tunnel refused a {}-byte payload with {}", payload.size(), tunnel.fault());
 }
 
-/** @brief Opens one whole record from a wire buffer, in place, exactly as a driver would. */
-[[nodiscard]] static secure_tunnel_opened_t open_from(secure_tunnel_t &tunnel, wire_t &wire) noexcept {
+/** Opens one whole record from a wire buffer, in place, exactly as a driver would. */
+[[nodiscard]] static secure_tunnel_opened_t open_from(secure_tunnel_t& tunnel, wire_t& wire) noexcept {
     return tunnel.open(wire.arrived());
 }
 
-/** @brief The big-endian length a record declares in its prefix. */
-[[nodiscard]] static std::size_t declared_length(wire_t &wire) noexcept {
+/** The big-endian length a record declares in its prefix. */
+[[nodiscard]] static std::size_t declared_length(wire_t& wire) noexcept {
     return (static_cast<std::size_t>(wire.bytes()[0]) << 8) | static_cast<std::size_t>(wire.bytes()[1]);
 }
 
 /**
  *  @brief Builds a run of one repeated byte in scratch storage and views it.
  *
- *  Safe to alias its own argument only because the storage is scratch the caller never reads
- *  back; a sweep that re-reads its buffer keeps the fill and the view apart.
+ *  Safe to alias its own argument only because the storage is scratch the caller never reads back;
+ *  a sweep that re-reads its buffer keeps the fill and the view apart.
  */
 [[nodiscard]] static span<byte_t const> run_of(span<byte_t> bytes, byte_t value) noexcept {
     fill_with(bytes, value);
     return bytes;
 }
 
-/** @brief Computes one tag into @p digest and returns a view of it. */
+/** Computes one tag into @p digest and returns a view of it. */
 [[nodiscard]] static span<byte_t const> hmac_of(span<byte_t const> key, span<byte_t const> data,
                                                 byte_t digest[hash_size_k]) noexcept {
     hmac_sha256(key, data, digest);
@@ -284,7 +292,7 @@ void test_hmac_unit() {
     span<byte_t const> const cached_key = run_of({key_storage, key_storage + 40}, 0x5a);
     hmac_sha256_t cached;
     cached.reset(cached_key);
-    for (char const *message : {"", "a", "the quick brown fox", "0123456789012345678901234567890123456789"}) {
+    for (char const* message : {"", "a", "the quick brown fox", "0123456789012345678901234567890123456789"}) {
         span<byte_t const> const data = ascii_bytes(message, std::strlen(message));
         byte_t reused[hash_size_k], fresh[hash_size_k];
         cached.compute(data, {}, reused);
@@ -353,7 +361,7 @@ void test_hkdf_unit() {
 }
 
 void test_transcript_unit() {
-    char const *const name = "Noise_XX_25519_AESGCM_SHA256";
+    char const* const name = "Noise_XX_25519_AESGCM_SHA256";
     std::size_t const name_length = std::strlen(name);
 
     announce("a_short_protocol_name_is_zero_padded");
@@ -366,15 +374,15 @@ void test_transcript_unit() {
 
     announce("a_long_protocol_name_is_hashed");
     char long_name[40];
-    for (char &character : long_name) character = 'x';
+    for (char& character : long_name) character = 'x';
     secure_tunnel_transcript_t hashed;
     hashed.initialize(long_name, sizeof(long_name));
 
     sz_sha256_state_t digest_state;
-    sz_sha256_state_init(&digest_state);
-    sz_sha256_state_update(&digest_state, long_name, sizeof(long_name));
+    sz_sha256_state_init_best(&digest_state, crypto_capabilities(), nullptr);
+    sz_sha256_state_update_best(&digest_state, long_name, sizeof(long_name), crypto_capabilities(), nullptr);
     byte_t hashed_expected[hash_size_k];
-    sz_sha256_state_digest(&digest_state, hashed_expected);
+    sz_sha256_state_digest_best(&digest_state, hashed_expected, crypto_capabilities(), nullptr);
     verify_bytes(hashed.hash(), hashed_expected);
 
     announce("mixing_is_order_sensitive");
@@ -481,8 +489,8 @@ void test_config_safety() {
  *  @brief What a bind's `max_payload` does and does not bound.
  *
  *  A bind sets it to bound per-connection memory, and `protocol_shared.hpp:289` sizes the
- *  connection's record buffer from `geometry().record_size()`. But `open` bounds an incoming
- *  record by `max_message_k` alone, so a peer that never agreed to the smaller cap can make
+ *  connection's record buffer from `geometry().record_size()`. But `open` bounds an incoming record
+ *  by `max_message_k` alone, so a peer that never agreed to the smaller cap can make
  *  `bytes_until_boundary` demand far more than that buffer can ever hold.
  *
  *  Pinned as it behaves today. If ingress is ever bounded too, this is the case that says so.
@@ -528,8 +536,8 @@ void test_geometry_safety() {
         verify(wire.length > server_buffer, "the capped side was not the smaller one");
 
         // What a driver sees first: two bytes of prefix, and a demand for the rest.
-        std::size_t const demanded =
-            server.bytes_until_boundary({wire.bytes(), wire.bytes() + secure_tunnel_headroom_k});
+        std::size_t const demanded = server.bytes_until_boundary(
+            {wire.bytes(), wire.bytes() + secure_tunnel_headroom_k});
         verify(demanded == wire.length - secure_tunnel_headroom_k);
         verify(demanded + secure_tunnel_headroom_k > server_buffer,
                "the boundary asked for {} bytes into a {}-byte buffer", demanded + secure_tunnel_headroom_k,
@@ -713,7 +721,7 @@ void test_handshake_delivery() {
         verify(responder.make(server_config) == secure_tunnel_fault_t::none_k);
 
         handshake_stream_t toward_responder, toward_initiator;
-        auto trickle = [](secure_tunnel_t &tunnel, handshake_stream_t &inbound, handshake_stream_t &outbound) {
+        auto trickle = [](secure_tunnel_t& tunnel, handshake_stream_t& inbound, handshake_stream_t& outbound) {
             // Everything but the last byte must be refused as incomplete.
             for (std::size_t fed = 1; fed < inbound.length; ++fed) {
                 secure_tunnel_step_t const partial = tunnel.advance({inbound.bytes, inbound.bytes + fed});
@@ -865,7 +873,7 @@ void test_records_unit() {
     byte_t key[secure_tunnel_key_size_k];
     for (std::size_t index = 0; index != sizeof(key); ++index) key[index] = static_cast<byte_t>(index * 7u + 1u);
 
-    auto seal_from_a_fresh_sender = [&key](byte_t *record) {
+    auto seal_from_a_fresh_sender = [&key](byte_t* record) {
         secure_tunnel_noise_t sender;
         sender.sending.initialize(key);
         std::memcpy(record + secure_tunnel_headroom_k, "bound", 5);
@@ -1021,8 +1029,8 @@ void test_records_delivery() {
         seal_into(pair.client, ascii_bytes("boundary"), wire);
         std::size_t const stride = sweep_stride(wire.length);
         for (std::size_t prefix = 0; prefix < wire.length; prefix += stride) {
-            std::size_t const expected =
-                prefix < secure_tunnel_headroom_k ? secure_tunnel_headroom_k - prefix : wire.length - prefix;
+            std::size_t const expected = prefix < secure_tunnel_headroom_k ? secure_tunnel_headroom_k - prefix
+                                                                           : wire.length - prefix;
             std::size_t const answered = pair.server.bytes_until_boundary({wire.bytes(), wire.bytes() + prefix});
             verify(answered == expected, "{} at prefix {} of {} the boundary answered {}, expected {}", mode, prefix,
                    wire.length, answered, expected);
@@ -1163,7 +1171,7 @@ void test_close_unit() {
     }
 }
 
-/** @brief A close coalesced into one read behind the peer's last data record. */
+/** A close coalesced into one read behind the peer's last data record. */
 void test_close_delivery() {
     wire_t wire, tail;
     verify(wire.reserve());
@@ -1253,8 +1261,8 @@ void test_reuse_unit() {
 /**
  *  @brief Every pattern against every payload width, exchanged both ways under a rekey schedule.
  *
- *  The named cases above each pin one property at one width. This is the cross-product, so a
- *  width that only misbehaves under a particular pattern has somewhere to show up.
+ *  The named cases above each pin one property at one width. This is the cross-product, so a width
+ *  that only misbehaves under a particular pattern has somewhere to show up.
  */
 void test_tunnel_stress() {
     wire_t wire;

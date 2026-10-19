@@ -1,0 +1,15 @@
+foreach (suite shared routes x25519 noise)
+    add_executable(ucall_test_${suite} ${suite}.cpp)
+    target_include_directories(ucall_test_${suite} PRIVATE "${PROJECT_SOURCE_DIR}/src")
+    target_link_libraries(ucall_test_${suite} PRIVATE ucall_core fmt::fmt)
+    add_test(NAME ${suite} COMMAND ucall_test_${suite})
+endforeach ()
+
+target_link_libraries(ucall_test_noise PRIVATE stringzilla::static)
+if (NOT MSVC)
+    target_compile_options(ucall_test_noise PRIVATE -fno-strict-aliasing)
+endif ()
+
+add_executable(ucall_test_c "${PROJECT_SOURCE_DIR}/c/test.c")
+target_link_libraries(ucall_test_c PRIVATE ucall_core)
+add_test(NAME c COMMAND ucall_test_c)

@@ -1,7 +1,8 @@
 /**
- *  @brief Tests for the segment-level URI routing trie in @c routes.hpp.
- *  @file scripts/test_routes.cpp
+ *  @file test/routes.cpp
  *  @author Ash Vardanian
+ *  @date November 13, 2025
+ *  @brief Tests for the segment-level URI routing trie in @c routes.hpp.
  *
  *  Every case builds its own trie: precedence is a property of the whole registered set, so a
  *  shared trie would make the answers depend on which case ran first.
@@ -10,15 +11,15 @@
 
 #include <string_view> // `std::string_view`
 
-#include "routes.hpp" // `route_trie_t`, `extract_path_component`
-#include "test.hpp"   // `verify`, `run_test`, `scale_iterations`
+#include "routes.hpp"  // `route_trie_t`, `extract_path_component`
+#include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
 
 using namespace unum::ucall;
-using namespace unum::ucall::scripts;
+using namespace unum::ucall::test;
 
 #pragma region Fixtures
 
-/** @brief Every verb the router distinguishes, so a sweep is a loop rather than seven copies. */
+/** Every verb the router distinguishes, so a sweep is a loop rather than seven copies. */
 static constexpr ucall_verb_t routed_verbs_k[] = {ucall_verb_get_k,    ucall_verb_post_k,  ucall_verb_put_k,
                                                   ucall_verb_delete_k, ucall_verb_patch_k, ucall_verb_head_k,
                                                   ucall_verb_options_k};
@@ -42,37 +43,35 @@ static constexpr ucall_verb_t routed_verbs_k[] = {ucall_verb_get_k,    ucall_ver
     }
 }
 
-/** @brief A stand-in endpoint, distinguishable by the number it was made from. */
-[[nodiscard]] static void *endpoint_numbered(std::uintptr_t number) noexcept {
-    return reinterpret_cast<void *>(number);
-}
+/** A stand-in endpoint, distinguishable by the number it was made from. */
+[[nodiscard]] static void* endpoint_numbered(std::uintptr_t number) noexcept { return reinterpret_cast<void*>(number); }
 
-/** @brief One case's trie, announced as it starts and torn down when its scope ends. */
+/** One case's trie, announced as it starts and torn down when its scope ends. */
 struct routing_case_t {
     route_trie_t trie {};
 
-    explicit routing_case_t(char const *label) {
+    explicit routing_case_t(char const* label) {
         announce("{}", label);
         verify(trie.init(), "the trie for `{}` could not allocate", label);
     }
 
-    /** @brief Registers a route that must be accepted. */
-    void must_add(char const *route, ucall_verb_t verb, void *endpoint) {
+    /** Registers a route that must be accepted. */
+    void must_add(char const* route, ucall_verb_t verb, void* endpoint) {
         verify(trie.insert(route, verb, endpoint), "registering `{}` [{}] was refused", route, verb);
     }
 
-    /** @brief Registers a route that must be rejected. */
-    void must_refuse(char const *route, ucall_verb_t verb, void *endpoint) {
+    /** Registers a route that must be rejected. */
+    void must_refuse(char const* route, ucall_verb_t verb, void* endpoint) {
         verify(!trie.insert(route, verb, endpoint), "registering `{}` [{}] was accepted", route, verb);
     }
 
-    void must_match(char const *path, ucall_verb_t verb, void *expected) const {
-        void *const matched = trie.match(path, verb);
+    void must_match(char const* path, ucall_verb_t verb, void* expected) const {
+        void* const matched = trie.match(path, verb);
         verify(matched == expected, "`{}` [{}] matched endpoint {}, expected {}", path, verb,
                reinterpret_cast<std::uintptr_t>(matched), reinterpret_cast<std::uintptr_t>(expected));
     }
 
-    void must_not_match(char const *path, ucall_verb_t verb) const { must_match(path, verb, nullptr); }
+    void must_not_match(char const* path, ucall_verb_t verb) const { must_match(path, verb, nullptr); }
 };
 
 /**
@@ -86,9 +85,9 @@ struct path_arena_t {
 
     [[nodiscard]] bool reserve(std::size_t routes) noexcept { return characters.reallocate(routes * slot_width_k); }
 
-    /** @brief Writes `/route<index>` into its own slot and returns a view of it. */
+    /** Writes `/route<index>` into its own slot and returns a view of it. */
     [[nodiscard]] std::string_view emit(std::size_t index) {
-        char *const slot = characters.data() + index * slot_width_k;
+        char* const slot = characters.data() + index * slot_width_k;
         auto const written = fmt::format_to_n(slot, slot_width_k - 1, "/route{}", index);
         verify(written.size < slot_width_k, "route {} needs {} characters, the slot holds {}", index, written.size,
                slot_width_k);
@@ -96,8 +95,8 @@ struct path_arena_t {
         return {slot, written.size};
     }
 
-    /** @brief The slot an earlier @c emit filled, as a zero-terminated string. */
-    [[nodiscard]] char const *written(std::size_t index) const noexcept {
+    /** The slot an earlier @c emit filled, as a zero-terminated string. */
+    [[nodiscard]] char const* written(std::size_t index) const noexcept {
         return characters.data() + index * slot_width_k;
     }
 };
@@ -107,9 +106,9 @@ struct path_arena_t {
 #pragma region Known Answers
 
 void test_routes_unit() {
-    void *const first = endpoint_numbered(1);
-    void *const second = endpoint_numbered(2);
-    void *const third = endpoint_numbered(3);
+    void* const first = endpoint_numbered(1);
+    void* const second = endpoint_numbered(2);
+    void* const third = endpoint_numbered(3);
 
     {
         routing_case_t routes("root_path");
@@ -275,8 +274,8 @@ void test_routes_unit() {
 #pragma region Hostile And Malformed Input
 
 void test_routes_safety() {
-    void *const first = endpoint_numbered(1);
-    void *const second = endpoint_numbered(2);
+    void* const first = endpoint_numbered(1);
+    void* const second = endpoint_numbered(2);
 
     {
         routing_case_t routes("an_empty_trie_matches_nothing");
@@ -369,7 +368,7 @@ void test_routes_stress() {
     std::size_t const initial_pools = routes.trie.pool_count();
     std::size_t observed_capacity = routes.trie.capacity();
     std::size_t observed_pools = initial_pools;
-    void *const endpoint = endpoint_numbered(1);
+    void* const endpoint = endpoint_numbered(1);
 
     for (std::size_t index = 0; index != routes_count; ++index) {
         std::string_view const route = arena.emit(index);

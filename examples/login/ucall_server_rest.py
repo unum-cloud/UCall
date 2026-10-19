@@ -1,4 +1,4 @@
-from typing import Optional
+"""UCall REST server for the session-validation example."""
 
 from ucall.server import Protocol
 from ucall.uring import Server
@@ -15,48 +15,48 @@ server = Server(
 books = dict()
 
 
-@server.get('/books')
+@server.get("/books")
 def book_list():
-    return {'books': list(books.values())}
+    return {"books": list(books.values())}
 
 
-@server.get('/books/{book_id}')
+@server.get("/books/{book_id}")
 def book_detail(book_id: str):
     book_id = int(book_id)
     if book_id in books:
-        return {'book': books[book_id]}
+        return {"book": books[book_id]}
     else:
-        raise RuntimeError('Book not found')
+        raise RuntimeError("Book not found")
 
 
-@server.post('/books')
+@server.post("/books")
 def book_add(book_id: int, book_name: str):
-    if book_id in books.keys():
-        raise RuntimeError('Id is busy')
+    if book_id in books:
+        raise RuntimeError("Id is busy")
 
     books[book_id] = book_name
-    return {'book': books[book_id]}
+    return {"book": books[book_id]}
 
 
-@server.put('/books/{old_book_id}')
+@server.put("/books/{old_book_id}")
 def book_update(book_name: str, old_book_id: str):
     old_book_id = int(old_book_id)
-    if old_book_id in books.keys():
+    if old_book_id in books:
         books[old_book_id] = book_name
-        return {'book': books[old_book_id]}
+        return {"book": books[old_book_id]}
     else:
-        raise RuntimeError('Book not found')
+        raise RuntimeError("Book not found")
 
 
-@server.delete('/books/{book_id}')
+@server.delete("/books/{book_id}")
 def book_delete(book_id: str):
     book_id = int(book_id)
-    if book_id in books.keys():
+    if book_id in books:
         books.pop(book_id)
-        return {'books': list(books.values())}
+        return {"books": list(books.values())}
     else:
-        raise RuntimeError('Book not found')
+        raise RuntimeError("Book not found")
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     server.run()

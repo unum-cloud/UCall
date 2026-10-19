@@ -1,45 +1,46 @@
 /**
- *  @brief Curve25519 scalar multiplication per RFC 7748 §5, in two field-arithmetic tiers.
  *  @file src/crypto_x25519.cpp
  *  @author Ash Vardanian
+ *  @date August 4, 2026
+ *  @brief Curve25519 scalar multiplication per RFC 7748 §5, in two field-arithmetic tiers.
  *
  *  @section Tiers
  *
- *  - @c x25519_scalar_multiply_serial - radix-51 limbs over 128-bit products. The portable
- *    tier for any GCC- or Clang-compatible compiler, and the faster one on machines without
- *    ADX carry chains.
- *  - @c x25519_scalar_multiply_adx - saturated 4-limb arithmetic, compiled to @c MULX carry
- *    chains under x86-64 GCC and Clang, and the only tier MSVC builds, where it lowers to
- *    plain @c MUL and @c ADC through @c _umul128 and @c _addcarry_u64. Neither compiler
- *    interleaves the @c ADCX / @c ADOX dual carry chains from C - that is what BoringSSL's
- *    hand-scheduled assembly buys, and it remains the measured follow-up.
+ *  - @c x25519_scalar_multiply_serial - radix-51 limbs over 128-bit products. The portable tier for
+ *    any GCC- or Clang-compatible compiler, and the faster one on machines without ADX carry
+ *    chains.
+ *  - @c x25519_scalar_multiply_adx - saturated 4-limb arithmetic, compiled to @c MULX carry chains
+ *    under x86-64 GCC and Clang, and the only tier MSVC builds, where it lowers to plain @c MUL and
+ *    @c ADC through @c _umul128 and @c _addcarry_u64. Neither compiler interleaves the @c ADCX / @c
+ *    ADOX dual carry chains from C - that is what BoringSSL's hand-scheduled assembly buys, and it
+ *    remains the measured follow-up.
  *
  *  @c x25519_scalar_multiply picks between them once per process from CPUID.
  *
  *  @section Provenance
  *
  *  Every @c fiat_25519_*, @c fiat_*_u64, and @c fe4_* kernel below is a mechanical,
- *  statement-preserving transcription of fiat-crypto's machine-verified output, whose Coq
- *  proofs cover functional correctness and constant-time execution. Only surface syntax
- *  differs: type spellings, grouped declarations, comma-collapsed assignment runs. The
- *  transcription is held to the RFC 7748 and Wycheproof vectors plus a serial-versus-adx
- *  differential suite in `scripts/test_x25519.cpp`, so regenerate a kernel from the pinned
- *  sources below rather than hand-editing its body.
+ *  statement-preserving transcription of fiat-crypto's machine-verified output, whose Coq proofs
+ *  cover functional correctness and constant-time execution. Only surface syntax differs: type
+ *  spellings, grouped declarations, comma-collapsed assignment runs. The transcription is held to
+ *  the RFC 7748 and Wycheproof vectors plus a serial-versus-adx differential suite in
+ *  `test/x25519.cpp`, so regenerate a kernel from the pinned sources below rather than hand-editing
+ *  its body.
  *
  *  @see Fiat Cryptography origin v0.1.6+137, the radix-51 `fiat_25519_*` kernels:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c
  *  @see Fiat Cryptography origin v0.1.6+137, the saturated `fiat_25519_solinas_*` pair:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c
  *  @see BoringSSL origin, main of 2026-08-04, the `fe4_*` family and the carry shims:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h
- *  @see BoringSSL origin, main of 2026-08-04, the inversion chain's shape - forced by the
- *    exponent p-2 = 2^255-21 itself, so any correct Fermat inversion for this prime performs
- *    the same squarings in the same order:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/crypto/curve25519/curve25519.cc#L311-L367
+ *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h
+ *  @see BoringSSL origin, main of 2026-08-04, the inversion chain's shape - forced by the exponent
+ *      p-2 = 2^255-21 itself, so any correct Fermat inversion for this prime performs the same
+ *      squarings in the same order:
+ *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/crypto/curve25519/curve25519.cc#L311-L367
  *
- *  The ladder in @c montgomery_ladder, the clamping, and the small-order check are
- *  transcribed from RFC 7748 §5's pseudocode with the specification's own variable names,
- *  and are shared by both tiers through the field-backend template parameter.
+ *  The ladder in @c montgomery_ladder, the clamping, and the small-order check are transcribed from
+ *  RFC 7748 §5's pseudocode with the specification's own variable names, and are shared by both
+ *  tiers through the field-backend template parameter.
  */
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
@@ -73,6 +74,7 @@ using fiat_25519_uint1_t = unsigned char;
 using fiat_25519_int1_t = signed char;
 
 #if defined(__SIZEOF_INT128__)
+
 /**
  *  @brief The 128-bit accumulator the radix-51 limbs multiply into.
  *
@@ -85,13 +87,13 @@ __extension__ typedef unsigned __int128 fiat_25519_uint128_t;
 /**
  *  @brief Returns @p value while hiding everything the optimizer knows about it.
  *
- *  Without this, a compiler that can prove the mask in @c fiat_25519_cmovznz_u64 is 0 or ~0
- *  may rewrite the masked select into a branch, turning a constant-time kernel into a
- *  key-dependent one. MSVC has no empty-asm barrier and no equivalent intrinsic -
- *  @c _ReadWriteBarrier is a deprecated memory-ordering fence that does not hide a register
- *  value's range - so the conforming substitute is a volatile round-trip: the load cannot be
- *  folded, and no range fact survives it. fiat-crypto and BoringSSL both compile this
- *  barrier to a plain identity under MSVC, so the round-trip is strictly stronger.
+ *  Without this, a compiler that can prove the mask in @c fiat_25519_cmovznz_u64 is 0 or ~0 may
+ *  rewrite the masked select into a branch, turning a constant-time kernel into a key-dependent
+ *  one. MSVC has no empty-asm barrier and no equivalent intrinsic - @c _ReadWriteBarrier is a
+ *  deprecated memory-ordering fence that does not hide a register value's range - so the conforming
+ *  substitute is a volatile round-trip: the load cannot be folded, and no range fact survives it.
+ *  fiat-crypto and BoringSSL both compile this barrier to a plain identity under MSVC, so the
+ *  round-trip is strictly stronger.
  */
 [[nodiscard]] inline std::uint64_t value_barrier(std::uint64_t value) noexcept {
 #if defined(__GNUC__) || defined(__clang__)
@@ -111,7 +113,7 @@ __extension__ typedef unsigned __int128 fiat_25519_uint128_t;
  *  the serial tier stays runnable on every x86-64 however a target region is scoped.
  */
 struct multiply_serial_t {
-    static void wide(std::uint64_t *out1, std::uint64_t *out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
+    static void wide(std::uint64_t* out1, std::uint64_t* out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
         std::uint64_t const arg1_low = arg1 & 0xFFFFFFFFull, arg1_high = arg1 >> 32;
         std::uint64_t const arg2_low = arg2 & 0xFFFFFFFFull, arg2_high = arg2 >> 32;
         std::uint64_t partial = arg1_low * arg2_low;
@@ -128,10 +130,10 @@ struct multiply_serial_t {
 /**
  *  @brief Multiplies through whatever 64×64 → 128 facility the toolchain offers.
  *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L44
+ *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L44
  */
 struct multiply_widening_t {
-    static void wide(std::uint64_t *out1, std::uint64_t *out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
+    static void wide(std::uint64_t* out1, std::uint64_t* out2, std::uint64_t arg1, std::uint64_t arg2) noexcept {
 #if defined(__SIZEOF_INT128__)
         fiat_25519_uint128_t const product = (fiat_25519_uint128_t)arg1 * arg2;
         *out1 = (std::uint64_t)product, *out2 = (std::uint64_t)(product >> 64);
@@ -148,9 +150,9 @@ struct multiply_widening_t {
 /**
  *  @brief 64-bit add with carry: @p out1 = @p arg2 + @p arg3 + @p arg1, @p out2 the carry-out.
  *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L76
+ *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L76
  */
-inline void fiat_addcarryx_u64(std::uint64_t *out1, fiat_25519_uint1_t *out2, fiat_25519_uint1_t arg1,
+inline void fiat_addcarryx_u64(std::uint64_t* out1, fiat_25519_uint1_t* out2, fiat_25519_uint1_t arg1,
                                std::uint64_t arg2, std::uint64_t arg3) noexcept {
 #if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
     unsigned long long summed;
@@ -166,11 +168,12 @@ inline void fiat_addcarryx_u64(std::uint64_t *out1, fiat_25519_uint1_t *out2, fi
 }
 
 /**
- *  @brief 64-bit subtract with borrow: @p out1 = @p arg2 - @p arg3 - @p arg1, @p out2 the borrow-out.
+ *  @brief 64-bit subtract with borrow: @p out1 = @p arg2 - @p arg3 - @p arg1, @p out2 the
+ *      borrow-out.
  *  @see BoringSSL origin, main of 2026-08-04:
- *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L116
+ *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L116
  */
-inline void fiat_subborrowx_u64(std::uint64_t *out1, fiat_25519_uint1_t *out2, fiat_25519_uint1_t arg1,
+inline void fiat_subborrowx_u64(std::uint64_t* out1, fiat_25519_uint1_t* out2, fiat_25519_uint1_t arg1,
                                 std::uint64_t arg2, std::uint64_t arg3) noexcept {
 #if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
     unsigned long long differenced;
@@ -182,11 +185,12 @@ inline void fiat_subborrowx_u64(std::uint64_t *out1, fiat_25519_uint1_t *out2, f
 }
 
 /**
- *  @brief Constant-time select: @p out1 = @p arg1 ? @p arg3 : @p arg2, masked rather than branched. Both tiers use it.
+ *  @brief Constant-time select: @p out1 = @p arg1 ? @p arg3 : @p arg2, masked rather than branched.
+ *      Both tiers use it.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L116
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L116
  */
-inline void fiat_25519_cmovznz_u64(std::uint64_t *out1, fiat_25519_uint1_t arg1, std::uint64_t arg2,
+inline void fiat_25519_cmovznz_u64(std::uint64_t* out1, fiat_25519_uint1_t arg1, std::uint64_t arg2,
                                    std::uint64_t arg3) noexcept {
     fiat_25519_uint1_t x1;
     std::uint64_t x2, x3;
@@ -194,7 +198,8 @@ inline void fiat_25519_cmovznz_u64(std::uint64_t *out1, fiat_25519_uint1_t arg1,
     x3 = ((value_barrier(x2) & arg3) | (value_barrier((~x2)) & arg2)), *out1 = x3;
 }
 
-/** @brief True when the CPU executes the ADX and BMI2 instruction sets the saturated tier is compiled for. */
+/** True when the CPU executes the ADX and BMI2 instruction sets the saturated tier is compiled
+ *  for. */
 [[nodiscard]] inline bool cpu_supports_adx_and_bmi2() noexcept {
 #if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
     unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
@@ -214,11 +219,12 @@ inline void fiat_25519_cmovznz_u64(std::uint64_t *out1, fiat_25519_uint1_t arg1,
 #pragma region Radix 51 Field Arithmetic
 
 /**
- *  @brief Adds @p arg2, @p arg3, and carry-in @p arg1 within a 51-bit limb, splitting sum and carry-out.
+ *  @brief Adds @p arg2, @p arg3, and carry-in @p arg1 within a 51-bit limb, splitting sum and
+ *      carry-out.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L66
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L66
  */
-inline void fiat_25519_addcarryx_u51(std::uint64_t *out1, fiat_25519_uint1_t *out2, fiat_25519_uint1_t arg1,
+inline void fiat_25519_addcarryx_u51(std::uint64_t* out1, fiat_25519_uint1_t* out2, fiat_25519_uint1_t arg1,
                                      std::uint64_t arg2, std::uint64_t arg3) noexcept {
     std::uint64_t x1, x2;
     fiat_25519_uint1_t x3;
@@ -227,12 +233,12 @@ inline void fiat_25519_addcarryx_u51(std::uint64_t *out1, fiat_25519_uint1_t *ou
 }
 
 /**
- *  @brief Subtracts @p arg3 and borrow-in @p arg1 from @p arg2 within a 51-bit limb, splitting difference and
- * borrow-out.
+ *  @brief Subtracts @p arg3 and borrow-in @p arg1 from @p arg2 within a 51-bit limb, splitting
+ *      difference and borrow-out.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L92
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L92
  */
-inline void fiat_25519_subborrowx_u51(std::uint64_t *out1, fiat_25519_uint1_t *out2, fiat_25519_uint1_t arg1,
+inline void fiat_25519_subborrowx_u51(std::uint64_t* out1, fiat_25519_uint1_t* out2, fiat_25519_uint1_t arg1,
                                       std::uint64_t arg2, std::uint64_t arg3) noexcept {
     std::int64_t x1;
     fiat_25519_int1_t x2;
@@ -244,7 +250,7 @@ inline void fiat_25519_subborrowx_u51(std::uint64_t *out1, fiat_25519_uint1_t *o
 /**
  *  @brief Multiplies two radix-51 elements and reduces mod 2^255-19 into tight bounds.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L133
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L133
  */
 inline void fiat_25519_carry_mul(std::uint64_t out1[5], std::uint64_t const arg1[5],
                                  std::uint64_t const arg2[5]) noexcept {
@@ -285,7 +291,7 @@ inline void fiat_25519_carry_mul(std::uint64_t out1[5], std::uint64_t const arg1
 /**
  *  @brief Carries a loose radix-51 element back into tight bounds.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L367
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L367
  */
 inline void fiat_25519_carry(std::uint64_t out1[5], std::uint64_t const arg1[5]) noexcept {
     std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12;
@@ -300,7 +306,7 @@ inline void fiat_25519_carry(std::uint64_t out1[5], std::uint64_t const arg1[5])
 /**
  *  @brief Adds tight radix-51 elements into a loose result awaiting @c fiat_25519_carry.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L406
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L406
  */
 inline void fiat_25519_add(std::uint64_t out1[5], std::uint64_t const arg1[5], std::uint64_t const arg2[5]) noexcept {
     std::uint64_t x1, x2, x3, x4, x5;
@@ -312,7 +318,7 @@ inline void fiat_25519_add(std::uint64_t out1[5], std::uint64_t const arg1[5], s
 /**
  *  @brief Subtracts tight radix-51 elements into a loose result awaiting @c fiat_25519_carry.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L431
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L431
  */
 inline void fiat_25519_sub(std::uint64_t out1[5], std::uint64_t const arg1[5], std::uint64_t const arg2[5]) noexcept {
     std::uint64_t x1, x2, x3, x4, x5;
@@ -325,7 +331,7 @@ inline void fiat_25519_sub(std::uint64_t out1[5], std::uint64_t const arg1[5], s
 /**
  *  @brief Serializes a tight radix-51 element to 32 canonical little-endian bytes.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L514
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L514
  */
 inline void fiat_25519_to_bytes(std::uint8_t out1[32], std::uint64_t const arg1[5]) noexcept {
     std::uint64_t x1, x3, x5, x7, x9, x11, x12, x14, x16, x18, x20, x22, x23, x24, x25, x27, x29, x31, x33, x35, x38,
@@ -375,7 +381,7 @@ inline void fiat_25519_to_bytes(std::uint8_t out1[32], std::uint64_t const arg1[
 /**
  *  @brief Deserializes 32 little-endian bytes, bit 255 pre-cleared, into a tight radix-51 element.
  *  @see Fiat Cryptography origin v0.1.6+137:
- *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L730
+ *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L730
  */
 inline void fiat_25519_from_bytes(std::uint64_t out1[5], std::uint8_t const arg1[32]) noexcept {
     std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21, x22,
@@ -413,12 +419,11 @@ inline void fiat_25519_from_bytes(std::uint64_t out1[5], std::uint8_t const arg1
 /**
  *  @brief The radix-51 field backend: five 51-bit limbs, little-endian, 128-bit products.
  *
- *  fiat-crypto distinguishes "tight" (freshly carried) from "loose" (freshly added or
- *  subtracted, wider) limb bounds so a caller can skip a carry between them. That
- *  distinction buys throughput, and throughput is not the concern of a primitive that runs
- *  four times per handshake rather than once per byte, so every sum and difference is
- *  carried back to tight bounds before reuse. A tight value always satisfies a loose
- *  precondition, so this is never unsafe, only slower.
+ *  fiat-crypto distinguishes "tight" (freshly carried) from "loose" (freshly added or subtracted,
+ *  wider) limb bounds so a caller can skip a carry between them. That distinction buys throughput,
+ *  and throughput is not the concern of a primitive that runs four times per handshake rather than
+ *  once per byte, so every sum and difference is carried back to tight bounds before reuse. A tight
+ *  value always satisfies a loose precondition, so this is never unsafe, only slower.
  */
 struct field_radix51_t {
     struct element_t {
@@ -428,32 +433,32 @@ struct field_radix51_t {
     static element_t zero() noexcept { return {{0, 0, 0, 0, 0}}; }
     static element_t one() noexcept { return {{1, 0, 0, 0, 0}}; }
 
-    static void add(element_t &out, element_t const &first, element_t const &second) noexcept {
+    static void add(element_t& out, element_t const& first, element_t const& second) noexcept {
         element_t loose;
         fiat_25519_add(loose.limb, first.limb, second.limb);
         fiat_25519_carry(out.limb, loose.limb);
     }
 
-    static void subtract(element_t &out, element_t const &first, element_t const &second) noexcept {
+    static void subtract(element_t& out, element_t const& first, element_t const& second) noexcept {
         element_t loose;
         fiat_25519_sub(loose.limb, first.limb, second.limb);
         fiat_25519_carry(out.limb, loose.limb);
     }
 
-    /** @brief May alias @p out with either input - fiat kernels read everything before writing. */
-    static void multiply(element_t &out, element_t const &first, element_t const &second) noexcept {
+    /** May alias @p out with either input - fiat kernels read everything before writing. */
+    static void multiply(element_t& out, element_t const& first, element_t const& second) noexcept {
         fiat_25519_carry_mul(out.limb, first.limb, second.limb);
     }
 
-    static void square(element_t &out, element_t const &value) noexcept { multiply(out, value, value); }
+    static void square(element_t& out, element_t const& value) noexcept { multiply(out, value, value); }
 
-    static void multiply_small(element_t &out, element_t const &value, std::uint64_t small) noexcept {
+    static void multiply_small(element_t& out, element_t const& value, std::uint64_t small) noexcept {
         element_t const factor {{small, 0, 0, 0, 0}};
         fiat_25519_carry_mul(out.limb, value.limb, factor.limb);
     }
 
-    /** @brief Constant-time swap when @p bit is 1: a barriered mask select, never a branch. */
-    static void conditional_swap(element_t &first, element_t &second, std::uint64_t bit) noexcept {
+    /** Constant-time swap when @p bit is 1: a barriered mask select, never a branch. */
+    static void conditional_swap(element_t& first, element_t& second, std::uint64_t bit) noexcept {
         std::uint64_t const mask = value_barrier(0 - bit);
         for (std::size_t index = 0; index != 5; ++index) {
             std::uint64_t const difference = (first.limb[index] ^ second.limb[index]) & mask;
@@ -462,12 +467,12 @@ struct field_radix51_t {
         }
     }
 
-    /** @brief Precondition: bit 255 of @p bytes is already clear - the caller masks it per RFC 7748 §5. */
-    static void from_bytes(element_t &out, std::uint8_t const bytes[x25519_key_size_k]) noexcept {
+    /** Precondition: bit 255 of @p bytes is already clear - the caller masks it per RFC 7748 §5. */
+    static void from_bytes(element_t& out, std::uint8_t const bytes[x25519_key_size_k]) noexcept {
         fiat_25519_from_bytes(out.limb, bytes);
     }
 
-    static void to_bytes(std::uint8_t bytes[x25519_key_size_k], element_t const &value) noexcept {
+    static void to_bytes(std::uint8_t bytes[x25519_key_size_k], element_t const& value) noexcept {
         fiat_25519_to_bytes(bytes, value.limb);
     }
 };
@@ -479,11 +484,12 @@ struct field_radix51_t {
 #pragma region Saturated Field Arithmetic
 
 /**
- *  @brief Saturated four-limb arithmetic over 2^255-19, over whichever widening multiply it is given.
+ *  @brief Saturated four-limb arithmetic over 2^255-19, over whichever widening multiply it is
+ *      given.
  *
  *  The multiply is the only thing that separates the tiers, so it is the only thing parameterised:
- *  @c multiply_serial_t keeps the kernels free of any widening operation at all, and
- *  @c multiply_widening_t lets the compiler lower one to @c MULX inside a target region.
+ *  @c multiply_serial_t keeps the kernels free of any widening operation at all, and @c
+ *  multiply_widening_t lets the compiler lower one to @c MULX inside a target region.
  */
 template <typename multiply_>
 struct field_saturated {
@@ -491,7 +497,7 @@ struct field_saturated {
     /**
      *  @brief Multiplies two saturated 4-limb elements mod 2^255-19.
      *  @see Fiat Cryptography origin v0.1.6+137:
-     *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L150
+     *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L150
      */
     static void fiat_25519_solinas_mul(std::uint64_t out1[4], std::uint64_t const arg1[4],
                                        std::uint64_t const arg2[4]) noexcept {
@@ -578,7 +584,7 @@ struct field_saturated {
     /**
      *  @brief Squares a saturated 4-limb element mod 2^255-19.
      *  @see Fiat Cryptography origin v0.1.6+137:
-     *    https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L369
+     *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L369
      */
     static void fiat_25519_solinas_square(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
         std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x13, x15, x17, x19, x20, x21, x22, x24, x26, x28,
@@ -646,7 +652,7 @@ struct field_saturated {
     /**
      *  @brief Adds saturated 4-limb elements mod 2^255-19.
      *  @see BoringSSL origin, main of 2026-08-04:
-     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L169
+     *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L169
      */
     static void fe4_add(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t const arg2[4]) noexcept {
         std::uint64_t x1, x3, x5, x7, x9, x10, x12, x14, x16, x18, x19;
@@ -668,7 +674,7 @@ struct field_saturated {
     /**
      *  @brief Subtracts saturated 4-limb elements mod 2^255-19.
      *  @see BoringSSL origin, main of 2026-08-04:
-     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L215
+     *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L215
      */
     static void fe4_sub(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t const arg2[4]) noexcept {
         std::uint64_t x1, x2, x4, x5, x7, x8, x10, x11, x13, x14, x16, x18, x20, x22, x23;
@@ -694,7 +700,7 @@ struct field_saturated {
     /**
      *  @brief Multiplies a saturated 4-limb element by a small scalar constant, at most 2^58-1.
      *  @see BoringSSL origin, main of 2026-08-04:
-     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L269
+     *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L269
      */
     static void fe4_scmul(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t arg2) noexcept {
         std::uint64_t x1, x2, x3, x4, x5, x7, x8, x9, x11, x12, x13, x15, x16, x17, x19, x21, x23, x25, x26;
@@ -719,7 +725,7 @@ struct field_saturated {
     /**
      *  @brief Reduces a saturated 4-limb element to its canonical representative below 2^255-19.
      *  @see BoringSSL origin, main of 2026-08-04:
-     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L324
+     *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L324
      */
     static void fe4_canon(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
         std::uint64_t x1, x3, x5, x7, x9, x10, x11, x12, x13, x15, x17, x19, x21, x22, x23, x24;
@@ -744,9 +750,10 @@ struct field_saturated {
     }
 
     /**
-     *  @brief Constant-time conditional swap of two saturated 4-limb elements; outputs may alias inputs.
+     *  @brief Constant-time conditional swap of two saturated 4-limb elements; outputs may alias
+     *      inputs.
      *  @see BoringSSL origin, main of 2026-08-04:
-     *    https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L381
+     *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L381
      */
     static void fe4_cswap(std::uint64_t out1[4], std::uint64_t out2[4], fiat_25519_uint1_t arg1,
                           std::uint64_t const arg2[4], std::uint64_t const arg3[4]) noexcept {
@@ -765,9 +772,9 @@ struct field_saturated {
     /**
      *  @brief The saturated field backend: four full 64-bit limbs, little-endian, carry-chained.
      *
-     *  `fe4` is fiat's name for this shape - a field element in four limbs. Values stay
-     *  unreduced anywhere below 2^256 between operations; @c fe4_canon produces the canonical
-     *  representative below 2^255-19 only at serialization.
+     *  `fe4` is fiat's name for this shape - a field element in four limbs. Values stay unreduced
+     *  anywhere below 2^256 between operations; @c fe4_canon produces the canonical representative
+     *  below 2^255-19 only at serialization.
      */
 
     struct element_t {
@@ -777,34 +784,34 @@ struct field_saturated {
     static element_t zero() noexcept { return {{0, 0, 0, 0}}; }
     static element_t one() noexcept { return {{1, 0, 0, 0}}; }
 
-    static void add(element_t &out, element_t const &first, element_t const &second) noexcept {
+    static void add(element_t& out, element_t const& first, element_t const& second) noexcept {
         fe4_add(out.limb, first.limb, second.limb);
     }
 
-    static void subtract(element_t &out, element_t const &first, element_t const &second) noexcept {
+    static void subtract(element_t& out, element_t const& first, element_t const& second) noexcept {
         fe4_sub(out.limb, first.limb, second.limb);
     }
 
-    /** @brief May alias @p out with either input - fiat kernels read everything before writing. */
-    static void multiply(element_t &out, element_t const &first, element_t const &second) noexcept {
+    /** May alias @p out with either input - fiat kernels read everything before writing. */
+    static void multiply(element_t& out, element_t const& first, element_t const& second) noexcept {
         fiat_25519_solinas_mul(out.limb, first.limb, second.limb);
     }
 
-    static void square(element_t &out, element_t const &value) noexcept {
+    static void square(element_t& out, element_t const& value) noexcept {
         fiat_25519_solinas_square(out.limb, value.limb);
     }
 
-    static void multiply_small(element_t &out, element_t const &value, std::uint64_t small) noexcept {
+    static void multiply_small(element_t& out, element_t const& value, std::uint64_t small) noexcept {
         fe4_scmul(out.limb, value.limb, small);
     }
 
-    /** @brief Constant-time swap when @p bit is 1: a barriered mask select, never a branch. */
-    static void conditional_swap(element_t &first, element_t &second, std::uint64_t bit) noexcept {
+    /** Constant-time swap when @p bit is 1: a barriered mask select, never a branch. */
+    static void conditional_swap(element_t& first, element_t& second, std::uint64_t bit) noexcept {
         fe4_cswap(first.limb, second.limb, (fiat_25519_uint1_t)bit, first.limb, second.limb);
     }
 
-    /** @brief Precondition: bit 255 of @p bytes is already clear - the caller masks it per RFC 7748 §5. */
-    static void from_bytes(element_t &out, std::uint8_t const bytes[x25519_key_size_k]) noexcept {
+    /** Precondition: bit 255 of @p bytes is already clear - the caller masks it per RFC 7748 §5. */
+    static void from_bytes(element_t& out, std::uint8_t const bytes[x25519_key_size_k]) noexcept {
         for (std::size_t limb_index = 0; limb_index != 4; ++limb_index) {
             std::uint64_t assembled = 0;
             for (std::size_t byte_index = 0; byte_index != 8; ++byte_index)
@@ -813,7 +820,7 @@ struct field_saturated {
         }
     }
 
-    static void to_bytes(std::uint8_t bytes[x25519_key_size_k], element_t const &value) noexcept {
+    static void to_bytes(std::uint8_t bytes[x25519_key_size_k], element_t const& value) noexcept {
         element_t canonical;
         fe4_canon(canonical.limb, value.limb);
         for (std::size_t limb_index = 0; limb_index != 4; ++limb_index)
@@ -833,19 +840,19 @@ using field_adx_t = field_saturated<multiply_widening_t>;
 #pragma region RFC 7748 Ladder
 
 template <typename field_type_>
-void field_square_repeated(typename field_type_::element_t &value, unsigned count) noexcept {
+void field_square_repeated(typename field_type_::element_t& value, unsigned count) noexcept {
     for (unsigned index = 0; index != count; ++index) field_type_::square(value, value);
 }
 
 /**
  *  @brief Modular inversion via Fermat: @p out = @p value ^ (p-2) mod p, p = 2^255-19.
  *
- *  The squaring counts are forced by the exponent p-2 = 2^255-21 in binary - 250 set bits,
- *  then 01011 - via the standard square-and-multiply-by-`2^k-1` chain. See the inversion
- *  permalink in this file's header comment for one worked reference.
+ *  The squaring counts are forced by the exponent p-2 = 2^255-21 in binary - 250 set bits, then
+ *  01011 - via the standard square-and-multiply-by-`2^k-1` chain. See the inversion permalink in
+ *  this file's header comment for one worked reference.
  */
 template <typename field_type_>
-void field_invert(typename field_type_::element_t &out, typename field_type_::element_t const &value) noexcept {
+void field_invert(typename field_type_::element_t& out, typename field_type_::element_t const& value) noexcept {
     using element_t = typename field_type_::element_t;
 
     element_t squared;
@@ -895,13 +902,11 @@ void field_invert(typename field_type_::element_t &out, typename field_type_::el
     field_type_::multiply(out, power_2_250_minus_1, power_11);  // value^(2^255-32+11) = value^(p-2)
 }
 
-/**
- *  @brief The Montgomery ladder of RFC 7748 §5, transcribed with the specification's own
- *    variable names so it reads side by side with the RFC text rather than any implementation.
- */
+/** The Montgomery ladder of RFC 7748 §5, transcribed with the specification's own variable names
+ *  so it reads side by side with the RFC text rather than any implementation. */
 template <typename field_type_>
-void montgomery_ladder(typename field_type_::element_t &output_u, std::uint8_t const clamped_scalar[x25519_key_size_k],
-                       typename field_type_::element_t const &x1) noexcept {
+void montgomery_ladder(typename field_type_::element_t& output_u, std::uint8_t const clamped_scalar[x25519_key_size_k],
+                       typename field_type_::element_t const& x1) noexcept {
     using element_t = typename field_type_::element_t;
 
     element_t x2 = field_type_::one();
@@ -949,7 +954,7 @@ void montgomery_ladder(typename field_type_::element_t &output_u, std::uint8_t c
     field_type_::multiply(output_u, x2, z2_inverted);
 }
 
-/** @brief Clamps, runs the ladder over @p field_type_, and applies RFC 7748 §6.1's small-order check. */
+/** Clamps, runs the ladder over @p field_type_, and applies RFC 7748 §6.1's small-order check. */
 template <typename field_type_>
 [[nodiscard]] bool scalar_multiply_through(std::uint8_t out[x25519_key_size_k],
                                            std::uint8_t const scalar[x25519_key_size_k],
@@ -1018,8 +1023,8 @@ __attribute__((flatten)) bool x25519_scalar_multiply_adx(std::uint8_t out[x25519
 #endif
 
 x25519_tiers_t x25519_tiers_runtime() noexcept {
-    auto const always =
-        static_cast<std::uint8_t>(x25519_tiers_t::serial_k) | static_cast<std::uint8_t>(x25519_tiers_t::radix51_k);
+    auto const always = static_cast<std::uint8_t>(x25519_tiers_t::serial_k) |
+                        static_cast<std::uint8_t>(x25519_tiers_t::radix51_k);
     static bool const accelerated = cpu_supports_adx_and_bmi2();
     return static_cast<x25519_tiers_t>(always | (accelerated ? static_cast<std::uint8_t>(x25519_tiers_t::adx_k) : 0u));
 }
@@ -1031,7 +1036,7 @@ x25519_tiers_t x25519_tier_preferred() noexcept {
     return x25519_tiers_t::serial_k;
 }
 
-char const *x25519_tier_name(x25519_tiers_t tier) noexcept {
+char const* x25519_tier_name(x25519_tiers_t tier) noexcept {
     switch (tier) {
     case x25519_tiers_t::serial_k: return "serial";
     case x25519_tiers_t::radix51_k: return "radix51";

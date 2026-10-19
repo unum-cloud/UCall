@@ -1,24 +1,25 @@
 /**
- *  @brief Tests for the utility types and containers in @c shared.hpp.
- *  @file scripts/test_shared.cpp
+ *  @file test/shared.cpp
  *  @author Ash Vardanian
+ *  @date November 10, 2025
+ *  @brief Tests for the utility types and containers in @c shared.hpp.
  *
- *  These stand in for their standard-library counterparts because they report an allocation
- *  failure rather than throwing, so every case that grows one checks the answer.
+ *  These stand in for their standard-library counterparts because they report an allocation failure
+ *  rather than throwing, so every case that grows one checks the answer.
  */
 #include <cstring> // `std::strstr`
 
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include "test.hpp" // `verify`, `run_test`, `scale_iterations`
+#include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
 
 using namespace unum::ucall;
-using namespace unum::ucall::scripts;
+using namespace unum::ucall::test;
 
 #pragma region Utilities
 
-/** @brief Whether two floats agree closely enough for a magnitude meant to be read by a human. */
+/** Whether two floats agree closely enough for a magnitude meant to be read by a human. */
 [[nodiscard]] static bool nearly_equal(float left, float right) noexcept {
     float const difference = left - right;
     return (difference < 0.0f ? -difference : difference) < 1e-3f;
@@ -90,8 +91,6 @@ void test_traffic_stats_unit() {
 
 #pragma endregion Utilities
 
-#pragma region Views
-
 void test_span_unit() {
     announce("construction_and_access");
     int values[] = {10, 20, 30, 40, 50};
@@ -116,8 +115,6 @@ void test_span_unit() {
     span<int> const empty;
     verify(empty.size() == 0u);
 }
-
-#pragma endregion Views
 
 #pragma region Containers
 
@@ -172,7 +169,7 @@ void test_buffer_unit() {
     announce("element_access_and_iteration");
     verify(values.reallocate(5));
     int next = 0;
-    for (int &element : values) element = next++;
+    for (int& element : values) element = next++;
     verify(values[0] == 0);
     verify(values[4] == 4);
 
@@ -243,8 +240,8 @@ void test_pool_unit() {
     verify(slots.reserve(5));
     verify(slots.capacity() == 5u);
 
-    int *const first = slots.alloc();
-    int *const second = slots.alloc();
+    int* const first = slots.alloc();
+    int* const second = slots.alloc();
     verify(first != nullptr);
     verify(second != nullptr);
     verify(first != second);
@@ -252,7 +249,7 @@ void test_pool_unit() {
     announce("a_released_slot_is_handed_out_again");
     *first = 42;
     slots.release(first);
-    int *const reused = slots.alloc();
+    int* const reused = slots.alloc();
     verify(reused != nullptr);
 
     announce("offsets_round_trip");
@@ -352,8 +349,8 @@ void test_containers_moves_unit() {
         announce("pool");
         pool<int> source;
         verify(source.reserve(5));
-        int *const first = source.alloc();
-        int *const second = source.alloc();
+        int* const first = source.alloc();
+        int* const second = source.alloc();
         verify(first != nullptr && second != nullptr);
         *first = 42;
         *second = 99;
@@ -376,7 +373,7 @@ void test_containers_safety() {
     announce("a_pool_refuses_rather_than_overruns");
     pool<int> slots;
     verify(slots.reserve(5));
-    int *taken[5];
+    int* taken[5];
     for (std::size_t index = 0; index != 5; ++index) {
         taken[index] = slots.alloc();
         verify(taken[index] != nullptr);
@@ -406,9 +403,7 @@ void test_containers_safety() {
 
 #pragma endregion Containers
 
-#pragma region Concurrency
-
-/** @brief Two threads incrementing behind one lock, which is the only thing the mutex promises. */
+/** Two threads incrementing behind one lock, which is the only thing the mutex promises. */
 void test_mutex_stress() {
     mutex_t guard;
     std::size_t counter = 0;
@@ -431,7 +426,21 @@ void test_mutex_stress() {
     verify(counter == increments * 2, "counted {}, expected {} across two threads", counter, increments * 2);
 }
 
-#pragma endregion Concurrency
+void test_outcomes_unit() {
+    ucall_outcome_t outcome {ucall_status_deferred_k, "deferred"};
+    verify(ucall_outcome_status(&outcome) == ucall_status_deferred_k);
+    int output = 0;
+    std::thread producer([&] {
+        output = 42;
+        outcome.message = nullptr;
+        std::atomic_ref<ucall_status_t> word {outcome.status};
+        word.store(ucall_status_success_k, std::memory_order_release);
+        word.notify_all();
+    });
+    verify(ucall_outcome_wait(&outcome) == ucall_status_success_k);
+    verify(output == 42 && outcome.message == nullptr);
+    producer.join();
+}
 
 int main() {
     install_test_signal_handlers();
@@ -449,6 +458,7 @@ int main() {
     run_test("test_containers_moves_unit", test_containers_moves_unit);
     run_test("test_containers_safety", test_containers_safety);
     run_test("test_mutex_stress", test_mutex_stress);
+    run_test("test_outcomes_unit", test_outcomes_unit);
 
     fmt::print("All tests passed.\n");
     return 0;

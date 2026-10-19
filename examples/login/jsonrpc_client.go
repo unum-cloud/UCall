@@ -1,3 +1,6 @@
+// examples/login/jsonrpc_client.go - HTTP client workload.
+// Ash Vardanian, January 31, 2023.
+
 package main
 
 import (

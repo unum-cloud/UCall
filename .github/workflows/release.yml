@@ -16,41 +16,37 @@ permissions:
   id-token: write
 
 jobs:
-  versioning:
-    name: Semantic Release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v3
-        with:
-          persist-credentials: false
-      - uses: actions/setup-node@v3
-        with:
-          node-version: 20
-      - run: npm install --save-dev @semantic-release/exec @semantic-release/git conventional-changelog-eslint semantic-release && npx semantic-release
+  validate:
+    name: Validate the release
+    uses: ./.github/workflows/prerelease.yml
 
-  rebase:
-    name: Rebase Dev. Branch
-    needs: versioning
-    runs-on: ubuntu-latest
+  versioning:
+    name: Update Version
+    needs: validate
+    if: github.repository == 'unum-cloud/UCall'
+    runs-on: ubuntu-26.04
     steps:
-      - name: Checkout the latest code
-        uses: actions/checkout@v3
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
           fetch-depth: 0
-
-      - name: Perform rebase
-        run: |
-          git fetch origin main
-          git checkout main-dev
-          git rebase origin/main
-
-      - name: Push changes
-        uses: CasperWA/push-protected@v2
+          persist-credentials: false
+      - name: Update version and create the release
+        uses: ashvardanian/tinysemver@v3
         with:
-          token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
-          branch: main-dev
-          unprotect_reviews: True
-          force: True
+          version-file: VERSION
+          update-version-in: |
+            CITATION.cff:^version: (\d+\.\d+\.\d+(?:-rc\.\d+)?)
+            CMakeLists.txt:VERSION (\d+\.\d+\.\d+(?:-rc\.\d+)?)
+          update-major-version-in: |
+            c/ucall/types.h:^#define UCALL_VERSION_MAJOR (\d+)
+          update-minor-version-in: |
+            c/ucall/types.h:^#define UCALL_VERSION_MINOR (\d+)
+          update-patch-version-in: |
+            c/ucall/types.h:^#define UCALL_VERSION_PATCH (\d+)
+          push: "true"
+          create-release: "true"
+          github-token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
 
   build_wheels:
     name: Build Python ${{ matrix.python-version }} for ${{ matrix.os }}
@@ -58,17 +54,18 @@ jobs:
     needs: versioning
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
-        python-version: ["39", "310", "311", "312"]
+        os: [macos-15, windows-2025]
+        python-version: ["312", "313", "314"]
     steps:
-      - uses: actions/checkout@v4
-      - name: Set up Python
-        uses: actions/setup-python@v5
+      - name: Checkout
+        uses: actions/checkout@v7
         with:
-          python-version: 3.x
-      - name: Setup QEMU
-        if: matrix.os == 'ubuntu-latest' # We only need QEMU for Linux builds
-        uses: docker/setup-qemu-action@v3
+          ref: main
+          submodules: recursive
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
       - name: Install cibuildwheel
         run: python -m pip install cibuildwheel
       - name: Build wheels
@@ -76,25 +73,57 @@ jobs:
         env:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
           path: ./wheelhouse/*.whl
           overwrite: true
 
+  build_linux_wheels:
+    name: Build Python ${{ matrix.python-version }} for ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    needs: versioning
+    strategy:
+      matrix:
+        os: [ubuntu-26.04, ubuntu-26.04-arm]
+        python-version: ["3.12", "3.13", "3.14"]
+    steps:
+      - name: Checkout with sibling libraries
+        uses: actions/checkout@v7
+        with:
+          ref: main
+          submodules: recursive
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install wheel tools
+        run: python -m pip install build auditwheel "cmake>=3.28"
+      - name: Install wheel repair tools
+        run: sudo apt-get update && sudo apt-get install -y patchelf
+      - name: Build the wheel on Ubuntu
+        run: python -m build --wheel
+      - name: Repair the Linux wheel
+        run: auditwheel repair --lib-sdir . --wheel-dir wheelhouse dist/*.whl
+      - name: Upload wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-${{ matrix.os }}-${{ matrix.python-version }}
+          path: ./wheelhouse/*.whl
+
   publish_python:
     name: Publish Python
-    needs: build_wheels
-    runs-on: ubuntu-20.04
+    needs: [build_wheels, build_linux_wheels]
+    runs-on: ubuntu-26.04
     environment:
       name: pypi
-      url: https://pypi.org/p/stringzilla
+      url: https://pypi.org/p/ucall
     permissions:
       id-token: write
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v7
         with:
           # unpacks all CIBW artifacts into dist/
           pattern: cibw-*
@@ -113,16 +142,16 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-22.04
-    if: ${{ always() }}
+    runs-on: ubuntu-26.04
     needs: publish_python
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
+        uses: actions/checkout@v7
         with:
-          ref: "main"
+          ref: main
+          submodules: recursive
       - name: Setup GitHub Pages
-        uses: actions/configure-pages@v2
+        uses: actions/configure-pages@v5
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
       - name: Install UCall from PyPi
@@ -132,10 +161,10 @@ jobs:
       - name: Copy assets
         run: cp -r assets build/docs/html/
       - name: Upload artifacts
-        uses: actions/upload-pages-artifact@v1
+        uses: actions/upload-pages-artifact@v3
         with:
           # Upload entire repository
           path: "./build/docs/html/"
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v1
+        uses: actions/deploy-pages@v4

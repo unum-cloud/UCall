@@ -1,3 +1,5 @@
+"""Exercises JSON-RPC requests against the example session server."""
+
 import random
 
 import numpy as np
@@ -9,7 +11,7 @@ from ucall.client import Client, ClientTLS
 
 
 class ClientGeneric:
-    """JSON-RPC Client that uses classic sync Python `requests` to pass JSON calls over HTTP"""
+    """JSON-RPC Client that uses classic sync Python `requests` to pass JSON calls over HTTP."""
 
     def __init__(self, uri: str = "127.0.0.1", port: int = 8545) -> None:
         self.url = f"http://{uri}:{port}/"
@@ -78,25 +80,25 @@ def test_uniform_batches():
 def test_normal():
     client = Client()
     response = client.validate_session(user_id=2, session_id=2)
-    assert response.json == True
+    assert response.json is True
 
 
 def test_normal_positional():
     client = Client()
     response = client.validate_session(2, 2)
-    assert response.json == True
+    assert response.json is True
 
 
 def test_normal_tls():
     client = ClientTLS(allow_self_signed=True)
     response = client.validate_session(user_id=2, session_id=2)
-    assert response.json == True
+    assert response.json is True
 
 
 def test_normal_positional_tls():
     client = ClientTLS(allow_self_signed=True)
     response = client.validate_session(2, 2)
-    assert response.json == True
+    assert response.json is True
 
 
 def test_notification():
@@ -166,7 +168,7 @@ def test_non_uniform_batch():
     }
 
     client = ClientGeneric()
-    response = client(
+    client(
         [
             r_normal,
             r_notification,

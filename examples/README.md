@@ -30,7 +30,6 @@ All of them implement identical endpoints:
 - `resize` - batch-capable image processing operation for Base64-encoded images
 - `dot_product` - batch-capable matrix vector-vector multiplication operation
 
-
 ## Reproducing Benchmarks
 
 ```sh
@@ -69,17 +68,16 @@ uvicorn fastapi_server:app --log-level critical --port 8000 &
 # To check if it works as expected
 pytest fastapi_client.py
 
-
-python examples/bench.py "fastapi_client.ClientREST" --progress
-python examples/bench.py "fastapi_client.ClientWebSocket" --progress
+python bench/http.py "fastapi_client.ClientREST" --progress
+python bench/http.py "fastapi_client.ClientWebSocket" --progress
 kill %%
 ```
 
 Want to dispatch more clients and aggregate statistics?
 
 ```sh
-python examples/bench.py "fastapi_client.ClientREST" --threads 8
-python examples/bench.py "fastapi_client.ClientWebSocket" --threads 8
+python bench/http.py "fastapi_client.ClientREST" --threads 8
+python bench/http.py "fastapi_client.ClientWebSocket" --threads 8
 ```
 
 ### UCall
@@ -94,9 +92,9 @@ cmake -DCMAKE_BUILD_TYPE=Release -B build_release
 cmake --build build_release --config Release
 build_release/build/bin/ucall_example_server_posix &
 build_release/build/bin/ucall_example_server_uring &
-python examples/bench.py "jsonrpc_client.CaseTCP" --progress
-python examples/bench.py "jsonrpc_client.CaseHTTP" --progress
-python examples/bench.py "jsonrpc_client.CaseHTTPBatches" --progress
+python bench/http.py "jsonrpc_client.CaseTCP" --progress
+python bench/http.py "jsonrpc_client.CaseHTTP" --progress
+python bench/http.py "jsonrpc_client.CaseHTTPBatches" --progress
 kill %%
 ```
 
@@ -109,9 +107,9 @@ build_release/build/bin/ucall_example_server_uring --nic=127.0.0.1 --port=8545 -
 Want to dispatch more clients and aggregate more accurate statistics?
 
 ```sh
-python examples/bench.py "jsonrpc_client.CaseTCP" --threads 32 --seconds 100
-python examples/bench.py "jsonrpc_client.CaseHTTP" --threads 32 --seconds 100
-python examples/bench.py "jsonrpc_client.CaseHTTPBatches" --threads 32 --seconds 100
+python bench/http.py "jsonrpc_client.CaseTCP" --threads 32 --seconds 100
+python bench/http.py "jsonrpc_client.CaseHTTP" --threads 32 --seconds 100
+python bench/http.py "jsonrpc_client.CaseHTTPBatches" --threads 32 --seconds 100
 ```
 
 A lot has been said about the speed of Python code ~~or the lack of~~.
@@ -141,7 +139,7 @@ parallel go run ./examples/login/jsonrpc_client.go run ::: {1..32}
 ```sh
 pip install grpcio grpcio-tools
 python ./examples/login/grpc_server.py &
-python examples/bench.py "grpc_client.ValidateClient" --progress
-python examples/bench.py "grpc_client.ValidateClient" --threads 32
+python bench/http.py "grpc_client.ValidateClient" --progress
+python bench/http.py "grpc_client.ValidateClient" --threads 32
 kill %%
 ```

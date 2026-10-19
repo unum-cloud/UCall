@@ -42,7 +42,7 @@ body:
     id: os
     attributes:
       label: Operating System
-      placeholder: Ubuntu 22.04
+      placeholder: Ubuntu 26.04
     validations:
       required: true
   - type: dropdown

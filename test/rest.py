@@ -1,18 +1,16 @@
+"""Exercises REST requests against the example session server."""
+
 import random
 
-import numpy as np
 import requests
 from login.rest_client import CaseValidateUser
-from PIL import Image
-
-from ucall.client import Client, ClientTLS
 
 
 class ClientGeneric:
-    """REST Client that uses classic sync Python `requests` to pass JSON calls over HTTP"""
+    """REST Client that uses classic sync Python `requests` to pass JSON calls over HTTP."""
 
-    def __init__(self, uri: str = '127.0.0.1', port: int = 8545) -> None:
-        self.url = f'http://{uri}:{port}/'
+    def __init__(self, uri: str = "127.0.0.1", port: int = 8545) -> None:
+        self.url = f"http://{uri}:{port}/"
 
     def __call__(self, jsonrpc: object) -> object:
         return requests.post(self.url, json=jsonrpc).json()
@@ -20,10 +18,7 @@ class ClientGeneric:
 
 def shuffled_n_identities(class_, count_clients: int = 3, count_cycles: int = 1000):
 
-    clients = [
-        class_(identity=identity)
-        for identity in range(count_clients)
-    ]
+    clients = [class_(identity=identity) for identity in range(count_clients)]
 
     for x in range(count_cycles):
         print(x)
@@ -186,7 +181,7 @@ def test_normal():
 #     assert np.array_equal(ar1, ar2)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_normal()
     # test_normal_positional()
     # test_normal_positional_tls()

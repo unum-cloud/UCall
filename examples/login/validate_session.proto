@@ -1,3 +1,6 @@
+// examples/login/validate_session.proto: Session-validation service used by the gRPC example.
+// Ash Vardanian, March 21, 2023.
+
 syntax = "proto3";
 
 package login;

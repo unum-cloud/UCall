@@ -1,16 +1,16 @@
 /**
- *  @brief  Pure CPython bindings for UCall.
+ *  @file python/lib.c
  *  @author Ash Vardanian
- *  @file   lib.c
- *  @date   2023-01-30
+ *  @date 2023-01-30
+ *  @brief Pure CPython bindings for UCall.
  *
  *  @copyright Copyright (c) 2023
  *
  *  @see Reading Materials
- *  https://pythoncapi.readthedocs.io/type_object.html
- *  https://numpy.org/doc/stable/reference/c-api/types-and-structures.html
- *  https://pythonextensionpatterns.readthedocs.io/en/latest/refcount.html
- *  https://docs.python.org/3/extending/newtypes_tutorial.html#adding-data-and-methods-to-the-basic-example
+ *      https://pythoncapi.readthedocs.io/type_object.html
+ *      https://numpy.org/doc/stable/reference/c-api/types-and-structures.html
+ *      https://pythonextensionpatterns.readthedocs.io/en/latest/refcount.html
+ *      https://docs.python.org/3/extending/newtypes_tutorial.html#adding-data-and-methods-to-the-basic-example
  */
 #include <time.h>
 
@@ -19,20 +19,19 @@
 
 #include <turbob64.h>
 
-#include "headers/parse/py_to_json.h"
 #include "ucall/ucall.h"
 
 #define stringify_value_m(a) stringify_m(a)
-#define stringify_m(a) #a
-#define concat_m(A, B) A##B
+#define stringify_m(a)       #a
+#define concat_m(A, B)       A##B
 #define macro_concat_m(A, B) concat_m(A, B)
-#define pyinit_f_m macro_concat_m(PyInit_, UCALL_PYTHON_MODULE_NAME)
+#define pyinit_f_m           macro_concat_m(PyInit_, UCALL_PYTHON_MODULE_NAME)
 
-#define get_attr_safe_m(name, obj, attr)                                                                               \
-    PyObject* name = PyObject_GetAttrString(obj, attr);                                                                \
-    if (!name) {                                                                                                       \
-        PyErr_SetString(PyExc_TypeError, "Failed to extract attribute: " attr);                                        \
-        return -1;                                                                                                     \
+#define get_attr_safe_m(name, obj, attr)                                        \
+    PyObject* name = PyObject_GetAttrString(obj, attr);                         \
+    if (!name) {                                                                \
+        PyErr_SetString(PyExc_TypeError, "Failed to extract attribute: " attr); \
+        return -1;                                                              \
     }
 
 typedef enum {
@@ -58,8 +57,7 @@ typedef struct {
 } py_wrapper_t;
 
 typedef struct {
-    PyObject_HEAD
-    ucall_config_t config;
+    PyObject_HEAD ucall_config_t config;
     ucall_server_t server;
     size_t count_threads;
     py_wrapper_t* wrappers;
@@ -124,8 +122,7 @@ static int prepare_wrapper(PyObject* callable, py_wrapper_t* wrap) {
     get_attr_safe_m(defaults, callable, "__defaults__");
     get_attr_safe_m(kwdefaults, callable, "__kwdefaults__");
 
-    if (PyTuple_CheckExact(defaults))
-        pos_default_count = PyTuple_Size(defaults);
+    if (PyTuple_CheckExact(defaults)) pos_default_count = PyTuple_Size(defaults);
 
     if (PyMethod_Check(callable)) {
         // When this is a class method...
@@ -168,8 +165,8 @@ static int prepare_wrapper(PyObject* callable, py_wrapper_t* wrap) {
 
     if (has_vararg) {
         py_param_t param;
-        param.name =
-            PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, pos_count + keyword_only_count), &param.name_len);
+        param.name = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, pos_count + keyword_only_count),
+                                             &param.name_len);
         param.value = NULL;
         param.type = (PyTypeObject*)PyDict_GetItemString(annotations, param.name);
         param.kind = VAR_POSITIONAL;
@@ -216,51 +213,50 @@ static void wrapper(ucall_message_t call, ucall_endpoint_tag_t endpoint_tag) {
 
         if (PyType_IsSubtype(type, &PyBool_Type)) {
             bool res;
-            if (may_have_name && name_len > 0)
-                got_named = ucall_param_named_bool(call, name, name_len, &res);
+            if (may_have_name && name_len > 0) got_named = ucall_param_named_bool(call, name, name_len, &res);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_bool(call, i, &res))
                 return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, res ? Py_True : Py_False);
-        } else if (PyType_IsSubtype(type, &PyLong_Type)) {
+        }
+        else if (PyType_IsSubtype(type, &PyLong_Type)) {
             Py_ssize_t res;
-            if (may_have_name && name_len > 0)
-                got_named = ucall_param_named_i64(call, name, name_len, &res);
+            if (may_have_name && name_len > 0) got_named = ucall_param_named_i64(call, name, name_len, &res);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_i64(call, i, &res))
                 return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, PyLong_FromSsize_t(res));
-        } else if (PyType_IsSubtype(type, &PyFloat_Type)) {
+        }
+        else if (PyType_IsSubtype(type, &PyFloat_Type)) {
             double res;
-            if (may_have_name && name_len > 0)
-                got_named = ucall_param_named_f64(call, name, name_len, &res);
+            if (may_have_name && name_len > 0) got_named = ucall_param_named_f64(call, name, name_len, &res);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_f64(call, i, &res))
                 return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, PyFloat_FromDouble(res));
-        } else if (PyType_IsSubtype(type, &PyUnicode_Type)) {
+        }
+        else if (PyType_IsSubtype(type, &PyUnicode_Type)) {
             ucall_string_t res;
             size_t len;
-            if (may_have_name && name_len > 0)
-                got_named = ucall_request_param(call, name, name_len, &res, &len);
+            if (may_have_name && name_len > 0) got_named = ucall_request_param(call, name, name_len, &res, &len);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_str(call, i, &res, &len))
                 return ucall_reply_error_invalid_params(call);
 
             PyTuple_SetItem(args, i, PyUnicode_FromStringAndSize(res, len));
-        } else {
+        }
+        else {
             // For non native type, assume binary.
             ucall_string_t res;
             size_t len;
-            if (may_have_name && name_len > 0)
-                got_named = ucall_request_param(call, name, name_len, &res, &len);
+            if (may_have_name && name_len > 0) got_named = ucall_request_param(call, name, name_len, &res, &len);
 
             if ((may_have_pos && !got_named) && //
                 !ucall_param_positional_str(call, i, &res, &len))
@@ -281,8 +277,8 @@ static void wrapper(ucall_message_t call, ucall_endpoint_tag_t endpoint_tag) {
             ucall_string_t error_str = PyUnicode_AsUTF8AndSize(pvalue_str, &sz);
             ucall_reply_error(call, 500, error_str, sz);
             Py_DECREF(pvalue_str);
-        } else
-            ucall_reply_error_unknown(call);
+        }
+        else ucall_reply_error_unknown(call);
         Py_XDECREF(ptype);
         Py_XDECREF(pvalue);
         Py_XDECREF(ptraceback);
@@ -291,8 +287,7 @@ static void wrapper(ucall_message_t call, ucall_endpoint_tag_t endpoint_tag) {
 
     size_t sz = calculate_size_as_str(response);
     char* parsed_response = (char*)(malloc(sz * sizeof(char)));
-    if (!parsed_response)
-        return ucall_reply_error_out_of_memory(call);
+    if (!parsed_response) return ucall_reply_error_out_of_memory(call);
     size_t len = 0;
     int res = to_string(response, &parsed_response[0], &len);
     ucall_reply_content(call, &parsed_response[0], len);
@@ -319,8 +314,7 @@ static PyObject* __add_procedure(py_decorator_self_t* decorated, PyObject* args)
         return NULL;
     }
 
-    if (prepare_wrapper(wrap.callable, &wrap) != 0)
-        return NULL;
+    if (prepare_wrapper(wrap.callable, &wrap) != 0) return NULL;
 
     if (server->count_added >= server->wrapper_capacity) {
         server->wrapper_capacity *= 2;
@@ -329,8 +323,7 @@ static PyObject* __add_procedure(py_decorator_self_t* decorated, PyObject* args)
 
     server->wrappers[server->count_added] = wrap;
 
-    if (path == NULL)
-        path = PyUnicode_AsUTF8(PyObject_GetAttrString(wrap.callable, "__name__"));
+    if (path == NULL) path = PyUnicode_AsUTF8(PyObject_GetAttrString(wrap.callable, "__name__"));
 
     ucall_add_endpoint(server->server, path, wrapper, decorated->request_type, &server->wrappers[server->count_added]);
 
@@ -395,13 +388,11 @@ static PyObject* server_run(py_server_t* self, PyObject* args) {
         PyErr_SetString(PyExc_TypeError, "Expecting a cycle count and timeout.");
         return NULL;
     }
-    if (max_cycles == -1 && max_seconds == -1) {
-        while (pycheck_take_call(self, 0))
-            ;
-    } else if (max_seconds == -1) {
-        while (max_cycles > 0 && pycheck_take_call(self, 0))
-            --max_cycles;
-    } else if (max_cycles == -1) {
+    if (max_cycles == -1 && max_seconds == -1) { while (pycheck_take_call(self, 0)); }
+    else if (max_seconds == -1) {
+        while (max_cycles > 0 && pycheck_take_call(self, 0)) --max_cycles;
+    }
+    else if (max_cycles == -1) {
         time_t start, end;
         time(&start);
         while (max_seconds > 0 && pycheck_take_call(self, 0)) {
@@ -409,7 +400,8 @@ static PyObject* server_run(py_server_t* self, PyObject* args) {
             max_seconds -= difftime(end, start);
             start = end;
         }
-    } else {
+    }
+    else {
         time_t start, end;
         time(&start);
         while (max_cycles > 0 && max_seconds > 0 && pycheck_take_call(self, 0)) {
@@ -535,12 +527,10 @@ static PyModuleDef server_module = {
 };
 
 PyMODINIT_FUNC pyinit_f_m(void) {
-    if (PyType_Ready(&ucall_type) < 0)
-        return NULL;
+    if (PyType_Ready(&ucall_type) < 0) return NULL;
 
     PyObject* m = PyModule_Create(&server_module);
-    if (!m)
-        return NULL;
+    if (!m) return NULL;
 
     Py_INCREF(&ucall_type);
     if (PyModule_AddObject(m, "Server", (PyObject*)&ucall_type) < 0) {

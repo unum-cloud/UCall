@@ -1,3 +1,5 @@
+"""Formatting policy for CMake source files."""
+
 # Options effecting formatting.
 with section("format"):
     # How wide to allow formatted cmake files

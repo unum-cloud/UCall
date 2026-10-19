@@ -1,7 +1,8 @@
+"""Parses command-line calls and forwards them to a remote endpoint."""
+
 import argparse
 import json
 from pydoc import locate
-from typing import Optional
 
 from PIL import Image
 
@@ -21,7 +22,7 @@ def get_kwargs(buffer):
     return kwargs
 
 
-def cast(value: str, type_name: Optional[str]):
+def cast(value: str, type_name: str | None):
     """Casts a single argument value to the expected `type_name` or guesses it."""
     if type_name is None:
         if value.isdigit():
@@ -61,11 +62,11 @@ def fix_types(args, kwargs):
             kwargs[k] = cast(kwargs[k], None)
 
 
-def add_specials(kwargs: dict, special: Optional[list[str]], type_name: str):
+def add_specials(kwargs: dict, special: list[str] | None, type_name: str):
     if special is None:
         return
     for x in special:
-        if not "=" in x:
+        if "=" not in x:
             raise KeyError(f"Missing key in {type_name} argument")
         k, v = x.split("=")
         kwargs[k + ":" + type_name] = v
@@ -103,9 +104,7 @@ def get_parser():
     parser.add_argument("-f", "--file", nargs="*", help="Binary files")
     parser.add_argument("-i", "--image", nargs="*", help="Image files")
 
-    parser.add_argument(
-        "--positional", nargs="*", help="Switch to positional arguments VALUE[:TYPE]"
-    )
+    parser.add_argument("--positional", nargs="*", help="Switch to positional arguments VALUE[:TYPE]")
 
     parser.add_argument(
         "--format",

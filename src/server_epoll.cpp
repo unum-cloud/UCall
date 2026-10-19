@@ -1,6 +1,8 @@
 /**
- * @brief   Epoll-based backend for UCall.
- * @author  Ash Vardanian
+ *  @file src/server_epoll.cpp
+ *  @author Ash Vardanian
+ *  @date August 4, 2023
+ *  @brief Epoll-based backend for UCall.
  */
 
 #include <arpa/inet.h>  // `inet_addr`
@@ -21,8 +23,8 @@
 using namespace unum::ucall;
 
 struct event_data_t {
-    connection_t *connection {};
-    void *buffer {};
+    connection_t* connection {};
+    void* buffer {};
     size_t buffer_length {};
     bool active {false};
     descriptor_t timer_file {bad_descriptor_k};
@@ -40,7 +42,7 @@ struct epoll_ctx_t {
     descriptor_t epoll {};
     array<event_data_t> event_log {};
 
-    event_data_t &data_at(descriptor_t fd) noexcept { return event_log[fd % event_log.capacity()]; }
+    event_data_t& data_at(descriptor_t fd) noexcept { return event_log[fd % event_log.capacity()]; }
 };
 
 static int set_nonblock(int socket_descriptor) {
@@ -55,13 +57,13 @@ static int epoll_ctl_add(int epoll_descriptor, int op, int fd, int keep_fd = -1)
     return res;
 }
 
-void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
+void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
 
     // Simple sanity check
     if (!server_out && !config_inout) return;
 
     // Retrieve configs, if present
-    ucall_config_t &config = *config_inout;
+    ucall_config_t& config = *config_inout;
     if (!config.port) config.port = 8545u;
     if (!config.queue_depth) config.queue_depth = 4096u;
     if (!config.max_callbacks) config.max_callbacks = 128u;
@@ -74,7 +76,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     // Allocation
     int socket_descriptor {-1};
     int socket_options {1};
-    epoll_ctx_t *ectx = new epoll_ctx_t();
+    epoll_ctx_t* ectx = new epoll_ctx_t();
 
     // By default, let's open TCP port for IPv4.
     struct sockaddr_in address {};
@@ -82,7 +84,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     address.sin_addr.s_addr = inet_addr(config.hostname);
     address.sin_port = htons(config.port);
 
-    server_state_t *server_ptr {};
+    server_state_t* server_ptr {};
     pool<connection_t> connections {};
     array<endpoint_t> callbacks {};
     buffer<struct iovec> registered_buffers {};
@@ -90,7 +92,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     std::unique_ptr<ssl_context_t> ssl_context {};
 
     // Try allocating all the necessary memory.
-    server_ptr = (server_state_t *)std::malloc(sizeof(server_state_t));
+    server_ptr = (server_state_t*)std::malloc(sizeof(server_state_t));
     if (!server_ptr) goto cleanup;
     if (!callbacks.reserve(config.max_callbacks)) goto cleanup;
     if (!fixed_buffers.reserve(ram_page_size_k * 2u * config.max_concurrent_connections)) goto cleanup;
@@ -98,7 +100,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     if (!ectx->event_log.reserve(config.queue_depth)) goto cleanup;
     if (!registered_buffers.resize(config.max_concurrent_connections * 2u)) goto cleanup;
     for (std::size_t i = 0; i != config.max_concurrent_connections; ++i) {
-        auto &connection = connections.at_offset(i);
+        auto& connection = connections.at_offset(i);
         auto inputs = fixed_buffers.ptr + ram_page_size_k * 2u * i;
         auto outputs = inputs + ram_page_size_k;
         connection.pipes.mount(inputs, outputs);
@@ -112,9 +114,9 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     socket_descriptor = socket(AF_INET, SOCK_STREAM, 0);
     if (socket_descriptor < 0) goto cleanup;
     if (setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-                   reinterpret_cast<char const *>(&socket_options), sizeof(socket_options)) == -1)
+                   reinterpret_cast<char const*>(&socket_options), sizeof(socket_options)) == -1)
         errno;
-    if (bind(socket_descriptor, (struct sockaddr *)&address, sizeof(address)) < 0) goto cleanup;
+    if (bind(socket_descriptor, (struct sockaddr*)&address, sizeof(address)) < 0) goto cleanup;
     if (set_nonblock(socket_descriptor) < 0) goto cleanup;
     if (listen(socket_descriptor, config.queue_depth) < 0) goto cleanup;
     ectx->epoll = epoll_create(1);
@@ -152,17 +154,17 @@ cleanup:
 void ucall_free(ucall_server_t punned_server) {
     if (!punned_server) return;
 
-    server_state_t &server = *reinterpret_cast<server_state_t *>(punned_server);
-    epoll_ctx_t *ctx = reinterpret_cast<epoll_ctx_t *>(server.network_engine.network_data);
+    server_state_t& server = *reinterpret_cast<server_state_t*>(punned_server);
+    epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(server.network_engine.network_data);
     close(server.socket);
     server.~server_state_t();
     std::free(punned_server);
     delete ctx;
 }
 
-int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) noexcept {
-    epoll_ctx_t *ctx = reinterpret_cast<epoll_ctx_t *>(network_data);
-    event_data_t &data = ctx->data_at(socket);
+int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) noexcept {
+    epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
+    event_data_t& data = ctx->data_at(socket);
     if (data.active) return -ECANCELED;
 
     data.connection = &connection;
@@ -174,15 +176,15 @@ int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) 
     return 0;
 }
 
-void network_engine_t::set_stats_heartbeat(connection_t &connection) noexcept {}
+void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {}
 
-bool network_engine_t::is_canceled(ssize_t res, connection_t const &connection) noexcept { return res == -ECANCELED; }
+bool network_engine_t::is_canceled(ssize_t res, connection_t const& connection) noexcept { return res == -ECANCELED; }
 
-bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
+bool network_engine_t::is_corrupted(ssize_t res, connection_t const& conn) noexcept {
     return res == -EBADF || res == -EPIPE || res == -ECONNRESET;
 }
 
-void network_engine_t::close_connection_gracefully(connection_t &connection) noexcept {
+void network_engine_t::close_connection_gracefully(connection_t& connection) noexcept {
 
     descriptor_t timer_file = timerfd_create(CLOCK_MONOTONIC, 0);
     itimerspec timer_spec;
@@ -192,26 +194,26 @@ void network_engine_t::close_connection_gracefully(connection_t &connection) noe
     timer_spec.it_interval.tv_nsec = 0;
     timerfd_settime(timer_file, 0, &timer_spec, NULL);
 
-    epoll_ctx_t *ctx = reinterpret_cast<epoll_ctx_t *>(network_data);
-    event_data_t &data = ctx->data_at(connection.descriptor);
+    epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
+    event_data_t& data = ctx->data_at(connection.descriptor);
     data.timer_file = timer_file;
     epoll_ctl_add(ctx->epoll, EPOLLIN | EPOLLONESHOT, timer_file, connection.descriptor);
 }
 
-void network_engine_t::send_packet(connection_t &connection, void *buffer, size_t buffer_length,
+void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    epoll_ctx_t *ctx = reinterpret_cast<epoll_ctx_t *>(network_data);
-    event_data_t &data = ctx->data_at(connection.descriptor);
+    epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
+    event_data_t& data = ctx->data_at(connection.descriptor);
     if (!data.active) return;
     data.buffer = buffer;
     data.buffer_length = buffer_length;
     epoll_ctl_add(ctx->epoll, EPOLLOUT | EPOLLET | EPOLLRDHUP | EPOLLHUP | EPOLLONESHOT, connection.descriptor);
 }
 
-void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_t buffer_length,
+void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    epoll_ctx_t *ctx = reinterpret_cast<epoll_ctx_t *>(network_data);
-    event_data_t &data = ctx->data_at(connection.descriptor);
+    epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
+    event_data_t& data = ctx->data_at(connection.descriptor);
     if (!data.active) return;
     data.buffer = buffer;
     data.buffer_length = buffer_length;
@@ -219,20 +221,20 @@ void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_
 }
 
 template <size_t max_count_ak>
-std::size_t network_engine_t::pop_completed_events(completed_event_t *events) noexcept {
-    epoll_ctx_t *ctx = reinterpret_cast<epoll_ctx_t *>(network_data);
+std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
+    epoll_ctx_t* ctx = reinterpret_cast<epoll_ctx_t*>(network_data);
     struct epoll_event ep_events[max_count_ak];
     size_t completed = 0;
     int num_events = epoll_wait(ctx->epoll, ep_events, max_count_ak, max_inactive_duration_ns_k / 1'000'000);
 
     for (int i = 0; i < num_events; ++i) {
         descriptor_t fd = ep_events[i].data.fd;
-        event_data_t &data = ctx->data_at(fd);
-        connection_t *connection = data.connection;
+        event_data_t& data = ctx->data_at(fd);
+        connection_t* connection = data.connection;
 
         if (fd != connection->descriptor) { // Accept
-            descriptor_t conn_sock =
-                accept(fd, (struct sockaddr *)&connection->client_address, &connection->client_address_length);
+            descriptor_t conn_sock = accept(fd, (struct sockaddr*)&connection->client_address,
+                                            &connection->client_address_length);
             set_nonblock(conn_sock);
             events[completed].connection_ptr = connection;
             events[completed].result = conn_sock;

@@ -1,47 +1,28 @@
 /**
- *  @brief   IO Uring-based backend for UCall.
- *  @author  Ash Vardanian
+ *  @file src/server_uring.cpp
+ *  @author Ash Vardanian
+ *  @date January 16, 2023
+ *  @brief IO Uring-based backend for UCall.
  *
- *  Supports:
- *  > Thousands of concurrent stateful connections.
- *  > Hundreds of physical execution threads.
- *  > Both HTTP and HTTP-less raw JSON-RPC calls.
+ *  @section structures Primary structures
  *
- *  @section Primary structures
  *  - `engine_t`: primary server instance.
  *  - `connection_t`: lifetime state of a single TCP connection.
  *  - `scratch_space_t`: temporary memory used by a single thread at a time.
  *  - `automata_t`: automata that accepts and responds to messages.
  *
- *  @section Concurrency
- *  The whole class is thread safe and can be used with as many threads as
- *  defined during construction with `ucall_init`. Some `connection_t`-s
- *  can, however, be simultaneously handled by two threads, if one logical
- *  operation is split into multiple physical calls:
+ *  @section concurrency Concurrency
  *
- *       1.  Receiving packets with timeouts.
- *           This allows us to reconsider closing a connection every once
- *           in a while, instead of loyally waiting for more data to come.
- *       2.  Closing sockets gracefully.
+ *  Threads share the server, but a connection may have concurrent receive, timeout, and close
+ *  completions. Submitted buffers must remain alive until every operation using them completes.
  *
- *  @section Linux kernel requirements
- *  We need Submission Queue Polling to extract maximum performance from `io_uring`.
- *  Many of the requests would get an additional `IOSQE_FIXED_FILE` flag, and the
- *  setup call would receive `IORING_SETUP_SQPOLL`. Aside from those, we also
- *  need to prioritize following efficient interfaces:
- *  - `io_uring_prep_accept_direct` to alloc from reusable files list > 5.19..
- *  - `io_uring_prep_read_fixed` to read into registered buffers.
- *  - `io_uring_register_buffers`.
- *  - `io_uring_register_files_sparse` > 5.19, or `io_uring_register_files` before that.
- *  - `IORING_SETUP_COOP_TASKRUN` > 5.19.
- *  - `IORING_SETUP_SINGLE_ISSUER` > 6.0.
+ *  @section kernel Linux kernel requirements
  *
- * @author Ash Vardanian
+ *  Submission queue polling uses `IORING_SETUP_SQPOLL`. Fixed files and registered buffers require
+ *  the corresponding kernel support, including sparse file registration from Linux 5.19.
  *
- * @see Notable links:
- * https://man7.org/linux/man-pages/dir_by_project.html#liburing
- * https://jvns.ca/blog/2017/06/03/async-io-on-linux--select--poll--and-epoll/
- * https://stackoverflow.com/a/17665015/2766161
+ *  @see liburing system calls:
+ *      https://man7.org/linux/man-pages/dir_by_project.html#liburing
  */
 #include <arpa/inet.h>  // `inet_addr`
 #include <netinet/in.h> // `sockaddr_in`
@@ -69,13 +50,13 @@ struct uring_server_t {
     io_uring uring {};
 };
 
-void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
+void ucall_init(ucall_config_t* config_inout, ucall_server_t* server_out) {
 
     // Simple sanity check
     if (!server_out && !config_inout) return;
 
     // Retrieve configs, if present
-    ucall_config_t &config = *config_inout;
+    ucall_config_t& config = *config_inout;
     if (!config.port) config.port = 8545u;
     if (!config.queue_depth) config.queue_depth = 4096u;
     if (!config.max_callbacks) config.max_callbacks = 128u;
@@ -89,18 +70,18 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     int socket_options {1};
     int socket_descriptor {-1};
     int uring_result {-1};
-    uring_server_t *uctx = new uring_server_t();
-    struct io_uring *uring = &uctx->uring;
+    uring_server_t* uctx = new uring_server_t();
+    struct io_uring* uring = &uctx->uring;
     struct io_uring_params uring_params {};
-    struct io_uring_sqe *uring_sqe {};
-    struct io_uring_cqe *uring_cqe {};
+    struct io_uring_sqe* uring_sqe {};
+    struct io_uring_cqe* uring_cqe {};
     uring_params.features |= IORING_FEAT_FAST_POLL;
     uring_params.features |= IORING_FEAT_SQPOLL_NONFIXED;
     // uring_params.flags |= IORING_SETUP_COOP_TASKRUN;
     uring_params.flags |= IORING_SETUP_SQPOLL;
     uring_params.sq_thread_idle = wakeup_initial_frequency_ns_k;
     // uring_params.flags |= config.max_threads == 1 ? IORING_SETUP_SINGLE_ISSUER : 0; // 6.0+
-    server_state_t *server_ptr {};
+    server_state_t* server_ptr {};
     pool<connection_t> connections {};
     array<endpoint_t> callbacks {};
     buffer<struct iovec> registered_buffers {};
@@ -117,7 +98,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     if (uring_result != 0) goto cleanup;
 
     // Try allocating all the necessary memory.
-    server_ptr = (server_state_t *)std::malloc(sizeof(server_state_t));
+    server_ptr = (server_state_t*)std::malloc(sizeof(server_state_t));
     if (!server_ptr) goto cleanup;
     if (!callbacks.reserve(config.max_callbacks)) goto cleanup;
     if (!uctx->fixed_buffers.reserve(ram_page_size_k * 2u * config.max_concurrent_connections)) goto cleanup;
@@ -126,7 +107,7 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     // Additional `io_uring` setup.
     if (!registered_buffers.resize(config.max_concurrent_connections * 2u)) goto cleanup;
     for (std::size_t i = 0; i != config.max_concurrent_connections; ++i) {
-        auto &connection = connections.at_offset(i);
+        auto& connection = connections.at_offset(i);
         auto inputs = uctx->fixed_buffers.ptr + ram_page_size_k * 2u * i;
         auto outputs = inputs + ram_page_size_k;
         connection.pipes.mount(inputs, outputs);
@@ -138,8 +119,8 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     }
     uring_result = io_uring_register_files_sparse(uring, config.max_concurrent_connections);
     if (uring_result != 0) goto cleanup;
-    uring_result =
-        io_uring_register_buffers(uring, registered_buffers.data(), static_cast<unsigned>(registered_buffers.size()));
+    uring_result = io_uring_register_buffers(uring, registered_buffers.data(),
+                                             static_cast<unsigned>(registered_buffers.size()));
     if (uring_result != 0) goto cleanup;
 
     // Configure the socket.
@@ -150,13 +131,15 @@ void ucall_init(ucall_config_t *config_inout, ucall_server_t *server_out) {
     uring_result = io_uring_wait_cqe(uring, &uring_cqe);
     socket_descriptor = uring_cqe->res;
     if (socket_descriptor < 0) goto cleanup;
-    // Not sure if this is required, after we have a kernel with `IORING_OP_SENDMSG_ZC` support, we can check.
-    // if (setsockopt(socket_descriptor, SOL_SOCKET, SO_ZEROCOPY, &socket_options, sizeof(socket_options)) == -1)
+    // Not sure if this is required, after we have a kernel with `IORING_OP_SENDMSG_ZC` support, we
+    // can check.
+    // if (setsockopt(socket_descriptor, SOL_SOCKET, SO_ZEROCOPY, &socket_options,
+    // sizeof(socket_options)) == -1)
     //     goto cleanup;
     if (setsockopt(socket_descriptor, SOL_SOCKET, SO_REUSEADDR | SO_REUSEPORT,
-                   reinterpret_cast<char const *>(&socket_options), sizeof(socket_options)) == -1)
+                   reinterpret_cast<char const*>(&socket_options), sizeof(socket_options)) == -1)
         errno;
-    if (bind(socket_descriptor, (struct sockaddr *)&address, sizeof(address)) < 0) goto cleanup;
+    if (bind(socket_descriptor, (struct sockaddr*)&address, sizeof(address)) < 0) goto cleanup;
     if (listen(socket_descriptor, config.queue_depth) < 0) goto cleanup;
     if (config.ssl_certificates_count != 0) {
         ssl_context = std::make_unique<ssl_context_t>();
@@ -192,8 +175,8 @@ cleanup:
 void ucall_free(ucall_server_t punned_server) {
     if (!punned_server) return;
 
-    server_state_t &server = *reinterpret_cast<server_state_t *>(punned_server);
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(server.network_engine.network_data);
+    server_state_t& server = *reinterpret_cast<server_state_t*>(punned_server);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(server.network_engine.network_data);
     io_uring_unregister_buffers(&ctx->uring);
     io_uring_queue_exit(&ctx->uring);
     close(server.socket);
@@ -203,16 +186,14 @@ void ucall_free(ucall_server_t punned_server) {
 }
 
 void ucall_take_calls(ucall_server_t server, uint16_t thread_idx) {
-    engine_t &engine = *reinterpret_cast<engine_t *>(server);
+    engine_t& engine = *reinterpret_cast<engine_t*>(server);
     if (!thread_idx && engine.logs_file_descriptor > 0) engine.submit_stats_heartbeat();
     while (true) { ucall_take_call(server, thread_idx); }
 }
 
 void ucall_take_call(ucall_server_t server, uint16_t thread_idx) {
-    // Unlike the classical synchronous interface, this implements only a part of the connection machine,
-    // is responsible for checking if a specific request has been completed. All of the submitted
-    // memory must be preserved until we get the confirmation.
-    engine_t &engine = *reinterpret_cast<engine_t *>(server);
+    // Submitted buffers must remain alive until their completion is observed.
+    engine_t& engine = *reinterpret_cast<engine_t*>(server);
     if (!thread_idx) engine.consider_accepting_new_connection();
 
     constexpr std::size_t completed_max_k {16};
@@ -220,7 +201,7 @@ void ucall_take_call(ucall_server_t server, uint16_t thread_idx) {
     std::size_t completed_count = engine.pop_completed<completed_max_k>(completed_events);
 
     for (std::size_t i = 0; i != completed_count; ++i) {
-        completed_event_t &completed = completed_events[i];
+        completed_event_t& completed = completed_events[i];
         automata_t automata {
             engine, //
             engine.spaces[thread_idx],
@@ -235,9 +216,9 @@ void ucall_take_call(ucall_server_t server, uint16_t thread_idx) {
 }
 
 void ucall_call_reply_content(ucall_call_t call, ucall_str_t body, size_t body_len) {
-    automata_t &automata = *reinterpret_cast<automata_t *>(call);
-    connection_t &connection = automata.connection;
-    scratch_space_t &scratch = automata.scratch;
+    automata_t& automata = *reinterpret_cast<automata_t*>(call);
+    connection_t& connection = automata.connection;
+    scratch_space_t& scratch = automata.scratch;
     // No response is needed for "id"-less notifications.
     if (scratch.dynamic_id.empty()) return;
 
@@ -248,9 +229,9 @@ void ucall_call_reply_content(ucall_call_t call, ucall_str_t body, size_t body_l
 }
 
 void ucall_call_reply_error(ucall_call_t call, int code_int, ucall_str_t note, size_t note_len) {
-    automata_t &automata = *reinterpret_cast<automata_t *>(call);
-    connection_t &connection = automata.connection;
-    scratch_space_t &scratch = automata.scratch;
+    automata_t& automata = *reinterpret_cast<automata_t*>(call);
+    connection_t& connection = automata.connection;
+    scratch_space_t& scratch = automata.scratch;
     // No response is needed for "id"-less notifications.
     if (scratch.dynamic_id.empty()) return;
 
@@ -278,7 +259,7 @@ void ucall_call_reply_error_out_of_memory(ucall_call_t call) {
     return ucall_call_reply_error(call, -32000, "Out of memory.", 14);
 }
 
-bool ucall_param_named_bool(ucall_call_t call, ucall_str_t name, size_t name_len, bool *result_ptr) {
+bool ucall_param_named_bool(ucall_call_t call, ucall_str_t name, size_t name_len, bool* result_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_bool()) {
         *result_ptr = value.get_bool().value_unsafe();
         return true;
@@ -286,7 +267,7 @@ bool ucall_param_named_bool(ucall_call_t call, ucall_str_t name, size_t name_len
     else return false;
 }
 
-bool ucall_param_named_i64(ucall_call_t call, ucall_str_t name, size_t name_len, int64_t *result_ptr) {
+bool ucall_param_named_i64(ucall_call_t call, ucall_str_t name, size_t name_len, int64_t* result_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_int64()) {
         *result_ptr = value.get_int64().value_unsafe();
         return true;
@@ -294,7 +275,7 @@ bool ucall_param_named_i64(ucall_call_t call, ucall_str_t name, size_t name_len,
     else return false;
 }
 
-bool ucall_param_named_f64(ucall_call_t call, ucall_str_t name, size_t name_len, double *result_ptr) {
+bool ucall_param_named_f64(ucall_call_t call, ucall_str_t name, size_t name_len, double* result_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_double()) {
         *result_ptr = value.get_double().value_unsafe();
         return true;
@@ -302,8 +283,8 @@ bool ucall_param_named_f64(ucall_call_t call, ucall_str_t name, size_t name_len,
     else return false;
 }
 
-bool ucall_param_named_str(ucall_call_t call, ucall_str_t name, size_t name_len, ucall_str_t *result_ptr,
-                           size_t *result_len_ptr) {
+bool ucall_param_named_str(ucall_call_t call, ucall_str_t name, size_t name_len, ucall_str_t* result_ptr,
+                           size_t* result_len_ptr) {
     if (auto value = param_at(call, name, name_len); value.is_string()) {
         *result_ptr = value.get_string().value_unsafe().data();
         *result_len_ptr = value.get_string_length().value_unsafe();
@@ -312,7 +293,7 @@ bool ucall_param_named_str(ucall_call_t call, ucall_str_t name, size_t name_len,
     else return false;
 }
 
-bool ucall_param_positional_bool(ucall_call_t call, size_t position, bool *result_ptr) {
+bool ucall_param_positional_bool(ucall_call_t call, size_t position, bool* result_ptr) {
     if (auto value = param_at(call, position); value.is_bool()) {
         *result_ptr = value.get_bool().value_unsafe();
         return true;
@@ -320,7 +301,7 @@ bool ucall_param_positional_bool(ucall_call_t call, size_t position, bool *resul
     else return false;
 }
 
-bool ucall_param_positional_i64(ucall_call_t call, size_t position, int64_t *result_ptr) {
+bool ucall_param_positional_i64(ucall_call_t call, size_t position, int64_t* result_ptr) {
     if (auto value = param_at(call, position); value.is_int64()) {
         *result_ptr = value.get_int64().value_unsafe();
         return true;
@@ -328,7 +309,7 @@ bool ucall_param_positional_i64(ucall_call_t call, size_t position, int64_t *res
     else return false;
 }
 
-bool ucall_param_positional_f64(ucall_call_t call, size_t position, double *result_ptr) {
+bool ucall_param_positional_f64(ucall_call_t call, size_t position, double* result_ptr) {
     if (auto value = param_at(call, position); value.is_double()) {
         *result_ptr = value.get_double().value_unsafe();
         return true;
@@ -336,7 +317,7 @@ bool ucall_param_positional_f64(ucall_call_t call, size_t position, double *resu
     else return false;
 }
 
-bool ucall_param_positional_str(ucall_call_t call, size_t position, ucall_str_t *result_ptr, size_t *result_len_ptr) {
+bool ucall_param_positional_str(ucall_call_t call, size_t position, ucall_str_t* result_ptr, size_t* result_len_ptr) {
     if (auto value = param_at(call, position); value.is_string()) {
         *result_ptr = value.get_string().value_unsafe().data();
         *result_len_ptr = value.get_string_length().value_unsafe();
@@ -404,10 +385,10 @@ bool automata_t::received_full_request() const noexcept {
     return res;
 }
 
-int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) noexcept {
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
-    io_uring *uring = &ctx->uring;
-    io_uring_sqe *uring_sqe {};
+int network_engine_t::try_accept(descriptor_t socket, connection_t& connection) noexcept {
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
+    io_uring* uring = &ctx->uring;
+    io_uring_sqe* uring_sqe {};
     ctx->submission_mutex.lock();
     uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_accept_direct(uring_sqe, socket, &connection.client_address, &connection.client_address_length, 0,
@@ -425,27 +406,27 @@ int network_engine_t::try_accept(descriptor_t socket, connection_t &connection) 
     return res;
 }
 
-void network_engine_t::set_stats_heartbeat(connection_t &connection) noexcept {
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+void network_engine_t::set_stats_heartbeat(connection_t& connection) noexcept {
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     __kernel_timespec wakeup {0, connection.next_wakeup};
-    io_uring *uring = &ctx->uring;
+    io_uring* uring = &ctx->uring;
     ctx->submission_mutex.lock();
-    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_timeout(uring_sqe, &wakeup, 0, 0);
     io_uring_sqe_set_data(uring_sqe, &connection);
     io_uring_submit(uring);
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::close_connection_gracefully(connection_t &connection) noexcept {
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+void network_engine_t::close_connection_gracefully(connection_t& connection) noexcept {
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     // The operations are not expected to complete in exactly the same order
     // as their submissions. So to stop all existing communication on the
     // socket, we can cancel everything related to its "file descriptor",
     // and then close.
-    io_uring *uring = &ctx->uring;
+    io_uring* uring = &ctx->uring;
     ctx->submission_mutex.lock();
-    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_cancel_fd(uring_sqe, int(connection.descriptor), 0);
     io_uring_sqe_set_data(uring_sqe, NULL);
     io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_HARDLINK);
@@ -464,12 +445,12 @@ void network_engine_t::close_connection_gracefully(connection_t &connection) noe
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::send_packet(connection_t &connection, void *buffer, size_t buffer_length,
+void network_engine_t::send_packet(connection_t& connection, void* buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
-    io_uring *uring = &ctx->uring;
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
+    io_uring* uring = &ctx->uring;
     ctx->submission_mutex.lock();
-    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
 
     // TODO: Test and benchmark the `send_zc option`.
     // if (io_check_send_zc()) {
@@ -485,11 +466,11 @@ void network_engine_t::send_packet(connection_t &connection, void *buffer, size_
     ctx->submission_mutex.unlock();
 }
 
-void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_t buffer_length,
+void network_engine_t::recv_packet(connection_t& connection, void* buffer, size_t buffer_length,
                                    size_t buf_index) noexcept {
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
     ctx->submission_mutex.lock();
-    io_uring *uring = &ctx->uring;
+    io_uring* uring = &ctx->uring;
 
     // Choosing between `recv` and `read` system calls:
     // > If a zero-length datagram is pending, read(2) and recv() with a
@@ -499,7 +480,7 @@ void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_
     // https://man7.org/linux/man-pages/man2/recv.2.html
     //
     // In this case we are waiting for an actual data, not some artificial wakeup.
-    io_uring_sqe *uring_sqe = io_uring_get_sqe(uring);
+    io_uring_sqe* uring_sqe = io_uring_get_sqe(uring);
     io_uring_prep_read_fixed(uring_sqe, int(connection.descriptor), buffer, buffer_length, 0, buf_index);
     io_uring_sqe_set_data(uring_sqe, &connection);
     io_uring_sqe_set_flags(uring_sqe, IOSQE_IO_LINK);
@@ -507,7 +488,8 @@ void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_
     // More than other operations this depends on the information coming from the client.
     // We can't afford to keep connections alive indefinitely, so we need to set a timeout
     // on this operation.
-    // The `io_uring_prep_link_timeout` is a convenience method for poorly documented `IORING_OP_LINK_TIMEOUT`.
+    // The `io_uring_prep_link_timeout` is a convenience method for poorly documented
+    // `IORING_OP_LINK_TIMEOUT`.
     uring_sqe = io_uring_get_sqe(uring);
     __kernel_timespec wakeup {0, connection.next_wakeup};
     io_uring_prep_link_timeout(uring_sqe, &wakeup, 0);
@@ -517,31 +499,29 @@ void network_engine_t::recv_packet(connection_t &connection, void *buffer, size_
     ctx->submission_mutex.unlock();
 }
 
-bool network_engine_t::is_canceled(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
-    return res == -ECANCELED;
-}
+bool network_engine_t::is_canceled(ssize_t res, connection_t const& conn) noexcept { return res == -ECANCELED; }
 
-bool network_engine_t::is_corrupted(ssize_t res, unum::ucall::connection_t const &conn) noexcept {
+bool network_engine_t::is_corrupted(ssize_t res, connection_t const& conn) noexcept {
     // Since the socket operates in blocking mode, a return value of 0 is unlikely,
     // but just in case allow the possibility of occasional occurrences.
     return res == -EBADF || res == -EPIPE || (res == 0 && conn.empty_transmits > 8);
 }
 
 template <size_t max_count_ak>
-std::size_t network_engine_t::pop_completed_events(completed_event_t *events) noexcept {
-    uring_server_t *ctx = reinterpret_cast<uring_server_t *>(network_data);
-    io_uring *uring = &ctx->uring;
+std::size_t network_engine_t::pop_completed_events(completed_event_t* events) noexcept {
+    uring_server_t* ctx = reinterpret_cast<uring_server_t*>(network_data);
+    io_uring* uring = &ctx->uring;
     unsigned uring_head = 0;
     unsigned completed = 0;
     unsigned passed = 0;
-    io_uring_cqe *uring_cqe {};
+    io_uring_cqe* uring_cqe {};
 
     ctx->submission_mutex.lock();
     io_uring_for_each_cqe(uring, uring_head, uring_cqe) {
         ++passed;
         if (!uring_cqe->user_data) continue;
 
-        events[completed].connection_ptr = (connection_t *)uring_cqe->user_data;
+        events[completed].connection_ptr = (connection_t*)uring_cqe->user_data;
         events[completed].result = uring_cqe->res;
         ++completed;
         if (completed == max_count_ak) break;

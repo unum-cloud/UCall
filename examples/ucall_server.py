@@ -1,12 +1,12 @@
-"""
-This module implements a pseudo-backend for benchmarking and demostration purposes for the UCall JSON-RPC implementation.
+"""This module implements a pseudo-backend for benchmarking and demostration purposes for the UCall JSON-RPC implementation.
+
 It provides a simplified in-memory key-value store and image manipulation functions, alongside user management utilities.
 """
 
 import random
-from typing import List
 
 import numpy as np
+import numpy.typing as npt
 import PIL.Image as pil
 
 from ucall.posix import Server
@@ -17,8 +17,7 @@ server = Server(port=8545)
 
 @server
 def echo(data: bytes) -> bytes:
-    """
-    Returns the same data it receives.
+    """Returns the same data it receives.
 
     Args:
         data (bytes): Data to be echoed back.
@@ -31,8 +30,7 @@ def echo(data: bytes) -> bytes:
 
 @server
 def validate_session(user_id: int, session_id: int) -> bool:
-    """
-    Validates if the session ID is valid for the given user ID based on a hashing scheme.
+    """Validates if the session ID is valid for the given user ID based on a hashing scheme.
 
     Args:
         user_id (int): The user's unique identifier.
@@ -46,8 +44,7 @@ def validate_session(user_id: int, session_id: int) -> bool:
 
 @server
 def create_user(age: int, name: str, avatar: bytes, bio: str) -> str:
-    """
-    Registers a new user with the given details and returns a summary.
+    """Registers a new user with the given details and returns a summary.
 
     Args:
         age (int): User's age.
@@ -68,8 +65,8 @@ def validate_user_identity(
     age: float,
     access_token: bytes,
 ) -> dict:
-    """
-    Similar to JWT, validates the user's identity based on the provided data.
+    """Similar to JWT, validates the user's identity based on the provided data.
+
     Showcases argument validation & exception handling in the Python layer,
     as well as complex structured returned values.
 
@@ -108,8 +105,7 @@ redis = dict()
 
 @server
 def set(key: str, value: str) -> bool:
-    """
-    Sets a value in the key-value store.
+    """Sets a value in the key-value store.
 
     Args:
         key (str): The key under which the value is stored.
@@ -124,8 +120,7 @@ def set(key: str, value: str) -> bool:
 
 @server
 def get(key: str) -> str:
-    """
-    Retrieves a value from the key-value store based on the key.
+    """Retrieves a value from the key-value store based on the key.
 
     Args:
         key (str): The key whose value needs to be retrieved.
@@ -133,13 +128,13 @@ def get(key: str) -> str:
     Returns:
         str: The value if found, otherwise None.
     """
-    return redis.get(key, None)
+    return redis.get(key)
 
 
 @server
 def resize(image: pil.Image, width: int, height: int) -> pil.Image:
-    """
-    Resizes a single image to the specified width and height.
+    """Resizes a single image to the specified width and height.
+
     Showcases how UCall handles complex binary types like images,
     encoding them into Base64.
 
@@ -155,9 +150,9 @@ def resize(image: pil.Image, width: int, height: int) -> pil.Image:
 
 
 @server(batch=True, name="resize")
-def resize_batch(images: List[pil.Image], width: int, height: int) -> List[pil.Image]:
-    """
-    Resizes a batch of images to the specified dimensions.
+def resize_batch(images: list[pil.Image], width: int, height: int) -> list[pil.Image]:
+    """Resizes a batch of images to the specified dimensions.
+
     Showcases how UCall handles complex binary types like images,
     encoding them into Base64, and regrouping them into lists
     for batch processing.
@@ -174,9 +169,9 @@ def resize_batch(images: List[pil.Image], width: int, height: int) -> List[pil.I
 
 
 @server
-def dot_product(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Calculates the dot product of two vectors.
+def dot_product(a: npt.NDArray[np.float32], b: npt.NDArray[np.float32]) -> float:
+    """Calculates the dot product of two vectors.
+
     Showcases how UCall handles complex binary types like NumPy arrays,
     encoding them into Base64.
 
@@ -191,9 +186,9 @@ def dot_product(a: np.ndarray, b: np.ndarray) -> float:
 
 
 @server(batch=True, name="dot_product")
-def dot_product_batch(a: List[np.ndarray], b: List[np.ndarray]) -> List[float]:
-    """
-    Calculates the dot products of many vectors.
+def dot_product_batch(a: list[npt.NDArray[np.float32]], b: list[npt.NDArray[np.float32]]) -> list[float]:
+    """Calculates the dot products of many vectors.
+
     Showcases how UCall handles complex binary types like NumPy arrays,
     encoding them into Base64, and regrouping them into lists
     for batch processing.

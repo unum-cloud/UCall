@@ -1,3 +1,6 @@
+-- examples/login/json.lua: Pipelined session-validation requests for wrk.
+-- Ash Vardanian, April 14, 2024.
+
 -- example script demonstrating HTTP pipelining
 
 init = function(args)

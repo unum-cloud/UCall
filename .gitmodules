@@ -1,0 +1,4 @@
+[submodule "stringzilla"]
+	path = stringzilla
+	url = https://github.com/ashvardanian/StringZilla
+	branch = main-v6

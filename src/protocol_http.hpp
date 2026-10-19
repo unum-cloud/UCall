@@ -1,3 +1,9 @@
+/**
+ *  @file src/protocol_http.hpp
+ *  @author Ash Vardanian
+ *  @date July 21, 2023
+ *  @brief HTTP request parsing and response framing.
+ */
 #pragma once
 
 #include <charconv>
@@ -12,7 +18,7 @@
 namespace unum::ucall {
 
 // TODO Let higher protocols modify, add, remove Headers
-static constexpr char const *http_header_k =
+static constexpr char const* http_header_k =
     "HTTP/1.1 200 OK\r\nContent-Length:          \r\nContent-Type: application/json\r\n\r\n";
 static constexpr std::size_t http_header_size_k = 78;
 static constexpr std::size_t http_header_length_offset_k = 33;
@@ -20,9 +26,11 @@ static constexpr std::size_t http_header_length_capacity_k = 9;
 static constexpr std::size_t http_max_headers_k = 32;
 
 struct http_protocol_t {
-    /** @brief Expected receiving/sending length extracted from HTTP headers. */
+
+    /** Expected receiving/sending length extracted from HTTP headers. */
     std::optional<std::size_t> content_length {};
-    /** @brief Active parsed request. */
+
+    /** Active parsed request. */
     parsed_request_t parsed {};
 
     phr_header headers[http_max_headers_k] {};
@@ -34,50 +42,50 @@ struct http_protocol_t {
     any_param_t get_param(std::string_view) const noexcept;
     std::string_view get_header(std::string_view) const noexcept;
 
-    inline void prepare_response(exchange_pipes_t &pipes) noexcept;
+    inline void prepare_response(exchange_pipes_t& pipes) noexcept;
 
-    inline bool append_response(exchange_pipes_t &, std::string_view) noexcept;
-    inline bool append_error(exchange_pipes_t &, std::string_view, std::string_view) noexcept;
+    inline bool append_response(exchange_pipes_t&, std::string_view) noexcept;
+    inline bool append_error(exchange_pipes_t&, std::string_view, std::string_view) noexcept;
 
-    inline void finalize_response(exchange_pipes_t &pipes) noexcept;
+    inline void finalize_response(exchange_pipes_t& pipes) noexcept;
 
     inline void reset() noexcept;
 
     bool is_input_complete(span<char> input) noexcept;
 
     /**
-     * @brief Analyzes the contents of the packet, bifurcating pure JSON-RPC from HTTP1-based.
-     * @warning This doesn't check the headers for validity or additional metadata.
+     *  @brief Analyzes the contents of the packet, bifurcating pure JSON-RPC from HTTP1-based.
+     *  @warning This doesn't check the headers for validity or additional metadata.
      */
     inline std::optional<status_t> parse_headers(std::string_view body) noexcept;
     inline std::optional<status_t> parse_content() noexcept { return std::nullopt; };
 
     template <typename callee_at>
-    std::optional<status_t> populate_response(exchange_pipes_t &, callee_at) noexcept {
+    std::optional<status_t> populate_response(exchange_pipes_t&, callee_at) noexcept {
         return std::nullopt;
     }
 };
 
-inline void http_protocol_t::prepare_response(exchange_pipes_t &pipes) noexcept {
+inline void http_protocol_t::prepare_response(exchange_pipes_t& pipes) noexcept {
     pipes.append_reserved(http_header_k, http_header_size_k);
     content_length = pipes.output_span().size();
 }
 
-inline bool http_protocol_t::append_response(exchange_pipes_t &pipes, std::string_view response) noexcept {
+inline bool http_protocol_t::append_response(exchange_pipes_t& pipes, std::string_view response) noexcept {
     return pipes.append_outputs(response);
 }
 
-inline bool http_protocol_t::append_error(exchange_pipes_t &pipes, std::string_view error_code,
+inline bool http_protocol_t::append_error(exchange_pipes_t& pipes, std::string_view error_code,
                                           std::string_view message) noexcept {
     return pipes.append_outputs(error_code);
 }
 
-inline void http_protocol_t::finalize_response(exchange_pipes_t &pipes) noexcept {
+inline void http_protocol_t::finalize_response(exchange_pipes_t& pipes) noexcept {
     auto output = pipes.output_span();
     content_length = output.size() - *content_length;
-    auto res =
-        std::to_chars(output.data() + http_header_length_offset_k,
-                      output.data() + http_header_length_offset_k + http_header_length_capacity_k, *content_length);
+    auto res = std::to_chars(output.data() + http_header_length_offset_k,
+                             output.data() + http_header_length_offset_k + http_header_length_capacity_k,
+                             *content_length);
 
     if (res.ec != std::errc()) {
         // TODO Return error
@@ -122,14 +130,14 @@ bool http_protocol_t::is_input_complete(span<char> input) noexcept {
 }
 
 /**
- * @brief Analyzes the contents of the packet, bifurcating pure JSON-RPC from HTTP1-based.
- * @warning This doesn't check the headers for validity or additional metadata.
+ *  @brief Analyzes the contents of the packet, bifurcating pure JSON-RPC from HTTP1-based.
+ *  @warning This doesn't check the headers for validity or additional metadata.
  */
 inline std::optional<status_t> http_protocol_t::parse_headers(std::string_view body) noexcept {
 
-    char const *method {};
+    char const* method {};
     size_t method_len {};
-    char const *path {};
+    char const* path {};
     size_t path_len {};
     int minor_version {};
     count_headers = http_max_headers_k;

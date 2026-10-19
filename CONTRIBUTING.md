@@ -1,68 +1,27 @@
 # Contributing to UCall
 
-Thanks for coming here!
-For coding guidelines, please refer to [ashvardanian/CONTRIBUTING.md](https://github.com/ashvardanian/ashvardanian/blob/master/CONTRIBUTING.md).
+For coding guidelines, refer to [ashvardanian/CONTRIBUTING.md](https://github.com/ashvardanian/ashvardanian/blob/master/CONTRIBUTING.md).
+Configuring a source checkout enables the hooks in `.githooks/`.
+They check staged additions, Doxygen and docstring structure, imports, naming, and language formatting.
 
-The repository carries its own hooks, gating the added lines of each staged file against the formatter its language uses:
-
-```bash
-git config core.hooksPath .githooks
-```
-
-## Compiling C++ Code
-
-Release build:
+## Compiling C and C++
 
 ```bash
-cmake -D CMAKE_BUILD_TYPE=Release -B build_release -D UCALL_BUILD_TESTS=1
-cmake --build build_release --config Release --parallel
-build_release/ucall_test_posix
+cmake --preset host_debug
+cmake --build --preset host_debug
+ctest --preset host_debug
 ```
 
-Debug build for the test suite:
+The `host_relwithdebinfo` and `host_release` presets build the same suites with optimization.
+StringZilla resolves from its submodule or a pinned fetch; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA` selects an existing checkout.
+
+## Running Tests
+
+Native suites live in `test/`, the C caller in `c/test.c`, and benchmark clients in `bench/`.
+`UCALL_SEED` selects an unsigned 32-bit seed or `random`, `UCALL_FILTER` selects cases, and `UCALL_MULTIPLIER` scales native sweeps.
 
 ```bash
-cmake -D CMAKE_BUILD_TYPE=Debug -B build_debug
-cmake --build build_debug --config Debug --target ucall_test_posix
-build_debug/ucall_test_posix
+UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset host_debug
 ```
 
-### Running Tests
-
-Run all tests:
-
-```bash
-build_debug/ucall_test_posix
-```
-
-Run specific test suites:
-
-```bash
-build_debug/ucall_test_posix --gtest_filter="upsert_and_find*"
-build_debug/ucall_test_posix --gtest_filter="transaction_*"
-build_debug/ucall_test_posix --gtest_filter="*with_threads"
-```
-
-Brief output:
-
-```bash
-build_debug/ucall_test_posix --gtest_brief=1
-```
-
-List available tests:
-
-```bash
-build_debug/ucall_test_posix --gtest_list_tests
-```
-
-## Compiling Python Bindings
-
-Python bindings are implemented using pure CPython, so you wouldn't need to install SWIG, PyBind11, or any other third-party library.
-Still, you need a virtual environment, and it's recommended to use `uv` to create one.
-
-```bash
-uv venv --python 3.14t                  # it's recommended to use a recent free-threading version
-source .venv/bin/activate               # to activate the virtual environment
-uv pip install setuptools wheel         # to pull the latest build tools
-uv pip install -e . --force-reinstall   # to build locally from source
-```
+The Python integration suites in `test/` require the example servers they exercise.

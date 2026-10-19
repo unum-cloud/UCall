@@ -2,7 +2,7 @@
 C Standard
 ==========
 
-.. mdinclude:: ../../include/ucall/README.md
+.. mdinclude:: ../../c/README.md
 
 .. toctree::
    :hidden:

@@ -1,3 +1,5 @@
+"""Formatting policy for the CMake source files."""
+
 # Controls the CMakeLists.txt file formatting for the `cmake-format` tool.
 # https://cmake-format.readthedocs.io/en/latest/configuration.html
 

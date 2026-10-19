@@ -1,4 +1,4 @@
-"""Every `UCALL_*` variable the `examples/test_*.py` suites read, parsed once at import into `SETTINGS`."""
+"""Every `UCALL_*` variable the `test/*.py` suites read, parsed once at import into `SETTINGS`."""
 
 from __future__ import annotations
 

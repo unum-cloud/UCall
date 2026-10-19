@@ -1,3 +1,5 @@
+"""Synchronous TCP, HTTP, and TLS clients for the UCall Python SDK."""
+
 import base64
 import errno
 import json
@@ -5,9 +7,10 @@ import random
 import socket
 import ssl
 from io import BytesIO
-from typing import Union
+from typing import Any
 
 import numpy as np
+import numpy.typing as npt
 from PIL import Image
 
 
@@ -45,12 +48,11 @@ def _receive_all(sock, buffer_size=4096):
 
 
 class Response:
-
     def __init__(self, data):
         self.data = data
 
     @property
-    def json(self) -> Union[bool, int, float, str, dict, list, tuple]:
+    def json(self) -> bool | int | float | str | dict | list | tuple:
         self.raise_for_status()
         return self.data["result"]
 
@@ -63,7 +65,7 @@ class Response:
         return base64.b64decode(self.json)
 
     @property
-    def numpy(self) -> np.ndarray:
+    def numpy(self) -> npt.NDArray[Any]:
         buf = BytesIO(self.bytes)
         return np.load(buf, allow_pickle=True)
 
@@ -74,7 +76,6 @@ class Response:
 
 
 class Request:
-
     def __init__(self, json):
         self.data = json
         self.packed = self.pack(json)
@@ -98,10 +99,7 @@ class Request:
 
     def pack(self, req):
         keys = None
-        if isinstance(req["params"], dict):
-            keys = req["params"].keys()
-        else:
-            keys = range(0, len(req["params"]))
+        keys = req["params"].keys() if isinstance(req["params"], dict) else range(0, len(req["params"]))
 
         for k in keys:
             if isinstance(req["params"][k], np.ndarray):
@@ -117,12 +115,11 @@ class Request:
 
 
 class Client:
-    """JSON-RPC Client that uses classic sync Python `requests` to pass JSON calls over HTTP"""
-    TCP_TERMINATOR = b'\0'
+    """JSON-RPC Client that uses classic sync Python `requests` to pass JSON calls over HTTP."""
 
-    def __init__(
-        self, uri: str = "127.0.0.1", port: int = 8545, use_http: bool = True
-    ) -> None:
+    TCP_TERMINATOR = b"\0"
+
+    def __init__(self, uri: str = "127.0.0.1", port: int = 8545, use_http: bool = True) -> None:
         self.uri = uri
         self.port = port
         self.use_http = use_http
@@ -153,9 +150,7 @@ class Client:
         self.sock.connect((self.uri, self.port))
 
     def _socket_is_closed(self) -> bool:
-        """
-        Returns True if the remote side did close the connection
-        """
+        """Returns True if the remote side did close the connection."""
         if self.sock is None:
             return True
         try:
@@ -182,20 +177,20 @@ class Client:
     def _receive_all_http(self, buffer_size=4096):
         body = None
         content_len = -1
-        header = b''
+        header = b""
 
-        while b'\r\n\r\n' not in header:
+        while b"\r\n\r\n" not in header:
             chunk = self.sock.recv(1024)
             if not chunk:
                 break
             header += chunk
 
-        header, body = header.split(b'\r\n\r\n', 1)
+        header, body = header.split(b"\r\n\r\n", 1)
 
-        pref = b'Content-Length:'
+        pref = b"Content-Length:"
         for line in header.splitlines():
             if line.startswith(pref):
-                content_len = int(line[len(pref):].strip())
+                content_len = int(line[len(pref) :].strip())
                 break
 
         content_len -= len(body)
@@ -207,7 +202,7 @@ class Client:
         return body
 
     def _receive_all_tcp(self, buffer_size=4096):
-        body = b''
+        body = b""
         while not body.endswith(self.TCP_TERMINATOR):
             body += self.sock.recv(buffer_size)
 
@@ -215,10 +210,7 @@ class Client:
 
     def _recv(self) -> Response:
         response_bytes = None
-        if self.use_http:
-            response_bytes = self._receive_all_http()
-        else:
-            response_bytes = self._receive_all_tcp()
+        response_bytes = self._receive_all_http() if self.use_http else self._receive_all_tcp()
         response = json.loads(response_bytes)
         return Response(response)
 
@@ -253,9 +245,7 @@ class ClientTLS(Client):
         if not self._socket_is_closed():
             return
         self.sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        self.sock = self.ssl_context.wrap_socket(
-            self.sock, server_hostname=self.uri, session=self.session
-        )
+        self.sock = self.ssl_context.wrap_socket(self.sock, server_hostname=self.uri, session=self.session)
         self.sock.connect((self.uri, self.port))
         if self.session_resumption:
             self.session = self.sock.session

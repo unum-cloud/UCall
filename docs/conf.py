@@ -1,3 +1,5 @@
+"""Builds the Sphinx reference pages and configures their theme."""
+
 # Configuration file for the Sphinx documentation builder.
 #
 # For the full list of built-in configuration values, see the documentation:
@@ -6,11 +8,13 @@
 # Project information
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#project-information
 
-project = 'Unum · UCall'
-copyright = '2023, Unum'
-author = 'Unum'
-release = open('../VERSION', 'r').read().strip()
-with open('_static/custom.js', 'r+') as js:
+from pathlib import Path
+
+project = "Unum · UCall"
+copyright = "2023, Unum"
+author = "Ash Vardanian"
+release = Path("../VERSION").read_text().strip()
+with open("_static/custom.js", "r+") as js:
     content = js.read()
     js.seek(0)
     js.truncate()
@@ -19,29 +23,31 @@ with open('_static/custom.js', 'r+') as js:
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#general-configuration
 
 extensions = [
-    'breathe', 'm2r2',
-    'sphinx.ext.autodoc',
-    'sphinx.ext.autosummary',
-    'sphinx.ext.intersphinx',
-    'sphinx.ext.napoleon',
-    'sphinxcontrib.jquery',
-    'sphinxcontrib.googleanalytics']
+    "breathe",
+    "m2r2",
+    "sphinx.ext.autodoc",
+    "sphinx.ext.autosummary",
+    "sphinx.ext.intersphinx",
+    "sphinx.ext.napoleon",
+    "sphinxcontrib.jquery",
+    "sphinxcontrib.googleanalytics",
+]
 
-exclude_patterns = ['_build', 'Thumbs.db', '.DS_Store', '*.md']
+exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "*.md"]
 
 
-googleanalytics_id = '341385789'
+googleanalytics_id = "341385789"
 googleanalytics_enabled = True
 
 # Options for HTML output
 # https://www.sphinx-doc.org/en/master/usage/configuration.html#options-for-html-output
 
-html_logo = '../assets/unum.png'
-html_theme = 'furo'
-html_static_path = ['_static']
-html_css_files = ['custom.css']
-html_js_files = ['custom.js']
+html_logo = "../assets/unum.png"
+html_theme = "furo"
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
+html_js_files = ["custom.js"]
 
 
-breathe_projects = {'UCall': '../build/xml'}
-breathe_default_project = 'UCall'
+breathe_projects = {"UCall": "../build/xml"}
+breathe_default_project = "UCall"

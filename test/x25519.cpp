@@ -1,7 +1,8 @@
 /**
- *  @brief Tests for @c crypto_x25519.hpp against RFC 7748 §5.2 and Project Wycheproof vectors.
- *  @file scripts/test_x25519.cpp
+ *  @file test/x25519.cpp
  *  @author Ash Vardanian
+ *  @date August 4, 2026
+ *  @brief Tests for @c crypto_x25519.hpp against RFC 7748 §5.2 and Project Wycheproof vectors.
  *
  *  Vectors come verbatim from RFC 7748 and from Google's Project Wycheproof (`x25519_test.json`,
  *  `XdhComp` group, curve25519); the low-order-point cases are that suite's, not hand-derived.
@@ -13,30 +14,30 @@
 #include <cstring> // `std::memcpy`
 
 #include "crypto_x25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
-#include "test.hpp"          // `verify`, `run_test`, `from_hex`
+#include "harness.hpp"       // `verify`, `run_test`, `from_hex`
 
 using namespace unum::ucall;
-using namespace unum::ucall::scripts;
+using namespace unum::ucall::test;
 
 #pragma region Fixtures
 
-/** @brief What a scalar multiplication yields, which a bare @c bool cannot name. */
+/** What a scalar multiplication yields, which a bare @c bool cannot name. */
 enum class shared_secret_t : std::uint8_t {
-    /** @brief A usable secret: the peer's point had large order. */
+
+    /** A usable secret: the peer's point had large order. */
     usable_k,
-    /** @brief All zeros, which RFC 7748 §6.1 requires be treated as a failed exchange. */
+
+    /** All zeros, which RFC 7748 §6.1 requires be treated as a failed exchange. */
     all_zero_k,
 };
 
-/**
- *  Generated from RFC 7748 section 5.2 and Project Wycheproof's x25519_test.json - do not
- *  hand-edit the hex literals below, regenerate from those sources instead.
- */
+/** Generated from RFC 7748 section 5.2 and Project Wycheproof's x25519_test.json - do not
+ *  hand-edit the hex literals below, regenerate from those sources instead. */
 struct x25519_vector_t {
-    char const *label;
-    char const *scalar_hex;
-    char const *point_hex;
-    char const *shared_hex;
+    char const* label;
+    char const* scalar_hex;
+    char const* point_hex;
+    char const* shared_hex;
     shared_secret_t expected;
 };
 
@@ -84,12 +85,12 @@ static x25519_vector_t const x25519_vectors_k[] = {
      "436a2c040cf45fea9b29a0cb81b1f41458f863d0d61b453d0a982720d6d61320", shared_secret_t::usable_k}, // normal case
 };
 
-/** @brief A vector's two input literals, decoded into bytes ready to hand to the library. */
+/** A vector's two input literals, decoded into bytes ready to hand to the library. */
 struct decoded_vector_t {
     byte_t scalar[x25519_key_size_k] {};
     byte_t point[x25519_key_size_k] {};
 
-    explicit decoded_vector_t(x25519_vector_t const &vector) noexcept {
+    explicit decoded_vector_t(x25519_vector_t const& vector) noexcept {
         verify(from_hex(vector.scalar_hex, {scalar, scalar + x25519_key_size_k}), "{} has a bad scalar literal",
                vector.label);
         verify(from_hex(vector.point_hex, {point, point + x25519_key_size_k}), "{} has a bad point literal",
@@ -97,12 +98,13 @@ struct decoded_vector_t {
     }
 };
 
-/** @brief One field-arithmetic backend, so a check is written once and run against each. */
+/** One field-arithmetic backend, so a check is written once and run against each. */
 struct x25519_backend_t {
-    char const *name;
-    /** @brief Which tier must be runnable here, or @c none_k for one that always is. */
+    char const* name;
+
+    /** Which tier must be runnable here, or @c none_k for one that always is. */
     x25519_tiers_t tier;
-    bool (*multiply)(std::uint8_t *, std::uint8_t const *, std::uint8_t const *) noexcept;
+    bool (*multiply)(std::uint8_t*, std::uint8_t const*, std::uint8_t const*) noexcept;
 };
 
 /*  The dispatcher leads, so whatever it picks is checked against the tiers themselves, and the
@@ -119,20 +121,20 @@ static x25519_backend_t const x25519_backends_k[] = {
 #endif
 };
 
-/** @brief The backend every other one is checked against: the one always built and always runnable. */
-static x25519_backend_t const &x25519_reference_k = x25519_backends_k[1];
+/** The backend every other one is checked against: the one always built and always runnable. */
+static x25519_backend_t const& x25519_reference_k = x25519_backends_k[1];
 
-/** @brief Whether this machine can execute @p backend. Compiled in does not mean runnable. */
-[[nodiscard]] static bool runnable_here(x25519_backend_t const &backend) noexcept {
+/** Whether this machine can execute @p backend. Compiled in does not mean runnable. */
+[[nodiscard]] static bool runnable_here(x25519_backend_t const& backend) noexcept {
     return backend.tier == x25519_tiers_t::none_k || x25519_has_tiers(x25519_tiers_runtime(), backend.tier);
 }
 
-/** @brief Reads the library's yes/no answer as the named state it stands for. */
+/** Reads the library's yes/no answer as the named state it stands for. */
 [[nodiscard]] static shared_secret_t reported(bool usable) noexcept {
     return usable ? shared_secret_t::usable_k : shared_secret_t::all_zero_k;
 }
 
-/** @brief Lets `{}` name a secret's state rather than print its ordinal. Found by ADL at file scope. */
+/** Lets `{}` name a secret's state rather than print its ordinal. Found by ADL at file scope. */
 [[nodiscard]] inline auto format_as(shared_secret_t secret) noexcept {
     return secret == shared_secret_t::usable_k ? "usable" : "all_zero";
 }
@@ -197,10 +199,10 @@ void test_x25519_unit() {
  */
 void test_x25519_all() {
 
-    for (x25519_backend_t const &backend : x25519_backends_k) {
+    for (x25519_backend_t const& backend : x25519_backends_k) {
         if (!runnable_here(backend)) continue;
         announce("{}", backend.name);
-        for (x25519_vector_t const &vector : x25519_vectors_k) {
+        for (x25519_vector_t const& vector : x25519_vectors_k) {
             decoded_vector_t const decoded(vector);
             byte_t produced[x25519_key_size_k];
             shared_secret_t const answer = reported(backend.multiply(produced, decoded.scalar, decoded.point));
@@ -212,7 +214,7 @@ void test_x25519_all() {
 
     // A carry bug one multiplication hides compounds once each result feeds the next, so every
     // backend walks the same dependent chain and must match the reference at every step.
-    for (x25519_backend_t const &backend : x25519_backends_k) {
+    for (x25519_backend_t const& backend : x25519_backends_k) {
         if (!runnable_here(backend) || &backend == &x25519_reference_k) continue;
         announce("{} along an iterated chain", backend.name);
 

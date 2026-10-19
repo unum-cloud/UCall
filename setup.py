@@ -1,3 +1,5 @@
+"""Builds and packages the UCall CPython extensions."""
+
 # Uses CMake to compile UCall with `io_uring` and other CPython bindings.
 # That is a multi-step process, that involves:
 #       1. Build the C server as one library, like `libucall_server_posix.a`
@@ -12,11 +14,12 @@ import subprocess
 import sys
 import sysconfig
 from os.path import dirname
+from pathlib import Path
 
 from setuptools import Extension, setup
 from setuptools.command.build_ext import build_ext
 
-__version__ = open("VERSION", "r").read().strip()
+__version__ = Path("VERSION").read_text().strip()
 __lib_name__ = "ucall"
 
 
@@ -26,7 +29,7 @@ with open(os.path.join(this_directory, "README.md")) as f:
 
 
 def print_dir_tree(startpath):
-    for root, dirs, files in os.walk(startpath):
+    for root, _dirs, files in os.walk(startpath):
         level = root.replace(startpath, "").count(os.sep)
         indent = " " * 4 * (level)
         print(f"{indent}{os.path.basename(root)}/")
@@ -58,7 +61,7 @@ class CMakeBuild(build_ext):
         if module_name == "uring" and platform.system() != "Linux":
             return
 
-        self.parallel = multiprocessing.cpu_count() // 2
+        self.parallel = max(1, multiprocessing.cpu_count() // 2)
         extension_dir = os.path.abspath(dirname(self.get_ext_fullpath(ext.name)))
 
         # required for auto-detection & inclusion of auxiliary 'native' libs
@@ -68,7 +71,9 @@ class CMakeBuild(build_ext):
         cmake_args = [
             f"-DCMAKE_LIBRARY_OUTPUT_DIRECTORY={extension_dir}",
             f"-DCMAKE_ARCHIVE_OUTPUT_DIRECTORY={extension_dir}",
-            f"-DPYTHON_EXECUTABLE={sys.executable}",
+            f"-DPython3_EXECUTABLE={sys.executable}",
+            f"-DUCALL_BUILD_PYTHON_{module_name.upper()}=ON",
+            "-DUCALL_BUILD_TEST=OFF",
         ]
 
         # Adding CMake arguments set as environment variable
@@ -86,13 +91,8 @@ class CMakeBuild(build_ext):
         if sys.platform.startswith("win32"):
             build_args += ["--config", "Release"]
 
-        # Set CMAKE_BUILD_PARALLEL_LEVEL to control the parallel build level
-        # across all generators.
-        if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ:
-            # self.parallel is a Python 3 only way to set parallel jobs by hand
-            # using -j in the build_ext call, not supported by pip or PyPA-build.
-            if hasattr(self, "parallel") and self.parallel:
-                build_args += [f"-j{self.parallel}"]
+        if "CMAKE_BUILD_PARALLEL_LEVEL" not in os.environ and self.parallel:
+            build_args += [f"-j{self.parallel}"]
 
         # Configure CMake
         try:
@@ -117,18 +117,16 @@ class CMakeBuild(build_ext):
                 + build_args,
             )
 
-            print(
-                f"Directory for `{ext.name}` extension should contain `{package_name}` / `{binding_name}`"
-            )
+            print(f"Directory for `{ext.name}` extension should contain `{package_name}` / `{binding_name}`")
             print_dir_tree(self.build_lib)
 
             # Match a file in the build directory, that is named like the `binding_name`,
             # regardless of the extension, and rename it to the `expected_name` with the same extension.
             compiled_files_pattern = f"{self.build_lib}/{package_name}/{binding_name}.*"
             compiled_files = list(glob.glob(compiled_files_pattern))
-            assert (
-                len(compiled_files) == 1
-            ), f"Expected to find one file, but found {len(compiled_files)}: {compiled_files}"
+            assert len(compiled_files) == 1, (
+                f"Expected to find one file, but found {len(compiled_files)}: {compiled_files}"
+            )
 
             old_name = compiled_files[0]
             new_name = os.path.join(os.path.dirname(old_name), expected_name)
@@ -166,15 +164,7 @@ if platform.system() == "Linux":
             "UCALL_BUILD_URING=1",
         ),
     ]
-elif platform.system() == "Darwin":
-    extensions += [
-        CMakeExtension(
-            "posix",
-            "CALL_TARGET_NAME_PY_POSIX=posix",
-            "UCALL_BUILD_POSIX=1",
-        ),
-    ]
-elif platform.system() == "Windows":
+elif platform.system() == "Darwin" or platform.system() == "Windows":
     extensions += [
         CMakeExtension(
             "posix",
@@ -212,10 +202,9 @@ setup(
         "Programming Language :: C++",
         "Programming Language :: Python :: Implementation :: CPython",
         "Programming Language :: Python :: 3 :: Only",
-        "Programming Language :: Python :: 3.9",
-        "Programming Language :: Python :: 3.10",
-        "Programming Language :: Python :: 3.11",
         "Programming Language :: Python :: 3.12",
+        "Programming Language :: Python :: 3.13",
+        "Programming Language :: Python :: 3.14",
         "Topic :: Communications :: File Sharing",
         "Topic :: Internet :: WWW/HTTP",
         "Topic :: System :: Networking",
@@ -232,5 +221,5 @@ setup(
     entry_points={"console_scripts": ["ucall=ucall.cli:cli"]},
     install_requires=["numpy", "pillow"],
     zip_safe=False,
-    python_requires=">=3.9",
+    python_requires=">=3.12",
 )

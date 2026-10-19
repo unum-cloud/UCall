@@ -1,3 +1,5 @@
+"""REST and WebSocket clients for the FastAPI comparison server."""
+
 #!/usr/bin/env python3
 import base64
 import io
@@ -29,7 +31,7 @@ def validate_session(client, user_id: int, session_id: int) -> bool:
         json={"user_id": user_id, "session_id": session_id},
     )
     assert response.status_code == 200
-    return response.json() == True
+    return response.json() is True
 
 
 def test_validate_session():
@@ -55,9 +57,7 @@ def test_create_user():
         assert create_user(client, name, age, bio, avatar)
 
 
-def validate_user_identity(
-    client, name: str, age: float, user_id: int, access_token: str
-) -> bool:
+def validate_user_identity(client, name: str, age: float, user_id: int, access_token: str) -> bool:
     data = {"name": name, "age": age, "user_id": user_id, "access_token": access_token}
     response = client.post("/validate_user_identity", json=data)
     assert response.status_code == 200
@@ -76,7 +76,7 @@ def test_validate_user_identity():
 def set_get(client, key: str, value: str) -> bool:
     set_response = client.post("/set", json={"key": key, "value": value})
     assert set_response.status_code == 200
-    assert set_response.json() == True
+    assert set_response.json() is True
 
     get_response = client.post("/get", json={"key": key})
     assert get_response.status_code == 200
@@ -91,9 +91,7 @@ def test_set_get():
 
 
 def resize(client, image: str, width: int, height: int) -> bool:
-    response = client.post(
-        "/resize", json={"image": image, "width": width, "height": height}
-    )
+    response = client.post("/resize", json={"image": image, "width": width, "height": height})
     assert response.status_code == 200
 
     image_bytes = base64.b64decode(response.json())

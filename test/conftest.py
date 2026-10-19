@@ -1,4 +1,4 @@
-"""The report header, the `UCALL_FILTER` hook and the seeding fixtures every `examples/test_*.py` suite inherits."""
+"""The report header, the `UCALL_FILTER` hook and the seeding fixtures every `test/*.py` suite inherits."""
 
 from __future__ import annotations
 

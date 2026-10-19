@@ -1,102 +1,67 @@
-cmake_minimum_required(VERSION 3.20 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" UCALL_VERSION_NAME LIMIT_COUNT 1)
 project(
-  ucall
-  VERSION 1.0.0
-  LANGUAGES C CXX
-  DESCRIPTION
-  "Up to 100x Faster FastAPI. JSON-RPC with io_uring, SIMD-acceleration, and pure CPython bindings"
-  HOMEPAGE_URL "https://github.com/unum-cloud/UCall")
+    ucall
+    VERSION 1.0.0
+    LANGUAGES C CXX
+    DESCRIPTION "Up to 100x Faster FastAPI. JSON-RPC with io_uring, SIMD-acceleration, and pure CPython bindings"
+    HOMEPAGE_URL "https://github.com/unum-cloud/UCall"
+)
+
+set(UCALL_IS_MAIN_PROJECT OFF)
+if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
+    set(UCALL_IS_MAIN_PROJECT ON)
+endif ()
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_C_STANDARD 99)
+set(CMAKE_C_STANDARD 11)
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 
-# Detect software capabilities before setting options
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  execute_process(
-    COMMAND uname -r
-    OUTPUT_VARIABLE UNAME_RESULT
-    OUTPUT_STRIP_TRAILING_WHITESPACE)
-  message(STATUS "Linux Kernel version: ${UNAME_RESULT}")
-  string(REGEX MATCH "([0-9]+)\\.([0-9]+)" _ ${UNAME_RESULT})
-  set(LINUX_MAJOR_VERSION ${CMAKE_MATCH_1})
-  set(LINUX_MINOR_VERSION ${CMAKE_MATCH_2})
+option(UCALL_BUILD_LIB_POSIX "Builds the legacy POSIX backend pending its C ABI port" OFF)
+option(UCALL_BUILD_PYTHON_POSIX "Builds CPython bindings for the `posix` backend" OFF)
 
-  # Combine major and minor version numbers into one for comparison
-  set(LINUX_VERSION "${LINUX_MAJOR_VERSION}.${LINUX_MINOR_VERSION}")
-  message(STATUS "Parsed Linux Kernel version: ${LINUX_VERSION}")
+option(UCALL_BUILD_LIB_URING "Builds the C library for the `uring` backend" OFF)
+option(UCALL_BUILD_PYTHON_URING "Builds CPython bindings for the `uring` backend" OFF)
 
-  # Check if the Linux kernel version is 5.19 or newer
-  if(${LINUX_VERSION} VERSION_GREATER_EQUAL "5.19")
-    set(SUPPORTS_IO_URING ON)
-  else()
-    set(SUPPORTS_IO_URING OFF)
-  endif()
-endif()
-
-# Set the default values for options based on whether io_uring is supported
-option(UCALL_BUILD_LIB_POSIX "Builds the C library for the `posix` backend" ON)
-option(UCALL_BUILD_PYTHON_POSIX
-  "Builds CPython bindings for the `posix` backend" ON)
-
-# Options depending on SUPPORTS_IO_URING
-option(UCALL_BUILD_LIB_URING "Builds the C library for the `uring` backend"
-  OFF)
-option(UCALL_BUILD_PYTHON_URING
-  "Builds CPython bindings for the `uring` backend" OFF)
-
-option(UCALL_BUILD_BENCHMARKS
-  "Builds all available backend for the summation server to run benchmarks"
-  OFF)
-option(UCALL_BUILD_EXAMPLES
-  "Builds examples for Redis-like server and PyTorch deployment" OFF)
-option(UCALL_BUILD_TESTS "Builds unit tests for the C library" OFF)
+option(UCALL_BUILD_EXAMPLES "Builds examples for Redis-like server and PyTorch deployment" OFF)
+option(UCALL_BUILD_TEST "Builds the C caller and native suites in test/" ${UCALL_IS_MAIN_PROJECT})
 option(UCALL_BUILD_ALL "Builds all supported target" OFF)
 
-# Enforce options based on SUPPORTS_IO_URING after its value is known
-# Disabled for now to focus on testing protocol_shared.hpp
-# if(SUPPORTS_IO_URING)
-#   set(UCALL_BUILD_LIB_URING
-#     ON
-#     CACHE BOOL "Force enable UCALL_BUILD_LIB_URING" FORCE)
-#   set(UCALL_BUILD_PYTHON_URING
-#     ON
-#     CACHE BOOL "Force enable UCALL_BUILD_PYTHON_URING" FORCE)
-# endif()
+if (UCALL_BUILD_PYTHON_POSIX)
+    set(UCALL_BUILD_LIB_POSIX ON)
+endif ()
 
-if(UCALL_BUILD_PYTHON_URING)
-  set(UCALL_BUILD_LIB_URING ON)
-endif()
+if (UCALL_BUILD_PYTHON_URING)
+    set(UCALL_BUILD_LIB_URING ON)
+endif ()
 
-if(UCALL_BUILD_ALL)
-  set(UCALL_BUILD_BENCHMARKS ON)
-  set(UCALL_BUILD_EXAMPLES ON)
-  set(UCALL_BUILD_TESTS ON)
-endif()
+if (UCALL_BUILD_ALL)
+    set(UCALL_BUILD_EXAMPLES ON)
+    set(UCALL_BUILD_TEST ON)
+endif ()
 
-message(STATUS "Supports io_uring: ${SUPPORTS_IO_URING}")
 message(STATUS "Building ucall_server_posix: ${UCALL_BUILD_LIB_POSIX}")
 message(STATUS "Building ucall_server_uring: ${UCALL_BUILD_LIB_URING}")
 message(STATUS "Building py_ucall_posix: ${UCALL_BUILD_PYTHON_POSIX}")
 message(STATUS "Building py_ucall_uring: ${UCALL_BUILD_PYTHON_URING}")
-message(STATUS "Building benchmarks: ${UCALL_BUILD_BENCHMARKS}")
 message(STATUS "Building examples: ${UCALL_BUILD_EXAMPLES}")
-message(STATUS "Building tests: ${UCALL_BUILD_TESTS}")
+message(STATUS "Building tests: ${UCALL_BUILD_TEST}")
 
 # Make Release by default
-if(NOT CMAKE_BUILD_TYPE)
-  set(CMAKE_BUILD_TYPE Release)
-endif()
+if (NOT CMAKE_BUILD_TYPE)
+    set(CMAKE_BUILD_TYPE Release)
+endif ()
 
-set(CMAKE_CACHEFILE_DIR "${CMAKE_SOURCE_DIR}/build")
 set(CMAKE_ARCHIVE_OUTPUT_DIRECTORY
-  "${CMAKE_BINARY_DIR}/build/lib"
-  CACHE PATH "Path to static libs")
+    "${CMAKE_BINARY_DIR}/build/lib"
+    CACHE PATH "Path to static libs"
+)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY
-  "${CMAKE_BINARY_DIR}/build/lib"
-  CACHE PATH "Path to shared libs")
+    "${CMAKE_BINARY_DIR}/build/lib"
+    CACHE PATH "Path to shared libs"
+)
 set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/build/bin")
 
 message(STATUS "Library output directory: ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
@@ -104,279 +69,204 @@ message(STATUS "Archive output directory: ${CMAKE_ARCHIVE_OUTPUT_DIRECTORY}")
 message(STATUS "Runtime output directory: ${CMAKE_RUNTIME_OUTPUT_DIRECTORY}")
 message(STATUS "Running on OS: ${CMAKE_SYSTEM_NAME}")
 
-if(MSVC)
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /DEBUG")
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2")
-  set(CMAKE_CXX_FLAGS_RELWITHDEBINFO
-    "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /DEBUG")
-else()
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -mavx2")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
-  set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
-  set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
-endif()
+if (MSVC)
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /DEBUG")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2")
+    set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /DEBUG")
+else ()
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
+    set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
+    set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
+endif ()
 
-if(CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fmax-errors=1")
-endif()
+if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
+    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fmax-errors=1")
+endif ()
 
 # Check if we are running on Linux
-if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
-  set(LINUX TRUE)
-endif()
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(LINUX TRUE)
+endif ()
 
-if(CMAKE_SYSTEM_NAME STREQUAL "Darwin")
-  set(CMAKE_OSX_DEPLOYMENT_TARGET "11")
-  set(CMAKE_OSX_SYSROOT
-    CACHE STRING "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk")
-  set(CMAKE_OSX_DEPLOYMENT_TARGET
-    "11"
-    CACHE STRING "Minimum OS X deployment version")
-  set(CMAKE_OSX_ARCHITECTURES
-    "x86_64" "universal2" "arm64"
-    CACHE STRING "Minimum OS X deployment version")
-  set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -stdlib=libc++")
-endif()
+if (UCALL_IS_MAIN_PROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+    execute_process(
+        COMMAND git config core.hooksPath .githooks
+        WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
+        OUTPUT_QUIET ERROR_QUIET
+    )
+endif ()
 
 include(FetchContent)
 include(ExternalProject)
 find_package(Threads REQUIRED)
 
-# Silence warnings from third-party dependencies
-set(CMAKE_POLICY_DEFAULT_CMP0077 NEW)
-set(CMAKE_WARN_DEPRECATED OFF CACHE BOOL "" FORCE)
-
-FetchContent_Declare(
-  simdjson
-  GIT_REPOSITORY https://github.com/simdjson/simdjson.git
-  GIT_TAG v4.2.2
-  GIT_SHALLOW 1
-  SYSTEM)
-FetchContent_MakeAvailable(simdjson)
-include_directories(SYSTEM ${simdjson_SOURCE_DIR}/include)
-
-FetchContent_Declare(
-  ada
-  GIT_REPOSITORY https://github.com/ada-url/ada
-  GIT_TAG v3.3.0
-  GIT_SHALLOW 1
-  SYSTEM)
-FetchContent_MakeAvailable(ada)
-include_directories(SYSTEM ${ada_SOURCE_DIR}/include)
-
-# Parsing HTTP headers On MacOS you may need to locate headers here: export
-# CPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/
-FetchContent_Declare(
-  cxxopts
-  GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
-  GIT_TAG v3.2.0
-  GIT_SHALLOW 1
-  SYSTEM)
-FetchContent_MakeAvailable(cxxopts)
-include_directories(SYSTEM ${cxxopts_SOURCE_DIR}/include)
-
-# Parsing HTTP headers On MacOS you may need to locate headers here: export
-# CPATH=/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/
-FetchContent_Declare(
-  stringzilla
-  GIT_REPOSITORY https://github.com/ashvardanian/stringzilla.git
-  GIT_TAG v4.2.3
-  GIT_SHALLOW 1
-  SYSTEM)
-FetchContent_MakeAvailable(stringzilla)
-include_directories(SYSTEM ${stringzilla_SOURCE_DIR})
-
-# Base64 decoding
-set(SIMDUTF_TOOLS OFF CACHE BOOL "Disable simdutf tools" FORCE)
-set(SIMDUTF_TESTS OFF CACHE BOOL "Disable simdutf tests" FORCE)
-FetchContent_Declare(
-  simdutf
-  GIT_REPOSITORY https://github.com/simdutf/simdutf
-  GIT_TAG v7.5.0
-  GIT_SHALLOW 1
-  SYSTEM)
-FetchContent_MakeAvailable(simdutf)
-include_directories(SYSTEM ${simdutf_SOURCE_DIR}/include)
-
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
+if (NOT TARGET stringzilla::static)
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/stringzilla/CMakeLists.txt" AND NOT DEFINED
+                                                                            FETCHCONTENT_SOURCE_DIR_STRINGZILLA
+    )
+        add_subdirectory(stringzilla EXCLUDE_FROM_ALL)
+    else ()
+        FetchContent_Declare(
+            stringzilla
+            GIT_REPOSITORY https://github.com/ashvardanian/StringZilla
+            GIT_TAG a87834b78549d9da1e1b824b14e47e7411684f08
+        )
+        FetchContent_MakeAvailable(stringzilla)
+    endif ()
+endif ()
+
+add_library(ucall_core STATIC src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp)
+add_library(ucall::core ALIAS ucall_core)
+target_include_directories(
+    ucall_core
+    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/c"
+    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+)
+target_compile_features(ucall_core PRIVATE cxx_std_20)
+if (NOT MSVC)
+    target_compile_options(ucall_core PRIVATE -fno-strict-aliasing)
+endif ()
+target_compile_definitions(ucall_core PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${UCALL_VERSION_NAME}")
+target_link_libraries(ucall_core PRIVATE stringzilla::static Threads::Threads)
+if (WIN32)
+    target_link_libraries(ucall_core PRIVATE bcrypt)
+    target_compile_definitions(ucall_core PUBLIC UCALL_EXPORT=)
+endif ()
+
+if (UCALL_BUILD_LIB_POSIX OR UCALL_BUILD_LIB_URING)
+    FetchContent_Declare(
+        simdjson
+        GIT_REPOSITORY https://github.com/simdjson/simdjson.git
+        GIT_TAG v5.0.5
+    )
+    FetchContent_MakeAvailable(simdjson)
+    include_directories(SYSTEM ${simdjson_SOURCE_DIR}/include)
+endif ()
+
+if (UCALL_BUILD_LIB_POSIX OR UCALL_BUILD_LIB_URING)
+    # Base64 decoding
+    set(SIMDUTF_TOOLS
+        OFF
+        CACHE BOOL "Disable simdutf tools" FORCE
+    )
+    set(SIMDUTF_TESTS
+        OFF
+        CACHE BOOL "Disable simdutf tests" FORCE
+    )
+    FetchContent_Declare(
+        simdutf
+        GIT_REPOSITORY https://github.com/simdutf/simdutf
+        GIT_TAG v9.3.2
+        GIT_SHALLOW 1
+        SYSTEM
+    )
+    FetchContent_MakeAvailable(simdutf)
+    include_directories(SYSTEM ${simdutf_SOURCE_DIR}/include)
+
+endif ()
+
 # LibUring
-if(UCALL_BUILD_LIB_URING)
-  set(URING_DIR ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
-  ExternalProject_Add(
-    liburing-ep
-    GIT_REPOSITORY https://github.com/axboe/liburing.git
-    GIT_TAG liburing-2.12
-    GIT_SHALLOW 1
-    PREFIX ${CMAKE_BINARY_DIR}/_deps/
-    SOURCE_DIR ${URING_DIR}
-    CONFIGURE_COMMAND
-    bash -c "cd ${URING_DIR} && ./configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER} 2>&1 | grep -v '^Configuring'"
-    BUILD_COMMAND bash -c "cd ${URING_DIR} && make -s 2>&1 | grep -v warning || true"
-    INSTALL_COMMAND ""
-    UPDATE_COMMAND "")
-  add_library(uring_internal STATIC IMPORTED GLOBAL)
-  add_dependencies(uring_internal liburing-ep)
-  set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION
-    ${URING_DIR}/src/liburing.a)
+if (UCALL_BUILD_LIB_URING)
+    set(URING_DIR ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
+    ExternalProject_Add(
+        liburing-ep
+        GIT_REPOSITORY https://github.com/axboe/liburing.git
+        GIT_TAG liburing-2.15
+        GIT_SHALLOW 1
+        PREFIX ${CMAKE_BINARY_DIR}/_deps/
+        SOURCE_DIR ${URING_DIR}
+        CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
+        BUILD_COMMAND make -C <SOURCE_DIR> -s
+        BUILD_IN_SOURCE 1
+        INSTALL_COMMAND ""
+        UPDATE_COMMAND ""
+    )
+    add_library(uring_internal STATIC IMPORTED GLOBAL)
+    add_dependencies(uring_internal liburing-ep)
+    set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION ${URING_DIR}/src/liburing.a)
 
-  include_directories(${URING_DIR}/src/include/)
-  set(URING_LIBS uring_internal)
-endif()
+    include_directories(${URING_DIR}/src/include/)
+    set(URING_LIBS uring_internal)
+endif ()
 
-if(UCALL_BUILD_BENCHMARKS)
-  set(BENCHMARK_ENABLE_TESTING OFF)
-  set(BENCHMARK_ENABLE_INSTALL OFF)
-  set(BENCHMARK_ENABLE_DOXYGEN OFF)
-  set(BENCHMARK_INSTALL_DOCS OFF)
-  set(BENCHMARK_DOWNLOAD_DEPENDENCIES ON)
-  set(BENCHMARK_ENABLE_GTEST_TESTS OFF)
-  set(BENCHMARK_USE_BUNDLED_GTEST ON)
-  FetchContent_Declare(
-    benchmark
-    GIT_REPOSITORY https://github.com/google/benchmark
-    GIT_TAG v1.7.0
-    GIT_SHALLOW 1)
-  FetchContent_MakeAvailable(benchmark)
-  include_directories(${benchmark_SOURCE_DIR}/include)
-endif()
+if (UCALL_BUILD_TEST OR UCALL_BUILD_EXAMPLES)
+    FetchContent_Declare(
+        fmt
+        GIT_REPOSITORY https://github.com/fmtlib/fmt.git
+        GIT_TAG 12.2.0
+        FIND_PACKAGE_ARGS 12.2.0
+    )
+    FetchContent_MakeAvailable(fmt)
+endif ()
 
-# Noise Protocol Framework for secure communication
-set(NOISE_DIR ${CMAKE_BINARY_DIR}/_deps/noise-c-ep)
-ExternalProject_Add(
-  noise-c-ep
-  GIT_REPOSITORY https://github.com/rweather/noise-c.git
-  GIT_TAG master
-  GIT_SHALLOW 1
-  PREFIX ${CMAKE_BINARY_DIR}/_deps/
-  SOURCE_DIR ${NOISE_DIR}
-  CONFIGURE_COMMAND
-  bash -c "cd ${NOISE_DIR} && (autoreconf -i 2>/dev/null || true) && ./configure --prefix=${NOISE_DIR}/install --with-libsodium=no --with-openssl=no 2>&1 | grep -v '^checking' | grep -v '^configure:'"
-  BUILD_COMMAND bash -c "cd ${NOISE_DIR} && make -s 2>&1 | grep -v warning || true"
-  INSTALL_COMMAND bash -c "cd ${NOISE_DIR} && make install -s 2>&1 | grep -v 'Nothing to be done' || true"
-  UPDATE_COMMAND "")
-add_library(noise_internal STATIC IMPORTED GLOBAL)
-add_dependencies(noise_internal noise-c-ep)
-set_property(TARGET noise_internal PROPERTY IMPORTED_LOCATION
-  ${NOISE_DIR}/install/lib/libnoise.a)
+if (UCALL_BUILD_EXAMPLES)
+    FetchContent_Declare(
+        cxxopts
+        GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
+        GIT_TAG v3.3.1
+    )
+    FetchContent_MakeAvailable(cxxopts)
+endif ()
 
-include_directories(${NOISE_DIR}/install/include/)
-set(NOISE_LIBRARIES noise_internal)
+include_directories(c/ src/)
 
-if(UCALL_BUILD_TESTS)
-  # GoogleTest for unit testing
-  FetchContent_Declare(
-    googletest
-    GIT_REPOSITORY https://github.com/google/googletest.git
-    GIT_TAG v1.17.0
-    GIT_SHALLOW 1)
-  # For Windows: Prevent overriding the parent project's compiler/linker settings
-  set(gtest_force_shared_crt ON CACHE BOOL "" FORCE)
-  FetchContent_MakeAvailable(googletest)
-  include_directories(${googletest_SOURCE_DIR}/googletest/include)
-  enable_testing()
-  message(STATUS "Building unit tests")
-endif()
+if (UCALL_BUILD_LIB_POSIX)
+    add_library(ucall_server_posix src/server_posix.cpp)
+    target_link_libraries(ucall_server_posix simdjson::simdjson simdutf::simdutf Threads::Threads ucall_core)
+    set(PYTHON_BACKEND ucall_server_posix)
+endif ()
 
-if(UCALL_BUILD_EXAMPLES)
-  # CLI
-  FetchContent_Declare(
-    cxxopts
-    GIT_REPOSITORY https://github.com/jarro2783/cxxopts.git
-    GIT_TAG v3.1.1
-    GIT_SHALLOW 1)
-  FetchContent_MakeAvailable(cxxopts)
-  include_directories(${cxxopts_SOURCE_DIR}/include)
-endif()
-
-include_directories(include/ src/)
-
-if(UCALL_BUILD_LIB_POSIX)
-  add_library(ucall_server_posix src/server_posix.cpp)
-  target_link_libraries(ucall_server_posix simdjson::simdjson simdutf::simdutf
-    Threads::Threads ${NOISE_LIBRARIES})
-  set(PYTHON_BACKEND ucall_server_posix)
-endif()
-
-if(UCALL_BUILD_LIB_URING)
-  add_library(ucall_server_uring src/server_uring.cpp)
-  set(PYTHON_BACKEND ucall_server_uring)
-  target_link_libraries(ucall_server_uring simdjson::simdjson simdutf::simdutf
-    Threads::Threads ${URING_LIBS} ${NOISE_LIBRARIES})
-endif()
+if (UCALL_BUILD_LIB_URING)
+    add_library(ucall_server_uring src/server_uring.cpp)
+    set(PYTHON_BACKEND ucall_server_uring)
+    target_link_libraries(
+        ucall_server_uring simdjson::simdjson simdutf::simdutf Threads::Threads ${URING_LIBS} ucall_core
+    )
+endif ()
 
 # Python bindings
-find_package(Python3 REQUIRED Development.Module)
-include_directories(${Python_INCLUDE_DIRS})
+if (UCALL_BUILD_PYTHON_POSIX OR UCALL_BUILD_PYTHON_URING)
+    find_package(Python3 3.12 REQUIRED Development.Module)
+endif ()
 
-if(UCALL_BUILD_PYTHON_POSIX)
-  python3_add_library(py_ucall_posix python/lib.c)
-  target_include_directories(py_ucall_posix PUBLIC src/ include/)
-  target_link_libraries(py_ucall_posix PRIVATE ucall_server_posix base64)
+if (UCALL_BUILD_PYTHON_POSIX)
+    python3_add_library(py_ucall_posix python/lib.c)
+    target_include_directories(py_ucall_posix PUBLIC src/ c/)
+    target_link_libraries(py_ucall_posix PRIVATE ucall_server_posix base64)
 
-  # set_target_properties(py_ucall_posix PROPERTIES OUTPUT_NAME posix)
-  target_compile_definitions(py_ucall_posix
-    PRIVATE UCALL_PYTHON_MODULE_NAME=posix)
-  message(
-    STATUS
-    "Building ucall_server_posix with output in ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-  )
-endif()
+    # set_target_properties(py_ucall_posix PROPERTIES OUTPUT_NAME posix)
+    target_compile_definitions(py_ucall_posix PRIVATE UCALL_PYTHON_MODULE_NAME=posix)
+    message(STATUS "Building ucall_server_posix with output in ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+endif ()
 
-if(UCALL_BUILD_PYTHON_URING)
-  python3_add_library(py_ucall_uring python/lib.c)
-  target_include_directories(py_ucall_uring PUBLIC src/ include/)
-  target_link_libraries(py_ucall_uring PRIVATE ucall_server_uring base64)
+if (UCALL_BUILD_PYTHON_URING)
+    python3_add_library(py_ucall_uring python/lib.c)
+    target_include_directories(py_ucall_uring PUBLIC src/ c/)
+    target_link_libraries(py_ucall_uring PRIVATE ucall_server_uring base64)
 
-  # set_target_properties(py_ucall_uring PROPERTIES OUTPUT_NAME uring)
-  target_compile_definitions(py_ucall_uring
-    PRIVATE UCALL_PYTHON_MODULE_NAME=uring)
-  message(
-    STATUS
-    "Building py_ucall_uring with output in ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}"
-  )
-endif()
+    # set_target_properties(py_ucall_uring PROPERTIES OUTPUT_NAME uring)
+    target_compile_definitions(py_ucall_uring PRIVATE UCALL_PYTHON_MODULE_NAME=uring)
+    message(STATUS "Building py_ucall_uring with output in ${CMAKE_LIBRARY_OUTPUT_DIRECTORY}")
+endif ()
 
-if(UCALL_BUILD_EXAMPLES)
-  add_executable(ucall_example_server_posix examples/ucall_server.cpp)
-  target_link_libraries(ucall_example_server_posix ucall_server_posix cxxopts
-    fmt::fmt)
-  target_compile_options(ucall_example_server_posix
-    PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
-endif()
+if (UCALL_BUILD_EXAMPLES)
+    add_executable(ucall_example_server_posix examples/ucall_server.cpp)
+    target_link_libraries(ucall_example_server_posix ucall_server_posix cxxopts fmt::fmt)
+    target_compile_options(ucall_example_server_posix PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+endif ()
 
-if(UCALL_BUILD_EXAMPLES AND UCALL_BUILD_LIB_URING)
-  add_executable(ucall_example_server_uring examples/ucall_server.cpp)
-  target_link_libraries(ucall_example_server_uring ucall_server_uring cxxopts
-    fmt::fmt)
-  target_compile_options(ucall_example_server_uring
-    PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
-endif()
+if (UCALL_BUILD_EXAMPLES AND UCALL_BUILD_LIB_URING)
+    add_executable(ucall_example_server_uring examples/ucall_server.cpp)
+    target_link_libraries(ucall_example_server_uring ucall_server_uring cxxopts fmt::fmt)
+    target_compile_options(ucall_example_server_uring PUBLIC -DCXXOPTS_NO_EXCEPTIONS=ON)
+endif ()
 
-# Unit tests
-if(UCALL_BUILD_TESTS)
-  # Test: Container utilities (pool, array, mutex, etc.)
-  add_executable(test_shared scripts/test_shared.cpp)
-  target_include_directories(test_shared PRIVATE include/ src/)
-  target_link_libraries(test_shared PRIVATE GTest::gtest GTest::gtest_main Threads::Threads)
-  add_test(NAME test_shared COMMAND test_shared)
-  message(STATUS "Building test_shared")
-
-  # Test: URI routing trie
-  add_executable(test_routes scripts/test_routes.cpp)
-  target_include_directories(test_routes PRIVATE include/ src/)
-  target_link_libraries(test_routes PRIVATE GTest::gtest GTest::gtest_main Threads::Threads)
-  add_test(NAME test_routes COMMAND test_routes)
-  message(STATUS "Building test_routes")
-
-  # Test: Protocol state machine and Noise encryption
-  add_executable(test_protocol scripts/test_protocol.cpp)
-  target_include_directories(test_protocol PRIVATE include/ src/)
-  target_link_libraries(test_protocol PRIVATE GTest::gtest GTest::gtest_main
-    Threads::Threads ${NOISE_LIBRARIES})
-  add_test(NAME test_protocol COMMAND test_protocol)
-  message(STATUS "Building test_protocol")
-endif()
+if (UCALL_BUILD_TEST)
+    enable_testing()
+    add_subdirectory(test)
+endif ()

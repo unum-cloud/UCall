@@ -1,32 +1,33 @@
 /**
- *  @brief Shared harness for the C++ test suites: verification, scaling, and byte diagnostics.
- *  @file scripts/test.hpp
+ *  @file test/harness.hpp
  *  @author Ash Vardanian
+ *  @date August 9, 2026
+ *  @brief Shared harness for the C++ test suites: verification, scaling, and byte diagnostics.
  *
  *  A failing check aborts, so a check is a statement rather than an expression callers accumulate.
  *  The first failure stops the run, which is why every case announces itself first - the last line
  *  on standard output names whatever the abort landed on.
  *
  *  `-fno-exceptions` rules out a `throws_verify` and a `try` around a test body, and makes
- *  `UCALL_TESTS_FILTER` a substring rather than a regular expression.
+ *  `UCALL_FILTER` a substring rather than a regular expression.
  *
  *  @section Environment Variables
  *
- *  - `UCALL_TESTS_SEED` : Seed for the deterministic generator. Defaults to a fixed value, and is
- *    always printed at startup, so a run reproduces without being told.
- *  - `UCALL_TESTS_MULTIPLIER` : Scales every sweep and iteration count. Defaults to 1.0. Use 0.1
- *    for a quick smoke run, 10 for a thorough one.
- *  - `UCALL_TESTS_FILTER` : Substring matched against test names; only matching tests run. Unset
- *    or empty runs everything. Honored by @c run_test.
+ *  - `UCALL_SEED` : Seed for the deterministic generator. Defaults to a fixed value, and is always
+ *    printed at startup, so a run reproduces without being told.
+ *  - `UCALL_MULTIPLIER` : Scales every sweep and iteration count. Defaults to 1.0. Use 0.1 for a
+ *    quick smoke run, 10 for a thorough one.
+ *  - `UCALL_FILTER` : Substring matched against test names; only matching tests run. Unset or empty
+ *    runs everything. Honored by @c run_test.
  *
  *  @section Example Usage
  *
  *  @code{.sh}
- *  # Only the record-layer tests, at a tenth of the usual depth.
- *  UCALL_TESTS_FILTER=records UCALL_TESTS_MULTIPLIER=0.1 ./build_test/test_noise
+ * # Only the record-layer tests, at a tenth of the usual depth.
+ * UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ./build_test/test_noise
  *
- *  # A thorough sweep, reproducible from a named seed.
- *  UCALL_TESTS_SEED=12345 UCALL_TESTS_MULTIPLIER=10 ./build_test/test_noise
+ * # A thorough sweep, reproducible from a named seed.
+ * UCALL_SEED=12345 UCALL_MULTIPLIER=10 ./build_test/test_noise
  *  @endcode
  */
 #pragma once
@@ -37,9 +38,10 @@
 #include <cstdlib> // `std::abort`, `std::getenv`, `std::strtod`, `std::strtoull`
 #include <cstring> // `std::strstr`, `std::memcmp`
 
-#include <chrono>  // `std::chrono::steady_clock`
-#include <random>  // `std::uniform_random_bit_generator`
-#include <utility> // `std::forward`
+#include <charconv> // `std::from_chars`
+#include <chrono>   // `std::chrono::steady_clock`
+#include <random>   // `std::uniform_random_bit_generator`
+#include <utility>  // `std::forward`
 
 #include <fmt/base.h>   // `fmt::print`, `fmt::format_string`
 #include <fmt/color.h>  // `fmt::text_style`, `fmt::fg`, `fmt::emphasis`
@@ -54,45 +56,45 @@
 #include <execinfo.h> // `backtrace`, `backtrace_symbols_fd`
 #endif
 
-namespace unum::ucall::scripts {
+namespace unum::ucall::test {
 
 #pragma region Spans
 
-/** @brief Views a string literal as bytes, without its terminating zero. */
+/** Views a string literal as bytes, without its terminating zero. */
 template <std::size_t length_>
 [[nodiscard]] inline span<byte_t const> ascii_bytes(char const (&text)[length_]) noexcept {
-    byte_t const *const begin = reinterpret_cast<byte_t const *>(text);
+    byte_t const* const begin = reinterpret_cast<byte_t const*>(text);
     return {begin, begin + length_ - 1};
 }
 
-/** @brief Views a counted run of characters as bytes. */
-[[nodiscard]] inline span<byte_t const> ascii_bytes(char const *text, std::size_t length) noexcept {
-    byte_t const *const begin = reinterpret_cast<byte_t const *>(text);
+/** Views a counted run of characters as bytes. */
+[[nodiscard]] inline span<byte_t const> ascii_bytes(char const* text, std::size_t length) noexcept {
+    byte_t const* const begin = reinterpret_cast<byte_t const*>(text);
     return {begin, begin + length};
 }
 
-/** @brief Fills a range with one repeated value, keeping its pointer and length together. */
+/** Fills a range with one repeated value, keeping its pointer and length together. */
 inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
     // `memset` with a null destination is undefined even when it writes no bytes, and an empty
     // span carries one - the same hazard `array::append_n` guards against.
     if (bytes.size()) std::memset(bytes.data(), value, bytes.size());
 }
 
-/** @brief Whether two byte ranges have the same length and the same contents. */
+/** Whether two byte ranges have the same length and the same contents. */
 [[nodiscard]] inline bool bytes_equal(span<byte_t const> left, span<byte_t const> right) noexcept {
     if (left.size() != right.size()) return false;
     if (!left.size()) return true;
     return std::memcmp(left.data(), right.data(), left.size()) == 0;
 }
 
-/** @brief Whether every byte in the range equals @p value. */
+/** Whether every byte in the range equals @p value. */
 [[nodiscard]] inline bool all_equal_to(span<byte_t const> bytes, byte_t value) noexcept {
     for (std::size_t index = 0; index != bytes.size(); ++index)
         if (bytes[index] != value) return false;
     return true;
 }
 
-/** @brief Whether every byte in the range is zero, which is how a wiped secret is recognised. */
+/** Whether every byte in the range is zero, which is how a wiped secret is recognised. */
 [[nodiscard]] inline bool all_zero(span<byte_t const> bytes) noexcept { return all_equal_to(bytes, 0); }
 
 #pragma endregion Spans
@@ -106,7 +108,7 @@ inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
  *  @brief Decodes one hex digit into @p value.
  *  @return False when @p character is not a hex digit, leaving @p value untouched.
  */
-[[nodiscard]] inline bool parse_hex_nibble_(char character, byte_t &value) noexcept {
+[[nodiscard]] inline bool parse_hex_nibble_(char character, byte_t& value) noexcept {
     if (character >= '0' && character <= '9') value = static_cast<byte_t>(character - '0');
     else if (character >= 'a' && character <= 'f') value = static_cast<byte_t>(character - 'a' + 10);
     else if (character >= 'A' && character <= 'F') value = static_cast<byte_t>(character - 'A' + 10);
@@ -118,7 +120,7 @@ inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
  *  @brief Parses `2 × size` hex characters from @p text into @p bytes.
  *  @return False when the literal is not hex, or its length disagrees with the range.
  */
-[[nodiscard]] inline bool from_hex(char const *text, span<byte_t> bytes) noexcept {
+[[nodiscard]] inline bool from_hex(char const* text, span<byte_t> bytes) noexcept {
     for (std::size_t index = 0; index != bytes.size(); ++index) {
         byte_t high = 0, low = 0;
         if (!parse_hex_nibble_(text[index * 2], high)) return false;
@@ -128,16 +130,17 @@ inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
     return text[bytes.size() * 2] == '\0';
 }
 
-/** @brief How a byte range compared against a hex literal, which one @c bool could not say. */
+/** How a byte range compared against a hex literal, which one @c bool could not say. */
 enum class hex_match_t : std::uint8_t {
     matched_k,
     differed_k,
-    /** @brief The literal is not hex, or its length disagrees with the range - a typo in a table. */
+
+    /** The literal is not hex, or its length disagrees with the range - a typo in a table. */
     malformed_literal_k,
 };
 
-/** @brief Compares @p bytes against the value the hex literal @p text names. */
-[[nodiscard]] inline hex_match_t bytes_match_hex_(span<byte_t const> bytes, char const *text) noexcept {
+/** Compares @p bytes against the value the hex literal @p text names. */
+[[nodiscard]] inline hex_match_t bytes_match_hex_(span<byte_t const> bytes, char const* text) noexcept {
     hex_match_t answer = hex_match_t::matched_k;
     for (std::size_t index = 0; index != bytes.size(); ++index) {
         byte_t high = 0, low = 0;
@@ -167,7 +170,7 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
 
 #pragma region Diagnostics
 
-/** @brief Whether diagnostics may use colour: only when standard error is a terminal. */
+/** Whether diagnostics may use colour: only when standard error is a terminal. */
 [[nodiscard]] inline bool diagnostics_are_styled_() noexcept {
 #if defined(UCALL_OS_LINUX_) || defined(UCALL_OS_MACOS_)
     static bool const styled = isatty(STDERR_FILENO) != 0;
@@ -185,14 +188,14 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
     return diagnostics_are_styled_() ? fmt::fg(fmt::color::dim_gray) : fmt::text_style {};
 }
 
-/** @brief Prints the header line every failed check shares, before any context the caller adds. */
-inline void report_failure(char const *expression, char const *file, int line) {
+/** Prints the header line every failed check shares, before any context the caller adds. */
+inline void report_failure(char const* expression, char const* file, int line) {
     fmt::print(stderr, failure_style_(), "Test verification failed: {}, {}:{}\n", expression, file, line);
 }
 
-/** @brief Backs @c verify_bytes: reports a mismatch and answers whether the ranges agreed. */
+/** Backs @c verify_bytes: reports a mismatch and answers whether the ranges agreed. */
 [[nodiscard]] inline bool report_unequal_bytes(span<byte_t const> actual, span<byte_t const> expected,
-                                               char const *actual_text, char const *expected_text, char const *file,
+                                               char const* actual_text, char const* expected_text, char const* file,
                                                int line) {
     if (bytes_equal(actual, expected)) return true;
 
@@ -222,9 +225,9 @@ inline void report_failure(char const *expression, char const *file, int line) {
     return false;
 }
 
-/** @brief Backs @c verify_hex: reports a mismatch and answers whether the range matched the literal. */
-[[nodiscard]] inline bool report_unmatched_hex(span<byte_t const> actual, char const *expected_hex,
-                                               char const *actual_text, char const *file, int line) {
+/** Backs @c verify_hex: reports a mismatch and answers whether the range matched the literal. */
+[[nodiscard]] inline bool report_unmatched_hex(span<byte_t const> actual, char const* expected_hex,
+                                               char const* actual_text, char const* file, int line) {
     hex_match_t const answer = bytes_match_hex_(actual, expected_hex);
     if (answer == hex_match_t::matched_k) return true;
 
@@ -238,9 +241,9 @@ inline void report_failure(char const *expression, char const *file, int line) {
     return false;
 }
 
-/** @brief Announces the case about to run, so an aborting harness names what it was attempting. */
+/** Announces the case about to run, so an aborting harness names what it was attempting. */
 template <typename... argument_types_>
-inline void announce(fmt::format_string<argument_types_...> format, argument_types_ &&...arguments) {
+inline void announce(fmt::format_string<argument_types_...> format, argument_types_&&... arguments) {
     fmt::print("  - ");
     fmt::print(format, std::forward<argument_types_>(arguments)...);
     fmt::print("\n");
@@ -259,8 +262,8 @@ inline void announce(fmt::format_string<argument_types_...> format, argument_typ
  *
  *  Satisfying the concept is what lets @c std::shuffle and @c std::sample take it. Do not reach for
  *  @c std::uniform_int_distribution with it: distributions are not specified to yield the same
- *  sequence across standard libraries, so a failure would stop reproducing from @c UCALL_TESTS_SEED
- *  the moment the toolchain changed. That is what @c below is for.
+ *  sequence across standard libraries, so a failure would stop reproducing from @c UCALL_SEED the
+ *  moment the toolchain changed. That is what @c below is for.
  */
 struct random_generator_t {
     using result_type = std::uint64_t;
@@ -297,14 +300,17 @@ struct random_generator_t {
 static_assert(std::uniform_random_bit_generator<random_generator_t>,
               "the generator must be usable with `std::shuffle` and friends");
 
-/** @brief Everything the environment configures, established once before any test runs. */
+/** Everything the environment configures, established once before any test runs. */
 struct test_environment_t {
-    /** @brief `UCALL_TESTS_SEED`. Fixed by default, so a run reproduces without being told. */
-    std::uint64_t seed {0x5EED};
-    /** @brief `UCALL_TESTS_MULTIPLIER`. Scales every sweep and iteration count. */
+
+    /** `UCALL_SEED`. Fixed by default, so a run reproduces without being told. */
+    std::uint64_t seed {42};
+
+    /** `UCALL_MULTIPLIER`. Scales every sweep and iteration count. */
     double multiplier {1.0};
-    /** @brief `UCALL_TESTS_FILTER`. Null or empty runs everything. */
-    char const *filter {nullptr};
+
+    /** `UCALL_FILTER`. Null or empty runs everything. */
+    char const* filter {nullptr};
 };
 
 /*  Constant-initialized, so it carries no thread-safe-static guard on every read and takes no part
@@ -312,8 +318,8 @@ struct test_environment_t {
  *  is what makes the compiler enforce both rather than leave them to inspection. */
 constinit inline test_environment_t test_environment {};
 
-/** @brief Aborts with a message, for the checks that run before the `verify` macro is in scope. */
-[[noreturn]] inline void abort_with_(char const *what, char const *file, int line) {
+/** Aborts with a message, for the checks that run before the `verify` macro is in scope. */
+[[noreturn]] inline void abort_with_(char const* what, char const* file, int line) {
     report_failure(what, file, line);
     std::abort();
 }
@@ -325,38 +331,41 @@ constinit inline test_environment_t test_environment {};
  *  become a zero seed or an unscaled sweep, either of which a run would then report as deliberate.
  */
 inline void configure_tests() {
-    if (char const *const text = std::getenv("UCALL_TESTS_SEED"); text && text[0] != '\0') {
-        char *end = nullptr;
-        unsigned long long const parsed = std::strtoull(text, &end, 10);
-        if (!end || *end != '\0') abort_with_("UCALL_TESTS_SEED is not a number", __FILE__, __LINE__);
-        test_environment.seed = parsed;
+    if (char const* const text = std::getenv("UCALL_SEED"); text && text[0] != '\0') {
+        if (std::strcmp(text, "random") == 0) test_environment.seed = std::random_device {}();
+        else {
+            std::uint32_t parsed = 0;
+            auto const [end, error] = std::from_chars(text, text + std::strlen(text), parsed);
+            if (error != std::errc {} || *end != '\0')
+                abort_with_("UCALL_SEED expects an unsigned 32-bit integer or random", __FILE__, __LINE__);
+            test_environment.seed = parsed;
+        }
     }
-    if (char const *const text = std::getenv("UCALL_TESTS_MULTIPLIER"); text && text[0] != '\0') {
-        char *end = nullptr;
+    if (char const* const text = std::getenv("UCALL_MULTIPLIER"); text && text[0] != '\0') {
+        char* end = nullptr;
         double const parsed = std::strtod(text, &end);
         if (!end || *end != '\0' || !(parsed > 0.0))
-            abort_with_("UCALL_TESTS_MULTIPLIER is not a positive number", __FILE__, __LINE__);
+            abort_with_("UCALL_MULTIPLIER is not a positive number", __FILE__, __LINE__);
         test_environment.multiplier = parsed;
     }
-    if (char const *const text = std::getenv("UCALL_TESTS_FILTER"); text && text[0] != '\0')
-        test_environment.filter = text;
+    if (char const* const text = std::getenv("UCALL_FILTER"); text && text[0] != '\0') test_environment.filter = text;
 
-    fmt::print("  UCALL_TESTS_SEED       {}\n", test_environment.seed);
-    fmt::print("  UCALL_TESTS_MULTIPLIER {:.2f}\n", test_environment.multiplier);
-    fmt::print("  UCALL_TESTS_FILTER     {}\n", test_environment.filter ? test_environment.filter : "(none)");
+    fmt::print("  UCALL_SEED       {}\n", test_environment.seed);
+    fmt::print("  UCALL_MULTIPLIER {:.2f}\n", test_environment.multiplier);
+    fmt::print("  UCALL_FILTER     {}\n", test_environment.filter ? test_environment.filter : "(none)");
     std::fflush(stdout);
 }
 
-/** @brief The shared generator. Reseeded per test, so a filtered run reproduces an unfiltered one. */
-[[nodiscard]] inline random_generator_t &global_random_generator() noexcept {
+/** The shared generator. Reseeded per test, so a filtered run reproduces an unfiltered one. */
+[[nodiscard]] inline random_generator_t& global_random_generator() noexcept {
     static random_generator_t generator(test_environment.seed);
     return generator;
 }
 
-/** @brief Reseeds the shared generator from the run's seed and a test's name. */
-inline void seed_generator_for_test_(char const *name) noexcept {
+/** Reseeds the shared generator from the run's seed and a test's name. */
+inline void seed_generator_for_test_(char const* name) noexcept {
     std::uint64_t hashed = 0xCBF29CE484222325ull;
-    for (char const *character = name; *character; ++character) {
+    for (char const* character = name; *character; ++character) {
         hashed ^= static_cast<std::uint64_t>(static_cast<unsigned char>(*character));
         hashed *= 0x100000001B3ull;
     }
@@ -393,13 +402,13 @@ inline void seed_generator_for_test_(char const *name) noexcept {
 /**
  *  @brief Prints a backtrace on abort or a segmentation fault, then re-raises the default action.
  *
- *  Load-bearing where a counting harness would not need it: @c verify aborts, so this is what
- *  turns a failure into a located one.
+ *  Load-bearing where a counting harness would not need it: @c verify aborts, so this is what turns
+ *  a failure into a located one.
  */
 inline void install_test_signal_handlers() noexcept {
     auto report = [](int signal_number) noexcept {
 #if defined(UCALL_OS_LINUX_) && defined(__GLIBC__)
-        void *frames[32];
+        void* frames[32];
         int const depth = backtrace(frames, 32);
         fmt::print(stderr, "Caught signal {}, backtrace follows:\n", signal_number);
         std::fflush(stderr);
@@ -415,8 +424,8 @@ inline void install_test_signal_handlers() noexcept {
     std::signal(SIGSEGV, report);
 }
 
-/** @brief Whether a test named @p name should run, honoring the run's filter. */
-[[nodiscard]] inline bool test_should_run_(char const *name) noexcept {
+/** Whether a test named @p name should run, honoring the run's filter. */
+[[nodiscard]] inline bool test_should_run_(char const* name) noexcept {
     if (!test_environment.filter) return true;
     return std::strstr(name, test_environment.filter) != nullptr;
 }
@@ -427,9 +436,9 @@ inline void install_test_signal_handlers() noexcept {
  *  Reaching the end is the pass; a @c verify inside aborts, and the name printed before it started
  *  is what says which one.
  */
-inline void run_test(char const *name, void (*test_function)()) {
+inline void run_test(char const* name, void (*test_function)()) {
     if (!test_should_run_(name)) {
-        fmt::print("- {} ... skipped (UCALL_TESTS_FILTER)\n", name);
+        fmt::print("- {} ... skipped (UCALL_FILTER)\n", name);
         std::fflush(stdout);
         return;
     }
@@ -445,7 +454,7 @@ inline void run_test(char const *name, void (*test_function)()) {
 
 #pragma endregion Test Runner
 
-} // namespace unum::ucall::scripts
+} // namespace unum::ucall::test
 
 /*  Defined after the namespace because a macro is text: nothing above needs them, and putting them
  *  last is what lets every helper live in one namespace block rather than two split around them. */
@@ -457,31 +466,30 @@ inline void run_test(char const *name, void (*test_function)()) {
  *
  *  Optional trailing arguments are an @c fmt format string and its operands:
  *  @code{.cpp}
- *  verify(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+ * verify(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
  *  @endcode
  */
 #define verify(condition, ...)                                                          \
     do {                                                                                \
         if (!(condition)) {                                                             \
-            ::unum::ucall::scripts::report_failure(#condition, __FILE__, __LINE__);     \
+            ::unum::ucall::test::report_failure(#condition, __FILE__, __LINE__);        \
             __VA_OPT__(fmt::print(stderr, "  " __VA_ARGS__); fmt::print(stderr, "\n");) \
             std::abort();                                                               \
         }                                                                               \
     } while (0)
 
-/** @brief Compares two byte ranges, naming the first differing offset before aborting. */
-#define verify_bytes(actual, expected)                                                                        \
-    do {                                                                                                      \
-        if (!::unum::ucall::scripts::report_unequal_bytes((actual), (expected), #actual, #expected, __FILE__, \
-                                                          __LINE__))                                          \
-            std::abort();                                                                                     \
+/** Compares two byte ranges, naming the first differing offset before aborting. */
+#define verify_bytes(actual, expected)                                                                                \
+    do {                                                                                                              \
+        if (!::unum::ucall::test::report_unequal_bytes((actual), (expected), #actual, #expected, __FILE__, __LINE__)) \
+            std::abort();                                                                                             \
     } while (0)
 
-/** @brief Compares a byte range against a hex literal, without materialising either as a string. */
-#define verify_hex(actual, expected_hex)                                                                          \
-    do {                                                                                                          \
-        if (!::unum::ucall::scripts::report_unmatched_hex((actual), (expected_hex), #actual, __FILE__, __LINE__)) \
-            std::abort();                                                                                         \
+/** Compares a byte range against a hex literal, without materialising either as a string. */
+#define verify_hex(actual, expected_hex)                                                                       \
+    do {                                                                                                       \
+        if (!::unum::ucall::test::report_unmatched_hex((actual), (expected_hex), #actual, __FILE__, __LINE__)) \
+            std::abort();                                                                                      \
     } while (0)
 
 #pragma endregion Assertion Helpers

@@ -1,3 +1,6 @@
+// bench/http.go - HTTP client workload.
+// Ash Vardanian, May 12, 2024.
+
 package main
 
 import (

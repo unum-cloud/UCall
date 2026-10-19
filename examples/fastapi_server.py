@@ -1,9 +1,10 @@
+"""FastAPI comparison server with echo and session endpoints."""
+
 #!/usr/bin/env python
 import base64
 import io
 import logging
 import random
-from typing import List
 
 import numpy as np
 from fastapi import Body, FastAPI, HTTPException
@@ -55,19 +56,13 @@ class ValidateUserIdentityItem(BaseModel):
 @app.post("/validate_user_identity")
 async def validate_user_identity(item: ValidateUserIdentityItem = Body(...)):
     if item.age < 18:
-        raise HTTPException(
-            status_code=400, detail=f"{item.name} must be older than 18"
-        )
+        raise HTTPException(status_code=400, detail=f"{item.name} must be older than 18")
 
     access_token_bytes = base64.b64decode(item.access_token)
     if not access_token_bytes.decode().startswith(item.name):
-        raise HTTPException(
-            status_code=400, detail=f"Invalid access token for {item.name}"
-        )
+        raise HTTPException(status_code=400, detail=f"Invalid access token for {item.name}")
 
-    suggested_session_ids = [
-        random.random() * item.age * item.user_id for _ in range(round(item.age))
-    ]
+    suggested_session_ids = [random.random() * item.age * item.user_id for _ in range(round(item.age))]
     return {
         "session_ids": suggested_session_ids,
         "user": {
@@ -100,7 +95,7 @@ class GetItem(BaseModel):
 
 @app.post("/get")
 async def get(item: GetItem = Body(...)) -> str:
-    return redis.get(item.key, None)
+    return redis.get(item.key)
 
 
 class ResizeItem(BaseModel):

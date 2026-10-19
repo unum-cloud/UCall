@@ -1,3 +1,5 @@
+"""Measures latency and throughput of synchronous RPC clients."""
+
 import os
 import sys
 import time
@@ -59,7 +61,7 @@ def bench_serial(
         except AssertionError:
             stats.requests += 1
             stats.requests_incorrect += 1
-        except Exception as e:
+        except Exception as e:  # noqa: BLE001 - Client failures are measured results.
             stats.requests += 1
             stats.requests_failure += 1
             stats.last_failure = str(e)
