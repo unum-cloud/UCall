@@ -148,5 +148,28 @@ int main(int argc, char** argv) {
     batch.callback = echo_batch;
     batch.context = &application.server;
     ucall_server_add_batch_endpoint(&batch);
-    return application.succeeded(outcome) ? application.run() : 1;
+    if (!application.succeeded(outcome)) return 1;
+    auto result = application.run();
+    // The last ForkUnion thread drains batches rather than polling an event loop.
+    for (std::size_t index = 0; index + 1 < application.outcomes.size(); ++index) {
+        ucall_event_loop_statistics_t counters {};
+        ucall_server_event_loop_statistics_t query {application.server, &outcome, index, &counters};
+        ucall_server_event_loop_statistics(&query);
+        if (!application.succeeded(outcome)) return 1;
+        std::printf("Event loop %zu: %llu requests, %llu accepts, %llu polls, %llu empty polls, %llu kernel enters, "
+                    "%llu submissions, %llu completions, %llu cancellations, %llu receive re-arms, "
+                    "%llu bytes received, %llu bytes sent, %llu bytes copied\n",
+                    index, static_cast<unsigned long long>(counters.requests),
+                    static_cast<unsigned long long>(counters.accepts), static_cast<unsigned long long>(counters.polls),
+                    static_cast<unsigned long long>(counters.empty_polls),
+                    static_cast<unsigned long long>(counters.kernel_enters),
+                    static_cast<unsigned long long>(counters.submissions),
+                    static_cast<unsigned long long>(counters.completions),
+                    static_cast<unsigned long long>(counters.cancellations),
+                    static_cast<unsigned long long>(counters.receive_rearms),
+                    static_cast<unsigned long long>(counters.bytes_received),
+                    static_cast<unsigned long long>(counters.bytes_sent),
+                    static_cast<unsigned long long>(counters.bytes_copied));
+    }
+    return result;
 }

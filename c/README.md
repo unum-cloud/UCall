@@ -32,7 +32,7 @@ Keep the borrowed URL, headers, body, and security-key inputs alive until comple
 `ucall_client_take_completed()` drives progress and retrieves a batch of records containing the caller cookie, final outcome, and response.
 Retrieval returns each call's admission credit.
 The connection budget must be positive; a zero call budget uses the connection budget.
-Retrieved responses belong to the caller until `ucall_received_http_response_free()`; client teardown discards unretrieved results.
+Retrieved responses belong to the caller until `ucall_client_response_free()`; client teardown discards unretrieved results.
 Request handles own immutable received bytes and can outlive their callback until a reply consumes them or the server is freed.
 Batch callbacks receive a counted array of retained request handles, followed by the registered context.
 The array is borrowed only during the callback; copy its handles into application-owned storage to defer work without copying request bytes.

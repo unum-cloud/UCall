@@ -163,7 +163,7 @@ typedef struct ucall_completed_call_t {
     /** Final network or protocol outcome, independent of the acceptance result. */
     ucall_outcome_t outcome;
 
-    /** Received response, or NULL on failure. Free with @c ucall_received_http_response_free(). */
+    /** Received response, or NULL on failure. Free with @c ucall_client_response_free(). */
     ucall_received_http_response_t response;
 
 } ucall_completed_call_t;
@@ -264,11 +264,11 @@ UCALL_EXPORT void ucall_client_websocket_receive(ucall_client_websocket_receive_
  *  @param[in] response Response from ucall_client_take_completed().
  *  @return The peer's status code, or zero for a null response.
  */
-UCALL_EXPORT ucall_http_status_t ucall_received_http_response_status(ucall_client_t client,
-                                                                     ucall_received_http_response_t response);
+UCALL_EXPORT ucall_http_status_t ucall_client_response_status(ucall_client_t client,
+                                                              ucall_received_http_response_t response);
 
-/** Arguments of @c ucall_received_http_response_header(). */
-typedef struct ucall_received_http_response_header_t {
+/** Arguments of @c ucall_client_response_header(). */
+typedef struct ucall_client_response_header_t {
 
     /** The client this call operates on. */
     ucall_client_t client;
@@ -285,7 +285,7 @@ typedef struct ucall_received_http_response_header_t {
     /** Output for a borrowed view of the header value. */
     ucall_bytes_view_t* value;
 
-} ucall_received_http_response_header_t;
+} ucall_client_response_header_t;
 
 /**
  *  @brief Extracts the named string header from the received response.
@@ -295,10 +295,10 @@ typedef struct ucall_received_http_response_header_t {
  *  @note @b Thread-safe across responses. Two threads must not operate on the @b same @c response
  *      concurrently.
  */
-UCALL_EXPORT void ucall_received_http_response_header(ucall_received_http_response_header_t* arguments);
+UCALL_EXPORT void ucall_client_response_header(ucall_client_response_header_t* arguments);
 
-/** Arguments of @c ucall_received_http_response_body(). */
-typedef struct ucall_received_http_response_body_t {
+/** Arguments of @c ucall_client_response_body(). */
+typedef struct ucall_client_response_body_t {
 
     /** The client this call operates on. */
     ucall_client_t client;
@@ -312,7 +312,7 @@ typedef struct ucall_received_http_response_body_t {
     /** Output for a borrowed view of the body. */
     ucall_bytes_view_t* body;
 
-} ucall_received_http_response_body_t;
+} ucall_client_response_body_t;
 
 /**
  *  @brief Extracts the body content from the received response.
@@ -320,7 +320,7 @@ typedef struct ucall_received_http_response_body_t {
  *  @note @b Thread-safe across responses. Two threads must not operate on the @b same @c response
  *      concurrently.
  */
-UCALL_EXPORT void ucall_received_http_response_body(ucall_received_http_response_body_t* arguments);
+UCALL_EXPORT void ucall_client_response_body(ucall_client_response_body_t* arguments);
 
 /**
  *  @brief Frees the received response handle. Does nothing for @c NULL.
@@ -329,7 +329,7 @@ UCALL_EXPORT void ucall_received_http_response_body(ucall_received_http_response
  *  @note @b Thread-safe across responses. Two threads must not operate on the @b same @p response
  *      concurrently.
  */
-UCALL_EXPORT void ucall_received_http_response_free(ucall_received_http_response_t response);
+UCALL_EXPORT void ucall_client_response_free(ucall_received_http_response_t response);
 
 /** Arguments of @c ucall_client_websocket_send(). */
 typedef struct ucall_client_websocket_send_t {
@@ -357,14 +357,26 @@ typedef struct ucall_client_websocket_send_t {
  */
 UCALL_EXPORT void ucall_client_websocket_send(ucall_client_websocket_send_t* arguments);
 
+/** Arguments of @c ucall_client_websocket_close(). */
+typedef struct ucall_client_websocket_close_t {
+
+    /** The client this call operates on. */
+    ucall_client_t client;
+
+    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    ucall_outcome_t* outcome;
+
+    /** WebSocket connection handle from @c ucall_client_websocket_connect(). Invalid once this call
+     *  returns. */
+    ucall_websocket_t websocket;
+
+} ucall_client_websocket_close_t;
+
 /**
  *  @brief Closes a WebSocket connection.
- *  @param[in] client Client handle from @c ucall_client_init().
- *  @param[in] websocket WebSocket connection handle to close.
- *
  *  @note Call on the client owner thread.
  */
-UCALL_EXPORT void ucall_client_websocket_close(ucall_client_t client, ucall_websocket_t websocket);
+UCALL_EXPORT void ucall_client_websocket_close(ucall_client_websocket_close_t* arguments);
 
 #ifdef __cplusplus
 }

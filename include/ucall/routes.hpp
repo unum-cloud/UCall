@@ -203,18 +203,19 @@ class route_trie {
         if (!trie.init()) return std::nullopt;
         return trie;
     }
-    bool insert(std::string_view path, ucall_verb_t verb, void* callback, void* tag = nullptr) noexcept {
-        if (!root_ || path.empty()) return false;
+    ucall_status_t insert(std::string_view path, ucall_verb_t verb, void* callback, void* tag = nullptr) noexcept {
+        if (!root_) return ucall_status_uninitialized_k;
+        if (path.empty()) return ucall_status_invalid_argument_k;
         path_cursor<search_type_> cursor {path};
         bool wildcard {};
         std::size_t count {};
         for (auto segment = cursor.next(); !segment.empty(); segment = cursor.next()) {
             parsed_segment_t parsed {};
-            if (wildcard || !parse_segment<search_type_>(segment, parsed)) return false;
+            if (wildcard || !parse_segment<search_type_>(segment, parsed)) return ucall_status_invalid_argument_k;
             wildcard = parsed.type == segment_type_t::wildcard_k;
             ++count;
         }
-        if (!count && path != "/") return false;
+        if (!count && path != "/") return ucall_status_invalid_argument_k;
         cursor.offset = 0;
         auto current = root_;
         for (auto segment = cursor.next(); !segment.empty(); segment = cursor.next()) {
@@ -225,7 +226,7 @@ class route_trie {
                 if (!found) {
                     found = child(current, parsed.type);
                     auto edge = edges_.alloc();
-                    if (!found || !edge) return false;
+                    if (!found || !edge) return ucall_status_out_of_memory_k;
                     *edge = {parsed.content, found, current->literals};
                     current->literals = edge;
                 }
@@ -234,22 +235,22 @@ class route_trie {
             else {
                 auto& next = parsed.type == segment_type_t::param_k ? current->parameter : current->wildcard;
                 auto& name = parsed.type == segment_type_t::param_k ? current->parameter_name : current->wildcard_name;
-                if (next && !search_type_::equal(name, parsed.content)) return false;
+                if (next && !search_type_::equal(name, parsed.content)) return ucall_status_invalid_argument_k;
                 if (!next) {
                     next = child(current, parsed.type);
-                    if (!next) return false;
+                    if (!next) return ucall_status_out_of_memory_k;
                     name = parsed.content;
                 }
                 current = next;
             }
         }
         for (auto existing = current->endpoints; existing; existing = existing->next)
-            if (existing->verb == verb) return false;
+            if (existing->verb == verb) return ucall_status_already_exists_k;
         auto added = endpoints_.alloc();
-        if (!added) return false;
+        if (!added) return ucall_status_out_of_memory_k;
         *added = {verb, callback, tag, current->endpoints};
         current->endpoints = added;
-        return true;
+        return ucall_status_success_k;
     }
     void* match(std::string_view path, ucall_verb_t verb, void** tag = nullptr) const noexcept {
         if (!root_) return nullptr;

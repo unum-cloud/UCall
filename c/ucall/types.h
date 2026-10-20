@@ -80,6 +80,26 @@ UCALL_EXPORT char const* ucall_io_backend_name(ucall_io_backend_t backend);
 UCALL_EXPORT char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class);
 
 /**
+ *  @brief Reads an I/O backend back from its stable name.
+ *  @param[in] name The counted spelling @c ucall_io_backend_name() returns.
+ *  @return The named backend, or @c ucall_io_backend_automatic_k for an unrecognized name, which
+ *      callers tell from "automatic" by naming the result back.
+ *
+ *  @note @b Thread-safe.
+ */
+UCALL_EXPORT ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name);
+
+/**
+ *  @brief Reads a CPU kernel class back from its stable name.
+ *  @param[in] name The counted spelling @c ucall_cpu_class_name() returns.
+ *  @return The named class, or @c ucall_cpu_class_unknown_k for an unrecognized name, which
+ *      callers tell from "automatic" by naming the result back.
+ *
+ *  @note @b Thread-safe.
+ */
+UCALL_EXPORT ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name);
+
+/**
  *  @brief Opaque server handle.
  *  @sa Deals with @c ucall_received_http_request_t, individually or in counted arrays.
  *  @sa Use with @c ucall_server_init() and @c ucall_server_free() for lifetime.
@@ -135,17 +155,6 @@ typedef enum ucall_security_mode_t {
 
 /** Noise protocol key (32 bytes for Curve25519). */
 typedef ucall_byte_t ucall_noise_key_t[32];
-
-/**
- *  @brief Decides whether a peer presenting a given static key may proceed past the handshake.
- *  @param[in] peer_static_key The remote party's 32-byte Curve25519 static public key.
- *  @param[in] context User-supplied context from the server or client configuration.
- *  @return True to accept the peer, false to abort with @c ucall_status_peer_rejected_k.
- *
- *  Required for @c ucall_security_mode_noise_xx_k, where keys are learned during the handshake
- *  rather than known in advance. Called after the key is authenticated, before any payload.
- */
-typedef bool (*ucall_peer_authorizer_t)(ucall_noise_key_t const* peer_static_key, void* context);
 
 /** HTTP request methods/verbs for endpoint routing.
  *
@@ -245,6 +254,18 @@ enum {
     ucall_status_would_block_k = 25,
 
 };
+
+/**
+ *  @brief Decides whether a peer presenting a given static key may proceed past the handshake.
+ *  @param[in] peer_static_key The remote party's 32-byte Curve25519 static public key.
+ *  @param[in] context User-supplied context from the server or client configuration.
+ *  @return @c ucall_status_success_k to admit the peer. Any other status refuses it and becomes
+ *      the connection's outcome, @c ucall_status_peer_rejected_k being the plain refusal.
+ *
+ *  Required for @c ucall_security_mode_noise_xx_k, where keys are learned during the handshake
+ *  rather than known in advance. Called after the key is authenticated, before any payload.
+ */
+typedef ucall_status_t (*ucall_peer_authorizer_t)(ucall_noise_key_t const* peer_static_key, void* context);
 
 /** Outcome of one call: a status to branch on, and a static message with the detail it cannot
  *  carry.

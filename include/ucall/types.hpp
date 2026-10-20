@@ -141,6 +141,7 @@ struct ucall_server_handle_t {
         void (*free)(ucall_server_t);
         void (*take_call)(ucall_server_take_call_t*);
         void (*take_calls)(ucall_server_take_calls_t*);
+        void (*event_loop_statistics)(ucall_server_event_loop_statistics_t*);
         void (*take_batch)(ucall_server_take_batch_t*);
         void (*take_batches)(ucall_server_take_batches_t*);
         void (*add_http_endpoint)(ucall_server_add_http_endpoint_t*);
@@ -169,8 +170,8 @@ struct ucall_client_handle_t {
         void (*free)(ucall_client_t);
         void (*call)(ucall_client_call_t*);
         void (*take_completed)(ucall_client_take_completed_t*);
-        void (*response_header)(ucall_received_http_response_header_t*);
-        void (*response_body)(ucall_received_http_response_body_t*);
+        void (*response_header)(ucall_client_response_header_t*);
+        void (*response_body)(ucall_client_response_body_t*);
     };
     api_t const* api {};
     std::uint64_t string_capabilities {}, atomic_capabilities {};

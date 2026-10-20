@@ -6,6 +6,7 @@
  */
 #include <cassert>
 #include <cstdint>
+#include <cstring> // `std::strlen`, `std::memcmp`
 
 #if defined(_WIN32)
 #include <io.h>
@@ -51,6 +52,10 @@ static bool admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept
         return false;
     }
     return true;
+}
+
+static bool named(char const* spelling, ucall_bytes_view_t name) noexcept {
+    return std::strlen(spelling) == name.length && std::memcmp(spelling, name.data, name.length) == 0;
 }
 
 template <typename init_type_>
@@ -123,6 +128,20 @@ char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
     return "unknown";
 }
 
+ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name) {
+    for (auto backend = ucall_io_backend_posix_k; backend <= ucall_io_backend_windows_iocp_k;
+         backend = static_cast<ucall_io_backend_t>(backend + 1))
+        if (named(ucall_io_backend_name(backend), name)) return backend;
+    return ucall_io_backend_automatic_k;
+}
+
+ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name) {
+    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_aws_g5_k;
+         cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1))
+        if (named(ucall_cpu_class_name(cpu_class), name)) return cpu_class;
+    return ucall_cpu_class_unknown_k;
+}
+
 void ucall_server_init(ucall_server_init_t* arguments) {
     if (!arguments) return;
     if (arguments->server) *arguments->server = nullptr;
@@ -153,6 +172,13 @@ void ucall_server_take_calls(ucall_server_take_calls_t* arguments) {
     if (!arguments) return;
     if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->take_calls(arguments);
+}
+
+void ucall_server_event_loop_statistics(ucall_server_event_loop_statistics_t* arguments) {
+    if (!arguments) return;
+    if (arguments->statistics) *arguments->statistics = {};
+    if (!admit(arguments->server, arguments->outcome)) return;
+    arguments->server->api->event_loop_statistics(arguments);
 }
 
 void ucall_server_take_batch(ucall_server_take_batch_t* arguments) {
@@ -239,12 +265,12 @@ void ucall_client_call(ucall_client_call_t* arguments) {
     if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->call(arguments);
 }
-void ucall_received_http_response_header(ucall_received_http_response_header_t* arguments) {
+void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     if (!arguments) return;
     if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->response_header(arguments);
 }
-void ucall_received_http_response_body(ucall_received_http_response_body_t* arguments) {
+void ucall_client_response_body(ucall_client_response_body_t* arguments) {
     if (!arguments) return;
     if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->response_body(arguments);
@@ -256,10 +282,10 @@ ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_htt
 size_t ucall_server_request_path_segments_count(ucall_server_t server, ucall_received_http_request_t request) {
     return server && compatible(server) ? server->api->request_path_segments_count(server, request) : 0;
 }
-ucall_http_status_t ucall_received_http_response_status(ucall_client_t, ucall_received_http_response_t response) {
+ucall_http_status_t ucall_client_response_status(ucall_client_t, ucall_received_http_response_t response) {
     return response ? static_cast<received_response_t*>(response)->status : 0;
 }
-void ucall_received_http_response_free(ucall_received_http_response_t response) {
+void ucall_client_response_free(ucall_received_http_response_t response) {
     if (!response) return;
     auto* received = static_cast<received_response_t*>(response);
     received->destroy(received);
@@ -283,7 +309,10 @@ void ucall_client_websocket_send(ucall_client_websocket_send_t* arguments) {
     publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
-void ucall_client_websocket_close(ucall_client_t client, ucall_websocket_t websocket) {}
+void ucall_client_websocket_close(ucall_client_websocket_close_t* arguments) {
+    if (!arguments) return;
+    publish(arguments->outcome, ucall_status_unsupported_k);
+}
 
 void ucall_server_add_batch_endpoint(ucall_server_add_batch_endpoint_t* arguments) {
     if (!arguments) return;
@@ -298,14 +327,13 @@ void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* 
 
 void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* arguments) {
     if (!arguments) return;
-    if (arguments->chunk) *arguments->chunk = {};
-    if (arguments->has_more) *arguments->has_more = {};
+    if (arguments->data) *arguments->data = {};
     publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
-size_t ucall_server_request_part_count(ucall_server_t server, ucall_received_http_request_t request) { return 0; }
+size_t ucall_server_request_parts_count(ucall_server_t server, ucall_received_http_request_t request) { return 0; }
 
-void ucall_server_request_part_at(ucall_server_request_part_at_t* arguments) {
+void ucall_server_request_part(ucall_server_request_part_t* arguments) {
     if (!arguments) return;
     if (arguments->name) *arguments->name = {};
     if (arguments->content_type) *arguments->content_type = {};
@@ -355,6 +383,9 @@ void ucall_server_websocket_send(ucall_server_websocket_send_t* arguments) {
     publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
-void ucall_server_websocket_close(ucall_server_t server, ucall_websocket_t websocket) {}
+void ucall_server_websocket_close(ucall_server_websocket_close_t* arguments) {
+    if (!arguments) return;
+    publish(arguments->outcome, ucall_status_unsupported_k);
+}
 
 } // extern "C"

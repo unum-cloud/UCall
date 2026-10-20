@@ -98,8 +98,10 @@ server.run()
 
 ## 📈 Performance Metrics
 
-The native [benchmark driver](bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, and latency percentiles.
+The native [benchmark driver](bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
+It runs closed-loop by default, or open-loop at a fixed arrival rate that charges each call its delay from the intended send time.
 Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
+On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
 The [October 19 Razer snapshot](bench/README.md#razer-snapshot-october-19-2026) measured about 263,000 requests/s for 1 KiB plaintext loopback echo, with one POSIX server polling thread and two fixed io_uring 7.0 client polling threads.
 The report separates server and client backend comparisons, retained replies, connection churn, large payloads, and independent offered-rate runs.
 The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, streaming, and authorization plans below are labeled as such.
@@ -137,7 +139,7 @@ Each loop has one application owner, and `ucall_server_stop()` can wake it from 
 Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
 Initialize, submit, poll, and free a client on the same owner thread.
 Keep borrowed request inputs alive until their completion is retrieved.
-After retrieval, the caller owns each response until `ucall_received_http_response_free()`.
+After retrieval, the caller owns each response until `ucall_client_response_free()`.
 Stop and join server polling threads before freeing the server.
 
 ### Encryption: From TLS to Noise

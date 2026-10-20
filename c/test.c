@@ -2,7 +2,7 @@
  *  @file c/test.c
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief A C caller of the linked library's status, outcome, and version functions.
+ *  @brief A C caller of the linked library's name, status, outcome, and version functions.
  */
 #undef NDEBUG
 #include <assert.h>
@@ -23,6 +23,16 @@ int main(void) {
     name.data = NULL;
     name.length = 0;
     assert(ucall_status_from_name(name) == ucall_status_invalid_argument_k);
+
+    ucall_bytes_view_t backend = {(ucall_byte_t const*)"linux-epoll", 11};
+    assert(ucall_io_backend_from_name(backend) == ucall_io_backend_linux_epoll_k);
+    backend.length = 5;
+    assert(ucall_io_backend_from_name(backend) == ucall_io_backend_automatic_k);
+    ucall_bytes_view_t cpu_class = {(ucall_byte_t const*)"apple-m2", 8};
+    assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_apple_m2_k);
+    cpu_class.data = NULL;
+    cpu_class.length = 0;
+    assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_unknown_k);
 
     ucall_outcome_t outcome = {ucall_status_success_k, NULL};
     assert(ucall_outcome_status(&outcome) == ucall_status_success_k);

@@ -188,6 +188,71 @@ typedef struct ucall_server_take_calls_t {
 /** Drives one server loop until @c ucall_server_stop() or an I/O failure. */
 UCALL_EXPORT void ucall_server_take_calls(ucall_server_take_calls_t* arguments);
 
+/** Counters of one event loop since initialization; divided by @c requests, they price one call.
+ *
+ *  Only the loop's polling owner advances them. Byte counters cover the bytes UCall itself moves,
+ *  never the copies the kernel makes between socket buffers and user memory. */
+typedef struct ucall_event_loop_statistics_t {
+
+    /** Engine polls the loop issued, each taking zero or more completions. */
+    uint64_t polls;
+
+    /** Engine polls that took no completion. */
+    uint64_t empty_polls;
+
+    /** System calls: io_uring enters, or other backends' waits, registrations and socket calls. */
+    uint64_t kernel_enters;
+
+    /** Operations queued: io_uring submission entries, or requests another backend accepted. */
+    uint64_t submissions;
+
+    /** Results taken: io_uring completion entries, or operations another backend finished. */
+    uint64_t completions;
+
+    /** Pending operations, or io_uring multishot receives, the engine asked to cancel. */
+    uint64_t cancellations;
+
+    /** Connections accepted and handed to this loop. */
+    uint64_t accepts;
+
+    /** HTTP requests parsed and dispatched to an endpoint or an error reply. */
+    uint64_t requests;
+
+    /** Multishot receives armed again on a socket that already streamed, only on io_uring 7.0. */
+    uint64_t receive_rearms;
+
+    /** Bytes the kernel reported received on this loop's connections, ciphertext under Noise. */
+    uint64_t bytes_received;
+
+    /** Bytes the kernel reported sent from this loop's connections, ciphertext under Noise. */
+    uint64_t bytes_sent;
+
+    /** Bytes UCall copied: receive appends, reply bodies, Noise records and parked receives. */
+    uint64_t bytes_copied;
+
+} ucall_event_loop_statistics_t;
+
+/** Arguments of @c ucall_server_event_loop_statistics(). */
+typedef struct ucall_server_event_loop_statistics_t {
+
+    /** Initialized server. */
+    ucall_server_t server;
+
+    /** Receives @c ucall_status_invalid_argument_k for an index past the last loop. */
+    ucall_outcome_t* outcome;
+
+    /** Zero-based loop index. */
+    size_t event_loop_index;
+
+    /** Output for a snapshot of the loop's counters, zeroed on failure. */
+    ucall_event_loop_statistics_t* statistics;
+
+} ucall_server_event_loop_statistics_t;
+
+/** Copies one loop's counters, from any thread whose CPU runs the server's CPU class.
+ *  Each counter is read on its own, so a snapshot of a running loop is not one instant. */
+UCALL_EXPORT void ucall_server_event_loop_statistics(ucall_server_event_loop_statistics_t* arguments);
+
 /** Arguments of @c ucall_server_take_batch(). */
 typedef struct ucall_server_take_batch_t {
 
@@ -547,11 +612,8 @@ typedef struct ucall_server_request_body_chunk_t {
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Output for a borrowed view of the chunk. Aliases the receive buffer. */
-    ucall_bytes_view_t* chunk;
-
-    /** Output flag, false once the final chunk has been delivered. */
-    bool* has_more;
+    /** Output for a borrowed view of the next body bytes, empty once the body is complete. */
+    ucall_bytes_view_t* data;
 
 } ucall_server_request_body_chunk_t;
 
@@ -562,7 +624,7 @@ typedef struct ucall_server_request_body_chunk_t {
  *  complete. Without this, a multi-gigabyte upload must be buffered in full before the handler
  *  runs, which is both a memory hazard and a denial-of-service vector.
  *
- *  @warning The returned @c chunk is valid only until the next call on this @c request.
+ *  @warning The returned @c data is valid only until the next call on this @c request.
  *  @sa Use @c ucall_server_request_body() for endpoints that are not registered as streaming.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
@@ -579,10 +641,10 @@ UCALL_EXPORT void ucall_server_request_body_chunk(ucall_server_request_body_chun
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @p request
  *      concurrently.
  */
-UCALL_EXPORT size_t ucall_server_request_part_count(ucall_server_t server, ucall_received_http_request_t request);
+UCALL_EXPORT size_t ucall_server_request_parts_count(ucall_server_t server, ucall_received_http_request_t request);
 
-/** Arguments of @c ucall_server_request_part_at(). */
-typedef struct ucall_server_request_part_at_t {
+/** Arguments of @c ucall_server_request_part(). */
+typedef struct ucall_server_request_part_t {
 
     /** The server this call operates on. */
     ucall_server_t server;
@@ -593,7 +655,7 @@ typedef struct ucall_server_request_part_at_t {
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Zero-based index of the part, below @c ucall_server_request_part_count(). */
+    /** Zero-based index of the part, below @c ucall_server_request_parts_count(). */
     size_t index;
 
     /** Output for the part name from @c Content-Disposition. */
@@ -605,7 +667,7 @@ typedef struct ucall_server_request_part_at_t {
     /** Output for the part payload. Aliases the receive buffer, never copied. */
     ucall_bytes_view_t* data;
 
-} ucall_server_request_part_at_t;
+} ucall_server_request_part_t;
 
 /**
  *  @brief Extracts one part of a @c multipart/form-data request body by index.
@@ -616,7 +678,7 @@ typedef struct ucall_server_request_part_at_t {
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
  */
-UCALL_EXPORT void ucall_server_request_part_at(ucall_server_request_part_at_t* arguments);
+UCALL_EXPORT void ucall_server_request_part(ucall_server_request_part_t* arguments);
 
 /** Arguments of @c ucall_server_reply_content(). */
 typedef struct ucall_server_reply_content_t {
@@ -910,18 +972,28 @@ typedef struct ucall_server_websocket_send_t {
  */
 UCALL_EXPORT void ucall_server_websocket_send(ucall_server_websocket_send_t* arguments);
 
+/** Arguments of @c ucall_server_websocket_close(). */
+typedef struct ucall_server_websocket_close_t {
+
+    /** The server this call operates on. */
+    ucall_server_t server;
+
+    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    ucall_outcome_t* outcome;
+
+    /** WebSocket connection handle from the callback. Invalid once this call returns. */
+    ucall_websocket_t websocket;
+
+} ucall_server_websocket_close_t;
+
 /**
  *  @brief Closes a WebSocket connection.
  *
- *  This function is thread-safe and can be called from any thread. After calling this, the @p
- *  websocket handle becomes invalid.
- *
- *  @param[in] server Server handle from @c ucall_server_init().
- *  @param[in] websocket WebSocket connection handle to close.
+ *  Thread-safe, can be called from any thread including from within the callback itself.
  *
  *  @note @b Thread-safe.
  */
-UCALL_EXPORT void ucall_server_websocket_close(ucall_server_t server, ucall_websocket_t websocket);
+UCALL_EXPORT void ucall_server_websocket_close(ucall_server_websocket_close_t* arguments);
 
 #ifdef __cplusplus
 }

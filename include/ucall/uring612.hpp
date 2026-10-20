@@ -34,17 +34,17 @@ struct linux_uring612_engine {
 
     enum class engine_stage_t : std::uint8_t { idle_k, running_k, stopping_k, recovering_k, stopped_k };
     enum class operation_stage_t : std::uint8_t { waiting_k, submitted_k, cancelling_k, completed_k };
-    enum class resource_stage_t : std::uint8_t { vacant_k, installing_k, open_k, closing_k, closed_k };
+    enum class socket_stage_t : std::uint8_t { vacant_k, installing_k, open_k, closing_k, closed_k };
     enum operation_flags_t : std::uint8_t { operation_none_k = 0, operation_expired_k = 1 };
-    enum resource_flags_t : std::uint8_t { resource_none_k = 0, resource_retiring_k = 1 };
+    enum socket_flags_t : std::uint8_t { socket_none_k = 0, socket_retiring_k = 1 };
     enum registration_flags_t : std::uint8_t { registration_none_k = 0, registration_files_k = 1 };
     enum buffer_flags_t : std::uint8_t { buffer_none_k = 0, buffer_leased_k = 1 };
     static constexpr unsigned absent_k = std::numeric_limits<unsigned>::max();
     static constexpr std::uintptr_t operation_tag_k = 0, control_tag_k = 1, close_tag_k = 4, cancel_tag_k = 7;
-    struct resource_t;
+    struct socket_slot_t;
     struct alignas(8) operation_t {
         io_request_t* request {};
-        resource_t* resource {};
+        socket_slot_t* socket_slot {};
         descriptor_t result {};
         __kernel_timespec expiry {};
         unsigned accepted {absent_k}, buffer {absent_k}, next {absent_k};
@@ -57,12 +57,12 @@ struct linux_uring612_engine {
     struct operation_list_t {
         unsigned head {absent_k}, tail {absent_k};
     };
-    struct alignas(8) resource_t {
+    struct alignas(8) socket_slot_t {
         unsigned index {}, next {absent_k};
         operation_t* close_request {};
         std::uint64_t serial {};
-        resource_stage_t stage {resource_stage_t::vacant_k};
-        resource_flags_t flags {resource_none_k};
+        socket_stage_t stage {socket_stage_t::vacant_k};
+        socket_flags_t flags {socket_none_k};
     };
     struct buffer_t {
         buffer_flags_t flags {buffer_none_k};
@@ -84,11 +84,11 @@ struct linux_uring612_engine {
     io_uring_buf_ring* receive_ring {};
     allocator_t allocator;
     vector<operation_t> operations;
-    vector<resource_t> resources;
+    vector<socket_slot_t> socket_slots;
     vector<buffer_t> buffers;
     allocated_ptr<storage_t, allocator_t> storage;
     operation_list_t free_operations, completed_operations, waiting_operations;
-    unsigned free_resources {absent_k};
+    unsigned free_socket_slots {absent_k};
     unsigned buffer_count {}, buffer_mask {}, available_buffers {};
     std::size_t page {};
     control_t control {};
@@ -96,10 +96,11 @@ struct linux_uring612_engine {
     engine_stage_t stage {engine_stage_t::idle_k};
     registration_flags_t registrations {registration_none_k};
     int fault {};
+    io_statistics_t statistics {};
 
     explicit linux_uring612_engine(allocator_t const& instance = {}) noexcept
         : allocator(instance), operations(rebound_allocator<operation_t> {instance}),
-          resources(rebound_allocator<resource_t> {instance}), buffers(rebound_allocator<buffer_t> {instance}),
+          socket_slots(rebound_allocator<socket_slot_t> {instance}), buffers(rebound_allocator<buffer_t> {instance}),
           storage(nullptr, allocator_delete<storage_t, allocator_t> {instance}) {}
     linux_uring612_engine(linux_uring612_engine const&) = delete;
     linux_uring612_engine& operator=(linux_uring612_engine const&) = delete;
@@ -112,19 +113,20 @@ struct linux_uring612_engine {
         if (!control.result) return true;
         for (auto const& operation : operations)
             if (operation.in_flight()) return true;
-        for (auto const& owner : resources)
-            if (owner.stage == resource_stage_t::closing_k) return true;
+        for (auto const& owner : socket_slots)
+            if (owner.stage == socket_stage_t::closing_k) return true;
         return false;
     }
 
     static std::uintptr_t tag(void* pointer, std::uintptr_t kind) noexcept {
         return reinterpret_cast<std::uintptr_t>(pointer) | kind;
     }
-    resource_t* resource(descriptor_t handle) noexcept {
+    socket_slot_t* socket_slot(descriptor_t handle) noexcept {
         if (!registered_socket_t::contains(handle)) return nullptr;
         auto index = registered_socket_t::index_of(handle);
-        return index < resources.size() && (resources[index].stage != resource_stage_t::vacant_k) ? &resources[index]
-                                                                                                  : nullptr;
+        return index < socket_slots.size() && (socket_slots[index].stage != socket_stage_t::vacant_k)
+                   ? &socket_slots[index]
+                   : nullptr;
     }
     byte_t* receive_data(unsigned index) noexcept {
         return storage->receive.data() + static_cast<std::size_t>(index) * page;
@@ -164,20 +166,26 @@ struct linux_uring612_engine {
         operation.request = nullptr;
         push(free_operations, operation);
     }
-    void vacate(resource_t& owner) noexcept {
-        owner.stage = resource_stage_t::vacant_k;
-        owner.next = free_resources;
-        free_resources = owner.index;
+    void vacate(socket_slot_t& owner) noexcept {
+        owner.stage = socket_stage_t::vacant_k;
+        owner.next = free_socket_slots;
+        free_socket_slots = owner.index;
     }
     static __kernel_timespec timespec_of(std::uint64_t nanoseconds) noexcept {
         return {static_cast<__kernel_time64_t>(nanoseconds / 1'000'000'000),
                 static_cast<long long>(nanoseconds % 1'000'000'000)};
     }
     io_uring_sqe* entry(unsigned count = 1) noexcept {
-        if (io_uring_sq_space_left(&ring) < count && io_uring_submit(&ring) < 0) return nullptr;
-        return io_uring_sq_space_left(&ring) < count ? nullptr : io_uring_get_sqe(&ring);
+        if (io_uring_sq_space_left(&ring) < count) {
+            tally(statistics.kernel_enters);
+            if (io_uring_submit(&ring) < 0) return nullptr;
+        }
+        if (io_uring_sq_space_left(&ring) < count) return nullptr;
+        tally(statistics.submissions);
+        return io_uring_get_sqe(&ring);
     }
     int enter(unsigned wait, std::uint64_t deadline) noexcept {
+        tally(statistics.kernel_enters);
         // Deferred task work only runs inside an enter that asks for events.
         if (!wait) return io_uring_submit_and_get_events(&ring);
         auto now = deadline ? monotonic_ns() : 0;
@@ -200,14 +208,14 @@ struct linux_uring612_engine {
         while (buffer_count < capacity && buffer_count < 32768) buffer_count *= 2;
         buffer_mask = buffer_count - 1;
         available_buffers = buffer_count;
-        if (st::failed(operations.resize(capacity)) || st::failed(resources.resize(capacity)) ||
+        if (st::failed(operations.resize(capacity)) || st::failed(socket_slots.resize(capacity)) ||
             st::failed(buffers.resize(buffer_count)) ||
             st::failed(storage->receive.resize(static_cast<std::size_t>(buffer_count) * page)))
             return ucall_status_out_of_memory_k;
         for (auto& operation : operations) push(free_operations, operation);
-        for (auto i = resources.size(); i--;) {
-            resources[i].index = static_cast<unsigned>(i);
-            vacate(resources[i]);
+        for (auto i = socket_slots.size(); i--;) {
+            socket_slots[i].index = static_cast<unsigned>(i);
+            vacate(socket_slots[i]);
         }
         io_uring_params parameters {};
         parameters.flags = IORING_SETUP_CLAMP | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SINGLE_ISSUER |
@@ -240,7 +248,7 @@ struct linux_uring612_engine {
             stop();
             return ucall_status_unsupported_k;
         }
-        result = io_uring_register_files_sparse(&ring, static_cast<unsigned>(resources.size()));
+        result = io_uring_register_files_sparse(&ring, static_cast<unsigned>(socket_slots.size()));
         if (result < 0) {
             stop();
             return ucall_status_unsupported_k;
@@ -257,14 +265,14 @@ struct linux_uring612_engine {
         io_uring_buf_ring_advance(receive_ring, buffer_count);
         return ucall_status_success_k;
     }
-    resource_t* reserve() noexcept {
-        if (free_resources == absent_k) return nullptr;
-        auto index = free_resources;
-        auto& result = resources[index];
-        free_resources = result.next;
+    socket_slot_t* reserve() noexcept {
+        if (free_socket_slots == absent_k) return nullptr;
+        auto index = free_socket_slots;
+        auto& result = socket_slots[index];
+        free_socket_slots = result.next;
         result = {};
         result.index = index;
-        result.stage = resource_stage_t::installing_k;
+        result.stage = socket_stage_t::installing_k;
         result.serial = ++next_serial;
         return &result;
     }
@@ -297,7 +305,7 @@ struct linux_uring612_engine {
             return result < 0 ? result : -EIO;
         }
         socket_close(descriptor);
-        target->stage = resource_stage_t::open_k;
+        target->stage = socket_stage_t::open_k;
         return registered_socket_t {target->index}.handle();
     }
     descriptor_t open_socket(int family) noexcept {
@@ -318,7 +326,7 @@ struct linux_uring612_engine {
             if (control.result) vacate(*target);
             return result;
         }
-        target->stage = resource_stage_t::open_k;
+        target->stage = socket_stage_t::open_k;
         auto handle = registered_socket_t {target->index}.handle();
         submission = entry();
         if (!submission) {
@@ -353,42 +361,43 @@ struct linux_uring612_engine {
             else buffers[index].flags = buffer_none_k;
         }
     }
-    bool submit(io_request_t& request) noexcept {
-        auto* owner = resource(request.descriptor);
-        if (!owner || (owner->flags & resource_retiring_k)) return false;
+    ucall_status_t submit(io_request_t& request) noexcept {
+        auto* owner = socket_slot(request.descriptor);
+        if (!owner) return ucall_status_invalid_argument_k;
+        if (owner->flags & socket_retiring_k) return ucall_status_connection_closed_k;
         auto* operation = pop(free_operations);
-        if (!operation) return false;
+        if (!operation) return ucall_status_contended_k;
         *operation = {};
         operation->request = &request;
-        operation->resource = owner;
+        operation->socket_slot = owner;
         if (request.operation == io_operation_t::close_k) {
             owner->close_request = operation;
             retire(*owner);
-            return true;
+            return ucall_status_success_k;
         }
-        if (start_operation(*operation)) return true;
-        vacate(*operation);
-        return false;
+        auto status = start_operation(*operation);
+        if (status != ucall_status_success_k) vacate(*operation);
+        return status;
     }
-    bool start_operation(operation_t& operation) noexcept {
+    ucall_status_t start_operation(operation_t& operation) noexcept {
         auto& request = *operation.request;
-        auto* owner = operation.resource;
+        auto* owner = operation.socket_slot;
         if (request.operation == io_operation_t::accept_k && operation.accepted == absent_k) {
             auto* accepted = reserve();
             if (!accepted) {
                 push(waiting_operations, operation);
-                return true;
+                return ucall_status_success_k;
             }
             operation.accepted = accepted->index;
         }
         if (request.operation == io_operation_t::receive_k && !available_buffers) {
             push(waiting_operations, operation);
-            return true;
+            return ucall_status_success_k;
         }
         auto* submission = entry(request.deadline ? 2 : 1);
         if (!submission) {
-            if (operation.accepted != absent_k) vacate(resources[operation.accepted]);
-            return false;
+            if (operation.accepted != absent_k) vacate(socket_slots[operation.accepted]);
+            return ucall_status_io_k;
         }
         auto length = static_cast<unsigned>(std::min(request.length, page));
         switch (request.operation) {
@@ -427,47 +436,48 @@ struct linux_uring612_engine {
             io_uring_sqe_set_data64(timeout, cancel_tag_k);
         }
         operation.stage = operation_stage_t::submitted_k;
-        return true;
+        return ucall_status_success_k;
     }
-    bool cancel(io_request_t& request) noexcept {
+    ucall_status_t cancel(io_request_t& request) noexcept {
         for (auto& operation : operations)
             if (operation.request == &request) {
-                if (request.operation == io_operation_t::close_k) return true;
+                if (request.operation == io_operation_t::close_k) return ucall_status_success_k;
                 if ((operation.stage == operation_stage_t::completed_k) ||
                     (operation.stage == operation_stage_t::cancelling_k))
-                    return true;
+                    return ucall_status_success_k;
+                tally(statistics.cancellations);
                 if (!operation.in_flight()) {
                     unlink(waiting_operations, operation);
                     operation.result = -ECANCELED;
                     complete(operation);
-                    return true;
+                    return ucall_status_success_k;
                 }
                 operation.stage = operation_stage_t::cancelling_k;
                 auto* submission = entry();
                 if (!submission) {
                     operation.stage = operation_stage_t::submitted_k;
-                    return false;
+                    return ucall_status_io_k;
                 }
                 io_uring_prep_cancel64(submission, tag(&operation, operation_tag_k), 0);
                 io_uring_sqe_set_data64(submission, cancel_tag_k);
-                return true;
+                return ucall_status_success_k;
             }
-        return false;
+        return ucall_status_not_found_k;
     }
-    void retire(resource_t& owner) noexcept {
+    void retire(socket_slot_t& owner) noexcept {
         if (stage == engine_stage_t::recovering_k) return;
-        if (!(owner.flags & resource_retiring_k)) {
-            owner.flags = static_cast<resource_flags_t>(owner.flags | resource_retiring_k);
+        if (!(owner.flags & socket_retiring_k)) {
+            owner.flags = static_cast<socket_flags_t>(owner.flags | socket_retiring_k);
             for (auto& operation : operations)
-                if (operation.request && operation.resource == &owner &&
+                if (operation.request && operation.socket_slot == &owner &&
                     operation.stage != operation_stage_t::completed_k &&
                     operation.request->operation != io_operation_t::close_k)
-                    if (!cancel(*operation.request)) fault = -EIO;
+                    if (cancel(*operation.request) != ucall_status_success_k) fault = -EIO;
         }
-        if (owner.stage == resource_stage_t::installing_k || owner.stage == resource_stage_t::closing_k) return;
+        if (owner.stage == socket_stage_t::installing_k || owner.stage == socket_stage_t::closing_k) return;
         for (auto const& operation : operations)
-            if (operation.in_flight() && operation.resource == &owner) return;
-        if (owner.stage == resource_stage_t::closed_k) {
+            if (operation.in_flight() && operation.socket_slot == &owner) return;
+        if (owner.stage == socket_stage_t::closed_k) {
             finish_close(owner);
             return;
         }
@@ -478,15 +488,15 @@ struct linux_uring612_engine {
         }
         io_uring_prep_close_direct(submission, owner.index);
         io_uring_sqe_set_data64(submission, tag(&owner, close_tag_k));
-        owner.stage = resource_stage_t::closing_k;
+        owner.stage = socket_stage_t::closing_k;
     }
     int close_socket(descriptor_t descriptor) noexcept {
         if (!is_open()) return 0;
-        auto* owner = resource(descriptor);
+        auto* owner = socket_slot(descriptor);
         if (!owner) return 0;
         auto serial = owner->serial;
         retire(*owner);
-        while ((owner->stage != resource_stage_t::vacant_k) && owner->serial == serial && !fault) {
+        while ((owner->stage != socket_stage_t::vacant_k) && owner->serial == serial && !fault) {
             int result = enter(1, 0);
             if (result < 0) {
                 fault = result;
@@ -496,7 +506,7 @@ struct linux_uring612_engine {
         }
         return fault;
     }
-    void finish_close(resource_t& owner) noexcept {
+    void finish_close(socket_slot_t& owner) noexcept {
         if (owner.close_request) {
             owner.close_request->result = 0;
             owner.close_request->request->descriptor = -1;
@@ -515,13 +525,13 @@ struct linux_uring612_engine {
             return;
         }
         if (kind == close_tag_k) {
-            auto& owner = *static_cast<resource_t*>(pointer);
-            owner.stage = resource_stage_t::open_k;
+            auto& owner = *static_cast<socket_slot_t*>(pointer);
+            owner.stage = socket_stage_t::open_k;
             if (completion.res < 0) {
                 fault = completion.res;
                 return;
             }
-            owner.stage = resource_stage_t::closed_k;
+            owner.stage = socket_stage_t::closed_k;
             retire(owner);
             return;
         }
@@ -532,11 +542,11 @@ struct linux_uring612_engine {
             operation.request->deadline)
             operation.flags = static_cast<operation_flags_t>(operation.flags | operation_expired_k);
         if (operation.accepted != absent_k) {
-            auto& accepted = resources[operation.accepted];
-            accepted.stage = resource_stage_t::open_k;
+            auto& accepted = socket_slots[operation.accepted];
+            accepted.stage = socket_stage_t::open_k;
             if (completion.res >= 0) {
                 operation.result = registered_socket_t {operation.accepted}.handle();
-                if (stage != engine_stage_t::running_k || (operation.resource->flags & resource_retiring_k))
+                if (stage != engine_stage_t::running_k || (operation.socket_slot->flags & socket_retiring_k))
                     retire(accepted);
             }
             else vacate(accepted);
@@ -553,7 +563,7 @@ struct linux_uring612_engine {
             operation.stage = operation_stage_t::waiting_k;
             push(waiting_operations, operation);
         }
-        if (operation.resource->flags & resource_retiring_k) retire(*operation.resource);
+        if (operation.socket_slot->flags & socket_retiring_k) retire(*operation.socket_slot);
     }
     void reap() noexcept {
         unsigned head {}, count {};
@@ -562,7 +572,9 @@ struct linux_uring612_engine {
             completion(*current);
             ++count;
         }
-        if (count) io_uring_cq_advance(&ring, count);
+        if (!count) return;
+        io_uring_cq_advance(&ring, count);
+        tally(statistics.completions, count);
     }
     int collect(span<io_completion_t> output) noexcept {
         std::size_t count {};
@@ -584,7 +596,7 @@ struct linux_uring612_engine {
     void maintain() noexcept {
         if (fault) return;
         for (auto retry = std::exchange(waiting_operations, {}); auto* operation = pop(retry);)
-            if (!start_operation(*operation)) fault = -EIO;
+            if (start_operation(*operation) != ucall_status_success_k) fault = -EIO;
     }
     int poll(span<io_completion_t> output, io_wait_t policy, std::uint64_t deadline = 0) noexcept {
         if (!is_open()) return -EBADF;
@@ -626,12 +638,12 @@ struct linux_uring612_engine {
             auto& operation = *static_cast<operation_t*>(pointer);
             operation.result = -ECANCELED;
             complete(operation);
-            if (operation.accepted != absent_k) vacate(resources[operation.accepted]);
+            if (operation.accepted != absent_k) vacate(socket_slots[operation.accepted]);
         }
         else if (kind == control_tag_k) control.result = -ECANCELED;
         else if (kind == close_tag_k) {
-            auto& owner = *static_cast<resource_t*>(pointer);
-            if (owner.stage == resource_stage_t::closing_k) owner.stage = resource_stage_t::open_k;
+            auto& owner = *static_cast<socket_slot_t*>(pointer);
+            if (owner.stage == socket_stage_t::closing_k) owner.stage = socket_stage_t::open_k;
         }
     }
     void discard_unsubmitted() noexcept {
@@ -674,8 +686,8 @@ struct linux_uring612_engine {
                 if (operation.request && operation.stage != operation_stage_t::completed_k &&
                     operation.request->operation != io_operation_t::close_k)
                     (void)cancel(*operation.request);
-            for (auto& owner : resources)
-                if (owner.stage != resource_stage_t::vacant_k) retire(owner);
+            for (auto& owner : socket_slots)
+                if (owner.stage != socket_stage_t::vacant_k) retire(owner);
             while (has_kernel_work() && !fault) {
                 int result = enter(1, 0);
                 if (result < 0) {
@@ -702,7 +714,7 @@ struct linux_uring612_engine {
         }
         io_uring_queue_exit(&ring);
         stage = engine_stage_t::stopped_k;
-        for (auto& owner : resources) owner.stage = resource_stage_t::vacant_k;
+        for (auto& owner : socket_slots) owner.stage = socket_stage_t::vacant_k;
     }
 };
 

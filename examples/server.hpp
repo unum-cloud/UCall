@@ -50,7 +50,7 @@ struct server_t {
     bool running {};
     std::vector<ucall_outcome_t> outcomes;
     ucall_server_t server {};
-    ucall_network_interface_t interface {};
+    ucall_network_interface_t network_interface {};
     char address[sizeof("127.0.0.1:65535")] {};
 #if !defined(_WIN32)
     sigset_t stop_signals {}, original_signals {};
@@ -93,30 +93,17 @@ struct server_t {
                 return parsed.ec == std::errc {} && parsed.ptr == value.data() + value.size() && (zero || output);
             };
             bool valid {};
+            ucall_bytes_view_t name {reinterpret_cast<ucall_byte_t const*>(value.data()), value.size()};
             if (flag == "--port") valid = number(port, true) && port <= std::numeric_limits<std::uint16_t>::max();
             else if (flag == "--threads") valid = number(threads);
             else if (flag == "--connections") valid = number(connections);
             else if (flag == "--backend") {
-                for (auto backend :
-                     {ucall_io_backend_automatic_k, ucall_io_backend_posix_k, ucall_io_backend_linux_epoll_k,
-                      ucall_io_backend_linux_uring612_k, ucall_io_backend_linux_uring700_k,
-                      ucall_io_backend_macos_kqueue_k, ucall_io_backend_windows_iocp_k})
-                    if (value == ucall_io_backend_name(backend)) {
-                        config.backend = backend;
-                        valid = true;
-                    }
+                config.backend = ucall_io_backend_from_name(name);
+                valid = value == ucall_io_backend_name(config.backend);
             }
             else if (flag == "--cpu-class") {
-                valid = value == "automatic";
-                if (valid) config.cpu_class = ucall_cpu_class_unknown_k;
-                for (auto cpu :
-                     {ucall_cpu_class_serial_k, ucall_cpu_class_intel_haswell_k, ucall_cpu_class_intel_skylake_k,
-                      ucall_cpu_class_intel_icelake_k, ucall_cpu_class_intel_alder_k, ucall_cpu_class_intel_sierra_k,
-                      ucall_cpu_class_aws_g2_k, ucall_cpu_class_apple_m2_k, ucall_cpu_class_aws_g5_k})
-                    if (value == ucall_cpu_class_name(cpu)) {
-                        config.cpu_class = cpu;
-                        valid = true;
-                    }
+                config.cpu_class = ucall_cpu_class_from_name(name);
+                valid = value == ucall_cpu_class_name(config.cpu_class);
             }
             if (!valid) {
                 std::fprintf(stderr, "Invalid argument: %.*s=%.*s\n", static_cast<int>(flag.size()), flag.data(),
@@ -136,10 +123,10 @@ struct server_t {
         waiter = pthread_self();
 #endif
         std::snprintf(address, sizeof(address), "127.0.0.1:%u", port);
-        interface.address = address;
-        interface.max_concurrent_connections = connections;
-        interface.event_loops = std::min(threads, connections);
-        config.interfaces = &interface;
+        network_interface.address = address;
+        network_interface.max_concurrent_connections = connections;
+        network_interface.event_loops = std::min(threads, connections);
+        config.interfaces = &network_interface;
         config.interfaces_count = 1;
         ucall_outcome_t outcome {};
         ucall_server_config_t resolved {};
