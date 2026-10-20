@@ -11,8 +11,10 @@
 #include <cstring>
 
 #include <array>
+#include <atomic>
 #include <chrono>
 #include <string>
+#include <thread>
 
 #include "ucall/ucall.h"
 #include "ucall/types.hpp"
@@ -220,9 +222,9 @@ static void timeout_and_cancel() {
 
 struct batch_context_t {
     fixture_t* fixture {};
-    std::array<ucall_received_http_request_t, 2> requests {};
+    std::array<ucall_received_http_request_t, 4> requests {};
     std::array<std::size_t, 2> sizes {};
-    std::size_t completed {};
+    std::atomic<std::size_t> completed {};
 
     static void receive(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
         auto& state = *static_cast<batch_context_t*>(context);
@@ -231,12 +233,14 @@ struct batch_context_t {
             assert(requests[i]);
             state.requests[i] = requests[i];
         }
-        assert(state.completed < state.sizes.size());
-        state.sizes[state.completed++] = count;
+        auto completed = state.completed.load(std::memory_order_relaxed);
+        assert(completed < state.sizes.size());
+        state.sizes[completed] = count;
+        state.completed.store(completed + 1, std::memory_order_release);
     }
     void wait(std::size_t count) {
         auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {5};
-        while (completed != count) {
+        while (completed.load(std::memory_order_acquire) != count) {
             for (std::size_t i = 0; i != fixture->clients.size(); ++i) fixture->take(i);
             fixture->serve(200000);
             assert(std::chrono::steady_clock::now() < deadline);
@@ -244,10 +248,20 @@ struct batch_context_t {
     }
 };
 
+static std::thread drain_batches(ucall_server_t server) {
+    return std::thread {[server] {
+        ucall_outcome_t outcome {};
+        ucall_server_take_batches_t take {server, &outcome};
+        ucall_server_take_batches(&take);
+        assert(outcome.status == ucall_status_success_k);
+    }};
+}
+
 static void application_batches() {
     batch_context_t batches;
     fixture_t fixture {batch_context_t::receive, &batches};
     batches.fixture = &fixture;
+    auto drain = drain_batches(fixture.server);
     call_t first, second, partial;
     first.submit(fixture, 0, "/batch");
     second.submit(fixture, 1, "/batch");
@@ -262,6 +276,86 @@ static void application_batches() {
     assert(batches.sizes[1] == 1);
     fixture.reply(batches.requests[0]);
     partial.success(fixture.wait(0));
+    ucall_server_stop(fixture.server);
+    fixture.serve();
+    drain.join();
+}
+
+static void batches_across_loops() {
+#if !UCALL_OS_WINDOWS_
+    ucall_server_t server {};
+    ucall_client_t client {};
+    ucall_outcome_t outcome {};
+    ucall_network_interface_t interface {};
+    interface.address = "127.0.0.1:0";
+    interface.max_concurrent_connections = 4;
+    interface.event_loops = 2;
+    ucall_server_config_t config {}, resolved {};
+    config.interfaces = &interface;
+    config.interfaces_count = 1;
+    ucall_server_init_t init {&server, &outcome, &config, &resolved};
+    ucall_server_init(&init);
+    assert(outcome.status == ucall_status_success_k && resolved.interfaces[0].event_loops == 2);
+    batch_context_t batches;
+    ucall_server_add_batch_endpoint_t add {
+        server, &outcome, view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 4, 4, 10000000};
+    ucall_server_add_batch_endpoint(&add);
+    assert(outcome.status == ucall_status_success_k);
+    ucall_client_config_t client_config {};
+    client_config.max_concurrent_connections = 4;
+    ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
+    ucall_client_init(&client_init);
+    assert(outcome.status == ucall_status_success_k);
+    auto drain = drain_batches(server);
+    // Each loop owns two of the four connections, so each receives exactly half of the batch.
+    std::string url = std::string {"http://"} + resolved.interfaces[0].address + "/batch";
+    for (std::size_t i = 0; i != 4; ++i) {
+        ucall_client_call_t call {};
+        call.client = client;
+        call.outcome = &outcome;
+        call.url = view(url);
+        call.verb = ucall_verb_post_k;
+        call.body = view("echo");
+        ucall_client_call(&call);
+        assert(outcome.status == ucall_status_success_k);
+    }
+    std::array<ucall_completed_call_t, 4> completed {};
+    std::size_t received {};
+    auto deadline = std::chrono::steady_clock::now() + std::chrono::seconds {5};
+    auto progress = [&] {
+        for (std::size_t loop = 0; loop != 2; ++loop) {
+            ucall_server_take_call_t serving {server, &outcome, loop, 0};
+            ucall_server_take_call(&serving);
+            assert(outcome.status == ucall_status_success_k);
+        }
+        std::size_t count {};
+        ucall_client_take_completed_t take {client, &outcome, completed.data() + received, completed.size() - received,
+                                            &count, 0};
+        ucall_client_take_completed(&take);
+        assert(outcome.status == ucall_status_success_k);
+        received += count;
+        assert(std::chrono::steady_clock::now() < deadline);
+    };
+    while (!batches.completed.load(std::memory_order_acquire)) progress();
+    assert(batches.completed == 1 && batches.sizes[0] == 4);
+    for (auto request : batches.requests) {
+        ucall_bytes_view_t body = view("echo");
+        ucall_server_reply_content_t response {server, &outcome, request, nullptr, 0, body};
+        ucall_server_reply_content(&response);
+        assert(outcome.status == ucall_status_success_k);
+    }
+    while (received != completed.size()) progress();
+    for (auto& call : completed) {
+        assert(call.outcome.status == ucall_status_success_k);
+        ucall_received_http_response_free(call.response);
+    }
+    assert(batches.completed == 1);
+    ucall_server_stop(server);
+    progress();
+    drain.join();
+    ucall_client_free(client);
+    ucall_server_free(server);
+#endif
 }
 
 static void capability_admission() {
@@ -456,4 +550,5 @@ int main() {
     completion_credits();
     timeout_and_cancel();
     application_batches();
+    batches_across_loops();
 }

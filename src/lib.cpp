@@ -155,6 +155,18 @@ void ucall_server_take_calls(ucall_server_take_calls_t* arguments) {
     arguments->server->api->take_calls(arguments);
 }
 
+void ucall_server_take_batch(ucall_server_take_batch_t* arguments) {
+    if (!arguments) return;
+    if (!admit(arguments->server, arguments->outcome)) return;
+    arguments->server->api->take_batch(arguments);
+}
+
+void ucall_server_take_batches(ucall_server_take_batches_t* arguments) {
+    if (!arguments) return;
+    if (!admit(arguments->server, arguments->outcome)) return;
+    arguments->server->api->take_batches(arguments);
+}
+
 void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     if (!arguments) return;
     if (arguments->count) *arguments->count = 0;
@@ -171,6 +183,10 @@ void ucall_server_stop(ucall_server_t server) {
     if (!server) return;
     std::atomic_ref<std::uint32_t> {server->stopped}.store(1, std::memory_order_release);
     for (auto* wake : server->wakeups) wake->notify();
+    if (!server->batch_tail) return;
+    std::atomic_ref<std::uint64_t> {*server->batch_tail}.fetch_or(ucall_server_handle_t::batch_signal_k,
+                                                                  std::memory_order_release);
+    std::atomic_ref<std::uint64_t> {*server->batch_tail}.notify_one();
 }
 void ucall_client_free(ucall_client_t client) {
     if (!client) return;

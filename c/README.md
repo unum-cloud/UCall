@@ -20,7 +20,8 @@ Accepts remain credit-limited one-shot operations: multishot direct accept can c
 Initialize the server and register routes before polling.
 `ucall_server_take_call()` drives one loop with a bounded wait; zero timeout performs one nonblocking progress round.
 `ucall_server_take_calls()` drives it continuously until `ucall_server_stop()` or failure.
-Each loop has one application polling owner, and endpoint and batch callbacks execute synchronously on that caller.
+Each loop has one application polling owner, and endpoint callbacks execute synchronously on that caller.
+Batch callbacks execute on the one thread calling `ucall_server_take_batch()` or `ucall_server_take_batches()`.
 A deadline cannot preempt a callback.
 Stop the server, join its polling threads, and finish application use of retained requests before freeing it.
 Native I/O retirement during teardown can block.
@@ -36,7 +37,7 @@ Request handles own immutable received bytes and can outlive their callback unti
 Batch callbacks receive a counted array of retained request handles, followed by the registered context.
 The array is borrowed only during the callback; copy its handles into application-owned storage to defer work without copying request bytes.
 Each request can be replied to independently, including after the callback returns.
-Each loop assembles its own endpoint batches and flushes partial batches at their configured deadline.
+Every loop deposits into one queue per server, so batches mix requests from all loops, and partial batches flush at their configured deadline.
 A reply to a disconnected request reports connection closure and consumes the handle.
 All byte views carry an explicit length, including empty and binary values.
 

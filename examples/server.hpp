@@ -147,11 +147,11 @@ struct server_t {
         ucall_server_init(&init);
         if (!succeeded(outcome)) return -1;
         auto loops = resolved.interfaces[0].event_loops;
-        outcomes.resize(loops);
+        outcomes.resize(loops + 1); // The last thread drains batch endpoints.
         fu_topology_t topology {};
         auto status = fu_topology_new(&topology);
         if (status == fu_success_k) status = fu_pool_new("ucall-example", fu_capabilities_all_k, &pool);
-        if (status == fu_success_k) status = fu_pool_spawn(topology, pool, loops, fu_caller_exclusive_k);
+        if (status == fu_success_k) status = fu_pool_spawn(topology, pool, loops + 1, fu_caller_exclusive_k);
         if (topology) fu_topology_delete(topology);
         if (status != fu_success_k) {
             std::fprintf(stderr, "ForkUnion initialization failed: %d\n", static_cast<int>(status));
@@ -165,8 +165,14 @@ struct server_t {
     static void serve(void* context, std::size_t index, std::size_t) {
         auto& application = *static_cast<server_t*>(context);
         auto& outcome = application.outcomes[index];
-        ucall_server_take_calls_t serving {application.server, &outcome, index};
-        ucall_server_take_calls(&serving);
+        if (index + 1 == application.outcomes.size()) {
+            ucall_server_take_batches_t draining {application.server, &outcome};
+            ucall_server_take_batches(&draining);
+        }
+        else {
+            ucall_server_take_calls_t serving {application.server, &outcome, index};
+            ucall_server_take_calls(&serving);
+        }
         if (outcome.status == ucall_status_success_k) return;
         ucall_server_stop(application.server);
 #if defined(_WIN32)

@@ -119,7 +119,8 @@ For lightweight operations, a handler stays an ordinary synchronous function.
 For heavy operations, there is no secret pill, but there is a common "latency hiding" trick - batching.
 
 Batch endpoints group independent requests by their configured size and latency budgets.
-Endpoint and batch callbacks run synchronously on the application polling caller; a deadline cannot preempt a callback.
+Endpoint callbacks run synchronously on the application polling caller; a deadline cannot preempt a callback.
+Batch callbacks run on the application thread calling `ucall_server_take_batches()`, never on an event loop.
 
 ### Caller-Owned Polling
 
@@ -370,7 +371,7 @@ For JSON-RPC, that's trivial - pack a JSON array of individual procedure calls:
 ```
 
 A JSON-RPC adapter could regroup procedures by endpoint before assembling its response array; that adapter is planned.
-The implemented server batching instead collects independent HTTP requests ready on one polling loop and passes their retained handles as a counted array.
+The implemented server batching instead collects independent HTTP requests from every polling loop and passes their retained handles as a counted array.
 Each request keeps its own response and transaction boundary, as the [key-value and ledger examples](examples/README.md) demonstrate.
 
 ### Resumable Uploads & Downloads

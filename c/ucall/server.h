@@ -188,6 +188,40 @@ typedef struct ucall_server_take_calls_t {
 /** Drives one server loop until @c ucall_server_stop() or an I/O failure. */
 UCALL_EXPORT void ucall_server_take_calls(ucall_server_take_calls_t* arguments);
 
+/** Arguments of @c ucall_server_take_batch(). */
+typedef struct ucall_server_take_batch_t {
+
+    /** Initialized server with at least one batch endpoint. */
+    ucall_server_t server;
+
+    /** Outcome of this draining round; @c ucall_status_not_found_k without batch endpoints. */
+    ucall_outcome_t* outcome;
+
+    /** Maximum wait for a due batch; zero performs one nonblocking round. */
+    size_t timeout_microseconds;
+
+} ucall_server_take_batch_t;
+
+/** Invokes the batch callbacks that are due, from every event loop, on the calling thread.
+ *  Call from one thread at a time; UCall creates none. A bounded wait yields the core between
+ *  checks. */
+UCALL_EXPORT void ucall_server_take_batch(ucall_server_take_batch_t* arguments);
+
+/** Arguments of @c ucall_server_take_batches(). */
+typedef struct ucall_server_take_batches_t {
+
+    /** Initialized server with at least one batch endpoint. */
+    ucall_server_t server;
+
+    /** Final outcome after draining stops; @c ucall_status_not_found_k without batch endpoints. */
+    ucall_outcome_t* outcome;
+
+} ucall_server_take_batches_t;
+
+/** Invokes due batch callbacks on the calling thread, sleeping in between, until
+ *  @c ucall_server_stop(). Requests still queued then are released without a callback. */
+UCALL_EXPORT void ucall_server_take_batches(ucall_server_take_batches_t* arguments);
+
 /**
  *  @brief Callback type for handling incoming requests on the server side.
  *  @param[in] request Retained until a reply consumes it or the server is freed.
@@ -293,8 +327,10 @@ typedef struct ucall_server_add_batch_endpoint_t {
  *  - Batch size >= @c max_batch_size: Force dispatch (prevent unbounded growth).
  *
  *
- *  The callback receives a counted array of request handles on the polling caller. Copy the
- *  handles into application-owned storage to process them later; received bytes need no copy.
+ *  Requests from every event loop share one queue per server. The callback receives a counted array
+ *  of request handles on the thread calling @c ucall_server_take_batch() or
+ *  @c ucall_server_take_batches(), never on an event loop. Copy the handles into application-owned
+ *  storage to process them later; received bytes need no copy.
  *
  *  @note Call during setup only, before any loop is polled.
  */
