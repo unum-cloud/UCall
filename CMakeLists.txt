@@ -162,7 +162,7 @@ ucall_sibling(
 )
 ucall_sibling(
     smashtable SMASHTABLE smashtable::header https://github.com/ashvardanian/SmashTable
-    7b169145be44f2baa309c2fee4f7f821df9420e4
+    22ada2272cc7aeb5206b75c58716efcfaec3132a
 )
 
 # Prefer a current system liburing; source builds are isolated under the build directory.
