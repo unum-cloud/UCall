@@ -13,7 +13,8 @@
 #include <algorithm>
 #include <vector>
 
-#include "ucall/uring.hpp"
+#include "ucall/uring612.hpp"
+#include "ucall/uring700.hpp"
 
 using namespace unum::ucall;
 
@@ -93,7 +94,8 @@ static void assert_nodelay(engine_type_& engine, descriptor_t handle) {
     auto* submission = engine.entry();
     assert(submission);
     engine.control.result.reset();
-    io_uring_prep_fixed_fd_install(submission, static_cast<int>(registered_socket_t::index_of(handle)), 0);
+    io_uring_prep_fixed_fd_install(submission, static_cast<int>(engine_type_::registered_socket_t::index_of(handle)),
+                                   0);
     io_uring_sqe_set_data64(submission, engine.tag(&engine.control, engine.control_tag_k));
     auto descriptor = engine.wait_control();
     assert(descriptor >= 0);
@@ -187,7 +189,7 @@ static void streamed_transmit() {
 }
 
 static void paused_receive(counting_allocator<byte_t> const& allocator) {
-    linux_uring_engine<ucall_io_backend_linux_uring700_k, counting_allocator<byte_t>> engine {allocator};
+    linux_uring700_engine<counting_allocator<byte_t>> engine {allocator};
     assert(engine.open(8, 4) == ucall_status_success_k);
     tcp_pair_t held, other;
     auto first = engine.import_socket(held.client);
@@ -266,8 +268,7 @@ static void allocation_failure(bool kernel_available) {
         allocation_counts_t counts;
         counts.fail_at = fail_at;
         {
-            linux_uring_engine<ucall_io_backend_linux_uring612_k, counting_allocator<byte_t>> engine {
-                counting_allocator<byte_t> {counts}};
+            linux_uring612_engine<counting_allocator<byte_t>> engine {counting_allocator<byte_t> {counts}};
             assert(engine.open(4, 4) == ucall_status_out_of_memory_k);
         }
         assert(!counts.bytes && counts.allocations == counts.deallocations);

@@ -70,11 +70,12 @@ inline int socket_error(int error) noexcept {
     }
 }
 inline int socket_last_error() noexcept { return socket_error(WSAGetLastError()); }
+inline bool start_windows_sockets() noexcept {
+    WSADATA data {};
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+}
 inline bool sockets_start() noexcept {
-    static bool ready = [] {
-        WSADATA data {};
-        return WSAStartup(MAKEWORD(2, 2), &data) == 0;
-    }();
+    static bool const ready = start_windows_sockets();
     return ready;
 }
 inline int socket_close(descriptor_t descriptor) noexcept { return closesocket(static_cast<SOCKET>(descriptor)); }
@@ -250,14 +251,39 @@ struct wake_channel_t {
     }
 };
 
+/** An intrusive FIFO of engine slots, linked through their `next` indices. */
+struct io_slot_list_t {
+    static constexpr unsigned absent_k = std::numeric_limits<unsigned>::max();
+    unsigned head {absent_k}, tail {absent_k};
+    template <typename slots_type_>
+    void push(slots_type_& slots, unsigned index) noexcept {
+        slots[index].next = absent_k;
+        if (tail != absent_k) slots[tail].next = index;
+        else head = index;
+        tail = index;
+    }
+    template <typename slots_type_>
+    unsigned pop(slots_type_& slots) noexcept {
+        auto index = head;
+        if (index == absent_k) return index;
+        head = slots[index].next;
+        if (head == absent_k) tail = absent_k;
+        return index;
+    }
+};
+
 /** Readiness slots retain connect progress and cancellation beside the durable request. */
 enum class io_phase_t { fresh_k, started_k, cancelled_k };
 struct io_slot_t {
     io_request_t* request {};
     io_phase_t phase {io_phase_t::fresh_k};
+    unsigned next {io_slot_list_t::absent_k};
 };
 
 #if UCALL_OS_POSIX_
+inline short io_events(io_operation_t operation) noexcept {
+    return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? POLLOUT : POLLIN;
+}
 inline descriptor_t attempt_io(io_slot_t& slot, bool ready) noexcept {
     if (slot.phase == io_phase_t::cancelled_k) return -ECANCELED;
     auto& request = *slot.request;
@@ -310,104 +336,126 @@ struct posix_engine {
     using rebind_allocator = posix_engine<other_allocator_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
-    st::basic_vector<io_slot_t, rebound_allocator<io_slot_t>> slots {};
+    static constexpr unsigned absent_k = io_slot_list_t::absent_k;
+    struct slot_t : io_slot_t {
+        unsigned polled {absent_k};
+    };
+    st::basic_vector<slot_t, rebound_allocator<slot_t>> slots {};
     st::basic_vector<pollfd, rebound_allocator<pollfd>> polling {};
-    std::size_t active {};
+    st::basic_vector<unsigned, rebound_allocator<unsigned>> polled {};
+    io_slot_list_t free_slots, fresh_slots;
+    unsigned waiting {};
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
     int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
     void release(io_completion_t const&) noexcept {}
-    void receive_pause(descriptor_t) noexcept {}
     bool cancel(io_request_t& request) noexcept {
-        for (auto& slot : slots)
-            if (slot.request == &request) {
-                slot.phase = io_phase_t::cancelled_k;
+        for (unsigned i = 0; i != slots.size(); ++i)
+            if (slots[i].request == &request) {
+                slots[i].phase = io_phase_t::cancelled_k;
+                if (slots[i].polled != absent_k) {
+                    unpoll(slots[i]);
+                    fresh_slots.push(slots, i);
+                }
                 return true;
             }
         return false;
     }
     explicit posix_engine(allocator_t const& allocator = {}) noexcept
-        : slots(rebound_allocator<io_slot_t> {allocator}), polling(rebound_allocator<pollfd> {allocator}) {}
+        : slots(rebound_allocator<slot_t> {allocator}), polling(rebound_allocator<pollfd> {allocator}),
+          polled(rebound_allocator<unsigned> {allocator}) {}
     posix_engine(posix_engine const&) = delete;
     posix_engine& operator=(posix_engine const&) = delete;
     posix_engine(posix_engine&&) = delete;
     posix_engine& operator=(posix_engine&&) = delete;
-    ~posix_engine() noexcept;
-    ucall_status_t open(std::size_t depth, std::size_t capacity) noexcept;
-    bool submit(io_request_t& request) noexcept;
-    int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept;
-    void stop() noexcept;
-};
-template <typename allocator_type_>
-inline ucall_status_t posix_engine<allocator_type_>::open(std::size_t, std::size_t capacity) noexcept {
-    return st::succeeded(slots.resize(capacity)) && st::succeeded(polling.resize(capacity))
-               ? ucall_status_success_k
-               : ucall_status_out_of_memory_k;
-}
-template <typename allocator_type_>
-inline posix_engine<allocator_type_>::~posix_engine() noexcept {
-    stop();
-}
-template <typename allocator_type_>
-inline void posix_engine<allocator_type_>::stop() noexcept {
-    for (auto& slot : slots) slot.request = nullptr;
-    active = 0;
-}
-template <typename allocator_type_>
-inline bool posix_engine<allocator_type_>::submit(io_request_t& request) noexcept {
-    for (auto& slot : slots)
-        if (!slot.request) {
-            slot = {};
-            slot.request = &request;
-            ++active;
-            return true;
-        }
-    return false;
-}
-template <typename allocator_type_>
-inline int posix_engine<allocator_type_>::poll(span<io_completion_t> completions, io_wait_t wait_policy,
-                                               std::uint64_t deadline) noexcept {
-    std::size_t count = 0;
-    for (unsigned round = 0; round != 2; ++round) {
-        auto now = monotonic_ns();
-        auto wait = wait_policy == io_wait_t::blocking_k ? std::numeric_limits<std::uint64_t>::max() : 0;
-        if (deadline)
-            wait = std::min(wait, deadline > now ? (deadline - now) / 1000 + ((deadline - now) % 1000 != 0) : 0);
-        std::size_t polling_count = 0, ready_index = 0;
-        for (std::size_t i = 0; i != slots.size() && count < completions.size(); ++i) {
-            auto& slot = slots[i];
-            if (!slot.request) continue;
-            bool ready = round && polling[ready_index++].revents;
-            auto& request = *slot.request;
-            descriptor_t result = -EAGAIN;
-            if (request.deadline && now >= request.deadline) result = -ETIMEDOUT;
-            else result = attempt_io(slot, ready);
-            if (!io_pending(result)) {
-                if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
-                completions[count++] = {&request, result};
-                slot.request = nullptr;
-                --active;
-                continue;
-            }
-            short events = request.operation == io_operation_t::connect_k || request.operation == io_operation_t::send_k
-                               ? POLLOUT
-                               : POLLIN;
-            polling[polling_count++] = {static_cast<int>(request.descriptor), events, 0};
-            if (request.deadline && request.deadline > now) {
-                auto remaining = (request.deadline - now + 999) / 1000;
-                if (remaining < wait) wait = remaining;
-            }
-        }
-        if (count || round || !active) break;
-        int timeout = wait == std::numeric_limits<std::uint64_t>::max()
-                          ? -1
-                          : static_cast<int>(std::min<std::uint64_t>(wait / 1000 + (wait % 1000 != 0),
-                                                                     std::numeric_limits<int>::max()));
-        int result = ::poll(polling.data(), static_cast<nfds_t>(polling_count), timeout);
-        if (result < 0 && errno != EINTR) return -errno;
+    ~posix_engine() noexcept { stop(); }
+    ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
+        if (st::failed(slots.resize(capacity)) || st::failed(polling.resize(capacity)) ||
+            st::failed(polled.resize(capacity)))
+            return ucall_status_out_of_memory_k;
+        stop();
+        return ucall_status_success_k;
     }
-    return static_cast<int>(count);
-}
+    void stop() noexcept {
+        free_slots = fresh_slots = {};
+        waiting = 0;
+        for (unsigned i = 0; i != slots.size(); ++i) {
+            slots[i] = {};
+            free_slots.push(slots, i);
+        }
+    }
+    bool submit(io_request_t& request) noexcept {
+        auto index = free_slots.pop(slots);
+        if (index == absent_k) return false;
+        slots[index] = {};
+        slots[index].request = &request;
+        fresh_slots.push(slots, index);
+        return true;
+    }
+    void unpoll(slot_t& slot) noexcept {
+        auto position = slot.polled;
+        --waiting;
+        polling[position] = polling[waiting];
+        polled[position] = polled[waiting];
+        slots[polled[position]].polled = position;
+        slot.polled = absent_k;
+    }
+    io_completion_t finish(unsigned index, descriptor_t result) noexcept {
+        auto& slot = slots[index];
+        auto& request = *slot.request;
+        if (slot.polled != absent_k) unpoll(slot);
+        if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
+        slot.request = nullptr;
+        free_slots.push(slots, index);
+        return {&request, result};
+    }
+    int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
+        std::size_t count = 0;
+        for (unsigned round = 0; round != 2; ++round) {
+            auto now = monotonic_ns();
+            auto wait = wait_policy == io_wait_t::blocking_k ? std::numeric_limits<std::uint64_t>::max() : 0;
+            if (deadline)
+                wait = std::min(wait, deadline > now ? (deadline - now) / 1000 + ((deadline - now) % 1000 != 0) : 0);
+            while (count != completions.size()) {
+                auto index = fresh_slots.pop(slots);
+                if (index == absent_k) break;
+                auto& slot = slots[index];
+                auto& request = *slot.request;
+                auto result = request.deadline && now >= request.deadline ? -ETIMEDOUT : attempt_io(slot, false);
+                if (!io_pending(result)) {
+                    completions[count++] = finish(index, result);
+                    continue;
+                }
+                slot.polled = waiting;
+                polling[waiting] = {static_cast<int>(request.descriptor), io_events(request.operation), 0};
+                polled[waiting++] = index;
+            }
+            for (unsigned i = 0; i != waiting && count != completions.size();) {
+                auto& slot = slots[polled[i]];
+                auto& request = *slot.request;
+                bool expired = request.deadline && now >= request.deadline;
+                if (expired || polling[i].revents) {
+                    auto result = expired ? -ETIMEDOUT : attempt_io(slot, true);
+                    polling[i].revents = 0;
+                    if (!io_pending(result)) {
+                        completions[count++] = finish(polled[i], result);
+                        continue;
+                    }
+                }
+                if (request.deadline) wait = std::min(wait, (request.deadline - now + 999) / 1000);
+                ++i;
+            }
+            if (count || round || !waiting) break;
+            int timeout = wait == std::numeric_limits<std::uint64_t>::max()
+                              ? -1
+                              : static_cast<int>(std::min<std::uint64_t>(wait / 1000 + (wait % 1000 != 0),
+                                                                         std::numeric_limits<int>::max()));
+            int result = ::poll(polling.data(), static_cast<nfds_t>(waiting), timeout);
+            if (result < 0 && errno != EINTR) return -errno;
+        }
+        return static_cast<int>(count);
+    }
+};
 
 using posix_engine_t = posix_engine<>;
 
@@ -417,7 +465,7 @@ using posix_engine_t = posix_engine<>;
 
 enum class io_interest_t { unarmed_k, armed_k, ready_k };
 
-/** Readiness engines retain stable slots until their one-shot interest is removed. */
+/** Each descriptor stays registered edge-triggered until closed, pointing at its latest slot. */
 template <typename readiness_type_, typename allocator_type_ = st::default_allocator<byte_t>>
 struct readiness_engine {
     using allocator_t = allocator_type_;
@@ -426,44 +474,97 @@ struct readiness_engine {
         readiness_engine<typename readiness_type_::template rebind_allocator<other_allocator_>, other_allocator_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
+    static constexpr unsigned absent_k = io_slot_list_t::absent_k;
     struct slot_t : io_slot_t {
         io_interest_t interest {io_interest_t::unarmed_k};
+        unsigned timed {absent_k};
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
-    int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
+    int close_socket(descriptor_t descriptor) noexcept {
+        readiness.remove(descriptor);
+        return socket_close(descriptor);
+    }
     void release(io_completion_t const&) noexcept {}
-    void receive_pause(descriptor_t) noexcept {}
     bool cancel(io_request_t& request) noexcept {
-        for (auto& slot : slots)
-            if (slot.request == &request) {
-                slot.phase = io_phase_t::cancelled_k;
+        for (unsigned i = 0; i != slots.size(); ++i)
+            if (slots[i].request == &request) {
+                slots[i].phase = io_phase_t::cancelled_k;
+                if (slots[i].interest == io_interest_t::armed_k) wake(i);
                 return true;
             }
         return false;
     }
     explicit readiness_engine(allocator_t const& allocator = {}) noexcept
-        : slots(rebound_allocator<slot_t> {allocator}), readiness(allocator) {}
+        : slots(rebound_allocator<slot_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
+          readiness(allocator) {}
     readiness_engine(readiness_engine const&) = delete;
     readiness_engine& operator=(readiness_engine const&) = delete;
     readiness_engine(readiness_engine&&) = delete;
     readiness_engine& operator=(readiness_engine&&) = delete;
     st::basic_vector<slot_t, rebound_allocator<slot_t>> slots {};
+    st::basic_vector<unsigned, rebound_allocator<unsigned>> timed {};
     readiness_type_ readiness {};
+    io_slot_list_t free_slots, fresh_slots, ready_slots;
     std::size_t active {};
     ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
-        if (st::failed(slots.resize(capacity))) return ucall_status_out_of_memory_k;
+        if (st::failed(slots.resize(capacity)) || st::failed(timed.reserve(capacity)))
+            return ucall_status_out_of_memory_k;
+        stop();
         return readiness.open(capacity);
     }
     bool submit(io_request_t& request) noexcept {
-        for (auto& slot : slots)
-            if (!slot.request) {
-                slot = {};
-                slot.request = &request;
-                ++active;
-                return true;
+        auto index = free_slots.pop(slots);
+        if (index == absent_k) return false;
+        auto& slot = slots[index];
+        slot = {};
+        slot.request = &request;
+        fresh_slots.push(slots, index);
+        if (request.deadline) {
+            slot.timed = static_cast<unsigned>(timed.size());
+            (void)timed.push_back(st::assume_reserved, unsigned {index});
+        }
+        ++active;
+        return true;
+    }
+    void wake(unsigned index) noexcept {
+        slots[index].interest = io_interest_t::ready_k;
+        ready_slots.push(slots, index);
+    }
+    io_completion_t finish(unsigned index, descriptor_t result) noexcept {
+        auto& slot = slots[index];
+        auto& request = *slot.request;
+        if (slot.timed != absent_k) {
+            timed[slot.timed] = timed.back();
+            slots[timed.back()].timed = slot.timed;
+            timed.pop_back();
+        }
+        if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
+        slot = {};
+        free_slots.push(slots, index);
+        --active;
+        return {&request, result};
+    }
+    std::size_t progress(io_slot_list_t& list, span<io_completion_t> completions, std::size_t count,
+                         std::uint64_t now) noexcept {
+        while (count != completions.size()) {
+            auto index = list.pop(slots);
+            if (index == absent_k) break;
+            auto& slot = slots[index];
+            auto& request = *slot.request;
+            bool fired = slot.interest == io_interest_t::ready_k;
+            descriptor_t result = -ETIMEDOUT;
+            // An edge-triggered slot hears nothing more until its syscall reports EAGAIN.
+            if (!request.deadline || request.deadline > now) {
+                if (request.operation == io_operation_t::close_k) readiness.remove(request.descriptor);
+                do { result = attempt_io(slot, fired); } while (fired && result == -EINTR);
             }
-        return false;
+            if (io_pending(result) && !fired)
+                if (int armed = readiness.arm(request.descriptor, index); armed < 0) result = armed;
+            if (io_pending(result)) slot.interest = io_interest_t::armed_k;
+            else completions[count++] = finish(index, result);
+        }
+        return count;
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
         if (!completions.size()) return 0;
@@ -472,44 +573,36 @@ struct readiness_engine {
             auto now = monotonic_ns();
             auto wait = wait_policy == io_wait_t::blocking_k ? std::numeric_limits<std::uint64_t>::max() : 0;
             if (deadline) wait = std::min(wait, deadline > now ? deadline - now : 0);
-            for (auto& slot : slots) {
-                if (!slot.request || count == completions.size()) continue;
-                auto& request = *slot.request;
-                bool expired = request.deadline && request.deadline <= now;
-                if (slot.interest != io_interest_t::armed_k || expired || slot.phase == io_phase_t::cancelled_k) {
-                    auto result = expired ? -ETIMEDOUT : attempt_io(slot, slot.interest == io_interest_t::ready_k);
-                    if (slot.interest == io_interest_t::ready_k) slot.interest = io_interest_t::armed_k;
-                    if (!io_pending(result)) {
-                        if (slot.interest != io_interest_t::unarmed_k) readiness.remove(slot);
-                        if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
-                        completions[count++] = {&request, result};
-                        slot = {};
-                        --active;
-                        continue;
-                    }
-                    int result_arm = readiness.arm(slot);
-                    if (result_arm < 0) return result_arm;
-                    slot.interest = io_interest_t::armed_k;
-                }
-                if (request.deadline && request.deadline > now) wait = std::min(wait, request.deadline - now);
+            for (auto index : timed) {
+                auto expiry = slots[index].request->deadline;
+                if (expiry > now) wait = std::min(wait, expiry - now);
+                else if (slots[index].interest == io_interest_t::armed_k) wake(index);
             }
+            count = progress(fresh_slots, completions, count, now);
+            count = progress(ready_slots, completions, count, now);
             if (count || round || !active) break;
             int timeout = wait == std::numeric_limits<std::uint64_t>::max()
                               ? -1
                               : static_cast<int>(std::min<std::uint64_t>(wait / 1'000'000 + (wait % 1'000'000 != 0),
                                                                          std::numeric_limits<int>::max()));
-            int result = readiness.wait(timeout);
+            int result = readiness.wait(timeout, [&](unsigned index, descriptor_t descriptor, short events) noexcept {
+                auto& slot = slots[index];
+                if (slot.interest == io_interest_t::armed_k && slot.request->descriptor == descriptor &&
+                    (events & io_events(slot.request->operation)))
+                    wake(index);
+            });
             if (result < 0 && result != -EINTR) return result;
         }
         return static_cast<int>(count);
     }
     void stop() noexcept {
-        for (auto& slot : slots)
-            if (slot.request) {
-                if (slot.interest != io_interest_t::unarmed_k) readiness.remove(slot);
-                slot = {};
-            }
+        free_slots = fresh_slots = ready_slots = {};
+        timed.clear();
         active = 0;
+        for (unsigned i = 0; i != slots.size(); ++i) {
+            slots[i] = {};
+            free_slots.push(slots, i);
+        }
     }
     ~readiness_engine() noexcept { stop(); }
 };
@@ -534,40 +627,41 @@ struct epoll_readiness {
         descriptor = epoll_create1(EPOLL_CLOEXEC);
         return descriptor < 0 ? ucall_status_io_k : ucall_status_success_k;
     }
-    template <typename slot_type_>
-    int arm(slot_type_& slot) noexcept {
-        auto operation = slot.request->operation;
+
+    /** Re-points the descriptor's registration at @p slot, adding it on first use. */
+    int arm(descriptor_t watched, unsigned slot) noexcept {
         epoll_event event {};
-        event.events = EPOLLONESHOT |
-                       (operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? EPOLLOUT
-                                                                                                      : EPOLLIN);
-        event.data.ptr = &slot;
-        int action = slot.interest != io_interest_t::unarmed_k ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
-        return epoll_ctl(descriptor, action, static_cast<int>(slot.request->descriptor), &event) == 0 ? 0 : -errno;
+        event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+        // The descriptor rides beside the slot, so its stale events never wake a reused slot.
+        event.data.u64 = std::uint64_t {slot} << 32 | static_cast<std::uint32_t>(watched);
+        if (epoll_ctl(descriptor, EPOLL_CTL_MOD, static_cast<int>(watched), &event) == 0) return 0;
+        if (errno != ENOENT) return -errno;
+        return epoll_ctl(descriptor, EPOLL_CTL_ADD, static_cast<int>(watched), &event) == 0 ? 0 : -errno;
     }
-    template <typename slot_type_>
-    void remove(slot_type_& slot) noexcept {
-        epoll_ctl(descriptor, EPOLL_CTL_DEL, static_cast<int>(slot.request->descriptor), nullptr);
+    void remove(descriptor_t watched) noexcept {
+        epoll_ctl(descriptor, EPOLL_CTL_DEL, static_cast<int>(watched), nullptr);
     }
-    int wait(int timeout) noexcept;
+    template <typename callback_type_>
+    int wait(int timeout, callback_type_&& fired) noexcept {
+        int count = epoll_wait(descriptor, events.data(),
+                               static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
+                               timeout);
+        if (count < 0) return -errno;
+        for (int i = 0; i != count; ++i) {
+            auto flags = events[i].events;
+            short directions = (flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR) ? POLLIN : 0) |
+                               (flags & (EPOLLOUT | EPOLLHUP | EPOLLERR) ? POLLOUT : 0);
+            fired(static_cast<unsigned>(events[i].data.u64 >> 32),
+                  static_cast<descriptor_t>(static_cast<std::uint32_t>(events[i].data.u64)), directions);
+        }
+        return count;
+    }
     ~epoll_readiness() noexcept {
         if (descriptor >= 0) close(descriptor);
     }
 };
 using epoll_readiness_t = epoll_readiness<>;
 using linux_epoll_engine_t = readiness_engine<epoll_readiness_t>;
-template <typename allocator_type_>
-inline int epoll_readiness<allocator_type_>::wait(int timeout) noexcept {
-    int count = epoll_wait(descriptor, events.data(),
-                           static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
-                           timeout);
-    if (count < 0) return -errno;
-    for (int i = 0; i != count; ++i)
-        static_cast<typename readiness_engine<epoll_readiness<allocator_type_>, allocator_type_>::slot_t*>(
-            events[i].data.ptr)
-            ->interest = io_interest_t::ready_k;
-    return count;
-}
 #endif
 
 #if UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_
@@ -590,48 +684,38 @@ struct kqueue_readiness {
         if (descriptor >= 0 && fcntl(descriptor, F_SETFD, FD_CLOEXEC) == 0) return ucall_status_success_k;
         return ucall_status_io_k;
     }
-    template <typename slot_type_>
-    int arm(slot_type_& slot) noexcept {
-        auto operation = slot.request->operation;
-        struct kevent event {};
-        EV_SET(
-            &event, static_cast<std::uintptr_t>(slot.request->descriptor),
-            operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? EVFILT_WRITE : EVFILT_READ,
-            EV_ADD | EV_ONESHOT, 0, 0, &slot);
-        return kevent(descriptor, &event, 1, nullptr, 0, nullptr) == 0 ? 0 : -errno;
+
+    /** Re-points both filters of the descriptor at @p slot, adding them on first use. */
+    int arm(descriptor_t watched, unsigned slot) noexcept {
+        struct kevent changes[2] {};
+        auto* context = reinterpret_cast<void*>(static_cast<std::uintptr_t>(slot));
+        EV_SET(&changes[0], static_cast<std::uintptr_t>(watched), EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, context);
+        EV_SET(&changes[1], static_cast<std::uintptr_t>(watched), EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, context);
+        return kevent(descriptor, changes, 2, nullptr, 0, nullptr) == 0 ? 0 : -errno;
     }
-    template <typename slot_type_>
-    void remove(slot_type_& slot) noexcept {
-        auto operation = slot.request->operation;
-        struct kevent event {};
-        EV_SET(
-            &event, static_cast<std::uintptr_t>(slot.request->descriptor),
-            operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? EVFILT_WRITE : EVFILT_READ,
-            EV_DELETE, 0, 0, nullptr);
-        kevent(descriptor, &event, 1, nullptr, 0, nullptr);
+    // Closing a descriptor drops its knotes.
+    void remove(descriptor_t) noexcept {}
+    template <typename callback_type_>
+    int wait(int timeout, callback_type_&& fired) noexcept {
+        timespec duration {timeout / 1000, (timeout % 1000) * 1'000'000L};
+        int count = kevent(descriptor, nullptr, 0, events.data(),
+                           static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
+                           timeout < 0 ? nullptr : &duration);
+        if (count < 0) return -errno;
+        for (int i = 0; i != count; ++i) {
+            if (events[i].flags & EV_ERROR) return -static_cast<int>(events[i].data);
+            fired(static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(events[i].udata)),
+                  static_cast<descriptor_t>(events[i].ident),
+                  static_cast<short>(events[i].filter == EVFILT_READ ? POLLIN : POLLOUT));
+        }
+        return count;
     }
-    int wait(int timeout) noexcept;
     ~kqueue_readiness() noexcept {
         if (descriptor >= 0) close(descriptor);
     }
 };
 using kqueue_readiness_t = kqueue_readiness<>;
 using kqueue_engine_t = readiness_engine<kqueue_readiness_t>;
-template <typename allocator_type_>
-inline int kqueue_readiness<allocator_type_>::wait(int timeout) noexcept {
-    timespec duration {timeout / 1000, (timeout % 1000) * 1'000'000L};
-    int count = kevent(descriptor, nullptr, 0, events.data(),
-                       static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
-                       timeout < 0 ? nullptr : &duration);
-    if (count < 0) return -errno;
-    for (int i = 0; i != count; ++i) {
-        if (events[i].flags & EV_ERROR) return -static_cast<int>(events[i].data);
-        static_cast<typename readiness_engine<kqueue_readiness<allocator_type_>, allocator_type_>::slot_t*>(
-            events[i].udata)
-            ->interest = io_interest_t::ready_k;
-    }
-    return count;
-}
 #endif
 
 #if UCALL_OS_WINDOWS_
@@ -645,19 +729,20 @@ struct windows_iocp_engine {
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     enum class phase_t { pending_k, immediate_k, cancelling_k, timing_out_k };
+    static constexpr unsigned absent_k = io_slot_list_t::absent_k;
     struct slot_t {
         OVERLAPPED overlapped {};
         io_request_t* request {};
         SOCKET accepted {INVALID_SOCKET};
         descriptor_t immediate {};
         phase_t phase {phase_t::pending_k};
+        unsigned next {absent_k}, timed {absent_k};
         byte_t addresses[2 * (sizeof(sockaddr_storage) + 16)] {};
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
     int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
     void release(io_completion_t const&) noexcept {}
-    void receive_pause(descriptor_t) noexcept {}
     bool cancel(io_request_t& request) noexcept {
         for (auto& slot : slots)
             if (slot.request == &request) {
@@ -670,19 +755,32 @@ struct windows_iocp_engine {
         return false;
     }
     explicit windows_iocp_engine(allocator_t const& allocator = {}) noexcept
-        : slots(rebound_allocator<slot_t> {allocator}) {}
+        : slots(rebound_allocator<slot_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
+          entries(rebound_allocator<OVERLAPPED_ENTRY> {allocator}) {}
     windows_iocp_engine(windows_iocp_engine const&) = delete;
     windows_iocp_engine& operator=(windows_iocp_engine const&) = delete;
     windows_iocp_engine(windows_iocp_engine&&) = delete;
     windows_iocp_engine& operator=(windows_iocp_engine&&) = delete;
     HANDLE port {};
     st::basic_vector<slot_t, rebound_allocator<slot_t>> slots {};
+    st::basic_vector<unsigned, rebound_allocator<unsigned>> timed {};
+    st::basic_vector<OVERLAPPED_ENTRY, rebound_allocator<OVERLAPPED_ENTRY>> entries {};
+    io_slot_list_t free_slots, immediate_slots;
     std::size_t active {};
     ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
         if (!sockets_start()) return ucall_status_io_k;
-        if (st::failed(slots.resize(capacity))) return ucall_status_out_of_memory_k;
+        if (st::failed(slots.resize(capacity)) || st::failed(timed.reserve(capacity)) ||
+            st::failed(entries.resize(capacity)))
+            return ucall_status_out_of_memory_k;
+        for (unsigned i = 0; i != slots.size(); ++i) free_slots.push(slots, i);
         port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
         return port ? ucall_status_success_k : ucall_status_io_k;
+    }
+    void untime(slot_t& slot) noexcept {
+        timed[slot.timed] = timed.back();
+        slots[timed.back()].timed = slot.timed;
+        timed.pop_back();
+        slot.timed = absent_k;
     }
     template <typename function_type_>
     bool extension(SOCKET socket, GUID id, function_type_& function) noexcept {
@@ -691,20 +789,16 @@ struct windows_iocp_engine {
                         &bytes, nullptr, nullptr) == 0;
     }
     bool submit(io_request_t& request) noexcept {
-        slot_t* slot {};
-        for (auto& candidate : slots)
-            if (!candidate.request) {
-                slot = &candidate;
-                break;
-            }
-        if (!slot) return false;
+        auto index = free_slots.pop(slots);
+        if (index == absent_k) return false;
+        auto* slot = &slots[index];
         *slot = {};
-        slot->accepted = INVALID_SOCKET;
         slot->request = &request;
         auto socket = static_cast<SOCKET>(request.descriptor);
         auto complete_immediately = [&](descriptor_t result) noexcept {
             slot->immediate = result;
             slot->phase = phase_t::immediate_k;
+            immediate_slots.push(slots, index);
             ++active;
             return true;
         };
@@ -766,8 +860,36 @@ struct windows_iocp_engine {
             }
             return complete_immediately(-error);
         }
+        if (request.deadline) {
+            slot->timed = static_cast<unsigned>(timed.size());
+            (void)timed.push_back(st::assume_reserved, unsigned {index});
+        }
         ++active;
         return true;
+    }
+    io_completion_t finish(slot_t& slot, descriptor_t result) noexcept {
+        auto& request = *slot.request;
+        if (slot.timed != absent_k) untime(slot);
+        if (slot.phase == phase_t::timing_out_k && result == -ECANCELED) result = -ETIMEDOUT;
+        if (request.operation == io_operation_t::accept_k && slot.accepted != INVALID_SOCKET) {
+            if (result >= 0) {
+                auto listener = static_cast<SOCKET>(request.descriptor);
+                if (setsockopt(slot.accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
+                               reinterpret_cast<char const*>(&listener), sizeof(listener)) == 0)
+                    result = static_cast<descriptor_t>(slot.accepted);
+                else result = -socket_last_error();
+            }
+            if (result < 0) closesocket(slot.accepted);
+        }
+        else if (request.operation == io_operation_t::connect_k && result >= 0 &&
+                 setsockopt(static_cast<SOCKET>(request.descriptor), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr,
+                            0) != 0)
+            result = -socket_last_error();
+        if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
+        slot.request = nullptr;
+        free_slots.push(slots, static_cast<unsigned>(&slot - slots.data()));
+        --active;
+        return {&request, result};
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
         std::size_t count {};
@@ -779,61 +901,46 @@ struct windows_iocp_engine {
                 wait = std::min<DWORD>(wait, static_cast<DWORD>(std::min<std::uint64_t>(
                                                  duration / 1'000'000 + (duration % 1'000'000 != 0), INFINITE - 1)));
             }
-            for (auto& slot : slots)
-                if (slot.request && slot.phase == phase_t::pending_k && slot.request->deadline) {
-                    auto deadline = slot.request->deadline;
-                    if (deadline <= now) {
-                        slot.phase = phase_t::timing_out_k;
-                        CancelIoEx(reinterpret_cast<HANDLE>(slot.request->descriptor), &slot.overlapped);
-                    }
-                    else
-                        wait = std::min<DWORD>(
-                            wait,
-                            static_cast<DWORD>(std::min<std::uint64_t>(
-                                (deadline - now) / 1'000'000 + ((deadline - now) % 1'000'000 != 0), INFINITE - 1)));
+            for (std::size_t i = 0; i != timed.size();) {
+                auto& slot = slots[timed[i]];
+                auto expiry = slot.request->deadline;
+                if (expiry > now) {
+                    wait = std::min<DWORD>(
+                        wait, static_cast<DWORD>(std::min<std::uint64_t>(
+                                  (expiry - now) / 1'000'000 + ((expiry - now) % 1'000'000 != 0), INFINITE - 1)));
+                    ++i;
+                    continue;
                 }
-            DWORD bytes {};
-            ULONG_PTR key {};
-            OVERLAPPED* overlapped {};
-            for (auto& slot : slots)
-                if (slot.request && slot.phase == phase_t::immediate_k) {
-                    overlapped = &slot.overlapped;
-                    break;
+                if (slot.phase == phase_t::pending_k) {
+                    slot.phase = phase_t::timing_out_k;
+                    CancelIoEx(reinterpret_cast<HANDLE>(slot.request->descriptor), &slot.overlapped);
                 }
-            BOOL success = overlapped ? TRUE : GetQueuedCompletionStatus(port, &bytes, &key, &overlapped, wait);
-            DWORD error = success ? ERROR_SUCCESS : GetLastError();
-            if (!overlapped) {
-                if (!success && error == WAIT_TIMEOUT) {
+                untime(slot);
+            }
+            if (auto index = immediate_slots.pop(slots); index != absent_k) {
+                completions[count++] = finish(slots[index], slots[index].immediate);
+                continue;
+            }
+            ULONG dequeued {};
+            auto limit = static_cast<ULONG>(std::min(completions.size() - count, entries.size()));
+            if (!GetQueuedCompletionStatusEx(port, entries.data(), limit, &dequeued, wait, FALSE)) {
+                if (GetLastError() == WAIT_TIMEOUT) {
                     if (wait_policy == io_wait_t::blocking_k && !count && (!deadline || monotonic_ns() < deadline))
                         continue;
                     break;
                 }
                 return -EIO;
             }
-            auto& slot = *reinterpret_cast<slot_t*>(overlapped);
-            auto& request = *slot.request;
-            descriptor_t result = slot.phase == phase_t::immediate_k ? slot.immediate
-                                  : success                          ? static_cast<descriptor_t>(bytes)
-                                                                     : -socket_error(static_cast<int>(error));
-            if (!success && slot.phase == phase_t::timing_out_k && result == -ECANCELED) result = -ETIMEDOUT;
-            if (request.operation == io_operation_t::accept_k && slot.accepted != INVALID_SOCKET) {
-                if (result >= 0) {
-                    auto listener = static_cast<SOCKET>(request.descriptor);
-                    if (setsockopt(slot.accepted, SOL_SOCKET, SO_UPDATE_ACCEPT_CONTEXT,
-                                   reinterpret_cast<char const*>(&listener), sizeof(listener)) == 0)
-                        result = static_cast<descriptor_t>(slot.accepted);
-                    else result = -socket_last_error();
-                }
-                if (result < 0) closesocket(slot.accepted);
+            for (ULONG i = 0; i != dequeued; ++i) {
+                auto& slot = *reinterpret_cast<slot_t*>(entries[i].lpOverlapped);
+                DWORD bytes {}, flags {};
+                // The per-packet status lives in the OVERLAPPED; this reads it without waiting.
+                descriptor_t result = WSAGetOverlappedResult(static_cast<SOCKET>(slot.request->descriptor),
+                                                             &slot.overlapped, &bytes, FALSE, &flags)
+                                          ? static_cast<descriptor_t>(bytes)
+                                          : -socket_last_error();
+                completions[count++] = finish(slot, result);
             }
-            else if (request.operation == io_operation_t::connect_k && result >= 0 &&
-                     setsockopt(static_cast<SOCKET>(request.descriptor), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr,
-                                0) != 0)
-                result = -socket_last_error();
-            if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
-            completions[count++] = {&request, result};
-            slot.request = nullptr;
-            --active;
         }
         return static_cast<int>(count);
     }
@@ -863,5 +970,6 @@ using windows_iocp_engine_t = windows_iocp_engine<>;
 } // namespace unum::ucall
 
 #if UCALL_WITH_LINUX_URING
-#include "ucall/uring.hpp"
+#include "ucall/uring612.hpp"
+#include "ucall/uring700.hpp"
 #endif
