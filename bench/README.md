@@ -20,20 +20,55 @@ build_release/ucall_bench_http --url http://127.0.0.1:8545/echo \
     --connections 64 --in-flight 256 --requests 100000 --warmup-requests 10000 --bytes 1024 --verify-echo
 ```
 
-`--requests` is required and fixes the number of measured attempts.
-Warmup finishes before the measured phase begins.
-Latency storage and per-worker counters are allocated before warmup; recording a completion does not grow a container or sort samples.
+`--requests`, `--time-limit`, or both bound the measured phase, which stops issuing at whichever comes first and then drains its outstanding calls.
+`--warmup-requests` and `--warmup` bound the unmeasured phase the same way, and it finishes before the measured phase begins.
+Durations read like `500ms`, `10s` or `250us`.
+Each worker records latencies into its own histogram of 16 linear bins per power of two nanoseconds, merged after timing ends, so a percentile reads at most 1/16 high and recording a completion neither allocates nor sorts.
+The report prints the mean, p50, p90, p99, p99.9, p99.99, and maximum in microseconds.
 The driver timestamps each batch immediately after its polling call returns.
 Latency includes submission, queueing, transport progress, and completion observation by that worker; it is not a kernel completion timestamp.
 Throughput covers the measured ForkUnion dispatch through response verification, release, and completion of every worker.
-Nearest-rank p50, p95, and p99 selection happens after timing ends.
+`Client CPU` divides the process's user and system time over the measured phase, from `getrusage` or `GetProcessTimes`, by its successful requests.
 Rejected submissions, failed exchanges, and incorrect echo bytes are counted and produce a nonzero exit status.
 
 `--backend` and `--cpu-class` select the implementation and kernel bundle; the report prints the application worker count, connection and in-flight budgets, and each active worker's resolved choices and outcomes.
 Explicit unsupported selections fail instead of silently changing the experiment.
 The same binary can select `linux-uring612` or `linux-uring700`; run the server and client with the intended backend independently.
-`--help` lists the other native backends and CPU classes.
+`--help` lists every flag; each one also reads its default from a `UCALL_BENCH_` variable named after it, so `UCALL_BENCH_TIME_LIMIT=10s` stands in for `--time-limit 10s` and the command line overrides it.
+`--pin` lets the ForkUnion pool pin each worker to its own core where the operating system allows, and the report says whether it did.
+`--seed` fixes the request body bytes, drawn from SplitMix64.
+`--format json` prints one JSON object per row instead: the configuration, the total, each origin, and each worker.
 For the key-value example, seed a value first and use its URL with `--verb get --bytes 0`, omitting `--verify-echo`.
+
+## Open-Loop Load
+
+By default each in-flight slot sends its next call as soon as the previous one completes, a closed loop that slows down with the server and hides queueing delay.
+`--rate N` instead follows one fixed arrival schedule of `N` requests per second, interleaved across workers, so each worker issues at its share of it.
+Latency is then measured from each call's __intended__ send time, so a call delayed by a busy slot or a slow server carries that delay, and coordinated omission stays visible in the tail.
+A worker without an idle slot keeps its due arrivals queued, and sleeps when it has nothing in flight and the next arrival is in the future.
+
+```sh
+build_release/ucall_bench_http --url http://127.0.0.1:8545/echo \
+    --threads 2 --connections 64 --in-flight 256 --rate 100000 --warmup 1s --time-limit 10s --verify-echo
+```
+
+## Server Counters
+
+The driver reads no counters from the server, so it prints where they come from instead.
+The echo example prints one line per event loop when stopped with `SIGINT` or `SIGTERM`, from `ucall_server_event_loop_statistics()`:
+
+```text
+Event loop 0: 40000 requests, 79 accepts, 41068 polls, 0 empty polls, 41065 kernel enters, 40242 submissions, 80241 completions, 1 cancellations, 0 receive re-arms, 44440000 bytes received, 45640000 bytes sent, 85400000 bytes copied
+```
+
+The counters cover the server's whole life, warmup included, so divide them by its own `requests` rather than by the driver's measured count:
+
+- __Submissions per request__ counts the operations queued to the kernel for one exchange: io_uring entries, or the requests a readiness backend accepted.
+- __Completions per request__ counts the results taken back, so a keep-alive echo on io_uring 7.0 with an armed multishot receive approaches one send submission and two completions.
+- __Kernel enters per request__ counts system calls: io_uring enters, or the receives, sends, registrations, and waits of the readiness backends.
+- __Empty polls per poll__ shows how often a loop woke without work.
+- __Receive re-arms per request__ shows how often io_uring 7.0 had to restart a multishot receive.
+- __Bytes copied per request__, compared with the request and response body bytes, shows how many times UCall itself copied each payload byte: receive-buffer appends, reply bodies, Noise records, and parked receives, never the kernel's own copies.
 
 ## Multiple Targets and Retained Replies
 
@@ -67,6 +102,7 @@ The same byte checks, target quotas, and latency boundaries apply to both modes.
 ## Python Adapters
 
 The semantic workload is an exact binary echo: `N` application bytes, a leading zero followed by `x` bytes, returned unchanged.
+The native driver draws its `N` bytes from `--seed` instead; an echo service returns either unchanged.
 Zero-length payloads are also valid.
 FastAPI serves raw HTTP bytes at `POST /echo`, matching the native example, and the gRPC adapter carries the same bytes in `ucall.bench.Payload.data`.
 Generated protobuf modules stay outside the repository, following the [gRPC Python toolchain](https://grpc.io/docs/languages/python/quickstart/).
@@ -127,7 +163,7 @@ ghz --insecure --proto bench/echo.proto --call ucall.bench.Echo.Exchange \
 
 The application work matches, while the wire protocols differ: native HTTP and FastAPI use an HTTP/1.1 body; gRPC adds protobuf serialization, gRPC framing, and HTTP/2 multiplexing.
 A gRPC connection can carry concurrent streams, while the native HTTP/1.1 client keeps one exchange active per connection and queues the rest.
-The native and Python fixed-count clients are closed-loop drivers; wrk2 schedules an offered rate and accounts for delayed sends in its latency distribution.
+The Python client and the native driver without `--rate` are closed-loop drivers; wrk2 and the native driver with `--rate` schedule an offered rate and account for delayed sends in their latency distributions.
 Report those load models separately, and inspect saturation and errors before interpreting their percentiles together.
 The Lua driver verifies response bytes; ghz reports RPC status and decoding, so use the Python gRPC client to check echoed bytes before its independent load run.
 
