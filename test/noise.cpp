@@ -6,7 +6,7 @@
  */
 #include <cstring> // `std::memcpy`, `std::memmove`, `std::memset`, `std::strlen`
 
-#include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
+#include "harness.hpp" // `expect`, `require`, `run_test`, `scale_iterations`
 
 #include "ucall/tunnel.hpp"
 
@@ -107,15 +107,20 @@ struct handshake_stream_t {
     byte_t bytes[crypto_t::outbound_capacity_k * 4] {};
     std::size_t length {};
 
-    void append(span<byte_t const> more) noexcept {
-        verify(length + more.size() <= sizeof(bytes));
+    /** Appends @p more, or answers false and appends nothing when it would overflow. */
+    [[nodiscard]] bool append(span<byte_t const> more) noexcept {
+        if (length + more.size() > sizeof(bytes)) return false;
         if (more.size()) std::memcpy(bytes + length, more.data(), more.size());
         length += more.size();
+        return true;
     }
-    void consume(std::size_t count) noexcept {
-        verify(count <= length);
+
+    /** Drops @p count leading bytes, or answers false and drops nothing when fewer are pending. */
+    [[nodiscard]] bool consume(std::size_t count) noexcept {
+        if (count > length) return false;
         if (count && count != length) std::memmove(bytes, bytes + count, length - count);
         length -= count;
+        return true;
     }
 
     /** What the peer sent and this end has not yet consumed. */
@@ -136,8 +141,8 @@ struct handshake_stream_t {
     auto pump = [](secure_tunnel_t& tunnel, handshake_stream_t& inbound,
                    handshake_stream_t& outbound) noexcept -> secure_tunnel_state_t {
         secure_tunnel_step_t const step = tunnel.advance(inbound.pending());
-        inbound.consume(step.consumed);
-        outbound.append(step.outbound);
+        // A step consuming past its input or overflowing the wire reads as a broken peer.
+        if (!inbound.consume(step.consumed) || !outbound.append(step.outbound)) return secure_tunnel_state_t::broken_k;
         return step.state;
     };
 
@@ -157,21 +162,22 @@ struct connected_pair_t {
     keypair_t client_keys, server_keys;
     secure_tunnel_t client, server;
 
-    /** Completes a handshake in @p mode, naming the pattern and the failure if one comes. */
-    void connect(secure_tunnel_mode_t mode, std::size_t max_payload = 0) {
+    /** Completes a handshake in @p mode, counting a failure that names the pattern and outcome. */
+    [[nodiscard]] std::size_t connect(secure_tunnel_mode_t mode, std::size_t max_payload = 0) {
         handshake_outcome_t const outcome = attempt(mode, max_payload);
-        verify(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+        return expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
     }
 
     /** Whether @c attempt draws fresh static keys or uses the ones already in place. */
     enum class keys_t : bool { fresh_k, supplied_k };
 
     /** Reconnects on keys the caller already holds, for the cases about identity reuse. */
-    void connect_with(secure_tunnel_mode_t mode, keypair_t const& client_identity, keypair_t const& server_identity) {
+    [[nodiscard]] std::size_t connect_with(secure_tunnel_mode_t mode, keypair_t const& client_identity,
+                                           keypair_t const& server_identity) {
         client_keys = client_identity;
         server_keys = server_identity;
         handshake_outcome_t const outcome = attempt(mode, 0, keys_t::supplied_k);
-        verify(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+        return expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
     }
 
     [[nodiscard]] handshake_outcome_t attempt(secure_tunnel_mode_t mode, std::size_t max_payload,
@@ -204,13 +210,13 @@ struct connected_pair_t {
     }
 };
 
-/** Seals one payload into @p wire, in place, as a driver would. Aborts if the tunnel refuses. */
-static void seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_t& wire) {
+/** Seals one payload into @p wire, in place, as a driver would, counting a refusal as a failure. */
+[[nodiscard]] static std::size_t seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_t& wire) {
     span<byte_t> const window = tunnel.payload_window(wire.whole());
-    verify(window.size() >= payload.size(), "a {}-byte window cannot hold {} bytes", window.size(), payload.size());
+    require(0, window.size() >= payload.size(), "a {}-byte window cannot hold {} bytes", window.size(), payload.size());
     if (payload.size()) std::memcpy(window.data(), payload.data(), payload.size());
     wire.length = tunnel.seal(wire.whole(), payload.size()).size();
-    verify(wire.length > 0u, "the tunnel refused a {}-byte payload with {}", payload.size(), tunnel.fault());
+    return expect(wire.length > 0u, "the tunnel refused a {}-byte payload with {}", payload.size(), tunnel.fault());
 }
 
 /** Opens one whole record from a wire buffer, in place, exactly as a driver would. */
@@ -245,7 +251,8 @@ static void seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_
 
 #pragma region Primitives
 
-void test_hmac_unit() {
+case_result_t test_hmac_unit() {
+    std::size_t failures = 0;
     byte_t key_storage[131];
     byte_t data_storage[50];
     byte_t digest[crypto_t::hash_size_k];
@@ -253,22 +260,23 @@ void test_hmac_unit() {
     // RFC 4231 §4.2-§4.7, byte for byte: the named reproducer for `-fno-strict-aliasing`, so a
     // digest that drifts here is a miscompile rather than a redesign.
     announce("rfc4231_case1");
-    verify_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), ascii_bytes("Hi There"), digest),
-               "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    failures += expect_hex(
+        hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), ascii_bytes("Hi There"), digest),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
 
     announce("rfc4231_case2");
-    verify_hex(hmac_of(ascii_bytes("Jefe"), ascii_bytes("what do ya want for nothing?"), digest),
-               "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    failures += expect_hex(hmac_of(ascii_bytes("Jefe"), ascii_bytes("what do ya want for nothing?"), digest),
+                           "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 
     announce("rfc4231_case3");
-    verify_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0xaa}),
-                       run_of({data_storage, data_storage + 50}, byte_t {0xdd}), digest),
-               "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+    failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0xaa}),
+                                   run_of({data_storage, data_storage + 50}, byte_t {0xdd}), digest),
+                           "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
 
     announce("rfc4231_case6_key_longer_than_block");
-    verify_hex(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
-                       ascii_bytes("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
-               "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
+                                   ascii_bytes("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
+                           "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
 
     announce("cached_state_matches_one_shot");
     span<byte_t const> const cached_key = run_of({key_storage, key_storage + 40}, byte_t {0x5a});
@@ -279,7 +287,7 @@ void test_hmac_unit() {
         byte_t reused[crypto_t::hash_size_k], fresh[crypto_t::hash_size_k];
         cached.compute(data, {}, reused);
         crypto_t::hmac_sha256(cached_key, data, fresh);
-        verify_bytes(reused, fresh);
+        failures += expect_bytes(reused, fresh);
     }
 
     announce("split_input_matches_concatenated");
@@ -289,10 +297,12 @@ void test_hmac_unit() {
     split_hmac.reset(run_of({key_storage, key_storage + 32}, byte_t {0x0b}));
     byte_t split[crypto_t::hash_size_k];
     split_hmac.compute(ascii_bytes("chaining"), ascii_bytes("-material"), split);
-    verify_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
+    failures += expect_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
+    return failures;
 }
 
-void test_hkdf_unit() {
+case_result_t test_hkdf_unit() {
+    std::size_t failures = 0;
     byte_t digest[crypto_t::hash_size_k];
     byte_t material_storage[22];
     span<byte_t const> const material = run_of({material_storage, material_storage + 22}, byte_t {0x0b});
@@ -302,8 +312,8 @@ void test_hkdf_unit() {
     byte_t const salt_storage[] = {byte_t {0x00}, byte_t {0x01}, byte_t {0x02}, byte_t {0x03}, byte_t {0x04},
                                    byte_t {0x05}, byte_t {0x06}, byte_t {0x07}, byte_t {0x08}, byte_t {0x09},
                                    byte_t {0x0a}, byte_t {0x0b}, byte_t {0x0c}};
-    verify_hex(hmac_of(salt_storage, material, digest),
-               "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+    failures += expect_hex(hmac_of(salt_storage, material, digest),
+                           "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
 
     // With an empty info string, RFC 5869's T(1) reduces to HMAC(PRK, 0x01).
     announce("first_output_is_expand_of_extract");
@@ -319,7 +329,7 @@ void test_hkdf_unit() {
     byte_t const one = byte_t {0x01};
     byte_t expected[crypto_t::hash_size_k];
     crypto_t::hmac_sha256(pseudo_random_key, {&one, &one + 1}, expected);
-    verify_bytes(outputs[0], expected);
+    failures += expect_bytes(outputs[0], expected);
 
     announce("second_output_chains_from_the_first");
     byte_t empty_chaining_key[crypto_t::hash_size_k] {};
@@ -331,31 +341,33 @@ void test_hkdf_unit() {
     crypto_t::hmac_sha256_t chaining_hmac;
     chaining_hmac.reset(pseudo_random_key);
     chaining_hmac.compute(chained[0], {&two, &two + 1}, expected);
-    verify_bytes(chained[1], expected);
-    verify(!bytes_equal(chained[0], chained[1]));
+    failures += expect_bytes(chained[1], expected);
+    failures += expect(!bytes_equal(chained[0], chained[1]));
 
     announce("third_output_only_derived_when_asked");
     byte_t two_outputs[3][crypto_t::hash_size_k] {};
     byte_t three_outputs[3][crypto_t::hash_size_k] {};
     crypto_t::hkdf_sha256(empty_chaining_key, {}, 2, two_outputs);
     crypto_t::hkdf_sha256(empty_chaining_key, {}, 3, three_outputs);
-    verify_bytes(two_outputs[0], three_outputs[0]);
-    verify_bytes(two_outputs[1], three_outputs[1]);
-    verify(all_zero(two_outputs[2]));
-    verify(!all_zero(three_outputs[2]));
+    failures += expect_bytes(two_outputs[0], three_outputs[0]);
+    failures += expect_bytes(two_outputs[1], three_outputs[1]);
+    failures += expect(all_zero(two_outputs[2]));
+    failures += expect(!all_zero(three_outputs[2]));
+    return failures;
 }
 
-void test_transcript_unit() {
+case_result_t test_transcript_unit() {
+    std::size_t failures = 0;
     char const* const name = "Noise_XX_25519_AESGCM_SHA256";
     std::size_t const name_length = std::strlen(name);
 
     announce("a_short_protocol_name_is_zero_padded");
-    verify(name_length <= crypto_t::hash_size_k);
+    require(failures, name_length <= crypto_t::hash_size_k);
     crypto_t::secure_tunnel_transcript_t padded;
     padded.initialize(name, name_length);
     byte_t expected[crypto_t::hash_size_k] {};
     std::memcpy(expected, name, name_length);
-    verify_bytes(padded.hash(), expected);
+    failures += expect_bytes(padded.hash(), expected);
 
     announce("a_long_protocol_name_is_hashed");
     char long_name[40];
@@ -368,7 +380,7 @@ void test_transcript_unit() {
     crypto_t::sha_update(&digest_state, long_name, sizeof(long_name), nullptr);
     byte_t hashed_expected[crypto_t::hash_size_k];
     crypto_t::sha_digest(&digest_state, reinterpret_cast<sz_u8_t*>(hashed_expected), nullptr);
-    verify_bytes(hashed.hash(), hashed_expected);
+    failures += expect_bytes(hashed.hash(), hashed_expected);
 
     announce("mixing_is_order_sensitive");
     crypto_t::secure_tunnel_transcript_t forward, backward;
@@ -381,7 +393,7 @@ void test_transcript_unit() {
     backward.mix_hash(second);
     backward.mix_hash(first);
     // A transcript that ignored ordering would let a peer reorder the handshake.
-    verify(!bytes_equal(forward.hash(), backward.hash()));
+    failures += expect(!bytes_equal(forward.hash(), backward.hash()));
 
     announce("an_empty_prologue_still_advances_the_transcript");
     crypto_t::secure_tunnel_transcript_t prologued;
@@ -389,53 +401,59 @@ void test_transcript_unit() {
     byte_t before[crypto_t::hash_size_k];
     std::memcpy(before, prologued.hash().data(), crypto_t::hash_size_k);
     prologued.mix_hash({});
-    verify(!bytes_equal(prologued.hash(), before));
+    failures += expect(!bytes_equal(prologued.hash(), before));
+    return failures;
 }
 
-void test_entropy_unit() {
+case_result_t test_entropy_unit() {
+    std::size_t failures = 0;
     // Not a statistical test - proof the platform call is wired, since zeros here would silently
     // destroy every ephemeral key.
     announce("distinct_and_never_all_zero");
     byte_t first[32] {}, second[32] {};
-    verify(crypto_t::secure_random_bytes(first, sizeof(first)));
-    verify(crypto_t::secure_random_bytes(second, sizeof(second)));
-    verify(!all_zero(first));
-    verify(!bytes_equal(first, second));
+    failures += expect(crypto_t::secure_random_bytes(first, sizeof(first)));
+    failures += expect(crypto_t::secure_random_bytes(second, sizeof(second)));
+    failures += expect(!all_zero(first));
+    failures += expect(!bytes_equal(first, second));
+    return failures;
 }
 
 #pragma endregion Primitives
 
 #pragma region Configuration
 
-void test_config_unit() {
+case_result_t test_config_unit() {
+    std::size_t failures = 0;
     announce("plaintext_is_born_ready_and_frames_nothing");
     secure_tunnel_t plain;
-    verify(plain.state() == secure_tunnel_state_t::ready_k);
-    verify(!plain.encrypts());
-    verify(plain.may_seal());
-    verify(plain.may_open());
-    verify(plain.geometry().headroom == 0u);
-    verify(plain.geometry().tailroom == 0u);
-    verify(plain.bytes_until_boundary({}) == 0u);
+    failures += expect(plain.state() == secure_tunnel_state_t::ready_k);
+    failures += expect(!plain.encrypts());
+    failures += expect(plain.may_seal());
+    failures += expect(plain.may_open());
+    failures += expect(plain.geometry().headroom == 0u);
+    failures += expect(plain.geometry().tailroom == 0u);
+    failures += expect(plain.bytes_until_boundary({}) == 0u);
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         connected_pair_t pair;
-        pair.connect(mode);
+        failures += pair.connect(mode);
         secure_tunnel_geometry_t const geometry = pair.client.geometry();
-        verify(geometry.headroom == secure_tunnel_headroom_k);
-        verify(geometry.tailroom == secure_tunnel_tailroom_k);
-        verify(geometry.max_payload == secure_tunnel_default_payload_k);
-        verify(geometry.record_size() == secure_tunnel_default_payload_k + secure_tunnel_overhead_k);
+        failures += expect(geometry.headroom == secure_tunnel_headroom_k);
+        failures += expect(geometry.tailroom == secure_tunnel_tailroom_k);
+        failures += expect(geometry.max_payload == secure_tunnel_default_payload_k);
+        failures += expect(geometry.record_size() == secure_tunnel_default_payload_k + secure_tunnel_overhead_k);
 
         connected_pair_t oversized;
-        oversized.connect(mode, secure_tunnel_payload_ceiling_k + 4096);
-        verify(oversized.client.geometry().max_payload == secure_tunnel_payload_ceiling_k);
+        failures += oversized.connect(mode, secure_tunnel_payload_ceiling_k + 4096);
+        failures += expect(oversized.client.geometry().max_payload == secure_tunnel_payload_ceiling_k);
     }
+    return failures;
 }
 
-void test_config_safety() {
+case_result_t test_config_safety() {
+    std::size_t failures = 0;
     // An absent static key would silently become a scalar of zeros.
     announce("every_pattern_demands_a_local_static_key");
     for (secure_tunnel_mode_t const mode : tunnel_modes_k)
@@ -444,12 +462,12 @@ void test_config_safety() {
             secure_tunnel_config_t config;
             config.mode = mode;
             config.role = role;
-            verify(tunnel.make(config) == secure_tunnel_fault_t::misconfigured_k,
-                   "{} {} accepted a configuration with no local static key", mode, role);
+            failures += expect(tunnel.make(config) == secure_tunnel_fault_t::misconfigured_k,
+                               "{} {} accepted a configuration with no local static key", mode, role);
         }
 
     keypair_t keys;
-    verify(keys.draw());
+    failures += expect(keys.draw());
 
     announce("a_key_of_the_wrong_width_is_rejected");
     secure_tunnel_t narrow;
@@ -457,7 +475,7 @@ void test_config_safety() {
     narrow_config.mode = secure_tunnel_mode_t::noise_xx_k;
     narrow_config.role = secure_tunnel_role_t::responder_k;
     narrow_config.local_private = {keys.secret, keys.secret + 16}; // half a key
-    verify(narrow.make(narrow_config) == secure_tunnel_fault_t::misconfigured_k);
+    failures += expect(narrow.make(narrow_config) == secure_tunnel_fault_t::misconfigured_k);
 
     // An `IK` initiator hashes the responder's static before message one, so it cannot come from
     // the wire - the transcripts would diverge before anything is sent.
@@ -467,7 +485,8 @@ void test_config_safety() {
     unshared_config.mode = secure_tunnel_mode_t::noise_ik_k;
     unshared_config.role = secure_tunnel_role_t::initiator_k;
     unshared_config.local_private = keys.private_half();
-    verify(unshared.make(unshared_config) == secure_tunnel_fault_t::misconfigured_k);
+    failures += expect(unshared.make(unshared_config) == secure_tunnel_fault_t::misconfigured_k);
+    return failures;
 }
 
 /**
@@ -479,16 +498,17 @@ void test_config_safety() {
  *
  *  Pinned as it behaves today. If ingress is ever bounded too, this is the case that says so.
  */
-void test_geometry_safety() {
+case_result_t test_geometry_safety() {
+    std::size_t failures = 0;
     wire_t wire;
-    verify(wire.reserve());
+    require(failures, wire.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{} an_ingress_record_is_not_bounded_by_this_binds_cap", mode);
 
         keypair_t client_identity, server_identity;
-        verify(client_identity.draw());
-        verify(server_identity.draw());
+        failures += expect(client_identity.draw());
+        failures += expect(server_identity.draw());
 
         // The mismatch a deployment actually produces: one side bounds its memory, the other
         // was configured by someone else and never agreed to.
@@ -506,64 +526,67 @@ void test_geometry_safety() {
         server_config.max_payload = 1024;
 
         secure_tunnel_t client, server;
-        verify(client.make(client_config) == secure_tunnel_fault_t::none_k);
-        verify(server.make(server_config) == secure_tunnel_fault_t::none_k);
-        verify(complete_handshake(client, server) == handshake_outcome_t::settled_k);
+        failures += expect(client.make(client_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(server.make(server_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(complete_handshake(client, server) == handshake_outcome_t::settled_k);
 
         std::size_t const server_buffer = server.geometry().record_size();
-        verify(server_buffer == 1024 + secure_tunnel_overhead_k);
+        failures += expect(server_buffer == 1024 + secure_tunnel_overhead_k);
 
         span<byte_t> const window = client.payload_window(wire.whole());
-        verify(window.size() == secure_tunnel_payload_ceiling_k);
+        failures += expect(window.size() == secure_tunnel_payload_ceiling_k);
         fill_with(window, byte_t {'X'});
         wire.length = client.seal(wire.whole(), window.size()).size();
-        verify(wire.length > server_buffer, "the capped side was not the smaller one");
+        failures += expect(wire.length > server_buffer, "the capped side was not the smaller one");
 
         // What a driver sees first: two bytes of prefix, and a demand for the rest.
         std::size_t const demanded = server.bytes_until_boundary(
             {wire.bytes(), wire.bytes() + secure_tunnel_headroom_k});
-        verify(demanded == wire.length - secure_tunnel_headroom_k);
-        verify(demanded + secure_tunnel_headroom_k > server_buffer,
-               "the boundary asked for {} bytes into a {}-byte buffer", demanded + secure_tunnel_headroom_k,
-               server_buffer);
+        failures += expect(demanded == wire.length - secure_tunnel_headroom_k);
+        failures += expect(demanded + secure_tunnel_headroom_k > server_buffer,
+                           "the boundary asked for {} bytes into a {}-byte buffer", demanded + secure_tunnel_headroom_k,
+                           server_buffer);
 
         // And `open` accepts it, because ingress is bounded by `max_message_k` and nothing else.
         secure_tunnel_opened_t const opened = open_from(server, wire);
-        verify(opened.consumed == wire.length, "{} refused an over-cap record with {}", mode, server.fault());
-        verify(opened.payload.size() == secure_tunnel_payload_ceiling_k);
+        failures += expect(opened.consumed == wire.length, "{} refused an over-cap record with {}", mode,
+                           server.fault());
+        failures += expect(opened.payload.size() == secure_tunnel_payload_ceiling_k);
     }
+    return failures;
 }
 
 #pragma endregion Configuration
 
 #pragma region Handshake
 
-void test_handshake_unit() {
+case_result_t test_handshake_unit() {
+    std::size_t failures = 0;
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         connected_pair_t pair;
-        pair.connect(mode);
-        verify(pair.client.may_seal());
-        verify(pair.client.may_open());
-        verify(pair.server.may_seal());
-        verify(pair.server.may_open());
+        failures += pair.connect(mode);
+        failures += expect(pair.client.may_seal());
+        failures += expect(pair.client.may_open());
+        failures += expect(pair.server.may_seal());
+        failures += expect(pair.server.may_open());
 
         // `KK` transmits no static token, so nothing promotes a peer key while reading - only the
         // split does, which is what makes this hold for that pattern.
         byte_t seen_by_client[secure_tunnel_key_size_k];
         byte_t seen_by_server[secure_tunnel_key_size_k];
-        verify(pair.client.peer_key(seen_by_client));
-        verify(pair.server.peer_key(seen_by_server));
-        verify_bytes(seen_by_client, pair.server_keys.public_half());
-        verify_bytes(seen_by_server, pair.client_keys.public_half());
+        failures += expect(pair.client.peer_key(seen_by_client));
+        failures += expect(pair.server.peer_key(seen_by_server));
+        failures += expect_bytes(seen_by_client, pair.server_keys.public_half());
+        failures += expect_bytes(seen_by_server, pair.client_keys.public_half());
     }
 
     // A configured key is assumed, not proven, and must stay unreported until authenticated.
     announce("a_configured_peer_key_is_not_yet_a_proven_one");
     keypair_t client_keys, server_keys;
-    verify(client_keys.draw());
-    verify(server_keys.draw());
+    failures += expect(client_keys.draw());
+    failures += expect(server_keys.draw());
 
     secure_tunnel_t unproven;
     secure_tunnel_config_t unproven_config;
@@ -571,32 +594,32 @@ void test_handshake_unit() {
     unproven_config.role = secure_tunnel_role_t::initiator_k;
     unproven_config.local_private = client_keys.private_half();
     unproven_config.remote_public = server_keys.public_half();
-    verify(unproven.make(unproven_config) == secure_tunnel_fault_t::none_k);
+    failures += expect(unproven.make(unproven_config) == secure_tunnel_fault_t::none_k);
 
     byte_t seen[secure_tunnel_key_size_k];
-    verify(!unproven.peer_key(seen));
-    verify(unproven.state() == secure_tunnel_state_t::starting_k);
+    failures += expect(!unproven.peer_key(seen));
+    failures += expect(unproven.state() == secure_tunnel_state_t::starting_k);
 
     announce("each_role_parks_where_it_cannot_deadlock");
     keypair_t keys;
-    verify(keys.draw());
+    failures += expect(keys.draw());
     secure_tunnel_config_t config;
     config.mode = secure_tunnel_mode_t::noise_xx_k;
     config.local_private = keys.private_half();
 
     secure_tunnel_t initiator;
     config.role = secure_tunnel_role_t::initiator_k;
-    verify(initiator.make(config) == secure_tunnel_fault_t::none_k);
+    failures += expect(initiator.make(config) == secure_tunnel_fault_t::none_k);
     secure_tunnel_step_t const first = initiator.advance({});
-    verify(first.state == secure_tunnel_state_t::transmitting_k); // an initiator writes before reading
-    verify(first.outbound.size() > 0u);
+    failures += expect(first.state == secure_tunnel_state_t::transmitting_k); // an initiator writes before reading
+    failures += expect(first.outbound.size() > 0u);
 
     secure_tunnel_t responder;
     config.role = secure_tunnel_role_t::responder_k;
-    verify(responder.make(config) == secure_tunnel_fault_t::none_k);
+    failures += expect(responder.make(config) == secure_tunnel_fault_t::none_k);
     secure_tunnel_step_t const second = responder.advance({});
-    verify(second.state == secure_tunnel_state_t::receiving_k); // a responder has nothing to say first
-    verify(second.outbound.size() == 0u);
+    failures += expect(second.state == secure_tunnel_state_t::receiving_k); // a responder has nothing to say first
+    failures += expect(second.outbound.size() == 0u);
 
     // Forward secrecy: an attacker who later takes the static key, or reads this process's
     // memory, must not be able to reconstruct session keys for traffic already sent.
@@ -611,22 +634,24 @@ void test_handshake_unit() {
 
     crypto_t::finish_handshake(noise);
 
-    verify(all_zero(noise.local_ephemeral_private));
-    verify(all_zero(noise.remote_ephemeral));
-    verify(all_zero(noise.local_static_private));
+    failures += expect(all_zero(noise.local_ephemeral_private));
+    failures += expect(all_zero(noise.remote_ephemeral));
+    failures += expect(all_zero(noise.local_static_private));
     // The peer's public half survives - it is the answer `peer_key` exists to give.
-    verify(all_equal_to(noise.remote_static, byte_t {0x22}));
-    verify(noise.sending.has_key());
-    verify(noise.receiving.has_key());
+    failures += expect(all_equal_to(noise.remote_static, byte_t {0x22}));
+    failures += expect(noise.sending.has_key());
+    failures += expect(noise.receiving.has_key());
+    return failures;
 }
 
-void test_handshake_safety() {
+case_result_t test_handshake_safety() {
+    std::size_t failures = 0;
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         keypair_t client_keys, server_keys;
-        verify(client_keys.draw());
-        verify(server_keys.draw());
+        failures += expect(client_keys.draw());
+        failures += expect(server_keys.draw());
 
         secure_tunnel_config_t client_config;
         client_config.mode = mode;
@@ -645,32 +670,33 @@ void test_handshake_safety() {
         // A peer forcing a shared secret it already knows is an attack, not the operating system
         // refusing entropy, and the two must not collapse into one fault.
         secure_tunnel_t initiator, responder;
-        verify(initiator.make(client_config) == secure_tunnel_fault_t::none_k);
-        verify(responder.make(server_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(initiator.make(client_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(responder.make(server_config) == secure_tunnel_fault_t::none_k);
 
         secure_tunnel_step_t const first = initiator.advance({});
-        verify(first.state == secure_tunnel_state_t::transmitting_k);
+        failures += expect(first.state == secure_tunnel_state_t::transmitting_k);
         handshake_stream_t message;
-        message.append(first.outbound);
+        failures += expect(message.append(first.outbound));
 
         // Every pattern's opening message carries one ephemeral in the clear behind the length
         // prefix. All zeros is the canonical small-order point.
-        verify(message.length >= secure_tunnel_headroom_k + secure_tunnel_key_size_k);
+        failures += expect(message.length >= secure_tunnel_headroom_k + secure_tunnel_key_size_k);
         std::memset(message.bytes + secure_tunnel_headroom_k, 0, secure_tunnel_key_size_k);
 
         secure_tunnel_step_t const answer = responder.advance(message.pending());
-        verify(answer.state == secure_tunnel_state_t::broken_k);
-        verify(responder.fault() == secure_tunnel_fault_t::authentication_failed_k);
+        failures += expect(answer.state == secure_tunnel_state_t::broken_k);
+        failures += expect(responder.fault() == secure_tunnel_fault_t::authentication_failed_k);
 
         // Too short for the ephemeral is malformed, not hostile; the faults must differ.
         secure_tunnel_t truncated_responder;
-        verify(truncated_responder.make(server_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(truncated_responder.make(server_config) == secure_tunnel_fault_t::none_k);
         byte_t const truncated[] = {byte_t {0x00}, byte_t {0x04}, byte_t {0xde},
                                     byte_t {0xad}, byte_t {0xbe}, byte_t {0xef}};
         secure_tunnel_step_t const refused = truncated_responder.advance(truncated);
-        verify(refused.state == secure_tunnel_state_t::broken_k);
-        verify(truncated_responder.fault() == secure_tunnel_fault_t::malformed_k);
+        failures += expect(refused.state == secure_tunnel_state_t::broken_k);
+        failures += expect(truncated_responder.fault() == secure_tunnel_fault_t::malformed_k);
     }
+    return failures;
 }
 
 /**
@@ -679,14 +705,15 @@ void test_handshake_safety() {
  *  `advance` reports what it consumed, so a partial message must leave the bytes in the caller's
  *  hands and emit nothing until a whole one has landed.
  */
-void test_handshake_delivery() {
+case_result_t test_handshake_delivery() {
+    std::size_t failures = 0;
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         connected_pair_t pair;
         keypair_t client_identity, server_identity;
-        verify(client_identity.draw());
-        verify(server_identity.draw());
+        failures += expect(client_identity.draw());
+        failures += expect(server_identity.draw());
         pair.client_keys = client_identity;
         pair.server_keys = server_identity;
 
@@ -702,110 +729,115 @@ void test_handshake_delivery() {
         if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.remote_public = client_identity.public_half();
 
         secure_tunnel_t initiator, responder;
-        verify(initiator.make(client_config) == secure_tunnel_fault_t::none_k);
-        verify(responder.make(server_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(initiator.make(client_config) == secure_tunnel_fault_t::none_k);
+        failures += expect(responder.make(server_config) == secure_tunnel_fault_t::none_k);
 
         handshake_stream_t toward_responder, toward_initiator;
-        auto trickle = [](secure_tunnel_t& tunnel, handshake_stream_t& inbound, handshake_stream_t& outbound) {
+        auto trickle = [&failures](secure_tunnel_t& tunnel, handshake_stream_t& inbound, handshake_stream_t& outbound) {
             // Everything but the last byte must be refused as incomplete.
             for (std::size_t fed = 1; fed < inbound.length; ++fed) {
                 secure_tunnel_step_t const partial = tunnel.advance({inbound.bytes, inbound.bytes + fed});
-                verify(partial.state != secure_tunnel_state_t::broken_k, "{} bytes of a message broke the peer", fed);
-                verify(partial.consumed == 0u, "{} of {} bytes were consumed from a partial message", partial.consumed,
-                       inbound.length);
-                verify(partial.outbound.size() == 0u, "a partial message produced {} outbound bytes",
-                       partial.outbound.size());
+                failures += expect(partial.state != secure_tunnel_state_t::broken_k,
+                                   "{} bytes of a message broke the peer", fed);
+                failures += expect(partial.consumed == 0u, "{} of {} bytes were consumed from a partial message",
+                                   partial.consumed, inbound.length);
+                failures += expect(partial.outbound.size() == 0u, "a partial message produced {} outbound bytes",
+                                   partial.outbound.size());
             }
             secure_tunnel_step_t const step = tunnel.advance(inbound.pending());
-            inbound.consume(step.consumed);
-            outbound.append(step.outbound);
+            if (!inbound.consume(step.consumed) || !outbound.append(step.outbound))
+                return secure_tunnel_state_t::broken_k;
             return step.state;
         };
 
         for (std::size_t round = 0; round != 8; ++round) {
-            verify(trickle(initiator, toward_initiator, toward_responder) != secure_tunnel_state_t::broken_k);
-            verify(trickle(responder, toward_responder, toward_initiator) != secure_tunnel_state_t::broken_k);
+            failures += expect(trickle(initiator, toward_initiator, toward_responder) !=
+                               secure_tunnel_state_t::broken_k);
+            failures += expect(trickle(responder, toward_responder, toward_initiator) !=
+                               secure_tunnel_state_t::broken_k);
             if (initiator.state() == secure_tunnel_state_t::ready_k &&
                 responder.state() == secure_tunnel_state_t::ready_k)
                 break;
         }
-        verify(initiator.state() == secure_tunnel_state_t::ready_k, "a trickled {} handshake left the initiator {}",
-               mode, initiator.state());
-        verify(responder.state() == secure_tunnel_state_t::ready_k, "a trickled {} handshake left the responder {}",
-               mode, responder.state());
+        failures += expect(initiator.state() == secure_tunnel_state_t::ready_k,
+                           "a trickled {} handshake left the initiator {}", mode, initiator.state());
+        failures += expect(responder.state() == secure_tunnel_state_t::ready_k,
+                           "a trickled {} handshake left the responder {}", mode, responder.state());
     }
+    return failures;
 }
 
 #pragma endregion Handshake
 
 #pragma region Records
 
-void test_records_unit() {
+case_result_t test_records_unit() {
+    std::size_t failures = 0;
     wire_t wire;
-    verify(wire.reserve());
+    require(failures, wire.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         connected_pair_t pair;
-        pair.connect(mode);
+        failures += pair.connect(mode);
 
-        seal_into(pair.client, ascii_bytes("GET / HTTP/1.1"), wire);
-        verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
+        failures += seal_into(pair.client, ascii_bytes("GET / HTTP/1.1"), wire);
+        failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const request = open_from(pair.server, wire);
-        verify(request.consumed > 0u);
-        verify(request.kind == secure_tunnel_record_t::application_k);
-        verify(request.payload.data() == wire.bytes() + secure_tunnel_headroom_k);
-        verify_bytes(request.payload, ascii_bytes("GET / HTTP/1.1"));
+        failures += expect(request.consumed > 0u);
+        failures += expect(request.kind == secure_tunnel_record_t::application_k);
+        failures += expect(request.payload.data() == wire.bytes() + secure_tunnel_headroom_k);
+        failures += expect_bytes(request.payload, ascii_bytes("GET / HTTP/1.1"));
 
-        seal_into(pair.server, ascii_bytes("HTTP/1.1 200 OK"), wire);
-        verify(pair.client.bytes_until_boundary(wire.received()) == 0u);
+        failures += seal_into(pair.server, ascii_bytes("HTTP/1.1 200 OK"), wire);
+        failures += expect(pair.client.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const reply = open_from(pair.client, wire);
-        verify(reply.consumed > 0u);
-        verify_bytes(reply.payload, ascii_bytes("HTTP/1.1 200 OK"));
+        failures += expect(reply.consumed > 0u);
+        failures += expect_bytes(reply.payload, ascii_bytes("HTTP/1.1 200 OK"));
 
         // One byte less than this minimum decrypts to nothing, after which reading the kind byte
         // would run off the end of the plaintext.
-        seal_into(pair.client, {}, wire);
-        verify(wire.length == secure_tunnel_headroom_k + secure_tunnel_tailroom_k);
-        verify(declared_length(wire) == crypto_t::tag_size_k + crypto_t::kind_size_k);
+        failures += seal_into(pair.client, {}, wire);
+        failures += expect(wire.length == secure_tunnel_headroom_k + secure_tunnel_tailroom_k);
+        failures += expect(declared_length(wire) == crypto_t::tag_size_k + crypto_t::kind_size_k);
         secure_tunnel_opened_t const empty = open_from(pair.server, wire);
-        verify(empty.consumed > 0u);
-        verify(empty.payload.size() == 0u);
+        failures += expect(empty.consumed > 0u);
+        failures += expect(empty.payload.size() == 0u);
 
         // Diverging counts diverge the rekey schedules, after which every record fails
         // authentication while looking exactly like an attack.
         std::size_t const already_sealed = pair.client.records_sealed();
         std::size_t const already_opened = pair.server.records_opened();
         for (std::size_t index = 0; index != 16; ++index) {
-            seal_into(pair.client, ascii_bytes("ping"), wire);
-            verify(open_from(pair.server, wire).consumed > 0u);
-            seal_into(pair.server, ascii_bytes("pong"), wire);
-            verify(open_from(pair.client, wire).consumed > 0u);
+            failures += seal_into(pair.client, ascii_bytes("ping"), wire);
+            failures += expect(open_from(pair.server, wire).consumed > 0u);
+            failures += seal_into(pair.server, ascii_bytes("pong"), wire);
+            failures += expect(open_from(pair.client, wire).consumed > 0u);
         }
-        verify(pair.client.records_sealed() == pair.server.records_opened());
-        verify(pair.server.records_sealed() == pair.client.records_opened());
-        verify(pair.client.records_sealed() == already_sealed + 16);
-        verify(pair.server.records_opened() == already_opened + 16);
+        failures += expect(pair.client.records_sealed() == pair.server.records_opened());
+        failures += expect(pair.server.records_sealed() == pair.client.records_opened());
+        failures += expect(pair.client.records_sealed() == already_sealed + 16);
+        failures += expect(pair.server.records_opened() == already_opened + 16);
     }
 
     // A ceiling that ignored the kind byte would declare 65536, mask to zero, and be rejected.
     announce("a_maximum_size_payload_fits_the_wire_format");
     st::basic_vector<byte_t> payload;
-    verify(!st::failed(payload.resize(secure_tunnel_payload_ceiling_k)));
+    require(failures, !st::failed(payload.resize(secure_tunnel_payload_ceiling_k)));
     span<byte_t> const widest_scratch {payload.data(), payload.data() + secure_tunnel_payload_ceiling_k};
     fill_with(widest_scratch, byte_t {'M'});
     span<byte_t const> const widest = widest_scratch;
 
     connected_pair_t widest_pair;
-    widest_pair.connect(secure_tunnel_mode_t::noise_xx_k, secure_tunnel_payload_ceiling_k);
-    seal_into(widest_pair.client, widest, wire);
-    verify(declared_length(wire) == crypto_t::max_message_k);
-    verify(wire.length == secure_tunnel_headroom_k + crypto_t::max_message_k);
-    verify(widest_pair.server.bytes_until_boundary(wire.received()) == 0u);
+    failures += widest_pair.connect(secure_tunnel_mode_t::noise_xx_k, secure_tunnel_payload_ceiling_k);
+    failures += seal_into(widest_pair.client, widest, wire);
+    failures += expect(declared_length(wire) == crypto_t::max_message_k);
+    failures += expect(wire.length == secure_tunnel_headroom_k + crypto_t::max_message_k);
+    failures += expect(widest_pair.server.bytes_until_boundary(wire.received()) == 0u);
     secure_tunnel_opened_t const opened = open_from(widest_pair.server, wire);
-    verify(opened.consumed > 0u);
-    verify(opened.payload.size() == secure_tunnel_payload_ceiling_k);
+    failures += expect(opened.consumed > 0u);
+    failures += expect(opened.payload.size() == secure_tunnel_payload_ceiling_k);
 
     // Isolated from framing: two identical senders produce identical records, so the only
     // variable left is what a reader offers as associated data. Invisible to any test that
@@ -814,223 +846,230 @@ void test_records_unit() {
     // exposes an off-by-one that a generous one hides.
     announce("a_driver_sized_buffer_holds_a_maximum_payload");
     connected_pair_t exact_pair;
-    exact_pair.connect(secure_tunnel_mode_t::noise_xx_k, secure_tunnel_payload_ceiling_k);
+    failures += exact_pair.connect(secure_tunnel_mode_t::noise_xx_k, secure_tunnel_payload_ceiling_k);
     wire_t exact;
-    verify(exact.reserve(exact_pair.client.geometry().record_size()));
-    verify(exact.storage.capacity() == secure_tunnel_max_record_k, "the ceiling's record_size should be the maximum");
-    seal_into(exact_pair.client, widest, exact);
-    verify(exact.length == exact.storage.capacity(), "a maximum record did not fill its exact buffer");
-    verify(open_from(exact_pair.server, exact).payload.size() == secure_tunnel_payload_ceiling_k);
+    require(failures, exact.reserve(exact_pair.client.geometry().record_size()));
+    failures += expect(exact.storage.capacity() == secure_tunnel_max_record_k,
+                       "the ceiling's record_size should be the maximum");
+    failures += seal_into(exact_pair.client, widest, exact);
+    failures += expect(exact.length == exact.storage.capacity(), "a maximum record did not fill its exact buffer");
+    failures += expect(open_from(exact_pair.server, exact).payload.size() == secure_tunnel_payload_ceiling_k);
 
     // The same at a modest cap, where `record_size()` is nowhere near the format's maximum.
     connected_pair_t modest_pair;
-    modest_pair.connect(secure_tunnel_mode_t::noise_xx_k, 1024);
+    failures += modest_pair.connect(secure_tunnel_mode_t::noise_xx_k, 1024);
     wire_t modest;
-    verify(modest.reserve(modest_pair.client.geometry().record_size()));
+    require(failures, modest.reserve(modest_pair.client.geometry().record_size()));
     span<byte_t> const modest_window = modest_pair.client.payload_window(modest.whole());
-    verify(modest_window.size() == 1024u, "a {}-byte buffer offered a {}-byte window", modest.storage.capacity(),
-           modest_window.size());
+    failures += expect(modest_window.size() == 1024u, "a {}-byte buffer offered a {}-byte window",
+                       modest.storage.capacity(), modest_window.size());
     fill_with(modest_window, byte_t {'m'});
     modest.length = modest_pair.client.seal(modest.whole(), modest_window.size()).size();
-    verify(modest.length == modest.storage.capacity(), "a capped record did not fill its exact buffer");
-    verify(open_from(modest_pair.server, modest).payload.size() == 1024u);
+    failures += expect(modest.length == modest.storage.capacity(), "a capped record did not fill its exact buffer");
+    failures += expect(open_from(modest_pair.server, modest).payload.size() == 1024u);
 
     // A client reusing one static identity across connections is ordinary; the sessions must still
     // be independent, so byte-identical plaintext must not produce byte-identical ciphertext.
     announce("one_identity_yields_independent_sessions");
     keypair_t reused_client, reused_server;
-    verify(reused_client.draw());
-    verify(reused_server.draw());
+    failures += expect(reused_client.draw());
+    failures += expect(reused_server.draw());
 
     wire_t first_session, second_session;
-    verify(first_session.reserve());
-    verify(second_session.reserve());
+    require(failures, first_session.reserve());
+    require(failures, second_session.reserve());
     connected_pair_t earlier, later;
-    earlier.connect_with(secure_tunnel_mode_t::noise_xx_k, reused_client, reused_server);
-    later.connect_with(secure_tunnel_mode_t::noise_xx_k, reused_client, reused_server);
-    seal_into(earlier.client, ascii_bytes("identical plaintext"), first_session);
-    seal_into(later.client, ascii_bytes("identical plaintext"), second_session);
-    verify(first_session.length == second_session.length);
-    verify(!bytes_equal(first_session.received(), second_session.received()),
-           "two sessions on one identity produced the same ciphertext");
+    failures += earlier.connect_with(secure_tunnel_mode_t::noise_xx_k, reused_client, reused_server);
+    failures += later.connect_with(secure_tunnel_mode_t::noise_xx_k, reused_client, reused_server);
+    failures += seal_into(earlier.client, ascii_bytes("identical plaintext"), first_session);
+    failures += seal_into(later.client, ascii_bytes("identical plaintext"), second_session);
+    failures += expect(first_session.length == second_session.length);
+    failures += expect(!bytes_equal(first_session.received(), second_session.received()),
+                       "two sessions on one identity produced the same ciphertext");
 
     announce("sealing_binds_the_length_prefix_into_the_tag");
     byte_t key[secure_tunnel_key_size_k];
     for (std::size_t index = 0; index != sizeof(key); ++index) key[index] = static_cast<byte_t>(index * 7u + 1u);
 
-    auto seal_from_a_fresh_sender = [&key](byte_t* record) {
+    auto seal_from_a_fresh_sender = [&key, &failures](byte_t* record) {
         crypto_t::secure_tunnel_noise_t sender;
         sender.sending.initialize(key);
         std::memcpy(record + secure_tunnel_headroom_k, "bound", 5);
         std::size_t const produced = crypto_t::seal_record(sender, record, 5, secure_tunnel_record_t::application_k);
-        verify(produced > 0u, "a fresh sender refused a five-byte payload");
+        failures += expect(produced > 0u, "a fresh sender refused a five-byte payload");
         return produced;
     };
 
     byte_t first_record[64] {}, second_record[64] {};
     std::size_t const written = seal_from_a_fresh_sender(first_record);
-    verify(seal_from_a_fresh_sender(second_record) == written, "two identical seals produced different lengths");
-    verify(bytes_equal({first_record, first_record + written}, {second_record, second_record + written}),
-           "identical senders sealing identical payloads must agree byte for byte");
+    failures += expect(seal_from_a_fresh_sender(second_record) == written,
+                       "two identical seals produced different lengths");
+    failures += expect(bytes_equal({first_record, first_record + written}, {second_record, second_record + written}),
+                       "identical senders sealing identical payloads must agree byte for byte");
 
     std::size_t const body_size = 5 + crypto_t::kind_size_k;
     crypto_t::secure_tunnel_cipher_t honest;
     honest.initialize(key);
-    verify(honest.open({first_record, first_record + secure_tunnel_headroom_k},
-                       {first_record + secure_tunnel_headroom_k, first_record + secure_tunnel_headroom_k + body_size},
-                       first_record + secure_tunnel_headroom_k + body_size));
+    failures += expect(
+        honest.open({first_record, first_record + secure_tunnel_headroom_k},
+                    {first_record + secure_tunnel_headroom_k, first_record + secure_tunnel_headroom_k + body_size},
+                    first_record + secure_tunnel_headroom_k + body_size));
 
     crypto_t::secure_tunnel_cipher_t forgetful;
     forgetful.initialize(key);
-    verify(!forgetful.open(
+    failures += expect(!forgetful.open(
         {}, {second_record + secure_tunnel_headroom_k, second_record + secure_tunnel_headroom_k + body_size},
         second_record + secure_tunnel_headroom_k + body_size));
+    return failures;
 }
 
-void test_records_safety() {
+case_result_t test_records_safety() {
+    std::size_t failures = 0;
     wire_t wire, replayed;
-    verify(wire.reserve());
-    verify(replayed.reserve());
+    require(failures, wire.reserve());
+    require(failures, replayed.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         {
             announce("{} a_forged_tag_breaks_the_connection", mode);
             connected_pair_t pair;
-            pair.connect(mode);
-            seal_into(pair.client, ascii_bytes("authentic"), wire);
+            failures += pair.connect(mode);
+            failures += seal_into(pair.client, ascii_bytes("authentic"), wire);
             auto* bytes = wire.bytes();
             bytes[wire.length - 1] ^= byte_t {0x01u};
-            verify(open_from(pair.server, wire).consumed == 0u);
-            verify(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
-            verify(pair.server.state() == secure_tunnel_state_t::broken_k);
+            failures += expect(open_from(pair.server, wire).consumed == 0u);
+            failures += expect(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
+            failures += expect(pair.server.state() == secure_tunnel_state_t::broken_k);
         }
         {
             // A shortened prefix still leaves a whole record present by the boundary rule, so
             // `open` has to be the thing that objects.
             announce("{} a_shortened_prefix_yields_no_plaintext", mode);
             connected_pair_t pair;
-            pair.connect(mode);
-            seal_into(pair.client, ascii_bytes("prefix authenticated"), wire);
+            failures += pair.connect(mode);
+            failures += seal_into(pair.client, ascii_bytes("prefix authenticated"), wire);
             auto* bytes = wire.bytes();
             bytes[1] = byte_t {static_cast<unsigned char>(std::to_integer<unsigned>(bytes[1]) - 1)};
-            verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
-            verify(open_from(pair.server, wire).consumed == 0u);
-            verify(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
+            failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
+            failures += expect(open_from(pair.server, wire).consumed == 0u);
+            failures += expect(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
         }
         {
             announce("{} a_sixteen_byte_record_is_refused", mode);
             connected_pair_t pair;
-            pair.connect(mode);
+            failures += pair.connect(mode);
             std::memset(wire.bytes(), 0, 2 + 16);
             auto* bytes = wire.bytes();
             bytes[1] = byte_t {16};
             wire.length = 2 + 16;
-            verify(open_from(pair.server, wire).consumed == 0u);
-            verify(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
+            failures += expect(open_from(pair.server, wire).consumed == 0u);
+            failures += expect(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
         }
         {
             announce("{} a_payload_wider_than_the_cap_is_refused", mode);
             connected_pair_t pair;
-            pair.connect(mode, 64);
-            verify(pair.client.payload_window(wire.whole()).size() == 64u);
-            verify(pair.client.seal(wire.whole(), 65).size() == 0u);
-            verify(pair.client.fault() == secure_tunnel_fault_t::malformed_k);
-            verify(pair.client.state() == secure_tunnel_state_t::broken_k);
+            failures += pair.connect(mode, 64);
+            failures += expect(pair.client.payload_window(wire.whole()).size() == 64u);
+            failures += expect(pair.client.seal(wire.whole(), 65).size() == 0u);
+            failures += expect(pair.client.fault() == secure_tunnel_fault_t::malformed_k);
+            failures += expect(pair.client.state() == secure_tunnel_state_t::broken_k);
         }
         {
             announce("{} empty_records_do_not_impose_a_connection_quota", mode);
             connected_pair_t pair;
-            pair.connect(mode);
+            failures += pair.connect(mode);
             for (std::size_t index = 0; index != 64; ++index) {
-                seal_into(pair.client, {}, wire);
-                verify(open_from(pair.server, wire).consumed > 0u);
+                failures += seal_into(pair.client, {}, wire);
+                failures += expect(open_from(pair.server, wire).consumed > 0u);
             }
-            seal_into(pair.client, ascii_bytes("still open"), wire);
-            verify(open_from(pair.server, wire).consumed > 0u);
+            failures += seal_into(pair.client, ascii_bytes("still open"), wire);
+            failures += expect(open_from(pair.server, wire).consumed > 0u);
         }
         {
             // Re-delivering a record the peer already opened is what a retrying proxy does. The
             // receiving nonce has advanced, so the tag no longer matches.
             announce("{} a_replayed_record_is_refused", mode);
             connected_pair_t pair;
-            pair.connect(mode);
-            seal_into(pair.client, ascii_bytes("once"), wire);
+            failures += pair.connect(mode);
+            failures += seal_into(pair.client, ascii_bytes("once"), wire);
 
             // Kept before opening, because `open` uncovers the plaintext over the ciphertext.
             replayed.length = wire.length;
             std::memcpy(replayed.bytes(), wire.bytes(), wire.length);
-            verify(open_from(pair.server, wire).consumed > 0u);
+            failures += expect(open_from(pair.server, wire).consumed > 0u);
 
-            verify(open_from(pair.server, replayed).consumed == 0u, "a replayed record was accepted");
-            verify(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
+            failures += expect(open_from(pair.server, replayed).consumed == 0u, "a replayed record was accepted");
+            failures += expect(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
         }
         {
             // Two sessions between the same two identities. Only the ephemerals separate them, so
             // this is the case that proves they are doing that work.
             announce("{} a_record_from_another_session_is_refused", mode);
             keypair_t client_identity, server_identity;
-            verify(client_identity.draw());
-            verify(server_identity.draw());
+            failures += expect(client_identity.draw());
+            failures += expect(server_identity.draw());
 
             connected_pair_t earlier, later;
-            earlier.connect_with(mode, client_identity, server_identity);
-            later.connect_with(mode, client_identity, server_identity);
+            failures += earlier.connect_with(mode, client_identity, server_identity);
+            failures += later.connect_with(mode, client_identity, server_identity);
 
-            seal_into(earlier.client, ascii_bytes("session one"), wire);
-            verify(open_from(later.server, wire).consumed == 0u, "a record crossed between sessions");
-            verify(later.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
+            failures += seal_into(earlier.client, ascii_bytes("session one"), wire);
+            failures += expect(open_from(later.server, wire).consumed == 0u, "a record crossed between sessions");
+            failures += expect(later.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
         }
     }
+    return failures;
 }
 
-void test_records_delivery() {
+case_result_t test_records_delivery() {
+    std::size_t failures = 0;
     wire_t wire, second_wire;
-    verify(wire.reserve());
-    verify(second_wire.reserve());
+    require(failures, wire.reserve());
+    require(failures, second_wire.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         connected_pair_t pair;
-        pair.connect(mode);
+        failures += pair.connect(mode);
 
         // Until the length prefix has landed there is nothing to read a length from, so the
         // answer is the rest of the prefix - a progress guarantee rather than the record's width.
-        seal_into(pair.client, ascii_bytes("boundary"), wire);
+        failures += seal_into(pair.client, ascii_bytes("boundary"), wire);
         std::size_t const stride = sweep_stride(wire.length);
         for (std::size_t prefix = 0; prefix < wire.length; prefix += stride) {
             std::size_t const expected = prefix < secure_tunnel_headroom_k ? secure_tunnel_headroom_k - prefix
                                                                            : wire.length - prefix;
             std::size_t const answered = pair.server.bytes_until_boundary({wire.bytes(), wire.bytes() + prefix});
-            verify(answered == expected, "{} at prefix {} of {} the boundary answered {}, expected {}", mode, prefix,
-                   wire.length, answered, expected);
+            failures += expect(answered == expected, "{} at prefix {} of {} the boundary answered {}, expected {}",
+                               mode, prefix, wire.length, answered, expected);
         }
-        verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
-        verify(pair.server.bytes_until_boundary({}) == secure_tunnel_headroom_k);
+        failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
+        failures += expect(pair.server.bytes_until_boundary({}) == secure_tunnel_headroom_k);
 
         // Sealing advanced the sender's nonce, so leaving the swept record unopened would part
         // the two ends' schedules and read as a tunnel defect rather than a skipped step.
         secure_tunnel_opened_t const swept = open_from(pair.server, wire);
-        verify(swept.consumed > 0u, "the record the boundary sweep walked would not open");
-        verify_bytes(swept.payload, ascii_bytes("boundary"));
+        failures += expect(swept.consumed > 0u, "the record the boundary sweep walked would not open");
+        failures += expect_bytes(swept.payload, ascii_bytes("boundary"));
 
-        seal_into(pair.client, ascii_bytes("first"), wire);
-        seal_into(pair.client, ascii_bytes("second"), second_wire);
+        failures += seal_into(pair.client, ascii_bytes("first"), wire);
+        failures += seal_into(pair.client, ascii_bytes("second"), second_wire);
         std::memcpy(wire.bytes() + wire.length, second_wire.bytes(), second_wire.length);
         wire.length += second_wire.length;
 
-        verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
+        failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const one = open_from(pair.server, wire);
-        verify(one.consumed > 0u);
-        verify(one.consumed < wire.length);
-        verify_bytes(one.payload, ascii_bytes("first"));
+        failures += expect(one.consumed > 0u);
+        failures += expect(one.consumed < wire.length);
+        failures += expect_bytes(one.payload, ascii_bytes("first"));
 
         std::memmove(wire.bytes(), wire.bytes() + one.consumed, wire.length - one.consumed);
         wire.length -= one.consumed;
-        verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
+        failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const two = open_from(pair.server, wire);
-        verify(two.consumed > 0u);
-        verify_bytes(two.payload, ascii_bytes("second"));
+        failures += expect(two.consumed > 0u);
+        failures += expect_bytes(two.payload, ascii_bytes("second"));
 
         // A stream of records arriving in chunks a driver never chose, reassembled the way a
         // driver has to: read, ask the boundary rule, open only when it answers zero.
@@ -1038,25 +1077,26 @@ void test_records_delivery() {
         announce("{} reassembled_from_{}_records_in_random_chunks", mode, records);
 
         wire_t sent;
-        verify(sent.reserve());
+        require(failures, sent.reserve());
         std::size_t produced = 0;
         for (std::size_t index = 0; index != records; ++index) {
-            seal_into(pair.client, ascii_bytes("chunked payload"), second_wire);
-            verify(produced + second_wire.length <= sent.storage.capacity(), "the stream outgrew its buffer");
+            failures += seal_into(pair.client, ascii_bytes("chunked payload"), second_wire);
+            require(failures, produced + second_wire.length <= sent.storage.capacity(),
+                    "the stream outgrew its buffer");
             std::memcpy(sent.bytes() + produced, second_wire.bytes(), second_wire.length);
             produced += second_wire.length;
         }
 
         wire_t inbox;
-        verify(inbox.reserve());
+        require(failures, inbox.reserve());
         std::size_t offered = 0, opened_count = 0;
         while (opened_count != records) {
             std::size_t const wanted = pair.server.bytes_until_boundary(inbox.received());
-            verify(wanted > 0u || inbox.length > 0u, "the boundary rule stopped asking for bytes");
+            require(failures, wanted > 0u || inbox.length > 0u, "the boundary rule stopped asking for bytes");
             if (wanted) {
                 // A chunk no larger than what is still owed, and never zero, so this terminates.
                 std::size_t const remaining = produced - offered;
-                verify(remaining > 0u, "the boundary asked for {} more bytes than were ever sent", wanted);
+                require(failures, remaining > 0u, "the boundary asked for {} more bytes than were ever sent", wanted);
                 std::size_t const chunk = 1 + global_random_generator().below(remaining < wanted ? remaining : wanted);
                 std::memcpy(inbox.bytes() + inbox.length, sent.bytes() + offered, chunk);
                 inbox.length += chunk;
@@ -1064,117 +1104,123 @@ void test_records_delivery() {
                 continue;
             }
             secure_tunnel_opened_t const next = open_from(pair.server, inbox);
-            verify(next.consumed > 0u, "record {} of {} failed with {}", opened_count, records, pair.server.fault());
-            verify_bytes(next.payload, ascii_bytes("chunked payload"));
+            require(failures, next.consumed > 0u, "record {} of {} failed with {}", opened_count, records,
+                    pair.server.fault());
+            failures += expect_bytes(next.payload, ascii_bytes("chunked payload"));
             std::memmove(inbox.bytes(), inbox.bytes() + next.consumed, inbox.length - next.consumed);
             inbox.length -= next.consumed;
             ++opened_count;
         }
-        verify(offered == produced, "{} of {} stream bytes were never delivered", offered, produced);
+        failures += expect(offered == produced, "{} of {} stream bytes were never delivered", offered, produced);
     }
+    return failures;
 }
 
 #pragma endregion Records
 
 #pragma region Closing
 
-void test_close_unit() {
+case_result_t test_close_unit() {
+    std::size_t failures = 0;
     wire_t wire;
-    verify(wire.reserve());
+    require(failures, wire.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         {
             announce("{} a_close_shuts_one_direction", mode);
             connected_pair_t pair;
-            pair.connect(mode);
-            seal_into(pair.client, ascii_bytes("before"), wire);
-            verify(open_from(pair.server, wire).consumed > 0u);
+            failures += pair.connect(mode);
+            failures += seal_into(pair.client, ascii_bytes("before"), wire);
+            failures += expect(open_from(pair.server, wire).consumed > 0u);
 
             secure_tunnel_step_t const closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
-            verify(closing.state == secure_tunnel_state_t::transmitting_k);
-            verify(closing.outbound.size() > 0u);
-            verify(!pair.client.may_seal());
-            verify(pair.client.may_open());
+            failures += expect(closing.state == secure_tunnel_state_t::transmitting_k);
+            failures += expect(closing.outbound.size() > 0u);
+            failures += expect(!pair.client.may_seal());
+            failures += expect(pair.client.may_open());
 
             std::memcpy(wire.bytes(), closing.outbound.data(), closing.outbound.size());
             wire.length = closing.outbound.size();
             secure_tunnel_opened_t const received = open_from(pair.server, wire);
-            verify(received.consumed > 0u);
-            verify(received.kind == secure_tunnel_record_t::close_k);
-            verify(received.payload.size() == 0u);
-            verify(!pair.server.may_open());
-            verify(pair.server.may_seal());
+            failures += expect(received.consumed > 0u);
+            failures += expect(received.kind == secure_tunnel_record_t::close_k);
+            failures += expect(received.payload.size() == 0u);
+            failures += expect(!pair.server.may_open());
+            failures += expect(pair.server.may_seal());
 
             // The close goes through the sealing path, so it advances both counts or the rekey
             // schedules diverge with no diagnosable symptom.
-            verify(pair.client.records_sealed() == 2u);
-            verify(pair.server.records_opened() == 2u);
+            failures += expect(pair.client.records_sealed() == 2u);
+            failures += expect(pair.server.records_opened() == 2u);
 
-            seal_into(pair.server, ascii_bytes("last words"), wire);
-            verify(open_from(pair.client, wire).consumed > 0u);
+            failures += seal_into(pair.server, ascii_bytes("last words"), wire);
+            failures += expect(open_from(pair.client, wire).consumed > 0u);
 
             // Nothing legitimate follows an authenticated close, so this is a protocol violation.
             std::memset(wire.bytes(), 0, 64);
             wire.length = 64;
-            verify(open_from(pair.server, wire).consumed == 0u);
-            verify(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
+            failures += expect(open_from(pair.server, wire).consumed == 0u);
+            failures += expect(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
         }
         {
             announce("{} both_directions_shut_reports_closed", mode);
             connected_pair_t pair;
-            pair.connect(mode);
+            failures += pair.connect(mode);
 
             secure_tunnel_step_t const server_closing = pair.server.advance({}, secure_tunnel_request_t::close_k);
             std::memcpy(wire.bytes(), server_closing.outbound.data(), server_closing.outbound.size());
             wire.length = server_closing.outbound.size();
-            verify(open_from(pair.client, wire).consumed > 0u);
-            verify(!pair.client.may_open());
+            failures += expect(open_from(pair.client, wire).consumed > 0u);
+            failures += expect(!pair.client.may_open());
 
             secure_tunnel_step_t const client_closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
-            verify(client_closing.state == secure_tunnel_state_t::closed_k);
-            verify(client_closing.outbound.size() > 0u); // the close still has to reach the peer
+            failures += expect(client_closing.state == secure_tunnel_state_t::closed_k);
+            failures += expect(client_closing.outbound.size() > 0u); // the close still has to reach the peer
 
             secure_tunnel_step_t const again = pair.client.advance({});
-            verify(again.state == secure_tunnel_state_t::closed_k);
-            verify(again.outbound.size() == 0u);
+            failures += expect(again.state == secure_tunnel_state_t::closed_k);
+            failures += expect(again.outbound.size() == 0u);
         }
     }
+    return failures;
 }
 
 /** A close coalesced into one read behind the peer's last data record. */
-void test_close_delivery() {
+case_result_t test_close_delivery() {
+    std::size_t failures = 0;
     wire_t wire, tail;
-    verify(wire.reserve());
-    verify(tail.reserve());
+    require(failures, wire.reserve());
+    require(failures, tail.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{} a_close_behind_data_in_one_read", mode);
 
         connected_pair_t pair;
-        pair.connect(mode);
-        seal_into(pair.client, ascii_bytes("last request"), wire);
+        failures += pair.connect(mode);
+        failures += seal_into(pair.client, ascii_bytes("last request"), wire);
 
         secure_tunnel_step_t const closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
-        verify(closing.outbound.size() > 0u);
+        failures += expect(closing.outbound.size() > 0u);
         std::memcpy(wire.bytes() + wire.length, closing.outbound.data(), closing.outbound.size());
         wire.length += closing.outbound.size();
 
         // The data record has to come out first, with the close still untouched behind it.
-        verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
+        failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const data = open_from(pair.server, wire);
-        verify(data.consumed > 0u);
-        verify(data.kind == secure_tunnel_record_t::application_k);
-        verify_bytes(data.payload, ascii_bytes("last request"));
-        verify(pair.server.may_open(), "the close took effect before its record was opened");
+        failures += expect(data.consumed > 0u);
+        failures += expect(data.kind == secure_tunnel_record_t::application_k);
+        failures += expect_bytes(data.payload, ascii_bytes("last request"));
+        failures += expect(pair.server.may_open(), "the close took effect before its record was opened");
 
         std::memmove(wire.bytes(), wire.bytes() + data.consumed, wire.length - data.consumed);
         wire.length -= data.consumed;
         secure_tunnel_opened_t const shut = open_from(pair.server, wire);
-        verify(shut.consumed > 0u);
-        verify(shut.kind == secure_tunnel_record_t::close_k);
-        verify(!pair.server.may_open());
-        verify(pair.server.may_seal(), "a received close shut the reply direction too");
+        failures += expect(shut.consumed > 0u);
+        failures += expect(shut.kind == secure_tunnel_record_t::close_k);
+        failures += expect(!pair.server.may_open());
+        failures += expect(pair.server.may_seal(), "a received close shut the reply direction too");
     }
+    return failures;
 }
 
 #pragma endregion Closing
@@ -1187,41 +1233,44 @@ void test_close_delivery() {
  *  `make` calls `reset`, so re-using a `secure_tunnel_t` is the normal server shape. What a second
  *  session must not inherit is the first one's nonces, counters, or direction flags.
  */
-void test_reuse_unit() {
+case_result_t test_reuse_unit() {
+    std::size_t failures = 0;
     wire_t wire;
-    verify(wire.reserve());
+    require(failures, wire.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
         announce("{}", mode);
 
         connected_pair_t pair;
-        pair.connect(mode);
+        failures += pair.connect(mode);
         for (std::size_t index = 0; index != 4; ++index) {
-            seal_into(pair.client, ascii_bytes("first session"), wire);
-            verify(open_from(pair.server, wire).consumed > 0u);
+            failures += seal_into(pair.client, ascii_bytes("first session"), wire);
+            failures += expect(open_from(pair.server, wire).consumed > 0u);
         }
         [[maybe_unused]] secure_tunnel_step_t const closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
-        verify(!pair.client.may_seal());
-        verify(pair.client.records_sealed() > 0u);
+        failures += expect(!pair.client.may_seal());
+        failures += expect(pair.client.records_sealed() > 0u);
 
         // A fresh `make` on the same objects, exactly as a connection pool would.
-        verify(pair.attempt(mode, 0, connected_pair_t::keys_t::supplied_k) == handshake_outcome_t::settled_k,
-               "a reused tunnel could not handshake again");
+        failures += expect(
+            pair.attempt(mode, 0, connected_pair_t::keys_t::supplied_k) == handshake_outcome_t::settled_k,
+            "a reused tunnel could not handshake again");
 
-        verify(pair.client.records_sealed() == 0u, "a reused tunnel kept {} sealed records",
-               pair.client.records_sealed());
-        verify(pair.server.records_opened() == 0u, "a reused tunnel kept {} opened records",
-               pair.server.records_opened());
-        verify(pair.client.may_seal(), "a reused tunnel inherited a shut sending direction");
-        verify(pair.client.may_open());
-        verify(pair.client.fault() == secure_tunnel_fault_t::none_k);
+        failures += expect(pair.client.records_sealed() == 0u, "a reused tunnel kept {} sealed records",
+                           pair.client.records_sealed());
+        failures += expect(pair.server.records_opened() == 0u, "a reused tunnel kept {} opened records",
+                           pair.server.records_opened());
+        failures += expect(pair.client.may_seal(), "a reused tunnel inherited a shut sending direction");
+        failures += expect(pair.client.may_open());
+        failures += expect(pair.client.fault() == secure_tunnel_fault_t::none_k);
 
         // The nonces reset with everything else, so the second session's first record opens.
-        seal_into(pair.client, ascii_bytes("second session"), wire);
+        failures += seal_into(pair.client, ascii_bytes("second session"), wire);
         secure_tunnel_opened_t const opened = open_from(pair.server, wire);
-        verify(opened.consumed > 0u, "a reused tunnel's first record failed with {}", pair.server.fault());
-        verify_bytes(opened.payload, ascii_bytes("second session"));
+        failures += expect(opened.consumed > 0u, "a reused tunnel's first record failed with {}", pair.server.fault());
+        failures += expect_bytes(opened.payload, ascii_bytes("second session"));
     }
+    return failures;
 }
 
 #pragma endregion Lifecycle
@@ -1234,11 +1283,12 @@ void test_reuse_unit() {
  *  The named cases above each pin one property at one width. This is the cross-product, so a width
  *  that only misbehaves under a particular pattern has somewhere to show up.
  */
-void test_tunnel_stress() {
+case_result_t test_tunnel_stress() {
+    std::size_t failures = 0;
     wire_t wire;
-    verify(wire.reserve());
+    require(failures, wire.reserve());
     st::basic_vector<byte_t> payload;
-    verify(!st::failed(payload.resize(secure_tunnel_payload_ceiling_k)));
+    require(failures, !st::failed(payload.resize(secure_tunnel_payload_ceiling_k)));
 
     std::size_t const exchanges = scale_iterations(16);
 
@@ -1249,7 +1299,7 @@ void test_tunnel_stress() {
 
             std::size_t const filled = static_cast<std::size_t>(width);
             connected_pair_t pair;
-            pair.connect(mode, secure_tunnel_payload_ceiling_k);
+            failures += pair.connect(mode, secure_tunnel_payload_ceiling_k);
 
             for (std::size_t exchange = 0; exchange != rounds; ++exchange) {
                 byte_t const marker = static_cast<byte_t>(global_random_generator()());
@@ -1257,58 +1307,59 @@ void test_tunnel_stress() {
                 fill_with(scratch, marker);
                 span<byte_t const> const sent = scratch;
 
-                seal_into(pair.client, sent, wire);
-                verify(pair.server.bytes_until_boundary(wire.received()) == 0u);
+                failures += seal_into(pair.client, sent, wire);
+                failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
                 secure_tunnel_opened_t const request = open_from(pair.server, wire);
-                verify(request.consumed > 0u, "{} {} exchange {} was refused with {}", mode, width, exchange,
-                       pair.server.fault());
-                verify(request.payload.size() == filled, "opened {} bytes, sealed {}", request.payload.size(), filled);
-                verify(request.payload.data() == wire.bytes() + secure_tunnel_headroom_k);
-                verify(all_equal_to(request.payload, marker));
+                failures += expect(request.consumed > 0u, "{} {} exchange {} was refused with {}", mode, width,
+                                   exchange, pair.server.fault());
+                failures += expect(request.payload.size() == filled, "opened {} bytes, sealed {}",
+                                   request.payload.size(), filled);
+                failures += expect(request.payload.data() == wire.bytes() + secure_tunnel_headroom_k);
+                failures += expect(all_equal_to(request.payload, marker));
 
-                seal_into(pair.server, sent, wire);
+                failures += seal_into(pair.server, sent, wire);
                 secure_tunnel_opened_t const reply = open_from(pair.client, wire);
-                verify(reply.consumed > 0u);
-                verify(reply.payload.size() == filled);
-                verify(all_equal_to(reply.payload, marker));
+                failures += expect(reply.consumed > 0u);
+                failures += expect(reply.payload.size() == filled);
+                failures += expect(all_equal_to(reply.payload, marker));
             }
 
-            verify(pair.client.records_sealed() == pair.server.records_opened());
-            verify(pair.server.records_sealed() == pair.client.records_opened());
+            failures += expect(pair.client.records_sealed() == pair.server.records_opened());
+            failures += expect(pair.server.records_sealed() == pair.client.records_opened());
         }
+    return failures;
 }
 
 #pragma endregion Sweeps
 
-int main() {
+int main(int, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
     configure_tests();
 
-    run_test("test_hmac_unit", test_hmac_unit);
-    run_test("test_hkdf_unit", test_hkdf_unit);
-    run_test("test_transcript_unit", test_transcript_unit);
-    run_test("test_entropy_unit", test_entropy_unit);
+    suite_totals_t totals {.program = argv[0]};
+    run_test(totals, "test_hmac_unit", test_hmac_unit);
+    run_test(totals, "test_hkdf_unit", test_hkdf_unit);
+    run_test(totals, "test_transcript_unit", test_transcript_unit);
+    run_test(totals, "test_entropy_unit", test_entropy_unit);
 
-    run_test("test_config_unit", test_config_unit);
-    run_test("test_config_safety", test_config_safety);
-    run_test("test_geometry_safety", test_geometry_safety);
+    run_test(totals, "test_config_unit", test_config_unit);
+    run_test(totals, "test_config_safety", test_config_safety);
+    run_test(totals, "test_geometry_safety", test_geometry_safety);
 
-    run_test("test_handshake_unit", test_handshake_unit);
-    run_test("test_handshake_safety", test_handshake_safety);
+    run_test(totals, "test_handshake_unit", test_handshake_unit);
+    run_test(totals, "test_handshake_safety", test_handshake_safety);
 
-    run_test("test_handshake_delivery", test_handshake_delivery);
+    run_test(totals, "test_handshake_delivery", test_handshake_delivery);
 
-    run_test("test_records_unit", test_records_unit);
-    run_test("test_records_safety", test_records_safety);
-    run_test("test_records_delivery", test_records_delivery);
+    run_test(totals, "test_records_unit", test_records_unit);
+    run_test(totals, "test_records_safety", test_records_safety);
+    run_test(totals, "test_records_delivery", test_records_delivery);
 
-    run_test("test_close_unit", test_close_unit);
-    run_test("test_close_delivery", test_close_delivery);
+    run_test(totals, "test_close_unit", test_close_unit);
+    run_test(totals, "test_close_delivery", test_close_delivery);
 
-    run_test("test_reuse_unit", test_reuse_unit);
-    run_test("test_tunnel_stress", test_tunnel_stress);
-
-    fmt::print("All tests passed.\n");
-    return 0;
+    run_test(totals, "test_reuse_unit", test_reuse_unit);
+    run_test(totals, "test_tunnel_stress", test_tunnel_stress);
+    return suite_exit_code(totals);
 }

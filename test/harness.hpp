@@ -2,14 +2,18 @@
  *  @file test/harness.hpp
  *  @author Ash Vardanian
  *  @date August 9, 2026
- *  @brief Shared harness for the C++ test suites: verification, scaling, and byte diagnostics.
+ *  @brief Shared harness for the C++ test suites: counted checks, scaling, and byte diagnostics.
  *
- *  A failing check aborts, so a check is a statement rather than an expression callers accumulate.
- *  The first failure stops the run, which is why every case announces itself first - the last line
- *  on standard output names whatever the abort landed on.
+ *  Every check answers its own failure count, a case adds them up and returns a @c case_result_t,
+ *  and @c run_test rolls each result into the @c suite_totals_t the suite's @c main owns, so counts
+ *  reach @c suite_exit_code without global mutable state. A failed case prints the command that
+ *  reruns only it, under the same seed and multiplier.
  *
- *  `-fno-exceptions` rules out a `throws_verify` and a `try` around a test body, and makes
- *  `UCALL_FILTER` a substring rather than a regular expression.
+ *  A failed @c expect lets the case go on. Where the next line would dereference what the check
+ *  guarded, @c require returns from the case instead, with the failures counted so far.
+ *
+ *  `-fno-exceptions` rules out a `try` around a test body, and makes `UCALL_FILTER` a substring
+ *  rather than a regular expression.
  *
  *  @section Environment Variables
  *
@@ -31,6 +35,7 @@
  *  @endcode
  */
 #pragma once
+#include <cerrno>  // `errno`, `EAGAIN`, `EINTR`
 #include <csignal> // `std::signal`, `std::raise`, `SIGABRT`, `SIGSEGV`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint64_t`
@@ -41,6 +46,7 @@
 #include <charconv> // `std::from_chars`
 #include <chrono>   // `std::chrono::steady_clock`
 #include <random>   // `std::uniform_random_bit_generator`
+#include <string>   // `std::string`
 #include <utility>  // `std::forward`
 
 #include <fmt/base.h>   // `fmt::print`, `fmt::format_string`
@@ -54,6 +60,14 @@
 #endif
 #if UCALL_OS_LINUX_ && defined(__GLIBC__)
 #include <execinfo.h> // `backtrace`, `backtrace_symbols_fd`
+#endif
+#if UCALL_OS_POSIX_
+#include <arpa/inet.h>   // `inet_pton`, `htons`
+#include <netinet/in.h>  // `sockaddr_in`
+#include <netinet/tcp.h> // `TCP_NODELAY`
+#include <poll.h>        // `poll`
+#include <sys/socket.h>  // `socket`, `connect`, `send`, `recv`
+#include <unistd.h>      // `close`
 #endif
 
 namespace unum::ucall::test {
@@ -197,11 +211,30 @@ inline void report_failure(char const* expression, char const* file, int line) {
     fmt::print(stderr, failure_style_(), "Test verification failed: {}, {}:{}\n", expression, file, line);
 }
 
-/** Backs @c verify_bytes: reports a mismatch and answers whether the ranges agreed. */
-[[nodiscard]] inline bool report_unequal_bytes(span<byte_t const> actual, span<byte_t const> expected,
+/** Backs @c expect: counts one failure when @p holds is false, printing it with its location. */
+[[nodiscard]] inline std::size_t expect_(bool holds, char const* expression, char const* file, int line) {
+    if (holds) return 0;
+    report_failure(expression, file, line);
+    return 1;
+}
+
+/** Backs @c expect with context: counts like the plain overload, then prints the context. */
+template <typename... argument_types_>
+[[nodiscard]] std::size_t expect_(bool holds, char const* expression, char const* file, int line,
+                                  fmt::format_string<argument_types_...> format, argument_types_&&... arguments) {
+    if (holds) return 0;
+    report_failure(expression, file, line);
+    fmt::print(stderr, "  ");
+    fmt::print(stderr, format, std::forward<argument_types_>(arguments)...);
+    fmt::print(stderr, "\n");
+    return 1;
+}
+
+/** Backs @c expect_bytes: reports a mismatch and counts it as one failure. */
+[[nodiscard]] inline std::size_t expect_bytes_(span<byte_t const> actual, span<byte_t const> expected,
                                                char const* actual_text, char const* expected_text, char const* file,
                                                int line) {
-    if (bytes_equal(actual, expected)) return true;
+    if (bytes_equal(actual, expected)) return 0;
 
     fmt::print(stderr, failure_style_(), "Test verification failed: bytes differ, {}:{}\n", file, line);
     fmt::print(stderr, detail_style_(), "  actual   `{}` holds {} bytes\n", actual_text, actual.size());
@@ -226,14 +259,14 @@ inline void report_failure(char const* expression, char const* file, int line) {
     fmt::print(stderr, "\n  expected from {}: ", start);
     print_hex_(from_start(expected));
     fmt::print(stderr, "\n");
-    return false;
+    return 1;
 }
 
-/** Backs @c verify_hex: reports a mismatch and answers whether the range matched the literal. */
-[[nodiscard]] inline bool report_unmatched_hex(span<byte_t const> actual, char const* expected_hex,
-                                               char const* actual_text, char const* file, int line) {
+/** Backs @c expect_hex: reports a mismatch against the literal and counts it as one failure. */
+[[nodiscard]] inline std::size_t expect_hex_(span<byte_t const> actual, char const* expected_hex,
+                                             char const* actual_text, char const* file, int line) {
     hex_match_t const answer = bytes_match_hex_(actual, expected_hex);
-    if (answer == hex_match_t::matched_k) return true;
+    if (answer == hex_match_t::matched_k) return 0;
 
     fmt::print(stderr, failure_style_(), "Test verification failed: {}, {}:{}\n",
                answer == hex_match_t::malformed_literal_k ? "the hex literal is malformed" : "bytes do not match hex",
@@ -242,10 +275,10 @@ inline void report_failure(char const* expression, char const* file, int line) {
     fmt::print(stderr, "  actual   ");
     print_hex_(actual, 64);
     fmt::print(stderr, "\n  expected {}\n", expected_hex);
-    return false;
+    return 1;
 }
 
-/** Announces the case about to run, so an aborting harness names what it was attempting. */
+/** Announces the step about to run, so the failures printed after it read as that step's. */
 template <typename... argument_types_>
 inline void announce(fmt::format_string<argument_types_...> format, argument_types_&&... arguments) {
     fmt::print("  - ");
@@ -322,7 +355,7 @@ struct test_environment_t {
  *  is what makes the compiler enforce both rather than leave them to inspection. */
 constinit inline test_environment_t test_environment {};
 
-/** Aborts with a message, for the checks that run before the `verify` macro is in scope. */
+/** Aborts with a message, for a malformed environment that no case could run under. */
 [[noreturn]] inline void abort_with_(char const* what, char const* file, int line) {
     report_failure(what, file, line);
     std::abort();
@@ -401,13 +434,146 @@ inline void seed_generator_for_test_(char const* name) noexcept {
 
 #pragma endregion Environment
 
+#pragma region Raw Sockets
+#if UCALL_OS_POSIX_
+
+/** How a @c raw_client_t read ended. */
+enum class read_end_t : std::uint8_t {
+
+    /** The peer closed its side in order. */
+    closed_k,
+
+    /** The requested byte count arrived first. */
+    filled_k,
+
+    /** The deadline passed first. */
+    timed_out_k,
+
+    /** The socket reported an error, such as a reset. */
+    failed_k,
+};
+
+/**
+ *  @brief A blocking loopback TCP client that writes exact bytes and reads what comes back.
+ *
+ *  Library clients frame what they send, so a malformed, fragmented, or pipelined request needs
+ *  this instead. Every wait is bounded by a deadline, so a server that stalls fails a case rather
+ *  than hanging the suite.
+ */
+struct raw_client_t {
+    using deadline_t = std::chrono::steady_clock::time_point;
+
+    int descriptor = -1;
+
+    /** Every byte read so far, across calls to @c read. */
+    std::string received;
+
+    raw_client_t() noexcept = default;
+    raw_client_t(raw_client_t const&) = delete;
+    raw_client_t& operator=(raw_client_t const&) = delete;
+    ~raw_client_t() noexcept { close(); }
+
+    /** Connects to a numeric IPv4 @p address in `host:port` form, without Nagle's delay. */
+    [[nodiscard]] bool connect(std::string_view address) noexcept {
+        close();
+        auto const colon = address.rfind(':');
+        if (colon == std::string_view::npos || colon >= 16) return false;
+        char host[16] {};
+        std::memcpy(host, address.data(), colon);
+        std::uint16_t port = 0;
+        auto const [end, error] = std::from_chars(address.data() + colon + 1, address.data() + address.size(), port);
+        if (error != std::errc {} || end != address.data() + address.size()) return false;
+        sockaddr_in target {};
+        target.sin_family = AF_INET;
+        target.sin_port = htons(port);
+        if (inet_pton(AF_INET, host, &target.sin_addr) != 1) return false;
+        descriptor = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (descriptor < 0) return false;
+        int enabled = 1;
+        ::setsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+#if defined(SO_NOSIGPIPE)
+        ::setsockopt(descriptor, SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled));
+#endif
+        if (::connect(descriptor, reinterpret_cast<sockaddr const*>(&target), sizeof(target)) == 0) return true;
+        close();
+        return false;
+    }
+
+    /**
+     *  @brief Writes all of @p bytes in chunks of one to @p max_chunk bytes, drawn from the shared
+     *      generator, so a seed reproduces the fragmentation.
+     *  @return False when the peer stopped taking bytes or the deadline passed.
+     */
+    [[nodiscard]] bool write(span<byte_t const> bytes, std::size_t max_chunk, deadline_t deadline) noexcept {
+#if defined(MSG_NOSIGNAL)
+        constexpr int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
+#else
+        constexpr int flags = MSG_DONTWAIT;
+#endif
+        std::size_t offset = 0;
+        while (offset != bytes.size()) {
+            std::size_t const remaining = bytes.size() - offset;
+            std::size_t chunk = 1 + global_random_generator().below(max_chunk);
+            if (chunk > remaining) chunk = remaining;
+            std::size_t sent = 0;
+            while (sent != chunk) {
+                if (!wait_for_(POLLOUT, deadline)) return false;
+                auto const count = ::send(descriptor, bytes.data() + offset + sent, chunk - sent, flags);
+                if (count < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+                if (count <= 0) return false;
+                sent += static_cast<std::size_t>(count);
+            }
+            offset += chunk;
+        }
+        return true;
+    }
+
+    /** Reads until @c received holds @p size bytes, the peer closes, or @p deadline passes. */
+    [[nodiscard]] read_end_t read(std::size_t size, deadline_t deadline) {
+        char buffer[16384];
+        while (received.size() < size) {
+            if (!wait_for_(POLLIN, deadline)) return read_end_t::timed_out_k;
+            auto const count = ::recv(descriptor, buffer, sizeof(buffer), MSG_DONTWAIT);
+            if (count < 0 && (errno == EAGAIN || errno == EINTR)) continue;
+            if (count < 0) return read_end_t::failed_k;
+            if (count == 0) return read_end_t::closed_k;
+            received.append(buffer, static_cast<std::size_t>(count));
+        }
+        return read_end_t::filled_k;
+    }
+
+    /** Reads until the peer closes, or @p deadline passes. */
+    [[nodiscard]] read_end_t read_until_close(deadline_t deadline) { return read(std::string::npos, deadline); }
+
+    void close() noexcept {
+        if (descriptor >= 0) ::close(descriptor);
+        descriptor = -1;
+    }
+
+    /** Waits for @p events on the socket until @p deadline, answering whether they arrived. */
+    [[nodiscard]] bool wait_for_(short events, deadline_t deadline) const noexcept {
+        for (;;) {
+            auto const now = std::chrono::steady_clock::now();
+            auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - now);
+            if (left.count() < 0) return false;
+            pollfd watched {descriptor, events, 0};
+            int const ready = ::poll(&watched, 1, static_cast<int>(left.count()) + 1);
+            if (ready > 0) return true;
+            if (ready == 0 || errno != EINTR) return false;
+        }
+    }
+};
+
+#endif // UCALL_OS_POSIX_
+#pragma endregion Raw Sockets
+
 #pragma region Test Runner
 
 /**
  *  @brief Prints a backtrace on abort or a segmentation fault, then re-raises the default action.
  *
- *  Load-bearing where a counting harness would not need it: @c verify aborts, so this is what turns
- *  a failure into a located one.
+ *  A failed check is counted and located by its own message, so this is for the crash a check did
+ *  not see coming, which the last announced case and step then name.
  */
 inline void install_test_signal_handlers() noexcept {
     auto report = [](int signal_number) noexcept {
@@ -434,13 +600,52 @@ inline void install_test_signal_handlers() noexcept {
     return std::strstr(name, test_environment.filter) != nullptr;
 }
 
+/** What one case answers: its failures, and the reason it could not run when it skipped. */
+struct case_result_t {
+
+    /** Checks that failed, which a case skipping past its gate still carries from before it. */
+    std::size_t failures = 0;
+
+    /** Why the case did not run, or null when it ran. */
+    char const* skip_reason = nullptr;
+
+    /** A result of @p counted failures, so a case answering its count reads as one. */
+    constexpr case_result_t(std::size_t counted) noexcept : failures(counted) {}
+
+    /** A result that did not run for @p reason, carrying the @p counted failures from before it. */
+    [[nodiscard]] static constexpr case_result_t skipped(char const* reason, std::size_t counted = 0) noexcept {
+        case_result_t result {counted};
+        result.skip_reason = reason;
+        return result;
+    }
+};
+
+/** The counts one suite's @c main owns and every @c run_test rolls into. */
+struct suite_totals_t {
+
+    /** Cases that ran without a failure. */
+    std::size_t passed = 0;
+
+    /** Cases that did not run. */
+    std::size_t skipped = 0;
+
+    /** Cases with at least one failure. */
+    std::size_t failed = 0;
+
+    /** Failed checks across every case. */
+    std::size_t failures = 0;
+
+    /** The binary's @c argv[0], which turns a rerun line into a command. */
+    char const* program = "";
+};
+
 /**
- *  @brief Runs one named test: honors the filter, reseeds, times it, reports the outcome.
+ *  @brief Runs the case @p name unless the filter leaves it out: reseeds, times it, and rolls its
+ *      result into @p totals.
  *
- *  Reaching the end is the pass; a @c verify inside aborts, and the name printed before it started
- *  is what says which one.
+ *  A failed case also prints the command that reruns only it, under the same seed and multiplier.
  */
-inline void run_test(char const* name, void (*test_function)()) {
+inline void run_test(suite_totals_t& totals, char const* name, case_result_t (*case_function)()) {
     if (!test_should_run_(name)) {
         fmt::print("- {} ... skipped (UCALL_FILTER)\n", name);
         std::fflush(stdout);
@@ -450,10 +655,46 @@ inline void run_test(char const* name, void (*test_function)()) {
     std::fflush(stdout);
     seed_generator_for_test_(name);
     auto const start = std::chrono::steady_clock::now();
-    test_function();
+    case_result_t const result = case_function();
     double const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-    fmt::print("- {} ... ok ({:.2f} s)\n", name, seconds);
+
+    totals.failures += result.failures;
+    if (result.failures) {
+        ++totals.failed;
+        fmt::print("- {} ... FAILED with {} failures ({:.2f} s)\n", name, result.failures, seconds);
+        std::fflush(stdout);
+        fmt::print(stderr, "  rerun: UCALL_SEED={} UCALL_MULTIPLIER={} UCALL_FILTER={} {}\n", test_environment.seed,
+                   test_environment.multiplier, name, totals.program);
+    }
+    else if (result.skip_reason) {
+        ++totals.skipped;
+        fmt::print("- {} ... skipped: {}\n", name, result.skip_reason);
+    }
+    else {
+        ++totals.passed;
+        fmt::print("- {} ... ok ({:.2f} s)\n", name, seconds);
+    }
     std::fflush(stdout);
+}
+
+/**
+ *  @brief Prints the totals and answers the exit code: 1 on any failure or on a filter that matched
+ *      no case, 77 when every case that ran skipped, 0 otherwise.
+ *
+ *  A filter that selected nothing fails, since a mistyped one would otherwise read like a green
+ *  suite. 77 is the code CTest's `SKIP_RETURN_CODE` names.
+ */
+[[nodiscard]] inline int suite_exit_code(suite_totals_t const& totals) {
+    fmt::print("Totals: {} passed, {} skipped, {} failed with {} failures, seed {}\n", totals.passed, totals.skipped,
+               totals.failed, totals.failures, test_environment.seed);
+    std::fflush(stdout);
+    if (totals.failures) return 1;
+    if (test_environment.filter && totals.passed + totals.skipped == 0) {
+        fmt::print(stderr, "UCALL_FILTER={} matched no case, so nothing ran\n", test_environment.filter);
+        return 1;
+    }
+    if (totals.skipped && !totals.passed) return 77;
+    return 0;
 }
 
 #pragma endregion Test Runner
@@ -466,34 +707,33 @@ inline void run_test(char const* name, void (*test_function)()) {
 #pragma region Assertion Helpers
 
 /**
- *  @brief Test-suite verification - always active, regardless of `NDEBUG`.
+ *  @brief Counts one failure when @p condition is false - always active, regardless of `NDEBUG`.
  *
  *  Optional trailing arguments are an @c fmt format string and its operands:
  *  @code{.cpp}
- * verify(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+ * failures += expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
  *  @endcode
  */
-#define verify(condition, ...)                                                          \
-    do {                                                                                \
-        if (!(condition)) {                                                             \
-            ::unum::ucall::test::report_failure(#condition, __FILE__, __LINE__);        \
-            __VA_OPT__(fmt::print(stderr, "  " __VA_ARGS__); fmt::print(stderr, "\n");) \
-            std::abort();                                                               \
-        }                                                                               \
+#define expect(condition, ...)                                                       \
+    ::unum::ucall::test::expect_(static_cast<bool>(condition), #condition, __FILE__, \
+                                 __LINE__ __VA_OPT__(, ) __VA_ARGS__)
+
+/**
+ *  @brief Like @c expect, but a failure returns from the enclosing case with @p failures plus one.
+ *
+ *  For the checks whose failure would make the next line unsafe, such as a null about to be read.
+ */
+#define require(failures, condition, ...)                                        \
+    do {                                                                         \
+        if (expect(condition __VA_OPT__(, ) __VA_ARGS__)) return (failures) + 1; \
     } while (0)
 
-/** Compares two byte ranges, naming the first differing offset before aborting. */
-#define verify_bytes(actual, expected)                                                                                \
-    do {                                                                                                              \
-        if (!::unum::ucall::test::report_unequal_bytes((actual), (expected), #actual, #expected, __FILE__, __LINE__)) \
-            std::abort();                                                                                             \
-    } while (0)
+/** Compares two byte ranges, naming the first differing offset, and counts a mismatch. */
+#define expect_bytes(actual, expected) \
+    ::unum::ucall::test::expect_bytes_((actual), (expected), #actual, #expected, __FILE__, __LINE__)
 
 /** Compares a byte range against a hex literal, without materialising either as a string. */
-#define verify_hex(actual, expected_hex)                                                                       \
-    do {                                                                                                       \
-        if (!::unum::ucall::test::report_unmatched_hex((actual), (expected_hex), #actual, __FILE__, __LINE__)) \
-            std::abort();                                                                                      \
-    } while (0)
+#define expect_hex(actual, expected_hex) \
+    ::unum::ucall::test::expect_hex_((actual), (expected_hex), #actual, __FILE__, __LINE__)
 
 #pragma endregion Assertion Helpers

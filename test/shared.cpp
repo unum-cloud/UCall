@@ -12,7 +12,7 @@
 #include <thread>  // `std::thread`
 #include <utility> // `std::move`
 
-#include "harness.hpp" // `verify`, `run_test`, `scale_iterations`
+#include "harness.hpp" // `expect`, `require`, `run_test`
 
 using namespace unum::ucall;
 using namespace unum::ucall::test;
@@ -25,29 +25,32 @@ using namespace unum::ucall::test;
     return (difference < 0.0f ? -difference : difference) < 1e-3f;
 }
 
-void test_utilities_unit() {
+case_result_t test_utilities_unit() {
+    std::size_t failures = 0;
     announce("string_length");
     // A length of zero means "measure it"; anything else is trusted without a scan.
-    verify(string_length("hello", 0) == 5u);
-    verify(string_length("hello", 5) == 5u);
-    verify(string_length("test", 4) == 4u);
-    verify(string_length("", 0) == 0u);
-    verify(string_length("", 5) == 5u);
-    verify(string_length(nullptr, 0) == 0u);
-    verify(string_length(nullptr, 10) == 0u);
+    failures += expect(string_length("hello", 0) == 5u);
+    failures += expect(string_length("hello", 5) == 5u);
+    failures += expect(string_length("test", 4) == 4u);
+    failures += expect(string_length("", 0) == 0u);
+    failures += expect(string_length("", 5) == 5u);
+    failures += expect(string_length(nullptr, 0) == 0u);
+    failures += expect(string_length(nullptr, 10) == 0u);
 
     announce("printable");
     number_and_suffix_t scaled = printable(500);
-    verify(nearly_equal(scaled.number, 500.0f) && scaled.suffix == ' ');
+    failures += expect(nearly_equal(scaled.number, 500.0f) && scaled.suffix == ' ');
     scaled = printable(1'500);
-    verify(nearly_equal(scaled.number, 1.5f) && scaled.suffix == 'K');
+    failures += expect(nearly_equal(scaled.number, 1.5f) && scaled.suffix == 'K');
     scaled = printable(2'500'000);
-    verify(nearly_equal(scaled.number, 2.5f) && scaled.suffix == 'M');
+    failures += expect(nearly_equal(scaled.number, 2.5f) && scaled.suffix == 'M');
     scaled = printable(3'500'000'000);
-    verify(nearly_equal(scaled.number, 3.5f) && scaled.suffix == 'G');
+    failures += expect(nearly_equal(scaled.number, 3.5f) && scaled.suffix == 'G');
+    return failures;
 }
 
-void test_traffic_stats_unit() {
+case_result_t test_traffic_stats_unit() {
+    std::size_t failures = 0;
     announce("human_readable_drains_every_counter");
     traffic_stats_t stats;
     stats.added_connections.store(100);
@@ -55,16 +58,16 @@ void test_traffic_stats_unit() {
 
     char rendered[512];
     std::size_t written = stats.log_human_readable(rendered, sizeof(rendered), 5);
-    verify(written > 0 && written < sizeof(rendered));
+    failures += expect(written > 0 && written < sizeof(rendered));
     // Rendering exchanges each counter for zero, or a second call over the same window would
     // double-count what it already reported.
-    verify(stats.added_connections.load() == 0u);
-    verify(stats.bytes_sent.load() == 0u);
+    failures += expect(stats.added_connections.load() == 0u);
+    failures += expect(stats.bytes_sent.load() == 0u);
 
     announce("a_zero_second_window_does_not_divide_by_zero");
     stats.packets_received.store(1000);
     written = stats.log_human_readable(rendered, sizeof(rendered), 0);
-    verify(written > 0);
+    failures += expect(written > 0);
 
     announce("json_names_every_counter");
     stats.added_connections.store(10);
@@ -75,60 +78,64 @@ void test_traffic_stats_unit() {
     stats.packets_sent.store(75);
 
     written = stats.log_json(rendered, sizeof(rendered));
-    verify(written > 0 && written < sizeof(rendered));
+    require(failures, written > 0 && written < sizeof(rendered));
     rendered[written] = '\0';
-    verify(std::strstr(rendered, "\"add\":10") != nullptr);
-    verify(std::strstr(rendered, "\"close\":5") != nullptr);
+    failures += expect(std::strstr(rendered, "\"add\":10") != nullptr);
+    failures += expect(std::strstr(rendered, "\"close\":5") != nullptr);
+    return failures;
 }
 
 #pragma endregion Utilities
 
 #pragma region Containers
 
-void test_pool_unit() {
+case_result_t test_pool_unit() {
+    std::size_t failures = 0;
     announce("allocation_hands_out_distinct_slots");
     pool<int> slots;
-    verify(slots.reserve(5));
-    verify(slots.capacity() == 5u);
+    require(failures, slots.reserve(5));
+    failures += expect(slots.capacity() == 5u);
 
     int* const first = slots.alloc();
     int* const second = slots.alloc();
-    verify(first != nullptr);
-    verify(second != nullptr);
-    verify(first != second);
+    require(failures, first != nullptr);
+    require(failures, second != nullptr);
+    failures += expect(first != second);
 
     announce("a_released_slot_is_handed_out_again");
     *first = 42;
     slots.release(first);
     int* const reused = slots.alloc();
-    verify(reused != nullptr);
+    failures += expect(reused != nullptr);
 
     announce("offsets_round_trip");
     std::size_t const offset = slots.offset_of(*second);
-    verify(offset < 5u);
-    verify(&slots.at_offset(offset) == second);
+    require(failures, offset < 5u);
+    failures += expect(&slots.at_offset(offset) == second);
+    return failures;
 }
 
-void test_memory_map_unit() {
+case_result_t test_memory_map_unit() {
+    std::size_t failures = 0;
     announce("remap_allocates_and_reports_its_size");
     memory_map_t mapping;
-    verify(mapping.remap(fixture_buffer_bytes_k));
-    verify(mapping.data() != nullptr);
-    verify(mapping.size() == fixture_buffer_bytes_k);
+    require(failures, mapping.remap(fixture_buffer_bytes_k));
+    require(failures, mapping.data() != nullptr);
+    failures += expect(mapping.size() == fixture_buffer_bytes_k);
 
     announce("pages_arrive_zeroed");
     // A mapping that arrived dirty would hand a connection whatever the last one left behind.
-    verify(all_zero({mapping.data(), mapping.data() + mapping.size()}));
+    failures += expect(all_zero({mapping.data(), mapping.data() + mapping.size()}));
 
     announce("remapping_replaces_the_old_mapping");
-    verify(mapping.remap(fixture_buffer_bytes_k * 2));
-    verify(mapping.data() != nullptr);
-    verify(mapping.size() == fixture_buffer_bytes_k * 2);
+    failures += expect(mapping.remap(fixture_buffer_bytes_k * 2));
+    failures += expect(mapping.data() != nullptr);
+    failures += expect(mapping.size() == fixture_buffer_bytes_k * 2);
 
     announce("reset_unmaps");
     mapping.reset();
-    verify(mapping.data() == nullptr);
-    verify(mapping.size() == 0u);
+    failures += expect(mapping.size() == 0u);
+    return failures;
 }
 
 /**
@@ -137,53 +144,58 @@ void test_memory_map_unit() {
  *  The source releases ownership, the destination reports the same capacity and count, and the
  *  elements are the same objects rather than copies.
  */
-void test_containers_moves_unit() {
+case_result_t test_containers_moves_unit() {
+    std::size_t failures = 0;
     {
         announce("pool");
         pool<int> source;
-        verify(source.reserve(5));
+        require(failures, source.reserve(5));
         int* const first = source.alloc();
         int* const second = source.alloc();
-        verify(first != nullptr && second != nullptr);
+        require(failures, first != nullptr && second != nullptr);
         *first = 42;
         *second = 99;
 
         // A pool hands out addresses, so a move must not relocate what it already handed out.
         pool<int> constructed(std::move(source));
-        verify(*first == 42);
-        verify(*second == 99);
-        verify(constructed.capacity() == 5u);
+        failures += expect(*first == 42);
+        failures += expect(*second == 99);
+        failures += expect(constructed.capacity() == 5u);
 
         pool<int> assigned;
         assigned = std::move(constructed);
-        verify(*first == 42);
-        verify(*second == 99);
-        verify(assigned.capacity() == 5u);
+        failures += expect(*first == 42);
+        failures += expect(*second == 99);
+        failures += expect(assigned.capacity() == 5u);
     }
+    return failures;
 }
 
-void test_containers_safety() {
+case_result_t test_containers_safety() {
+    std::size_t failures = 0;
     announce("a_pool_refuses_rather_than_overruns");
     pool<int> slots;
-    verify(slots.reserve(5));
+    require(failures, slots.reserve(5));
     int* taken[5];
     for (std::size_t index = 0; index != 5; ++index) {
         taken[index] = slots.alloc();
-        verify(taken[index] != nullptr);
+        require(failures, taken[index] != nullptr);
     }
     // The sixth request must say so rather than hand back a slot already in use.
-    verify(slots.alloc() == nullptr);
+    failures += expect(slots.alloc() == nullptr);
 
     slots.release(taken[2]);
-    verify(slots.alloc() != nullptr);
-    verify(slots.alloc() == nullptr);
+    failures += expect(slots.alloc() != nullptr);
+    failures += expect(slots.alloc() == nullptr);
+    return failures;
 }
 
 #pragma endregion Containers
 
-void test_outcomes_unit() {
+case_result_t test_outcomes_unit() {
+    std::size_t failures = 0;
     ucall_outcome_t outcome {ucall_status_deferred_k, "deferred"};
-    verify(ucall_outcome_status(&outcome) == ucall_status_deferred_k);
+    failures += expect(ucall_outcome_status(&outcome) == ucall_status_deferred_k);
     int output = 0;
     std::thread producer([&] {
         output = 42;
@@ -192,24 +204,24 @@ void test_outcomes_unit() {
         word.store(ucall_status_success_k, std::memory_order_release);
         word.notify_all();
     });
-    verify(ucall_outcome_wait(&outcome) == ucall_status_success_k);
-    verify(output == 42 && outcome.message == nullptr);
+    failures += expect(ucall_outcome_wait(&outcome) == ucall_status_success_k);
+    failures += expect(output == 42 && outcome.message == nullptr);
     producer.join();
+    return failures;
 }
 
-int main() {
+int main(int, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
     configure_tests();
 
-    run_test("test_utilities_unit", test_utilities_unit);
-    run_test("test_traffic_stats_unit", test_traffic_stats_unit);
-    run_test("test_pool_unit", test_pool_unit);
-    run_test("test_memory_map_unit", test_memory_map_unit);
-    run_test("test_containers_moves_unit", test_containers_moves_unit);
-    run_test("test_containers_safety", test_containers_safety);
-    run_test("test_outcomes_unit", test_outcomes_unit);
-
-    fmt::print("All tests passed.\n");
-    return 0;
+    suite_totals_t totals {.program = argv[0]};
+    run_test(totals, "test_utilities_unit", test_utilities_unit);
+    run_test(totals, "test_traffic_stats_unit", test_traffic_stats_unit);
+    run_test(totals, "test_pool_unit", test_pool_unit);
+    run_test(totals, "test_memory_map_unit", test_memory_map_unit);
+    run_test(totals, "test_containers_moves_unit", test_containers_moves_unit);
+    run_test(totals, "test_containers_safety", test_containers_safety);
+    run_test(totals, "test_outcomes_unit", test_outcomes_unit);
+    return suite_exit_code(totals);
 }

@@ -25,16 +25,42 @@
       "inherits": "base",
       "displayName": "Host Release",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
+    },
+    {
+      "name": "debug-asan",
+      "inherits": "debug",
+      "displayName": "Host Debug with AddressSanitizer and UndefinedBehaviorSanitizer",
+      "cacheVariables": {"UCALL_BUILD_SANITIZERS": "address"}
+    },
+    {
+      "name": "debug-tsan",
+      "inherits": "debug",
+      "displayName": "Host Debug with ThreadSanitizer",
+      "cacheVariables": {"UCALL_BUILD_SANITIZERS": "thread"}
     }
   ],
   "buildPresets": [
     {"name": "debug", "configurePreset": "debug"},
     {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
-    {"name": "release", "configurePreset": "release"}
+    {"name": "release", "configurePreset": "release"},
+    {"name": "debug-asan", "configurePreset": "debug-asan"},
+    {"name": "debug-tsan", "configurePreset": "debug-tsan"}
   ],
   "testPresets": [
     {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
     {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": {"outputOnFailure": true}},
-    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}}
+    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
+    {
+      "name": "debug-asan",
+      "configurePreset": "debug-asan",
+      "output": {"outputOnFailure": true},
+      "environment": {"UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"}
+    },
+    {
+      "name": "debug-tsan",
+      "configurePreset": "debug-tsan",
+      "output": {"outputOnFailure": true},
+      "environment": {"TSAN_OPTIONS": "halt_on_error=1"}
+    }
   ]
 }

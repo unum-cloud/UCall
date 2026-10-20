@@ -47,6 +47,18 @@ option(UCALL_BUILD_EXAMPLES "Build the echo, ledger, and key-value examples" OFF
 option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
 option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" ${UCALL_IS_MAIN_PROJECT})
 option(UCALL_BUILD_ALL "Build every target supported on this platform" OFF)
+set(UCALL_BUILD_SANITIZERS
+    "off"
+    CACHE STRING "Sanitizers for UCall's own targets: off, address (with undefined) or thread"
+)
+set_property(CACHE UCALL_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
+
+# ThreadSanitizer sees no inline assembly, so ForkUnion leaves out its instruction-set atomics and the rungs above them.
+if (UCALL_BUILD_SANITIZERS STREQUAL "thread")
+    set(FORKUNION_TARGET_ARM64_LSE OFF)
+    set(FORKUNION_TARGET_X86_CMPCCXADD OFF)
+    set(FORKUNION_TARGET_RISC5_ATOMIC OFF)
+endif ()
 
 if (UCALL_BUILD_ALL)
     set(UCALL_BUILD_EXAMPLES ON)
@@ -195,6 +207,29 @@ if (UCALL_BUILD_TEST)
     FetchContent_MakeAvailable(fmt)
 endif ()
 
+# Sanitizers instrument UCall's library and tests, while fetched dependencies keep their own flags.
+add_library(ucall_sanitizers INTERFACE)
+if (UCALL_BUILD_SANITIZERS STREQUAL "address")
+    if (MSVC)
+        set(ucall_sanitizer_flags /fsanitize=address)
+    else ()
+        set(ucall_sanitizer_flags -fsanitize=address,undefined -fno-omit-frame-pointer)
+    endif ()
+elseif (UCALL_BUILD_SANITIZERS STREQUAL "thread")
+    if (MSVC)
+        message(FATAL_ERROR "MSVC has no ThreadSanitizer, so UCALL_BUILD_SANITIZERS=thread needs Clang or GCC")
+    endif ()
+    set(ucall_sanitizer_flags -fsanitize=thread)
+elseif (NOT UCALL_BUILD_SANITIZERS STREQUAL "off")
+    message(FATAL_ERROR "UCALL_BUILD_SANITIZERS is off, address or thread, not '${UCALL_BUILD_SANITIZERS}'")
+endif ()
+if (ucall_sanitizer_flags)
+    target_compile_options(ucall_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_sanitizer_flags}>")
+    if (NOT MSVC)
+        target_link_options(ucall_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ucall_sanitizer_flags}>")
+    endif ()
+endif ()
+
 # One compiled class per distinct native kernel bundle; flags stay on its instantiation unit.
 include(CheckCXXCompilerFlag)
 
@@ -217,7 +252,7 @@ target_compile_definitions(
 target_link_libraries(
     ucall
     PUBLIC forkunion::header smashtable::header stringzilla::header
-    PRIVATE Threads::Threads
+    PRIVATE Threads::Threads ucall_sanitizers
 )
 foreach (capabilities forkunion::cpu_capabilities_compiled stringzilla::cpu_capabilities_compiled)
     if (TARGET ${capabilities})

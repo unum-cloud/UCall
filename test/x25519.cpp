@@ -14,7 +14,7 @@
 #include <cstring> // `std::memcpy`
 
 #include "ucall/curve25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
-#include "harness.hpp"          // `verify`, `run_test`, `from_hex`
+#include "harness.hpp"          // `expect`, `run_test`, `from_hex`
 
 using namespace unum::ucall;
 using namespace unum::ucall::test;
@@ -90,11 +90,12 @@ struct decoded_vector_t {
     byte_t scalar[x25519_key_size_k] {};
     byte_t point[x25519_key_size_k] {};
 
-    explicit decoded_vector_t(x25519_vector_t const& vector) noexcept {
-        verify(from_hex(vector.scalar_hex, {scalar, scalar + x25519_key_size_k}), "{} has a bad scalar literal",
-               vector.label);
-        verify(from_hex(vector.point_hex, {point, point + x25519_key_size_k}), "{} has a bad point literal",
-               vector.label);
+    /** Decodes @p vector, counting a malformed literal into @p failures. */
+    decoded_vector_t(x25519_vector_t const& vector, std::size_t& failures) {
+        failures += expect(from_hex(vector.scalar_hex, {scalar, scalar + x25519_key_size_k}),
+                           "{} has a bad scalar literal", vector.label);
+        failures += expect(from_hex(vector.point_hex, {point, point + x25519_key_size_k}), "{} has a bad point literal",
+                           vector.label);
     }
 };
 
@@ -143,7 +144,8 @@ static x25519_backend_t const& x25519_reference_k = x25519_backends_k[1];
 
 #pragma region Known Answers
 
-void test_x25519_unit() {
+case_result_t test_x25519_unit() {
+    std::size_t failures = 0;
 
     // RFC 7748 §5.2: k = u = 9, then k = X25519(k, u). The trip counts are the specification's
     // own, so they are fixed rather than scaled.
@@ -152,8 +154,8 @@ void test_x25519_unit() {
     scalar[0] = byte_t {9}, point[0] = byte_t {9};
 
     byte_t after_one[x25519_key_size_k];
-    verify(x25519_scalar_multiply(after_one, scalar, point));
-    verify_hex(after_one, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    failures += expect(x25519_scalar_multiply(after_one, scalar, point));
+    failures += expect_hex(after_one, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
 
     for (std::size_t iteration = 0; iteration != 1000; ++iteration) {
         byte_t next[x25519_key_size_k];
@@ -161,30 +163,31 @@ void test_x25519_unit() {
         std::memcpy(point, scalar, x25519_key_size_k);
         std::memcpy(scalar, next, x25519_key_size_k);
     }
-    verify_hex(scalar, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
+    failures += expect_hex(scalar, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
 
     // RFC 7748 vector 1 and Wycheproof tcId=100 hold the same key, before and after clamping.
     announce("clamping_is_idempotent");
     byte_t raw_scalar[x25519_key_size_k], clamped_scalar[x25519_key_size_k], shared_point[x25519_key_size_k];
-    verify(from_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
-                    {raw_scalar, raw_scalar + x25519_key_size_k}));
-    verify(from_hex("a046e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449a44",
-                    {clamped_scalar, clamped_scalar + x25519_key_size_k}));
-    verify(from_hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
-                    {shared_point, shared_point + x25519_key_size_k}));
+    failures += expect(from_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+                                {raw_scalar, raw_scalar + x25519_key_size_k}));
+    failures += expect(from_hex("a046e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449a44",
+                                {clamped_scalar, clamped_scalar + x25519_key_size_k}));
+    failures += expect(from_hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+                                {shared_point, shared_point + x25519_key_size_k}));
 
     byte_t from_raw[x25519_key_size_k], from_clamped[x25519_key_size_k];
-    verify(x25519_scalar_multiply(from_raw, raw_scalar, shared_point));
-    verify(x25519_scalar_multiply(from_clamped, clamped_scalar, shared_point));
-    verify_bytes(from_raw, from_clamped);
-    verify_hex(from_raw, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+    failures += expect(x25519_scalar_multiply(from_raw, raw_scalar, shared_point));
+    failures += expect(x25519_scalar_multiply(from_clamped, clamped_scalar, shared_point));
+    failures += expect_bytes(from_raw, from_clamped);
+    failures += expect_hex(from_raw, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
 
     announce("derive_public_matches_base_point");
     byte_t nine[x25519_key_size_k] {};
     nine[0] = byte_t {9};
     byte_t derived[x25519_key_size_k];
     x25519_derive_public(derived, nine);
-    verify_hex(derived, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    failures += expect_hex(derived, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    return failures;
 }
 
 #pragma endregion Known Answers
@@ -197,18 +200,19 @@ void test_x25519_unit() {
  *  The chain matters separately from the vectors: a carry bug a single multiplication hides
  *  compounds once each result feeds the next.
  */
-void test_x25519_all() {
+case_result_t test_x25519_all() {
+    std::size_t failures = 0;
 
     for (x25519_backend_t const& backend : x25519_backends_k) {
         if (!runnable_here(backend)) continue;
         announce("{}", backend.name);
         for (x25519_vector_t const& vector : x25519_vectors_k) {
-            decoded_vector_t const decoded(vector);
+            decoded_vector_t const decoded(vector, failures);
             byte_t produced[x25519_key_size_k];
             shared_secret_t const answer = reported(backend.multiply(produced, decoded.scalar, decoded.point));
-            verify(answer == vector.expected, "{} called {} a {} secret, expected {}", backend.name, vector.label,
-                   answer, vector.expected);
-            verify_hex(produced, vector.shared_hex);
+            failures += expect(answer == vector.expected, "{} called {} a {} secret, expected {}", backend.name,
+                               vector.label, answer, vector.expected);
+            failures += expect_hex(produced, vector.shared_hex);
         }
     }
 
@@ -224,17 +228,18 @@ void test_x25519_all() {
             byte_t expected[x25519_key_size_k], produced[x25519_key_size_k];
             [[maybe_unused]] bool const reference_usable = x25519_reference_k.multiply(expected, scalar, point);
             [[maybe_unused]] bool const candidate_usable = backend.multiply(produced, scalar, point);
-            verify(bytes_equal(produced, expected), "{} left {} at iteration {}", backend.name, x25519_reference_k.name,
-                   iteration);
+            failures += expect(bytes_equal(produced, expected), "{} left {} at iteration {}", backend.name,
+                               x25519_reference_k.name, iteration);
             std::memcpy(point, scalar, x25519_key_size_k);
             std::memcpy(scalar, expected, x25519_key_size_k);
         }
     }
+    return failures;
 }
 
 #pragma endregion Tier Differential
 
-int main() {
+int main(int, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
     fmt::print("  x25519 tiers built     serial={} radix51={} adx={}\n",
@@ -245,9 +250,8 @@ int main() {
     fmt::print("  x25519 tier preferred  {}\n", x25519_tier_name(x25519_tier_preferred()));
     configure_tests();
 
-    run_test("test_x25519_unit", test_x25519_unit);
-    run_test("test_x25519_all", test_x25519_all);
-
-    fmt::print("All tests passed.\n");
-    return 0;
+    suite_totals_t totals {.program = argv[0]};
+    run_test(totals, "test_x25519_unit", test_x25519_unit);
+    run_test(totals, "test_x25519_all", test_x25519_all);
+    return suite_exit_code(totals);
 }
