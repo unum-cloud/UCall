@@ -21,12 +21,20 @@
 
 namespace unum::ucall {
 
-template <typename engine_type_, cpu_class_t cpu_class_>
+template <typename engine_type_, cpu_class_t cpu_class_, typename allocator_type_ = st::default_allocator<byte_t>>
 struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k> {
     static constexpr sz_capability_t capabilities_k = cpu_traits<cpu_class_>::stringzilla_capabilities_k;
     using http_t = http<capabilities_k>;
+    using allocator_t = allocator_type_;
+    using engine_t = typename engine_type_::template rebind_allocator<allocator_t>;
     template <typename value_type_>
-    using atomic_ref_type_ = typename cpu_traits<cpu_class_>::template atomic_ref<value_type_>;
+    using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
+    template <typename value_type_>
+    using vector = st::basic_vector<value_type_, rebound_allocator<value_type_>>;
+    template <typename value_type_>
+    using owner = allocated_ptr<value_type_, allocator_t>;
+    template <typename value_type_>
+    using atomic_ref = typename cpu_traits<cpu_class_>::template atomic_ref<value_type_>;
     using http_message_t = typename http_t::http_message_t;
     using http_t::append_text;
     using http_t::c_view;
@@ -57,6 +65,12 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         closed_k
     };
 
+    enum connection_flags_t : std::uint8_t {
+        connection_none_k = 0,
+        connection_authorized_k = 1,
+        connection_pending_k = 2,
+        connection_peer_closed_k = 4
+    };
     struct server_t;
     struct client_t;
     struct loop_t;
@@ -65,9 +79,19 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     struct endpoint_t;
     struct request_t;
     struct batch_t;
+    inline static thread_local loop_t* polling_loop {};
 
     /** Drives accepted and dialed sockets through partial handshakes, records, and writes. */
     struct connection_t {
+        explicit connection_t(allocator_t const& allocator = {}) noexcept
+            : input(rebound_allocator<byte_t> {allocator}), encrypted(rebound_allocator<byte_t> {allocator}),
+              output(rebound_allocator<byte_t> {allocator}), received(rebound_allocator<byte_t> {allocator}),
+              record(rebound_allocator<byte_t> {allocator}) {}
+        connection_t(connection_t const&) = delete;
+        connection_t& operator=(connection_t const&) = delete;
+        connection_t(connection_t&&) = delete;
+        connection_t& operator=(connection_t&&) = delete;
+
         io_request_t request {};
         descriptor_t descriptor {-1};
         connection_role_t role {connection_role_t::server_k};
@@ -75,13 +99,13 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         ucall_status_t status {ucall_status_success_k};
         std::uint64_t deadline {};
         secure_tunnel<capabilities_k> tunnel {};
-        st::basic_vector<byte_t> input {}, encrypted {}, output {};
+        vector<byte_t> input {}, encrypted {}, output {};
         http_message_t message {};
         ucall_verb_t verb {ucall_verb_get_k};
         ucall_peer_authorizer_t authorizer {};
         void* authorizer_context {};
-        bool authorized {}, pending {}, peer_closed {};
-        st::basic_vector<byte_t> received {}, record {};
+        connection_flags_t flags {connection_none_k};
+        vector<byte_t> received {}, record {};
         byte_t* sending {};
         std::size_t sending_length {}, sending_offset {}, output_offset {}, payload_length {};
         binding_t* binding {};
@@ -97,7 +121,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             sending = nullptr;
             sending_length = sending_offset = output_offset = payload_length = 0;
             deadline = 0;
-            peer_closed = pending = false;
+            flags = connection_none_k;
             auto fault = tunnel.make(config);
             if (fault != secure_tunnel_fault_t::none_k) return ucall_status_handshake_failed_k;
             auto page = page_size();
@@ -106,12 +130,12 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 st::failed(record.resize(tunnel.geometry().record_size())))
                 return ucall_status_out_of_memory_k;
             request.context = this;
-            authorized = config.mode == secure_tunnel_mode_t::plain_k;
+            flags = config.mode == secure_tunnel_mode_t::plain_k ? connection_authorized_k : connection_none_k;
             return ucall_status_success_k;
         }
         io_request_t* advance(io_completion_t const* completion = nullptr) noexcept {
             if (completion) {
-                pending = false;
+                flags = static_cast<connection_flags_t>(flags & ~connection_pending_k);
                 auto result = completion->result;
                 if (request.operation == io_operation_t::close_k) {
                     descriptor = -1;
@@ -129,7 +153,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 }
                 else if (request.operation == io_operation_t::receive_k) {
                     if (!result) {
-                        peer_closed = true;
+                        flags = static_cast<connection_flags_t>(flags | connection_peer_closed_k);
                         if (!tunnel.encrypts() && role == connection_role_t::client_k && message.headers_length &&
                             message.framing == http_framing_t::until_close_k) {
                             message.body_length = input.size() - message.headers_length;
@@ -194,7 +218,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                     }
                     if (step.state != secure_tunnel_state_t::ready_k)
                         return emit(io_operation_t::receive_k, received.data(), received.size());
-                    if (!authorized) {
+                    if (!(flags & connection_authorized_k)) {
                         ucall_noise_key_t key {};
                         if (!tunnel.peer_key(std::as_writable_bytes(std::span {key}).data())) {
                             fail(ucall_status_handshake_failed_k);
@@ -204,7 +228,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                             fail(ucall_status_peer_rejected_k);
                             continue;
                         }
-                        authorized = true;
+                        flags = static_cast<connection_flags_t>(flags | connection_authorized_k);
                     }
                     stage = role == connection_role_t::client_k ? connection_stage_t::transmitting_k
                                                                 : connection_stage_t::receiving_k;
@@ -259,7 +283,8 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                             break;
                         }
                         drop_bytes(encrypted, opened.consumed);
-                        if (opened.kind == secure_tunnel_record_t::close_k) peer_closed = true;
+                        if (opened.kind == secure_tunnel_record_t::close_k)
+                            flags = static_cast<connection_flags_t>(flags | connection_peer_closed_k);
                     }
                     if (stage == connection_stage_t::closing_k) continue;
                     auto http_role = role == connection_role_t::server_k ? http_role_t::request_k
@@ -286,7 +311,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                                                                      : ucall_status_malformed_k);
                         continue;
                     }
-                    if (peer_closed) {
+                    if (flags & connection_peer_closed_k) {
                         if (role == connection_role_t::client_k && message.headers_length &&
                             message.framing == http_framing_t::until_close_k) {
                             message.body_length = input.size() - message.headers_length;
@@ -318,7 +343,14 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     };
 
     struct endpoint_t {
-        st::basic_vector<char> storage {};
+        explicit endpoint_t(allocator_t const& allocator = {}) noexcept
+            : storage(rebound_allocator<char> {allocator}) {}
+        endpoint_t(endpoint_t const&) = delete;
+        endpoint_t& operator=(endpoint_t const&) = delete;
+        endpoint_t(endpoint_t&&) = delete;
+        endpoint_t& operator=(endpoint_t&&) = delete;
+
+        vector<char> storage {};
         std::string_view path {};
         ucall_verb_t verb {};
         ucall_received_http_request_callback_t callback {};
@@ -329,108 +361,166 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     };
     enum request_state_t : std::uint32_t { claimed_k = 1, ready_k = 2, detached_k = 4 };
     struct request_t : ucall_received_http_request_handle_t {
+        explicit request_t(allocator_t const& allocator = {}) noexcept
+            : input(rebound_allocator<byte_t> {allocator}), output(rebound_allocator<byte_t> {allocator}) {}
+        request_t(request_t const&) = delete;
+        request_t& operator=(request_t const&) = delete;
+        request_t(request_t&&) = delete;
+        request_t& operator=(request_t&&) = delete;
+
         loop_t* loop {};
         connection_t* connection {};
         endpoint_t* endpoint {};
         request_t* next {};
         http_message_t message {};
-        st::basic_vector<byte_t> input {}, output {};
+        vector<byte_t> input {}, output {};
         std::uint32_t state {};
         std::string_view text() const noexcept { return http_t::text_view(input); }
     };
     struct batch_t {
+        explicit batch_t(allocator_t const& allocator = {}) noexcept
+            : requests(rebound_allocator<ucall_received_http_request_t> {allocator}) {}
+        batch_t(batch_t const&) = delete;
+        batch_t& operator=(batch_t const&) = delete;
+        batch_t(batch_t&&) = delete;
+        batch_t& operator=(batch_t&&) = delete;
+
         endpoint_t* endpoint {};
-        st::basic_vector<ucall_received_http_request_t> requests {};
+        vector<ucall_received_http_request_t> requests {};
         std::uint64_t deadline {};
         batch_t* next {};
     };
     struct binding_t {
+        explicit binding_t(allocator_t const& allocator = {}) noexcept
+            : address(rebound_allocator<char> {allocator}), device(rebound_allocator<char> {allocator}) {}
+        binding_t(binding_t const&) = delete;
+        binding_t& operator=(binding_t const&) = delete;
+        binding_t(binding_t&&) = delete;
+        binding_t& operator=(binding_t&&) = delete;
+
         ucall_network_interface_t config {};
-        st::basic_vector<char> address {}, device {};
+        vector<char> address {}, device {};
         byte_t public_key[32] {};
         ucall_noise_key_t private_key {};
         std::size_t active {};
     };
     using wake_t = wake_channel_t;
     struct listener_t {
+        listener_t() noexcept = default;
+        listener_t(listener_t const&) = delete;
+        listener_t& operator=(listener_t const&) = delete;
+        listener_t(listener_t&&) = delete;
+        listener_t& operator=(listener_t&&) = delete;
         io_request_t request {};
         binding_t* binding {};
         loop_t* loop {};
-        bool pending {}, imported {};
+        enum class stage_t { idle_k, pending_k };
+        stage_t stage {stage_t::idle_k};
+        descriptor_t descriptor {-1};
     };
+    enum class loop_stage_t { unopened_k, ready_k, quiesced_k };
     struct loop_t {
-        engine_type_ engine {};
+        allocator_t allocator;
+        explicit loop_t(allocator_t const& allocator = {}) noexcept
+            : allocator(allocator), engine(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
+              connections(rebound_allocator<owner<connection_t>> {allocator}) {}
+        loop_t(loop_t const&) = delete;
+        loop_t& operator=(loop_t const&) = delete;
+        loop_t(loop_t&&) = delete;
+        loop_t& operator=(loop_t&&) = delete;
+
+        engine_t engine {};
         wake_t wake {};
-        st::basic_vector<io_completion_t> completions {};
+        vector<io_completion_t> completions {};
         server_t* server {};
         std::uint32_t wake_pending {};
-        bool opened {};
-        st::basic_vector<std::unique_ptr<connection_t>> connections {};
-        st::basic_vector<listener_t> listeners {};
-        bool quiesced {};
+        loop_stage_t stage {loop_stage_t::unopened_k};
+        vector<owner<connection_t>> connections {};
+        span<listener_t> listeners {};
         request_t* requests {};
         request_t* free_requests {};
         batch_t* batches {};
         batch_t* free_batches {};
         ucall_status_t setup_status {ucall_status_success_k};
         void notify() noexcept {
-            if (!atomic_ref_type_<std::uint32_t> {wake_pending}.exchange(1, std::memory_order_release)) wake.notify();
+            if (polling_loop == this) return;
+            if (!atomic_ref<std::uint32_t> {wake_pending}.exchange(1, std::memory_order_release)) wake.notify();
         }
         ~loop_t() noexcept {
             engine.stop();
             if (wake.descriptors[0] < 0 && wake.request.descriptor >= 0) engine.close_socket(wake.request.descriptor);
             for (auto& connection : connections)
                 if (connection && connection->descriptor >= 0 &&
-                    !(connection->pending && connection->request.operation == io_operation_t::close_k &&
-                      connection->request.descriptor < 0))
+                    !((connection->flags & connection_pending_k) &&
+                      connection->request.operation == io_operation_t::close_k && connection->request.descriptor < 0))
                     engine.close_socket(connection->descriptor);
             while (requests) {
                 auto* next = requests->next;
-                delete requests;
+                allocator_delete<request_t, allocator_t> {allocator}(requests);
                 requests = next;
             }
             while (free_requests) {
                 auto* next = free_requests->next;
-                delete free_requests;
+                allocator_delete<request_t, allocator_t> {allocator}(free_requests);
                 free_requests = next;
             }
             while (batches) {
                 auto* next = batches->next;
-                delete batches;
+                allocator_delete<batch_t, allocator_t> {allocator}(batches);
                 batches = next;
             }
             while (free_batches) {
                 auto* next = free_batches->next;
-                delete free_batches;
+                allocator_delete<batch_t, allocator_t> {allocator}(free_batches);
                 free_batches = next;
             }
-            for (auto& listener : listeners)
+            for (auto& listener : listeners) {
                 if (listener.request.descriptor >= 0) {
-                    if (listener.imported) engine.close_socket(listener.request.descriptor);
-                    else socket_close(listener.request.descriptor);
+                    if (listener.descriptor >= 0) socket_close(listener.descriptor);
+                    else engine.close_socket(listener.request.descriptor);
                 }
+                std::destroy_at(&listener);
+            }
+            if (!listeners.empty())
+                rebound_allocator<listener_t> {allocator}.deallocate(listeners.data(), listeners.size());
         }
     };
     struct server_t : ucall_server_handle_t {
-        std::atomic<ucall_status_t> failure {ucall_status_success_k};
+        allocator_t allocator;
+        explicit server_t(allocator_t const& allocator = {}) noexcept
+            : allocator(allocator), resolved(rebound_allocator<ucall_network_interface_t> {allocator}),
+              loops(rebound_allocator<owner<loop_t>> {allocator}), routes(allocator),
+              owned_wakeups(rebound_allocator<wake_t*> {allocator}) {}
+        server_t(server_t const&) = delete;
+        server_t& operator=(server_t const&) = delete;
+        server_t(server_t&&) = delete;
+        server_t& operator=(server_t&&) = delete;
+
+        ucall_status_t failure {ucall_status_success_k};
         ucall_server_config_t config {};
-        st::basic_vector<binding_t> bindings {};
-        st::basic_vector<ucall_network_interface_t> resolved {};
-        st::basic_vector<std::unique_ptr<loop_t>> loops {};
-        route_trie<http_t> routes {};
+        span<binding_t> bindings {};
+        vector<ucall_network_interface_t> resolved {};
+        vector<owner<loop_t>> loops {};
+        route_trie<http_t, allocator_t> routes {};
+        vector<wake_t*> owned_wakeups;
         endpoint_t* endpoints {};
-        std::uint32_t stopped {};
         std::uint32_t serving {};
         ~server_t() noexcept {
-            for (auto& binding : bindings) secure_tunnel_crypto<capabilities_k>::secure_zero(binding.private_key);
+            loops.clear();
+            for (auto& binding : bindings) {
+                secure_tunnel_crypto<capabilities_k>::secure_zero(binding.private_key);
+                std::destroy_at(&binding);
+            }
+            if (!bindings.empty())
+                rebound_allocator<binding_t> {allocator}.deallocate(bindings.data(), bindings.size());
             while (endpoints) {
                 auto* next = endpoints->next;
-                delete endpoints;
+                allocator_delete<endpoint_t, allocator_t> {allocator}(endpoints);
                 endpoints = next;
             }
         }
     };
-    using response_t = received_response_t;
+    using response_t = received_response<allocator_t>;
 
     static secure_tunnel_mode_t tunnel_mode(ucall_security_mode_t mode) noexcept {
         return static_cast<secure_tunnel_mode_t>(mode);
@@ -449,12 +539,11 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         if (peer_key) config.remote_public = std::as_bytes(std::span {*peer_key});
         return config;
     }
-    static bool copy_text(st::basic_vector<char>& destination, std::string_view text) noexcept {
+    static bool copy_text(vector<char>& destination, std::string_view text) noexcept {
         destination.clear();
         return append_text(destination, text) && append_text(destination, std::string_view {"\0", 1});
     }
-    static bool split_address(std::string_view address, st::basic_vector<char>& host,
-                              st::basic_vector<char>& service) noexcept {
+    static bool split_address(std::string_view address, vector<char>& host, vector<char>& service) noexcept {
         auto colon = http_t::rfind(address, ':');
         if (colon == std::string_view::npos || !colon || colon + 1 == address.size()) return false;
         auto name = address.substr(0, colon), port = address.substr(colon + 1);
@@ -489,7 +578,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
 #endif // UCALL_OS_LINUX_
     }
     static ucall_status_t bind_listener(binding_t& binding, listener_t& listener) noexcept {
-        st::basic_vector<char> host, service;
+        vector<char> host {rebound_allocator<char> {binding.address.get_allocator()}}, service {host.get_allocator()};
         if (!sockets_start()) return ucall_status_io_k;
         if (!split_address(binding.config.address, host, service)) return ucall_status_invalid_argument_k;
         addrinfo hints {};
@@ -546,8 +635,8 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         return ucall_status_success_k;
     }
 
-    static ucall_status_t append_headers(st::basic_vector<byte_t>& output, ucall_bytes_view_t const* headers,
-                                         std::size_t count, http_role_t role) noexcept {
+    static ucall_status_t append_headers(vector<byte_t>& output, ucall_bytes_view_t const* headers, std::size_t count,
+                                         http_role_t role) noexcept {
         if (count && !headers) return ucall_status_invalid_argument_k;
         for (std::size_t i = 0; i != count; ++i) {
             if (!valid_view(headers[i])) return ucall_status_invalid_argument_k;
@@ -599,7 +688,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             }
         }
         std::snprintf(first, sizeof(first), "connection: %s\r\n\r\n",
-                      request.message.keep_alive ? "keep-alive" : "close");
+                      request.message.keep_alive() ? "keep-alive" : "close");
         if (!append_text(request.output, first) ||
             (request.message.verb != ucall_verb_head_k && !append_text(request.output, body))) {
             request.output.clear();
@@ -609,12 +698,12 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     }
     static ucall_status_t reply(request_t& request, unsigned status, ucall_bytes_view_t const* headers,
                                 std::size_t count, std::string_view body) noexcept {
-        auto state = atomic_ref_type_<std::uint32_t> {request.state};
+        auto state = atomic_ref<std::uint32_t> {request.state};
         auto previous = state.fetch_or(claimed_k, std::memory_order_acq_rel);
         if (previous & claimed_k) return ucall_status_already_exists_k;
         auto* loop = request.loop;
         if ((previous & detached_k) ||
-            atomic_ref_type_<std::uint32_t> {request.loop->server->stopped}.load(std::memory_order_acquire)) {
+            atomic_ref<std::uint32_t> {request.loop->server->stopped}.load(std::memory_order_acquire)) {
             state.fetch_or(detached_k | ready_k, std::memory_order_release);
             loop->notify();
             return ucall_status_connection_closed_k;
@@ -632,7 +721,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     static void detach(connection_t& connection) noexcept {
         if (!connection.exchange) return;
         connection.exchange->connection = nullptr;
-        atomic_ref_type_<std::uint32_t> {connection.exchange->state}.fetch_or(detached_k, std::memory_order_release);
+        atomic_ref<std::uint32_t> {connection.exchange->state}.fetch_or(detached_k, std::memory_order_release);
         connection.exchange = nullptr;
     }
     static void recycle_request(loop_t& loop, request_t& request) noexcept {
@@ -644,7 +733,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     static void collect_requests(loop_t& loop) noexcept {
         for (auto** position = &loop.requests; *position;) {
             auto& request = **position;
-            auto state = atomic_ref_type_<std::uint32_t> {request.state}.load(std::memory_order_acquire);
+            auto state = atomic_ref<std::uint32_t> {request.state}.load(std::memory_order_acquire);
             if (!(state & ready_k) || request.connection) {
                 position = &request.next;
                 continue;
@@ -658,7 +747,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         *position = batch->next;
         if (stopping) {
             for (auto request : batch->requests)
-                atomic_ref_type_<std::uint32_t> {static_cast<request_t*>(request)->state}.fetch_or(
+                atomic_ref<std::uint32_t> {static_cast<request_t*>(request)->state}.fetch_or(
                     claimed_k | ready_k | detached_k, std::memory_order_release);
         }
         else batch->endpoint->batch_callback(batch->requests.data(), batch->requests.size(), batch->endpoint->context);
@@ -675,7 +764,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     static void dispatch(server_t& server, loop_t& loop, connection_t& connection) noexcept {
         auto* request = loop.free_requests;
         if (request) loop.free_requests = request->next;
-        else request = new (std::nothrow) request_t;
+        else request = allocate_unique<request_t>(loop.allocator, loop.allocator).release();
         if (!request) {
             connection.fail(ucall_status_out_of_memory_k);
             return;
@@ -717,7 +806,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         if (!*position || (*position)->endpoint != endpoint) {
             auto* batch = loop.free_batches;
             if (batch) loop.free_batches = batch->next;
-            else batch = new (std::nothrow) batch_t;
+            else batch = allocate_unique<batch_t>(loop.allocator, loop.allocator).release();
             if (!batch) {
                 if (reply(*request, 503, nullptr, 0, "Allocation failed") != ucall_status_success_k) {
                     request->state = claimed_k | ready_k;
@@ -734,7 +823,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             if ((*position)->requests.empty()) {
                 auto* batch = *position;
                 *position = batch->next;
-                delete batch;
+                allocator_delete<batch_t, allocator_t> {loop.allocator}(batch);
             }
             if (reply(*request, 503, nullptr, 0, "Allocation failed") != ucall_status_success_k) {
                 request->state = claimed_k | ready_k;
@@ -743,19 +832,19 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         }
     }
     static void release_admission(server_t& server, binding_t& binding) noexcept {
-        auto before = atomic_ref_type_<std::size_t> {binding.active}.fetch_sub(1, std::memory_order_relaxed);
+        auto before = atomic_ref<std::size_t> {binding.active}.fetch_sub(1, std::memory_order_relaxed);
         if (before == binding.config.max_concurrent_connections)
             for (auto& loop : server.loops) loop->notify();
     }
     static ucall_status_t server_progress(server_t& server, loop_t& loop) noexcept {
         auto& engine = loop.engine;
-        bool stopping = atomic_ref_type_<std::uint32_t> {server.stopped}.load(std::memory_order_acquire);
+        bool stopping = atomic_ref<std::uint32_t> {server.stopped}.load(std::memory_order_acquire);
         for (auto& listener : loop.listeners) {
             if (stopping) {
-                if (listener.pending) { engine.cancel(listener.request); }
+                if (listener.stage == listener_t::stage_t::pending_k) { engine.cancel(listener.request); }
                 continue;
             }
-            if (listener.pending) continue;
+            if (listener.stage == listener_t::stage_t::pending_k) continue;
             bool available = false;
             for (auto& connection : loop.connections)
                 if (connection->stage == connection_stage_t::idle_k) {
@@ -764,21 +853,21 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 }
             if (!available) continue;
             auto& binding = *listener.binding;
-            auto active = atomic_ref_type_<std::size_t> {binding.active};
+            auto active = atomic_ref<std::size_t> {binding.active};
             auto before = active.fetch_add_if_at_most(1, binding.config.max_concurrent_connections,
                                                       std::memory_order_relaxed);
             if (before >= binding.config.max_concurrent_connections) continue;
-            if (engine.submit(listener.request)) listener.pending = true;
+            if (engine.submit(listener.request)) listener.stage = listener_t::stage_t::pending_k;
             else active.fetch_sub(1, std::memory_order_relaxed);
         }
         for (auto& owned : loop.connections) {
             auto& connection = *owned;
             if (connection.stage == connection_stage_t::idle_k) continue;
-            if (stopping && connection.pending) {
+            if (stopping && (connection.flags & connection_pending_k)) {
                 if (connection.request.operation != io_operation_t::close_k) engine.cancel(connection.request);
                 continue;
             }
-            if (connection.pending) continue;
+            if (connection.flags & connection_pending_k) continue;
             if (stopping && connection.stage != connection_stage_t::closed_k)
                 connection.fail(ucall_status_connection_closed_k);
             for (;;) {
@@ -786,7 +875,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                     if (!connection.exchange) dispatch(server, loop, connection);
                     if (connection.exchange && connection.stage == connection_stage_t::received_k) {
                         auto& request = *connection.exchange;
-                        auto state = atomic_ref_type_<std::uint32_t> {request.state}.load(std::memory_order_acquire);
+                        auto state = atomic_ref<std::uint32_t> {request.state}.load(std::memory_order_acquire);
                         if (!(state & ready_k)) break;
                         std::swap(connection.output, request.output);
                         request.output.clear();
@@ -796,7 +885,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                     }
                 }
                 if (connection.stage == connection_stage_t::sent_k) {
-                    if (!connection.message.keep_alive || connection.peer_closed)
+                    if (!connection.message.keep_alive() || (connection.flags & connection_peer_closed_k))
                         connection.fail(ucall_status_success_k);
                     else {
                         connection.output.clear();
@@ -806,7 +895,8 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 }
                 auto* next = connection.advance();
                 if (next) {
-                    if (engine.submit(*next)) connection.pending = true;
+                    if (engine.submit(*next))
+                        connection.flags = static_cast<connection_flags_t>(connection.flags | connection_pending_k);
                     break;
                 }
                 if (connection.stage == connection_stage_t::closed_k) {
@@ -817,7 +907,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                     connection.encrypted.clear();
                     connection.output.clear();
                     connection.sending = nullptr;
-                    connection.peer_closed = false;
+                    connection.flags = static_cast<connection_flags_t>(connection.flags & ~connection_peer_closed_k);
                     connection.endpoint = nullptr;
                     connection.stage = connection_stage_t::idle_k;
                     break;
@@ -835,7 +925,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         collect_requests(loop);
         if (stopping) {
             bool busy = false;
-            for (auto& listener : loop.listeners) busy |= listener.pending;
+            for (auto& listener : loop.listeners) busy |= (listener.stage == listener_t::stage_t::pending_k);
             for (auto& connection : loop.connections) busy |= connection->stage != connection_stage_t::idle_k;
             if (!busy) {
                 for (auto& listener : loop.listeners)
@@ -843,7 +933,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                         engine.close_socket(listener.request.descriptor);
                         listener.request.descriptor = -1;
                     }
-                loop.quiesced = true;
+                loop.stage = loop_stage_t::quiesced_k;
             }
         }
         return ucall_status_success_k;
@@ -853,11 +943,11 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         auto& loop = *listener.loop;
         auto& server = *loop.server;
         auto& binding = *listener.binding;
-        listener.pending = false;
+        listener.stage = listener_t::stage_t::idle_k;
         if (completion.result < 0) {
             release_admission(server, binding);
             if (completion.result != -ECONNABORTED && completion.result != -ECANCELED) {
-                server.failure = ucall_status_io_k;
+                atomic_ref<ucall_status_t> {server.failure}.store(ucall_status_io_k, std::memory_order_release);
                 server_stop(&server);
             }
             return;
@@ -868,7 +958,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 chosen = connection.get();
                 break;
             }
-        if (!chosen || atomic_ref_type_<std::uint32_t> {server.stopped}.load(std::memory_order_acquire)) {
+        if (!chosen || atomic_ref<std::uint32_t> {server.stopped}.load(std::memory_order_acquire)) {
             loop.engine.close_socket(completion.result);
             release_admission(server, binding);
             return;
@@ -884,7 +974,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                                                       binding.config.noise_private_key, binding.public_key, nullptr));
         if (result != ucall_status_success_k) chosen->fail(result);
     }
-    static void server_init(ucall_server_init_t* arguments) noexcept {
+    static void server_init(ucall_server_init_t* arguments, allocator_t const& allocator = {}) noexcept {
         if (!arguments) return;
         if (arguments->server) *arguments->server = nullptr;
         auto* config = arguments->config;
@@ -896,12 +986,19 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             publish(arguments->outcome, ucall_status_unsupported_k);
             return;
         }
-        std::unique_ptr<server_t> server {new (std::nothrow) server_t};
-        if (!server || st::failed(server->bindings.resize(config->interfaces_count)) ||
-            st::failed(server->resolved.resize(config->interfaces_count)) || !server->routes.init()) {
+        auto server = allocate_unique<server_t>(allocator, allocator);
+        if (!server || st::failed(server->resolved.resize(config->interfaces_count)) || !server->routes.init()) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
+        rebound_allocator<binding_t> binding_allocator {allocator};
+        auto* bindings = binding_allocator.allocate(config->interfaces_count);
+        if (!bindings) {
+            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            return;
+        }
+        for (std::size_t i = 0; i != config->interfaces_count; ++i) std::construct_at(bindings + i, allocator);
+        server->bindings = {bindings, config->interfaces_count};
         std::size_t loops_count = 1;
         for (std::size_t i = 0; i != config->interfaces_count; ++i) {
             auto& binding = server->bindings[i];
@@ -954,25 +1051,26 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                                      std::as_bytes(std::span {*interface.noise_private_key}).data());
         }
         {
-            engine_type_ probe;
+            engine_t probe {allocator};
             auto status = probe.open(1, 1);
             if (status != ucall_status_success_k) {
                 publish(arguments->outcome, status);
                 return;
             }
         }
-        if (st::failed(server->loops.resize(loops_count))) {
+        if (st::failed(server->loops.resize(loops_count)) || st::failed(server->owned_wakeups.resize(loops_count))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         for (std::size_t loop_index = 0; loop_index != loops_count; ++loop_index) {
-            server->loops[loop_index].reset(new (std::nothrow) loop_t);
+            server->loops[loop_index] = allocate_unique<loop_t>(allocator, allocator);
             if (!server->loops[loop_index]) {
                 publish(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
             auto& loop = *server->loops[loop_index];
             loop.server = server.get();
+            server->owned_wakeups[loop_index] = &loop.wake;
             if (!loop.wake.open()) {
                 publish(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
@@ -989,13 +1087,20 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                     connections_count += quota;
                     ++listeners_count;
                 }
-            if (st::failed(loop.connections.resize(connections_count)) ||
-                st::failed(loop.listeners.resize(listeners_count))) {
+            if (st::failed(loop.connections.resize(connections_count))) {
                 publish(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
+            rebound_allocator<listener_t> listener_allocator {allocator};
+            auto* listeners = listener_allocator.allocate(listeners_count);
+            if (!listeners) {
+                publish(arguments->outcome, ucall_status_out_of_memory_k);
+                return;
+            }
+            for (std::size_t i = 0; i != listeners_count; ++i) std::construct_at(listeners + i);
+            loop.listeners = {listeners, listeners_count};
             for (auto& connection : loop.connections) {
-                connection.reset(new (std::nothrow) connection_t);
+                connection = allocate_unique<connection_t>(allocator, allocator);
                 if (!connection) {
                     publish(arguments->outcome, ucall_status_out_of_memory_k);
                     return;
@@ -1024,13 +1129,17 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                         publish(arguments->outcome, result);
                         return;
                     }
+                    listener.descriptor = listener.request.descriptor;
                 }
         }
+        server->wakeups = server->owned_wakeups;
         server->config = *config;
         server->config.cpu_class = static_cast<ucall_cpu_class_t>(cpu_class_);
         for (std::size_t i = 0; i != config->interfaces_count; ++i) server->resolved[i] = server->bindings[i].config;
         server->config.interfaces = server->resolved.data();
         if (arguments->resolved) *arguments->resolved = server->config;
+        server->string_capabilities = capabilities_k;
+        server->atomic_capabilities = static_cast<std::uint64_t>(cpu_traits<cpu_class_>::forkunion_capabilities_k);
         server->api = &server_api_k;
         *arguments->server = server.release();
         publish(arguments->outcome, ucall_status_success_k);
@@ -1038,17 +1147,17 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     static void server_stop(ucall_server_t handle) noexcept {
         if (!handle) return;
         auto& server = *static_cast<server_t*>(handle);
-        atomic_ref_type_<std::uint32_t> {server.stopped}.store(1, std::memory_order_release);
+        atomic_ref<std::uint32_t> {server.stopped}.store(1, std::memory_order_release);
         for (auto& loop : server.loops) loop->notify();
     }
     static ucall_status_t open_loop(loop_t& loop) noexcept {
-        if (loop.opened) return loop.setup_status;
+        if (loop.stage != loop_stage_t::unopened_k) return loop.setup_status;
         auto slots = loop.connections.size() + loop.listeners.size();
         if (slots == std::numeric_limits<std::size_t>::max()) return ucall_status_overflow_k;
         ++slots; // The wakeup occupies one operation slot beside listeners and connections.
         auto status = loop.engine.open(slots, slots);
         if (status != ucall_status_success_k) return status;
-        loop.opened = true;
+        loop.stage = loop_stage_t::ready_k;
         if (st::failed(loop.completions.resize(slots))) return ucall_status_out_of_memory_k;
         auto descriptor = loop.engine.import_socket(loop.wake.descriptors[0]);
         if (descriptor < 0) return ucall_status_io_k;
@@ -1059,16 +1168,18 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             auto imported = loop.engine.import_socket(listener.request.descriptor);
             if (imported < 0) return ucall_status_io_k;
             listener.request.descriptor = imported;
-            listener.imported = true;
+            listener.descriptor = -1;
         }
         return ucall_status_success_k;
     }
-    static void advance_completion(engine_type_& engine, io_completion_t const& completion) noexcept {
+    static void advance_completion(engine_t& engine, io_completion_t const& completion) noexcept {
         if (completion.request->operation == io_operation_t::accept_k) accepted(completion);
         else {
             auto& connection = *static_cast<connection_t*>(completion.request->context);
             bool connected = connection.stage == connection_stage_t::connecting_k && completion.result >= 0;
-            connection.advance(&completion);
+            auto* next = connection.advance(&completion);
+            if (connection.descriptor >= 0 && (!next || next->operation != io_operation_t::receive_k))
+                engine.receive_pause(connection.descriptor);
             if (connected && connection.peer && connection.peer->job)
                 connection.deadline = connection.peer->job->deadline;
         }
@@ -1076,22 +1187,24 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
     }
     static ucall_status_t server_poll(server_t& server, loop_t& loop, io_wait_t wait,
                                       std::uint64_t deadline = 0) noexcept {
-        if (loop.quiesced) return server.failure;
+        if (loop.stage == loop_stage_t::quiesced_k)
+            return atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire);
         if (loop.setup_status != ucall_status_success_k) return loop.setup_status;
         loop.setup_status = open_loop(loop);
         if (loop.setup_status != ucall_status_success_k) return loop.setup_status;
-        atomic_ref_type_<std::uint32_t> {server.serving}.store(1, std::memory_order_release);
-        atomic_ref_type_<std::uint32_t> {loop.wake_pending}.store(0, std::memory_order_release);
+        atomic_ref<std::uint32_t> {server.serving}.store(1, std::memory_order_release);
+        atomic_ref<std::uint32_t> {loop.wake_pending}.store(0, std::memory_order_release);
         server_progress(server, loop);
-        if (loop.quiesced) return server.failure;
+        if (loop.stage == loop_stage_t::quiesced_k)
+            return atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire);
         auto batch_deadline = server_deadline(loop);
         if (batch_deadline) deadline = deadline ? std::min(deadline, batch_deadline) : batch_deadline;
         int count = loop.engine.poll(span<io_completion_t> {loop.completions}, wait, deadline);
         if (count < 0) {
-            server.failure = ucall_status_io_k;
+            atomic_ref<ucall_status_t> {server.failure}.store(ucall_status_io_k, std::memory_order_release);
             server_stop(&server);
             loop.engine.stop();
-            loop.quiesced = true;
+            loop.stage = loop_stage_t::quiesced_k;
             return ucall_status_io_k;
         }
         for (int i = 0; i != count; ++i) {
@@ -1099,14 +1212,14 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             if (completion.request == &loop.wake.request) {
                 loop.engine.release(completion);
                 if (!loop.engine.submit(loop.wake.request)) {
-                    server.failure = ucall_status_io_k;
+                    atomic_ref<ucall_status_t> {server.failure}.store(ucall_status_io_k, std::memory_order_release);
                     server_stop(&server);
                 }
             }
             else advance_completion(loop.engine, completion);
         }
         server_progress(server, loop);
-        return server.failure;
+        return atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire);
     }
     static void server_take_call(ucall_server_take_call_t* arguments) noexcept {
         if (!arguments) return;
@@ -1121,7 +1234,11 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         }
         auto wait = arguments->timeout_microseconds ? io_wait_t::blocking_k : io_wait_t::nonblocking_k;
         auto deadline = arguments->timeout_microseconds ? deadline_after(arguments->timeout_microseconds) : 0;
-        publish(arguments->outcome, server_poll(server, *server.loops[arguments->event_loop_index], wait, deadline));
+        auto& loop = *server.loops[arguments->event_loop_index];
+        auto* previous = std::exchange(polling_loop, &loop);
+        auto status = server_poll(server, loop, wait, deadline);
+        polling_loop = previous;
+        publish(arguments->outcome, status);
     }
     static void server_take_calls(ucall_server_take_calls_t* arguments) noexcept {
         if (!arguments) return;
@@ -1136,8 +1253,10 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         }
         auto& loop = *server.loops[arguments->event_loop_index];
         ucall_status_t status = ucall_status_success_k;
-        while (!loop.quiesced && status == ucall_status_success_k)
+        auto* previous = std::exchange(polling_loop, &loop);
+        while (loop.stage != loop_stage_t::quiesced_k && status == ucall_status_success_k)
             status = server_poll(server, loop, io_wait_t::blocking_k);
+        polling_loop = previous;
         publish(arguments->outcome, status);
     }
     static void server_free(ucall_server_t handle) noexcept {
@@ -1145,9 +1264,9 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         auto& server = *static_cast<server_t*>(handle);
         server_stop(handle);
         for (auto& loop : server.loops)
-            while (loop->opened && !loop->quiesced && loop->setup_status == ucall_status_success_k)
+            while (loop->stage == loop_stage_t::ready_k && loop->setup_status == ucall_status_success_k)
                 if (server_poll(server, *loop, io_wait_t::blocking_k) != ucall_status_success_k) break;
-        delete &server;
+        allocator_delete<server_t, allocator_t> {server.allocator}(&server);
     }
     template <typename arguments_type_>
     static void add_endpoint(arguments_type_* arguments) noexcept {
@@ -1158,7 +1277,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             return;
         }
         auto& server = *static_cast<server_t*>(arguments->server);
-        if (atomic_ref_type_<std::uint32_t> {server.serving}.load(std::memory_order_acquire)) {
+        if (atomic_ref<std::uint32_t> {server.serving}.load(std::memory_order_acquire)) {
             publish(arguments->outcome, ucall_status_contended_k);
             return;
         }
@@ -1174,9 +1293,9 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 publish(arguments->outcome, ucall_status_already_exists_k);
                 return;
             }
-        auto* endpoint = new (std::nothrow) endpoint_t;
+        auto* endpoint = allocate_unique<endpoint_t>(server.allocator, server.allocator).release();
         if (!endpoint || !copy_text(endpoint->storage, path)) {
-            delete endpoint;
+            allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
@@ -1303,7 +1422,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             publish(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        st::basic_vector<char> name;
+        vector<char> name {rebound_allocator<char> {static_cast<server_t*>(arguments->server)->allocator}};
         if (!append_text(name, text_view(arguments->name))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
@@ -1347,34 +1466,65 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                                           1, text_view(arguments->message)));
     }
     struct client_job_t {
+        explicit client_job_t(allocator_t const& allocator = {}) noexcept
+            : authority(rebound_allocator<char> {allocator}), target(rebound_allocator<char> {allocator}),
+              host(rebound_allocator<char> {allocator}), service(rebound_allocator<char> {allocator}),
+              redirect(rebound_allocator<char> {allocator}),
+              redirect_headers(rebound_allocator<ucall_bytes_view_t> {allocator}) {}
+        client_job_t(client_job_t const&) = delete;
+        client_job_t& operator=(client_job_t const&) = delete;
+        client_job_t(client_job_t&&) = delete;
+        client_job_t& operator=(client_job_t&&) = delete;
+
         ucall_client_call_t arguments {};
         enum class stage_t { idle_k, queued_k, active_k };
         stage_t stage {};
         std::uint64_t deadline {};
         std::unique_ptr<addrinfo, void (*)(addrinfo*)> addresses {nullptr, &freeaddrinfo};
         addrinfo* address {};
-        st::basic_vector<char> authority {}, target {}, host {}, service {}, redirect {};
-        st::basic_vector<ucall_bytes_view_t> redirect_headers {};
+        addrinfo numeric_address {};
+        sockaddr_storage numeric_socket {};
+        std::uint16_t port {};
+        addrinfo* first_address() noexcept { return numeric_address.ai_addr ? &numeric_address : addresses.get(); }
+        vector<char> authority {}, target {}, host {}, service {}, redirect {};
+        vector<ucall_bytes_view_t> redirect_headers {};
         std::size_t attempts {}, redirects {};
         std::uint64_t authority_hash {};
     };
     struct client_peer_t {
+        explicit client_peer_t(allocator_t const& allocator = {}) noexcept
+            : connection(allocator), authority(rebound_allocator<char> {allocator}) {}
+        client_peer_t(client_peer_t const&) = delete;
+        client_peer_t& operator=(client_peer_t const&) = delete;
+        client_peer_t(client_peer_t&&) = delete;
+        client_peer_t& operator=(client_peer_t&&) = delete;
+
         connection_t connection {};
         client_job_t* job {};
-        st::basic_vector<char> authority {};
+        vector<char> authority {};
         ucall_security_mode_t security {};
         std::uint64_t authority_hash {};
         ucall_noise_key_t private_key {}, remote_key {};
     };
     struct client_t : ucall_client_handle_t {
-        engine_type_ engine {};
-        st::basic_vector<io_completion_t> completions {};
-        st::basic_vector<ucall_completed_call_t> completed {};
+        allocator_t allocator;
+        explicit client_t(allocator_t const& allocator = {}) noexcept
+            : allocator(allocator), engine(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
+              completed(rebound_allocator<ucall_completed_call_t> {allocator}),
+              peers(rebound_allocator<owner<client_peer_t>> {allocator}) {}
+        client_t(client_t const&) = delete;
+        client_t& operator=(client_t const&) = delete;
+        client_t(client_t&&) = delete;
+        client_t& operator=(client_t&&) = delete;
+
+        engine_t engine {};
+        vector<io_completion_t> completions {};
+        vector<ucall_completed_call_t> completed {};
         ucall_status_t failure {ucall_status_success_k};
         ucall_client_config_t config {};
         ucall_noise_key_t private_key {};
-        st::basic_vector<std::unique_ptr<client_peer_t>> peers {};
-        st::basic_vector<client_job_t> jobs {};
+        vector<owner<client_peer_t>> peers {};
+        span<client_job_t> jobs {};
         std::size_t next_job {}, admitted {}, completed_head {}, completed_count {};
         ~client_t() noexcept {
             engine.stop();
@@ -1383,13 +1533,16 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 if (peer) {
                     auto& connection = peer->connection;
                     if (connection.descriptor >= 0 &&
-                        !(connection.pending && connection.request.operation == io_operation_t::close_k &&
-                          connection.request.descriptor < 0))
+                        !((connection.flags & connection_pending_k) &&
+                          connection.request.operation == io_operation_t::close_k && connection.request.descriptor < 0))
                         engine.close_socket(connection.descriptor);
                     secure_tunnel_crypto<capabilities_k>::secure_zero(peer->private_key);
                 }
             for (std::size_t i = 0; i != completed_count; ++i)
-                delete static_cast<response_t*>(completed[(completed_head + i) % completed.size()].response);
+                ucall_received_http_response_free(completed[(completed_head + i) % completed.size()].response);
+            peers.clear();
+            for (auto& job : jobs) std::destroy_at(&job);
+            if (!jobs.empty()) rebound_allocator<client_job_t> {allocator}.deallocate(jobs.data(), jobs.size());
         }
     };
     static ucall_status_t parse_url(client_job_t& job) noexcept {
@@ -1441,12 +1594,39 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             return ucall_status_invalid_argument_k;
         if (!copy_text(job.host, host) || !copy_text(job.service, port)) return ucall_status_out_of_memory_k;
         job.addresses.reset();
+        job.numeric_address = {};
         job.address = nullptr;
+        job.port = static_cast<std::uint16_t>(number);
+        return ucall_status_success_k;
+    }
+    static ucall_status_t resolve_job(client_job_t& job) noexcept {
+        sockaddr_in ipv4 {};
+        sockaddr_in6 ipv6 {};
+        if (!sockets_start()) return ucall_status_io_k;
+        if (inet_pton(AF_INET, job.host.data(), &ipv4.sin_addr) == 1) {
+            ipv4.sin_family = AF_INET;
+            ipv4.sin_port = htons(job.port);
+            std::memcpy(&job.numeric_socket, &ipv4, sizeof(ipv4));
+            job.numeric_address.ai_family = AF_INET;
+            job.numeric_address.ai_addrlen = sizeof(ipv4);
+        }
+        else if (inet_pton(AF_INET6, job.host.data(), &ipv6.sin6_addr) == 1) {
+            ipv6.sin6_family = AF_INET6;
+            ipv6.sin6_port = htons(job.port);
+            std::memcpy(&job.numeric_socket, &ipv6, sizeof(ipv6));
+            job.numeric_address.ai_family = AF_INET6;
+            job.numeric_address.ai_addrlen = sizeof(ipv6);
+        }
+        if (job.numeric_address.ai_addrlen) {
+            job.numeric_address.ai_socktype = SOCK_STREAM;
+            job.numeric_address.ai_addr = reinterpret_cast<sockaddr*>(&job.numeric_socket);
+            job.address = &job.numeric_address;
+            return ucall_status_success_k;
+        }
         addrinfo hints {};
         hints.ai_family = AF_UNSPEC;
         hints.ai_socktype = SOCK_STREAM;
         addrinfo* resolved = nullptr;
-        if (!sockets_start()) return ucall_status_io_k;
         if (getaddrinfo(job.host.data(), job.service.data(), &hints, &resolved) != 0)
             return ucall_status_connection_failed_k;
         job.addresses.reset(resolved);
@@ -1524,11 +1704,11 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             connection.output_offset = 0;
             connection.sending = nullptr;
             connection.message = {};
-            connection.peer_closed = false;
+            connection.flags = static_cast<connection_flags_t>(connection.flags & ~connection_peer_closed_k);
             connection.role = connection_role_t::client_k;
             connection.stage = connection_stage_t::connecting_k;
             connection.status = ucall_status_success_k;
-            connection.pending = false;
+            connection.flags = static_cast<connection_flags_t>(connection.flags & ~connection_pending_k);
             connection.authorizer = client.config.peer_authorizer;
             connection.authorizer_context = client.config.peer_authorizer_context;
             connection.deadline = std::min(job.deadline, deadline_after(client.config.connect_timeout_microseconds));
@@ -1550,7 +1730,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         auto previous = text_view(job.arguments.url);
         auto scheme = find(previous, "://");
         auto origin_end = scheme + 3 + job.authority.size() - 1;
-        st::basic_vector<char> next;
+        vector<char> next {job.redirect.get_allocator()};
         if (find(location, "://") != std::string_view::npos) {
             if (!append_text(next, location)) return ucall_status_out_of_memory_k;
         }
@@ -1581,11 +1761,11 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             job.arguments.body = {};
         }
         // Credentials belong to the caller's original origin, never to a redirect target.
-        st::basic_vector<ucall_bytes_view_t> safe_headers;
+        vector<ucall_bytes_view_t> safe_headers {job.redirect_headers.get_allocator()};
         for (std::size_t i = 0; i != job.arguments.headers_count; ++i) {
             auto header = job.arguments.headers[i];
             auto name = text_view(header).substr(0, find(text_view(header), ':'));
-            st::basic_vector<char> folded;
+            vector<char> folded {job.authority.get_allocator()};
             if (!append_text(folded, name)) return ucall_status_out_of_memory_k;
             lowercase_ascii(folded.data(), folded.size());
             name = text_view(folded);
@@ -1595,7 +1775,8 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         job.redirect_headers = std::move(safe_headers);
         job.arguments.headers = job.redirect_headers.data();
         job.arguments.headers_count = job.redirect_headers.size();
-        return parse_url(job);
+        auto result = parse_url(job);
+        return result == ucall_status_success_k ? resolve_job(job) : result;
     }
     static void client_completed(client_t& client, client_peer_t& peer) noexcept {
         auto& connection = peer.connection;
@@ -1605,13 +1786,13 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             if (retry) {
                 job.address = job.address ? job.address->ai_next : nullptr;
                 auto maximum = job.arguments.options.max_retries ? job.arguments.options.max_retries : 3;
-                if (!job.address && job.attempts++ < maximum) job.address = job.addresses.get();
+                if (!job.address && job.attempts++ < maximum) job.address = job.first_address();
                 if (job.address) {
                     connection.input.clear();
                     connection.encrypted.clear();
                     connection.sending = nullptr;
                     connection.output_offset = 0;
-                    connection.peer_closed = false;
+                    connection.flags = static_cast<connection_flags_t>(connection.flags & ~connection_peer_closed_k);
                     auto result = compose_request(connection, job);
                     if (result == ucall_status_success_k) result = dial_peer(client, peer);
                     if (result == ucall_status_success_k) return;
@@ -1640,7 +1821,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 return;
             }
         }
-        auto* response = new (std::nothrow) response_t;
+        auto* response = allocate_unique<response_t>(client.allocator, client.allocator).release();
         if (!response) {
             connection.fail(ucall_status_out_of_memory_k);
             return;
@@ -1648,9 +1829,10 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         response->headers_length = connection.message.headers_length;
         response->body_length = connection.message.body_length;
         response->status = code;
-        bool keep_alive = connection.message.keep_alive && !connection.peer_closed &&
+        bool keep_alive = connection.message.keep_alive() && !(connection.flags & connection_peer_closed_k) &&
                           connection.input.size() == connection.message.wire_length && connection.encrypted.empty();
         response->storage = std::move(connection.input);
+        response->content = response->storage;
         connection.input.clear();
         connection.output.clear();
         connection.message = {};
@@ -1664,69 +1846,88 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         auto& engine = client.engine;
         auto now = monotonic_ns();
         std::uint64_t deadline = 0;
+        std::size_t available = 0;
         for (auto& peer : client.peers) {
             auto& connection = peer->connection;
-            if (!connection.pending && peer->job) client_completed(client, *peer);
+            if (!(connection.flags & connection_pending_k) && peer->job) client_completed(client, *peer);
+            available += !peer->job && !(connection.flags & connection_pending_k) &&
+                         (connection.stage == connection_stage_t::idle_k ||
+                          connection.stage == connection_stage_t::closed_k);
         }
         auto first = client.next_job;
-        for (std::size_t offset = 0; offset != client.jobs.size(); ++offset) {
-            auto index = offset < client.jobs.size() - first ? first + offset : offset - (client.jobs.size() - first);
-            auto& job = client.jobs[index];
-            if (job.stage == client_job_t::stage_t::idle_k) continue;
-            if (job.stage == client_job_t::stage_t::active_k) {
-                deadline = !deadline ? job.deadline : std::min(deadline, job.deadline);
-                continue;
-            }
-            if (now >= job.deadline) {
-                finish_job(client, job, ucall_status_timeout_k);
-                continue;
-            }
-            client_peer_t* chosen = nullptr;
-            for (auto& peer : client.peers)
-                if (!peer->job && !peer->connection.pending &&
-                    (peer->connection.stage == connection_stage_t::idle_k ||
-                     peer->connection.stage == connection_stage_t::closed_k)) {
-                    if (!chosen || same_peer(client, *peer, job)) chosen = peer.get();
-                    if (same_peer(client, *peer, job)) break;
+        bool assigned = false;
+        for (unsigned pass = 0; pass != 2; ++pass) {
+            for (std::size_t offset = 0; offset != client.jobs.size(); ++offset) {
+                auto index = offset < client.jobs.size() - first ? first + offset
+                                                                 : offset - (client.jobs.size() - first);
+                auto& job = client.jobs[index];
+                if (job.stage == client_job_t::stage_t::idle_k) continue;
+                if (!pass) {
+                    if (now >= job.deadline && job.stage == client_job_t::stage_t::queued_k) {
+                        finish_job(client, job, ucall_status_timeout_k);
+                        continue;
+                    }
+                    deadline = !deadline ? job.deadline : std::min(deadline, job.deadline);
                 }
-            deadline = !deadline ? job.deadline : std::min(deadline, job.deadline);
-            if (!chosen) continue;
-            client.next_job = index + 1 == client.jobs.size() ? 0 : index + 1;
-            job.stage = client_job_t::stage_t::active_k;
-            chosen->job = &job;
-            auto& connection = chosen->connection;
-            auto result = parse_url(job);
-            bool reuse = result == ucall_status_success_k && connection.descriptor >= 0 &&
-                         same_peer(client, *chosen, job);
-            if (result == ucall_status_success_k) result = compose_request(connection, job);
-            if (result != ucall_status_success_k) {
-                chosen->job = nullptr;
-                finish_job(client, job, result);
-                continue;
-            }
-            connection.deadline = job.deadline;
-            if (reuse) connection.transmit();
-            else if (connection.descriptor >= 0) {
-                connection.fail(ucall_status_connection_failed_k);
-                job.address = nullptr;
-            }
-            else {
-                result = dial_peer(client, *chosen);
+                if (job.stage != client_job_t::stage_t::queued_k) continue;
+                if (!available) continue;
+                client_peer_t* chosen = nullptr;
+                for (auto& peer : client.peers)
+                    if (!peer->job && !(peer->connection.flags & connection_pending_k) &&
+                        (peer->connection.stage == connection_stage_t::idle_k ||
+                         peer->connection.stage == connection_stage_t::closed_k)) {
+                        bool same = peer->connection.descriptor >= 0 && same_peer(client, *peer, job);
+                        if (!pass && assigned && peer->connection.descriptor >= 0 && !same) continue;
+                        if (!chosen || same || (chosen->connection.descriptor >= 0 && peer->connection.descriptor < 0))
+                            chosen = peer.get();
+                        if (same) break;
+                    }
+                if (!chosen) continue;
+                --available;
+                if (!assigned) {
+                    client.next_job = index + 1 == client.jobs.size() ? 0 : index + 1;
+                    assigned = true;
+                }
+                job.stage = client_job_t::stage_t::active_k;
+                chosen->job = &job;
+                auto& connection = chosen->connection;
+                ucall_status_t result = ucall_status_success_k;
+                bool reuse = connection.descriptor >= 0 && same_peer(client, *chosen, job);
+                if (result == ucall_status_success_k && !reuse) result = resolve_job(job);
+                if (result == ucall_status_success_k) result = compose_request(connection, job);
                 if (result != ucall_status_success_k) {
                     chosen->job = nullptr;
+                    ++available;
                     finish_job(client, job, result);
+                    continue;
+                }
+                connection.deadline = job.deadline;
+                if (reuse) connection.transmit();
+                else if (connection.descriptor >= 0) {
+                    connection.fail(ucall_status_connection_failed_k);
+                    job.address = nullptr;
+                }
+                else {
+                    result = dial_peer(client, *chosen);
+                    if (result != ucall_status_success_k) {
+                        chosen->job = nullptr;
+                        ++available;
+                        finish_job(client, job, result);
+                    }
                 }
             }
+            if (!available) break;
         }
         for (auto& peer : client.peers) {
             auto& connection = peer->connection;
-            if (connection.pending) continue;
+            if (connection.flags & connection_pending_k) continue;
             auto* request = connection.advance();
-            if (request && engine.submit(*request)) connection.pending = true;
+            if (request && engine.submit(*request))
+                connection.flags = static_cast<connection_flags_t>(connection.flags | connection_pending_k);
         }
         return deadline;
     }
-    static void client_init(ucall_client_init_t* arguments) noexcept {
+    static void client_init(ucall_client_init_t* arguments, allocator_t const& allocator = {}) noexcept {
         if (!arguments) return;
         if (arguments->client) *arguments->client = nullptr;
         if (!arguments->client || !arguments->outcome || !arguments->config ||
@@ -1734,7 +1935,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             publish(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        std::unique_ptr<client_t> client {new (std::nothrow) client_t};
+        auto client = allocate_unique<client_t>(allocator, allocator);
         if (!client) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
@@ -1749,20 +1950,27 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             std::memcpy(client->private_key, *config.noise_private_key, sizeof(client->private_key));
             config.noise_private_key = &client->private_key;
         }
-        if (st::failed(client->jobs.resize(config.max_concurrent_calls)) ||
-            st::failed(client->completed.resize(config.max_concurrent_calls)) ||
+        if (st::failed(client->completed.resize(config.max_concurrent_calls)) ||
             st::failed(client->completions.resize(config.max_concurrent_connections)) ||
             st::failed(client->peers.resize(config.max_concurrent_connections))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
+        rebound_allocator<client_job_t> job_allocator {allocator};
+        auto* jobs = job_allocator.allocate(config.max_concurrent_calls);
+        if (!jobs) {
+            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            return;
+        }
+        for (std::size_t i = 0; i != config.max_concurrent_calls; ++i) std::construct_at(jobs + i, allocator);
+        client->jobs = {jobs, config.max_concurrent_calls};
         auto status = client->engine.open(config.max_concurrent_connections, config.max_concurrent_connections);
         if (status != ucall_status_success_k) {
             publish(arguments->outcome, status);
             return;
         }
         for (auto& peer : client->peers) {
-            peer.reset(new (std::nothrow) client_peer_t);
+            peer = allocate_unique<client_peer_t>(allocator, allocator);
             if (!peer) {
                 publish(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
@@ -1771,11 +1979,16 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             peer->connection.peer = peer.get();
         }
         if (arguments->resolved) *arguments->resolved = config;
+        client->string_capabilities = capabilities_k;
+        client->atomic_capabilities = static_cast<std::uint64_t>(cpu_traits<cpu_class_>::forkunion_capabilities_k);
         client->api = &client_api_k;
         *arguments->client = client.release();
         publish(arguments->outcome, ucall_status_success_k);
     }
-    static void client_free(ucall_client_t handle) noexcept { delete static_cast<client_t*>(handle); }
+    static void client_free(ucall_client_t handle) noexcept {
+        auto* client = static_cast<client_t*>(handle);
+        allocator_delete<client_t, allocator_t> {client->allocator}(client);
+    }
     static void client_call(ucall_client_call_t* arguments) noexcept {
         if (!arguments) return;
         if (!arguments->client || !arguments->outcome || !valid_view(arguments->url) || !valid_view(arguments->body) ||
@@ -1810,6 +2023,11 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             if (job.stage == client_job_t::stage_t::idle_k) {
                 job.arguments = *arguments;
                 job.arguments.outcome = nullptr;
+                auto result = parse_url(job);
+                if (result != ucall_status_success_k) {
+                    publish(arguments->outcome, result);
+                    return;
+                }
                 job.deadline = deadline_after(timeout);
                 job.attempts = job.redirects = 0;
                 job.stage = client_job_t::stage_t::queued_k;
@@ -1829,13 +2047,15 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         auto& client = *static_cast<client_t*>(arguments->client);
         auto deadline = arguments->timeout_microseconds ? deadline_after(arguments->timeout_microseconds) : 0;
         if (client.failure == ucall_status_success_k) {
+            auto next_deadline = client_progress(client);
             do {
-                auto next_deadline = client_progress(client);
-                if (deadline) next_deadline = next_deadline ? std::min(next_deadline, deadline) : deadline;
+                auto round_deadline = deadline && next_deadline ? std::min(next_deadline, deadline)
+                                      : deadline                ? deadline
+                                                                : next_deadline;
                 auto wait = arguments->timeout_microseconds && client.admitted && !client.completed_count
                                 ? io_wait_t::blocking_k
                                 : io_wait_t::nonblocking_k;
-                int count = client.engine.poll(span<io_completion_t> {client.completions}, wait, next_deadline);
+                int count = client.engine.poll(span<io_completion_t> {client.completions}, wait, round_deadline);
                 if (count < 0) {
                     client.failure = ucall_status_io_k;
                     client.engine.stop();
@@ -1845,7 +2065,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
                 }
                 for (int i = 0; i != count; ++i)
                     advance_completion(client.engine, client.completions[static_cast<std::size_t>(i)]);
-                client_progress(client);
+                next_deadline = client_progress(client);
             } while (!client.completed_count && client.admitted && arguments->timeout_microseconds &&
                      monotonic_ns() < deadline);
         }
@@ -1867,8 +2087,8 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             publish(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        auto& response = *static_cast<response_t*>(arguments->response);
-        st::basic_vector<char> name;
+        auto& response = *static_cast<received_response_t*>(arguments->response);
+        vector<char> name {rebound_allocator<char> {static_cast<client_t*>(arguments->client)->allocator}};
         if (!append_text(name, text_view(arguments->name))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
@@ -1887,13 +2107,12 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
             publish(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        auto& response = *static_cast<response_t*>(arguments->response);
+        auto& response = *static_cast<received_response_t*>(arguments->response);
         *arguments->body = c_view(text_view(response.bytes()).substr(response.headers_length, response.body_length));
         publish(arguments->outcome, ucall_status_success_k);
     }
 
     inline static server_api_t const server_api_k {&server_free,
-                                                   &server_stop,
                                                    &server_take_call,
                                                    &server_take_calls,
                                                    &server_add_http_endpoint,

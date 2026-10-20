@@ -41,7 +41,9 @@ Python comparison adapters exercise explicitly started benchmark services.
 
 Use the vocabulary already established by the sibling libraries: variants, CPU classes, capability ladders, and outcomes.
 A name identifies the resource or operation it represents; do not introduce another wrapper to rename an existing concept.
-Class and variable templates have bare names, template parameters end in an underscore, concrete types use `_t`, and concrete constants use `_k`.
+Class, alias, and variable templates have bare names, template parameters end in an underscore, concrete types use `_t`, and concrete constants use `_k`.
+Declare sibling namespace aliases once and use `st::`, `fu::`, and `sz::` at use sites.
+Spell full sibling namespaces only when declaring those aliases.
 
 Every mutable object has one owner and one authoritative state.
 Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
@@ -50,6 +52,14 @@ Endpoint and batch callbacks execute synchronously on the polling caller.
 Cross-thread retained replies and server shutdown publish state atomically rather than changing the loop's I/O records directly.
 Public contracts say when inputs may be reused, when an outcome becomes final, and which owner must outlive which handle.
 Cancellation requests work to stop; only retirement permits its storage to be reused.
+Represent mutually exclusive phases with scoped enums and independent properties with named enum flags.
+Derive state from existing ownership pointers or counters when they already provide the answer; do not mirror it with booleans.
+Give owning classes explicit copy and move contracts.
+An object referenced by kernel user data or live child pointers stays at a stable address and cannot be copied or moved.
+
+Pass one allocator instance through owning parents, child objects, containers, and buffers, rebinding it for each element type.
+Allocators return null on allocation failure, and callers report that failure without throwing.
+Deallocation uses the allocator that created the allocation, including responses that outlive their clients.
 
 Keep scalar control in the state machine and bulk byte work in capability-selected StringZilla kernels.
 An explicit CPU instantiation exists only when its selected kernels, atomics, or waits differ from its parent.

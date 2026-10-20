@@ -8,7 +8,9 @@ Link `ucall::ucall` to use the single library containing every enabled backend.
 Select `automatic`, `posix`, `linux-epoll`, `linux-uring612`, `linux-uring700`, `macos-kqueue`, or `windows-iocp` in the server or client configuration.
 Explicit unavailable selections fail.
 CPU classes select compiled string, cryptographic, and atomic kernels after checking the initialization thread's capabilities.
-The application must ensure its polling threads support the selected class; `serial` is the conservative choice for differing CPU capabilities.
+Baseline entry points check cached calling-thread capabilities before entering CPU-specific code.
+The application keeps those threads on CPUs supporting the selected class; `serial` is the conservative choice for differing capabilities.
+Server shutdown uses baseline atomics and native wakeups, so another thread can stop it without entering CPU-specific code.
 UCall creates no threads.
 All variants use the same HTTP/1.1 and Noise connection automata.
 Both io_uring variants use registered files, direct descriptors, a provided receive-buffer ring, and registered transmission storage.
@@ -43,5 +45,6 @@ Servers support immutable routes, size and latency based application batching, r
 XX and IK servers authenticate clients; KK clients can connect to a separately configured peer, while the server interface cannot specify KK's preknown initiator key.
 
 WebSockets, multipart access, streaming replies, file replies, and metrics remain unsupported and return `ucall_status_unsupported_k` where an outcome is available.
-DNS resolution currently runs synchronously on the polling caller; request deadlines cannot interrupt the system resolver.
+Numeric addresses are handled directly, and reusing a connection does not resolve its host again.
+A new connection to a hostname still uses the synchronous system resolver on the polling caller; request deadlines cannot interrupt that resolver.
 The Python and Rust SDKs await migration to this ABI.

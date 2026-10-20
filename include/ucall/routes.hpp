@@ -142,8 +142,10 @@ inline std::size_t parse_uri_template(std::string_view path, parsed_segment_t* s
 }
 
 /** Template strings remain borrowed; complete registration before concurrent matching begins. */
-template <typename search_type_ = route_search_t>
+template <typename search_type_ = route_search_t, typename allocator_type_ = st::default_allocator<byte_t>>
 class route_trie {
+    template <typename element_type_>
+    using rebind_allocator = typename std::allocator_traits<allocator_type_>::template rebind_alloc<element_type_>;
     struct node_t;
     struct endpoint_t {
         ucall_verb_t verb {};
@@ -166,9 +168,9 @@ class route_trie {
         segment_type_t kind {};
     };
 
-    successive_pools<node_t> nodes_ {};
-    successive_pools<edge_t> edges_ {};
-    successive_pools<endpoint_t> endpoints_ {};
+    successive_pools<node_t, rebind_allocator<node_t>> nodes_;
+    successive_pools<edge_t, rebind_allocator<edge_t>> edges_;
+    successive_pools<endpoint_t, rebind_allocator<endpoint_t>> endpoints_;
     node_t* root_ {};
 
     node_t* literal(node_t const* node, std::string_view segment) const noexcept {
@@ -198,22 +200,36 @@ class route_trie {
     }
 
   public:
-    route_trie() noexcept = default;
+    using allocator_t = allocator_type_;
+
+    explicit route_trie(allocator_t const& allocator = {}) noexcept
+        : nodes_(100, rebind_allocator<node_t> {allocator}), edges_(100, rebind_allocator<edge_t> {allocator}),
+          endpoints_(100, rebind_allocator<endpoint_t> {allocator}) {}
     route_trie(route_trie const&) = delete;
     route_trie& operator=(route_trie const&) = delete;
-    route_trie(route_trie&&) noexcept = default;
-    route_trie& operator=(route_trie&&) noexcept = default;
+    route_trie(route_trie&& other) noexcept
+        : nodes_(std::move(other.nodes_)), edges_(std::move(other.edges_)), endpoints_(std::move(other.endpoints_)),
+          root_(std::exchange(other.root_, nullptr)) {}
+    route_trie& operator=(route_trie&& other) noexcept {
+        if (this == &other) return *this;
+        nodes_ = std::move(other.nodes_);
+        edges_ = std::move(other.edges_);
+        endpoints_ = std::move(other.endpoints_);
+        root_ = std::exchange(other.root_, nullptr);
+        return *this;
+    }
 
     bool init() noexcept {
         if (!root_) root_ = child(nullptr, segment_type_t::literal_k);
         return root_;
     }
-    static std::optional<route_trie> make(std::size_t estimated_routes = 100) noexcept {
+    static std::optional<route_trie> make(std::size_t estimated_routes = 100,
+                                          allocator_t const& allocator = {}) noexcept {
         if (estimated_routes > std::numeric_limits<std::size_t>::max() / 2) return std::nullopt;
-        route_trie trie;
-        trie.nodes_ = successive_pools<node_t>(estimated_routes * 2);
-        trie.edges_ = successive_pools<edge_t>(estimated_routes * 2);
-        trie.endpoints_ = successive_pools<endpoint_t>(estimated_routes * 2);
+        route_trie trie {allocator};
+        trie.nodes_ = decltype(nodes_) {estimated_routes * 2, rebind_allocator<node_t> {allocator}};
+        trie.edges_ = decltype(edges_) {estimated_routes * 2, rebind_allocator<edge_t> {allocator}};
+        trie.endpoints_ = decltype(endpoints_) {estimated_routes * 2, rebind_allocator<endpoint_t> {allocator}};
         if (!trie.init()) return std::nullopt;
         return trie;
     }

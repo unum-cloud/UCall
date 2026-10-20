@@ -1,13 +1,12 @@
 <h1 align="center">UCall</h1>
 <h3 align="center">
   Simple Secure Web Client and Server Framework<br />
-  Up to 70x Higher Throughput and 50x Lower Latency than FastAPI and gRPC<br />
+  Caller-Owned Polling, SIMD Kernels, and Retained Request Batches<br />
 </h3>
 <br />
 
-> The web's encryption layer was designed in 1995.
-> gRPC and FastAPI just keep making the problems worse.
-> UCall is what networking looks like when you start fresh with Noise, io_uring, and SIMD — 50x faster, 10x simpler, actually auditable.
+> What would a web framework look like built around Noise, io_uring, and SIMD?
+> UCall keeps application handlers synchronous while its connection state machines overlap network I/O.
 
 <p align="center">
   <a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
@@ -23,24 +22,29 @@
 
 ---
 
-UCall is a very ¹ fast, ² portable, and ³ tiny HTTP/RPC framework supporting both REST, JSON-RPC, and WebSockets - with a ⁴ twist!
+UCall is a ¹ performance-oriented, ² portable, and ³ compact HTTP/RPC framework, with a ⁴ twist!
 How ¹ fast?
-10-70x faster than FastAPI and Google's gRPC.
+About 263,000 requests/s for a 1 KiB loopback echo in the [current Razer snapshot](bench/README.md#razer-snapshot-october-19-2026), with the workload and backend choices recorded alongside the results.
 How ² portable?
-It powers applications in C 99, C++, Rust, Python, JavaScript, and Swift.
-How ³ tiny?
-10x shorter source code and smaller binary than FastAPI and gRPC.
+A C ABI fronts a C++20 core with POSIX, Linux epoll and io_uring, macOS/FreeBSD kqueue, and Windows IOCP backends.
+Python and Rust SDKs await migration to that ABI.
+How ³ compact?
+HTTP framing, routing, and transport state live in templated headers, with one native library exporting the C interface.
 What's the ⁴ twist?
-For simplicity and robustness, it uses the Noise secure communication protocol instead of implementing the massive TLS standard.
+For encrypted native connections, it uses the Noise secure communication protocol instead of implementing TLS.
 
-Moreover, it's easy to use synchronously, even when the underlying backend uses asynchronous IO like Linux `io_uring`.
-And provides transparent batching functionality for high-latency batch-processing endpoints, like on-GPU AI inference tasks and OLAP database queries.
+Moreover, it's easy to use synchronous handlers, even when the underlying backend uses asynchronous IO like Linux `io_uring`.
+And it provides server-side batching for high-latency batch-processing endpoints, like GPU inference tasks and OLAP database queries.
+The [native examples](examples/README.md) demonstrate binary echo, conditional key-value writes, and atomic ledger transfers through the current C ABI.
 
 ## 📊 FastAPI UX Comparison
 
+The UCall column shows the intended Python SDK experience; that SDK is awaiting migration and the sketch is not runnable against this branch.
+The working native interface and build examples are documented in [the C guide](c/README.md) and [examples](examples/README.md).
+
 <table width="100%">
 <tr>
-<th width="50%">FastAPI</th><th width="50%">UCall</th>
+<th width="50%">FastAPI</th><th width="50%">UCall Python SDK — planned</th>
 </tr>
 <tr>
 <td>
@@ -52,9 +56,8 @@ pip install fastapi uvicorn
 </td>
 <td>
 
-```sh
-pip install ucall
-```
+Python SDK migration pending.
+Build and run the [native examples](examples/README.md) today.
 
 </td>
 </tr>
@@ -97,20 +100,22 @@ server.run()
 
 The native [benchmark driver](bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, and latency percentiles.
 Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
-The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, and streaming sections describe planned interfaces.
+The [October 19 Razer snapshot](bench/README.md#razer-snapshot-october-19-2026) measured about 263,000 requests/s for 1 KiB plaintext loopback echo, with one POSIX server polling thread and two fixed io_uring 7.0 client polling threads.
+The report separates server and client backend comparisons, retained replies, connection churn, large payloads, and independent offered-rate runs.
+The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, streaming, and authorization plans below are labeled as such.
 
 ## Design Principles
 
 ### Asynchronous Framework for Synchronous Applications
 
-It's clear that talking to remote services over a network is slower than any other operation in a computer.
+Talking to remote services over a network can cost much more than the local computation that handles a request.
 Moreover, the packet exchange between the application and the network card involves multiple context switches and kernel calls.
 To mitigate these latencies, UCall uses several asynchronous IO mechanisms under the hood, like `io_uring`.
 Now the question is, how to expose this asynchrony to the user code?
 
 The UCall way is to keep the application code synchronous.
 No `async`/`await` keywords or `future`/`promise` handles.
-For lightweight operations it's optimal - no additional bookkeeping overhead.
+For lightweight operations, a handler stays an ordinary synchronous function.
 For heavy operations, there is no secret pill, but there is a common "latency hiding" trick - batching.
 
 Batch endpoints group independent requests by their configured size and latency budgets.
@@ -130,7 +135,9 @@ Each loop has one application owner, and `ucall_server_stop()` can wake it from 
 `ucall_client_call()` submits an exchange and returns its acceptance result.
 Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
 Initialize, submit, poll, and free a client on the same owner thread.
+Keep borrowed request inputs alive until their completion is retrieved.
 After retrieval, the caller owns each response until `ucall_received_http_response_free()`.
+Stop and join server polling threads before freeing the server.
 
 ### Encryption: From TLS to Noise
 
@@ -142,9 +149,9 @@ Moreover, the certificate management, PKI, and trust chains are an absolute ergo
 There is a better way... that is broadly deployed, but little known.
 The Noise Protocol Framework!
 
-It's used by WhatsApp, WireGuard VPN, and the Lightning Network for faster off-chain transactions on top of Bitcoin.
-UCall uses a `protocol+transport` URL scheme convention (like Docker's `http+unix://`) to explicitly specify the transport: `http://`, `ws://`, `http+noise://`, and `ws+noise://`.
-It also uses a Diffie-Hellman __(DH)__ key exchange to establish a shared secret between the client and server, but it's much simpler, easier to implement, audit, and reason about than TLS.
+UCall uses a `protocol+transport` URL scheme convention (like Docker's `http+unix://`) to explicitly specify the transport: `http://` or `http+noise://`.
+WebSocket transports are planned.
+Noise uses a Diffie-Hellman __(DH)__ key exchange to establish a shared secret between the client and server, with the handshake pattern determining which keys each side must know.
 Several handshake patterns are defined, each suitable for different use cases:
 
 - __XX__: Full mutual authentication where both parties authenticate each other during the handshake.
@@ -152,10 +159,10 @@ Several handshake patterns are defined, each suitable for different use cases:
 - __IK__: Client knows the server's public key in advance (Identity Known).
   Provides faster handshakes and is ideal for typical client-server architectures, similar to TLS with certificate pinning.
 - __KK__: Both parties know each other's public keys beforehand (Known Known).
-  Enables zero round-trip encryption for pre-configured systems with maximum performance.
+  The client-side pattern is implemented; the current server interface cannot name its preknown initiator key and rejects KK.
 
 Noise can be implemented in several ways, depending on the choice of three cryptographic primitives: Diffie-Hellman key exchange, symmetric cipher, and hash function.
-The suite defines four standard combinations optimized for different use cases:
+Examples of primitive combinations are:
 
 | Name                       | Key exchange |            Cipher |    Hash |
 | :------------------------- | -----------: | ----------------: | ------: |
@@ -169,39 +176,22 @@ First, it uses the [Curve25519](https://en.wikipedia.org/wiki/Curve25519) ellipt
 Then, it uses the [AES-256-GCM](https://en.wikipedia.org/wiki/Advanced_Encryption_Standard) authenticated symmetric cipher for encrypting and decrypting the data.
 Finally, it uses the [SHA-256](https://en.wikipedia.org/wiki/SHA-2) hash function for hashing operations during the handshake and key derivation.
 
-Why not one of the three ChaCha20-Poly1305 suites?
-Because UCall targets modern silicon, where AES is not a software algorithm at all:
+Why choose AES-256-GCM and SHA-256?
+Both primitives ship in [StringZilla][stringzilla], so the transport shares the framework's capability-selected kernels rather than maintaining a separate cryptographic backend.
+The selected CPU class carries matching string searches, AES-GCM, SHA-256, and atomic operations together.
+The implemented x86 and Arm kernels use the available cryptographic instruction paths, with serial fallbacks for the baseline class.
 
-- __Both halves of the AEAD are single instructions.__
-  `AES-NI` and `PCLMULQDQ` on x86 since 2010, `AESE`/`AESMC` and `PMULL` on every server Arm — Neoverse, Graviton, Ampere, Apple Silicon.
-  ChaCha20 and Poly1305 have no such path and must be assembled from general-purpose SIMD.
-- __The gap widens every generation.__
-  ChaCha20 scales only with vector width, which is already saturated.
-  AES gained `VAES` on Ice Lake and Zen 3, encrypting four blocks per instruction, and vendors keep widening that path.
-- __It is the only AEAD anyone offloads.__
-  NIC inline crypto, IPsec engines, Intel QAT, and DPUs all implement AES-GCM; none implement ChaCha20-Poly1305.
-  That is the only realistic route to eventually combining encryption with the zero-copy paths described below.
-- __Constant-time by construction.__
-  The hardware instructions perform no data-dependent table lookups, so the cache-timing attacks that plague table-driven software AES simply do not apply.
-- __It is the only NIST-shaped suite of the four.__
-  AES-256-GCM, SHA-256, and X25519 are all NIST-approved; ChaCha20-Poly1305 and BLAKE2s are not.
-  That is a hard gate in regulated deployments, not a preference.
-- __Both primitives ship in [`stringzilla`][stringzilla].__
-  AES-256-GCM and SHA-256 dispatch across x86 `AES-NI`, `VAES`, and `SHA-NI`, ARMv8 `AES` and `SHA2`, and RISC-V `Zvknh`.
-
-WireGuard, WhatsApp, and the Lightning Network all chose ChaCha20-Poly1305 because they run on phones where AES instructions are not guaranteed.
-UCall runs in datacenters, so the tradeoff inverts.
-
-UCall therefore refuses to start without `AES-NI` or the ARMv8 cryptographic extensions, never falling back to table-driven software AES.
-And because AES-GCM's margin degrades with volume encrypted under one key, the transport rekeys on a fixed schedule.
-
-Noise itself sits __beneath__ HTTP and WebSockets, where TLS sits in `https://` and `wss://`, so one transport serves both.
-Payloads split into independently authenticated 16 KB records, invisible to the protocols above.
+Noise itself sits __beneath__ HTTP, independently of the socket backend.
+Payloads split into independently authenticated records, invisible to the protocol above.
+The record bound comes from its two-byte length prefix and authentication overhead; it does not become an application message-size limit.
 
 ### Authentication: Macaroons, Biscuits, and Other Pastries
 
-The standard web authentication flow involves OAuth2 tokens, JWTs, and session cookies - all designed around the assumption that a central server validates every request against a database.
-This works, but it means every API call requires a database lookup, and delegating access (giving a third-party app limited access to your data) requires complex OAuth flows with redirect URIs and consent screens.
+__Roadmap:__ Native Macaroon and Biscuit parsers are not implemented.
+The following describes the authorization model being considered; current applications inspect headers and apply their own policy.
+
+Traditional web authentication often combines OAuth2 flows, JWTs, and session cookies.
+Delegating access to part of a service can require additional token issuance, scopes, and consent flows; capability tokens offer another way to express those restrictions.
 
 There is a better way, pioneered by Google in 2014: [Macaroons][macaroons].
 A Macaroon is a bearer token built on chained HMACs that supports __attenuation__ - anyone holding a token can add restrictions to it, but nobody can remove them.
@@ -235,9 +225,8 @@ check if operation($op), ["read", "list"].contains($op);
 check if resource($r), $r.starts_with("/api/");
 ```
 
-UCall supports both formats natively, with built-in parsers for common restriction types: time bounds, path patterns, HTTP methods, IP ranges, and rate limits.
-Custom restrictions are evaluated by user-provided callbacks.
-The `Authorization` header format is straightforward: `Authorization: Macaroon <base64>` or `Authorization: Biscuit <base64>`.
+The proposed integration would cover time bounds, path patterns, HTTP methods, IP ranges, and application-defined restrictions.
+A possible `Authorization` header format is `Authorization: Macaroon <base64>` or `Authorization: Biscuit <base64>`; the current framework does not interpret either token.
 
 Why "pastries"?
 Because capability-based tokens are delicious - they're self-contained, offline-verifiable, and delegation-friendly.
@@ -251,6 +240,8 @@ Both are battle-tested at scale.
 
 ### Protocol Identity: SPIFFE
 
+__Roadmap:__ SPIFFE integration and SVID binding to Noise keys are not implemented.
+
 Authentication tokens answer "what can this request do?" but not "who is making it?"
 In traditional deployments, workloads authenticate using static credentials - API keys, service account tokens, or certificates manually provisioned by operators.
 These secrets end up in config files, environment variables, and CI/CD pipelines, creating a sprawling attack surface.
@@ -259,7 +250,7 @@ These secrets end up in config files, environment variables, and CI/CD pipelines
 Instead of "here's my password", it's "here's cryptographic proof of what I am" - verified by inspecting process attributes, Kubernetes pod labels, AWS instance metadata, or other environmental signals.
 
 A SPIFFE identity is a URI: `spiffe://example.com/service/api-server`.
-The workload receives a short-lived certificate (SVID - SPIFFE Verifiable Identity Document) from a local agent, automatically rotated every hour.
+The workload receives a short-lived identity document (SVID - SPIFFE Verifiable Identity Document), with its issuer and deployment policy controlling renewal.
 No secrets in config files.
 No manual certificate management.
 If the workload dies and restarts, it re-attests and gets fresh credentials.
@@ -271,19 +262,18 @@ If the workload dies and restarts, it re-attests and gets fresh credentials.
 ├─────────────────────────────────────────────────────────────────┤
 │  SPIFFE: Identity from attestation                              │
 │  Process starts → Agent inspects (PID, UID, k8s labels)         │
-│                 → Issues certificate valid for 1 hour           │
-│                 → Auto-rotates before expiry                    │
-│  No secrets to leak. Identity is "what you are", not "what you  │
-│  know".                                                         │
+│                 → Issues a short-lived identity document        │
+│                 → Renews before expiry                          │
+│  No application API keys in config; workload attestation        │
+│  provides the basis for issuing its identity.                   │
 └─────────────────────────────────────────────────────────────────┘
 ```
 
-UCall integrates SPIFFE with Noise in a natural way: the SPIFFE identity (SVID) binds to the Noise static key.
-After the Noise handshake establishes an encrypted channel, both parties exchange their SPIFFE identities over that channel.
-The server can then authorize based on the client's SPIFFE ID pattern: `spiffe://prod.example.com/service/*` allows any production service, while `spiffe://prod.example.com/service/payment-*` restricts to payment services only.
+A future integration would need to verify a binding between the SPIFFE identity and the Noise static key.
+After an authenticated exchange, an application could authorize based on the client's SPIFFE ID pattern: `spiffe://prod.example.com/service/*` allows any production service, while `spiffe://prod.example.com/service/payment-*` restricts to payment services only.
 
-This combination - Noise for encryption, SPIFFE for identity, Macaroons/Biscuits for capabilities - provides a complete security stack without the complexity of TLS certificates, OAuth servers, or secret management systems.
-It's what zero-trust networking looks like when you start from first principles.
+The intended separation is Noise for channel encryption, SPIFFE for workload identity, and Macaroons or Biscuits for delegated capabilities.
+Only the Noise transport and application peer-authorization callbacks are implemented today.
 
 [spiffe]: https://spiffe.io
 
@@ -301,7 +291,7 @@ The implementation uses:
 - [SmashTable](https://github.com/ashvardanian/SmashTable) for fallible containers and the examples' strictly serializable transactions.
 
 There is no OpenSSL, no libsodium, and no third-party Noise implementation.
-The only vendored cryptographic code is a single-file Curve25519, which is the one primitive that has no place in a string library.
+The Curve25519 implementation lives separately from StringZilla's symmetric cipher and hash kernels.
 
 [stringzilla]: https://github.com/ashvardanian/StringZilla
 [simdjson]: https://github.com/simdjson/simdjson
@@ -311,15 +301,15 @@ The only vendored cryptographic code is a single-file Curve25519, which is the o
 
 ### Protocol Flexibility: REST and JSON-RPC
 
-UCall supports flexible parameter extraction for both REST-style APIs and JSON-RPC requests.
-You can configure how and where each parameter is extracted from:
+The current C ABI exposes path, query, header, and body views for REST-style APIs.
+JSON-RPC conversion and higher-level parameter decoding are planned:
 
 - __Path Parameters__: Extract from URL pattern, e.g., `/users/{user_id}/posts/{post_id}`
 - __Query Parameters__: Extract from query string, e.g., `/search?q=rust&limit=10`
-- __JSON Body__: Extract from request body, e.g., `{"temperature": 0.7, "max_tokens": 100}`
-- __Multipart Body__: Files + metadata in one request
+- __JSON Body__: Applications can parse raw body bytes, e.g., `{"temperature": 0.7, "max_tokens": 100}`; automatic decoding is planned
+- __Multipart Body__: Planned support for files + metadata in one request
 
-This flexibility allows you to build both traditional REST APIs (using query params) and modern JSON-based APIs with the same codebase.
+The routing and raw-body interface already lets an application implement either shape; the framework does not yet supply the JSON-RPC adapter.
 Why support JSON-RPC?
 
 - Broadly supported, especially in decentralized software.
@@ -328,11 +318,13 @@ Why support JSON-RPC?
 
 ### Multipart Data and Rich Types
 
-UCall supports `multipart/form-data` requests, allowing you to send files and metadata in a single HTTP request.
-The `boundary=----WebKitFormBoundary` is injected by the client and respected by the server, making it compatible with most HTML `<form>` submissions and `fetch` API calls.
+__Roadmap:__ Multipart parsing, Python rich-type conversion, and the following SDK example await implementation or migration.
+
+The planned `multipart/form-data` interface would let an application send files and metadata in a single HTTP request.
+A client would supply the boundary parameter and the server would parse individual parts.
 Each part gets its own `Content-Disposition` and `Content-Type` and can include rich data types, like images, audio, and binary blobs.
-In Python, that allows us to transparently decode `numpy.ndarray` and `PIL.Image` inputs and outputs.
-Here's what it would look like for building a multi-modal semantic search platform built on top of Unum's [UForm](https://github.com/unum-cloud/UForm) models and [USearch](https://github.com/unum-cloud/USearch) engine.
+The intended Python SDK could decode `numpy.ndarray` and `PIL.Image` inputs and outputs.
+The following is an illustrative design sketch, requiring future SDK support and application-provided model and index setup, for a multi-modal semantic search platform built on top of Unum's [UForm](https://github.com/unum-cloud/UForm) models and [USearch](https://github.com/unum-cloud/USearch) engine.
 
 ```python
 from ucall import Server
@@ -356,7 +348,7 @@ def search(vector: numpy.ndarray, top_k: int = 10):
     return matches.keys.tolist()
 ```
 
-Now that server can be called with both standard tools like `curl` and with the UCall Python client:
+The intended wire interface could be called with standard tools like `curl`; this route is part of the sketch above:
 
 ```sh
 curl -X POST http://localhost:8545/vectorize \
@@ -377,36 +369,35 @@ For JSON-RPC, that's trivial - pack a JSON array of individual procedure calls:
 ]
 ```
 
-It's important to remember that the batch sent from a user won't necessarily be processed at once.
-All of the replies will be returned at once on completion, but under the hood, they may be regrouped, potentially invoking `"id": 1` and `"id": 3` together on a batch-capable callback, and the remaining task separately.
+A JSON-RPC adapter could regroup procedures by endpoint before assembling its response array; that adapter is planned.
+The implemented server batching instead collects independent HTTP requests ready on one polling loop and passes their retained handles as a counted array.
+Each request keeps its own response and transaction boundary, as the [key-value and ledger examples](examples/README.md) demonstrate.
 
 ### Resumable Uploads & Downloads
+
+__Roadmap:__ Resumable-transfer policies, streaming multipart access, and file-reply backends are not implemented.
 
 There is no one unique way to deal with resumable or chunked uploads and downloads.
 The most common approaches for uploads and downloads are sadly not symmetric.
 
 |          | Upload                            | Download                                  |
 | -------- | --------------------------------- | ----------------------------------------- |
-| Standard | Tus.io                            | HTTP/1.1 RFC 7233 (1999)                  |
+| Standard | Tus.io                            | HTTP range requests (RFC 7233)            |
 | State    | Stateful (server tracks progress) | Stateless (client decides ranges)         |
 | Headers  | `Upload-Offset`, `Tus-Resumable`  | `Range`, `Accept-Ranges`, `Content-Range` |
 | Methods  | `POST`, `PATCH`, `HEAD`           | `GET` with `Range` header                 |
-| Usage    | Vimeo                             | Universal (all browsers since 1999)       |
+| Usage    | Vimeo                             | Browsers and download clients             |
 
-The more popular alternative to Tus.io for resumable uploads is Streaming Multipart uploads.
-Those are also natively supported by UCall, but not recommended for large files or unreliable connections, as they require re-sending all data after a failure - no continuation is possible.
+Streaming multipart is another upload design, but continuation after a failure requires an application-level protocol rather than multipart framing alone.
 
-When using `io_uring` as the backend, it's recommended to use large chunk sizes in multiples of default SSD page sizes.
-In that case we can further reduce the number of transparent file copies in the OS and system calls by performing `O_DIRECT` zero-copy IO by splicing data directly between the network socket and the file descriptor.
-
-Splicing and encryption are __mutually exclusive__.
-Moving bytes kernel-side means never seeing them in user space, and Noise has to see them to encrypt them.
-So the zero-copy path serves `http://` and `ws://` only, and connections using `http+noise://` or `ws+noise://` fall back to a buffered copy.
-Terminating Noise on a NIC that offloads AES-GCM would lift that restriction, which is part of why the cipher was chosen.
+A future file backend could splice plaintext data between sockets and file descriptors where the operating system supports it.
+Splicing and user-space encryption have different buffer requirements: Noise must access the bytes it encrypts.
+The current file-reply entry points return unsupported, so this is a backend direction rather than an available zero-copy transfer API.
 
 ### Other Functional HTTP Headers
 
-UCall supports standard HTTP headers for production deployments.
+The C ABI exposes request headers and accepts application-supplied response headers.
+The following are useful application-level conventions; they do not imply built-in rate limiting, caching, tracing, or security policies.
 
 __Rate Limiting & Flow Control__ (Server → Client):
 
@@ -420,7 +411,7 @@ __Rate Limiting & Flow Control__ (Server → Client):
 __Request Correlation & Tracing__ (Bidirectional):
 
 - `X-Request-ID` / `X-Correlation-ID`: Unique identifier linking logs and metrics across services
-- `X-Trace-ID` / `X-Span-ID`: OpenTelemetry-compatible distributed tracing identifiers
+- `X-Trace-ID` / `X-Span-ID`: Application-defined distributed tracing identifiers
 
 __Caching & Validation__:
 
@@ -434,7 +425,7 @@ __Caching & Validation__:
 __Performance & Observability__ (Server → Client):
 
 - `X-Response-Time`: Server-side processing time in milliseconds
-- `Server`: Server software identification (e.g., `UCall/2.0`)
+- `Server`: Server software identification (e.g., `UCall/1.0`)
 
 __Security__ (Server → Client):
 
@@ -444,21 +435,25 @@ __Security__ (Server → Client):
 
 ### WebSockets and Streaming
 
+__Roadmap:__ The declared WebSocket and streaming-reply operations currently return unsupported.
+
 WebSockets have very different semantics from remaining request-response one-shot functionality.
 Communication is bidirectional and long-lived, with messages flowing in both directions independently.
 Often small, frequent messages, should be handled differently.
 
-We also provide callback handlers for WebSocket connections that let you handle messages as they arrive.
-But you are not required or expected to form a response for each message inside the callback.
+The planned WebSocket callbacks would deliver messages as they arrive.
+An application would not be required to form one response for every message inside the callback.
 
 ### Observability & Metrics
 
-UCall provides minimal overhead observability, using the same kernel-bypass techniques to output metrics.
-Metrics are __opt-in__: point `metrics_address` at a StatsD/DogStatsD endpoint such as `127.0.0.1:8125` to enable them, and leave it `NULL` — the default — to emit nothing at all.
-A server should never send packets to a port its operator didn't ask for.
-This is the most lightweight approach for high-throughput servers: fire-and-forget UDP packets add ~100ns overhead per request.
+__Roadmap:__ StatsD emission is not implemented; configuring `metrics_address` currently returns unsupported.
+The wire samples and configuration below describe the intended interface.
 
-Metrics are automatically tagged with endpoint, method, and status code for easy debugging:
+The planned observability path would emit StatsD/DogStatsD datagrams to an explicitly configured endpoint.
+Metrics would be __opt-in__: `metrics_address` would name an endpoint such as `127.0.0.1:8125`, with `NULL` retaining the default of no emission.
+A server should never send packets to a port its operator didn't ask for.
+
+The proposed metric names carry endpoint, method, and status tags:
 
 ```statsd
 ucall.requests:1|c|#endpoint:/sum,method:POST,status:200
@@ -468,38 +463,37 @@ ucall.queue.depth:8|g|#endpoint:/inference
 ucall.errors:1|c|#endpoint:/sum,error:timeout
 ```
 
-For high-throughput scenarios (>500K rps), sampling can be configured to reduce UDP traffic:
+The proposed sampling configuration would reduce metric traffic:
 
 ```c
 ucall_server_config_t config = {
-    .metrics_address = "127.0.0.1:8125", // Enables metrics; NULL keeps them off
+    .metrics_address = "127.0.0.1:8125", // Reserved; currently returns unsupported
     .metrics_sample_rate = 0.1,          // Sample 10% of requests, StatsD will multiply counts
     .metrics_prefix = "myapp",           // Metric names become "myapp.requests", etc.
     .metrics_tags = "env:prod,region:us-east", // Global tags for all metrics
 };
 ```
 
-The StatsD format works universally with all major observability platforms via collectors: Datadog Agent, OTel Collector, Telegraf, and Prometheus StatsD Exporter.
+The intent is to integrate with existing StatsD collectors rather than introduce a framework-specific metrics service.
 
 ## Design Differences and Limitations
 
 ### Where Would You Prefer WebRTC?
 
-WebRTC is a separate protocol providing selective reliability in latency-critical applications.
-Unlike most of UCall functionality, it builds on top of UDP, not TCP.
-On top of that, it uses Sequence Numbers (TSN), Selective Acknowledgments (SACK), Retransmission Timers, and Congestion Control algorithms to emulate TCP-like behavior when needed.
+WebRTC DataChannels offer message-oriented communication with configurable reliability.
+That is a different tradeoff from UCall's TCP byte streams.
 
-This solves a few problems, most importantly - head of line blocking in lossy networks.
+TCP's head-of-line blocking matters on lossy networks.
 In TCP, if a packet is lost, all subsequent packets are held back until the lost packet is retransmitted and received.
 On reliable networks, there should be no noticeable difference.
 In the future, WebRTC DataChannels may be added.
 
 ### What About HTTP/2?
 
-UCall currently only supports HTTP/1.1 with an upgrade path to WebSockets.
+UCall currently supports HTTP/1.1; WebSocket upgrades are planned.
 HTTP/2 adds several important features:
 
-- `CONNECT` verb for tunneling in both directions to eliminate the need for traditional WebSockets.
+- Extended `CONNECT` for protocols that tunnel bidirectional traffic.
 - Multiplexing multiple streams over a single TCP connection to improve resource utilization.
 - Header compression using `HPACK` to reduce bandwidth usage for common and repetitive headers.
 
@@ -513,23 +507,23 @@ All of that increases the attack surface and the potential for bugs and didn't a
 
 UCall currently only operates on top of TCP.
 Building around UDP has been a long-standing ambition for Unum since inception in 2015, and a QUIC-like protocol with Noise encryption makes a lot of sense, but it's far less compatible with existing infrastructure.
-So for now, UCall focuses on high-performance TCP-based communication and interoperability with existing HTTP/1.1 and WebSocket ecosystems.
+So for now, UCall focuses on TCP-based communication and HTTP/1.1 interoperability.
 
 ### What Will You Miss From FastAPI?
 
 FastAPI comes with a rich ecosystem of plugins and extensions for authentication, database integration, OpenAPI schema generation, and more.
 
-First of all, UCall doesn't support endpoints like `/users/{id}` natively.
+UCall supports routes like `/users/{id}` natively, including named parameters and greedy suffixes.
+The current gaps are higher-level SDK ergonomics, automatic schema generation, rich-type conversion, and the authentication integrations discussed above.
 
 ### What If You Love TLS?!
 
 If you really need TLS, you can always deploy UCall behind a reverse proxy, like Nginx or Envoy.
 They will handle all the TLS termination and forward decrypted HTTP traffic to UCall over a local network interface.
 This is a common pattern in production deployments, as it allows to offload TLS processing from the application server.
-Here's what your Docker Compose configuration may look like:
+The following deployment template assumes your application image binds plaintext HTTP on port 8080; replace the image and certificate paths for your deployment:
 
 ```yaml
-version: '3.8'
 services:
   nginx:
     image: nginx:alpine
@@ -543,13 +537,9 @@ services:
       - ucall
 
   ucall:
-    build: .
-    ports:
-      - "8080:8080"
-    environment:
-      - UCALL_HOSTNAME=0.0.0.0
-      - UCALL_PORT=8080
-      - UCALL_MAX_THREADS=4
+    image: your-ucall-application:latest
+    expose:
+      - "8080"
 ```
 
 And the corresponding `nginx.conf`:

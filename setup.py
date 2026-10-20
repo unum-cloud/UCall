@@ -180,7 +180,7 @@ setup(
     author="Ash Vardanian",
     author_email="info@unum.cloud",
     url="https://github.com/unum-cloud/UCall",
-    description="Up to 100x Faster FastAPI. JSON-RPC with io_uring, SIMD-acceleration, and pure CPython bindings",
+    description="Native HTTP and Noise networking with caller-owned polling and request batching",
     long_description=long_description,
     long_description_content_type="text/markdown",
     license="Apache-2.0",

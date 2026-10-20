@@ -20,8 +20,10 @@
 #include <mswsock.h>
 #include <ws2tcpip.h>
 #else
+#include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/tcp.h>
 #include <poll.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -122,8 +124,14 @@ inline descriptor_t socket_open(int family) noexcept {
         socket_close(descriptor);
         return -1;
     }
-#if UCALL_OS_APPLE_
     int enabled = 1;
+    // Fragmented RPC writes must not wait for delayed ACKs before releasing TX credits.
+    if ((family == AF_INET || family == AF_INET6) &&
+        socket_option(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
+        socket_close(descriptor);
+        return -1;
+    }
+#if UCALL_OS_APPLE_
     if (setsockopt(static_cast<int>(descriptor), SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
         socket_close(descriptor);
         return -1;
@@ -138,8 +146,13 @@ inline descriptor_t accepted_socket(descriptor_t descriptor) noexcept {
         socket_close(descriptor);
         return -error;
     }
-#if UCALL_OS_APPLE_
     int enabled = 1;
+    if (socket_option(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
+        int error = socket_last_error();
+        socket_close(descriptor);
+        return -error;
+    }
+#if UCALL_OS_APPLE_
     if (setsockopt(static_cast<int>(descriptor), SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) {
         int error = errno;
         socket_close(descriptor);
@@ -174,6 +187,11 @@ struct io_completion_t {
 
 /** A pollable wakeup with the same request lifetime as socket operations. */
 struct wake_channel_t {
+    wake_channel_t() noexcept = default;
+    wake_channel_t(wake_channel_t const&) = delete;
+    wake_channel_t& operator=(wake_channel_t const&) = delete;
+    wake_channel_t(wake_channel_t&&) = delete;
+    wake_channel_t& operator=(wake_channel_t&&) = delete;
     descriptor_t descriptors[2] {-1, -1};
     byte_t bytes[sizeof(std::uint64_t)] {};
     io_request_t request {};
@@ -233,14 +251,15 @@ struct wake_channel_t {
 };
 
 /** Readiness slots retain connect progress and cancellation beside the durable request. */
+enum class io_phase_t { fresh_k, started_k, cancelled_k };
 struct io_slot_t {
     io_request_t* request {};
-    bool started {}, cancelled {};
+    io_phase_t phase {io_phase_t::fresh_k};
 };
 
 #if UCALL_OS_POSIX_
 inline descriptor_t attempt_io(io_slot_t& slot, bool ready) noexcept {
-    if (slot.cancelled) return -ECANCELED;
+    if (slot.phase == io_phase_t::cancelled_k) return -ECANCELED;
     auto& request = *slot.request;
     auto descriptor = static_cast<int>(request.descriptor);
     ssize_t result = -1;
@@ -248,8 +267,8 @@ inline descriptor_t attempt_io(io_slot_t& slot, bool ready) noexcept {
     switch (request.operation) {
     case io_operation_t::accept_k: return accepted_socket(accept(descriptor, nullptr, nullptr));
     case io_operation_t::connect_k:
-        if (!slot.started) {
-            slot.started = true;
+        if (slot.phase == io_phase_t::fresh_k) {
+            slot.phase = io_phase_t::started_k;
             if (connect(descriptor, reinterpret_cast<sockaddr*>(request.data),
                         static_cast<socklen_t>(request.length)) == 0)
                 return 0;
@@ -284,41 +303,58 @@ inline bool io_pending(descriptor_t result) noexcept {
 #if UCALL_OS_POSIX_
 
 /** Nonblocking POSIX syscalls, completed through poll readiness. */
-struct posix_engine_t {
-    st::basic_vector<io_slot_t> slots {};
-    st::basic_vector<pollfd> polling {};
+template <typename allocator_type_ = st::default_allocator<byte_t>>
+struct posix_engine {
+    using allocator_t = allocator_type_;
+    template <typename other_allocator_>
+    using rebind_allocator = posix_engine<other_allocator_>;
+    template <typename value_type_>
+    using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
+    st::basic_vector<io_slot_t, rebound_allocator<io_slot_t>> slots {};
+    st::basic_vector<pollfd, rebound_allocator<pollfd>> polling {};
     std::size_t active {};
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
     int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
     void release(io_completion_t const&) noexcept {}
+    void receive_pause(descriptor_t) noexcept {}
     bool cancel(io_request_t& request) noexcept {
         for (auto& slot : slots)
             if (slot.request == &request) {
-                slot.cancelled = true;
+                slot.phase = io_phase_t::cancelled_k;
                 return true;
             }
         return false;
     }
-    posix_engine_t() noexcept = default;
-    posix_engine_t(posix_engine_t const&) = delete;
-    ~posix_engine_t() noexcept;
+    explicit posix_engine(allocator_t const& allocator = {}) noexcept
+        : slots(rebound_allocator<io_slot_t> {allocator}), polling(rebound_allocator<pollfd> {allocator}) {}
+    posix_engine(posix_engine const&) = delete;
+    posix_engine& operator=(posix_engine const&) = delete;
+    posix_engine(posix_engine&&) = delete;
+    posix_engine& operator=(posix_engine&&) = delete;
+    ~posix_engine() noexcept;
     ucall_status_t open(std::size_t depth, std::size_t capacity) noexcept;
     bool submit(io_request_t& request) noexcept;
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept;
     void stop() noexcept;
 };
-inline ucall_status_t posix_engine_t::open(std::size_t, std::size_t capacity) noexcept {
+template <typename allocator_type_>
+inline ucall_status_t posix_engine<allocator_type_>::open(std::size_t, std::size_t capacity) noexcept {
     return st::succeeded(slots.resize(capacity)) && st::succeeded(polling.resize(capacity))
                ? ucall_status_success_k
                : ucall_status_out_of_memory_k;
 }
-inline posix_engine_t::~posix_engine_t() noexcept { stop(); }
-inline void posix_engine_t::stop() noexcept {
+template <typename allocator_type_>
+inline posix_engine<allocator_type_>::~posix_engine() noexcept {
+    stop();
+}
+template <typename allocator_type_>
+inline void posix_engine<allocator_type_>::stop() noexcept {
     for (auto& slot : slots) slot.request = nullptr;
     active = 0;
 }
-inline bool posix_engine_t::submit(io_request_t& request) noexcept {
+template <typename allocator_type_>
+inline bool posix_engine<allocator_type_>::submit(io_request_t& request) noexcept {
     for (auto& slot : slots)
         if (!slot.request) {
             slot = {};
@@ -328,8 +364,9 @@ inline bool posix_engine_t::submit(io_request_t& request) noexcept {
         }
     return false;
 }
-inline int posix_engine_t::poll(span<io_completion_t> completions, io_wait_t wait_policy,
-                                std::uint64_t deadline) noexcept {
+template <typename allocator_type_>
+inline int posix_engine<allocator_type_>::poll(span<io_completion_t> completions, io_wait_t wait_policy,
+                                               std::uint64_t deadline) noexcept {
     std::size_t count = 0;
     for (unsigned round = 0; round != 2; ++round) {
         auto now = monotonic_ns();
@@ -372,31 +409,46 @@ inline int posix_engine_t::poll(span<io_completion_t> completions, io_wait_t wai
     return static_cast<int>(count);
 }
 
+using posix_engine_t = posix_engine<>;
+
 #endif // UCALL_OS_POSIX_
 
 #if UCALL_OS_POSIX_
 
+enum class io_interest_t { unarmed_k, armed_k, ready_k };
+
 /** Readiness engines retain stable slots until their one-shot interest is removed. */
-template <typename readiness_type_>
+template <typename readiness_type_, typename allocator_type_ = st::default_allocator<byte_t>>
 struct readiness_engine {
+    using allocator_t = allocator_type_;
+    template <typename other_allocator_>
+    using rebind_allocator =
+        readiness_engine<typename readiness_type_::template rebind_allocator<other_allocator_>, other_allocator_>;
+    template <typename value_type_>
+    using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     struct slot_t : io_slot_t {
-        bool armed {}, ready {};
+        io_interest_t interest {io_interest_t::unarmed_k};
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
     int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
     void release(io_completion_t const&) noexcept {}
+    void receive_pause(descriptor_t) noexcept {}
     bool cancel(io_request_t& request) noexcept {
         for (auto& slot : slots)
             if (slot.request == &request) {
-                slot.cancelled = true;
+                slot.phase = io_phase_t::cancelled_k;
                 return true;
             }
         return false;
     }
-    readiness_engine() noexcept = default;
+    explicit readiness_engine(allocator_t const& allocator = {}) noexcept
+        : slots(rebound_allocator<slot_t> {allocator}), readiness(allocator) {}
     readiness_engine(readiness_engine const&) = delete;
-    st::basic_vector<slot_t> slots {};
+    readiness_engine& operator=(readiness_engine const&) = delete;
+    readiness_engine(readiness_engine&&) = delete;
+    readiness_engine& operator=(readiness_engine&&) = delete;
+    st::basic_vector<slot_t, rebound_allocator<slot_t>> slots {};
     readiness_type_ readiness {};
     std::size_t active {};
     ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
@@ -424,11 +476,11 @@ struct readiness_engine {
                 if (!slot.request || count == completions.size()) continue;
                 auto& request = *slot.request;
                 bool expired = request.deadline && request.deadline <= now;
-                if (!slot.armed || slot.ready || expired || slot.cancelled) {
-                    auto result = expired ? -ETIMEDOUT : attempt_io(slot, slot.ready);
-                    slot.ready = false;
+                if (slot.interest != io_interest_t::armed_k || expired || slot.phase == io_phase_t::cancelled_k) {
+                    auto result = expired ? -ETIMEDOUT : attempt_io(slot, slot.interest == io_interest_t::ready_k);
+                    if (slot.interest == io_interest_t::ready_k) slot.interest = io_interest_t::armed_k;
                     if (!io_pending(result)) {
-                        if (slot.armed) readiness.remove(slot);
+                        if (slot.interest != io_interest_t::unarmed_k) readiness.remove(slot);
                         if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
                         completions[count++] = {&request, result};
                         slot = {};
@@ -437,7 +489,7 @@ struct readiness_engine {
                     }
                     int result_arm = readiness.arm(slot);
                     if (result_arm < 0) return result_arm;
-                    slot.armed = true;
+                    slot.interest = io_interest_t::armed_k;
                 }
                 if (request.deadline && request.deadline > now) wait = std::min(wait, request.deadline - now);
             }
@@ -454,7 +506,7 @@ struct readiness_engine {
     void stop() noexcept {
         for (auto& slot : slots)
             if (slot.request) {
-                if (slot.armed) readiness.remove(slot);
+                if (slot.interest != io_interest_t::unarmed_k) readiness.remove(slot);
                 slot = {};
             }
         active = 0;
@@ -464,9 +516,19 @@ struct readiness_engine {
 #endif
 
 #if UCALL_OS_LINUX_
-struct epoll_readiness_t {
+template <typename allocator_type_ = st::default_allocator<byte_t>>
+struct epoll_readiness {
+    using allocator_t = allocator_type_;
+    template <typename other_allocator_>
+    using rebind_allocator = epoll_readiness<other_allocator_>;
+    using events_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<epoll_event>;
+    explicit epoll_readiness(allocator_t const& allocator = {}) noexcept : events(events_allocator_t {allocator}) {}
+    epoll_readiness(epoll_readiness const&) = delete;
+    epoll_readiness& operator=(epoll_readiness const&) = delete;
+    epoll_readiness(epoll_readiness&&) = delete;
+    epoll_readiness& operator=(epoll_readiness&&) = delete;
     int descriptor {-1};
-    st::basic_vector<epoll_event> events {};
+    st::basic_vector<epoll_event, events_allocator_t> events {};
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(events.resize(capacity))) return ucall_status_out_of_memory_k;
         descriptor = epoll_create1(EPOLL_CLOEXEC);
@@ -480,7 +542,7 @@ struct epoll_readiness_t {
                        (operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? EPOLLOUT
                                                                                                       : EPOLLIN);
         event.data.ptr = &slot;
-        int action = slot.armed ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
+        int action = slot.interest != io_interest_t::unarmed_k ? EPOLL_CTL_MOD : EPOLL_CTL_ADD;
         return epoll_ctl(descriptor, action, static_cast<int>(slot.request->descriptor), &event) == 0 ? 0 : -errno;
     }
     template <typename slot_type_>
@@ -488,25 +550,40 @@ struct epoll_readiness_t {
         epoll_ctl(descriptor, EPOLL_CTL_DEL, static_cast<int>(slot.request->descriptor), nullptr);
     }
     int wait(int timeout) noexcept;
-    ~epoll_readiness_t() noexcept {
+    ~epoll_readiness() noexcept {
         if (descriptor >= 0) close(descriptor);
     }
 };
+using epoll_readiness_t = epoll_readiness<>;
 using linux_epoll_engine_t = readiness_engine<epoll_readiness_t>;
-inline int epoll_readiness_t::wait(int timeout) noexcept {
+template <typename allocator_type_>
+inline int epoll_readiness<allocator_type_>::wait(int timeout) noexcept {
     int count = epoll_wait(descriptor, events.data(),
                            static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
                            timeout);
     if (count < 0) return -errno;
-    for (int i = 0; i != count; ++i) static_cast<linux_epoll_engine_t::slot_t*>(events[i].data.ptr)->ready = true;
+    for (int i = 0; i != count; ++i)
+        static_cast<typename readiness_engine<epoll_readiness<allocator_type_>, allocator_type_>::slot_t*>(
+            events[i].data.ptr)
+            ->interest = io_interest_t::ready_k;
     return count;
 }
 #endif
 
 #if UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_
-struct kqueue_readiness_t {
+template <typename allocator_type_ = st::default_allocator<byte_t>>
+struct kqueue_readiness {
+    using allocator_t = allocator_type_;
+    template <typename other_allocator_>
+    using rebind_allocator = kqueue_readiness<other_allocator_>;
+    using events_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<struct kevent>;
+    explicit kqueue_readiness(allocator_t const& allocator = {}) noexcept : events(events_allocator_t {allocator}) {}
+    kqueue_readiness(kqueue_readiness const&) = delete;
+    kqueue_readiness& operator=(kqueue_readiness const&) = delete;
+    kqueue_readiness(kqueue_readiness&&) = delete;
+    kqueue_readiness& operator=(kqueue_readiness&&) = delete;
     int descriptor {-1};
-    st::basic_vector<struct kevent> events {};
+    st::basic_vector<struct kevent, events_allocator_t> events {};
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(events.resize(capacity))) return ucall_status_out_of_memory_k;
         descriptor = kqueue();
@@ -534,12 +611,14 @@ struct kqueue_readiness_t {
         kevent(descriptor, &event, 1, nullptr, 0, nullptr);
     }
     int wait(int timeout) noexcept;
-    ~kqueue_readiness_t() noexcept {
+    ~kqueue_readiness() noexcept {
         if (descriptor >= 0) close(descriptor);
     }
 };
+using kqueue_readiness_t = kqueue_readiness<>;
 using kqueue_engine_t = readiness_engine<kqueue_readiness_t>;
-inline int kqueue_readiness_t::wait(int timeout) noexcept {
+template <typename allocator_type_>
+inline int kqueue_readiness<allocator_type_>::wait(int timeout) noexcept {
     timespec duration {timeout / 1000, (timeout % 1000) * 1'000'000L};
     int count = kevent(descriptor, nullptr, 0, events.data(),
                        static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
@@ -547,7 +626,9 @@ inline int kqueue_readiness_t::wait(int timeout) noexcept {
     if (count < 0) return -errno;
     for (int i = 0; i != count; ++i) {
         if (events[i].flags & EV_ERROR) return -static_cast<int>(events[i].data);
-        static_cast<kqueue_engine_t::slot_t*>(events[i].udata)->ready = true;
+        static_cast<typename readiness_engine<kqueue_readiness<allocator_type_>, allocator_type_>::slot_t*>(
+            events[i].udata)
+            ->interest = io_interest_t::ready_k;
     }
     return count;
 }
@@ -556,34 +637,46 @@ inline int kqueue_readiness_t::wait(int timeout) noexcept {
 #if UCALL_OS_WINDOWS_
 
 /** Overlapped socket operations retain their storage through cancellation completion. */
-struct windows_iocp_engine_t {
+template <typename allocator_type_ = st::default_allocator<byte_t>>
+struct windows_iocp_engine {
+    using allocator_t = allocator_type_;
+    template <typename other_allocator_>
+    using rebind_allocator = windows_iocp_engine<other_allocator_>;
+    template <typename value_type_>
+    using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
+    enum class phase_t { pending_k, immediate_k, cancelling_k, timing_out_k };
     struct slot_t {
         OVERLAPPED overlapped {};
         io_request_t* request {};
         SOCKET accepted {INVALID_SOCKET};
         descriptor_t immediate {};
-        bool posted {}, timed_out {}, cancelling {};
+        phase_t phase {phase_t::pending_k};
         byte_t addresses[2 * (sizeof(sockaddr_storage) + 16)] {};
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
     int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
     void release(io_completion_t const&) noexcept {}
+    void receive_pause(descriptor_t) noexcept {}
     bool cancel(io_request_t& request) noexcept {
         for (auto& slot : slots)
             if (slot.request == &request) {
-                if (!slot.posted && !slot.cancelling) {
-                    slot.cancelling = true;
+                if (slot.phase == phase_t::pending_k) {
+                    slot.phase = phase_t::cancelling_k;
                     CancelIoEx(reinterpret_cast<HANDLE>(request.descriptor), &slot.overlapped);
                 }
                 return true;
             }
         return false;
     }
-    windows_iocp_engine_t() noexcept = default;
-    windows_iocp_engine_t(windows_iocp_engine_t const&) = delete;
+    explicit windows_iocp_engine(allocator_t const& allocator = {}) noexcept
+        : slots(rebound_allocator<slot_t> {allocator}) {}
+    windows_iocp_engine(windows_iocp_engine const&) = delete;
+    windows_iocp_engine& operator=(windows_iocp_engine const&) = delete;
+    windows_iocp_engine(windows_iocp_engine&&) = delete;
+    windows_iocp_engine& operator=(windows_iocp_engine&&) = delete;
     HANDLE port {};
-    st::basic_vector<slot_t> slots {};
+    st::basic_vector<slot_t, rebound_allocator<slot_t>> slots {};
     std::size_t active {};
     ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
         if (!sockets_start()) return ucall_status_io_k;
@@ -611,11 +704,7 @@ struct windows_iocp_engine_t {
         auto socket = static_cast<SOCKET>(request.descriptor);
         auto complete_immediately = [&](descriptor_t result) noexcept {
             slot->immediate = result;
-            slot->posted = true;
-            if (!PostQueuedCompletionStatus(port, 0, 0, &slot->overlapped)) {
-                slot->request = nullptr;
-                return false;
-            }
+            slot->phase = phase_t::immediate_k;
             ++active;
             return true;
         };
@@ -691,11 +780,10 @@ struct windows_iocp_engine_t {
                                                  duration / 1'000'000 + (duration % 1'000'000 != 0), INFINITE - 1)));
             }
             for (auto& slot : slots)
-                if (slot.request && slot.request->deadline && !slot.cancelling) {
+                if (slot.request && slot.phase == phase_t::pending_k && slot.request->deadline) {
                     auto deadline = slot.request->deadline;
                     if (deadline <= now) {
-                        slot.timed_out = true;
-                        slot.cancelling = true;
+                        slot.phase = phase_t::timing_out_k;
                         CancelIoEx(reinterpret_cast<HANDLE>(slot.request->descriptor), &slot.overlapped);
                     }
                     else
@@ -707,7 +795,12 @@ struct windows_iocp_engine_t {
             DWORD bytes {};
             ULONG_PTR key {};
             OVERLAPPED* overlapped {};
-            BOOL success = GetQueuedCompletionStatus(port, &bytes, &key, &overlapped, wait);
+            for (auto& slot : slots)
+                if (slot.request && slot.phase == phase_t::immediate_k) {
+                    overlapped = &slot.overlapped;
+                    break;
+                }
+            BOOL success = overlapped ? TRUE : GetQueuedCompletionStatus(port, &bytes, &key, &overlapped, wait);
             DWORD error = success ? ERROR_SUCCESS : GetLastError();
             if (!overlapped) {
                 if (!success && error == WAIT_TIMEOUT) {
@@ -719,10 +812,10 @@ struct windows_iocp_engine_t {
             }
             auto& slot = *reinterpret_cast<slot_t*>(overlapped);
             auto& request = *slot.request;
-            descriptor_t result = slot.posted ? slot.immediate
-                                  : success   ? static_cast<descriptor_t>(bytes)
-                                              : -socket_error(static_cast<int>(error));
-            if (!success && slot.timed_out && result == -ECANCELED) result = -ETIMEDOUT;
+            descriptor_t result = slot.phase == phase_t::immediate_k ? slot.immediate
+                                  : success                          ? static_cast<descriptor_t>(bytes)
+                                                                     : -socket_error(static_cast<int>(error));
+            if (!success && slot.phase == phase_t::timing_out_k && result == -ECANCELED) result = -ETIMEDOUT;
             if (request.operation == io_operation_t::accept_k && slot.accepted != INVALID_SOCKET) {
                 if (result >= 0) {
                     auto listener = static_cast<SOCKET>(request.descriptor);
@@ -746,8 +839,8 @@ struct windows_iocp_engine_t {
     }
     void stop() noexcept {
         for (auto& slot : slots)
-            if (slot.request && !slot.posted) {
-                slot.cancelling = true;
+            if (slot.request && slot.phase != phase_t::immediate_k) {
+                if (slot.phase == phase_t::pending_k) slot.phase = phase_t::cancelling_k;
                 CancelIoEx(reinterpret_cast<HANDLE>(slot.request->descriptor), &slot.overlapped);
             }
         io_completion_t discarded[32];
@@ -759,11 +852,12 @@ struct windows_iocp_engine_t {
                     socket_close(discarded[i].result);
         }
     }
-    ~windows_iocp_engine_t() noexcept {
+    ~windows_iocp_engine() noexcept {
         stop();
         if (port) CloseHandle(port);
     }
 };
+using windows_iocp_engine_t = windows_iocp_engine<>;
 #endif
 
 } // namespace unum::ucall

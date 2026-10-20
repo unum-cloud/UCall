@@ -8,11 +8,12 @@
 #include <cstddef> // `std::byte`
 #include <cstdint> // `std::intptr_t`
 #include <cassert> // `assert`
-#include <cstdlib> // `std::malloc`, `std::free`, `std::realloc`
 #include <cstring> // `std::strlen`, `std::memset`, `std::memcpy`
 
-#include <atomic> // `std::atomic`
-#include <memory> // `std::uninitialized_default_construct`, `std::destroy_n`
+#include <atomic>    // `std::atomic`
+#include <algorithm> // `std::max`
+#include <limits>    // `std::numeric_limits`
+#include <memory>    // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <span>
 #include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
@@ -117,10 +118,22 @@
 
 #include "ucall/ucall.h" // `ucall_callback_t`
 
+namespace unum::ucall {
+struct wake_channel_t;
+}
+namespace uc = unum::ucall;
+
 struct ucall_server_handle_t {
+    ucall_server_handle_t() noexcept = default;
+    ucall_server_handle_t(ucall_server_handle_t const&) = delete;
+    ucall_server_handle_t& operator=(ucall_server_handle_t const&) = delete;
+    ucall_server_handle_t(ucall_server_handle_t&&) = delete;
+    ucall_server_handle_t& operator=(ucall_server_handle_t&&) = delete;
+
+    std::uint32_t stopped {};
+    std::span<uc::wake_channel_t*> wakeups {};
     struct api_t {
         void (*free)(ucall_server_t);
-        void (*stop)(ucall_server_t);
         void (*take_call)(ucall_server_take_call_t*);
         void (*take_calls)(ucall_server_take_calls_t*);
         void (*add_http_endpoint)(ucall_server_add_http_endpoint_t*);
@@ -136,8 +149,15 @@ struct ucall_server_handle_t {
         void (*add_batch_endpoint)(ucall_server_add_batch_endpoint_t*);
     };
     api_t const* api {};
+    std::uint64_t string_capabilities {}, atomic_capabilities {};
 };
 struct ucall_client_handle_t {
+    ucall_client_handle_t() noexcept = default;
+    ucall_client_handle_t(ucall_client_handle_t const&) = delete;
+    ucall_client_handle_t& operator=(ucall_client_handle_t const&) = delete;
+    ucall_client_handle_t(ucall_client_handle_t&&) = delete;
+    ucall_client_handle_t& operator=(ucall_client_handle_t&&) = delete;
+
     struct api_t {
         void (*free)(ucall_client_t);
         void (*call)(ucall_client_call_t*);
@@ -146,6 +166,7 @@ struct ucall_client_handle_t {
         void (*response_body)(ucall_received_http_response_body_t*);
     };
     api_t const* api {};
+    std::uint64_t string_capabilities {}, atomic_capabilities {};
 };
 struct ucall_received_http_request_handle_t {};
 struct ucall_received_http_response_handle_t {};
@@ -167,6 +188,33 @@ namespace st = ashvardanian::smashtable;
 /** Raw storage, with the same width as the C interface's ucall_byte_t. */
 using byte_t = std::byte;
 static_assert(sizeof(byte_t) == sizeof(ucall_byte_t));
+
+template <typename value_type_, typename allocator_type_>
+struct allocator_delete {
+    using allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_type_>;
+    allocator_t allocator {};
+
+    void operator()(value_type_* pointer) const noexcept {
+        if (!pointer) return;
+        auto owner = allocator;
+        std::destroy_at(pointer);
+        owner.deallocate(pointer, 1);
+    }
+};
+
+template <typename value_type_, typename allocator_type_>
+using allocated_ptr = std::unique_ptr<value_type_, allocator_delete<value_type_, allocator_type_>>;
+
+template <typename value_type_, typename allocator_type_, typename... arguments_types_>
+allocated_ptr<value_type_, allocator_type_> allocate_unique(allocator_type_ const& allocator,
+                                                            arguments_types_&&... arguments) noexcept {
+    static_assert(std::is_nothrow_constructible_v<value_type_, arguments_types_...>);
+    using deleter_t = allocator_delete<value_type_, allocator_type_>;
+    typename deleter_t::allocator_t owner {allocator};
+    auto* pointer = owner.allocate(1);
+    if (pointer) std::construct_at(pointer, std::forward<arguments_types_>(arguments)...);
+    return {pointer, deleter_t {owner}};
+}
 
 /**
  *  @brief Bytes to keep between things two threads write, so neither steals the other's line.
@@ -211,8 +259,9 @@ inline std::size_t string_length(char const* c_str, std::size_t optional_length)
  *
  *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible.
  */
-template <typename element_type_>
+template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class round_robin {
+    allocator_type_ allocator_ {};
 
     element_type_* circle_ {};
     std::size_t count_ {};
@@ -226,20 +275,22 @@ class round_robin {
   public:
     using element_t = element_type_;
     using value_type = element_t;
+    using allocator_t = allocator_type_;
 
-    round_robin() = default;
+    explicit round_robin(allocator_t const& allocator = {}) noexcept : allocator_(allocator) {}
     round_robin(round_robin const&) = delete;
     round_robin& operator=(round_robin const&) = delete;
 
     inline round_robin(round_robin&& other) noexcept
-        : circle_(std::exchange(other.circle_, nullptr)), count_(std::exchange(other.count_, 0)),
-          capacity_(std::exchange(other.capacity_, 0)), idx_newest_(std::exchange(other.idx_newest_, 0)),
-          idx_oldest_(std::exchange(other.idx_oldest_, 0)), idx_to_poll_(std::exchange(other.idx_to_poll_, 0)) {}
+        : allocator_(std::move(other.allocator_)), circle_(std::exchange(other.circle_, nullptr)),
+          count_(std::exchange(other.count_, 0)), capacity_(std::exchange(other.capacity_, 0)),
+          idx_newest_(std::exchange(other.idx_newest_, 0)), idx_oldest_(std::exchange(other.idx_oldest_, 0)),
+          idx_to_poll_(std::exchange(other.idx_to_poll_, 0)) {}
 
     void reset() noexcept {
         if (!circle_) return;
         if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(circle_, capacity_);
-        std::free(circle_);
+        allocator_.deallocate(circle_, capacity_);
         circle_ = nullptr;
         count_ = capacity_ = 0;
         idx_newest_ = idx_oldest_ = idx_to_poll_ = 0;
@@ -250,6 +301,7 @@ class round_robin {
     inline round_robin& operator=(round_robin&& other) noexcept {
         if (this == &other) return *this;
         reset();
+        allocator_ = std::move(other.allocator_);
         circle_ = std::exchange(other.circle_, nullptr);
         count_ = std::exchange(other.count_, 0);
         capacity_ = std::exchange(other.capacity_, 0);
@@ -260,12 +312,13 @@ class round_robin {
     }
 
     inline bool alloc(std::size_t n) noexcept {
-        auto cons = (element_t*)std::malloc(sizeof(element_t) * n);
-        if (!cons) return false;
-        circle_ = cons;
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(element_t)) return false;
+        auto circle = allocator_.allocate(n);
+        if (!circle) return false;
+        std::uninitialized_default_construct_n(circle, n);
+        reset();
+        circle_ = circle;
         capacity_ = n;
-        // Default-construct all elements
-        std::uninitialized_default_construct(circle_, circle_ + capacity_);
         return true;
     }
 
@@ -320,21 +373,22 @@ class round_robin {
  *  consider using @c std::mutex instead.
  */
 class alignas(false_sharing_bytes_k) mutex_t {
-    std::atomic<bool> flag {false};
+    enum class state_t : std::uint8_t { unlocked_k, locked_k };
+    std::atomic<state_t> state_ {state_t::unlocked_k};
 
   public:
+    mutex_t() noexcept = default;
+    mutex_t(mutex_t const&) = delete;
+    mutex_t& operator=(mutex_t const&) = delete;
+    mutex_t(mutex_t&&) = delete;
+    mutex_t& operator=(mutex_t&&) = delete;
+
     inline void lock() noexcept {
-        while (flag.exchange(true, std::memory_order_relaxed))
-            // Yield to avoid burning CPU in tight loop
-            while (flag.load(std::memory_order_relaxed));
-
-        std::atomic_thread_fence(std::memory_order_acquire);
+        while (state_.exchange(state_t::locked_k, std::memory_order_acquire) == state_t::locked_k)
+            while (state_.load(std::memory_order_relaxed) == state_t::locked_k);
     }
 
-    inline void unlock() noexcept {
-        std::atomic_thread_fence(std::memory_order_release);
-        flag.store(false, std::memory_order_relaxed);
-    }
+    inline void unlock() noexcept { state_.store(state_t::unlocked_k, std::memory_order_release); }
 };
 
 /**
@@ -447,8 +501,9 @@ class memory_map_t {
  *
  *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible.
  */
-template <typename element_type_>
+template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class buffer {
+    allocator_type_ allocator_ {};
     element_type_* elements_ {};
     std::size_t capacity_ {};
     static_assert(std::is_nothrow_default_constructible<element_type_>());
@@ -456,17 +511,20 @@ class buffer {
   public:
     using element_t = element_type_;
     using value_type = element_t;
+    using allocator_t = allocator_type_;
 
-    buffer() noexcept = default;
+    explicit buffer(allocator_t const& allocator = {}) noexcept : allocator_(allocator) {}
     buffer(buffer const&) = delete;
     buffer& operator=(buffer const&) = delete;
 
     buffer(buffer&& other) noexcept
-        : elements_(std::exchange(other.elements_, nullptr)), capacity_(std::exchange(other.capacity_, 0)) {}
+        : allocator_(std::move(other.allocator_)), elements_(std::exchange(other.elements_, nullptr)),
+          capacity_(std::exchange(other.capacity_, 0)) {}
 
     buffer& operator=(buffer&& other) noexcept {
         if (this == &other) return *this;
         reset();
+        allocator_ = std::move(other.allocator_);
         elements_ = std::exchange(other.elements_, nullptr);
         capacity_ = std::exchange(other.capacity_, 0);
         return *this;
@@ -474,7 +532,7 @@ class buffer {
 
     void reset() noexcept {
         if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        std::free(elements_);
+        if (elements_) allocator_.deallocate(elements_, capacity_);
         elements_ = nullptr;
         capacity_ = 0;
     }
@@ -482,11 +540,9 @@ class buffer {
     /** Allocates exactly @p n elements, @b discarding whatever the buffer held. */
     [[nodiscard]] bool reallocate(std::size_t n) noexcept {
         reset();
-        elements_ = (element_t*)std::malloc(sizeof(element_t) * n);
-        if (!elements_) {
-            capacity_ = 0;
-            return false;
-        }
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(element_t)) return false;
+        elements_ = allocator_.allocate(n);
+        if (!elements_) return false;
         capacity_ = n;
         std::uninitialized_default_construct(elements_, elements_ + capacity_);
         return true;
@@ -523,84 +579,64 @@ class buffer {
  * if (conn) { conn->reset(); conn_pool.release(conn); }
  *  @endcode
  */
-template <typename element_type_>
+template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class pool {
-    std::size_t capacity_ {};
+    using offsets_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::size_t>;
+    st::basic_vector<element_type_, allocator_type_> elements_;
+    st::basic_vector<std::size_t, offsets_allocator_t> free_offsets_;
     std::size_t free_count_ {};
-    element_type_* elements_ {};
-    std::size_t* free_offsets_ {};
-    static_assert(std::is_nothrow_default_constructible<element_type_>());
 
   public:
     using element_t = element_type_;
     using value_type = element_t;
+    using allocator_t = allocator_type_;
 
-    pool() = default;
+    explicit pool(allocator_t const& allocator = {}) noexcept
+        : elements_(allocator), free_offsets_(offsets_allocator_t {allocator}) {}
     pool(pool const&) = delete;
     pool& operator=(pool const&) = delete;
-
     pool(pool&& other) noexcept
-        : capacity_(std::exchange(other.capacity_, 0)), free_count_(std::exchange(other.free_count_, 0)),
-          elements_(std::exchange(other.elements_, nullptr)),
-          free_offsets_(std::exchange(other.free_offsets_, nullptr)) {}
-
+        : elements_(std::move(other.elements_)), free_offsets_(std::move(other.free_offsets_)),
+          free_count_(std::exchange(other.free_count_, 0)) {}
     pool& operator=(pool&& other) noexcept {
         if (this == &other) return *this;
-        reset();
-        capacity_ = std::exchange(other.capacity_, 0);
+        elements_ = std::move(other.elements_);
+        free_offsets_ = std::move(other.free_offsets_);
         free_count_ = std::exchange(other.free_count_, 0);
-        elements_ = std::exchange(other.elements_, nullptr);
-        free_offsets_ = std::exchange(other.free_offsets_, nullptr);
         return *this;
     }
+    ~pool() noexcept = default;
 
     void reset() noexcept {
-        if (!elements_) return;
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        std::free(elements_);
-        elements_ = nullptr;
-        free_offsets_ = nullptr;
-        capacity_ = free_count_ = 0;
+        elements_ = decltype(elements_) {elements_.get_allocator()};
+        free_offsets_ = decltype(free_offsets_) {free_offsets_.get_allocator()};
+        free_count_ = 0;
     }
-
-    /** Initializes pool with n elements. Can only be called once. */
-    [[nodiscard]] bool reserve(std::size_t n) noexcept {
-        assert(!elements_ && "pool::reserve() called on already-initialized pool");
-        auto mem = std::malloc((sizeof(element_t) + sizeof(std::size_t)) * n);
-        if (!mem) return false;
-        elements_ = (element_t*)mem;
-        free_offsets_ = (std::size_t*)(elements_ + n);
-        free_count_ = capacity_ = n;
-        std::uninitialized_default_construct(elements_, elements_ + capacity_);
-        std::iota(free_offsets_, free_offsets_ + n, 0ul);
+    bool reserve(std::size_t count) noexcept {
+        assert(elements_.empty());
+        decltype(elements_) elements {elements_.get_allocator()};
+        decltype(free_offsets_) offsets {free_offsets_.get_allocator()};
+        if (st::failed(elements.resize(count)) || st::failed(offsets.resize(count))) return false;
+        std::iota(offsets.begin(), offsets.end(), std::size_t {0});
+        elements_ = std::move(elements);
+        free_offsets_ = std::move(offsets);
+        free_count_ = count;
         return true;
     }
-
-    ~pool() noexcept { reset(); }
-
-    /** Returns pointer to available element, or nullptr if pool exhausted. */
-    [[nodiscard]] element_t* alloc() noexcept {
-        return free_count_ ? elements_ + free_offsets_[--free_count_] : nullptr;
-    }
-
-    /** Returns element to pool. Pointer must be valid, within bounds, and not double-freed. */
+    element_t* alloc() noexcept { return free_count_ ? elements_.data() + free_offsets_[--free_count_] : nullptr; }
     void release(element_t* released) noexcept {
-        assert(released && "pool::release() called with null pointer");
-        assert(released >= elements_ && released < elements_ + capacity_ && "pool::release() pointer out of bounds");
-        assert(free_count_ < capacity_ && "pool::release() called too many times (double-free?)");
-        free_offsets_[free_count_++] = released - elements_;
+        assert(contains(released) && free_count_ < elements_.size());
+        free_offsets_[free_count_++] = static_cast<std::size_t>(released - elements_.data());
     }
-
-    [[nodiscard]] std::size_t offset_of(element_t& element) const noexcept { return &element - elements_; }
-    [[nodiscard]] element_t& at_offset(std::size_t i) const noexcept { return elements_[i]; }
-    [[nodiscard]] element_t const* data() const noexcept { return elements_; }
-
-    /** Slots this pool was reserved with, allocated or not. */
-    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-
-    /** Checks if pointer is within this pool's allocated range. */
-    [[nodiscard]] bool contains(element_t const* ptr) const noexcept {
-        return ptr >= elements_ && ptr < elements_ + capacity_;
+    std::size_t offset_of(element_t& element) const noexcept {
+        return static_cast<std::size_t>(&element - elements_.data());
+    }
+    element_t& at_offset(std::size_t index) noexcept { return elements_[index]; }
+    element_t const& at_offset(std::size_t index) const noexcept { return elements_[index]; }
+    element_t const* data() const noexcept { return elements_.data(); }
+    std::size_t capacity() const noexcept { return elements_.size(); }
+    bool contains(element_t const* pointer) const noexcept {
+        return !elements_.empty() && pointer >= elements_.data() && pointer < elements_.data() + elements_.size();
     }
 };
 
@@ -634,20 +670,23 @@ class pool {
  * if (conn) { conn->reset(); conn_pools.release(conn); }
  *  @endcode
  */
-template <typename element_type_>
+template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class successive_pools {
-    struct pool_node {
-        pool<element_type_> pool_ {};
+    struct pool_node_t {
+        pool<element_type_, allocator_type_> pool_;
         std::size_t capacity_ {};
 
         /** Singly linked list, newer pools first. */
-        pool_node* next_ {};
+        pool_node_t* next_ {};
 
-        pool_node(std::size_t cap) noexcept : capacity_(cap), next_(nullptr) {}
+        pool_node_t(std::size_t capacity, allocator_type_ const& allocator) noexcept
+            : pool_(allocator), capacity_(capacity) {}
     };
 
+    allocator_type_ allocator_ {};
+
     /** Newest pool, tried first. */
-    pool_node* head_ {};
+    pool_node_t* head_ {};
     std::size_t initial_capacity_ {};
     std::size_t total_capacity_ {};
 
@@ -662,21 +701,23 @@ class successive_pools {
      *  @brief Constructs with initial pool capacity.
      *  @param[in] initial_capacity Number of elements in first pool (default 100).
      */
-    explicit successive_pools(std::size_t initial_capacity = 100) noexcept
-        : head_(nullptr), initial_capacity_(initial_capacity), total_capacity_(0), allocated_count_(0) {}
+    explicit successive_pools(std::size_t initial_capacity = 100, allocator_type_ const& allocator = {}) noexcept
+        : allocator_(allocator), initial_capacity_(initial_capacity) {}
 
     // Disable copying, allow moving
     successive_pools(successive_pools const&) = delete;
     successive_pools& operator=(successive_pools const&) = delete;
 
     successive_pools(successive_pools&& other) noexcept
-        : head_(std::exchange(other.head_, nullptr)), initial_capacity_(std::exchange(other.initial_capacity_, 0)),
+        : allocator_(std::move(other.allocator_)), head_(std::exchange(other.head_, nullptr)),
+          initial_capacity_(std::exchange(other.initial_capacity_, 0)),
           total_capacity_(std::exchange(other.total_capacity_, 0)),
           allocated_count_(std::exchange(other.allocated_count_, 0)) {}
 
     successive_pools& operator=(successive_pools&& other) noexcept {
         if (this == &other) return *this;
         reset();
+        allocator_ = std::move(other.allocator_);
         head_ = std::exchange(other.head_, nullptr);
         initial_capacity_ = std::exchange(other.initial_capacity_, 0);
         total_capacity_ = std::exchange(other.total_capacity_, 0);
@@ -695,7 +736,7 @@ class successive_pools {
      */
     [[nodiscard]] element_t* alloc() noexcept {
         // Try existing pools (newest to oldest)
-        for (pool_node* node = head_; node != nullptr; node = node->next_) {
+        for (pool_node_t* node = head_; node != nullptr; node = node->next_) {
             element_t* elem = node->pool_.alloc();
             if (elem) {
                 ++allocated_count_;
@@ -723,7 +764,7 @@ class successive_pools {
         if (!released) return;
 
         // Find which pool owns this pointer
-        for (pool_node* node = head_; node != nullptr; node = node->next_) {
+        for (pool_node_t* node = head_; node != nullptr; node = node->next_) {
             if (node->pool_.contains(released)) {
                 node->pool_.release(released);
                 --allocated_count_;
@@ -743,16 +784,16 @@ class successive_pools {
     /** Returns number of pools currently allocated. */
     [[nodiscard]] std::size_t pool_count() const noexcept {
         std::size_t count = 0;
-        for (pool_node* node = head_; node != nullptr; node = node->next_) ++count;
+        for (pool_node_t* node = head_; node != nullptr; node = node->next_) ++count;
         return count;
     }
 
     /** Releases all pools and resets to empty state. */
     void reset() noexcept {
-        pool_node* current = head_;
+        pool_node_t* current = head_;
         while (current) {
-            pool_node* next = current->next_;
-            delete current;
+            pool_node_t* next = current->next_;
+            allocator_delete<pool_node_t, allocator_type_> {allocator_}(current);
             current = next;
         }
         head_ = nullptr;
@@ -768,18 +809,16 @@ class successive_pools {
      *  @return True on success, false on allocation failure.
      */
     [[nodiscard]] bool grow(std::size_t capacity) noexcept {
-        pool_node* new_node = new (std::nothrow) pool_node(capacity);
+        auto owned = allocate_unique<pool_node_t>(allocator_, capacity, allocator_);
+        auto* new_node = owned.get();
         if (!new_node) return false;
 
         // Reserve the pool capacity
-        if (!new_node->pool_.reserve(capacity)) {
-            delete new_node;
-            return false;
-        }
+        if (!new_node->pool_.reserve(capacity)) return false;
 
         // Prepend to linked list (newest first)
         new_node->next_ = head_;
-        head_ = new_node;
+        head_ = owned.release();
         total_capacity_ += capacity;
 
         return true;
@@ -792,36 +831,37 @@ using span = std::span<element_type_>;
 /**
  *  @brief Dynamic array with manual memory management.
  *
- *  Similar to @c std::vector but uses @c malloc / @c realloc for amortized O(1) growth. Maintains
- *  both capacity (allocated) and count (active) for efficient growing.
+ *  Maintains allocated capacity separately from the active count, with amortized O(1) growth.
  *
  *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible and
- *      trivially copyable (required for @c realloc and @c memcpy to work correctly).
+ *      trivially copyable.
  */
-template <typename element_type_>
+template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class array {
+    allocator_type_ allocator_ {};
     element_type_* elements_ {};
     std::size_t count_ {};
     std::size_t capacity_ {};
     static_assert(std::is_nothrow_default_constructible<element_type_>());
-    static_assert(std::is_trivially_copyable<element_type_>(),
-                  "Elements must be trivially copyable for realloc and memcpy");
+    static_assert(std::is_trivially_copyable<element_type_>(), "Elements must be trivially copyable for memcpy");
 
   public:
     using element_t = element_type_;
     using value_type = element_t;
+    using allocator_t = allocator_type_;
 
-    array() = default;
+    explicit array(allocator_t const& allocator = {}) noexcept : allocator_(allocator) {}
     array(array const&) = delete;
     array& operator=(array const&) = delete;
 
     array(array&& other) noexcept
-        : elements_(std::exchange(other.elements_, nullptr)), count_(std::exchange(other.count_, 0)),
-          capacity_(std::exchange(other.capacity_, 0)) {}
+        : allocator_(std::move(other.allocator_)), elements_(std::exchange(other.elements_, nullptr)),
+          count_(std::exchange(other.count_, 0)), capacity_(std::exchange(other.capacity_, 0)) {}
 
     array& operator=(array&& other) noexcept {
         if (this == &other) return *this;
         reset();
+        allocator_ = std::move(other.allocator_);
         elements_ = std::exchange(other.elements_, nullptr);
         count_ = std::exchange(other.count_, 0);
         capacity_ = std::exchange(other.capacity_, 0);
@@ -831,17 +871,13 @@ class array {
     /** Grows capacity to at least n elements. Never shrinks. Preserves existing elements. */
     [[nodiscard]] bool reserve(std::size_t n) noexcept {
         if (n <= capacity_) return true;
-        if (!elements_) {
-            auto ptr = (element_t*)std::malloc(sizeof(element_t) * n);
-            if (!ptr) return false;
-            elements_ = ptr;
-        }
-        else {
-            auto ptr = (element_t*)std::realloc(elements_, sizeof(element_t) * n);
-            if (!ptr) return false;
-            elements_ = ptr;
-        }
-        std::uninitialized_default_construct(elements_ + capacity_, elements_ + n);
+        if (n > std::numeric_limits<std::size_t>::max() / sizeof(element_t)) return false;
+        auto elements = allocator_.allocate(n);
+        if (!elements) return false;
+        if (elements_) std::memcpy(elements, elements_, capacity_ * sizeof(element_t));
+        std::uninitialized_default_construct(elements + capacity_, elements + n);
+        if (elements_) allocator_.deallocate(elements_, capacity_);
+        elements_ = elements;
         capacity_ = n;
         return true;
     }
@@ -849,7 +885,7 @@ class array {
     void reset() noexcept {
         if (!elements_) return;
         if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        std::free(elements_);
+        allocator_.deallocate(elements_, capacity_);
         elements_ = nullptr;
         capacity_ = count_ = 0;
     }
@@ -876,19 +912,13 @@ class array {
         count_ -= n;
     }
     [[nodiscard]] bool append_n(element_t const* elements, std::size_t n) noexcept {
-        // Appending nothing is not a copy of length zero - it is not a copy, and `memcpy` with a
-        // null destination is undefined even when it moves no bytes.
         if (!n) return true;
-        // Doubling here rather than inside `reserve`, so an explicit `reserve(n)` still means
-        // exactly `n` and only the growth an append implies is amortized. Without it, a message
-        // assembled a read at a time reallocates once per read.
+        std::size_t const maximum = std::numeric_limits<std::size_t>::max() / sizeof(element_t);
+        if (n > maximum - count_) return false;
         if (count_ + n > capacity_) {
-            std::size_t const doubled = capacity_ * 2;
-            if (!reserve(count_ + n > doubled ? count_ + n : doubled)) return false;
+            std::size_t const doubled = capacity_ <= maximum / 2 ? capacity_ * 2 : maximum;
+            if (!reserve(std::max(count_ + n, doubled))) return false;
         }
-        // `reserve` guarantees room for `count_ + n`, but the optimiser cannot always follow that
-        // through its two inlined branches and warns about writing into a region it believes is
-        // empty. Stating the invariant costs one predictable branch and keeps the build silent.
         if (!elements_) return false;
         std::memcpy(elements_ + count_, elements, n * sizeof(element_t));
         count_ += n;

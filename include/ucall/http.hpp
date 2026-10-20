@@ -55,22 +55,50 @@ namespace unum::ucall {
 enum class http_role_t { request_k, response_k, head_response_k };
 enum class http_parse_t { incomplete_k, complete_k, malformed_k, unsupported_k, overflow_k };
 enum class http_framing_t { length_k, chunked_k, until_close_k };
+enum class http_connection_t { close_k, keep_alive_k };
+enum class http_body_state_t { framed_k, decoded_k };
 
 /** A received response keeps its bytes independently of the client and its CPU specialization. */
 struct received_response_t : ucall_received_http_response_handle_t {
-    st::basic_vector<byte_t> storage {};
+    span<byte_t const> content {};
     std::size_t headers_length {}, body_length {};
     ucall_http_status_t status {};
-    span<byte_t const> bytes() const noexcept { return span<byte_t const> {storage}; }
+    void (*destroy)(received_response_t*) noexcept {};
+
+    received_response_t() noexcept = default;
+    received_response_t(received_response_t const&) = delete;
+    received_response_t& operator=(received_response_t const&) = delete;
+    received_response_t(received_response_t&&) = delete;
+    received_response_t& operator=(received_response_t&&) = delete;
+    span<byte_t const> bytes() const noexcept { return content; }
 };
+
+template <typename allocator_type_ = st::default_allocator<byte_t>>
+struct received_response : received_response_t {
+    st::basic_vector<byte_t, allocator_type_> storage;
+
+    explicit received_response(allocator_type_ const& allocator) noexcept : storage(allocator) { destroy = &release; }
+    received_response(received_response const&) = delete;
+    received_response& operator=(received_response const&) = delete;
+    received_response(received_response&&) = delete;
+    received_response& operator=(received_response&&) = delete;
+
+    static void release(received_response_t* response) noexcept {
+        auto* owned = static_cast<received_response*>(response);
+        using deleter_t = allocator_delete<received_response, allocator_type_>;
+        deleter_t {typename deleter_t::allocator_t {owned->storage.get_allocator()}}(owned);
+    }
+};
+
+extern template struct received_response<st::default_allocator<byte_t>>;
 
 template <sz_capability_t capabilities_>
 struct http {
     static std::string_view text_view(span<byte_t const> bytes) noexcept {
         return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
     }
-    template <typename element_type_>
-    static std::string_view text_view(st::basic_vector<element_type_> const& bytes) noexcept {
+    template <typename element_type_, typename allocator_type_>
+    static std::string_view text_view(st::basic_vector<element_type_, allocator_type_> const& bytes) noexcept {
         static_assert(sizeof(element_type_) == 1);
         return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
     }
@@ -383,7 +411,9 @@ struct http {
         http_framing_t framing {http_framing_t::length_k};
         ucall_verb_t verb {ucall_verb_unknown_k};
         ucall_http_status_t status {};
-        bool keep_alive {}, decoded {};
+        http_connection_t connection {http_connection_t::close_k};
+        http_body_state_t body_state {http_body_state_t::framed_k};
+        bool keep_alive() const noexcept { return connection == http_connection_t::keep_alive_k; }
 
         std::string_view target(std::string_view bytes) const noexcept {
             return bytes.substr(target_offset, target_length);
@@ -439,7 +469,7 @@ struct http {
                     return http_parse_t::malformed_k;
             }
             if (version != "HTTP/1.1" && version != "HTTP/1.0") return http_parse_t::unsupported_k;
-            message.keep_alive = version == "HTTP/1.1";
+            message.connection = version == "HTTP/1.1" ? http_connection_t::keep_alive_k : http_connection_t::close_k;
             bool has_length = false, has_transfer = false, has_host = false, has_close = false;
             std::size_t start = first_end + 2;
             while (start < end) {
@@ -473,7 +503,8 @@ struct http {
                 }
                 else if (equal(name, "connection")) {
                     if (http_has_token(value, "close")) has_close = true;
-                    else if (version == "HTTP/1.0" && http_has_token(value, "keep-alive")) message.keep_alive = true;
+                    else if (version == "HTTP/1.0" && http_has_token(value, "keep-alive"))
+                        message.connection = http_connection_t::keep_alive_k;
                 }
                 else if (equal(name, "host")) {
                     if (has_host || value.empty()) return http_parse_t::malformed_k;
@@ -481,7 +512,7 @@ struct http {
                 }
                 start = line_end + 2;
             }
-            if (has_close) message.keep_alive = false;
+            if (has_close) message.connection = http_connection_t::close_k;
             if (has_length && has_transfer) return http_parse_t::malformed_k;
             if (role == http_role_t::request_k && version == "HTTP/1.1" && !has_host) return http_parse_t::malformed_k;
             message.headers_length = end + 4;
@@ -489,7 +520,7 @@ struct http {
             message.framing = has_transfer ? http_framing_t::chunked_k : http_framing_t::length_k;
             if (role != http_role_t::request_k && !has_transfer && !has_length) {
                 message.framing = http_framing_t::until_close_k;
-                message.keep_alive = false;
+                message.connection = http_connection_t::close_k;
             }
             if (role == http_role_t::head_response_k || (message.status >= 100 && message.status < 200) ||
                 message.status == 204 || message.status == 304) {
@@ -548,7 +579,7 @@ struct http {
     }
 
     static void http_decode_chunks(span<byte_t> bytes, http_message_t& message) noexcept {
-        if (message.framing != http_framing_t::chunked_k || message.decoded) return;
+        if (message.framing != http_framing_t::chunked_k || message.body_state == http_body_state_t::decoded_k) return;
         auto text = text_view(bytes);
         std::size_t cursor = message.headers_length, destination = cursor;
         for (;;) {
@@ -561,11 +592,11 @@ struct http {
             destination += length;
             cursor = end + 2 + length + 2;
         }
-        message.decoded = true;
+        message.body_state = http_body_state_t::decoded_k;
     }
 
-    template <typename element_type_>
-    static bool append_text(st::basic_vector<element_type_>& bytes, std::string_view text) noexcept {
+    template <typename element_type_, typename allocator_type_>
+    static bool append_text(st::basic_vector<element_type_, allocator_type_>& bytes, std::string_view text) noexcept {
         static_assert(sizeof(element_type_) == 1);
         auto previous = bytes.size();
         if (text.size() > std::numeric_limits<std::size_t>::max() - previous ||
@@ -574,7 +605,10 @@ struct http {
         if (!text.empty()) std::memcpy(bytes.data() + previous, text.data(), text.size());
         return true;
     }
-    static void drop_bytes(st::basic_vector<byte_t>& bytes, std::size_t count) noexcept { bytes.erase(0, count); }
+    template <typename allocator_type_>
+    static void drop_bytes(st::basic_vector<byte_t, allocator_type_>& bytes, std::size_t count) noexcept {
+        bytes.erase(0, count);
+    }
 };
 
 } // namespace unum::ucall

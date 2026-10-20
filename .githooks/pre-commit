@@ -611,6 +611,27 @@ check_bare_member_docs() {
         "            /** @brief ... */ blocks; \`//\` is for implementation notes inside bodies:"
 }
 
+check_sibling_namespaces() {
+    local spelled
+    spelled=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -vE 'namespace [a-z_]+ = (ashvardanian::(smashtable|forkunion|stringzilla)|unum::(usearch|ustore))(::[a-z_]+)*;' |
+        grep -E '(ashvardanian::(smashtable|forkunion|stringzilla)|unum::(usearch|ustore))::' || true)
+    [ -z "$spelled" ] || fail "$spelled" \
+        "$file spells a sibling namespace at a use site - declare an alias and use st::, fu:: or sz:: instead:"
+}
+
+check_allocating_new() {
+    local allocations
+    allocations=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//)' |
+        grep -vE '//[[:space:]]*allocator primitive[[:space:]]*$' |
+        sed -e 's|"[^"]*"||g' -e 's|/\*.*\*/||g' -e 's|//.*$||' |
+        grep -E '::operator[[:space:]]+(new|delete)|new[[:space:]]*\([[:space:]]*std::nothrow|new[[:space:]]+[A-Za-z_]|(^|[^_[:alnum:]])delete[[:space:]]*(\[[[:space:]]*\])?[[:space:]]+[A-Za-z_]' || true)
+    [ -z "$allocations" ] || fail "$allocations" \
+        "$file allocates with bare new or delete - use the owning allocator; placement construction is allowed:"
+}
+
 check_qualified_namespace() {
     local spelled
     spelled=$(printf '%s\n' "$added" |
@@ -696,19 +717,26 @@ check_namespace_reopened() {
 }
 
 check_template_type_suffixes() {
-    local suffixed variables
-    suffixed=$(printf '%s\n' "$added" | awk '
-        /^\+[[:space:]]*template[[:space:]]*</ {
-            if ($0 ~ /(struct|class)[[:space:]]+[A-Za-z0-9_]+_t([^A-Za-z0-9_]|$)/) print
-            pending = 1
-            next
+    local suffixed aliases variables
+    suffixed=$(awk '
+        NR == FNR { touched[$1] = 1; next }
+        /^[[:space:]]*template[[:space:]]*</ { pending = 1; declaration = FNR }
+        pending && /(^|>)[[:space:]]*(struct|class)[[:space:]]+[A-Za-z0-9_]+_t([^A-Za-z0-9_]|$)/ {
+            if (touched[FNR] || touched[declaration]) print FNR ": " $0
         }
-        pending && /^\+[[:space:]]*requires/ { next }
-        pending && /^\+[[:space:]]*(struct|class)[[:space:]]+[A-Za-z0-9_]+_t([^A-Za-z0-9_]|$)/ { print }
-        { pending = 0 }' || true)
+        /[;{]/ { pending = 0 }' "$results_directory/$ordinal.lines" "$staged_blob")
     [ -z "$suffixed" ] || fail "$suffixed" \
         "$file names a class template with the _t suffix - name the template bare, as in" \
-        "            \`template <typename value_type_> struct humanized\`, and keep _t for its aliases:"
+        "            \`template <typename value_type_> struct humanized\`, and keep _t for instantiated types:"
+    aliases=$(awk '
+        NR == FNR { touched[$1] = 1; next }
+        /^[[:space:]]*template[[:space:]]*</ { pending = 1; declaration = FNR }
+        pending && /(^|>)[[:space:]]*using[[:space:]]+[A-Za-z0-9_]+_[tk][[:space:]]*=/ {
+            if (touched[FNR] || touched[declaration]) print FNR ": " $0
+        }
+        /[;{]/ { pending = 0 }' "$results_directory/$ordinal.lines" "$staged_blob")
+    [ -z "$aliases" ] || fail "$aliases" \
+        "$file names an alias template with _t or _k - only instantiated aliases carry those suffixes:"
     variables=$(printf '%s\n' "$added" | awk '
         # A `static` member of a class template is not a variable template, though an unchanged `struct` line between
         # them leaves only the `template` line and the member among the added lines.
@@ -1203,6 +1231,7 @@ judge_path() {
         ;;&
     *.hpp | *.cpp | *.cc | *.cxx)
         case "$file" in test/harness.hpp) ;; *) check_qualified_namespace ;; esac
+        check_sibling_namespaces
         check_c_limit_macros
         check_template_parameter_underscores
         check_template_type_suffixes
@@ -1271,6 +1300,7 @@ judge_path() {
         check_substring_assertions
         ;;
     esac
+    case "$file" in include/ucall/*.hpp | src/*.cpp | src/*.hpp) check_allocating_new ;; esac
     case "$file" in
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx)
         if command -v clang-format > /dev/null 2>&1 &&

@@ -160,6 +160,15 @@ static void exchanges(ucall_security_mode_t security) {
         check_response(fixture, completed.response, payload);
     }
     if (security != ucall_security_mode_none_k) return;
+    auto named_url = url;
+    named_url.replace(named_url.find("127.0.0.1"), std::strlen("127.0.0.1"), "localhost");
+    call.url = view(named_url);
+    ucall_client_call(&call);
+    assert(outcome.status == ucall_status_success_k);
+    auto named = fixture.wait();
+    assert(named.outcome.status == ucall_status_success_k);
+    check_response(fixture, named.response, payload);
+    call.url = view(url);
     ucall_bytes_view_t close = view("Connection: close");
     call.headers = &close;
     call.headers_count = 1;

@@ -4,6 +4,7 @@
  *  @date August 15, 2023
  *  @brief C entry points over each handle's initialization-selected operations.
  */
+#include <cassert>
 #include <cstdint>
 
 #if defined(_WIN32)
@@ -13,19 +14,53 @@
 #endif
 
 #include "ucall/http.hpp"
+#include "ucall/io.hpp"
 #include "lib.hpp"
 
 using namespace unum::ucall;
 
 namespace unum::ucall {
 
+template struct received_response<st::default_allocator<byte_t>>;
+
+struct thread_capabilities_t {
+    std::uint64_t strings, atomics;
+};
+
+static thread_capabilities_t const& thread_capabilities() noexcept {
+    static thread_local thread_capabilities_t const capabilities {sz_capabilities_detected_cpu_(),
+                                                                  static_cast<std::uint64_t>(fu::cpu_capabilities())};
+    return capabilities;
+}
+
+template <typename handle_type_>
+static bool compatible(handle_type_ const* handle) noexcept {
+    auto const& capabilities = thread_capabilities();
+    return (capabilities.strings & handle->string_capabilities) == handle->string_capabilities &&
+           (capabilities.atomics & handle->atomic_capabilities) == handle->atomic_capabilities;
+}
+
+template <typename handle_type_>
+static bool admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept {
+    if (!handle) {
+        publish(outcome, ucall_status_uninitialized_k);
+        return false;
+    }
+    if (!compatible(handle)) {
+        publish(outcome, ucall_status_unsupported_k);
+        return false;
+    }
+    return true;
+}
+
 template <typename init_type_>
 static void init_network(init_type_* arguments) noexcept {
     auto config = *arguments->config;
     auto request = *arguments;
     request.config = &config;
-    auto strings = sz_capabilities_detected_cpu_();
-    auto atomics = fu::cpu_capabilities();
+    auto const& capabilities = thread_capabilities();
+    auto strings = static_cast<sz_capability_t>(capabilities.strings);
+    auto atomics = static_cast<fu::capabilities_t>(capabilities.atomics);
     auto try_backend = [&](ucall_io_backend_t backend) {
         config.backend = backend;
         make_network(&request, strings, atomics);
@@ -110,142 +145,108 @@ void ucall_client_init(ucall_client_init_t* arguments) {
 
 void ucall_server_take_call(ucall_server_take_call_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->take_call(arguments);
 }
 
 void ucall_server_take_calls(ucall_server_take_calls_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->take_calls(arguments);
 }
 
 void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     if (!arguments) return;
     if (arguments->count) *arguments->count = 0;
-    if (!arguments->client) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->take_completed(arguments);
 }
 
 void ucall_server_free(ucall_server_t server) {
-    if (server) server->api->free(server);
+    if (!server) return;
+    assert(compatible(server));
+    server->api->free(server);
 }
 void ucall_server_stop(ucall_server_t server) {
-    if (server) server->api->stop(server);
+    if (!server) return;
+    std::atomic_ref<std::uint32_t> {server->stopped}.store(1, std::memory_order_release);
+    for (auto* wake : server->wakeups) wake->notify();
 }
 void ucall_client_free(ucall_client_t client) {
-    if (client) client->api->free(client);
+    if (!client) return;
+    assert(compatible(client));
+    client->api->free(client);
 }
 
 void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->add_http_endpoint(arguments);
 }
 void ucall_server_request_path_segment(ucall_server_request_path_segment_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->request_path_segment(arguments);
 }
 void ucall_server_request_path_parameter(ucall_server_request_path_parameter_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->request_path_parameter(arguments);
 }
 void ucall_server_request_query_parameter(ucall_server_request_query_parameter_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->request_query_parameter(arguments);
 }
 void ucall_server_request_header(ucall_server_request_header_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->request_header(arguments);
 }
 void ucall_server_request_body(ucall_server_request_body_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->request_body(arguments);
 }
 void ucall_server_reply_content(ucall_server_reply_content_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->reply_content(arguments);
 }
 void ucall_server_reply_error(ucall_server_reply_error_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->reply_error(arguments);
 }
 void ucall_client_call(ucall_client_call_t* arguments) {
     if (!arguments) return;
-    if (!arguments->client) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->call(arguments);
 }
 void ucall_received_http_response_header(ucall_received_http_response_header_t* arguments) {
     if (!arguments) return;
-    if (!arguments->client) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->response_header(arguments);
 }
 void ucall_received_http_response_body(ucall_received_http_response_body_t* arguments) {
     if (!arguments) return;
-    if (!arguments->client) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->client, arguments->outcome)) return;
     arguments->client->api->response_body(arguments);
 }
 
 ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_http_request_t request) {
-    return server ? server->api->request_verb(server, request) : ucall_verb_unknown_k;
+    return server && compatible(server) ? server->api->request_verb(server, request) : ucall_verb_unknown_k;
 }
 size_t ucall_server_request_path_segments_count(ucall_server_t server, ucall_received_http_request_t request) {
-    return server ? server->api->request_path_segments_count(server, request) : 0;
+    return server && compatible(server) ? server->api->request_path_segments_count(server, request) : 0;
 }
 ucall_http_status_t ucall_received_http_response_status(ucall_client_t, ucall_received_http_response_t response) {
     return response ? static_cast<received_response_t*>(response)->status : 0;
 }
 void ucall_received_http_response_free(ucall_received_http_response_t response) {
-    delete static_cast<received_response_t*>(response);
+    if (!response) return;
+    auto* received = static_cast<received_response_t*>(response);
+    received->destroy(received);
 }
 
 void ucall_client_websocket_connect(ucall_client_websocket_connect_t* arguments) {
@@ -270,10 +271,7 @@ void ucall_client_websocket_close(ucall_client_t client, ucall_websocket_t webso
 
 void ucall_server_add_batch_endpoint(ucall_server_add_batch_endpoint_t* arguments) {
     if (!arguments) return;
-    if (!arguments->server) {
-        publish(arguments->outcome, ucall_status_uninitialized_k);
-        return;
-    }
+    if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->add_batch_endpoint(arguments);
 }
 

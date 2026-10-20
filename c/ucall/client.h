@@ -47,7 +47,7 @@ typedef struct ucall_client_config_t {
     ucall_io_backend_t backend;
 
     /** Requested CPU class; unknown selects from the initialization thread's capabilities.
-     *  Polling threads must support the selected class. Serial is the conservative choice. */
+     *  Callers must stay on compatible CPUs after first use. Serial is the conservative choice. */
     ucall_cpu_class_t cpu_class;
 
 } ucall_client_config_t;
