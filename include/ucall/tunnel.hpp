@@ -49,6 +49,152 @@
 
 namespace unum::ucall {
 
+#pragma region Cipher Kits
+
+/** Portable scalar SHA-256, the floor of its ladder. */
+struct serial_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_serial_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto init = sz_sha256_state_init_serial;
+    static constexpr auto update = sz_sha256_state_update_serial;
+    static constexpr auto digest = sz_sha256_state_digest_serial;
+};
+
+/** Portable scalar AES-256-GCM, the floor of its ladder. */
+struct serial_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_serial_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto key_init = sz_aes256_gcm_key_init_serial;
+    static constexpr auto encrypt = sz_aes256_gcm_encrypt_serial;
+    static constexpr auto decrypt = sz_aes256_gcm_decrypt_serial;
+};
+
+#if STRINGZILLA_TARGET_NEONSHA
+
+/** Arm NEON with the SHA-2 extension. */
+struct neonsha_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neonsha_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto init = sz_sha256_state_init_neonsha;
+    static constexpr auto update = sz_sha256_state_update_neonsha;
+    static constexpr auto digest = sz_sha256_state_digest_neonsha;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct neonsha_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neonsha_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_NEONSHA
+
+#if STRINGZILLA_TARGET_GOLDMONT
+
+/** Intel Goldmont SHA-NI. */
+struct goldmont_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_goldmont_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto init = sz_sha256_state_init_goldmont;
+    static constexpr auto update = sz_sha256_state_update_goldmont;
+    static constexpr auto digest = sz_sha256_state_digest_goldmont;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct goldmont_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_goldmont_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_GOLDMONT
+
+#if STRINGZILLA_TARGET_SVE2AES
+
+/** Arm SVE2 with the AES extension. */
+struct sve2aes_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_sve2aes_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto key_init = sz_aes256_gcm_key_init_sve2aes;
+    static constexpr auto encrypt = sz_aes256_gcm_encrypt_sve2aes;
+    static constexpr auto decrypt = sz_aes256_gcm_decrypt_sve2aes;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct sve2aes_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_sve2aes_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_SVE2AES
+
+#if STRINGZILLA_TARGET_ICELAKE
+
+/** Intel Ice Lake with VAES and VPCLMULQDQ. */
+struct icelake_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto key_init = sz_aes256_gcm_key_init_icelake;
+    static constexpr auto encrypt = sz_aes256_gcm_encrypt_icelake;
+    static constexpr auto decrypt = sz_aes256_gcm_decrypt_icelake;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct icelake_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_ICELAKE
+
+#if STRINGZILLA_TARGET_NEONAES
+
+/** Arm NEON with the AES extension. */
+struct neonaes_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neonaes_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto key_init = sz_aes256_gcm_key_init_neonaes;
+    static constexpr auto encrypt = sz_aes256_gcm_encrypt_neonaes;
+    static constexpr auto decrypt = sz_aes256_gcm_decrypt_neonaes;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct neonaes_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neonaes_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_NEONAES
+
+#if STRINGZILLA_TARGET_WESTMERE
+
+/** Intel Westmere AES-NI with carry-less multiplication. */
+struct westmere_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_westmere_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto key_init = sz_aes256_gcm_key_init_westmere;
+    static constexpr auto encrypt = sz_aes256_gcm_encrypt_westmere;
+    static constexpr auto decrypt = sz_aes256_gcm_decrypt_westmere;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct westmere_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_westmere_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_WESTMERE
+
+/** The widest SHA-256 kit among the backends @p caps_ admits, newest first. */
+template <sz_capability_t caps_>
+using sha256_kit = typename highest_kit<caps_, serial_sha256_kit_t, neonsha_sha256_kit_t, goldmont_sha256_kit_t>::type;
+
+/** The widest AES-256-GCM kit among the backends @p caps_ admits, newest first. */
+template <sz_capability_t caps_>
+using aes256_gcm_kit =
+    typename highest_kit<caps_, serial_aes256_gcm_kit_t, sve2aes_aes256_gcm_kit_t, icelake_aes256_gcm_kit_t,
+                         neonaes_aes256_gcm_kit_t, westmere_aes256_gcm_kit_t>::type;
+
+#pragma endregion Cipher Kits
+
 #pragma region Vocabulary
 
 /**
@@ -469,108 +615,15 @@ struct secure_tunnel_opened_t {
 /** Cryptographic primitives and pattern state specialized for the admitted instruction set. */
 template <sz_capability_t capabilities_>
 struct secure_tunnel_crypto {
-    static sz_status_t sha_init(sz_sha256_state_t* state, sz_stream_t stream) noexcept {
-#if STRINGZILLA_TARGET_NEONSHA
-        if constexpr (capabilities_ & sz_cap_neonsha_k) return sz_sha256_state_init_neonsha(state, stream);
-#endif
-#if STRINGZILLA_TARGET_GOLDMONT
-        if constexpr (capabilities_ & sz_cap_goldmont_k) return sz_sha256_state_init_goldmont(state, stream);
-#endif
-        return sz_sha256_state_init_serial(state, stream);
-    }
+    using sha256_kit_t = sha256_kit<capabilities_>;
+    using aes256_gcm_kit_t = aes256_gcm_kit<capabilities_>;
 
-    static sz_status_t sha_update(sz_sha256_state_t* state, sz_cptr_t text, sz_size_t length,
-                                  sz_stream_t stream) noexcept {
-#if STRINGZILLA_TARGET_NEONSHA
-        if constexpr (capabilities_ & sz_cap_neonsha_k)
-            return sz_sha256_state_update_neonsha(state, text, length, stream);
-#endif
-#if STRINGZILLA_TARGET_GOLDMONT
-        if constexpr (capabilities_ & sz_cap_goldmont_k)
-            return sz_sha256_state_update_goldmont(state, text, length, stream);
-#endif
-        return sz_sha256_state_update_serial(state, text, length, stream);
-    }
-
-    static sz_status_t sha_digest(sz_sha256_state_t const* state, sz_u8_t* digest, sz_stream_t stream) noexcept {
-#if STRINGZILLA_TARGET_NEONSHA
-        if constexpr (capabilities_ & sz_cap_neonsha_k) return sz_sha256_state_digest_neonsha(state, digest, stream);
-#endif
-#if STRINGZILLA_TARGET_GOLDMONT
-        if constexpr (capabilities_ & sz_cap_goldmont_k) return sz_sha256_state_digest_goldmont(state, digest, stream);
-#endif
-        return sz_sha256_state_digest_serial(state, digest, stream);
-    }
-
-    static sz_status_t aes_init(sz_aes256_gcm_key_t* key, sz_u8_t const* secret, sz_stream_t stream) noexcept {
-#if STRINGZILLA_TARGET_SVE2AES
-        if constexpr (capabilities_ & sz_cap_sve2aes_k) return sz_aes256_gcm_key_init_sve2aes(key, secret, stream);
-#endif
-#if STRINGZILLA_TARGET_ICELAKE
-        if constexpr (capabilities_ & sz_cap_icelake_k) return sz_aes256_gcm_key_init_icelake(key, secret, stream);
-#endif
-#if STRINGZILLA_TARGET_NEONAES
-        if constexpr (capabilities_ & sz_cap_neonaes_k) return sz_aes256_gcm_key_init_neonaes(key, secret, stream);
-#endif
-#if STRINGZILLA_TARGET_WESTMERE
-        if constexpr (capabilities_ & sz_cap_westmere_k) return sz_aes256_gcm_key_init_westmere(key, secret, stream);
-#endif
-        return sz_aes256_gcm_key_init_serial(key, secret, stream);
-    }
-
-    static sz_status_t aes_encrypt(sz_aes256_gcm_key_t const* key, sz_u8_t const* nonce, sz_cptr_t associated,
-                                   sz_size_t associated_length, sz_cptr_t text, sz_size_t length, sz_ptr_t target,
-                                   sz_u8_t* tag, sz_stream_t stream) noexcept {
-#if STRINGZILLA_TARGET_SVE2AES
-        if constexpr (capabilities_ & sz_cap_sve2aes_k)
-            return sz_aes256_gcm_encrypt_sve2aes(key, nonce, associated, associated_length, text, length, target, tag,
-                                                 stream);
-#endif
-#if STRINGZILLA_TARGET_ICELAKE
-        if constexpr (capabilities_ & sz_cap_icelake_k)
-            return sz_aes256_gcm_encrypt_icelake(key, nonce, associated, associated_length, text, length, target, tag,
-                                                 stream);
-#endif
-#if STRINGZILLA_TARGET_NEONAES
-        if constexpr (capabilities_ & sz_cap_neonaes_k)
-            return sz_aes256_gcm_encrypt_neonaes(key, nonce, associated, associated_length, text, length, target, tag,
-                                                 stream);
-#endif
-#if STRINGZILLA_TARGET_WESTMERE
-        if constexpr (capabilities_ & sz_cap_westmere_k)
-            return sz_aes256_gcm_encrypt_westmere(key, nonce, associated, associated_length, text, length, target, tag,
-                                                  stream);
-#endif
-        return sz_aes256_gcm_encrypt_serial(key, nonce, associated, associated_length, text, length, target, tag,
-                                            stream);
-    }
-
-    static sz_status_t aes_decrypt(sz_aes256_gcm_key_t const* key, sz_u8_t const* nonce, sz_cptr_t associated,
-                                   sz_size_t associated_length, sz_cptr_t text, sz_size_t length, sz_ptr_t target,
-                                   sz_u8_t const* tag, sz_stream_t stream) noexcept {
-#if STRINGZILLA_TARGET_SVE2AES
-        if constexpr (capabilities_ & sz_cap_sve2aes_k)
-            return sz_aes256_gcm_decrypt_sve2aes(key, nonce, associated, associated_length, text, length, target, tag,
-                                                 stream);
-#endif
-#if STRINGZILLA_TARGET_ICELAKE
-        if constexpr (capabilities_ & sz_cap_icelake_k)
-            return sz_aes256_gcm_decrypt_icelake(key, nonce, associated, associated_length, text, length, target, tag,
-                                                 stream);
-#endif
-#if STRINGZILLA_TARGET_NEONAES
-        if constexpr (capabilities_ & sz_cap_neonaes_k)
-            return sz_aes256_gcm_decrypt_neonaes(key, nonce, associated, associated_length, text, length, target, tag,
-                                                 stream);
-#endif
-#if STRINGZILLA_TARGET_WESTMERE
-        if constexpr (capabilities_ & sz_cap_westmere_k)
-            return sz_aes256_gcm_decrypt_westmere(key, nonce, associated, associated_length, text, length, target, tag,
-                                                  stream);
-#endif
-        return sz_aes256_gcm_decrypt_serial(key, nonce, associated, associated_length, text, length, target, tag,
-                                            stream);
-    }
+    static constexpr auto sha_init = sha256_kit_t::init;
+    static constexpr auto sha_update = sha256_kit_t::update;
+    static constexpr auto sha_digest = sha256_kit_t::digest;
+    static constexpr auto aes_init = aes256_gcm_kit_t::key_init;
+    static constexpr auto aes_encrypt = aes256_gcm_kit_t::encrypt;
+    static constexpr auto aes_decrypt = aes256_gcm_kit_t::decrypt;
 
 #pragma region Wire Constants
 

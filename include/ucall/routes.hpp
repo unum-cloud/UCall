@@ -11,8 +11,7 @@
 #include <optional>
 #include <string_view>
 
-#include <stringzilla/find/serial.h>
-
+#include "ucall/http.hpp"
 #include "ucall/types.hpp"
 #include "ucall/ucall.h"
 
@@ -24,27 +23,7 @@ struct parsed_segment_t {
     std::string_view content {};
 };
 
-struct route_search_t {
-    static std::size_t find(std::string_view text, char needle, std::size_t offset = 0) noexcept {
-        if (offset >= text.size()) return std::string_view::npos;
-        auto found = sz_find_serial_(text.data() + offset, text.size() - offset, &needle, 1);
-        return found ? static_cast<std::size_t>(found - text.data()) : std::string_view::npos;
-    }
-    static std::size_t rfind(std::string_view text, char needle) noexcept {
-        if (text.empty()) return std::string_view::npos;
-        auto found = sz_rfind_serial_(text.data(), text.size(), &needle, 1);
-        return found ? static_cast<std::size_t>(found - text.data()) : std::string_view::npos;
-    }
-    static char const* find_set(std::string_view text, sz_byteset_t const& set) noexcept {
-        return text.empty() ? nullptr : sz_find_byteset_serial_(text.data(), text.size(), &set);
-    }
-    static char const* rfind_set(std::string_view text, sz_byteset_t const& set) noexcept {
-        return text.empty() ? nullptr : sz_rfind_byteset_serial_(text.data(), text.size(), &set);
-    }
-    static bool equal(std::string_view left, std::string_view right) noexcept {
-        return left.size() == right.size() && sz_equal_serial_(left.data(), right.data(), left.size());
-    }
-};
+using route_search_t = http<sz_cap_serial_k>;
 
 template <typename search_type_ = route_search_t>
 inline std::string_view extract_path_component(std::string_view url) noexcept {
@@ -57,17 +36,8 @@ struct path_cursor {
     std::string_view path {};
     std::size_t offset {};
 
-    static sz_byteset_t const& non_slashes() noexcept {
-        static sz_byteset_t const set = [] {
-            sz_byteset_t result {};
-            sz_byteset_add(&result, '/');
-            sz_byteset_invert(&result);
-            return result;
-        }();
-        return set;
-    }
     std::string_view next() noexcept {
-        auto first = search_type_::find_set(path.substr(offset), non_slashes());
+        auto first = search_type_::find_set(path.substr(offset), non_slash_bytes_k);
         if (!first) {
             offset = path.size();
             return {};
@@ -79,7 +49,7 @@ struct path_cursor {
         return path.substr(start, end - start);
     }
     void previous() noexcept {
-        auto last = search_type_::rfind_set(path.substr(0, offset), non_slashes());
+        auto last = search_type_::rfind_set(path.substr(0, offset), non_slash_bytes_k);
         auto end = last ? static_cast<std::size_t>(last - path.data()) + 1 : 0;
         auto slash = search_type_::rfind(path.substr(0, end), '/');
         offset = slash == std::string_view::npos ? 0 : slash + 1;

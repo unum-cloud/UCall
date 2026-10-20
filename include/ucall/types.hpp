@@ -130,12 +130,19 @@ struct ucall_server_handle_t {
     ucall_server_handle_t(ucall_server_handle_t&&) = delete;
     ucall_server_handle_t& operator=(ucall_server_handle_t&&) = delete;
 
+    /** Set in the batch queue's tail to wake its drain without publishing a request. */
+    static constexpr std::uint64_t batch_signal_k = std::uint64_t {1} << 63;
+
+    /** Stopping runs on any thread, so it touches only these CPU-independent words. */
     std::uint32_t stopped {};
     std::span<uc::wake_channel_t*> wakeups {};
+    std::uint64_t* batch_tail {};
     struct api_t {
         void (*free)(ucall_server_t);
         void (*take_call)(ucall_server_take_call_t*);
         void (*take_calls)(ucall_server_take_calls_t*);
+        void (*take_batch)(ucall_server_take_batch_t*);
+        void (*take_batches)(ucall_server_take_batches_t*);
         void (*add_http_endpoint)(ucall_server_add_http_endpoint_t*);
         ucall_verb_t (*request_verb)(ucall_server_t, ucall_received_http_request_t);
         std::size_t (*request_path_segments_count)(ucall_server_t, ucall_received_http_request_t);
@@ -217,6 +224,25 @@ allocated_ptr<value_type_, allocator_type_> allocate_unique(allocator_type_ cons
 }
 
 /**
+ *  @brief Picks the first of @p kits_ this build compiled and @p caps_ runs, else @p floor_ - a
+ *      ladder's one closing @c >::type, with no nested @c std::conditional_t pile.
+ *
+ *  Every kit states its own needs: @c capability_k, the capability it runs under, and
+ *  @c compiled_k, whether this build carries its body. A kit whose target this build cannot carry
+ *  is a stub of those two members alone, so naming it in a ladder never needs its body.
+ */
+template <auto caps_, typename floor_, typename... kits_>
+struct highest_kit {
+    using type = floor_;
+};
+
+template <auto caps_, typename floor_, typename head_, typename... tail_>
+struct highest_kit<caps_, floor_, head_, tail_...> {
+    using type = std::conditional_t<head_::compiled_k && (caps_ & head_::capability_k) != 0, head_,
+                                    typename highest_kit<caps_, floor_, tail_...>::type>;
+};
+
+/**
  *  @brief Bytes to keep between things two threads write, so neither steals the other's line.
  *
  *  Not 64. Apple's arm64 cores use 128-byte lines, and x86 pulls adjacent lines in pairs for the
@@ -250,146 +276,6 @@ inline std::size_t string_length(char const* c_str, std::size_t optional_length)
     if (!c_str) return 0;
     return optional_length ? optional_length : std::strlen(c_str);
 }
-
-/**
- *  @brief Round-robin circular buffer for managing reusable connection states.
- *
- *  Maintains a circular queue with oldest/newest tracking and polling support for fair connection
- *  scheduling.
- *
- *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible.
- */
-template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
-class round_robin {
-    allocator_type_ allocator_ {};
-
-    element_type_* circle_ {};
-    std::size_t count_ {};
-    std::size_t capacity_ {};
-    std::size_t idx_newest_ {};
-    std::size_t idx_oldest_ {};
-
-    /** Polling index that follows the tail or races forward through active connections. */
-    std::size_t idx_to_poll_ {};
-
-  public:
-    using element_t = element_type_;
-    using value_type = element_t;
-    using allocator_t = allocator_type_;
-
-    explicit round_robin(allocator_t const& allocator = {}) noexcept : allocator_(allocator) {}
-    round_robin(round_robin const&) = delete;
-    round_robin& operator=(round_robin const&) = delete;
-
-    inline round_robin(round_robin&& other) noexcept
-        : allocator_(std::move(other.allocator_)), circle_(std::exchange(other.circle_, nullptr)),
-          count_(std::exchange(other.count_, 0)), capacity_(std::exchange(other.capacity_, 0)),
-          idx_newest_(std::exchange(other.idx_newest_, 0)), idx_oldest_(std::exchange(other.idx_oldest_, 0)),
-          idx_to_poll_(std::exchange(other.idx_to_poll_, 0)) {}
-
-    void reset() noexcept {
-        if (!circle_) return;
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(circle_, capacity_);
-        allocator_.deallocate(circle_, capacity_);
-        circle_ = nullptr;
-        count_ = capacity_ = 0;
-        idx_newest_ = idx_oldest_ = idx_to_poll_ = 0;
-    }
-
-    inline ~round_robin() noexcept { reset(); }
-
-    inline round_robin& operator=(round_robin&& other) noexcept {
-        if (this == &other) return *this;
-        reset();
-        allocator_ = std::move(other.allocator_);
-        circle_ = std::exchange(other.circle_, nullptr);
-        count_ = std::exchange(other.count_, 0);
-        capacity_ = std::exchange(other.capacity_, 0);
-        idx_newest_ = std::exchange(other.idx_newest_, 0);
-        idx_oldest_ = std::exchange(other.idx_oldest_, 0);
-        idx_to_poll_ = std::exchange(other.idx_to_poll_, 0);
-        return *this;
-    }
-
-    inline bool alloc(std::size_t n) noexcept {
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(element_t)) return false;
-        auto circle = allocator_.allocate(n);
-        if (!circle) return false;
-        std::uninitialized_default_construct_n(circle, n);
-        reset();
-        circle_ = circle;
-        capacity_ = n;
-        return true;
-    }
-
-    /** Removes and returns oldest element. Requires non-empty buffer. */
-    inline element_t& drop_tail() noexcept {
-        assert(count_ > 0 && "drop_tail() called on empty round_robin");
-        element_t& dropped = circle_[idx_oldest_];
-        idx_to_poll_ = idx_to_poll_ == idx_oldest_ ? (idx_to_poll_ + 1) % capacity_ : idx_to_poll_;
-        idx_oldest_ = (idx_oldest_ + 1) % capacity_;
-        count_--;
-        return dropped;
-    }
-
-    /** Adds element at head position. Requires non-full buffer. */
-    inline element_t& push_ahead() noexcept {
-        assert(count_ < capacity_ && "push_ahead() called on full round_robin");
-        element_t& added = circle_[idx_newest_];
-        idx_newest_ = (idx_newest_ + 1) % capacity_;
-        count_++;
-        return added;
-    }
-
-    /** Returns current element and advances polling index for fair round-robin iteration. */
-    inline element_t& poll() noexcept {
-        assert(capacity_ > 0 && "poll() called on unallocated round_robin");
-        element_t& result = circle_[idx_to_poll_];
-        auto idx_to_poll_following = (idx_to_poll_ + 1) % capacity_;
-        idx_to_poll_ = idx_to_poll_following == idx_newest_ ? idx_oldest_ : idx_to_poll_following;
-        return result;
-    }
-
-    /** Returns oldest element. Requires non-empty buffer. */
-    inline element_t& tail() noexcept {
-        assert(count_ > 0 && "tail() called on empty round_robin");
-        return circle_[idx_oldest_];
-    }
-
-    /** Returns newest element. Requires non-empty buffer. */
-    inline element_t& head() noexcept {
-        assert(count_ > 0 && "head() called on empty round_robin");
-        return circle_[idx_newest_ > 0 ? idx_newest_ - 1 : capacity_ - 1];
-    }
-    inline std::size_t size() const noexcept { return count_; }
-    inline std::size_t capacity() const noexcept { return capacity_; }
-};
-
-/**
- *  @brief Lightweight spinlock mutex alternative to @c std::mutex.
- *
- *  Non-recursive, non-reentrant spinlock optimized for low thread contention. Uses a
- *  test-and-test-and-set pattern to reduce cache coherency traffic. For high contention scenarios,
- *  consider using @c std::mutex instead.
- */
-class alignas(false_sharing_bytes_k) mutex_t {
-    enum class state_t : std::uint8_t { unlocked_k, locked_k };
-    std::atomic<state_t> state_ {state_t::unlocked_k};
-
-  public:
-    mutex_t() noexcept = default;
-    mutex_t(mutex_t const&) = delete;
-    mutex_t& operator=(mutex_t const&) = delete;
-    mutex_t(mutex_t&&) = delete;
-    mutex_t& operator=(mutex_t&&) = delete;
-
-    inline void lock() noexcept {
-        while (state_.exchange(state_t::locked_k, std::memory_order_acquire) == state_t::locked_k)
-            while (state_.load(std::memory_order_relaxed) == state_t::locked_k);
-    }
-
-    inline void unlock() noexcept { state_.store(state_t::unlocked_k, std::memory_order_release); }
-};
 
 /**
  *  @brief RAII wrapper for memory-mapped pages, portable between UNIX and Windows.
@@ -489,78 +375,6 @@ class memory_map_t {
         data_ = new_ptr;
         size_ = size;
         return true;
-    }
-};
-
-/**
- *  @brief Fixed-size buffer with manual memory management.
- *
- *  Simple buffer container that allocates a fixed number of elements via @c reallocate(). Unlike @c
- *  array, does not support growing or partial filling - capacity is always equal to the number of
- *  constructed elements. Suitable for fixed-size working buffers.
- *
- *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible.
- */
-template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
-class buffer {
-    allocator_type_ allocator_ {};
-    element_type_* elements_ {};
-    std::size_t capacity_ {};
-    static_assert(std::is_nothrow_default_constructible<element_type_>());
-
-  public:
-    using element_t = element_type_;
-    using value_type = element_t;
-    using allocator_t = allocator_type_;
-
-    explicit buffer(allocator_t const& allocator = {}) noexcept : allocator_(allocator) {}
-    buffer(buffer const&) = delete;
-    buffer& operator=(buffer const&) = delete;
-
-    buffer(buffer&& other) noexcept
-        : allocator_(std::move(other.allocator_)), elements_(std::exchange(other.elements_, nullptr)),
-          capacity_(std::exchange(other.capacity_, 0)) {}
-
-    buffer& operator=(buffer&& other) noexcept {
-        if (this == &other) return *this;
-        reset();
-        allocator_ = std::move(other.allocator_);
-        elements_ = std::exchange(other.elements_, nullptr);
-        capacity_ = std::exchange(other.capacity_, 0);
-        return *this;
-    }
-
-    void reset() noexcept {
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        if (elements_) allocator_.deallocate(elements_, capacity_);
-        elements_ = nullptr;
-        capacity_ = 0;
-    }
-
-    /** Allocates exactly @p n elements, @b discarding whatever the buffer held. */
-    [[nodiscard]] bool reallocate(std::size_t n) noexcept {
-        reset();
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(element_t)) return false;
-        elements_ = allocator_.allocate(n);
-        if (!elements_) return false;
-        capacity_ = n;
-        std::uninitialized_default_construct(elements_, elements_ + capacity_);
-        return true;
-    }
-    ~buffer() noexcept { reset(); }
-    [[nodiscard]] element_t const* data() const noexcept { return elements_; }
-    [[nodiscard]] element_t* data() noexcept { return elements_; }
-    [[nodiscard]] element_t* begin() noexcept { return elements_; }
-    [[nodiscard]] element_t* end() noexcept { return elements_ + capacity_; }
-    [[nodiscard]] std::size_t size() const noexcept { return capacity_; }
-    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-    [[nodiscard]] element_t& operator[](std::size_t i) noexcept {
-        assert(i < capacity_ && "buffer::operator[] index out of bounds");
-        return elements_[i];
-    }
-    [[nodiscard]] element_t const& operator[](std::size_t i) const noexcept {
-        assert(i < capacity_ && "buffer::operator[] index out of bounds");
-        return elements_[i];
     }
 };
 
@@ -827,104 +641,6 @@ class successive_pools {
 
 template <typename element_type_>
 using span = std::span<element_type_>;
-
-/**
- *  @brief Dynamic array with manual memory management.
- *
- *  Maintains allocated capacity separately from the active count, with amortized O(1) growth.
- *
- *  @tparam element_type_ Type of elements stored. Must be nothrow default-constructible and
- *      trivially copyable.
- */
-template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
-class array {
-    allocator_type_ allocator_ {};
-    element_type_* elements_ {};
-    std::size_t count_ {};
-    std::size_t capacity_ {};
-    static_assert(std::is_nothrow_default_constructible<element_type_>());
-    static_assert(std::is_trivially_copyable<element_type_>(), "Elements must be trivially copyable for memcpy");
-
-  public:
-    using element_t = element_type_;
-    using value_type = element_t;
-    using allocator_t = allocator_type_;
-
-    explicit array(allocator_t const& allocator = {}) noexcept : allocator_(allocator) {}
-    array(array const&) = delete;
-    array& operator=(array const&) = delete;
-
-    array(array&& other) noexcept
-        : allocator_(std::move(other.allocator_)), elements_(std::exchange(other.elements_, nullptr)),
-          count_(std::exchange(other.count_, 0)), capacity_(std::exchange(other.capacity_, 0)) {}
-
-    array& operator=(array&& other) noexcept {
-        if (this == &other) return *this;
-        reset();
-        allocator_ = std::move(other.allocator_);
-        elements_ = std::exchange(other.elements_, nullptr);
-        count_ = std::exchange(other.count_, 0);
-        capacity_ = std::exchange(other.capacity_, 0);
-        return *this;
-    }
-
-    /** Grows capacity to at least n elements. Never shrinks. Preserves existing elements. */
-    [[nodiscard]] bool reserve(std::size_t n) noexcept {
-        if (n <= capacity_) return true;
-        if (n > std::numeric_limits<std::size_t>::max() / sizeof(element_t)) return false;
-        auto elements = allocator_.allocate(n);
-        if (!elements) return false;
-        if (elements_) std::memcpy(elements, elements_, capacity_ * sizeof(element_t));
-        std::uninitialized_default_construct(elements + capacity_, elements + n);
-        if (elements_) allocator_.deallocate(elements_, capacity_);
-        elements_ = elements;
-        capacity_ = n;
-        return true;
-    }
-    ~array() noexcept { reset(); }
-    void reset() noexcept {
-        if (!elements_) return;
-        if constexpr (!std::is_trivially_destructible<element_t>()) std::destroy_n(elements_, capacity_);
-        allocator_.deallocate(elements_, capacity_);
-        elements_ = nullptr;
-        capacity_ = count_ = 0;
-    }
-    [[nodiscard]] element_t const* data() const noexcept { return elements_; }
-    [[nodiscard]] element_t* data() noexcept { return elements_; }
-    [[nodiscard]] element_t* begin() noexcept { return elements_; }
-    [[nodiscard]] element_t* end() noexcept { return elements_ + count_; }
-    [[nodiscard]] std::size_t size() const noexcept { return count_; }
-    [[nodiscard]] std::size_t capacity() const noexcept { return capacity_; }
-    [[nodiscard]] element_t& operator[](std::size_t i) noexcept {
-        assert(i < count_ && "array::operator[] index out of bounds");
-        return elements_[i];
-    }
-
-    /** Adds element to pre-allocated space. Requires capacity > count. */
-    void push_back_reserved(element_t element) noexcept {
-        assert(count_ < capacity_ && "push_back_reserved() called on full array");
-        elements_[count_++] = std::move(element);
-    }
-
-    /** Decrements count by n. Does not destroy elements or deallocate. */
-    void pop_back(std::size_t n = 1) noexcept {
-        assert(count_ >= n && "pop_back() would underflow array");
-        count_ -= n;
-    }
-    [[nodiscard]] bool append_n(element_t const* elements, std::size_t n) noexcept {
-        if (!n) return true;
-        std::size_t const maximum = std::numeric_limits<std::size_t>::max() / sizeof(element_t);
-        if (n > maximum - count_) return false;
-        if (count_ + n > capacity_) {
-            std::size_t const doubled = capacity_ <= maximum / 2 ? capacity_ * 2 : maximum;
-            if (!reserve(std::max(count_ + n, doubled))) return false;
-        }
-        if (!elements_) return false;
-        std::memcpy(elements_ + count_, elements, n * sizeof(element_t));
-        count_ += n;
-        return true;
-    }
-};
 
 struct number_and_suffix_t {
     float number {};

@@ -75,14 +75,14 @@ static constexpr payload_width_t payload_widths_k[] = {payload_width_t::empty_k,
 
 /** One driver's record buffer: reserved once, written in place, never copied out of. */
 struct wire_t {
-    array<byte_t> storage {};
+    st::basic_vector<byte_t> storage {};
     std::size_t length {};
 
     /** Room for the widest record the wire format can name. */
-    [[nodiscard]] bool reserve() noexcept { return storage.reserve(secure_tunnel_max_record_k); }
+    [[nodiscard]] bool reserve() noexcept { return reserve(secure_tunnel_max_record_k); }
 
     /** Room for exactly @p capacity bytes, as a driver sizing from @c record_size would. */
-    [[nodiscard]] bool reserve(std::size_t capacity) noexcept { return storage.reserve(capacity); }
+    [[nodiscard]] bool reserve(std::size_t capacity) noexcept { return !st::failed(storage.resize(capacity)); }
     [[nodiscard]] span<byte_t> whole() noexcept { return {storage.data(), storage.data() + storage.capacity()}; }
     [[nodiscard]] span<byte_t> arrived() noexcept { return {storage.data(), storage.data() + length}; }
     [[nodiscard]] span<byte_t const> received() const noexcept { return {storage.data(), storage.data() + length}; }
@@ -791,8 +791,8 @@ void test_records_unit() {
 
     // A ceiling that ignored the kind byte would declare 65536, mask to zero, and be rejected.
     announce("a_maximum_size_payload_fits_the_wire_format");
-    array<byte_t> payload;
-    verify(payload.reserve(secure_tunnel_payload_ceiling_k));
+    st::basic_vector<byte_t> payload;
+    verify(!st::failed(payload.resize(secure_tunnel_payload_ceiling_k)));
     span<byte_t> const widest_scratch {payload.data(), payload.data() + secure_tunnel_payload_ceiling_k};
     fill_with(widest_scratch, byte_t {'M'});
     span<byte_t const> const widest = widest_scratch;
@@ -1237,8 +1237,8 @@ void test_reuse_unit() {
 void test_tunnel_stress() {
     wire_t wire;
     verify(wire.reserve());
-    array<byte_t> payload;
-    verify(payload.reserve(secure_tunnel_payload_ceiling_k));
+    st::basic_vector<byte_t> payload;
+    verify(!st::failed(payload.resize(secure_tunnel_payload_ceiling_k)));
 
     std::size_t const exchanges = scale_iterations(16);
 

@@ -81,9 +81,11 @@ struct routing_case_t {
  */
 struct path_arena_t {
     static constexpr std::size_t slot_width_k = 32;
-    buffer<char> characters {};
+    st::basic_vector<char> characters {};
 
-    [[nodiscard]] bool reserve(std::size_t routes) noexcept { return characters.reallocate(routes * slot_width_k); }
+    [[nodiscard]] bool reserve(std::size_t routes) noexcept {
+        return !st::failed(characters.resize(routes * slot_width_k));
+    }
 
     /** Writes `/route<index>` into its own slot and returns a view of it. */
     [[nodiscard]] std::string_view emit(std::size_t index) {
