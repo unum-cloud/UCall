@@ -2,7 +2,7 @@
  *  @file include/ucall/uring.hpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief Registered socket, transmit, and receive ownership for the Linux completion engines.
+ *  @brief Registered socket and receive ownership for the Linux completion engines.
  */
 #pragma once
 
@@ -25,7 +25,6 @@ struct registered_socket_t {
 template <ucall_io_backend_t backend_, typename allocator_type_ = st::default_allocator<byte_t>>
 struct linux_uring_engine {
     static_assert(backend_ == ucall_io_backend_linux_uring612_k || backend_ == ucall_io_backend_linux_uring700_k);
-    static constexpr bool advanced_k = backend_ == ucall_io_backend_linux_uring700_k;
     using allocator_t = allocator_type_;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
@@ -37,42 +36,42 @@ struct linux_uring_engine {
     enum class operation_stage_t : std::uint8_t { waiting_k, submitted_k, cancelling_k, completed_k };
     enum class resource_stage_t : std::uint8_t { vacant_k, installing_k, open_k, closing_k, closed_k };
     enum class receive_stage_t : std::uint8_t { idle_k, submitted_k, cancelling_k, ended_k };
-    enum operation_flags_t : std::uint8_t { operation_none_k = 0, operation_expired_k = 1, operation_backlog_k = 2 };
+    enum operation_flags_t : std::uint8_t {
+        operation_none_k = 0,
+        operation_expired_k = 1,
+        operation_backlog_k = 2,
+        operation_timed_k = 4
+    };
     enum resource_flags_t : std::uint8_t {
         resource_none_k = 0,
         resource_retiring_k = 1,
         resource_paused_k = 2,
-        resource_leased_k = 4
+        resource_leased_k = 4,
+        resource_rearming_k = 8
     };
-    enum registration_flags_t : std::uint8_t {
-        registration_none_k = 0,
-        registration_files_k = 1,
-        registration_tx_k = 2
-    };
+    enum registration_flags_t : std::uint8_t { registration_none_k = 0, registration_files_k = 1 };
     enum buffer_flags_t : std::uint8_t { buffer_none_k = 0, buffer_leased_k = 1 };
     static constexpr unsigned absent_k = std::numeric_limits<unsigned>::max();
-    static constexpr std::uintptr_t operation_tag_k = 0, control_tag_k = 1, transmit_tag_k = 2, receive_tag_k = 3,
-                                    close_tag_k = 4, cancel_tag_k = 7;
+    static constexpr std::uintptr_t operation_tag_k = 0, control_tag_k = 1, receive_tag_k = 3, close_tag_k = 4,
+                                    cancel_tag_k = 7;
     struct resource_t;
-    struct transmit_t;
     struct alignas(8) operation_t {
         io_request_t* request {};
         resource_t* resource {};
-        transmit_t* transmit {};
         descriptor_t result {};
-        unsigned accepted {absent_k}, buffer {absent_k};
+        __kernel_timespec expiry {};
+        unsigned accepted {absent_k}, buffer {absent_k}, next {absent_k};
         operation_stage_t stage {operation_stage_t::waiting_k};
         operation_flags_t flags {operation_none_k};
         bool in_flight() const noexcept {
             return stage == operation_stage_t::submitted_k || stage == operation_stage_t::cancelling_k;
         }
     };
-    struct alignas(8) transmit_t {
-        operation_t* operation {};
-        resource_t* resource {};
+    struct operation_list_t {
+        unsigned head {absent_k}, tail {absent_k};
     };
     struct alignas(8) resource_t {
-        unsigned index {};
+        unsigned index {}, next {absent_k}, queued_buffers {};
         unsigned receive_head {absent_k}, receive_tail {absent_k};
         operation_t* receive_request {};
         operation_t* close_request {};
@@ -98,9 +97,9 @@ struct linux_uring_engine {
     };
 
     struct storage_t {
-        vector<byte_t> transmit, receive;
+        vector<byte_t> receive;
         int socket_option_value {1};
-        explicit storage_t(allocator_t const& allocator) noexcept : transmit(allocator), receive(allocator) {}
+        explicit storage_t(allocator_t const& allocator) noexcept : receive(allocator) {}
         storage_t(storage_t const&) = delete;
         storage_t& operator=(storage_t const&) = delete;
         storage_t(storage_t&&) = delete;
@@ -110,10 +109,11 @@ struct linux_uring_engine {
     io_uring_buf_ring* receive_ring {};
     allocator_t allocator;
     vector<operation_t> operations;
-    vector<transmit_t> transmissions;
     vector<resource_t> resources;
     vector<buffer_t> buffers;
     allocated_ptr<storage_t, allocator_t> storage;
+    operation_list_t free_operations, completed_operations, waiting_operations, timed_operations;
+    unsigned free_resources {absent_k}, vacant_resources {}, rearming_resources {absent_k};
     unsigned buffer_count {}, buffer_mask {}, pending_sqes {}, available_buffers {};
     std::size_t page {};
     control_t control {};
@@ -124,8 +124,7 @@ struct linux_uring_engine {
 
     explicit linux_uring_engine(allocator_t const& instance = {}) noexcept
         : allocator(instance), operations(rebound_allocator<operation_t> {instance}),
-          transmissions(rebound_allocator<transmit_t> {instance}), resources(rebound_allocator<resource_t> {instance}),
-          buffers(rebound_allocator<buffer_t> {instance}),
+          resources(rebound_allocator<resource_t> {instance}), buffers(rebound_allocator<buffer_t> {instance}),
           storage(nullptr, allocator_delete<storage_t, allocator_t> {instance}) {}
     linux_uring_engine(linux_uring_engine const&) = delete;
     linux_uring_engine& operator=(linux_uring_engine const&) = delete;
@@ -138,8 +137,6 @@ struct linux_uring_engine {
         if (!control.result) return true;
         for (auto const& operation : operations)
             if (operation.in_flight()) return true;
-        for (auto const& transmission : transmissions)
-            if (transmission.resource) return true;
         for (auto const& owner : resources)
             if (owner.receive_in_flight() || owner.stage == resource_stage_t::closing_k) return true;
         return false;
@@ -157,39 +154,85 @@ struct linux_uring_engine {
     byte_t* receive_data(unsigned index) noexcept {
         return storage->receive.data() + static_cast<std::size_t>(index) * page;
     }
-    byte_t* transmit_data(transmit_t& transmission) noexcept {
-        return storage->transmit.data() + static_cast<std::size_t>(&transmission - transmissions.data()) * page;
+    unsigned index_of(operation_t const& operation) const noexcept {
+        return static_cast<unsigned>(&operation - operations.data());
     }
-    io_uring_sqe* entry() noexcept {
-        if constexpr (advanced_k) {
-            if (pending_sqes == ring.sq.ring_entries && enter(0, 0) < 0) return nullptr;
-            if (pending_sqes == ring.sq.ring_entries) return nullptr;
+    void push(operation_list_t& list, operation_t& operation) noexcept {
+        operation.next = absent_k;
+        if (list.tail != absent_k) operations[list.tail].next = index_of(operation);
+        else list.head = index_of(operation);
+        list.tail = index_of(operation);
+    }
+    operation_t* pop(operation_list_t& list) noexcept {
+        if (list.head == absent_k) return nullptr;
+        auto& operation = operations[list.head];
+        list.head = operation.next;
+        if (list.head == absent_k) list.tail = absent_k;
+        return &operation;
+    }
+    void unlink(operation_list_t& list, operation_t& operation) noexcept {
+        auto index = index_of(operation);
+        for (unsigned previous = absent_k, current = list.head; current != absent_k;
+             previous = current, current = operations[current].next) {
+            if (current != index) continue;
+            if (previous != absent_k) operations[previous].next = operation.next;
+            else list.head = operation.next;
+            if (list.tail == index) list.tail = previous;
+            return;
+        }
+    }
+    void complete(operation_t& operation) noexcept {
+        operation.stage = operation_stage_t::completed_k;
+        push(completed_operations, operation);
+    }
+    void vacate(operation_t& operation) noexcept {
+        operation.request = nullptr;
+        push(free_operations, operation);
+    }
+    void vacate(resource_t& owner) noexcept {
+        // A socket can close before maintain() drains the re-arm list that shares its link.
+        if (owner.flags & resource_rearming_k)
+            for (auto* link = &rearming_resources; *link != absent_k; link = &resources[*link].next)
+                if (*link == owner.index) {
+                    *link = owner.next;
+                    break;
+                }
+        owner.stage = resource_stage_t::vacant_k;
+        owner.next = free_resources;
+        free_resources = owner.index;
+        ++vacant_resources;
+    }
+    void rearm(resource_t& owner) noexcept {
+        if (owner.flags & resource_rearming_k) return;
+        owner.flags = static_cast<resource_flags_t>(owner.flags | resource_rearming_k);
+        owner.next = rearming_resources;
+        rearming_resources = owner.index;
+    }
+    static __kernel_timespec timespec_of(std::uint64_t nanoseconds) noexcept {
+        return {static_cast<__kernel_time64_t>(nanoseconds / 1'000'000'000),
+                static_cast<long long>(nanoseconds % 1'000'000'000)};
+    }
+    io_uring_sqe* entry(unsigned count = 1) noexcept {
+        if constexpr (backend_ == ucall_io_backend_linux_uring700_k) {
+            if (pending_sqes + count > ring.sq.ring_entries && enter(0, 0) < 0) return nullptr;
+            if (pending_sqes + count > ring.sq.ring_entries) return nullptr;
             auto* result = &ring.sq.sqes[pending_sqes++];
             io_uring_initialize_sqe(result);
             return result;
         }
         else {
-            auto* result = io_uring_get_sqe(&ring);
-            if (!result) {
-                if (io_uring_submit(&ring) < 0) return nullptr;
-                result = io_uring_get_sqe(&ring);
-            }
-            return result;
+            if (io_uring_sq_space_left(&ring) < count && io_uring_submit(&ring) < 0) return nullptr;
+            return io_uring_sq_space_left(&ring) < count ? nullptr : io_uring_get_sqe(&ring);
         }
     }
     int enter(unsigned wait, std::uint64_t deadline) noexcept {
-        __kernel_timespec timeout {};
-        if (deadline) {
-            auto now = monotonic_ns();
-            auto duration = deadline > now ? deadline - now : 0;
-            timeout.tv_sec = static_cast<__kernel_time64_t>(duration / 1'000'000'000);
-            timeout.tv_nsec = static_cast<long long>(duration % 1'000'000'000);
-        }
-        if constexpr (advanced_k) {
+        if constexpr (backend_ == ucall_io_backend_linux_uring700_k) {
+            auto timeout = timespec_of(deadline);
             io_uring_getevents_arg arguments {};
             arguments.ts = deadline ? reinterpret_cast<std::uintptr_t>(&timeout) : 0;
-            unsigned flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG;
-            int result = io_uring_enter2(ring.ring_fd, pending_sqes, wait, flags, &arguments, sizeof(arguments));
+            unsigned flags = IORING_ENTER_GETEVENTS | IORING_ENTER_EXT_ARG | IORING_ENTER_ABS_TIMER |
+                             (ring.int_flags & IORING_ENTER_REGISTERED_RING);
+            int result = io_uring_enter2(ring.enter_ring_fd, pending_sqes, wait, flags, &arguments, sizeof(arguments));
             if (result >= 0) {
                 auto submitted = static_cast<unsigned>(result);
                 pending_sqes -= submitted;
@@ -199,11 +242,13 @@ struct linux_uring_engine {
             return result == -ETIME || result == -EINTR ? 0 : result;
         }
         else {
-            int submitted = io_uring_submit(&ring);
-            if (submitted < 0 || !wait) return submitted;
+            // Deferred task work only runs inside an enter that asks for events.
+            if (!wait) return io_uring_submit_and_get_events(&ring);
+            auto now = deadline ? monotonic_ns() : 0;
+            auto timeout = timespec_of(deadline > now ? deadline - now : 0);
             io_uring_cqe* completion {};
-            int result = deadline ? io_uring_wait_cqe_timeout(&ring, &completion, &timeout)
-                                  : io_uring_wait_cqe(&ring, &completion);
+            int result = deadline ? io_uring_submit_and_wait_timeout(&ring, &completion, wait, &timeout, nullptr)
+                                  : io_uring_submit_and_wait(&ring, wait);
             return result == -ETIME || result == -EINTR ? 0 : result;
         }
     }
@@ -220,25 +265,27 @@ struct linux_uring_engine {
         while (buffer_count < capacity && buffer_count < 32768) buffer_count *= 2;
         buffer_mask = buffer_count - 1;
         available_buffers = buffer_count;
-        if (st::failed(operations.resize(capacity)) || st::failed(transmissions.resize(capacity)) ||
-            st::failed(resources.reserve(capacity)) || st::failed(buffers.resize(buffer_count)) ||
-            st::failed(storage->transmit.resize(capacity * page)) ||
+        if (st::failed(operations.resize(capacity)) || st::failed(resources.reserve(capacity)) ||
+            st::failed(buffers.resize(buffer_count)) ||
             st::failed(storage->receive.resize(static_cast<std::size_t>(buffer_count) * page)))
             return ucall_status_out_of_memory_k;
+        for (auto& operation : operations) push(free_operations, operation);
         resources.clear();
         for (std::size_t i = 0; i != capacity; ++i) {
             if (st::failed(resources.emplace_back(allocator))) return ucall_status_out_of_memory_k;
             resources[i].index = static_cast<unsigned>(i);
         }
+        for (auto i = resources.size(); i--;) vacate(resources[i]);
         io_uring_params parameters {};
-        parameters.flags = IORING_SETUP_CLAMP;
-        if constexpr (advanced_k)
-            parameters.flags |= IORING_SETUP_SINGLE_ISSUER | IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_NO_SQARRAY |
-                                IORING_SETUP_SQ_REWIND;
+        parameters.flags = IORING_SETUP_CLAMP | IORING_SETUP_SUBMIT_ALL | IORING_SETUP_SINGLE_ISSUER |
+                           IORING_SETUP_DEFER_TASKRUN | IORING_SETUP_NO_SQARRAY;
+        if constexpr (backend_ == ucall_io_backend_linux_uring700_k) parameters.flags |= IORING_SETUP_SQ_REWIND;
+        // Each one-shot operation may carry a linked timeout.
         auto entries = static_cast<unsigned>(
-            std::min(depth, static_cast<std::size_t>(std::numeric_limits<unsigned>::max())));
+            std::min(depth, static_cast<std::size_t>(std::numeric_limits<unsigned>::max() / 2)) * 2);
         int result = io_uring_queue_init_params(entries, &ring, &parameters);
         if (result < 0) return result == -ENOMEM ? ucall_status_out_of_memory_k : ucall_status_unsupported_k;
+        (void)io_uring_register_ring_fd(&ring);
         stage = engine_stage_t::running_k;
         constexpr auto probe_length = unsigned {std::numeric_limits<decltype(io_uring_probe_op::op)>::max()} + 1;
         struct alignas(io_uring_probe) probe_scratch_t {
@@ -252,8 +299,9 @@ struct linux_uring_engine {
         auto* probe = std::construct_at(reinterpret_cast<io_uring_probe*>(scratch->bytes));
         bool supported = io_uring_register_probe(&ring, probe, probe_length) == 0 &&
                          (parameters.features & IORING_FEAT_NODROP) && (parameters.features & IORING_FEAT_EXT_ARG);
-        for (auto opcode : {IORING_OP_SOCKET, IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_RECV, IORING_OP_SEND_ZC,
-                            IORING_OP_READ, IORING_OP_CLOSE, IORING_OP_ASYNC_CANCEL, IORING_OP_URING_CMD})
+        for (auto opcode :
+             {IORING_OP_SOCKET, IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_READ,
+              IORING_OP_CLOSE, IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD})
             supported = supported && io_uring_opcode_supported(probe, opcode);
         scratch.reset();
         if (!supported) {
@@ -266,15 +314,6 @@ struct linux_uring_engine {
             return ucall_status_unsupported_k;
         }
         registrations = static_cast<registration_flags_t>(registrations | registration_files_k);
-        iovec transmit {};
-        transmit.iov_base = storage->transmit.data();
-        transmit.iov_len = storage->transmit.size();
-        result = io_uring_register_buffers(&ring, &transmit, 1);
-        if (result < 0) {
-            stop();
-            return result == -ENOMEM ? ucall_status_out_of_memory_k : ucall_status_unsupported_k;
-        }
-        registrations = static_cast<registration_flags_t>(registrations | registration_tx_k);
         receive_ring = io_uring_setup_buf_ring(&ring, buffer_count, 0, 0, &result);
         if (!receive_ring) {
             stop();
@@ -287,19 +326,19 @@ struct linux_uring_engine {
         return ucall_status_success_k;
     }
     resource_t* reserve() noexcept {
-        for (unsigned i = 0; i != resources.size(); ++i)
-            if (resources[i].stage == resource_stage_t::vacant_k) {
-                auto& result = resources[i];
-                auto backlog = std::move(result.backlog);
-                result = resource_t {allocator};
-                result.backlog = std::move(backlog);
-                result.backlog.clear();
-                result.index = i;
-                result.stage = resource_stage_t::installing_k;
-                result.serial = ++next_serial;
-                return &result;
-            }
-        return nullptr;
+        if (free_resources == absent_k) return nullptr;
+        auto index = free_resources;
+        auto& result = resources[index];
+        free_resources = result.next;
+        --vacant_resources;
+        auto backlog = std::move(result.backlog);
+        result = resource_t {allocator};
+        result.backlog = std::move(backlog);
+        result.backlog.clear();
+        result.index = index;
+        result.stage = resource_stage_t::installing_k;
+        result.serial = ++next_serial;
+        return &result;
     }
     int wait_control() noexcept {
         while (!control.result.has_value() && !fault) {
@@ -326,7 +365,7 @@ struct linux_uring_engine {
         int raw = static_cast<int>(descriptor);
         int result = io_uring_register_files_update(&ring, target->index, &raw, 1);
         if (result != 1) {
-            target->stage = resource_stage_t::vacant_k;
+            vacate(*target);
             return result < 0 ? result : -EIO;
         }
         socket_close(descriptor);
@@ -339,7 +378,7 @@ struct linux_uring_engine {
         if (!target) return -ENFILE;
         auto* submission = entry();
         if (!submission) {
-            target->stage = resource_stage_t::vacant_k;
+            vacate(*target);
             return -EIO;
         }
         control = {};
@@ -348,7 +387,7 @@ struct linux_uring_engine {
         io_uring_sqe_set_data64(submission, tag(&control, control_tag_k));
         int result = wait_control();
         if (result < 0) {
-            if (control.result) target->stage = resource_stage_t::vacant_k;
+            if (control.result) vacate(*target);
             return result;
         }
         target->stage = resource_stage_t::open_k;
@@ -431,12 +470,13 @@ struct linux_uring_engine {
                 owner.terminal = buffer.length;
             }
             owner.receive_head = buffer.next;
+            --owner.queued_buffers;
             recycle(index);
         }
         owner.receive_tail = absent_k;
     }
     void receive_pause(descriptor_t descriptor) noexcept {
-        if constexpr (advanced_k) {
+        if constexpr (backend_ == ucall_io_backend_linux_uring700_k) {
             auto* owner = resource(descriptor);
             if (!owner || (owner->flags & resource_retiring_k) || owner->receive_request) return;
             owner->flags = static_cast<resource_flags_t>(owner->flags | resource_paused_k);
@@ -455,6 +495,7 @@ struct linux_uring_engine {
         if (owner.receive_tail != absent_k) buffers[owner.receive_tail].next = index;
         else owner.receive_head = index;
         owner.receive_tail = index;
+        ++owner.queued_buffers;
     }
     void deliver_receive(resource_t& owner) noexcept {
         auto* operation = owner.receive_request;
@@ -464,25 +505,22 @@ struct linux_uring_engine {
             operation->flags = static_cast<operation_flags_t>(operation->flags | operation_backlog_k);
             operation->result = static_cast<descriptor_t>(
                 std::min(owner.backlog.size() - owner.backlog_offset, std::min(operation->request->length, page)));
-            operation->stage = operation_stage_t::completed_k;
             owner.flags = static_cast<resource_flags_t>(owner.flags | resource_leased_k);
-            owner.receive_request = nullptr;
         }
         else if (owner.receive_head != absent_k) {
             auto index = owner.receive_head;
             owner.receive_head = buffers[index].next;
             if (owner.receive_head == absent_k) owner.receive_tail = absent_k;
+            --owner.queued_buffers;
             buffers[index].flags = buffer_leased_k;
             operation->buffer = index;
             operation->result = buffers[index].length;
-            operation->stage = operation_stage_t::completed_k;
-            owner.receive_request = nullptr;
         }
-        else if (owner.receive_stage == receive_stage_t::ended_k) {
-            operation->result = owner.terminal;
-            operation->stage = operation_stage_t::completed_k;
-            owner.receive_request = nullptr;
-        }
+        else if (owner.receive_stage == receive_stage_t::ended_k) operation->result = owner.terminal;
+        else return;
+        owner.receive_request = nullptr;
+        if (operation->flags & operation_timed_k) unlink(timed_operations, *operation);
+        complete(*operation);
     }
     bool start_receive(resource_t& owner) noexcept {
         if (owner.receive_stage != receive_stage_t::idle_k || (owner.flags & resource_paused_k) ||
@@ -501,12 +539,7 @@ struct linux_uring_engine {
     bool submit(io_request_t& request) noexcept {
         auto* owner = resource(request.descriptor);
         if (!owner || (owner->flags & resource_retiring_k)) return false;
-        operation_t* operation {};
-        for (auto& candidate : operations)
-            if (!candidate.request) {
-                operation = &candidate;
-                break;
-            }
+        auto* operation = pop(free_operations);
         if (!operation) return false;
         *operation = {};
         operation->request = &request;
@@ -516,21 +549,27 @@ struct linux_uring_engine {
             retire(*owner);
             return true;
         }
-        if constexpr (advanced_k) {
+        if constexpr (backend_ == ucall_io_backend_linux_uring700_k) {
             if (request.operation == io_operation_t::receive_k) {
                 owner->flags = static_cast<resource_flags_t>(owner->flags & ~resource_paused_k);
                 owner->receive_request = operation;
                 deliver_receive(*owner);
-                if (operation->stage != operation_stage_t::completed_k && !start_receive(*owner)) {
+                if (operation->stage == operation_stage_t::completed_k) return true;
+                if (!start_receive(*owner)) {
                     owner->receive_request = nullptr;
-                    operation->request = nullptr;
+                    vacate(*operation);
                     return false;
+                }
+                if (!owner->receive_in_flight()) rearm(*owner);
+                if (request.deadline) {
+                    operation->flags = static_cast<operation_flags_t>(operation->flags | operation_timed_k);
+                    push(timed_operations, *operation);
                 }
                 return true;
             }
         }
         if (start_operation(*operation)) return true;
-        operation->request = nullptr;
+        vacate(*operation);
         return false;
     }
     bool start_operation(operation_t& operation) noexcept {
@@ -538,25 +577,19 @@ struct linux_uring_engine {
         auto* owner = operation.resource;
         if (request.operation == io_operation_t::accept_k && operation.accepted == absent_k) {
             auto* accepted = reserve();
-            if (!accepted) return true;
-            accepted->stage = resource_stage_t::installing_k;
+            if (!accepted) {
+                push(waiting_operations, operation);
+                return true;
+            }
             operation.accepted = accepted->index;
         }
-        if (request.operation == io_operation_t::receive_k && !available_buffers) return true;
-        if (request.operation == io_operation_t::send_k) {
-            for (auto& transmission : transmissions)
-                if (!transmission.resource) {
-                    operation.transmit = &transmission;
-                    transmission = {&operation, owner};
-                    break;
-                }
-            if (!operation.transmit) return true;
+        if (request.operation == io_operation_t::receive_k && !available_buffers) {
+            push(waiting_operations, operation);
+            return true;
         }
-        auto* submission = entry();
+        auto* submission = entry(request.deadline ? 2 : 1);
         if (!submission) {
-            if (operation.transmit) operation.transmit->resource = nullptr;
-            if (operation.accepted != absent_k) resources[operation.accepted].stage = resource_stage_t::vacant_k;
-            operation.request = nullptr;
+            if (operation.accepted != absent_k) vacate(resources[operation.accepted]);
             return false;
         }
         auto length = static_cast<unsigned>(std::min(request.length, page));
@@ -576,10 +609,10 @@ struct linux_uring_engine {
             submission->buf_group = 0;
             break;
         case io_operation_t::send_k:
-            if (length) std::memcpy(transmit_data(*operation.transmit), request.data, length);
-            io_uring_prep_send_zc_fixed(submission, static_cast<int>(owner->index), transmit_data(*operation.transmit),
-                                        length, MSG_NOSIGNAL, 0, 0);
-
+            // The submission length field is 32 bits wide.
+            io_uring_prep_send(submission, static_cast<int>(owner->index), request.data,
+                               std::min(request.length, std::size_t {std::numeric_limits<unsigned>::max()}),
+                               MSG_NOSIGNAL);
             break;
         case io_operation_t::read_k:
             io_uring_prep_read(submission, static_cast<int>(owner->index), request.data, length, -1);
@@ -587,8 +620,14 @@ struct linux_uring_engine {
         case io_operation_t::close_k: break;
         }
         submission->flags |= IOSQE_FIXED_FILE;
-        io_uring_sqe_set_data64(submission, operation.transmit ? tag(operation.transmit, transmit_tag_k)
-                                                               : tag(&operation, operation_tag_k));
+        io_uring_sqe_set_data64(submission, tag(&operation, operation_tag_k));
+        if (request.deadline) {
+            submission->flags |= IOSQE_IO_LINK;
+            operation.expiry = timespec_of(request.deadline);
+            auto* timeout = entry();
+            io_uring_prep_link_timeout(timeout, &operation.expiry, IORING_TIMEOUT_ABS);
+            io_uring_sqe_set_data64(timeout, cancel_tag_k);
+        }
         operation.stage = operation_stage_t::submitted_k;
 
         return true;
@@ -608,11 +647,14 @@ struct linux_uring_engine {
                     (operation.stage == operation_stage_t::cancelling_k))
                     return true;
                 if (!operation.in_flight()) {
-                    if (operation.resource->receive_request == &operation)
+                    if (operation.resource->receive_request != &operation) unlink(waiting_operations, operation);
+                    else {
                         operation.resource->receive_request = nullptr;
+                        if (operation.flags & operation_timed_k) unlink(timed_operations, operation);
+                    }
                     operation.result = -ECANCELED;
-                    operation.stage = operation_stage_t::completed_k;
-                    if constexpr (advanced_k)
+                    complete(operation);
+                    if constexpr (backend_ == ucall_io_backend_linux_uring700_k)
                         if (request.operation == io_operation_t::receive_k) receive_pause(request.descriptor);
                     return true;
                 }
@@ -622,9 +664,7 @@ struct linux_uring_engine {
                     operation.stage = operation_stage_t::submitted_k;
                     return false;
                 }
-                io_uring_prep_cancel64(
-                    submission,
-                    operation.transmit ? tag(operation.transmit, transmit_tag_k) : tag(&operation, operation_tag_k), 0);
+                io_uring_prep_cancel64(submission, tag(&operation, operation_tag_k), 0);
                 io_uring_sqe_set_data64(submission, cancel_tag_k);
                 return true;
             }
@@ -646,6 +686,7 @@ struct linux_uring_engine {
             while (owner.receive_head != absent_k) {
                 auto index = owner.receive_head;
                 owner.receive_head = buffers[index].next;
+                --owner.queued_buffers;
                 recycle(index);
             }
             owner.receive_tail = absent_k;
@@ -653,13 +694,10 @@ struct linux_uring_engine {
         if (owner.stage == resource_stage_t::installing_k || owner.receive_in_flight() ||
             owner.stage == resource_stage_t::closing_k)
             return;
-        bool notifications = false;
         for (auto const& operation : operations)
             if (operation.in_flight() && operation.resource == &owner) return;
-        for (auto const& transmission : transmissions)
-            if (transmission.resource == &owner) notifications = true;
         if (owner.stage == resource_stage_t::closed_k) {
-            if (!notifications && !(owner.flags & resource_leased_k)) finish_close(owner);
+            if (!(owner.flags & resource_leased_k)) finish_close(owner);
             return;
         }
         auto* submission = entry();
@@ -690,11 +728,11 @@ struct linux_uring_engine {
     void finish_close(resource_t& owner) noexcept {
         if (owner.close_request) {
             owner.close_request->result = 0;
-            owner.close_request->stage = operation_stage_t::completed_k;
             owner.close_request->request->descriptor = -1;
+            complete(*owner.close_request);
             owner.close_request = nullptr;
         }
-        owner.stage = resource_stage_t::vacant_k;
+        vacate(owner);
     }
     void completion(io_uring_cqe const& completion) noexcept {
         auto kind = static_cast<std::uintptr_t>(completion.user_data) & 7;
@@ -704,20 +742,6 @@ struct linux_uring_engine {
         if (kind == control_tag_k) {
             control.result = completion.res;
 
-            return;
-        }
-        if (kind == transmit_tag_k) {
-            auto& transmission = *static_cast<transmit_t*>(pointer);
-            auto* owner = transmission.resource;
-            if (!(completion.flags & IORING_CQE_F_NOTIF)) {
-                auto& operation = *transmission.operation;
-                operation.result = completion.res;
-                operation.stage = operation_stage_t::completed_k;
-                operation.transmit = nullptr;
-                transmission.operation = nullptr;
-            }
-            if (!(completion.flags & IORING_CQE_F_MORE)) { transmission.resource = nullptr; }
-            if (owner->flags & resource_retiring_k) retire(*owner);
             return;
         }
         if (kind == close_tag_k) {
@@ -744,6 +768,13 @@ struct linux_uring_engine {
                     queue_buffer(owner, index, completion.res);
                     if (owner.flags & resource_paused_k) park_receive(owner);
                     else deliver_receive(owner);
+                    // One open socket may hold at most its fair share of the shared receive ring.
+                    assert(resources.size() > vacant_resources);
+                    if (owner.queued_buffers >= buffer_count / (resources.size() - vacant_resources) &&
+                        owner.receive_stage == receive_stage_t::submitted_k) {
+                        if (!cancel_stream(owner, receive_tag_k)) fault = -EIO;
+                        else owner.receive_stage = receive_stage_t::cancelling_k;
+                    }
                 }
             }
             else if (completion.res != -ENOBUFS && completion.res != -ECANCELED) {
@@ -753,10 +784,15 @@ struct linux_uring_engine {
             }
             if ((owner.flags & resource_paused_k) && !owner.receive_in_flight()) park_receive(owner);
             if (owner.flags & resource_retiring_k) retire(owner);
+            else if (owner.receive_stage == receive_stage_t::idle_k) rearm(owner);
             return;
         }
         auto& operation = *static_cast<operation_t*>(pointer);
         operation.result = completion.res;
+        // Only the linked timeout cancels an operation that was not asked to cancel.
+        if (completion.res == -ECANCELED && operation.stage != operation_stage_t::cancelling_k &&
+            operation.request->deadline)
+            operation.flags = static_cast<operation_flags_t>(operation.flags | operation_expired_k);
         if (operation.accepted != absent_k) {
             auto& accepted = resources[operation.accepted];
             accepted.stage = resource_stage_t::open_k;
@@ -765,21 +801,21 @@ struct linux_uring_engine {
                 if (stage != engine_stage_t::running_k || (operation.resource->flags & resource_retiring_k))
                     retire(accepted);
             }
-            else accepted.stage = resource_stage_t::vacant_k;
+            else vacate(accepted);
         }
         if (completion.flags & IORING_CQE_F_BUFFER) {
             --available_buffers;
             operation.buffer = completion.flags >> IORING_CQE_BUFFER_SHIFT;
             buffers[operation.buffer].flags = buffer_leased_k;
         }
-        if (!(completion.flags & IORING_CQE_F_MORE)) {
-            operation.stage = completion.res != -ENOBUFS || operation.stage == operation_stage_t::cancelling_k ||
-                                      stage != engine_stage_t::running_k
-                                  ? operation_stage_t::completed_k
-                                  : operation_stage_t::waiting_k;
-
-            if (operation.resource->flags & resource_retiring_k) retire(*operation.resource);
+        if (completion.res != -ENOBUFS || operation.stage == operation_stage_t::cancelling_k ||
+            stage != engine_stage_t::running_k)
+            complete(operation);
+        else {
+            operation.stage = operation_stage_t::waiting_k;
+            push(waiting_operations, operation);
         }
+        if (operation.resource->flags & resource_retiring_k) retire(*operation.resource);
     }
     void reap() noexcept {
         unsigned head {}, count {};
@@ -792,48 +828,51 @@ struct linux_uring_engine {
     }
     int collect(span<io_completion_t> output) noexcept {
         std::size_t count {};
-        for (auto& operation : operations)
-            if (operation.request && (operation.stage == operation_stage_t::completed_k) && count != output.size()) {
-                auto result = (operation.flags & operation_expired_k) && operation.result == -ECANCELED
-                                  ? -ETIMEDOUT
-                                  : operation.result;
-                auto index = operation.buffer;
-                byte_t* data {};
-                std::uintptr_t lease {};
-                if (operation.flags & operation_backlog_k) {
-                    data = operation.resource->backlog.data() + operation.resource->backlog_offset;
-                    lease = static_cast<std::uintptr_t>(registered_socket_t {operation.resource->index}.handle());
-                }
-                else if (index != absent_k) {
-                    data = receive_data(index);
-                    lease = static_cast<std::uintptr_t>(index) + 1;
-                }
-                output[count++] = {operation.request, result, data,
-                                   data && result >= 0 ? static_cast<std::size_t>(result) : 0, lease};
-                operation.request = nullptr;
+        while (count != output.size()) {
+            auto* operation = pop(completed_operations);
+            if (!operation) break;
+            auto result = (operation->flags & operation_expired_k) && operation->result == -ECANCELED
+                              ? -ETIMEDOUT
+                              : operation->result;
+            auto index = operation->buffer;
+            byte_t* data {};
+            std::uintptr_t lease {};
+            if (operation->flags & operation_backlog_k) {
+                data = operation->resource->backlog.data() + operation->resource->backlog_offset;
+                lease = static_cast<std::uintptr_t>(registered_socket_t {operation->resource->index}.handle());
             }
+            else if (index != absent_k) {
+                data = receive_data(index);
+                lease = static_cast<std::uintptr_t>(index) + 1;
+            }
+            output[count++] = {operation->request, result, data,
+                               data && result >= 0 ? static_cast<std::size_t>(result) : 0, lease};
+            vacate(*operation);
+        }
         return static_cast<int>(count);
     }
     void maintain() noexcept {
         if (fault) return;
-        auto now = monotonic_ns();
-        for (auto& operation : operations)
-            if (operation.request && operation.stage != operation_stage_t::completed_k && operation.request->deadline &&
-                operation.request->deadline <= now && operation.request->operation != io_operation_t::close_k) {
+        if (timed_operations.head != absent_k) {
+            auto now = monotonic_ns();
+            for (auto index = timed_operations.head; index != absent_k;) {
+                auto& operation = operations[index];
+                index = operation.next;
+                if (operation.request->deadline > now) continue;
                 operation.flags = static_cast<operation_flags_t>(operation.flags | operation_expired_k);
                 (void)cancel(*operation.request);
             }
-        for (auto& operation : operations)
-            if (operation.request && operation.stage == operation_stage_t::waiting_k &&
-                operation.request->operation != io_operation_t::close_k &&
-                (operation.request->operation == io_operation_t::accept_k ||
-                 operation.request->operation == io_operation_t::send_k || !advanced_k))
-                if (!start_operation(operation)) fault = -EIO;
-        if constexpr (advanced_k)
-            for (auto& owner : resources)
-                if (owner.stage != resource_stage_t::vacant_k && !(owner.flags & resource_retiring_k)) {
-                    if (owner.receive_request && !owner.receive_in_flight() && !start_receive(owner)) fault = -EIO;
-                }
+        }
+        for (auto retry = std::exchange(waiting_operations, {}); auto* operation = pop(retry);)
+            if (!start_operation(*operation)) fault = -EIO;
+        for (auto index = std::exchange(rearming_resources, absent_k); index != absent_k;) {
+            auto& owner = resources[index];
+            index = owner.next;
+            owner.flags = static_cast<resource_flags_t>(owner.flags & ~resource_rearming_k);
+            if (!owner.receive_request || owner.receive_in_flight()) continue;
+            if (!start_receive(owner)) fault = -EIO;
+            else if (!available_buffers) rearm(owner);
+        }
     }
     int poll(span<io_completion_t> output, io_wait_t policy, std::uint64_t deadline = 0) noexcept {
         if (!is_open()) return -EBADF;
@@ -845,11 +884,10 @@ struct linux_uring_engine {
             if (count) return count;
             auto now = monotonic_ns();
             auto wait_deadline = deadline;
-            for (auto const& operation : operations)
-                if (operation.request && operation.stage != operation_stage_t::completed_k &&
-                    operation.stage != operation_stage_t::cancelling_k && operation.request->deadline)
-                    wait_deadline = !wait_deadline ? operation.request->deadline
-                                                   : std::min(wait_deadline, operation.request->deadline);
+            for (auto index = timed_operations.head; index != absent_k; index = operations[index].next) {
+                auto expiry = operations[index].request->deadline;
+                wait_deadline = !wait_deadline ? expiry : std::min(wait_deadline, expiry);
+            }
             unsigned wait = policy == io_wait_t::blocking_k && (!wait_deadline || now < wait_deadline) ? 1 : 0;
             int result = enter(wait, wait_deadline);
             if (result < 0) return result;
@@ -875,34 +913,14 @@ struct linux_uring_engine {
         registrations = static_cast<registration_flags_t>(registrations & ~registration_files_k);
         return true;
     }
-    bool unregister_transmit() noexcept {
-        if (!(registrations & registration_tx_k)) return true;
-        int result = retry_interrupted([&] { return io_uring_unregister_buffers(&ring); });
-        if (result && result != -ENXIO) {
-            fault = result;
-            return false;
-        }
-        registrations = static_cast<registration_flags_t>(registrations & ~registration_tx_k);
-        return true;
-    }
     void discard(std::uint64_t user_data) noexcept {
         auto kind = static_cast<std::uintptr_t>(user_data) & 7;
         auto* pointer = reinterpret_cast<void*>(static_cast<std::uintptr_t>(user_data) & ~std::uintptr_t {7});
         if (kind == operation_tag_k) {
             auto& operation = *static_cast<operation_t*>(pointer);
-            operation.stage = operation_stage_t::completed_k;
             operation.result = -ECANCELED;
-            if (operation.accepted != absent_k) resources[operation.accepted].stage = resource_stage_t::vacant_k;
-        }
-        else if (kind == transmit_tag_k) {
-            auto& transmission = *static_cast<transmit_t*>(pointer);
-            auto& operation = *transmission.operation;
-            operation.stage = operation_stage_t::completed_k;
-            operation.result = -ECANCELED;
-            operation.transmit = nullptr;
-
-            transmission.resource = nullptr;
-            transmission.operation = nullptr;
+            complete(operation);
+            if (operation.accepted != absent_k) vacate(resources[operation.accepted]);
         }
         else if (kind == control_tag_k) control.result = -ECANCELED;
         else if (kind == receive_tag_k) {
@@ -915,7 +933,7 @@ struct linux_uring_engine {
         }
     }
     void discard_unsubmitted() noexcept {
-        if constexpr (advanced_k) {
+        if constexpr (backend_ == ucall_io_backend_linux_uring700_k) {
             for (unsigned i = 0; i != pending_sqes; ++i) discard(ring.sq.sqes[i].user_data);
             pending_sqes = 0;
         }
@@ -940,7 +958,7 @@ struct linux_uring_engine {
             }
             reap();
         }
-        return unregister_transmit();
+        return true;
     }
     bool cancel_synchronously() noexcept {
         io_uring_sync_cancel_reg cancellation {};
@@ -971,15 +989,8 @@ struct linux_uring_engine {
                 reap();
             }
         }
-        bool retired = true;
-        if (fault) {
-            // Failed submission must not bypass terminal CQEs or fixed-buffer TX notifications.
-            retired = drain_after_fault();
-        }
-        else {
-            retired = unregister_files();
-            retired = unregister_transmit() && retired;
-        }
+        // Failed submission must not bypass terminal CQEs that still reference caller memory.
+        bool retired = fault ? drain_after_fault() : unregister_files();
         if (receive_ring && retired) {
             int result = retry_interrupted(
                 [&] { return io_uring_free_buf_ring(&ring, receive_ring, buffer_count, 0); });

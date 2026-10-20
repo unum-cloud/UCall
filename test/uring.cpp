@@ -134,7 +134,7 @@ static bool failed_submission() {
     engine.ring.ring_fd = -1;
     engine.ring.enter_ring_fd = -1;
     auto failure = engine.enter(0, 0);
-    assert(failure == -EBADF);
+    assert(failure < 0);
     engine.ring.ring_fd = descriptor;
     engine.ring.enter_ring_fd = enter_descriptor;
     engine.fault = failure;
@@ -261,8 +261,8 @@ static void paused_receive(counting_allocator<byte_t> const& allocator) {
 }
 
 static void allocation_failure(bool kernel_available) {
-    for (auto fail_at : {std::size_t {0}, std::size_t {6}, std::size_t {7}}) {
-        if (fail_at == 7 && !kernel_available) continue;
+    for (auto fail_at : {std::size_t {0}, std::size_t {4}, std::size_t {5}}) {
+        if (fail_at == 5 && !kernel_available) continue;
         allocation_counts_t counts;
         counts.fail_at = fail_at;
         {

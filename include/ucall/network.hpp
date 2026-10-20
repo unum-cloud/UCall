@@ -1177,9 +1177,7 @@ struct network_variant : http<cpu_traits<cpu_class_>::stringzilla_capabilities_k
         else {
             auto& connection = *static_cast<connection_t*>(completion.request->context);
             bool connected = connection.stage == connection_stage_t::connecting_k && completion.result >= 0;
-            auto* next = connection.advance(&completion);
-            if (connection.descriptor >= 0 && (!next || next->operation != io_operation_t::receive_k))
-                engine.receive_pause(connection.descriptor);
+            connection.advance(&completion);
             if (connected && connection.peer && connection.peer->job)
                 connection.deadline = connection.peer->job->deadline;
         }
