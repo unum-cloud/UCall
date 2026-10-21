@@ -1,5 +1,5 @@
 cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
-file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" UCALL_VERSION_NAME LIMIT_COUNT 1)
+file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ucall_version_name_ LIMIT_COUNT 1)
 project(
     ucall
     VERSION 1.0.0
@@ -19,34 +19,39 @@ set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED YES)
 set(CMAKE_CXX_EXTENSIONS NO)
 
-set(UCALL_DEFAULT_POSIX OFF)
-set(UCALL_DEFAULT_LINUX OFF)
-set(UCALL_DEFAULT_KQUEUE OFF)
-set(UCALL_DEFAULT_IOCP OFF)
+set(ucall_default_posix_ OFF)
+set(ucall_default_linux_ OFF)
+set(ucall_default_kqueue_ OFF)
+set(ucall_default_iocp_ OFF)
 if (UCALL_IS_MAIN_PROJECT)
     if (UNIX)
-        set(UCALL_DEFAULT_POSIX ON)
+        set(ucall_default_posix_ ON)
     endif ()
     if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        set(UCALL_DEFAULT_LINUX ON)
+        set(ucall_default_linux_ ON)
     elseif (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-        set(UCALL_DEFAULT_KQUEUE ON)
+        set(ucall_default_kqueue_ ON)
     elseif (WIN32)
-        set(UCALL_DEFAULT_IOCP ON)
+        set(ucall_default_iocp_ ON)
     endif ()
 endif ()
 
-option(UCALL_WITH_POSIX "Include the portable POSIX backend" ${UCALL_DEFAULT_POSIX})
-option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 7.0 backends" ${UCALL_DEFAULT_LINUX})
-option(UCALL_WITH_LINUX_EPOLL "Include the Linux epoll backend" ${UCALL_DEFAULT_LINUX})
-option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${UCALL_DEFAULT_KQUEUE})
-option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${UCALL_DEFAULT_IOCP})
+option(UCALL_WITH_POSIX "Include the portable POSIX backend" ${ucall_default_posix_})
+option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 7.0 backends" ${ucall_default_linux_})
+option(UCALL_WITH_LINUX_EPOLL "Include the Linux epoll backend" ${ucall_default_linux_})
+option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${ucall_default_kqueue_})
+option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${ucall_default_iocp_})
 option(UCALL_BUILD_PYTHON_POSIX "Build the POSIX Python SDK" OFF)
 option(UCALL_BUILD_PYTHON_URING "Build the io_uring Python SDK" OFF)
-option(UCALL_BUILD_EXAMPLES "Build the echo, ledger, and key-value examples" OFF)
-option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
-option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" ${UCALL_IS_MAIN_PROJECT})
+# `UCALL_BUILD_ALL` only seeds the defaults below, so an explicit choice for any one of them stands
 option(UCALL_BUILD_ALL "Build every target supported on this platform" OFF)
+set(ucall_default_test_ ${UCALL_IS_MAIN_PROJECT})
+if (UCALL_BUILD_ALL)
+    set(ucall_default_test_ ON)
+endif ()
+option(UCALL_BUILD_EXAMPLES "Build the echo, ledger, and key-value examples" ${UCALL_BUILD_ALL})
+option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" ${UCALL_BUILD_ALL})
+option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" ${ucall_default_test_})
 set(UCALL_BUILD_SANITIZERS
     "off"
     CACHE STRING "Sanitizers for UCall's own targets: off, address (with undefined) or thread"
@@ -60,11 +65,6 @@ if (UCALL_BUILD_SANITIZERS STREQUAL "thread")
     set(FORKUNION_TARGET_RISC5_ATOMIC OFF)
 endif ()
 
-if (UCALL_BUILD_ALL)
-    set(UCALL_BUILD_EXAMPLES ON)
-    set(UCALL_BUILD_BENCH ON)
-    set(UCALL_BUILD_TEST ON)
-endif ()
 if (UCALL_BUILD_PYTHON_POSIX OR UCALL_BUILD_PYTHON_URING)
     message(FATAL_ERROR "The Python SDK is awaiting migration to the current C ABI; build the native libraries instead")
 endif ()
@@ -114,11 +114,6 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fmax-errors=1")
 endif ()
 
-# Check if we are running on Linux
-if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    set(LINUX TRUE)
-endif ()
-
 if (UCALL_IS_MAIN_PROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND git config core.hooksPath .githooks
@@ -133,22 +128,22 @@ find_package(Threads REQUIRED)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-function (ucall_sibling name source_override target url revision)
-    if (TARGET ${target})
+function (ucall_sibling name_ source_override_ target_ url_ revision_)
+    if (TARGET ${target_})
         return()
     endif ()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name}/CMakeLists.txt" AND NOT DEFINED
-                                                                        FETCHCONTENT_SOURCE_DIR_${source_override}
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED
+                                                                         FETCHCONTENT_SOURCE_DIR_${source_override_}
     )
-        add_subdirectory(${name} EXCLUDE_FROM_ALL)
+        add_subdirectory(${name_} EXCLUDE_FROM_ALL)
     else ()
         FetchContent_Declare(
-            ${name}
-            GIT_REPOSITORY ${url}
-            GIT_TAG ${revision}
+            ${name_}
+            GIT_REPOSITORY ${url_}
+            GIT_TAG ${revision_}
             EXCLUDE_FROM_ALL
         )
-        FetchContent_MakeAvailable(${name})
+        FetchContent_MakeAvailable(${name_})
     endif ()
 endfunction ()
 
@@ -174,26 +169,26 @@ if (UCALL_WITH_LINUX_URING)
     if (TARGET PkgConfig::UCALL_URING)
         add_library(uring_internal ALIAS PkgConfig::UCALL_URING)
     else ()
-        set(URING_DIR ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
+        set(ucall_uring_dir_ ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
         ExternalProject_Add(
             liburing-ep
             GIT_REPOSITORY https://github.com/axboe/liburing.git
             GIT_TAG liburing-2.15
             GIT_SHALLOW 1
             PREFIX ${CMAKE_BINARY_DIR}/_deps/
-            SOURCE_DIR ${URING_DIR}
+            SOURCE_DIR ${ucall_uring_dir_}
             CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
             BUILD_COMMAND make -C <SOURCE_DIR>/src -s
-            BUILD_BYPRODUCTS ${URING_DIR}/src/liburing.a
+            BUILD_BYPRODUCTS ${ucall_uring_dir_}/src/liburing.a
             BUILD_IN_SOURCE 1
             INSTALL_COMMAND ""
             UPDATE_COMMAND ""
         )
         add_library(uring_internal STATIC IMPORTED GLOBAL)
         add_dependencies(uring_internal liburing-ep)
-        set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION ${URING_DIR}/src/liburing.a)
-        file(MAKE_DIRECTORY ${URING_DIR}/src/include)
-        set_property(TARGET uring_internal PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${URING_DIR}/src/include)
+        set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION ${ucall_uring_dir_}/src/liburing.a)
+        file(MAKE_DIRECTORY ${ucall_uring_dir_}/src/include)
+        set_property(TARGET uring_internal PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${ucall_uring_dir_}/src/include)
     endif ()
 endif ()
 
@@ -211,22 +206,22 @@ endif ()
 add_library(ucall_sanitizers INTERFACE)
 if (UCALL_BUILD_SANITIZERS STREQUAL "address")
     if (MSVC)
-        set(ucall_sanitizer_flags /fsanitize=address)
+        set(ucall_sanitizer_flags_ /fsanitize=address)
     else ()
-        set(ucall_sanitizer_flags -fsanitize=address,undefined -fno-omit-frame-pointer)
+        set(ucall_sanitizer_flags_ -fsanitize=address,undefined -fno-omit-frame-pointer)
     endif ()
 elseif (UCALL_BUILD_SANITIZERS STREQUAL "thread")
     if (MSVC)
         message(FATAL_ERROR "MSVC has no ThreadSanitizer, so UCALL_BUILD_SANITIZERS=thread needs Clang or GCC")
     endif ()
-    set(ucall_sanitizer_flags -fsanitize=thread)
+    set(ucall_sanitizer_flags_ -fsanitize=thread)
 elseif (NOT UCALL_BUILD_SANITIZERS STREQUAL "off")
     message(FATAL_ERROR "UCALL_BUILD_SANITIZERS is off, address or thread, not '${UCALL_BUILD_SANITIZERS}'")
 endif ()
-if (ucall_sanitizer_flags)
-    target_compile_options(ucall_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_sanitizer_flags}>")
+if (ucall_sanitizer_flags_)
+    target_compile_options(ucall_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
     if (NOT MSVC)
-        target_link_options(ucall_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ucall_sanitizer_flags}>")
+        target_link_options(ucall_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
     endif ()
 endif ()
 
@@ -244,7 +239,7 @@ target_include_directories(
 target_compile_features(ucall PUBLIC cxx_std_20)
 target_compile_definitions(
     ucall
-    PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${UCALL_VERSION_NAME}"
+    PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${ucall_version_name_}"
     PUBLIC UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}> UCALL_WITH_LINUX_EPOLL=$<BOOL:${UCALL_WITH_LINUX_EPOLL}>
            UCALL_WITH_LINUX_URING=$<BOOL:${UCALL_WITH_LINUX_URING}> UCALL_WITH_KQUEUE=$<BOOL:${UCALL_WITH_KQUEUE}>
            UCALL_WITH_IOCP=$<BOOL:${UCALL_WITH_IOCP}>
@@ -254,9 +249,9 @@ target_link_libraries(
     PUBLIC forkunion::header smashtable::header stringzilla::header
     PRIVATE Threads::Threads ucall_sanitizers
 )
-foreach (capabilities forkunion::cpu_capabilities_compiled stringzilla::cpu_capabilities_compiled)
-    if (TARGET ${capabilities})
-        target_link_libraries(ucall PUBLIC ${capabilities})
+foreach (capabilities_ forkunion::cpu_capabilities_compiled stringzilla::cpu_capabilities_compiled)
+    if (TARGET ${capabilities_})
+        target_link_libraries(ucall PUBLIC ${capabilities_})
     endif ()
 endforeach ()
 if (NOT MSVC)
@@ -273,34 +268,34 @@ if (UCALL_WITH_LINUX_URING)
     endif ()
 endif ()
 
-function (ucall_cpu_variant source target_macro)
-    cmake_parse_arguments(PARSE_ARGV 2 argument "" "FLAGS;MSVC_FLAGS" "REQUIRES")
-    set(enabled TRUE)
-    foreach (requirement IN LISTS argument_REQUIRES)
-        if (NOT ${requirement})
-            set(enabled FALSE)
+function (ucall_cpu_variant class_ target_macro_)
+    cmake_parse_arguments(PARSE_ARGV 2 arg "" "FLAGS;MSVC_FLAGS" "REQUIRES")
+    set(enabled_ TRUE)
+    foreach (requirement_ IN LISTS arg_REQUIRES)
+        if (NOT ${requirement_})
+            set(enabled_ FALSE)
         endif ()
     endforeach ()
     if (MSVC)
-        set(flags "${argument_MSVC_FLAGS}")
+        set(flags_ "${arg_MSVC_FLAGS}")
     else ()
-        set(flags "${argument_FLAGS}")
+        set(flags_ "${arg_FLAGS}")
     endif ()
-    if (enabled)
-        check_cxx_compiler_flag("${flags}" ${target_macro})
+    if (enabled_)
+        check_cxx_compiler_flag("${flags_}" ucall_class_${class_}_compiles_)
+    endif ()
+    if (enabled_ AND ucall_class_${class_}_compiles_)
+        target_compile_definitions(ucall PUBLIC UCALL_TARGET_${target_macro_}=1)
+        target_sources(ucall PRIVATE src/variants_${class_}.cpp)
+        set_source_files_properties(src/variants_${class_}.cpp PROPERTIES COMPILE_FLAGS "${flags_}")
     else ()
-        set(${target_macro} FALSE)
-    endif ()
-    target_compile_definitions(ucall PUBLIC ${target_macro}=$<BOOL:${${target_macro}}>)
-    if (${target_macro})
-        target_sources(ucall PRIVATE ${source})
-        set_source_files_properties(${source} PROPERTIES COMPILE_FLAGS "${flags}")
+        target_compile_definitions(ucall PUBLIC UCALL_TARGET_${target_macro_}=0)
     endif ()
 endfunction ()
 
 ucall_cpu_variant(
-    src/variants_intel_haswell.cpp
-    UCALL_TARGET_INTEL_HASWELL
+    intel_haswell
+    INTEL_HASWELL
     REQUIRES
     sz_target_haswell_compiles
     sz_target_westmere_compiles
@@ -310,8 +305,8 @@ ucall_cpu_variant(
     "/arch:AVX2"
 )
 ucall_cpu_variant(
-    src/variants_intel_skylake.cpp
-    UCALL_TARGET_INTEL_SKYLAKE
+    intel_skylake
+    INTEL_SKYLAKE
     REQUIRES
     sz_target_skylake_compiles
     sz_target_westmere_compiles
@@ -321,8 +316,8 @@ ucall_cpu_variant(
     "/arch:AVX512"
 )
 ucall_cpu_variant(
-    src/variants_intel_icelake.cpp
-    UCALL_TARGET_INTEL_ICELAKE
+    intel_icelake
+    INTEL_ICELAKE
     REQUIRES
     sz_target_icelake_compiles
     sz_target_goldmont_compiles
@@ -332,8 +327,8 @@ ucall_cpu_variant(
     "/arch:AVX512"
 )
 ucall_cpu_variant(
-    src/variants_intel_alder.cpp
-    UCALL_TARGET_INTEL_ALDER
+    intel_alder
+    INTEL_ALDER
     REQUIRES
     sz_target_haswell_compiles
     sz_target_westmere_compiles
@@ -344,8 +339,8 @@ ucall_cpu_variant(
     "/arch:AVX2"
 )
 ucall_cpu_variant(
-    src/variants_intel_sierra.cpp
-    UCALL_TARGET_INTEL_SIERRA
+    intel_sierra
+    INTEL_SIERRA
     REQUIRES
     sz_target_haswell_compiles
     sz_target_westmere_compiles
@@ -357,8 +352,8 @@ ucall_cpu_variant(
     "/arch:AVX2"
 )
 ucall_cpu_variant(
-    src/variants_aws_g2.cpp
-    UCALL_TARGET_AWS_G2
+    aws_g2
+    AWS_G2
     REQUIRES
     sz_target_neon_compiles
     sz_target_neonaes_compiles
@@ -368,8 +363,8 @@ ucall_cpu_variant(
     "-march=armv8-a+simd+crypto+aes+sha2+lse"
 )
 ucall_cpu_variant(
-    src/variants_apple_m2.cpp
-    UCALL_TARGET_APPLE_M2
+    apple_m2
+    APPLE_M2
     REQUIRES
     sz_target_neon_compiles
     sz_target_neonaes_compiles
@@ -380,8 +375,8 @@ ucall_cpu_variant(
     "-march=armv8-a+simd+crypto+aes+sha2+lse+rcpc"
 )
 ucall_cpu_variant(
-    src/variants_aws_g5.cpp
-    UCALL_TARGET_AWS_G5
+    aws_g5
+    AWS_G5
     REQUIRES
     sz_target_sve_compiles
     sz_target_sve2_compiles
@@ -394,9 +389,9 @@ ucall_cpu_variant(
 )
 
 if (UCALL_BUILD_EXAMPLES)
-    foreach (example echo ledger redis)
-        add_executable(ucall_example_${example} examples/${example}/server.cpp)
-        target_link_libraries(ucall_example_${example} PRIVATE ucall::ucall forkunion::static)
+    foreach (example_ echo ledger redis)
+        add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
+        target_link_libraries(ucall_example_${example_} PRIVATE ucall::ucall forkunion::static)
     endforeach ()
 endif ()
 if (UCALL_BUILD_BENCH)
