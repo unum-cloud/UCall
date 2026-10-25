@@ -1,0 +1,28 @@
+[package]
+authors = ["Ash Vardanian <info@unum.cloud>"]
+description = "HTTP and Noise clients and servers with capability-specialized I/O backends"
+keywords = ["http", "rpc", "server", "io-uring", "noise"]
+edition = "2021"
+include = [
+  "/rust/**",
+  "/include/**",
+  "/src/**",
+  "/c/**",
+  "/CMakeLists.txt",
+  "/VERSION",
+  "/build.rs",
+]
+license = "Apache-2.0"
+links = "ucall"
+name = "ucall"
+publish = true
+repository = "https://github.com/unum-cloud/UCall"
+version = "1.0.0-rc.1"
+
+[lib]
+name = "ucall"
+path = "rust/lib.rs"
+
+[build-dependencies]
+# The library is CMake's to build, so `build.rs` drives it rather than restating its per-class flags.
+cmake = "0.1"

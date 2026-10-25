@@ -299,6 +299,51 @@ typedef struct ucall_server_take_batches_t {
  *  @c ucall_server_stop(). Requests still queued then are released without a callback. */
 UCALL_EXPORT void ucall_server_take_batches(ucall_server_take_batches_t* arguments);
 
+/** Counters of one batch endpoint since registration; they say how large its batches were and
+ *  why each fired.
+ *
+ *  Only the endpoint's draining owner advances them. Batches released by a stop fire no callback
+ *  and count nowhere. */
+typedef struct ucall_batch_endpoint_statistics_t {
+
+    /** Callbacks invoked. */
+    uint64_t batches;
+
+    /** Requests delivered across those callbacks. */
+    uint64_t requests;
+
+    /** Batches that fired on reaching @c max_batch_size. */
+    uint64_t filled_batches;
+
+    /** Batches that fired on reaching @c min_batch_size below the maximum. */
+    uint64_t ready_batches;
+
+    /** Batches that fired below @c min_batch_size once @c max_latency_microseconds passed. */
+    uint64_t expired_batches;
+
+} ucall_batch_endpoint_statistics_t;
+
+/** Arguments of @c ucall_server_batch_endpoint_statistics(). */
+typedef struct ucall_server_batch_endpoint_statistics_t {
+
+    /** Initialized server that registered @c endpoint. */
+    ucall_server_t server;
+
+    /** Receives @c ucall_status_invalid_argument_k for a NULL endpoint or statistics output. */
+    ucall_outcome_t* outcome;
+
+    /** Endpoint from @c ucall_server_add_http_batch_endpoint(). */
+    ucall_http_batch_endpoint_t endpoint;
+
+    /** Output for a snapshot of the endpoint's counters, zeroed on failure. */
+    ucall_batch_endpoint_statistics_t* statistics;
+
+} ucall_server_batch_endpoint_statistics_t;
+
+/** Copies one batch endpoint's counters, from any thread whose CPU runs the server's CPU class.
+ *  Each counter is read on its own, so a snapshot of a draining endpoint is not one instant. */
+UCALL_EXPORT void ucall_server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments);
+
 /**
  *  @brief Callback type for handling incoming requests on the server side.
  *  @param[in] request Retained until a reply consumes it or the server is freed.
@@ -460,6 +505,34 @@ UCALL_EXPORT void ucall_server_add_websocket_endpoint(ucall_server_add_websocket
  *      concurrently.
  */
 UCALL_EXPORT ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_http_request_t request);
+
+/** Arguments of @c ucall_server_request_path(). */
+typedef struct ucall_server_request_path_t {
+
+    /** The server this call operates on. */
+    ucall_server_t server;
+
+    /** Output for the outcome. */
+    ucall_outcome_t* outcome;
+
+    /** The received request inside the @c ucall_received_http_request_callback_t. */
+    ucall_received_http_request_t request;
+
+    /** Output for a borrowed view of the path. */
+    ucall_bytes_view_t* path;
+
+} ucall_server_request_path_t;
+
+/**
+ *  @brief Extracts the path of the received request: its target without the query.
+ *
+ *  The path stays as the peer sent it, percent-encoded and with repeated slashes, which the
+ *  segment and parameter accessors skip.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
+ *      concurrently.
+ */
+UCALL_EXPORT void ucall_server_request_path(ucall_server_request_path_t* arguments);
 
 /**
  *  @brief Returns the number of path components of the received request.

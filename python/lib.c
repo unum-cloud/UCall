@@ -1,589 +1,369 @@
 /**
  *  @file python/lib.c
  *  @author Ash Vardanian
- *  @date 2023-01-30
- *  @brief Pure CPython bindings for UCall.
- *
- *  @copyright Copyright (c) 2023
- *
- *  @see Reading Materials
- *      https://pythoncapi.readthedocs.io/type_object.html
- *      https://numpy.org/doc/stable/reference/c-api/types-and-structures.html
- *      https://pythonextensionpatterns.readthedocs.io/en/latest/refcount.html
- *      https://docs.python.org/3/extending/newtypes_tutorial.html#adding-data-and-methods-to-the-basic-example
+ *  @date January 30, 2023
+ *  @brief The module glue of `ucall.lib`: argument parsing, enum mirrors, errors and `PyInit_lib`.
  */
-#include <time.h>
+#include "lib.h"
 
-#define PY_SSIZE_T_CLEAN
-#include <Python.h>
+#pragma region Arguments
 
-#include <turbob64.h>
-
-#include "ucall/ucall.h"
-
-#define stringify_value_m(a) stringify_m(a)
-#define stringify_m(a)       #a
-#define concat_m(A, B)       A##B
-#define macro_concat_m(A, B) concat_m(A, B)
-#define pyinit_f_m           macro_concat_m(PyInit_, UCALL_PYTHON_MODULE_NAME)
-
-#define get_attr_safe_m(name, obj, attr)                                        \
-    PyObject* name = PyObject_GetAttrString(obj, attr);                         \
-    if (!name) {                                                                \
-        PyErr_SetString(PyExc_TypeError, "Failed to extract attribute: " attr); \
-        return -1;                                                              \
+/** Binds keyword @p name to its slot at or after @p first, refusing unknown and repeated names. */
+static int bind_keyword(char const* verb, PyObject* name, PyObject* value, Py_ssize_t first,
+                        ucall_py_argument_t const* arguments, size_t count) {
+    size_t position = (size_t)first;
+    while (position != count && PyUnicode_CompareWithASCIIString(name, arguments[position].name) != 0) ++position;
+    if (position == count) {
+        PyErr_Format(PyExc_TypeError, "%s() got an unexpected keyword argument %R", verb, name);
+        return -1;
     }
-
-typedef enum {
-    POSITIONAL_ONLY,       //
-    POSITIONAL_OR_KEYWORD, //
-    VAR_POSITIONAL,        //
-    KEYWORD_ONLY,          //
-    VAR_KEYWORD            //
-} py_param_kind_t;
-
-typedef struct {
-    char const* name;     // Name or NULL
-    Py_ssize_t name_len;  // Name Length
-    PyObject* value;      // Any or NULL
-    PyTypeObject* type;   // Type or NULL
-    py_param_kind_t kind; // Kind
-} py_param_t;
-
-typedef struct {
-    py_param_t* u_params;
-    size_t params_cnt;
-    PyObject* callable;
-} py_wrapper_t;
-
-typedef struct {
-    PyObject_HEAD ucall_config_t config;
-    ucall_server_t server;
-    size_t count_threads;
-    py_wrapper_t* wrappers;
-    size_t wrapper_capacity;
-    size_t count_added;
-    bool quiet;
-} py_server_t;
-
-typedef struct {
-    py_server_t* server;
-    PyObject* args;
-    PyObject* fn;
-    ucall_verb_t request_type;
-} py_decorator_self_t;
-
-static int prepare_wrapper(PyObject* callable, py_wrapper_t* wrap) {
-
-    if (PyObject_HasAttrString(callable, "__signature__")) {
-        get_attr_safe_m(py_signature, callable, "__signature__");
-        get_attr_safe_m(params, py_signature, "parameters");
-        PyObject* items = PyMapping_Items(params);
-        long total_params = PyList_Size(items);
-        py_param_t* parameters = (py_param_t*)malloc(total_params * sizeof(py_param_t));
-
-        for (Py_ssize_t i = 0; i < total_params; i++) {
-            PyObject* item = PyList_GetItem(items, i);
-            PyObject* py_param = PyTuple_GetItem(item, 1);
-            PyObject* name = PyTuple_GetItem(item, 0);
-            PyObject* type = PyObject_GetAttrString(py_param, "annotation");
-            PyObject* kind = PyObject_GetAttrString(py_param, "_kind");
-            PyObject* def = PyObject_GetAttrString(py_param, "default");
-
-            py_param_t param;
-            param.name = PyUnicode_AsUTF8AndSize(name, &param.name_len);
-            param.value = def;
-            param.type = (PyTypeObject*)type;
-            param.kind = PyLong_AsLong(kind);
-            parameters[i] = param;
-        }
-
-        Py_INCREF(callable); // Cause this is a partial wrapper around the original function.
-        wrap->u_params = parameters;
-        wrap->params_cnt = total_params;
-        return 0;
+    if (*arguments[position].value) {
+        PyErr_Format(PyExc_TypeError, "%s() got multiple values for argument '%s'", verb, arguments[position].name);
+        return -1;
     }
-
-    get_attr_safe_m(func_code, callable, "__code__");
-    get_attr_safe_m(arg_names, func_code, "co_varnames");
-    get_attr_safe_m(co_flags, func_code, "co_flags");
-    get_attr_safe_m(co_argcount, func_code, "co_argcount");
-    get_attr_safe_m(co_posonlyargcount, func_code, "co_posonlyargcount");
-    get_attr_safe_m(co_kwonlyargcount, func_code, "co_kwonlyargcount");
-
-    long flags = PyLong_AsLong(co_flags);
-    long pos_count = PyLong_AsLong(co_argcount);
-    long posonly_count = PyLong_AsLong(co_posonlyargcount);
-    long keyword_only_count = PyLong_AsLong(co_kwonlyargcount);
-    long pos_default_count = 0;
-
-    PyObject* annotations = PyFunction_GetAnnotations(callable); // Dict
-
-    get_attr_safe_m(defaults, callable, "__defaults__");
-    get_attr_safe_m(kwdefaults, callable, "__kwdefaults__");
-
-    if (PyTuple_CheckExact(defaults)) pos_default_count = PyTuple_Size(defaults);
-
-    if (PyMethod_Check(callable)) {
-        // When this is a class method...
-        // TODO: What?
-    }
-
-    long non_default_count = abs(pos_count - pos_default_count);
-    long posonly_left = posonly_count;
-
-    // if (posonly_count != pos_count) {
-    //     PyErr_SetString(PyExc_TypeError, "Strictly positional or Keyword arguments are allowed.");
-    //     return -1;
-    // }
-    bool const has_vararg = flags & CO_VARARGS;
-    bool const has_varkeyarg = flags & CO_VARKEYWORDS;
-    long total_params = pos_count + has_vararg + keyword_only_count + has_varkeyarg;
-    py_param_t* parameters = (py_param_t*)malloc(total_params * sizeof(py_param_t));
-
-    size_t param_i = 0;
-
-    // Non-keyword-only parameters w/o defaults.
-    for (Py_ssize_t i = 0; i < non_default_count; ++i) {
-        py_param_t param;
-        param.name = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, i), &param.name_len);
-        param.value = NULL;
-        param.type = (PyTypeObject*)PyDict_GetItemString(annotations, param.name);
-        param.kind = posonly_left-- > 0 ? POSITIONAL_ONLY : POSITIONAL_OR_KEYWORD;
-        parameters[param_i++] = param;
-    }
-
-    //... w / defaults.
-    for (Py_ssize_t i = non_default_count; i < pos_count; ++i) {
-        py_param_t param;
-        param.name = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, i), &param.name_len);
-        param.value = PyTuple_GetItem(defaults, i - non_default_count);
-        param.type = (PyTypeObject*)PyDict_GetItemString(annotations, param.name);
-        param.kind = posonly_left-- > 0 ? POSITIONAL_ONLY : POSITIONAL_OR_KEYWORD;
-        parameters[param_i++] = param;
-    }
-
-    if (has_vararg) {
-        py_param_t param;
-        param.name = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, pos_count + keyword_only_count),
-                                             &param.name_len);
-        param.value = NULL;
-        param.type = (PyTypeObject*)PyDict_GetItemString(annotations, param.name);
-        param.kind = VAR_POSITIONAL;
-        parameters[param_i++] = param;
-    }
-
-    // Keyword - only parameters.
-    for (Py_ssize_t i = pos_count; i < pos_count + keyword_only_count; ++i) {
-        py_param_t param;
-        param.name = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, i), &param.name_len);
-        param.value = PyDict_GetItemString(kwdefaults, param.name);
-        param.type = (PyTypeObject*)PyDict_GetItemString(annotations, param.name);
-        param.kind = KEYWORD_ONLY;
-        parameters[param_i++] = param;
-    }
-
-    if (has_varkeyarg) {
-        py_param_t param;
-        param.name = PyUnicode_AsUTF8AndSize(PyTuple_GetItem(arg_names, pos_count + keyword_only_count + has_vararg),
-                                             &param.name_len);
-        param.value = NULL;
-        param.type = (PyTypeObject*)PyDict_GetItemString(annotations, param.name);
-        param.kind = VAR_KEYWORD;
-        parameters[param_i++] = param;
-    }
-
-    wrap->u_params = parameters;
-    wrap->params_cnt = total_params;
+    *arguments[position].value = value;
     return 0;
 }
 
-static void wrapper(ucall_message_t call, ucall_endpoint_tag_t endpoint_tag) {
-    py_wrapper_t* wrap = (py_wrapper_t*)(endpoint_tag);
-    PyObject* args = PyTuple_New(wrap->params_cnt);
-
-    for (size_t i = 0; i < wrap->params_cnt; ++i) {
-        PyTypeObject* type = wrap->u_params[i].type;
-        py_param_kind_t kind = wrap->u_params[i].kind;
-        bool may_have_name = (kind & POSITIONAL_OR_KEYWORD) | (kind & KEYWORD_ONLY) | (kind & VAR_KEYWORD);
-        bool may_have_pos = (kind & POSITIONAL_OR_KEYWORD) | (kind & POSITIONAL_ONLY) | (kind & VAR_POSITIONAL);
-        bool got_named = false;
-        Py_ssize_t name_len = wrap->u_params[i].name_len;
-        ucall_string_t name = wrap->u_params[i].name;
-
-        if (PyType_IsSubtype(type, &PyBool_Type)) {
-            bool res;
-            if (may_have_name && name_len > 0) got_named = ucall_param_named_bool(call, name, name_len, &res);
-
-            if ((may_have_pos && !got_named) && //
-                !ucall_param_positional_bool(call, i, &res))
-                return ucall_reply_error_invalid_params(call);
-
-            PyTuple_SetItem(args, i, res ? Py_True : Py_False);
-        }
-        else if (PyType_IsSubtype(type, &PyLong_Type)) {
-            Py_ssize_t res;
-            if (may_have_name && name_len > 0) got_named = ucall_param_named_i64(call, name, name_len, &res);
-
-            if ((may_have_pos && !got_named) && //
-                !ucall_param_positional_i64(call, i, &res))
-                return ucall_reply_error_invalid_params(call);
-
-            PyTuple_SetItem(args, i, PyLong_FromSsize_t(res));
-        }
-        else if (PyType_IsSubtype(type, &PyFloat_Type)) {
-            double res;
-            if (may_have_name && name_len > 0) got_named = ucall_param_named_f64(call, name, name_len, &res);
-
-            if ((may_have_pos && !got_named) && //
-                !ucall_param_positional_f64(call, i, &res))
-                return ucall_reply_error_invalid_params(call);
-
-            PyTuple_SetItem(args, i, PyFloat_FromDouble(res));
-        }
-        else if (PyType_IsSubtype(type, &PyUnicode_Type)) {
-            ucall_string_t res;
-            size_t len;
-            if (may_have_name && name_len > 0) got_named = ucall_request_param(call, name, name_len, &res, &len);
-
-            if ((may_have_pos && !got_named) && //
-                !ucall_param_positional_str(call, i, &res, &len))
-                return ucall_reply_error_invalid_params(call);
-
-            PyTuple_SetItem(args, i, PyUnicode_FromStringAndSize(res, len));
-        }
-        else {
-            // For non native type, assume binary.
-            ucall_string_t res;
-            size_t len;
-            if (may_have_name && name_len > 0) got_named = ucall_request_param(call, name, name_len, &res, &len);
-
-            if ((may_have_pos && !got_named) && //
-                !ucall_param_positional_str(call, i, &res, &len))
-                return ucall_reply_error_invalid_params(call);
-
-            len = tb64dec((unsigned char const*)res, len, (unsigned char*)res);
-            PyTuple_SetItem(args, i, PyBytes_FromStringAndSize(res, len));
-        }
+/** Binds positional values, refusing more than @p positional_max of them. */
+static int bind_positional(char const* verb, PyObject* const* values, Py_ssize_t values_count,
+                           Py_ssize_t positional_max, ucall_py_argument_t const* arguments, size_t count) {
+    if (values_count > positional_max) {
+        PyErr_Format(PyExc_TypeError, "%s() takes at most %zd positional arguments, received %zd", verb, positional_max,
+                     values_count);
+        return -1;
     }
-
-    PyObject* response = PyObject_CallObject(wrap->callable, args);
-    if (response == NULL) {
-        PyObject *ptype, *pvalue, *ptraceback;
-        PyErr_Fetch(&ptype, &pvalue, &ptraceback);
-        if (ptype != NULL) {
-            PyObject* pvalue_str = PyObject_Str(pvalue);
-            size_t sz = 0;
-            ucall_string_t error_str = PyUnicode_AsUTF8AndSize(pvalue_str, &sz);
-            ucall_reply_error(call, 500, error_str, sz);
-            Py_DECREF(pvalue_str);
-        }
-        else ucall_reply_error_unknown(call);
-        Py_XDECREF(ptype);
-        Py_XDECREF(pvalue);
-        Py_XDECREF(ptraceback);
-        return;
-    }
-
-    size_t sz = calculate_size_as_str(response);
-    char* parsed_response = (char*)(malloc(sz * sizeof(char)));
-    if (!parsed_response) return ucall_reply_error_out_of_memory(call);
-    size_t len = 0;
-    int res = to_string(response, &parsed_response[0], &len);
-    ucall_reply_content(call, &parsed_response[0], len);
+    for (size_t position = 0; position != count; ++position) *arguments[position].value = NULL;
+    for (Py_ssize_t position = 0; position != values_count; ++position) *arguments[position].value = values[position];
+    return 0;
 }
 
-static PyObject* __add_procedure(py_decorator_self_t* decorated, PyObject* args) {
-    // Take a function object, introspect its arguments,
-    // register them inside of a higher-level function,
-    // which on every call requests them via `ucall_param_named_...`
-    // from the `ucall_message_t` context, then wraps them into native
-    // Python objects and passes to the original function.
-    // The result of that function call must then be returned via
-    // the `ucall_call_send_content` call.
-    py_server_t* server = decorated->server;
-    py_wrapper_t wrap;
-    if (!PyArg_ParseTuple(args, "O", &wrap.callable) || !PyCallable_Check(wrap.callable)) {
-        PyErr_SetString(PyExc_TypeError, "Need a callable object!");
-        return NULL;
-    }
-
-    char* path = NULL;
-    if (!PyArg_ParseTuple(decorated->args, "|s", &path)) {
-        PyErr_SetString(PyExc_TypeError, "Invalid Path!");
-        return NULL;
-    }
-
-    if (prepare_wrapper(wrap.callable, &wrap) != 0) return NULL;
-
-    if (server->count_added >= server->wrapper_capacity) {
-        server->wrapper_capacity *= 2;
-        server->wrappers = (py_wrapper_t*)realloc(server->wrappers, server->wrapper_capacity);
-    }
-
-    server->wrappers[server->count_added] = wrap;
-
-    if (path == NULL) path = PyUnicode_AsUTF8(PyObject_GetAttrString(wrap.callable, "__name__"));
-
-    ucall_add_endpoint(server->server, path, wrapper, decorated->request_type, &server->wrappers[server->count_added]);
-
-    ++server->count_added;
-    Py_INCREF(wrap.callable);
-    Py_DECREF(decorated->fn);
-    Py_DECREF(decorated->server);
-    Py_DECREF(decorated->args);
-    free(decorated);
-    return wrap.callable;
-}
-
-static PyObject* procedure_decorator(py_server_t* self, PyObject* args, ucall_verb_t req_type) {
-    static PyMethodDef methd = {"__add_procedure", __add_procedure, METH_VARARGS,
-                                "Actual function that registers procedure"};
-    PyObject* name = PyUnicode_FromString(methd.ml_name);
-    py_decorator_self_t* decorator_self = (py_decorator_self_t*)malloc(sizeof(py_decorator_self_t));
-    PyObject* decorator = PyCFunction_NewEx(&methd, decorator_self, name);
-    decorator_self->args = args;
-    decorator_self->server = self;
-    decorator_self->request_type = req_type;
-    decorator_self->fn = decorator;
-    Py_INCREF(args);
-    Py_INCREF(self);
-    Py_DECREF(name);
-    return decorator;
-}
-
-static PyObject* server_add_procedure_get(py_server_t* self, PyObject* args) {
-    return procedure_decorator(self, args, get_k);
-}
-
-static PyObject* server_add_procedure_post(py_server_t* self, PyObject* args) {
-    return procedure_decorator(self, args, post_k);
-}
-
-static PyObject* server_add_procedure_put(py_server_t* self, PyObject* args) {
-    return procedure_decorator(self, args, put_k);
-}
-
-static PyObject* server_add_procedure_delete(py_server_t* self, PyObject* args) {
-    return procedure_decorator(self, args, delete_k);
-}
-
-static bool pycheck_take_call(py_server_t* self, uint16_t thread_idx) {
-    if (PyErr_CheckSignals() != 0) { // Must be called from the main thread only!
-        PyGILState_STATE gstate = PyGILState_Ensure();
-        PyErr_SetString(PyExc_KeyboardInterrupt, "Server Stopped");
-        PyGILState_Release(gstate);
-        return false;
-    }
-    ucall_take_call(self->server, thread_idx);
-    return true;
-}
-
-static PyObject* server_run(py_server_t* self, PyObject* args) {
-    Py_ssize_t max_cycles = -1;
-    double max_seconds = -1;
-    // If none are provided, it is wiser to use the `ucall_take_calls`,
-    // as it has a more efficient busy-waiting loop implementation.
-    if (!PyArg_ParseTuple(args, "|nd", &max_cycles, &max_seconds)) {
-        PyErr_SetString(PyExc_TypeError, "Expecting a cycle count and timeout.");
-        return NULL;
-    }
-    if (max_cycles == -1 && max_seconds == -1) { while (pycheck_take_call(self, 0)); }
-    else if (max_seconds == -1) {
-        while (max_cycles > 0 && pycheck_take_call(self, 0)) --max_cycles;
-    }
-    else if (max_cycles == -1) {
-        time_t start, end;
-        time(&start);
-        while (max_seconds > 0 && pycheck_take_call(self, 0)) {
-            time(&end);
-            max_seconds -= difftime(end, start);
-            start = end;
+static int check_required(char const* verb, Py_ssize_t required, ucall_py_argument_t const* arguments) {
+    for (Py_ssize_t position = 0; position != required; ++position)
+        if (!*arguments[position].value) {
+            PyErr_Format(PyExc_TypeError, "%s() missing required argument '%s'", verb, arguments[position].name);
+            return -1;
         }
-    }
-    else {
-        time_t start, end;
-        time(&start);
-        while (max_cycles > 0 && max_seconds > 0 && pycheck_take_call(self, 0)) {
-            --max_cycles;
-            time(&end);
-            max_seconds -= difftime(end, start);
-            start = end;
-        }
-    }
+    return 0;
+}
 
+int ucall_py_parse_fast(char const* verb, PyObject* const* values, Py_ssize_t values_count, PyObject* names,
+                        Py_ssize_t required, Py_ssize_t positional_max, ucall_py_argument_t const* arguments,
+                        size_t count) {
+    Py_ssize_t const positional_count = PyVectorcall_NARGS(values_count);
+    if (bind_positional(verb, values, positional_count, positional_max, arguments, count) != 0) return -1;
+    Py_ssize_t const names_count = names ? PyTuple_GET_SIZE(names) : 0;
+    for (Py_ssize_t index = 0; index != names_count; ++index)
+        if (bind_keyword(verb, PyTuple_GET_ITEM(names, index), values[positional_count + index], required, arguments,
+                         count) != 0)
+            return -1;
+    return check_required(verb, required, arguments);
+}
+
+int ucall_py_parse_tuple(char const* verb, PyObject* positional, PyObject* keywords, Py_ssize_t required,
+                         Py_ssize_t positional_max, ucall_py_argument_t const* arguments, size_t count) {
+    Py_ssize_t const positional_count = positional ? PyTuple_GET_SIZE(positional) : 0;
+    PyObject* const* const values = positional_count ? &PyTuple_GET_ITEM(positional, 0) : NULL;
+    if (bind_positional(verb, values, positional_count, positional_max, arguments, count) != 0) return -1;
+    Py_ssize_t cursor = 0;
+    PyObject *name = NULL, *value = NULL;
+    while (keywords && PyDict_Next(keywords, &cursor, &name, &value))
+        if (bind_keyword(verb, name, value, required, arguments, count) != 0) return -1;
+    return check_required(verb, required, arguments);
+}
+
+int ucall_py_size_from_object(PyObject* object, char const* field, size_t* output) {
+    if (!object) return 0;
+    if (!PyLong_Check(object)) {
+        PyErr_Format(PyExc_TypeError, "'%s' must be a non-negative int, got %s", field, Py_TYPE(object)->tp_name);
+        return -1;
+    }
+    size_t const value = PyLong_AsSize_t(object);
+    if (value == (size_t)-1 && PyErr_Occurred()) return -1;
+    *output = value;
+    return 0;
+}
+
+int ucall_py_text_from_object(PyObject* object, char const* field, ucall_bytes_view_t* view) {
+    if (PyUnicode_Check(object)) {
+        Py_ssize_t length = 0;
+        char const* data = PyUnicode_AsUTF8AndSize(object, &length);
+        if (!data) return -1;
+        view->data = (ucall_byte_t const*)data;
+        view->length = (size_t)length;
+        return 0;
+    }
+    if (PyBytes_Check(object)) {
+        view->data = (ucall_byte_t const*)PyBytes_AS_STRING(object);
+        view->length = (size_t)PyBytes_GET_SIZE(object);
+        return 0;
+    }
+    PyErr_Format(PyExc_TypeError, "'%s' must be str or bytes, got %s", field, Py_TYPE(object)->tp_name);
+    return -1;
+}
+
+int ucall_py_key_from_object(PyObject* object, char const* field, ucall_noise_key_t key) {
+    if (!PyBytes_Check(object) || PyBytes_GET_SIZE(object) != (Py_ssize_t)sizeof(ucall_noise_key_t)) {
+        PyErr_Format(PyExc_ValueError, "'%s' must be %zu bytes, got %R", field, sizeof(ucall_noise_key_t), object);
+        return -1;
+    }
+    memcpy(key, PyBytes_AS_STRING(object), sizeof(ucall_noise_key_t));
+    return 0;
+}
+
+void ucall_py_header_lines_release(ucall_py_header_lines_t* lines) {
+    PyMem_Free(lines->views);
+    Py_CLEAR(lines->sequence);
+    lines->views = NULL;
+    lines->count = 0;
+}
+
+int ucall_py_header_lines_from_object(PyObject* object, ucall_py_header_lines_t* lines) {
+    lines->sequence = NULL;
+    lines->views = NULL;
+    lines->count = 0;
+    if (!object) return 0;
+    lines->sequence = PySequence_Fast(object, "'headers' must be a sequence of \"name: value\" lines");
+    if (!lines->sequence) return -1;
+    Py_ssize_t const count = PySequence_Fast_GET_SIZE(lines->sequence);
+    if (!count) return 0;
+    lines->views = PyMem_Calloc((size_t)count, sizeof(ucall_bytes_view_t));
+    if (!lines->views) {
+        ucall_py_header_lines_release(lines);
+        PyErr_NoMemory();
+        return -1;
+    }
+    lines->count = (size_t)count;
+    for (Py_ssize_t index = 0; index != count; ++index)
+        if (ucall_py_text_from_object(PySequence_Fast_GET_ITEM(lines->sequence, index), "headers",
+                                      &lines->views[index]) != 0) {
+            ucall_py_header_lines_release(lines);
+            return -1;
+        }
+    return 0;
+}
+
+PyObject* ucall_py_text_to_object(ucall_bytes_view_t view) {
+    return PyUnicode_DecodeUTF8((char const*)view.data, (Py_ssize_t)view.length, "surrogateescape");
+}
+
+PyObject* ucall_py_get_optional(PyObject* self, void* closure) {
+    PyObject* const value = *(PyObject**)((char*)self + (size_t)closure);
+    return Py_NewRef(value ? value : Py_None);
+}
+
+#pragma endregion Arguments
+
+#pragma region Enums and Errors
+
+/** The C spelling of @p value, or NULL when the gap between named values has no member. */
+static char const* enum_spelling(ucall_py_enum_mirror_t const* mirror, long value) {
+    if (value < mirror->first || value > mirror->last) return NULL;
+    char const* const spelled = mirror->spell((int)value);
+    return strcmp(spelled, "unrecognized") == 0 ? NULL : spelled;
+}
+
+/** Writes the member name of @p spelled to @p member, "out-of-memory" becoming "OUT_OF_MEMORY". */
+static void enum_member_name(char const* spelled, char* member, size_t capacity) {
+    size_t length = 0;
+    for (; spelled[length] && length + 1 != capacity; ++length) {
+        char const letter = spelled[length];
+        member[length] = letter == '-' ? '_' : letter >= 'a' && letter <= 'z' ? (char)(letter - 'a' + 'A') : letter;
+    }
+    member[length] = '\0';
+}
+
+static int enum_register(PyObject* module, PyObject* int_enum, PyObject* keywords, ucall_py_enum_mirror_t* mirror) {
+    PyObject* members = PyDict_New();
+    for (long value = mirror->first; members && value <= mirror->last; ++value) {
+        char const* const spelled = enum_spelling(mirror, value);
+        if (!spelled) continue;
+        char member[32];
+        enum_member_name(spelled, member, sizeof(member));
+        PyObject* const number = PyLong_FromLong(value);
+        if (!number || PyDict_SetItemString(members, member, number) != 0) Py_CLEAR(members);
+        Py_XDECREF(number);
+    }
+    PyObject* const arguments = members ? Py_BuildValue("(sO)", mirror->name, members) : NULL;
+    mirror->type = arguments ? PyObject_Call(int_enum, arguments, keywords) : NULL;
+    Py_XDECREF(arguments);
+    Py_XDECREF(members);
+    PyObject* const doc = mirror->type ? PyUnicode_FromString(mirror->doc) : NULL;
+    int const documented = doc ? PyObject_SetAttrString(mirror->type, "__doc__", doc) : -1;
+    Py_XDECREF(doc);
+    return documented == 0 ? PyModule_AddObjectRef(module, mirror->name, mirror->type) : -1;
+}
+
+int ucall_py_enums_register(PyObject* module) {
+    ucall_py_enum_mirror_t* const mirrors[] = {&ucall_py_status_enum, &ucall_py_backend_enum, &ucall_py_cpu_class_enum,
+                                               &ucall_py_security_enum, &ucall_py_verb_enum};
+    PyObject* const enum_module = PyImport_ImportModule("enum");
+    PyObject* const int_enum = enum_module ? PyObject_GetAttrString(enum_module, "IntEnum") : NULL;
+    PyObject* const keywords = int_enum ? Py_BuildValue("{ss}", "module", "ucall") : NULL;
+    int registered = keywords ? 0 : -1;
+    for (size_t row = 0; registered == 0 && row != sizeof(mirrors) / sizeof(mirrors[0]); ++row)
+        registered = enum_register(module, int_enum, keywords, mirrors[row]);
+    Py_XDECREF(keywords);
+    Py_XDECREF(int_enum);
+    Py_XDECREF(enum_module);
+    return registered;
+}
+
+int ucall_py_enum_from_object(PyObject* object, char const* field, ucall_py_enum_mirror_t const* mirror, int* value) {
+    if (!object) return 0;
+    PyObject* named = NULL;
+    if (PyUnicode_Check(object)) {
+        char const* const spelled = PyUnicode_AsUTF8(object);
+        if (!spelled) return -1;
+        char member[32];
+        enum_member_name(spelled, member, sizeof(member));
+        PyObject* const key = PyUnicode_FromString(member);
+        named = key ? PyObject_GetItem(mirror->type, key) : NULL;
+        Py_XDECREF(key);
+        if (!named) {
+            if (PyErr_ExceptionMatches(PyExc_KeyError)) {
+                PyErr_Clear();
+                PyErr_Format(PyExc_ValueError, "'%s' takes a ucall.%s, and %R names none", field, mirror->name, object);
+            }
+            return -1;
+        }
+        object = named;
+    }
+    if (!PyLong_Check(object) || PyBool_Check(object)) {
+        Py_XDECREF(named);
+        PyErr_Format(PyExc_TypeError, "'%s' takes a ucall.%s, got %s", field, mirror->name, Py_TYPE(object)->tp_name);
+        return -1;
+    }
+    int overflow = 0;
+    long const read = PyLong_AsLongAndOverflow(object, &overflow);
+    Py_XDECREF(named);
+    if (read == -1 && PyErr_Occurred()) return -1;
+    if (overflow || !enum_spelling(mirror, read)) {
+        PyErr_Format(PyExc_ValueError, "'%s' takes a ucall.%s, and %ld is none", field, mirror->name, read);
+        return -1;
+    }
+    *value = (int)read;
+    return 0;
+}
+
+PyObject* ucall_py_enum_to_object(ucall_py_enum_mirror_t const* mirror, long value) {
+    PyObject* const number = PyLong_FromLong(value);
+    if (!number || !enum_spelling(mirror, value)) return number;
+    PyObject* const member = PyObject_CallOneArg(mirror->type, number);
+    Py_DECREF(number);
+    return member;
+}
+
+PyObject* ucall_py_raise_status(ucall_status_t status, char const* message) {
+    PyObject* const member = ucall_py_enum_to_object(&ucall_py_status_enum, (long)status);
+    PyObject* const text = member ? PyUnicode_FromString(message ? message : ucall_status_name(status)) : NULL;
+    PyObject* const error = text ? PyObject_CallFunctionObjArgs((PyObject*)&ErrorType, member, text, NULL) : NULL;
+    if (error) PyErr_SetObject((PyObject*)&ErrorType, error);
+    Py_XDECREF(error);
+    Py_XDECREF(text);
+    Py_XDECREF(member);
     return NULL;
 }
 
-static Py_ssize_t server_callbacks_count(py_server_t* self, PyObject* _) { return self->count_added; }
-static PyObject* server_port(py_server_t* self, PyObject* _) { return PyLong_FromLong(self->config.port); }
-static PyObject* server_queue_depth(py_server_t* self, PyObject* _) {
-    return PyLong_FromLong(self->config.queue_depth);
-}
-static PyObject* server_max_lifetime(py_server_t* self, PyObject* _) {
-    return PyLong_FromLong(self->config.max_lifetime_micro_seconds);
+int ucall_py_raise_outcome(ucall_outcome_t const* outcome) {
+    if (outcome->status == ucall_status_success_k) return 0;
+    ucall_py_raise_status(outcome->status, outcome->message);
+    return -1;
 }
 
-static PyMethodDef server_methods[] = {
-    {"get", (PyCFunction)&server_add_procedure_get, METH_VARARGS, PyDoc_STR("Append a procedure callback")},
-    {"put", (PyCFunction)&server_add_procedure_put, METH_VARARGS, PyDoc_STR("Append a procedure callback")},
-    {"post", (PyCFunction)&server_add_procedure_post, METH_VARARGS, PyDoc_STR("Append a procedure callback")},
-    {"delete", (PyCFunction)&server_add_procedure_delete, METH_VARARGS, PyDoc_STR("Append a procedure callback")},
-    {"run", (PyCFunction)&server_run, METH_VARARGS,
-     PyDoc_STR("Runs the server for N calls or T seconds, before returning")},
-    {NULL},
-};
-
-static PyGetSetDef server_computed_properties[] = {
-    {"port", (getter)&server_port, NULL, PyDoc_STR("On which port the server listens")},
-    {"queue_depth", (getter)&server_queue_depth, NULL, PyDoc_STR("Max number of concurrent users")},
-    {"max_lifetime", (getter)&server_max_lifetime, NULL, PyDoc_STR("Max lifetime of connections in microseconds")},
-    {NULL},
-};
-
-static PyMappingMethods server_mapping_methods = {
-    .mp_length = (lenfunc)server_callbacks_count,
-    .mp_subscript = NULL,
-    .mp_ass_subscript = NULL,
-};
-
-static void server_dealloc(py_server_t* self) {
-    free(self->wrappers);
-    ucall_free(self->server);
-    Py_TYPE(self)->tp_free((PyObject*)self);
-}
-
-static PyObject* server_new(PyTypeObject* type, PyObject* args, PyObject* keywords) {
-    py_server_t* self = (py_server_t*)type->tp_alloc(type, 0);
-    return (PyObject*)self;
-}
-
-static int server_init(py_server_t* self, PyObject* args, PyObject* keywords) {
-    static char const const* keywords_list[] = {
-        "hostname",      "port",  "queue_depth", "max_callbacks", "max_threads",
-        "count_threads", "quiet", "ssl_pk",      "ssl_certs",     NULL,
-    };
-    self->config.hostname = "0.0.0.0";
-    self->config.port = 8545;
-    self->config.protocol = jsonrpc_http_k;
-    self->config.queue_depth = 4096;
-    self->config.max_callbacks = UINT16_MAX;
-    self->config.max_threads = 16;
-    self->config.max_concurrent_connections = 1024;
-    self->config.max_lifetime_exchanges = UINT32_MAX;
-    self->count_threads = 1;
-    self->quiet = false;
-
-    PyObject* certs_path = NULL;
-
-    if (!PyArg_ParseTupleAndKeywords(args, keywords, "|snnnnnp", (char**)keywords_list, //
-                                     &self->config.hostname, &self->config.port, &self->config.queue_depth,
-                                     &self->config.max_callbacks, &self->config.max_threads, &self->count_threads,
-                                     &self->quiet))
-        return -1;
-
-    self->wrapper_capacity = 16;
-    self->wrappers = (py_wrapper_t*)malloc(self->wrapper_capacity * sizeof(py_wrapper_t));
-
-    // Initialize the server
-    ucall_init(&self->config, &self->server);
-    if (self->server == NULL) {
-        PyErr_SetString(PyExc_RuntimeError, "Server Initialization");
-        return -1;
+void ucall_py_report_handler_failure(PyObject* handler) {
+    if (PyErr_ExceptionMatches(PyExc_KeyboardInterrupt)) {
+        PyErr_Clear();
+        PyErr_SetInterrupt();
+        return;
     }
-
-    if (!self->quiet) {
-        printf("Initialized server: %s:%i\n", self->config.hostname, self->config.port);
-        printf("- %i threads\n", self->config.max_threads);
-        printf("- %u max concurrent connections\n", self->config.max_concurrent_connections);
-    }
-    return 0;
+    PyErr_WriteUnraisable(handler);
 }
 
-// Order: https://docs.python.org/3/c-api/typeobj.html#quick-reference
-static PyTypeObject ucall_type = {
-    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "ucall." stringify_value_m(UCALL_PYTHON_MODULE_NAME) ".Server",
-    .tp_basicsize = sizeof(py_server_t),
-    .tp_itemsize = 0,
-    .tp_dealloc = (destructor)server_dealloc,
-    // TODO:
-    // .tp_vectorcall_offset = 0,
-    // .tp_repr = NULL,
-    .tp_as_mapping = &server_mapping_methods,
-    .tp_flags = Py_TPFLAGS_DEFAULT | Py_TPFLAGS_BASETYPE,
-    .tp_doc = PyDoc_STR("Server class for Remote Procedure Calls implemented in Python"),
-    .tp_methods = server_methods,
-    .tp_call = (ternaryfunc)&server_add_procedure_post,
-    .tp_getset = server_computed_properties,
-    .tp_init = (initproc)server_init,
-    .tp_new = server_new,
+#pragma endregion Enums and Errors
+
+#pragma region Module
+
+PyObject* ucall_py_json_dumps = NULL;
+PyObject* ucall_py_json_loads = NULL;
+
+static char const doc_module[] =                                                                     //
+    "Native HTTP and Noise networking with caller-owned polling and request batching.\n"             //
+    "\n"                                                                                             //
+    "A `Server` answers on one or more `Interface`s, and a `Client` calls other servers. Neither\n"  //
+    "starts a thread: the application polls each event loop with `Server.take_calls`, drains each\n" //
+    "`BatchEndpoint` with `take_batches`, and drives each `Client` from the thread that made it.\n"  //
+    "Handlers registered with `Server.get` and its siblings bind typed parameters from the path,\n"  //
+    "the query and a JSON body, and what they return becomes the reply.\n"                           //
+    "\n"                                                                                             //
+    "Example:\n"                                                                                     //
+    "  >>> import threading, ucall\n"                                                                //
+    "  >>> server = ucall.Server(ucall.Interface(\"127.0.0.1:0\"))\n"                                //
+    "  >>> @server.get(\"/sum\")\n"                                                                  //
+    "  ... def sum(a: int, b: int):\n"                                                               //
+    "  ...     return a + b\n"                                                                       //
+    "  >>> thread = threading.Thread(target=server.run)\n"                                           //
+    "  >>> thread.start()\n"                                                                         //
+    "  >>> client = ucall.Client(connections=1)\n"                                                   //
+    "  >>> bytes(client.get(f\"http://{server.addresses[0]}/sum?a=1&b=2\").body)\n"                  //
+    "  b'3'\n"                                                                                       //
+    "  >>> server.stop()\n"                                                                          //
+    "  >>> thread.join()";
+
+/** Every type the module readies and its name there; a nameless row stays internal. */
+static struct {
+
+    /** The attribute the type answers to on the module, or NULL to leave it unnamed. */
+    char const* name;
+
+    /** The type to ready. */
+    PyTypeObject* type;
+} const module_types[] = {
+    {"Error", &ErrorType},         {"Interface", &InterfaceType},         {"Server", &ServerType},
+    {"Request", &RequestType},     {"BatchEndpoint", &BatchEndpointType}, {"Client", &ClientType},
+    {"Completed", &CompletedType}, {"Response", &ResponseType},           {NULL, &EndpointType},
 };
 
-static PyModuleDef server_module = {
+/** The module, named as the extension is built, so @c lib.__name__ agrees with its file. */
+static PyModuleDef module_definition = {
     PyModuleDef_HEAD_INIT,
-    .m_name = "ucall." stringify_value_m(UCALL_PYTHON_MODULE_NAME),
-    .m_doc = "Uninterrupted JSON Remote Procedure Calls library.",
+    .m_name = "ucall.lib",
+    .m_doc = doc_module,
     .m_size = -1,
 };
 
-PyMODINIT_FUNC pyinit_f_m(void) {
-    if (PyType_Ready(&ucall_type) < 0) return NULL;
-
-    PyObject* m = PyModule_Create(&server_module);
-    if (!m) return NULL;
-
-    Py_INCREF(&ucall_type);
-    if (PyModule_AddObject(m, "Server", (PyObject*)&ucall_type) < 0) {
-        Py_DECREF(&ucall_type);
-        Py_DECREF(m);
-        return NULL;
-    }
-
-    return m;
+/** Imports `json.dumps` and `json.loads` once, for replies, typed handlers and client calls. */
+static int json_import(void) {
+    PyObject* const json = PyImport_ImportModule("json");
+    if (!json) return -1;
+    ucall_py_json_dumps = PyObject_GetAttrString(json, "dumps");
+    ucall_py_json_loads = ucall_py_json_dumps ? PyObject_GetAttrString(json, "loads") : NULL;
+    Py_DECREF(json);
+    return ucall_py_json_loads ? 0 : -1;
 }
 
-int main(int argc, char* argv[]) {
-    wchar_t* program = Py_DecodeLocale(argv[0], NULL);
-    if (!program) {
-        fprintf(stderr, "Fatal error: cannot decode argv[0]\n");
-        exit(1);
+PyMODINIT_FUNC PyInit_lib(void) {
+    ErrorType.tp_base = (PyTypeObject*)PyExc_RuntimeError;
+    size_t const types_count = sizeof(module_types) / sizeof(module_types[0]);
+    for (size_t type_index = 0; type_index != types_count; ++type_index)
+        if (PyType_Ready(module_types[type_index].type) < 0) return NULL;
+    if (json_import() != 0) return NULL;
+
+    PyObject* const module = PyModule_Create(&module_definition);
+    if (!module) return NULL;
+    if (ucall_py_enums_register(module) < 0 || PyModule_AddFunctions(module, ucall_py_noise_methods) < 0 ||
+        PyModule_AddStringConstant(module, "__version__", ucall_version_name()) < 0 ||
+        PyModule_AddStringConstant(module, "DEFAULT_ADDRESS", ucall_py_default_address_k) < 0)
+        goto failed;
+    for (size_t type_index = 0; type_index != types_count; ++type_index) {
+        char const* const name = module_types[type_index].name;
+        if (name && PyModule_AddObjectRef(module, name, (PyObject*)module_types[type_index].type) < 0) goto failed;
     }
+    return module;
 
-    // Add a built-in module, before Py_Initialize
-    if (PyImport_AppendInittab("ucall." stringify_value_m(UCALL_PYTHON_MODULE_NAME), pyinit_f_m) == -1) {
-        fprintf(stderr, "Error: could not extend in-built modules table\n");
-        exit(1);
-    }
-
-    // Pass argv[0] to the Python interpreter
-    PyConfig config;
-    PyConfig_InitPythonConfig(&config);
-    config.program_name = program;
-
-    // Initialize the Python interpreter.  Required.
-    // If this step fails, it will be a fatal error.
-    PyStatus status = Py_InitializeFromConfig(&config);
-    if (PyStatus_Exception(status)) {
-        fprintf(stderr, "Couldn't initialize from config\n");
-        exit(1);
-    }
-    PyConfig_Clear(&config);
-
-    // Optionally import the module; alternatively, import can be deferred
-    // until the embedded script imports it.
-    PyObject* pmodule = PyImport_ImportModule("ucall." stringify_value_m(UCALL_PYTHON_MODULE_NAME));
-    if (!pmodule) {
-        PyErr_Print();
-        fprintf(stderr, "Error: could not import module 'ucall'\n");
-    }
-
-    // Add version metadata
-    {
-        char version_str[50];
-        sprintf(version_str, "%d.%d.%d", UCALL_VERSION_MAJOR, UCALL_VERSION_MINOR, UCALL_VERSION_PATCH);
-        PyModule_AddStringConstant(pmodule, "__version__", version_str);
-    }
-
-    PyMem_RawFree(program);
-    return 0;
+failed:
+    Py_DECREF(module);
+    return NULL;
 }
+
+#pragma endregion Module

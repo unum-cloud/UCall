@@ -140,8 +140,10 @@ struct ucall_server_handle_t {
         void (*event_loop_statistics)(ucall_server_event_loop_statistics_t*);
         void (*take_batch)(ucall_server_take_batch_t*);
         void (*take_batches)(ucall_server_take_batches_t*);
+        void (*batch_endpoint_statistics)(ucall_server_batch_endpoint_statistics_t*);
         void (*add_http_endpoint)(ucall_server_add_http_endpoint_t*);
         ucall_verb_t (*request_verb)(ucall_server_t, ucall_received_http_request_t);
+        void (*request_path)(ucall_server_request_path_t*);
         std::size_t (*request_path_segments_count)(ucall_server_t, ucall_received_http_request_t);
         void (*request_path_segment)(ucall_server_request_path_segment_t*);
         void (*request_path_parameter)(ucall_server_request_path_parameter_t*);
@@ -167,8 +169,6 @@ struct ucall_client_handle_t {
         void (*free)(ucall_client_t);
         void (*call)(ucall_client_call_t*);
         void (*take_completed)(ucall_client_take_completed_t*);
-        void (*response_header)(ucall_client_response_header_t*);
-        void (*response_body)(ucall_client_response_body_t*);
     };
     api_t const* api {};
     std::uint64_t string_capabilities {}, atomic_capabilities {};

@@ -1,15 +1,121 @@
-# Wheels for CPython 3.12 to 3.14 from the project's CMake tree.
+# Wheels for CPython 3.12 to 3.14 from the project's own CMake tree.
 [build-system]
-requires = ["setuptools>=77", "wheel", "cmake>=3.28"]
-build-backend = "setuptools.build_meta"
+build-backend = "scikit_build_core.build"
+requires = ["scikit-build-core>=0.10"]
+
+[project]
+name = "ucall"
+dynamic = ["version"]
+description = "Native HTTP and Noise networking with caller-owned polling and request batching"
+readme = "python/README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+requires-python = ">=3.12"
+authors = [{ name = "Ash Vardanian", email = "info@unum.cloud" }]
+classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "Natural Language :: English",
+  "Intended Audience :: Developers",
+  "Intended Audience :: Information Technology",
+  "Programming Language :: C",
+  "Programming Language :: C++",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Programming Language :: Python :: Implementation :: CPython",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+  "Operating System :: Microsoft :: Windows",
+  "Topic :: Internet :: WWW/HTTP",
+  "Topic :: Internet :: WWW/HTTP :: HTTP Servers",
+  "Topic :: System :: Networking",
+  "Typing :: Typed",
+]
+dependencies = []
+
+[project.urls]
+Homepage = "https://github.com/unum-cloud/UCall"
+Repository = "https://github.com/unum-cloud/UCall"
+Issues = "https://github.com/unum-cloud/UCall/issues"
+
+# Every backend this platform supports, chosen at runtime; `CMAKE_ARGS="-DUCALL_WITH_LINUX_URING=OFF"` or
+# `--config-settings=cmake.define.UCALL_WITH_LINUX_URING=OFF` leaves one out.
+[tool.scikit-build]
+build-dir = "build_python/{wheel_tag}"
+build.targets = ["ucall_python"]
+cmake.build-type = "Release"
+cmake.version = ">=3.28"
+install.components = ["ucall_python"]
+metadata.version.provider = "scikit_build_core.metadata.regex"
+metadata.version.input = "VERSION"
+metadata.version.regex = "(?P<value>[^\\s]+)"
+minimum-version = "build-system.requires"
+sdist.exclude = [
+  "/build*/**",
+  "/target/**",
+  "/TODO*.md",
+  "/numkong/**",
+  "/stringzilla/**",
+  "/smashtable/**",
+  "/forkunion/**",
+]
+sdist.include = [
+  "/CMakeLists.txt",
+  "/CMakePresets.json",
+  "/VERSION",
+  "/c/ucall/**",
+  "/include/ucall/**",
+  "/src/**",
+  "/python/CMakeLists.txt",
+  "/python/README.md",
+  "/python/*.c",
+  "/python/*.h",
+  "/python/ucall/*.py",
+  "/python/ucall/*.pyi",
+  "/python/ucall/py.typed",
+  "/stringzilla/CMakeLists.txt",
+  "/stringzilla/VERSION",
+  "/stringzilla/cmake/**",
+  "/stringzilla/c/**",
+  "/stringzilla/probes/**",
+  "/stringzilla/include/**",
+  "/smashtable/CMakeLists.txt",
+  "/smashtable/VERSION",
+  "/smashtable/cmake/**",
+  "/smashtable/include/**",
+  "/forkunion/CMakeLists.txt",
+  "/forkunion/VERSION",
+  "/forkunion/cmake/**",
+  "/forkunion/c/**",
+  "/forkunion/probes/**",
+  "/forkunion/include/**",
+]
+wheel.packages = ["python/ucall"]
+
+[tool.scikit-build.cmake.define]
+UCALL_BUILD_BENCH = "OFF"
+UCALL_BUILD_EXAMPLES = "OFF"
+UCALL_BUILD_PYTHON = "ON"
+UCALL_BUILD_TEST = "OFF"
 
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
 [dependency-groups]
 lint = ["ruff>=0.15.8", "clang-format==22.*", "cmakelang>=0.6"]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
+filterwarnings = ["error"]
+minversion = "8.0"
+python_files = ["*.py"]
+testpaths = ["test"]
+xfail_strict = true
+
 [tool.ruff]
 line-length = 120
 target-version = "py312"
-extend-exclude = ["stringzilla"]
+extend-exclude = ["stringzilla", "*.md"]
 
 [tool.ruff.lint]
 select = ["E", "W", "F", "I", "UP", "YTT", "B", "SIM", "TID", "D200", "D201", "D202", "D205", "D209", "D210", "D212", "D300", "D415"]
@@ -19,7 +125,7 @@ ignore = ["E501", "E741"]
 quote-style = "double"
 
 [tool.ruff.lint.per-file-ignores]
-"python/ucall/__init__.py" = ["F401", "E402"]
+"python/ucall/__init__.py" = ["F401", "F403"]
 ".cmake-format.py" = ["F821"]
 "cmake-format.py" = ["F821"]
 
@@ -30,28 +136,29 @@ ban-relative-imports = "all"
 known-first-party = ["ucall"]
 combine-as-imports = true
 
-# Integration suites require a running example server.
+[tool.ruff.lint.flake8-bugbear]
+extend-immutable-calls = ["fastapi.Body", "Body"]
+
 [tool.cibuildwheel]
-test-requires = []
-test-command = ""
+build = ["cp312-*", "cp313-*", "cp314-*"]
 build-verbosity = 0
-skip = []
+skip = ["*musllinux*"]
+test-command = "python -X faulthandler -m pytest -x {project}/test"
+test-groups = ["test"]
+
+# The siblings come from their pinned commits, and every architecture keeps its baseline instruction set.
+[tool.cibuildwheel.linux]
+archs = ["x86_64", "aarch64"]
+before-build = ["rm -rf {project}/build_python"]
+manylinux-aarch64-image = "manylinux_2_28"
+manylinux-x86_64-image = "manylinux_2_28"
+repair-wheel-command = "auditwheel repair -w {dest_dir} {wheel}"
 
 [tool.cibuildwheel.macos]
-archs = ["x86_64", "universal2", "arm64"]
-before-build = [
-    "rm -rf {project}/CMakeCache.txt {project}/build {project}/build_debug {project}/CMakeFiles.txt {project}/_deps {project}/.pytest_cache",
-    "git submodule update --init --recursive",
-]
+archs = ["arm64"]
+before-build = ["rm -rf {project}/build_python"]
 repair-wheel-command = "delocate-wheel --require-archs {delocate_archs} -w {dest_dir} -v {wheel}"
-
 
 [tool.cibuildwheel.windows]
 archs = ["AMD64", "ARM64"]
-before-build = [
-    "rd /s /q {project}\\CMakeCache.txt {project}\\build {project}\\build_debug {project}\\CMakeFiles.txt {project}\\_deps {project}\\.pytest_cache || echo Done",
-    "git submodule update --init --recursive",
-]
-
-[tool.ruff.lint.flake8-bugbear]
-extend-immutable-calls = ["fastapi.Body", "Body"]
+before-build = ["rd /s /q {project}\\build_python || echo Done"]

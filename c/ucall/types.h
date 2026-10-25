@@ -311,6 +311,50 @@ UCALL_EXPORT ucall_status_t ucall_outcome_wait(ucall_outcome_t* outcome);
  */
 UCALL_EXPORT ucall_status_t ucall_outcome_status(ucall_outcome_t* outcome);
 
+/** Arguments of @c ucall_noise_key_generate(). */
+typedef struct ucall_noise_key_generate_t {
+
+    /** Receives @c ucall_status_io_k when the operating system refuses entropy. */
+    ucall_outcome_t* outcome;
+
+    /** Output for the secret scalar, drawn from the operating system's entropy. */
+    ucall_noise_key_t* private_key;
+
+    /** Output for the Curve25519 public key matching @c private_key. */
+    ucall_noise_key_t* public_key;
+
+} ucall_noise_key_generate_t;
+
+/**
+ *  @brief Draws a fresh static keypair for @c noise_private_key fields and peer authorizers.
+ *
+ *  Both outputs are zeroed unless the call succeeds.
+ *
+ *  @note @b Thread-safe.
+ */
+UCALL_EXPORT void ucall_noise_key_generate(ucall_noise_key_generate_t* arguments);
+
+/** Arguments of @c ucall_noise_key_derive(). */
+typedef struct ucall_noise_key_derive_t {
+
+    /** Output for the outcome. */
+    ucall_outcome_t* outcome;
+
+    /** The secret scalar, as @c noise_private_key fields take it. */
+    ucall_noise_key_t const* private_key;
+
+    /** Output for the Curve25519 public key, which peers see during the handshake. */
+    ucall_noise_key_t* public_key;
+
+} ucall_noise_key_derive_t;
+
+/**
+ *  @brief Derives the public key of a stored private key, as peer authorizers compare it.
+ *
+ *  @note @b Thread-safe.
+ */
+UCALL_EXPORT void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments);
+
 /** HTTP status codes for server responses and client results.
  *
  *  Numeric codes also represent responses absent from the named constants below.

@@ -33,10 +33,12 @@ Keep the borrowed URL, headers, body, and security-key inputs alive until comple
 Retrieval returns each call's admission credit.
 The connection budget must be positive; a zero call budget uses the connection budget times `max_pipelined_calls`.
 Retrieved responses belong to the caller until `ucall_client_response_free()`; client teardown discards unretrieved results.
+Response accessors take only the response, which stays readable after its client is freed.
 Request handles own immutable received bytes and can outlive their callback until a reply consumes them or the server is freed.
 Batch callbacks receive a counted array of retained request handles, followed by the registered context.
 The array is borrowed only during the callback; copy its handles into application-owned storage to defer work without copying request bytes.
 Each request can be replied to independently, including after the callback returns.
+`ucall_server_request_path()` answers the request target without its query, still percent-encoded, beside the segment and parameter accessors.
 `ucall_server_request_peer()` reports which configured interface a request arrived on and the peer's authenticated Noise static key, zero on plaintext interfaces, until its reply.
 Every loop deposits into one queue per batch endpoint, so batches mix requests from all loops, and partial batches flush at their configured deadline.
 A reply to a disconnected request reports connection closure and consumes the handle.
@@ -47,8 +49,9 @@ A server interface's `max_pipelined_requests` and a client's `max_pipelined_call
 A pipelined connection lost mid-flight retries its unanswered idempotent calls and finishes the rest with `ucall_status_connection_closed_k`.
 Servers support immutable routes, size and latency based application batching, retained request views, and content and error replies.
 XX and IK servers authenticate clients; KK clients can connect to a separately configured peer, while the server interface cannot specify KK's preknown initiator key.
+`ucall_noise_key_generate()` draws a static keypair from the operating system's entropy, reporting `ucall_status_io_k` when it is refused, and `ucall_noise_key_derive()` recovers the public key of a stored private key.
 
 WebSockets, multipart access, streaming replies, file replies, and metrics remain unsupported and return `ucall_status_unsupported_k` where an outcome is available.
 Numeric addresses are handled directly, and reusing a connection does not resolve its host again.
 A new connection to a hostname still uses the synchronous system resolver on the polling caller; request deadlines cannot interrupt that resolver.
-The Python and Rust SDKs await migration to this ABI.
+The [Python](../python/README.md) and [Rust](../rust/README.md) bindings wrap this ABI and keep its polling model: the application starts every thread.

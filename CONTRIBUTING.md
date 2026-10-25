@@ -24,7 +24,7 @@ CPU probes select separate instantiation units and apply their instruction flags
 
 `UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_echo`, `ucall_example_ledger`, and `ucall_example_redis`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http`.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
-Python and Rust SDK builds await migration to the current C ABI.
+`UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python-builds) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust-builds) describe.
 
 ## Running Tests
 
@@ -35,7 +35,31 @@ Native suites live in `test/`, the C caller in `c/test.c`, and benchmark clients
 UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset debug
 ```
 
-Python comparison adapters exercise explicitly started benchmark services.
+Python suites sit beside them as `test/serving.py` and `test/calling.py`, and Rust tests sit in each module of `rust/`.
+
+## Python Builds
+
+`pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `UCALL_BUILD_PYTHON=ON` and installs the `ucall_python` target, the extension `ucall.lib`, into the `python/ucall/` package.
+`python/lib.c` holds the module and the shared argument parsing, while `types.c`, `server.c`, and `client.c` wrap the types, the server, and the client.
+The build tree lives in `build_python/<wheel_tag>`, and an editable install recompiles only when the install command runs again.
+
+```sh
+uv venv .venv && source .venv/bin/activate
+uv pip install scikit-build-core ninja pytest
+uv pip install --no-build-isolation -e .
+python -X faulthandler -m pytest
+```
+
+## Rust Builds
+
+The root `Cargo.toml` builds the crate from `rust/lib.rs`, and `build.rs` compiles the native library through CMake.
+`rust/types.rs`, `server.rs`, and `client.rs` mirror the Python sources, each module keeps its tests in `mod tests`, and `rust/testing.rs` holds their shared helpers.
+
+```sh
+cargo test
+cargo clippy --all-targets -- -D warnings
+RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
+```
 
 ## Code Clarity
 
@@ -82,7 +106,7 @@ A code comment explains a non-obvious reason rather than narrating an operation.
 Keep source headers, attribution, and original creation dates consistent with the file's history.
 
 Begin each Markdown sentence on a separate source line and align table columns.
-Run `dprint fmt` for Markdown, `clang-format` for C and C++, and Ruff for Python.
+Run `dprint fmt` for Markdown, `clang-format` for C and C++, Ruff for Python, and `cargo +nightly fmt` for Rust.
 The staged-file hooks check these conventions and reject template suffixes even with brace initialization.
 
 ### Review and Measurements

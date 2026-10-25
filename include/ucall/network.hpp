@@ -366,6 +366,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::size_t min_batch_size {}, max_batch_size {}, max_latency_microseconds {};
         vector<ucall_received_http_request_t> pending {}; // Owned by the drain, reserved to `max_batch_size`.
         void* context {};
+        ucall_batch_endpoint_statistics_t statistics {}; // Advanced by the drain, loaded relaxed by any thread.
     };
 
     struct endpoint_t {
@@ -1129,6 +1130,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                         engine.close_socket(acceptor.request.descriptor);
                         acceptor.request.descriptor = -1;
                     }
+                // Retire the engine on its polling owner, as a single-issuer ring completes
+                // nothing for another thread.
+                engine.stop();
                 event_loop.stage = event_loop_stage_t::quiesced_k;
             }
         }
@@ -1510,8 +1514,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         publish(arguments->outcome, ucall_status_success_k);
     }
 
-    /** Hands the pending batch to its callback, or detaches it while stopping, firing nothing. */
-    static ucall_status_t flush_pending(batch_endpoint_t& endpoint, server_mode_t mode) noexcept {
+    /** Hands the pending batch to its callback and counts it under @p trigger, the counter of why
+     *  it fired, or detaches it while stopping, firing and counting nothing. */
+    static ucall_status_t flush_pending(batch_endpoint_t& endpoint, server_mode_t mode,
+                                        std::uint64_t& trigger) noexcept {
         if (endpoint.pending.empty()) return ucall_status_would_block_k;
         if (mode == server_mode_t::stopping_k)
             for (auto handle : endpoint.pending) {
@@ -1520,7 +1526,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                                                     std::memory_order_release);
                 push_replied(exchange);
             }
-        else endpoint.callback(endpoint.pending.data(), endpoint.pending.size(), endpoint.context);
+        else {
+            tally(endpoint.statistics.batches);
+            tally(endpoint.statistics.requests, endpoint.pending.size());
+            tally(trigger);
+            endpoint.callback(endpoint.pending.data(), endpoint.pending.size(), endpoint.context);
+        }
         endpoint.pending.clear();
         return mode == server_mode_t::serving_k ? ucall_status_success_k : ucall_status_would_block_k;
     }
@@ -1543,7 +1554,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             slot.store(nullptr, std::memory_order_relaxed);
             (void)endpoint.pending.push_back(st::assume_reserved, exchange);
             if (endpoint.pending.size() == endpoint.max_batch_size &&
-                flush_pending(endpoint, mode) == ucall_status_success_k)
+                flush_pending(endpoint, mode, endpoint.statistics.filled_batches) == ucall_status_success_k)
                 drained = ucall_status_success_k;
         }
         atomic_ref<std::uint64_t> {endpoint.head}.store(head, std::memory_order_release);
@@ -1554,9 +1565,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         auto due = endpoint.max_latency_microseconds > (maximum - deposited) / 1000
                        ? maximum
                        : deposited + endpoint.max_latency_microseconds * 1000;
-        if (mode == server_mode_t::stopping_k || endpoint.pending.size() >= endpoint.min_batch_size ||
-            monotonic_ns() >= due) {
-            if (flush_pending(endpoint, mode) == ucall_status_success_k) drained = ucall_status_success_k;
+        auto ready = endpoint.pending.size() >= endpoint.min_batch_size;
+        if (mode == server_mode_t::stopping_k || ready || monotonic_ns() >= due) {
+            auto& trigger = ready ? endpoint.statistics.ready_batches : endpoint.statistics.expired_batches;
+            if (flush_pending(endpoint, mode, trigger) == ucall_status_success_k) drained = ucall_status_success_k;
         }
         else expiry = due;
         return drained;
@@ -1616,6 +1628,27 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             await_deposits(server, endpoint, expiry);
         }
         publish(arguments->outcome, atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
+    }
+    static void server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments) noexcept {
+        if (!arguments) return;
+        if (!arguments->server) {
+            publish(arguments->outcome, ucall_status_uninitialized_k);
+            return;
+        }
+        if (!arguments->endpoint || !arguments->statistics) {
+            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        auto& counters = static_cast<batch_endpoint_t*>(arguments->endpoint)->statistics;
+        auto read = [](std::uint64_t& counter) noexcept {
+            return atomic_ref<std::uint64_t> {counter}.load(std::memory_order_relaxed);
+        };
+        *arguments->statistics = {.batches = read(counters.batches),
+                                  .requests = read(counters.requests),
+                                  .filled_batches = read(counters.filled_batches),
+                                  .ready_batches = read(counters.ready_batches),
+                                  .expired_batches = read(counters.expired_batches)};
+        publish(arguments->outcome, ucall_status_success_k);
     }
     static void server_free(ucall_server_t handle) noexcept {
         if (!handle) return;
@@ -1716,6 +1749,17 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
     static ucall_verb_t server_request_verb(ucall_server_t, ucall_received_http_request_t request) noexcept {
         return request ? static_cast<server_exchange_t*>(request)->message.verb : ucall_verb_unknown_k;
+    }
+    static void server_request_path(ucall_server_request_path_t* arguments) noexcept {
+        if (!arguments) return;
+        if (arguments->path) *arguments->path = {};
+        if (!arguments->server || !arguments->request || !arguments->path) {
+            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
+        *arguments->path = c_view(extract_path_component<http_t>(exchange.message.target(exchange.text())));
+        publish(arguments->outcome, ucall_status_success_k);
     }
     static std::string_view path_segment(std::string_view path, std::size_t index) noexcept {
         path_cursor<http_t> cursor {path};
@@ -2675,32 +2719,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         *arguments->count = count;
         publish(arguments->outcome, count ? ucall_status_success_k : client.failure);
     }
-    static void client_response_header(ucall_client_response_header_t* arguments) noexcept {
-        if (!arguments) return;
-        if (arguments->value) *arguments->value = {};
-        if (!arguments->client || !arguments->response || !arguments->value || !valid_view(arguments->name) ||
-            !http_token(text_view(arguments->name))) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
-            return;
-        }
-        auto& response = *static_cast<received_response_t*>(arguments->response);
-        http_message_t message {};
-        message.headers_length = response.headers_length;
-        auto value = message.header(text_view(response.bytes()), text_view(arguments->name));
-        *arguments->value = c_view(value);
-        publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
-    }
-    static void client_response_body(ucall_client_response_body_t* arguments) noexcept {
-        if (!arguments) return;
-        if (arguments->body) *arguments->body = {};
-        if (!arguments->client || !arguments->response || !arguments->body) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
-            return;
-        }
-        auto& response = *static_cast<received_response_t*>(arguments->response);
-        *arguments->body = c_view(text_view(response.bytes()).substr(response.headers_length, response.body_length));
-        publish(arguments->outcome, ucall_status_success_k);
-    }
 
     inline static server_api_t const server_api_k {&server_free,
                                                    &server_take_call,
@@ -2708,8 +2726,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                                    &server_event_loop_statistics,
                                                    &server_take_batch,
                                                    &server_take_batches,
+                                                   &server_batch_endpoint_statistics,
                                                    &server_add_http_endpoint,
                                                    &server_request_verb,
+                                                   &server_request_path,
                                                    &server_request_path_segments_count,
                                                    &server_request_path_segment,
                                                    &server_request_path_parameter,
@@ -2720,8 +2740,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                                    &server_reply_content,
                                                    &server_reply_error,
                                                    &server_add_http_batch_endpoint};
-    inline static client_api_t const client_api_k {&client_free, &client_call, &client_take_completed,
-                                                   &client_response_header, &client_response_body};
+    inline static client_api_t const client_api_k {&client_free, &client_call, &client_take_completed};
 };
 
 /** Portable network over the serial kits, for callers without a CPU dispatch point. */

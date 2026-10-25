@@ -29,6 +29,10 @@ CMakeUserPresets.json
 *.out
 *.app
 
+# Rust
+target/
+Cargo.lock
+
 # Python
 __pycache__/
 *.egg-info

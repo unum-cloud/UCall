@@ -535,11 +535,11 @@ struct worker_t {
                 ucall_http_status_t http_status {};
                 std::size_t bytes {};
                 if (!error) {
-                    http_status = ucall_client_response_status(client, completion.response);
+                    http_status = ucall_client_response_status(completion.response);
                     if (http_status < 200 || http_status >= 300) error = "unsuccessful HTTP status";
                     else {
                         ucall_bytes_view_t body {};
-                        ucall_client_response_body_t get {client, &outcome, completion.response, &body};
+                        ucall_client_response_body_t get {completion.response, &outcome, &body};
                         ucall_client_response_body(&get);
                         if (outcome.status != ucall_status_success_k) error = "response body unavailable";
                         else if (settings.echo_check == echo_check_t::bytes_k) {
@@ -553,8 +553,7 @@ struct worker_t {
                     if (!error && settings.reply_order == reply_order_t::reordered_k) {
                         for (auto name : {"x-ucall-pair", "x-ucall-member"}) {
                             ucall_bytes_view_t value {};
-                            ucall_client_response_header_t get {client, &outcome, completion.response, view(name),
-                                                                &value};
+                            ucall_client_response_header_t get {completion.response, &outcome, view(name), &value};
                             ucall_client_response_header(&get);
                             auto expected = std::string_view {name} == "x-ucall-pair" ? slot.pair
                                                                                       : (slot.member ? "1" : "0");

@@ -86,7 +86,7 @@ UCALL_EXPORT void ucall_client_init(ucall_client_init_t* arguments);
  *  @param[in] client Client from @c ucall_client_init(), or @c NULL.
  *
  *  @note Cancels accepted calls and discards unretrieved completions. Retrieved responses remain
- *      caller-owned. Do not submit or poll concurrently with teardown.
+ *      caller-owned and readable. Do not submit or poll concurrently with teardown.
  */
 UCALL_EXPORT void ucall_client_free(ucall_client_t client);
 
@@ -266,24 +266,20 @@ UCALL_EXPORT void ucall_client_websocket_receive(ucall_client_websocket_receive_
 
 /**
  *  @brief Returns the HTTP status of a received response.
- *  @param[in] client Client that received the response.
  *  @param[in] response Response from ucall_client_take_completed().
  *  @return The peer's status code, or zero for a null response.
  */
-UCALL_EXPORT ucall_http_status_t ucall_client_response_status(ucall_client_t client,
-                                                              ucall_received_http_response_t response);
+UCALL_EXPORT ucall_http_status_t ucall_client_response_status(ucall_received_http_response_t response);
 
 /** Arguments of @c ucall_client_response_header(). */
 typedef struct ucall_client_response_header_t {
 
-    /** The client this call operates on. */
-    ucall_client_t client;
+    /** The received response from @c ucall_client_take_completed(), readable after its client is
+     *  freed. */
+    ucall_received_http_response_t response;
 
     /** Receives @c ucall_status_not_found_k if the response has no such header. */
     ucall_outcome_t* outcome;
-
-    /** The received response from @c ucall_client_take_completed(). */
-    ucall_received_http_response_t response;
 
     /** The name of the HTTP header to extract (case-insensitive). */
     ucall_bytes_view_t name;
@@ -306,14 +302,12 @@ UCALL_EXPORT void ucall_client_response_header(ucall_client_response_header_t* a
 /** Arguments of @c ucall_client_response_body(). */
 typedef struct ucall_client_response_body_t {
 
-    /** The client this call operates on. */
-    ucall_client_t client;
+    /** The received response from @c ucall_client_take_completed(), readable after its client is
+     *  freed. */
+    ucall_received_http_response_t response;
 
     /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
     ucall_outcome_t* outcome;
-
-    /** The received response from @c ucall_client_take_completed(). */
-    ucall_received_http_response_t response;
 
     /** Output for a borrowed view of the body. */
     ucall_bytes_view_t* body;

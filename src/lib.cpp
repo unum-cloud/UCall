@@ -2,17 +2,20 @@
  *  @file src/lib.cpp
  *  @author Ash Vardanian
  *  @date August 15, 2023
- *  @brief C entry points over each handle's initialization-selected operations.
+ *  @brief C entry points over each handle's initialization-selected operations, and the Noise key
+ *      and received response verbs, which need no CPU-specific code.
  */
 #include <cassert>
 #include <cstdint>
-#include <cstring> // `std::strlen`, `std::memcmp`
+#include <cstring> // `std::strlen`, `std::memcmp`, `std::memset`
 
 #if defined(_WIN32)
 #include <io.h>
 #else
 #include <unistd.h>
 #endif
+
+#include <span> // `std::as_bytes`, `std::as_writable_bytes`
 
 #include "ucall/http.hpp"
 #include "ucall/io.hpp"
@@ -23,6 +26,10 @@ using namespace unum::ucall;
 namespace unum::ucall {
 
 template struct received_response<st::default_allocator<byte_t>>;
+
+/** Responses outlive their client and its CPU class, so reading one takes the serial kits. */
+using response_http_t =
+    http<serial_compare_kit_t, serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t>;
 
 struct thread_capabilities_t {
     std::uint64_t strings, atomics;
@@ -142,6 +149,35 @@ ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name) {
     return ucall_cpu_class_unknown_k;
 }
 
+void ucall_noise_key_generate(ucall_noise_key_generate_t* arguments) {
+    if (!arguments) return;
+    if (arguments->private_key) std::memset(*arguments->private_key, 0, sizeof(ucall_noise_key_t));
+    if (arguments->public_key) std::memset(*arguments->public_key, 0, sizeof(ucall_noise_key_t));
+    if (!arguments->private_key || !arguments->public_key) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    if (!secure_tunnel_generate_keypair(std::as_writable_bytes(std::span {*arguments->private_key}).data(),
+                                        std::as_writable_bytes(std::span {*arguments->public_key}).data())) {
+        std::memset(*arguments->private_key, 0, sizeof(ucall_noise_key_t));
+        publish(arguments->outcome, ucall_status_io_k);
+        return;
+    }
+    publish(arguments->outcome, ucall_status_success_k);
+}
+
+void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments) {
+    if (!arguments) return;
+    if (arguments->public_key) std::memset(*arguments->public_key, 0, sizeof(ucall_noise_key_t));
+    if (!arguments->private_key || !arguments->public_key) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    x25519_derive_public(std::as_writable_bytes(std::span {*arguments->public_key}).data(),
+                         std::as_bytes(std::span {*arguments->private_key}).data());
+    publish(arguments->outcome, ucall_status_success_k);
+}
+
 void ucall_server_init(ucall_server_init_t* arguments) {
     if (!arguments) return;
     if (arguments->server) *arguments->server = nullptr;
@@ -193,6 +229,13 @@ void ucall_server_take_batches(ucall_server_take_batches_t* arguments) {
     arguments->server->api->take_batches(arguments);
 }
 
+void ucall_server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments) {
+    if (!arguments) return;
+    if (arguments->statistics) *arguments->statistics = {};
+    if (!admit(arguments->server, arguments->outcome)) return;
+    arguments->server->api->batch_endpoint_statistics(arguments);
+}
+
 void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     if (!arguments) return;
     if (arguments->count) *arguments->count = 0;
@@ -220,6 +263,11 @@ void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments)
     if (!arguments) return;
     if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->add_http_endpoint(arguments);
+}
+void ucall_server_request_path(ucall_server_request_path_t* arguments) {
+    if (!arguments) return;
+    if (!admit(arguments->server, arguments->outcome)) return;
+    arguments->server->api->request_path(arguments);
 }
 void ucall_server_request_path_segment(ucall_server_request_path_segment_t* arguments) {
     if (!arguments) return;
@@ -268,13 +316,31 @@ void ucall_client_call(ucall_client_call_t* arguments) {
 }
 void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->client, arguments->outcome)) return;
-    arguments->client->api->response_header(arguments);
+    if (arguments->value) *arguments->value = {};
+    if (!arguments->response || !arguments->value || !response_http_t::valid_view(arguments->name) ||
+        !response_http_t::http_token(response_http_t::text_view(arguments->name))) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    auto& response = *static_cast<received_response_t*>(arguments->response);
+    response_http_t::http_message_t message {};
+    message.headers_length = response.headers_length;
+    auto value = message.header(response_http_t::text_view(response.bytes()),
+                                response_http_t::text_view(arguments->name));
+    *arguments->value = response_http_t::c_view(value);
+    publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
 }
 void ucall_client_response_body(ucall_client_response_body_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->client, arguments->outcome)) return;
-    arguments->client->api->response_body(arguments);
+    if (arguments->body) *arguments->body = {};
+    if (!arguments->response || !arguments->body) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    auto& response = *static_cast<received_response_t*>(arguments->response);
+    auto bytes = response_http_t::text_view(response.bytes());
+    *arguments->body = response_http_t::c_view(bytes.substr(response.headers_length, response.body_length));
+    publish(arguments->outcome, ucall_status_success_k);
 }
 
 ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_http_request_t request) {
@@ -283,7 +349,7 @@ ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_htt
 size_t ucall_server_request_path_segments_count(ucall_server_t server, ucall_received_http_request_t request) {
     return server && compatible(server) ? server->api->request_path_segments_count(server, request) : 0;
 }
-ucall_http_status_t ucall_client_response_status(ucall_client_t, ucall_received_http_response_t response) {
+ucall_http_status_t ucall_client_response_status(ucall_received_http_response_t response) {
     return response ? static_cast<received_response_t*>(response)->status : 0;
 }
 void ucall_client_response_free(ucall_received_http_response_t response) {

@@ -2,7 +2,8 @@
  *  @file c/test.c
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief A C caller of the linked library's name, status, outcome, and version functions.
+ *  @brief A C caller of the linked library's name, status, outcome, Noise key, and version
+ *      functions.
  */
 #undef NDEBUG
 #include <assert.h>
@@ -37,6 +38,21 @@ int main(void) {
     ucall_outcome_t outcome = {ucall_status_success_k, NULL};
     assert(ucall_outcome_status(&outcome) == ucall_status_success_k);
     assert(ucall_outcome_wait(&outcome) == ucall_status_success_k);
+
+    ucall_noise_key_t private_key, public_key, derived_key, other_private_key, other_public_key;
+    ucall_noise_key_generate_t generate = {&outcome, &private_key, &public_key};
+    ucall_noise_key_generate(&generate);
+    assert(outcome.status == ucall_status_success_k && outcome.message == NULL);
+    ucall_noise_key_derive_t derive = {&outcome, (ucall_noise_key_t const*)&private_key, &derived_key};
+    ucall_noise_key_derive(&derive);
+    assert(outcome.status == ucall_status_success_k && memcmp(derived_key, public_key, sizeof(public_key)) == 0);
+    generate.private_key = &other_private_key;
+    generate.public_key = &other_public_key;
+    ucall_noise_key_generate(&generate);
+    assert(memcmp(other_private_key, private_key, sizeof(private_key)) != 0);
+    derive.public_key = NULL;
+    ucall_noise_key_derive(&derive);
+    assert(outcome.status == ucall_status_invalid_argument_k);
 
     int major, minor, patch;
     ucall_version(&major, &minor, &patch);

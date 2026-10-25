@@ -27,7 +27,7 @@ How ¹ fast?
 About 263,000 requests/s for a 1 KiB loopback echo in the [current Razer snapshot](bench/README.md#razer-snapshot-october-19-2026), with the workload and backend choices recorded alongside the results.
 How ² portable?
 A C ABI fronts a C++20 core with POSIX, Linux epoll and io_uring, macOS/FreeBSD kqueue, and Windows IOCP backends.
-Python and Rust SDKs await migration to that ABI.
+Python and Rust bindings wrap that ABI directly, with the same caller-owned polling threads.
 How ³ compact?
 HTTP framing, routing, and transport state live in templated headers, with one native library exporting the C interface.
 What's the ⁴ twist?
@@ -141,7 +141,7 @@ Each loop has one application owner, and `ucall_server_stop()` can wake it from 
 Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
 Initialize, submit, poll, and free a client on the same owner thread.
 Keep borrowed request inputs alive until their completion is retrieved.
-After retrieval, the caller owns each response until `ucall_client_response_free()`.
+After retrieval, the caller owns each response until `ucall_client_response_free()`, even past client teardown.
 Stop and join server polling threads before freeing the server.
 
 ### Encryption: From TLS to Noise
@@ -165,6 +165,8 @@ Several handshake patterns are defined, each suitable for different use cases:
   Provides faster handshakes and is ideal for typical client-server architectures, similar to TLS with certificate pinning.
 - __KK__: Both parties know each other's public keys beforehand (Known Known).
   The client-side pattern is implemented; the current server interface cannot name its preknown initiator key and rejects KK.
+
+`ucall_noise_key_generate()` draws static keys from the operating system's entropy, and `ucall_noise_key_derive()` recovers the public key that peers see from a stored private one.
 
 Noise can be implemented in several ways, depending on the choice of three cryptographic primitives: Diffie-Hellman key exchange, symmetric cipher, and hash function.
 Examples of primitive combinations are:

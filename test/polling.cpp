@@ -422,6 +422,12 @@ static case_result_t test_application_batches_unit() {
         ucall_server_event_loop_statistics(&query);
         return counters.requests;
     };
+    auto batch_statistics = [&](ucall_http_batch_endpoint_t endpoint) {
+        ucall_batch_endpoint_statistics_t counters {};
+        ucall_server_batch_endpoint_statistics_t query {fixture.server, &outcome, endpoint, &counters};
+        ucall_server_batch_endpoint_statistics(&query);
+        return counters;
+    };
     auto drain = drain_batches(fixture.server, batches.failures, fixture.batch_endpoint);
     auto prompt_drain = drain_batches(fixture.server, batches.failures, prompt);
     call_t first, second, partial;
@@ -431,6 +437,11 @@ static case_result_t test_application_batches_unit() {
     failures += expect(fired, "the full batch never fired");
     if (fired) {
         failures += expect(batches.sizes[0] == 2);
+        auto const full = batch_statistics(fixture.batch_endpoint);
+        failures += expect(full.batches == 1 && full.requests == 2 && full.filled_batches == 1 &&
+                               full.ready_batches == 0 && full.expired_batches == 0,
+                           "a 2/2 batch counted {} batches, {} filled, {} ready, {} expired", full.batches,
+                           full.filled_batches, full.ready_batches, full.expired_batches);
         fixture.reply(batches.requests[1]);
         fixture.reply(batches.requests[0]);
         failures += first.success(fixture.wait(0));
@@ -452,6 +463,11 @@ static case_result_t test_application_batches_unit() {
         if (partial_fired) {
             auto const late = std::chrono::duration_cast<std::chrono::microseconds>(batches.fired - deposited).count();
             failures += expect(batches.sizes[1] == 1);
+            auto const partial_counted = batch_statistics(prompt);
+            failures += expect(partial_counted.batches == 1 && partial_counted.requests == 1 &&
+                                   partial_counted.expired_batches == 1 && partial_counted.filled_batches == 0,
+                               "a partial batch counted {} batches, {} expired", partial_counted.batches,
+                               partial_counted.expired_batches);
             failures += expect(late < 1000, "a 300 microsecond budget fired {} microseconds after the deposit", late);
             fixture.reply(batches.requests[0]);
             failures += partial.success(fixture.wait(0));
@@ -846,7 +862,7 @@ static case_result_t test_allocator_propagation_unit() {
                        ucall_status_name(completed.outcome.status));
     ucall_bytes_view_t body {};
     if (completed.response) {
-        ucall_client_response_body_t get {client, &outcome, completed.response, &body};
+        ucall_client_response_body_t get {completed.response, &outcome, &body};
         ucall_client_response_body(&get);
         failures += expect(outcome.status == ucall_status_success_k && body.length == payload.size());
     }
@@ -905,7 +921,7 @@ static case_result_t test_allocation_failure_safety() {
             completion = completed.outcome.status;
             if (completed.response) {
                 ucall_bytes_view_t body {};
-                ucall_client_response_body_t get {client, &outcome, completed.response, &body};
+                ucall_client_response_body_t get {completed.response, &outcome, &body};
                 ucall_client_response_body(&get);
                 bool const echoed = body.length == payload.size() && !std::memcmp(body.data, payload.data(), 64);
                 failures += expect(echoed, "budget {} answered {} bytes", budget, body.length);
