@@ -8,48 +8,40 @@
  *  from a @c UCALL_BENCH_ variable named after the flag, so @c --time-limit defaults to
  *  @c UCALL_BENCH_TIME_LIMIT and the command line overrides it.
  */
-#include <cctype>
-#include <cmath>
-#include <cstdint>
-#include <cstdio>
-#include <cstdlib>
-#include <cstring>
+#include <cctype>  // `std::toupper`
+#include <cmath>   // `std::ceil`
+#include <cstdint> // `std::uint64_t`
+#include <cstdio>  // `std::printf`, `std::snprintf`
+#include <cstdlib> // `std::getenv`
+#include <cstring> // `std::memcmp`
 
-#if defined(_WIN32)
-#ifndef NOMINMAX
-#define NOMINMAX
-#endif
-#ifndef WIN32_LEAN_AND_MEAN
-#define WIN32_LEAN_AND_MEAN
-#endif
-#include <windows.h>
-#else
-#include <sys/resource.h>
-#endif // defined(_WIN32)
+#include <algorithm>   // `std::find_if`, `std::any_of`, `std::max`, `std::min`
+#include <array>       // `std::array`
+#include <bit>         // `std::bit_width`
+#include <bitset>      // `std::bitset`
+#include <charconv>    // `std::from_chars`
+#include <chrono>      // `std::chrono::steady_clock`
+#include <limits>      // `std::numeric_limits`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <thread>      // `std::this_thread::sleep_for`
+#include <tuple>       // `std::tuple`
+#include <vector>      // `std::vector`
 
-#include <algorithm>
-#include <array>
-#include <bit>
-#include <bitset>
-#include <charconv>
-#include <chrono>
-#include <limits>
-#include <string>
-#include <string_view>
-#include <thread>
-#include <tuple>
-#include <vector>
+#include <forkunion.h>         // `fu_pool_t`, `fu_pool_for_threads`
+#include <forkunion/types.hpp> // `fu::split_mix`
 
-#include <forkunion.h>
+#include "ucall/types.hpp" // `bytes_view`
 
-#include "ucall/ucall.h"
+#include "arguments.hpp" // `tools::parse_count`, `tools::parse_duration`, `tools::parse_seed`, `tools::parse_key`
 
 namespace unum::ucall::bench {
 
 using clock_t = std::chrono::steady_clock;
+using time_point_t = clock_t::time_point;
 
-/** Whether each response body must equal the request body. */
-enum class echo_check_t { none_k, bytes_k };
+/** What each response body must match: nothing, the request body, or a byte count. */
+enum class body_check_t { none_k, echo_k, length_k };
 
 /** Whether calls go out in tagged pairs that the server answers in reverse. */
 enum class reply_order_t { ordinary_k, reordered_k };
@@ -69,51 +61,31 @@ enum class phase_t { warmup_k, measured_k };
 /** A quota no run reaches, for a phase bounded by its time limit alone. */
 static constexpr std::size_t unlimited_k = std::numeric_limits<std::size_t>::max();
 
-static constexpr double nanoseconds_per_second_k = std::chrono::nanoseconds(std::chrono::seconds(1)).count();
-static constexpr double nanoseconds_per_millisecond_k = std::chrono::nanoseconds(std::chrono::milliseconds(1)).count();
 static constexpr double nanoseconds_per_microsecond_k = std::chrono::nanoseconds(std::chrono::microseconds(1)).count();
 static constexpr double bytes_per_gigabyte_k = std::giga::num;
 
 struct settings_t {
     std::vector<std::string> urls;
     std::size_t requests {}, warmup_requests {}, connections = 64, in_flight = 64, threads = 1, bytes = 1024;
-    std::size_t rate {}, pipeline_depth = 1;
+    std::size_t rate {}, pipeline_depth = 1, response_bytes {};
     std::chrono::nanoseconds warmup {}, time_limit {};
-    std::uint32_t seed = 42;
+    std::uint64_t seed = 42;
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
     ucall_cpu_class_t cpu_class = ucall_cpu_class_unknown_k;
     ucall_verb_t verb = ucall_verb_post_k;
-    echo_check_t echo_check = echo_check_t::none_k;
+    body_check_t body_check = body_check_t::none_k;
+    std::string client_key, server_key; // Hexadecimal, validated while parsing and decoded once per run.
     reply_order_t reply_order = reply_order_t::ordinary_k;
     connection_reuse_t connection_reuse = connection_reuse_t::keep_alive_k;
     thread_placement_t placement = thread_placement_t::floating_k;
     output_format_t format = output_format_t::human_k;
 };
 
-static ucall_bytes_view_t view(std::string_view text) noexcept {
-    return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
-}
-
-static bool parse_count(std::string_view text, std::size_t& value, std::size_t minimum = 0) noexcept {
-    std::size_t parsed {};
-    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), parsed);
-    if (error != std::errc {} || end != text.data() + text.size() || parsed < minimum) return false;
-    value = parsed;
-    return true;
-}
-
-/** A duration like "1s", "500ms" or "250us". */
-static bool parse_duration(std::string_view text, std::chrono::nanoseconds& value) noexcept {
-    std::uint32_t count {};
-    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), count);
-    if (error != std::errc {} || end == text.data()) return false;
-    auto unit = text.substr(static_cast<std::size_t>(end - text.data()));
-    if (unit == "s") value = std::chrono::seconds(count);
-    else if (unit == "ms") value = std::chrono::milliseconds(count);
-    else if (unit == "us") value = std::chrono::microseconds(count);
-    else return false;
-    return true;
-}
+using tools::admit_any_peer;
+using tools::parse_count;
+using tools::parse_duration;
+using tools::parse_key;
+using tools::parse_seed;
 
 /** A switch: present, "1" or "true" select @p on, and "0" or "false" the zero enumerator. */
 template <typename mode_type_>
@@ -131,10 +103,11 @@ struct flag_t {
 };
 
 static constexpr std::array flags_k {
-    flag_t {"--url", "URL", "HTTP service, repeated for several origins (http://127.0.0.1:8545/echo)",
+    flag_t {"--url", "URL",
+            "http:// or http+noise:// service, repeated for several origins (http://127.0.0.1:8545/echo)",
             [](std::string_view text, settings_t& settings) noexcept {
                 settings.urls.emplace_back(text);
-                return text.starts_with("http://");
+                return text.starts_with("http://") || text.starts_with("http+noise://");
             }},
     flag_t {"--requests", "count", "measured exchanges, or 0 to run until --time-limit (0)",
             [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.requests); }},
@@ -167,12 +140,12 @@ static constexpr std::array flags_k {
             [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.bytes); }},
     flag_t {"--backend", "name", "automatic, posix, linux-epoll, linux-uring612, linux-uring700, ... (automatic)",
             [](std::string_view text, settings_t& settings) noexcept {
-                settings.backend = ucall_io_backend_from_name(view(text));
+                settings.backend = ucall_io_backend_from_name(bytes_view(text));
                 return text == ucall_io_backend_name(settings.backend);
             }},
     flag_t {"--cpu-class", "name", "automatic, serial, intel-haswell, apple-m2, aws-g5, ... (automatic)",
             [](std::string_view text, settings_t& settings) noexcept {
-                settings.cpu_class = ucall_cpu_class_from_name(view(text));
+                settings.cpu_class = ucall_cpu_class_from_name(bytes_view(text));
                 return text == ucall_cpu_class_name(settings.cpu_class);
             }},
     flag_t {"--verb", "name", "post, get or put (post)",
@@ -182,7 +155,24 @@ static constexpr std::array flags_k {
             }},
     flag_t {"--verify-echo", "", "require identical request and response bodies",
             [](std::string_view text, settings_t& settings) noexcept {
-                return parse_switch(text, settings.echo_check, echo_check_t::bytes_k);
+                return parse_switch(text, settings.body_check, body_check_t::echo_k);
+            }},
+    flag_t {"--response-bytes", "count", "require response bodies of this many bytes, like 2 from /sum",
+            [](std::string_view text, settings_t& settings) noexcept {
+                settings.body_check = body_check_t::length_k;
+                return parse_count(text, settings.response_bytes);
+            }},
+    flag_t {"--client-key", "hex", "64-digit client static private key, required by http+noise:// URLs",
+            [](std::string_view text, settings_t& settings) noexcept {
+                ucall_noise_key_t key {};
+                settings.client_key = text;
+                return parse_key(text, key);
+            }},
+    flag_t {"--server-key", "hex", "64-digit server public key, selecting Noise IK instead of XX",
+            [](std::string_view text, settings_t& settings) noexcept {
+                ucall_noise_key_t key {};
+                settings.server_key = text;
+                return parse_key(text, key);
             }},
     flag_t {"--reorder", "", "paired retained replies at /echo/reordered, implying --verify-echo",
             [](std::string_view text, settings_t& settings) noexcept {
@@ -197,10 +187,7 @@ static constexpr std::array flags_k {
                 return parse_switch(text, settings.placement, thread_placement_t::pinned_k);
             }},
     flag_t {"--seed", "number", "seed of the request body bytes (42)",
-            [](std::string_view text, settings_t& settings) noexcept {
-                auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), settings.seed);
-                return error == std::errc {} && end == text.data() + text.size();
-            }},
+            [](std::string_view text, settings_t& settings) noexcept { return parse_seed(text, settings.seed); }},
     flag_t {"--format", "name", "human or json, one object per row (human)",
             [](std::string_view text, settings_t& settings) noexcept {
                 settings.format = text == "json" ? output_format_t::json_k : output_format_t::human_k;
@@ -265,7 +252,7 @@ static bool parse(int argc, char** argv, settings_t& settings) {
         std::fprintf(stderr, "%s=\"%s\" does not parse\n", variable.c_str(), value);
         return false;
     }
-    if (settings.reply_order == reply_order_t::reordered_k) settings.echo_check = echo_check_t::bytes_k;
+    if (settings.reply_order == reply_order_t::reordered_k) settings.body_check = body_check_t::echo_k;
     if (!settings.requests && !settings.time_limit.count()) {
         std::fputs("--requests or --time-limit must bound the measured run\n", stderr);
         return false;
@@ -279,45 +266,17 @@ static bool parse(int argc, char** argv, settings_t& settings) {
         std::fputs("Paired replies require POST and even measured/warmup request counts\n", stderr);
         return false;
     }
+    auto noise = std::any_of(settings.urls.begin(), settings.urls.end(),
+                             [](std::string const& url) { return url.starts_with("http+noise://"); });
+    if (noise && settings.client_key.empty()) {
+        std::fputs("http+noise:// URLs require --client-key\n", stderr);
+        return false;
+    }
+    if (!noise && (!settings.client_key.empty() || !settings.server_key.empty())) {
+        std::fputs("--client-key and --server-key apply only to http+noise:// URLs\n", stderr);
+        return false;
+    }
     return true;
-}
-
-static std::uint64_t now_nanoseconds() noexcept {
-    return static_cast<std::uint64_t>(
-        std::chrono::duration_cast<std::chrono::nanoseconds>(clock_t::now().time_since_epoch()).count());
-}
-
-/** SplitMix64's step, so that @c --seed fixes every request body byte. */
-static std::uint64_t next_random(std::uint64_t& state) noexcept {
-    std::uint64_t value = state += 0x9E3779B97F4A7C15ull;
-    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
-    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
-    return value ^ (value >> 31);
-}
-
-/** User and system CPU time the whole client process has spent. */
-struct cpu_time_t {
-    std::chrono::nanoseconds user {}, system {};
-};
-
-static cpu_time_t cpu_time() noexcept {
-#if defined(_WIN32)
-    using filetime_ticks_t = std::chrono::duration<std::uint64_t, std::ratio<1, 10'000'000>>;
-    FILETIME creation {}, exit {}, kernel {}, user {};
-    if (!GetProcessTimes(GetCurrentProcess(), &creation, &exit, &kernel, &user)) return {};
-    auto duration = [](FILETIME time) {
-        return std::chrono::duration_cast<std::chrono::nanoseconds>(
-            filetime_ticks_t {std::uint64_t {time.dwHighDateTime} << 32 | time.dwLowDateTime});
-    };
-    return {duration(user), duration(kernel)};
-#else
-    rusage usage {};
-    if (getrusage(RUSAGE_SELF, &usage)) return {};
-    auto duration = [](timeval time) {
-        return std::chrono::nanoseconds(std::chrono::seconds(time.tv_sec) + std::chrono::microseconds(time.tv_usec));
-    };
-    return {duration(usage.ru_utime), duration(usage.ru_stime)};
-#endif // defined(_WIN32)
 }
 
 static bool succeeded(ucall_outcome_t const& outcome, char const* operation) {
@@ -369,7 +328,7 @@ struct latency_histogram_t {
 };
 
 struct slot_t {
-    std::uint64_t intended_nanoseconds {};
+    time_point_t intended {};
     std::size_t group {}, member {}, sequence {};
     char pair_header[sizeof("x-ucall-pair: ::") + std::numeric_limits<std::uint64_t>::digits10 +
                      2 * (std::numeric_limits<std::size_t>::digits10 + 1) + 1] {};
@@ -384,7 +343,8 @@ struct origin_result_t {
     std::size_t issued {}, completed {}, successful {}, failures {}, response_bytes {}, rejected {}, byte_checks {},
         reordered {};
     std::size_t largest_sequence {};
-    std::uint64_t first_completed {}, last_completed {}, latency_max {};
+    time_point_t first_completed {}, last_completed {};
+    std::uint64_t latency_max {};
     long double latency_sum {};
 };
 struct origin_t {
@@ -395,14 +355,14 @@ struct origin_t {
 /** When a phase starts, when it stops issuing calls, and which quotas bound it. */
 struct schedule_t {
     phase_t phase {phase_t::measured_k};
-    std::uint64_t begin {}, deadline {};
+    time_point_t begin {}, deadline {time_point_t::max()};
 };
 
 struct worker_t {
     ucall_client_t client {};
     ucall_client_config_t resolved {};
     std::vector<group_t> groups;
-    std::vector<group_t*> idle;
+    std::vector<std::size_t> idle; // Indices of `groups` waiting for their next arrival.
     std::vector<ucall_completed_call_t> completed;
     std::vector<origin_t> origins;
     latency_histogram_t latencies;
@@ -414,12 +374,14 @@ struct worker_t {
     bool ready {}, valid {};
 
     /** When this worker's arrival @p arrival is due, its turn on the one global schedule. */
-    std::uint64_t arrival_time(settings_t const& settings, std::uint64_t begin, std::size_t arrival) const noexcept {
-        auto global = static_cast<double>(index + arrival * workers);
-        return begin + static_cast<std::uint64_t>(global * nanoseconds_per_second_k / settings.rate);
+    time_point_t arrival_time(settings_t const& settings, time_point_t begin, std::size_t arrival) const noexcept {
+        double const global = static_cast<double>(index + arrival * workers);
+        return begin + std::chrono::duration_cast<std::chrono::nanoseconds>(
+                           std::chrono::duration<double> {global / static_cast<double>(settings.rate)});
     }
 
-    bool phase(settings_t const& settings, std::string const& payload, schedule_t schedule) {
+    bool phase(settings_t const& settings, std::string const& payload, schedule_t schedule,
+               ucall_noise_key_t const* server_key) {
         successful = failures = response_bytes = rejected = 0;
         first_error = nullptr;
         first_rejection = {};
@@ -431,7 +393,7 @@ struct worker_t {
             auto const& origin = origins[group.origin];
             return origin.result.issued == (measured ? origin.requests : origin.warmup_requests);
         };
-        auto issue = [&](group_t& group, std::uint64_t intended) {
+        auto issue = [&](group_t& group, time_point_t intended) {
             auto& origin = origins[group.origin];
             auto pair = origin.result.issued / width;
             for (std::size_t member = 0; member != width; ++member) {
@@ -441,26 +403,30 @@ struct worker_t {
                 ucall_client_call_t call {};
                 call.client = client;
                 call.outcome = &outcome;
-                call.url = view(settings.urls[group.origin]);
+                call.url = bytes_view(settings.urls[group.origin]);
                 call.verb = settings.verb;
-                call.body = view(payload);
+                call.body = bytes_view(payload);
                 call.context = &slot;
+                if (server_key && settings.urls[group.origin].starts_with("http+noise://")) {
+                    call.options.security = ucall_security_mode_noise_ik_k;
+                    call.options.server_key = server_key;
+                }
                 std::size_t headers = 0;
                 if (settings.reply_order == reply_order_t::reordered_k) {
                     auto length = std::snprintf(slot.pair_header, sizeof(slot.pair_header),
                                                 "x-ucall-pair: %llu:%zu:%zu",
                                                 static_cast<unsigned long long>(run_id + !measured), index,
                                                 pair * origins.size() + group.origin);
-                    slot.headers[headers++] = view({slot.pair_header, static_cast<std::size_t>(length)});
+                    slot.headers[headers++] = bytes_view({slot.pair_header, static_cast<std::size_t>(length)});
                     slot.pair = {slot.pair_header + sizeof("x-ucall-pair: ") - 1,
                                  static_cast<std::size_t>(length) - (sizeof("x-ucall-pair: ") - 1)};
-                    slot.headers[headers++] = view(member ? "x-ucall-member: 1" : "x-ucall-member: 0");
+                    slot.headers[headers++] = bytes_view(member ? "x-ucall-member: 1" : "x-ucall-member: 0");
                 }
                 if (settings.connection_reuse == connection_reuse_t::close_k)
-                    slot.headers[headers++] = view("connection: close");
+                    slot.headers[headers++] = bytes_view("connection: close");
                 call.headers = slot.headers.data();
                 call.headers_count = headers;
-                slot.intended_nanoseconds = intended;
+                slot.intended = intended;
                 ucall_client_call(&call);
                 if (outcome.status == ucall_status_success_k) {
                     ++outstanding;
@@ -474,36 +440,39 @@ struct worker_t {
             }
         };
         auto fill = [&](group_t& group) {
-            for (auto now = now_nanoseconds();
-                 !group.outstanding && !exhausted(group) && (!schedule.deadline || now < schedule.deadline);
-                 now = now_nanoseconds())
+            for (time_point_t now = clock_t::now(); !group.outstanding && !exhausted(group) && now < schedule.deadline;
+                 now = clock_t::now())
                 issue(group, now);
         };
-        // Returns the arrival an idle group waits for, or zero when only completions can help.
-        auto issue_due = [&]() -> std::uint64_t {
-            auto now = now_nanoseconds();
+        // Returns the arrival an idle group waits for, or the maximum when only completions help.
+        auto issue_due = [&]() -> time_point_t {
+            time_point_t const now = clock_t::now();
             while (!idle.empty()) {
-                auto intended = arrival_time(settings, schedule.begin, arrivals);
-                if (schedule.deadline && intended >= schedule.deadline) return 0;
+                time_point_t const intended = arrival_time(settings, schedule.begin, arrivals);
+                if (intended >= schedule.deadline) return time_point_t::max();
                 if (intended > now) return intended;
-                auto& group = *idle.back();
+                std::size_t const group_index = idle.back();
+                group_t& group = groups[group_index];
                 idle.pop_back();
                 if (exhausted(group)) continue;
                 issue(group, intended);
                 arrivals += width;
-                if (!group.outstanding) idle.push_back(&group);
+                if (!group.outstanding) idle.push_back(group_index);
             }
-            return 0;
+            return time_point_t::max();
         };
         idle.clear();
-        for (auto& group : groups)
-            if (settings.rate) idle.push_back(&group);
-            else fill(group);
+        for (std::size_t group_index = 0; group_index != groups.size(); ++group_index)
+            if (settings.rate) idle.push_back(group_index);
+            else fill(groups[group_index]);
         for (;;) {
-            auto wake = settings.rate ? issue_due() : 0;
-            if (!outstanding && !wake) break;
-            auto now = now_nanoseconds();
-            auto until_wake = std::chrono::nanoseconds(wake > now ? wake - now : 0);
+            time_point_t const wake = settings.rate ? issue_due() : time_point_t::max();
+            bool const waiting = wake != time_point_t::max();
+            if (!outstanding && !waiting) break;
+            time_point_t const now = clock_t::now();
+            std::chrono::nanoseconds const until_wake =
+                waiting && wake > now ? std::chrono::duration_cast<std::chrono::nanoseconds>(wake - now)
+                                      : std::chrono::nanoseconds {};
             if (!outstanding) {
                 std::this_thread::sleep_for(until_wake);
                 continue;
@@ -512,11 +481,11 @@ struct worker_t {
             std::size_t count {};
             ucall_client_take_completed_t take {client,           &outcome, completed.data(),
                                                 completed.size(), &count,   resolved.request_timeout_microseconds};
-            if (wake)
+            if (waiting)
                 take.timeout_microseconds = static_cast<std::size_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(until_wake).count());
             ucall_client_take_completed(&take);
-            auto completed_at = now_nanoseconds();
+            time_point_t const completed_at = clock_t::now();
             if (!succeeded(outcome, "Completion retrieval")) return false;
             for (std::size_t i = 0; i != count; ++i) {
                 auto const& completion = completed[i];
@@ -527,9 +496,10 @@ struct worker_t {
                 --outstanding;
                 --group.outstanding;
                 ++result.completed;
-                if (!result.first_completed) result.first_completed = completed_at;
+                if (result.completed == 1) result.first_completed = completed_at;
                 result.last_completed = completed_at;
-                auto elapsed = completed_at - slot.intended_nanoseconds;
+                std::uint64_t const elapsed = static_cast<std::uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(completed_at - slot.intended).count());
                 auto status = completion.outcome.status;
                 char const* error = status == ucall_status_success_k ? nullptr : ucall_status_name(status);
                 ucall_http_status_t http_status {};
@@ -542,18 +512,23 @@ struct worker_t {
                         ucall_client_response_body_t get {completion.response, &outcome, &body};
                         ucall_client_response_body(&get);
                         if (outcome.status != ucall_status_success_k) error = "response body unavailable";
-                        else if (settings.echo_check == echo_check_t::bytes_k) {
+                        else if (settings.body_check == body_check_t::echo_k) {
                             ++result.byte_checks;
                             if (body.length != payload.size() ||
                                 (body.length && std::memcmp(body.data, payload.data(), body.length)))
                                 error = "response body differs from request";
+                        }
+                        else if (settings.body_check == body_check_t::length_k) {
+                            ++result.byte_checks;
+                            if (body.length != settings.response_bytes) error = "response body has another length";
                         }
                         bytes = body.length;
                     }
                     if (!error && settings.reply_order == reply_order_t::reordered_k) {
                         for (auto name : {"x-ucall-pair", "x-ucall-member"}) {
                             ucall_bytes_view_t value {};
-                            ucall_client_response_header_t get {completion.response, &outcome, view(name), &value};
+                            ucall_client_response_header_t get {completion.response, &outcome, bytes_view(name),
+                                                                &value};
                             ucall_client_response_header(&get);
                             auto expected = std::string_view {name} == "x-ucall-pair" ? slot.pair
                                                                                       : (slot.member ? "1" : "0");
@@ -584,7 +559,7 @@ struct worker_t {
                 }
                 ucall_client_response_free(completion.response);
                 if (group.outstanding) continue;
-                if (settings.rate) idle.push_back(&group);
+                if (settings.rate) idle.push_back(slot.group);
                 else fill(group);
             }
         }
@@ -611,6 +586,8 @@ struct run_t {
     resources_t& resources;
     settings_t const& settings;
     std::string const& payload;
+    ucall_noise_key_t const* client_key {}; // Null without --client-key, and so is `server_key`.
+    ucall_noise_key_t const* server_key {};
     schedule_t schedule {};
     static void initialize(void* context, std::size_t index, std::size_t) {
         auto& run = *static_cast<run_t*>(context);
@@ -626,6 +603,8 @@ struct run_t {
         config.max_pipelined_calls = run.settings.pipeline_depth;
         config.backend = run.settings.backend;
         config.cpu_class = run.settings.cpu_class;
+        config.noise_private_key = run.client_key;
+        if (run.client_key) config.peer_authorizer = admit_any_peer;
         ucall_outcome_t outcome {};
         ucall_client_init_t init {&worker.client, &outcome, &config, &worker.resolved};
         ucall_client_init(&init);
@@ -635,13 +614,13 @@ struct run_t {
         auto& run = *static_cast<run_t*>(context);
         if (index < run.resources.workers.size()) {
             auto& worker = run.resources.workers[index];
-            worker.valid = worker.phase(run.settings, run.payload, run.schedule);
+            worker.valid = worker.phase(run.settings, run.payload, run.schedule, run.server_key);
         }
     }
     bool dispatch(phase_t phase, std::chrono::nanoseconds limit) {
         schedule.phase = phase;
-        schedule.begin = now_nanoseconds();
-        schedule.deadline = limit.count() ? schedule.begin + static_cast<std::uint64_t>(limit.count()) : 0;
+        schedule.begin = clock_t::now();
+        schedule.deadline = limit.count() ? schedule.begin + limit : time_point_t::max();
         return fu_pool_for_threads(resources.pool, execute, this) == fu_success_k;
     }
 };
@@ -668,7 +647,7 @@ static int run(settings_t const& settings) {
     }
     resources.workers.resize(clients);
     std::size_t capacity = 0;
-    auto run_id = now_nanoseconds();
+    std::uint64_t const run_id = static_cast<std::uint64_t>(clock_t::now().time_since_epoch().count());
     auto group_budget = settings.in_flight / width;
     if (settings.reply_order == reply_order_t::reordered_k)
         group_budget = std::min(group_budget, settings.connections / width);
@@ -725,9 +704,14 @@ static int run(settings_t const& settings) {
     }
     auto pinned = (effective & placement) == placement;
     std::string payload(settings.bytes, '\0');
-    std::uint64_t random_state = settings.seed;
-    for (auto& byte : payload) byte = static_cast<char>(next_random(random_state));
-    run_t run {resources, settings, payload};
+    std::uint64_t const key = fu::split_mix(settings.seed);
+    for (std::size_t index = 0; index != payload.size(); ++index)
+        payload[index] = static_cast<char>(fu::split_mix(key + index));
+    ucall_noise_key_t client_key {}, server_key {};
+    auto has_client_key = parse_key(settings.client_key, client_key);
+    auto has_server_key = parse_key(settings.server_key, server_key);
+    run_t run {resources, settings, payload, has_client_key ? &client_key : nullptr,
+               has_server_key ? &server_key : nullptr};
     if (fu_pool_for_threads(resources.pool, run_t::initialize, &run) != fu_success_k) return 1;
     for (auto const& worker : resources.workers)
         if (!worker.ready) return 1;
@@ -740,11 +724,9 @@ static int run(settings_t const& settings) {
                 return 1;
             }
     }
-    auto cpu_before = cpu_time();
-    auto begin = clock_t::now();
+    time_point_t const begin = clock_t::now();
     if (!run.dispatch(phase_t::measured_k, settings.time_limit)) return 1;
-    auto seconds = std::chrono::duration<double>(clock_t::now() - begin).count();
-    auto cpu_after = cpu_time();
+    double const seconds = std::chrono::duration<double>(clock_t::now() - begin).count();
     auto& workers = resources.workers;
     std::size_t successful = 0, failures = 0, rejected = 0, response_bytes = 0;
     bool valid = true;
@@ -766,6 +748,7 @@ static int run(settings_t const& settings) {
     std::uint64_t latency_max = 0;
     for (std::size_t origin_index = 0; origin_index != settings.urls.size(); ++origin_index) {
         auto& total = origins[origin_index];
+        total.first_completed = time_point_t::max();
         for (auto const& worker : workers) {
             auto const& result = worker.origins[origin_index].result;
             total.issued += result.issued;
@@ -778,8 +761,7 @@ static int run(settings_t const& settings) {
             total.reordered += result.reordered;
             total.latency_sum += result.latency_sum;
             total.latency_max = std::max(total.latency_max, result.latency_max);
-            if (result.first_completed && (!total.first_completed || result.first_completed < total.first_completed))
-                total.first_completed = result.first_completed;
+            if (result.completed) total.first_completed = std::min(total.first_completed, result.first_completed);
             total.last_completed = std::max(total.last_completed, result.last_completed);
         }
         latency_sum += total.latency_sum;
@@ -788,39 +770,35 @@ static int run(settings_t const& settings) {
     auto microseconds = [](auto nanoseconds) {
         return static_cast<double>(nanoseconds) / nanoseconds_per_microsecond_k;
     };
-    auto per_request = [&](std::chrono::nanoseconds spent) {
-        return successful ? microseconds((spent).count()) / successful : 0.0;
-    };
     auto mean = successful ? static_cast<double>(latency_sum / successful) / nanoseconds_per_microsecond_k : 0.0;
-    auto offset = [&](std::uint64_t at) {
-        return at ? static_cast<double>(at - run.schedule.begin) / nanoseconds_per_millisecond_k : 0.0;
+    auto offset = [&](origin_result_t const& total, time_point_t at) {
+        return total.completed ? std::chrono::duration<double, std::milli>(at - run.schedule.begin).count() : 0.0;
     };
     auto gigabytes_per_second = response_bytes / seconds / bytes_per_gigabyte_k;
     double const fractions[] = {0.5, 0.9, 0.99, 0.999, 0.9999};
     char const* const percentiles[] = {"p50", "p90", "p99", "p99.9", "p99.99"};
-    auto user = per_request(cpu_after.user - cpu_before.user),
-         system = per_request(cpu_after.system - cpu_before.system);
     auto load = settings.rate ? "open-loop" : "closed-loop";
+    auto security = has_server_key ? "ik" : has_client_key ? "xx" : "none";
     if (settings.format == output_format_t::json_k) {
         std::printf("{\"row\":\"configuration\",\"origins\":%zu,\"threads\":%zu,\"clients\":%zu,\"placement\":\"%s\","
                     "\"workload\":\"%s\",\"connection_reuse\":\"%s\",\"load\":\"%s\",\"rate_requests_per_second\":%zu,"
                     "\"connections\":%zu,\"in_flight_calls\":%zu,\"pipeline_depth\":%zu,\"request_body_bytes\":%zu,"
                     "\"warmup_requests\":%zu,\"warmup_seconds\":%.6f,\"measured_requests\":%zu,"
-                    "\"time_limit_seconds\":%.6f,\"seed\":%u}\n",
+                    "\"time_limit_seconds\":%.6f,\"seed\":%llu,\"security\":\"%s\"}\n",
                     settings.urls.size(), settings.threads, clients, pinned ? "pinned" : "floating",
                     settings.reply_order == reply_order_t::reordered_k ? "paired replies" : "ordinary",
                     settings.connection_reuse == connection_reuse_t::close_k ? "close" : "keep-alive", load,
                     settings.rate, settings.connections, capacity, settings.pipeline_depth, settings.bytes,
                     settings.warmup_requests, std::chrono::duration<double>(settings.warmup).count(), settings.requests,
-                    std::chrono::duration<double>(settings.time_limit).count(), settings.seed);
+                    std::chrono::duration<double>(settings.time_limit).count(),
+                    static_cast<unsigned long long>(settings.seed), security);
         std::printf("{\"row\":\"total\",\"successful_requests\":%zu,\"failed_requests\":%zu,\"rejected_requests\":%zu,"
                     "\"elapsed_seconds\":%.6f,\"throughput_requests_per_second\":%.1f,"
                     "\"response_body_gigabytes_per_second\":%.3f,\"latency_mean_us\":%.2f",
                     successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second, mean);
         for (std::size_t i = 0; i != std::size(fractions); ++i)
             std::printf(",\"latency_%s_us\":%.2f", percentiles[i], microseconds(latencies.percentile(fractions[i])));
-        std::printf(",\"latency_max_us\":%.2f,\"cpu_user_us_per_request\":%.3f,\"cpu_system_us_per_request\":%.3f}\n",
-                    microseconds(latency_max), user, system);
+        std::printf(",\"latency_max_us\":%.2f}\n", microseconds(latency_max));
         for (std::size_t origin_index = 0; origin_index != origins.size(); ++origin_index) {
             auto const& total = origins[origin_index];
             std::printf("{\"row\":\"origin\",\"index\":%zu,\"url\":", origin_index);
@@ -834,7 +812,8 @@ static int run(settings_t const& settings) {
                         total.successful
                             ? static_cast<double>(total.latency_sum / total.successful) / nanoseconds_per_microsecond_k
                             : 0.0,
-                        microseconds(total.latency_max), offset(total.first_completed), offset(total.last_completed));
+                        microseconds(total.latency_max), offset(total, total.first_completed),
+                        offset(total, total.last_completed));
         }
         for (std::size_t i = 0; i != workers.size(); ++i)
             std::printf("{\"row\":\"worker\",\"index\":%zu,\"backend\":\"%s\",\"cpu_class\":\"%s\","
@@ -842,9 +821,9 @@ static int run(settings_t const& settings) {
                         i, ucall_io_backend_name(workers[i].resolved.backend),
                         ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
                         workers[i].failures);
-        std::fputs("Server counters: stop the echo example with SIGINT or SIGTERM and divide its exit line by its "
-                   "requests\n",
-                   stderr);
+        std::fputs(
+            "Server counters: stop the server with SIGINT or SIGTERM; with --stats json it prints them as JSON\n",
+            stderr);
     }
     else {
         std::printf("Configuration\n  Origins: %zu\n  ForkUnion workers: %zu, %s\n  Clients: %zu\n  Workload: %s\n"
@@ -855,8 +834,12 @@ static int run(settings_t const& settings) {
                     load);
         if (settings.rate) std::printf(" at %zu requests/s", settings.rate);
         std::printf("\n  Connections: %zu\n  In-flight calls: %zu\n  Pipeline depth: %zu\n"
-                    "  Request body: %zu bytes, seed %u\n",
-                    settings.connections, capacity, settings.pipeline_depth, settings.bytes, settings.seed);
+                    "  Request body: %zu bytes, seed %llu\n  Security: %s\n",
+                    settings.connections, capacity, settings.pipeline_depth, settings.bytes,
+                    static_cast<unsigned long long>(settings.seed),
+                    has_server_key   ? "Noise IK"
+                    : has_client_key ? "Noise XX"
+                                     : "plaintext");
         // Zero leaves a phase to its other bound.
         for (auto [name, requests, limit] : {std::tuple {"Warmup", settings.warmup_requests, settings.warmup},
                                              std::tuple {"Measured", settings.requests, settings.time_limit}}) {
@@ -871,8 +854,7 @@ static int run(settings_t const& settings) {
                     successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second, mean);
         for (std::size_t i = 0; i != std::size(fractions); ++i)
             std::printf(", %s %.2f us", percentiles[i], microseconds(latencies.percentile(fractions[i])));
-        std::printf(", max %.2f us\n  Client CPU: user %.3f us/request, system %.3f us/request\n",
-                    microseconds(latency_max), user, system);
+        std::printf(", max %.2f us\n", microseconds(latency_max));
         for (std::size_t origin_index = 0; origin_index != origins.size(); ++origin_index) {
             auto const& total = origins[origin_index];
             std::printf(
@@ -884,15 +866,17 @@ static int run(settings_t const& settings) {
                 total.successful
                     ? static_cast<double>(total.latency_sum / total.successful) / nanoseconds_per_microsecond_k
                     : 0.0,
-                microseconds(total.latency_max), offset(total.first_completed), offset(total.last_completed));
+                microseconds(total.latency_max), offset(total, total.first_completed),
+                offset(total, total.last_completed));
         }
         for (std::size_t i = 0; i != workers.size(); ++i)
             std::printf("  Worker %zu: %s, %s, %zu successful requests, %zu failed requests\n", i,
                         ucall_io_backend_name(workers[i].resolved.backend),
                         ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
                         workers[i].failures);
-        std::printf("Server counters\n  Stop the echo example with SIGINT or SIGTERM: it prints one line per loop.\n"
-                    "  Divide its submissions, completions, kernel enters and bytes copied by its requests.\n");
+        std::printf(
+            "Server counters\n  Stop the server with SIGINT or SIGTERM: it prints one line per loop and batch "
+            "endpoint.\n  Divide its submissions, completions, kernel enters and bytes copied by its requests.\n");
     }
     if (!successful) return 1;
     auto complete = settings.time_limit.count() || successful == settings.requests;

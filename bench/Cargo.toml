@@ -1,0 +1,39 @@
+# Rust servers comparing UCall's bindings with axum, actix-web and tonic under the same load generators.
+[package]
+name = "ucall-bench"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[[bin]]
+name = "ucall_server"
+path = "ucall_server.rs"
+
+[[bin]]
+name = "axum_server"
+path = "axum_server.rs"
+
+[[bin]]
+name = "actix_server"
+path = "actix_server.rs"
+
+[[bin]]
+name = "tonic_server"
+path = "tonic_server.rs"
+
+[[bin]]
+name = "grpc_client"
+path = "grpc_client.rs"
+
+[dependencies]
+ucall = { path = ".." }
+axum = "0.8"
+tokio = { version = "1", features = ["rt-multi-thread", "net"] }
+actix-web = { version = "4", default-features = false, features = ["macros"] }
+serde = { version = "1", features = ["derive"] }
+tonic = "0.14"
+tonic-prost = "0.14"
+prost = "0.14"
+
+[build-dependencies]
+tonic-prost-build = "0.14"

@@ -1,0 +1,27 @@
+/**
+ *  @file bench/bench.proto
+ *  @author Ash Vardanian
+ *  @date October 19, 2026
+ *  @brief The echo and sum workloads for the Python and Rust gRPC servers and their load generators.
+ */
+syntax = "proto3";
+
+package ucall.bench;
+
+service Bench {
+    rpc Echo(Payload) returns (Payload);
+    rpc Sum(Operands) returns (Total);
+}
+
+message Payload {
+    bytes data = 1;
+}
+
+message Operands {
+    int64 a = 1;
+    int64 b = 2;
+}
+
+message Total {
+    int64 sum = 1;
+}

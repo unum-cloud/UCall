@@ -10,3 +10,7 @@
 	path = smashtable
 	url = https://github.com/ashvardanian/SmashTable
 	branch = main-v1
+[submodule "numkong"]
+	path = numkong
+	url = https://github.com/ashvardanian/NumKong
+	branch = main-v8

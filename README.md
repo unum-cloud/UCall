@@ -24,7 +24,7 @@
 
 UCall is a ¹ performance-oriented, ² portable, and ³ compact HTTP/RPC framework, with a ⁴ twist!
 How ¹ fast?
-About 263,000 requests/s for a 1 KiB loopback echo in the [current Razer snapshot](bench/README.md#razer-snapshot-october-19-2026), with the workload and backend choices recorded alongside the results.
+About 291,000 1 KiB echoes per second from one server thread natively, about 278,000 through its Rust bindings and about 268,000 through its Python bindings, against about 83,000 for gRPC on tonic, 21,000 for FastAPI and 15,000 for Python gRPC, in the [framework comparison](bench/README.md#framework-comparison).
 How ² portable?
 A C ABI fronts a C++20 core with POSIX, Linux epoll and io_uring, macOS/FreeBSD kqueue, and Windows IOCP backends.
 Python and Rust bindings wrap that ABI directly, with the same caller-owned polling threads.
@@ -35,16 +35,15 @@ For encrypted native connections, it uses the Noise secure communication protoco
 
 Moreover, it's easy to use synchronous handlers, even when the underlying backend uses asynchronous IO like Linux `io_uring`.
 And it provides server-side batching for high-latency batch-processing endpoints, like GPU inference tasks and OLAP database queries.
-The [native examples](examples/README.md) demonstrate binary echo, conditional key-value writes, and atomic ledger transfers through the current C ABI.
+The [native examples](examples/README.md) demonstrate binary echo, conditional key-value writes, atomic ledger transfers, and batched inference through the C ABI.
 
 ## 📊 FastAPI UX Comparison
 
-The UCall column shows the intended Python SDK experience; that SDK is awaiting migration and the sketch is not runnable against this branch.
-The working native interface and build examples are documented in [the C guide](c/README.md) and [examples](examples/README.md).
+Both columns serve the same typed endpoint; UCall's [Python bindings](python/README.md) bind its parameters in C and answer on the polling thread.
 
 <table width="100%">
 <tr>
-<th width="50%">FastAPI</th><th width="50%">UCall Python SDK — planned</th>
+<th width="50%">FastAPI</th><th width="50%">UCall</th>
 </tr>
 <tr>
 <td>
@@ -56,8 +55,9 @@ pip install fastapi uvicorn
 </td>
 <td>
 
-Python SDK migration pending.
-Build and run the [native examples](examples/README.md) today.
+```sh
+pip install ucall
+```
 
 </td>
 </tr>
@@ -81,9 +81,9 @@ uvicorn.run(server, host='0.0.0.0', port=8000)
 <td>
 
 ```python
-from ucall import Server
+import ucall
 
-server = Server()
+server = ucall.Server(ucall.Interface('0.0.0.0:8000'))
 
 @server.get('/sum')
 def sum(a: int, b: int):
@@ -102,8 +102,8 @@ The native [benchmark driver](bench/README.md) measures complete HTTP exchanges 
 It runs closed-loop by default, or open-loop at a fixed arrival rate that charges each call its delay from the intended send time.
 Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
 On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
-The [October 19 Razer snapshot](bench/README.md#razer-snapshot-october-19-2026) measured about 263,000 requests/s for 1 KiB plaintext loopback echo, with one POSIX server polling thread and two fixed io_uring 7.0 client polling threads.
-The report separates server and client backend comparisons, retained replies, connection churn, large payloads, and independent offered-rate runs.
+The [framework comparison](bench/README.md#framework-comparison) serves a 1 KiB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
+The guide also measures pipelining depth, Noise against TLS 1.3 behind nginx, scaling across event loops, and 10,000 connections.
 The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, streaming, and authorization plans below are labeled as such.
 
 ## Design Principles

@@ -1,4 +1,4 @@
-"""Measure fixed-count binary echo exchanges through Python's asynchronous gRPC client.
+"""Measure fixed-count echo or sum calls through Python's asynchronous gRPC client.
 
 File: bench/grpc_client.py
 Author: Ash Vardanian
@@ -9,11 +9,13 @@ import argparse
 import asyncio
 import math
 import time
+from collections.abc import Awaitable, Callable
 from contextlib import AsyncExitStack
 
-import echo_pb2
-import echo_pb2_grpc
+import bench_pb2
+import bench_pb2_grpc
 import grpc
+from google.protobuf.message import Message
 
 
 def count(value: str) -> int:
@@ -25,21 +27,24 @@ def count(value: str) -> int:
 
 
 async def phase(
-    stubs: list[echo_pb2_grpc.EchoStub], payload: bytes, requests: int, concurrency: int
+    methods: list[Callable[[Message], Awaitable[Message]]],
+    request: Message,
+    expected: Message,
+    requests: int,
+    concurrency: int,
 ) -> tuple[list[int], int, float]:
     """Complete exactly the requested attempts using a fixed set of asynchronous workers."""
     samples = [0] * requests
     failures = [0] * concurrency
-    message = echo_pb2.Payload(data=payload)
 
     async def worker(worker_index: int) -> None:
-        stub = stubs[worker_index % len(stubs)]
+        method = methods[worker_index % len(methods)]
         for request_index in range(worker_index, requests, concurrency):
             begin = time.perf_counter_ns()
             try:
-                response = await stub.Exchange(message)
+                response = await method(request)
                 elapsed = time.perf_counter_ns() - begin
-                if response.data != payload:
+                if response != expected:
                     failures[worker_index] += 1
                 else:
                     samples[request_index] = elapsed
@@ -53,7 +58,12 @@ async def phase(
 
 async def run(args: argparse.Namespace) -> int:
     """Warm the channels, then report the measured request count and verified latencies."""
-    payload = b"\0" + b"x" * (args.bytes - 1) if args.bytes else b""
+    if args.workload == "echo":
+        request = bench_pb2.Payload(data=b"\0" + b"x" * (args.bytes - 1) if args.bytes else b"")
+        expected = request
+    else:
+        request = bench_pb2.Operands(a=17, b=25)
+        expected = bench_pb2.Total(sum=42)
     options = (
         ("grpc.max_receive_message_length", -1),
         ("grpc.max_send_message_length", -1),
@@ -65,17 +75,18 @@ async def run(args: argparse.Namespace) -> int:
             for _ in range(args.connections)
         ]
         await asyncio.gather(*(channel.channel_ready() for channel in channels))
-        stubs = [echo_pb2_grpc.EchoStub(channel) for channel in channels]
-        _, failures, _ = await phase(stubs, payload, args.warmup_requests, args.concurrency)
+        stubs = [bench_pb2_grpc.BenchStub(channel) for channel in channels]
+        methods = [stub.Echo if args.workload == "echo" else stub.Sum for stub in stubs]
+        _, failures, _ = await phase(methods, request, expected, args.warmup_requests, args.concurrency)
         if failures:
-            print(f"Warmup failed: {failures} exchanges")
+            print(f"Warmup failed: {failures} calls")
             return 1
-        samples, failures, elapsed = await phase(stubs, payload, args.requests, args.concurrency)
+        samples, failures, elapsed = await phase(methods, request, expected, args.requests, args.concurrency)
     successful = [sample for sample in samples if sample]
     print(f"Requests: {args.requests}, successful: {len(successful)}, failures: {failures}")
     if not successful:
         return 1
-    print(f"Connections: {args.connections}, in-flight calls: {args.concurrency}, payload bytes: {args.bytes}")
+    print(f"Workload: {args.workload}, connections: {args.connections}, in-flight calls: {args.concurrency}")
     print(f"Elapsed: {elapsed:.6f} s, throughput: {len(successful) / elapsed:.1f} requests/s")
     mean = sum(successful) / len(successful) / 1e3
     successful.sort()
@@ -87,14 +98,15 @@ async def run(args: argparse.Namespace) -> int:
 
 
 def main() -> None:
-    """Select the request count, payload size, and transport concurrency."""
+    """Select the workload, request count, payload size, and transport concurrency."""
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("address", nargs="?", default="127.0.0.1:8546")
+    parser.add_argument("address", nargs="?", default="127.0.0.1:8545")
+    parser.add_argument("--workload", choices=("echo", "sum"), default="echo", help="Echo the payload or add 17 and 25")
     parser.add_argument("--requests", type=count, required=True)
     parser.add_argument("--warmup-requests", type=count, default=0)
     parser.add_argument("--connections", type=count, default=1)
     parser.add_argument("--concurrency", type=count, default=64)
-    parser.add_argument("--bytes", type=count, default=1024)
+    parser.add_argument("--bytes", type=count, default=1024, help="Echo payload bytes")
     args = parser.parse_args()
     if not args.requests or not args.connections or not args.concurrency:
         parser.error("--requests, --connections and --concurrency must be positive")

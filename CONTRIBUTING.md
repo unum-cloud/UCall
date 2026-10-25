@@ -17,12 +17,13 @@ ctest --preset debug
 ```
 
 The `relwithdebinfo` and `release` presets build the same suites with optimization.
-StringZilla, ForkUnion, and SmashTable resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, and `FETCHCONTENT_SOURCE_DIR_SMASHTABLE` select existing checkouts.
+StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
 The build exposes one library as `ucall::ucall`.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLL`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
 CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
 
-`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_echo`, `ucall_example_ledger`, and `ucall_example_redis`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http`.
+`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
+They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python-builds) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust-builds) describe.
 
@@ -35,7 +36,7 @@ Native suites live in `test/`, the C caller in `c/test.c`, and benchmark clients
 UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset debug
 ```
 
-Python suites sit beside them as `test/serving.py` and `test/calling.py`, and Rust tests sit in each module of `rust/`.
+Python suites sit beside them as `test/server.py` and `test/client.py`, and Rust tests sit in each module of `rust/`.
 
 ## Python Builds
 

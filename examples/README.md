@@ -1,31 +1,29 @@
 # UCall Examples
 
 The native examples use the public C ABI and run with any compiled transport backend.
-They bind loopback and accept `--backend`, `--cpu-class`, `--threads`, and `--port`.
+They bind loopback unless `--host` names another address, and accept `--backend`, `--cpu-class`, `--threads`, `--port`, and the pipelining, Noise, batch-budget, and `--stats` flags the [benchmark guide](../bench/README.md) lists.
 The backend defaults to automatic, the CPU class to serial, and the application polling thread count to one; the port defaults to 8545.
 
-| Example                             | Individual endpoints                                | Batched endpoint                      |
-| :---------------------------------- | :-------------------------------------------------- | :------------------------------------ |
-| [Echo](echo/server.cpp)             | `POST /echo`, `GET /health`                         | `POST /echo/batch`                    |
-| [Key-value store](redis/server.cpp) | `GET`, `PUT`, `DELETE /kv/{key}`                    | The same methods at `/batch/kv/{key}` |
-| [Ledger](ledger/server.cpp)         | `GET /accounts/{id}`, `POST /transfers/{from}/{to}` | `POST /batch/transfers/{from}/{to}`   |
+| Example                            | Individual endpoints                                | Batched endpoint                        |
+| :--------------------------------- | :-------------------------------------------------- | :-------------------------------------- |
+| [Echo](echo/README.md)             | `POST /echo`, `POST /echo/reordered`                | `POST /echo/batch`                      |
+| [Key-value store](redis/README.md) | `GET`, `PUT`, `DELETE /kv/{key}`                    | The same methods at `/batch/kv/{key}`   |
+| [Ledger](ledger/README.md)         | `GET /accounts/{id}`, `POST /transfers/{from}/{to}` | `POST /batch/transfers/{from}/{to}`     |
+| [Inference](inference/README.md)   | `POST /infer`                                       | `POST /infer/batch`, `POST /slow/batch` |
 
-Each batch callback receives a borrowed array of request handles and its count, and reuses the individual handler for each request.
-These routes coalesce requests from every polling loop without waiting for a minimum group size.
-The last pool thread drains the batch endpoint through the handle its registration returned, so batch callbacks never run on a polling loop.
+Every example also answers `GET /health` with `ready`.
+Each one is a single `server.cpp` over the flag parsing, polling loops, error replies and shutdown of `tools/server.hpp`, which the native benchmark server shares.
+
+Each batch callback receives a borrowed array of request handles and its count, and views them once as a `std::span`; the echo, key-value, and ledger callbacks reuse the individual handler for each request.
+These routes coalesce requests from every polling loop under the `--batch-min`, `--batch-max`, and `--batch-latency-us` budgets.
+Every batch endpoint gets a pool thread of its own that drains it through the handle its registration returned, so batch callbacks never run on a polling loop and a slow endpoint never holds another's batches.
+The inference example's `/infer/batch` scores a whole batch with one NumKong packed GEMM across a ForkUnion pool, and `/slow/batch` sleeps in its callback to test that isolation.
 Each request keeps its own response; ledger transfers and key-value operations keep their individual transaction boundaries.
 
-The echo service also exposes `POST /echo/reordered` for the benchmark driver's `--reorder` workload.
-It retains a tagged request until its partner arrives, then publishes the second member's response before the first without blocking the polling caller.
-This demonstrates delayed retained replies; socket arrival and client polling order remain independently observable.
-
-Build with `UCALL_BUILD_EXAMPLES=ON` and select `ucall_example_echo`, `ucall_example_redis`, or `ucall_example_ledger`.
+Build with `UCALL_BUILD_EXAMPLES=ON` and select `ucall_example_echo`, `ucall_example_redis`, `ucall_example_ledger`, or `ucall_example_inference`.
 Each executable selects among the backends compiled into the single UCall library.
 `--connections` supplies the admission budget, and `--threads` selects the application-owned polling loops.
 The application dispatches those loops through its ForkUnion pool; UCall creates no threads.
-Individual callbacks run on the polling caller, and the examples stop and join their threads on SIGINT or SIGTERM.
-The [benchmark driver](../bench/README.md) measures the same raw HTTP echo workload across backends.
-
-[fastapi_server.py](fastapi_server.py) exposes the same echo and health routes for a Python comparison.
-Run it with `uvicorn examples.fastapi_server:app --host 127.0.0.1 --port 8545`.
-[fastapi_client.py](fastapi_client.py) checks either server with `python examples/fastapi_client.py`.
+Individual callbacks run on the polling caller.
+`SIGINT` or `SIGTERM` sets a flag the main thread checks every 100 ms, after which the examples stop and join their threads.
+The [benchmarks](../bench/README.md) run their own servers, so these stay applications rather than measurement fixtures.
