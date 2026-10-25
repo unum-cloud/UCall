@@ -140,14 +140,15 @@ int main(int argc, char** argv) {
     add.callback = health;
     ucall_server_add_http_endpoint(&add);
     if (!application.succeeded(outcome)) return 1;
-    ucall_server_add_batch_endpoint_t batch {};
+    ucall_server_add_http_batch_endpoint_t batch {};
     batch.server = application.server;
     batch.outcome = &outcome;
     batch.uri_template = view("/echo/batch");
     batch.verb = ucall_verb_post_k;
     batch.callback = echo_batch;
     batch.context = &application.server;
-    ucall_server_add_batch_endpoint(&batch);
+    batch.endpoint = &application.batch_endpoint;
+    ucall_server_add_http_batch_endpoint(&batch);
     if (!application.succeeded(outcome)) return 1;
     auto result = application.run();
     // The last ForkUnion thread drains batches rather than polling an event loop.

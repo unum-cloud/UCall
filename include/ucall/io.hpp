@@ -11,6 +11,7 @@
 #include <ctime>
 
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <new>
 
@@ -167,6 +168,14 @@ enum class io_wait_t { blocking_k, nonblocking_k };
 
 enum class io_operation_t { accept_k, connect_k, receive_k, send_k, read_k, close_k };
 
+/** The readiness an operation waits for; a socket keeps at most one pending operation per
+ *  direction. */
+enum class io_direction_t : std::uint8_t { receive_k, transmit_k };
+inline io_direction_t io_direction(io_operation_t operation) noexcept {
+    return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? io_direction_t::transmit_k
+                                                                                         : io_direction_t::receive_k;
+}
+
 /** The submitter keeps this request and its buffer alive until its completion is polled. */
 struct io_request_t {
     io_operation_t operation {io_operation_t::receive_k};
@@ -261,6 +270,33 @@ struct wake_channel_t {
         while (send(static_cast<int>(descriptors[1]), &value, 1, flags) < 0 && errno == EINTR) {}
 #endif // UCALL_OS_WINDOWS_
     }
+
+    /** Blocks until a notification or the monotonic @p deadline, zero meaning none, then empties a
+     *  channel whose read end no engine imported. */
+    void wait(std::uint64_t deadline) noexcept {
+        auto now = monotonic_ns();
+        auto remaining = deadline > now ? deadline - now : 0;
+#if UCALL_OS_LINUX_
+        timespec timeout {static_cast<time_t>(remaining / 1000000000), static_cast<long>(remaining % 1000000000)};
+        pollfd polled {static_cast<int>(descriptors[0]), POLLIN, 0};
+        ::ppoll(&polled, 1, deadline ? &timeout : nullptr, nullptr);
+        while (recv(static_cast<int>(descriptors[0]), bytes, sizeof(bytes), 0) > 0) {}
+#else
+        int timeout = -1;
+        if (deadline)
+            timeout = static_cast<int>(std::min<std::uint64_t>(remaining / 1000000 + (remaining % 1000000 != 0),
+                                                               std::numeric_limits<int>::max()));
+#if UCALL_OS_WINDOWS_
+        WSAPOLLFD polled {static_cast<SOCKET>(descriptors[0]), POLLRDNORM, 0};
+        WSAPoll(&polled, 1, timeout);
+        while (recv(static_cast<SOCKET>(descriptors[0]), reinterpret_cast<char*>(bytes), sizeof(bytes), 0) > 0) {}
+#else
+        pollfd polled {static_cast<int>(descriptors[0]), POLLIN, 0};
+        ::poll(&polled, 1, timeout);
+        while (recv(static_cast<int>(descriptors[0]), bytes, sizeof(bytes), 0) > 0) {}
+#endif // UCALL_OS_WINDOWS_
+#endif // UCALL_OS_LINUX_
+    }
 };
 
 /** An intrusive FIFO of engine operations, linked through their `next` indices. */
@@ -294,7 +330,7 @@ struct readiness_operation_t {
 
 #if UCALL_OS_POSIX_
 inline short io_events(io_operation_t operation) noexcept {
-    return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? POLLOUT : POLLIN;
+    return io_direction(operation) == io_direction_t::transmit_k ? POLLOUT : POLLIN;
 }
 enum class io_interest_t { unarmed_k, armed_k, ready_k };
 
@@ -489,7 +525,8 @@ using posix_engine_t = posix_engine<>;
 
 #if UCALL_OS_POSIX_
 
-/** Each descriptor stays registered edge-triggered until closed, aimed at its latest operation. */
+/** Each descriptor stays registered edge-triggered until `close_socket` or a close request, aimed
+ *  at its latest operation in each direction. */
 template <typename readiness_type_, typename allocator_type_ = st::default_allocator<byte_t>>
 struct readiness_engine {
     using allocator_t = allocator_type_;
@@ -590,8 +627,9 @@ struct readiness_engine {
                 } while (fired && result == -EINTR);
             }
             if (io_pending(result) && !fired) {
-                tally(statistics.kernel_enters);
-                if (int armed = readiness.arm(request.descriptor, index); armed < 0) result = armed;
+                io_direction_t direction = io_direction(request.operation);
+                if (int armed = readiness.arm(request.descriptor, direction, index, statistics); armed < 0)
+                    result = armed;
             }
             if (io_pending(result)) operation.interest = io_interest_t::armed_k;
             else completions[count++] = finish(index, result);
@@ -642,37 +680,101 @@ struct readiness_engine {
 #endif
 
 #if UCALL_OS_LINUX_
+
+/** One registered descriptor and the operation waiting in each direction. */
+struct readiness_watch_t {
+    std::int32_t descriptor {-1};
+    std::uint32_t generation {}; // Rides in the event, so stale events never wake a reused watch.
+    std::uint32_t receive_operation {operation_list_t::absent_k};
+    std::uint32_t transmit_operation {operation_list_t::absent_k};
+};
+static_assert(sizeof(readiness_watch_t) == 16);
+
+/** Registers each descriptor once; a descriptor-addressed index finds its watch,
+ *  at most half full. */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
 struct epoll_readiness {
     using allocator_t = allocator_type_;
     template <typename other_allocator_>
     using rebind_allocator = epoll_readiness<other_allocator_>;
-    using events_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<epoll_event>;
-    explicit epoll_readiness(allocator_t const& allocator = {}) noexcept : events(events_allocator_t {allocator}) {}
+    template <typename value_type_>
+    using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
+    static constexpr std::uint32_t absent_k = operation_list_t::absent_k;
+    explicit epoll_readiness(allocator_t const& allocator = {}) noexcept
+        : events(rebound_allocator<epoll_event> {allocator}), watches(rebound_allocator<readiness_watch_t> {allocator}),
+          watch_slots(rebound_allocator<std::uint32_t> {allocator}),
+          free_watches(rebound_allocator<std::uint32_t> {allocator}) {}
     epoll_readiness(epoll_readiness const&) = delete;
     epoll_readiness& operator=(epoll_readiness const&) = delete;
     epoll_readiness(epoll_readiness&&) = delete;
     epoll_readiness& operator=(epoll_readiness&&) = delete;
     int descriptor {-1};
-    st::basic_vector<epoll_event, events_allocator_t> events {};
+    st::basic_vector<epoll_event, rebound_allocator<epoll_event>> events {};
+    st::basic_vector<readiness_watch_t, rebound_allocator<readiness_watch_t>> watches {};
+    st::basic_vector<std::uint32_t, rebound_allocator<std::uint32_t>> watch_slots {}, free_watches {};
     ucall_status_t open(std::size_t capacity) noexcept {
-        if (st::failed(events.resize(capacity))) return ucall_status_out_of_memory_k;
+        if (st::failed(events.resize(capacity)) || st::failed(watches.resize(capacity)) ||
+            st::failed(watch_slots.resize(std::bit_ceil(capacity * 2))) || st::failed(free_watches.reserve(capacity)))
+            return ucall_status_out_of_memory_k;
+        free_watches.clear();
+        for (std::size_t index = 0; index != capacity; ++index) {
+            watches[index] = {};
+            (void)free_watches.push_back(st::assume_reserved, static_cast<std::uint32_t>(index));
+        }
+        for (auto& slot : watch_slots) slot = absent_k;
         descriptor = epoll_create1(EPOLL_CLOEXEC);
         return descriptor < 0 ? ucall_status_io_k : ucall_status_success_k;
     }
 
-    /** Re-points the descriptor's registration at operation @p index, adding it on first use. */
-    int arm(descriptor_t watched, unsigned index) noexcept {
-        epoll_event event {};
-        event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
-        // The descriptor rides beside the index, so its stale events never wake a reused operation.
-        event.data.u64 = std::uint64_t {index} << 32 | static_cast<std::uint32_t>(watched);
-        if (epoll_ctl(descriptor, EPOLL_CTL_MOD, static_cast<int>(watched), &event) == 0) return 0;
-        if (errno != ENOENT) return -errno;
-        return epoll_ctl(descriptor, EPOLL_CTL_ADD, static_cast<int>(watched), &event) == 0 ? 0 : -errno;
+    /** The slot naming the watch of @p watched, or the vacant slot that ends its probe. */
+    std::size_t slot_of(descriptor_t watched) const noexcept {
+        std::size_t mask = watch_slots.size() - 1;
+        std::size_t slot = static_cast<std::size_t>(watched) & mask;
+        while (watch_slots[slot] != absent_k && watches[watch_slots[slot]].descriptor != watched)
+            slot = (slot + 1) & mask;
+        return slot;
     }
+
+    /** Points @p direction of the descriptor's watch at operation @p index,
+     *  registering it on first use. */
+    int arm(descriptor_t watched, io_direction_t direction, unsigned index, io_statistics_t& statistics) noexcept {
+        std::size_t slot = slot_of(watched);
+        if (watch_slots[slot] == absent_k) {
+            if (free_watches.empty()) return -ENOBUFS;
+            std::uint32_t chosen = free_watches.back();
+            epoll_event event {};
+            event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
+            event.data.u64 = std::uint64_t {chosen} << 32 | watches[chosen].generation;
+            tally(statistics.kernel_enters);
+            if (epoll_ctl(descriptor, EPOLL_CTL_ADD, static_cast<int>(watched), &event) != 0) return -errno;
+            free_watches.pop_back();
+            watches[chosen].descriptor = static_cast<std::int32_t>(watched);
+            watch_slots[slot] = chosen;
+        }
+        readiness_watch_t& watch = watches[watch_slots[slot]];
+        (direction == io_direction_t::receive_k ? watch.receive_operation : watch.transmit_operation) = index;
+        return 0;
+    }
+
+    /** Unregisters @p watched and frees its watch, shifting back the probe run behind it. */
     void remove(descriptor_t watched) noexcept {
+        std::size_t slot = slot_of(watched);
+        std::uint32_t chosen = watch_slots[slot];
+        if (chosen == absent_k) return;
         epoll_ctl(descriptor, EPOLL_CTL_DEL, static_cast<int>(watched), nullptr);
+        watches[chosen] = {-1, watches[chosen].generation + 1};
+        (void)free_watches.push_back(st::assume_reserved, std::uint32_t {chosen});
+        std::size_t mask = watch_slots.size() - 1;
+        for (std::size_t next = (slot + 1) & mask; watch_slots[next] != absent_k; next = (next + 1) & mask) {
+            std::size_t home = static_cast<std::size_t>(watches[watch_slots[next]].descriptor) & mask;
+            // Linear probing finds an entry only while no vacancy lies
+            // between its home and its slot.
+            if (((next - home) & mask) >= ((next - slot) & mask)) {
+                watch_slots[slot] = watch_slots[next];
+                slot = next;
+            }
+        }
+        watch_slots[slot] = absent_k;
     }
     template <typename callback_type_>
     int wait(int timeout, callback_type_&& fired) noexcept {
@@ -682,10 +784,12 @@ struct epoll_readiness {
         if (count < 0) return -errno;
         for (int i = 0; i != count; ++i) {
             auto flags = events[i].events;
-            short directions = (flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR) ? POLLIN : 0) |
-                               (flags & (EPOLLOUT | EPOLLHUP | EPOLLERR) ? POLLOUT : 0);
-            fired(static_cast<unsigned>(events[i].data.u64 >> 32),
-                  static_cast<descriptor_t>(static_cast<std::uint32_t>(events[i].data.u64)), directions);
+            readiness_watch_t const& watch = watches[static_cast<std::size_t>(events[i].data.u64 >> 32)];
+            if (watch.generation != static_cast<std::uint32_t>(events[i].data.u64)) continue;
+            if ((flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) && watch.receive_operation != absent_k)
+                fired(watch.receive_operation, watch.descriptor, short {POLLIN});
+            if ((flags & (EPOLLOUT | EPOLLHUP | EPOLLERR)) && watch.transmit_operation != absent_k)
+                fired(watch.transmit_operation, watch.descriptor, short {POLLOUT});
         }
         return count;
     }
@@ -718,13 +822,15 @@ struct kqueue_readiness {
         return ucall_status_io_k;
     }
 
-    /** Re-points both filters of the descriptor at operation @p index, adding them on first use. */
-    int arm(descriptor_t watched, unsigned index) noexcept {
-        struct kevent changes[2] {};
-        auto* context = reinterpret_cast<void*>(static_cast<std::uintptr_t>(index));
-        EV_SET(&changes[0], static_cast<std::uintptr_t>(watched), EVFILT_READ, EV_ADD | EV_CLEAR, 0, 0, context);
-        EV_SET(&changes[1], static_cast<std::uintptr_t>(watched), EVFILT_WRITE, EV_ADD | EV_CLEAR, 0, 0, context);
-        return kevent(descriptor, changes, 2, nullptr, 0, nullptr) == 0 ? 0 : -errno;
+    /** Points the @p direction filter of the descriptor at operation @p index,
+     *  adding it on first use. */
+    int arm(descriptor_t watched, io_direction_t direction, unsigned index, io_statistics_t& statistics) noexcept {
+        struct kevent change {};
+        short filter = direction == io_direction_t::receive_k ? EVFILT_READ : EVFILT_WRITE;
+        EV_SET(&change, static_cast<std::uintptr_t>(watched), filter, EV_ADD | EV_CLEAR, 0, 0,
+               reinterpret_cast<void*>(static_cast<std::uintptr_t>(index)));
+        tally(statistics.kernel_enters);
+        return kevent(descriptor, &change, 1, nullptr, 0, nullptr) == 0 ? 0 : -errno;
     }
     // Closing a descriptor drops its knotes.
     void remove(descriptor_t) noexcept {}

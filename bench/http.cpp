@@ -77,7 +77,7 @@ static constexpr double bytes_per_gigabyte_k = std::giga::num;
 struct settings_t {
     std::vector<std::string> urls;
     std::size_t requests {}, warmup_requests {}, connections = 64, in_flight = 64, threads = 1, bytes = 1024;
-    std::size_t rate {};
+    std::size_t rate {}, pipeline_depth = 1;
     std::chrono::nanoseconds warmup {}, time_limit {};
     std::uint32_t seed = 42;
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
@@ -156,6 +156,10 @@ static constexpr std::array flags_k {
     flag_t {
         "--in-flight", "count", "maximum outstanding calls across all clients (64)",
         [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.in_flight, 1); }},
+    flag_t {"--pipeline-depth", "count", "calls one connection carries before awaiting a response (1)",
+            [](std::string_view text, settings_t& settings) noexcept {
+                return parse_count(text, settings.pipeline_depth, 1);
+            }},
     flag_t {
         "--threads", "count", "application-owned ForkUnion workers, the caller included (1)",
         [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.threads, 1); }},
@@ -620,6 +624,7 @@ struct run_t {
         config.max_concurrent_connections = (connection_groups / count + (index < connection_groups % count)) * width +
                                             (index == 0 ? run.settings.connections % width : 0);
         config.max_concurrent_calls = worker.capacity;
+        config.max_pipelined_calls = run.settings.pipeline_depth;
         config.backend = run.settings.backend;
         config.cpu_class = run.settings.cpu_class;
         ucall_outcome_t outcome {};
@@ -800,14 +805,14 @@ static int run(settings_t const& settings) {
     if (settings.format == output_format_t::json_k) {
         std::printf("{\"row\":\"configuration\",\"origins\":%zu,\"threads\":%zu,\"clients\":%zu,\"placement\":\"%s\","
                     "\"workload\":\"%s\",\"connection_reuse\":\"%s\",\"load\":\"%s\",\"rate_requests_per_second\":%zu,"
-                    "\"connections\":%zu,\"in_flight_calls\":%zu,\"request_body_bytes\":%zu,"
+                    "\"connections\":%zu,\"in_flight_calls\":%zu,\"pipeline_depth\":%zu,\"request_body_bytes\":%zu,"
                     "\"warmup_requests\":%zu,\"warmup_seconds\":%.6f,\"measured_requests\":%zu,"
                     "\"time_limit_seconds\":%.6f,\"seed\":%u}\n",
                     settings.urls.size(), settings.threads, clients, pinned ? "pinned" : "floating",
                     settings.reply_order == reply_order_t::reordered_k ? "paired replies" : "ordinary",
                     settings.connection_reuse == connection_reuse_t::close_k ? "close" : "keep-alive", load,
-                    settings.rate, settings.connections, capacity, settings.bytes, settings.warmup_requests,
-                    std::chrono::duration<double>(settings.warmup).count(), settings.requests,
+                    settings.rate, settings.connections, capacity, settings.pipeline_depth, settings.bytes,
+                    settings.warmup_requests, std::chrono::duration<double>(settings.warmup).count(), settings.requests,
                     std::chrono::duration<double>(settings.time_limit).count(), settings.seed);
         std::printf("{\"row\":\"total\",\"successful_requests\":%zu,\"failed_requests\":%zu,\"rejected_requests\":%zu,"
                     "\"elapsed_seconds\":%.6f,\"throughput_requests_per_second\":%.1f,"
@@ -850,8 +855,9 @@ static int run(settings_t const& settings) {
                     settings.connection_reuse == connection_reuse_t::close_k ? "close after response" : "keep-alive",
                     load);
         if (settings.rate) std::printf(" at %zu requests/s", settings.rate);
-        std::printf("\n  Connections: %zu\n  In-flight calls: %zu\n  Request body: %zu bytes, seed %u\n",
-                    settings.connections, capacity, settings.bytes, settings.seed);
+        std::printf("\n  Connections: %zu\n  In-flight calls: %zu\n  Pipeline depth: %zu\n"
+                    "  Request body: %zu bytes, seed %u\n",
+                    settings.connections, capacity, settings.pipeline_depth, settings.bytes, settings.seed);
         // Zero leaves a phase to its other bound.
         for (auto [name, requests, limit] : {std::tuple {"Warmup", settings.warmup_requests, settings.warmup},
                                              std::tuple {"Measured", settings.requests, settings.time_limit}}) {

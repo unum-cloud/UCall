@@ -124,6 +124,10 @@ typedef struct ucall_client_handle_t* ucall_client_t;
 /** Opaque handle for a single Remote Procedure Call on the @b server side. */
 typedef struct ucall_received_http_request_handle_t* ucall_received_http_request_t;
 
+/** One batch endpoint of a server, drained by one application thread; lives until
+ *  @c ucall_server_free(). */
+typedef struct ucall_http_batch_endpoint_handle_t* ucall_http_batch_endpoint_t;
+
 /** Opaque handle for a single Remote Procedure Call reply on the @b client side. */
 typedef struct ucall_received_http_response_handle_t* ucall_received_http_response_t;
 

@@ -23,7 +23,8 @@ struct parsed_segment_t {
     std::string_view content {};
 };
 
-using route_search_t = http<sz_cap_serial_k>;
+using route_search_t =
+    http<serial_compare_kit_t, serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t>;
 
 template <typename search_type_ = route_search_t>
 inline std::string_view extract_path_component(std::string_view url) noexcept {

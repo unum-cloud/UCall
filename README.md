@@ -122,7 +122,9 @@ For heavy operations, there is no secret pill, but there is a common "latency hi
 
 Batch endpoints group independent requests by their configured size and latency budgets.
 Endpoint callbacks run synchronously on the application polling caller; a deadline cannot preempt a callback.
-Batch callbacks run on the application thread calling `ucall_server_take_batches()`, never on an event loop.
+Registering a batch endpoint returns its `ucall_http_batch_endpoint_t` handle.
+Each batch endpoint has one queue fed by every event loop and one application thread draining that handle through `ucall_server_take_batches()`, so its callback never runs on an event loop.
+With `max_pipelined_requests` on an interface and `max_pipelined_calls` on a client, one connection carries several requests at once, so a single client can fill a batch; replies still leave in request order.
 
 ### Caller-Owned Polling
 
@@ -373,7 +375,7 @@ For JSON-RPC, that's trivial - pack a JSON array of individual procedure calls:
 ```
 
 A JSON-RPC adapter could regroup procedures by endpoint before assembling its response array; that adapter is planned.
-The implemented server batching instead collects independent HTTP requests from every polling loop and passes their retained handles as a counted array.
+The implemented server batching instead collects independent HTTP requests from every polling loop into each batch endpoint's queue and passes their retained handles as a counted array.
 Each request keeps its own response and transaction boundary, as the [key-value and ledger examples](examples/README.md) demonstrate.
 
 ### Resumable Uploads & Downloads

@@ -130,13 +130,9 @@ struct ucall_server_handle_t {
     ucall_server_handle_t(ucall_server_handle_t&&) = delete;
     ucall_server_handle_t& operator=(ucall_server_handle_t&&) = delete;
 
-    /** Set in the batch queue's tail to wake its drain without publishing a request. */
-    static constexpr std::uint64_t batch_signal_k = std::uint64_t {1} << 63;
-
     /** Stopping runs on any thread, so it touches only these CPU-independent words. */
     std::uint32_t stopped {};
-    std::span<uc::wake_channel_t*> wakeups {};
-    std::uint64_t* batch_tail {};
+    std::span<uc::wake_channel_t*> wakeups {}; // Every event loop's, then every batch endpoint's.
     struct api_t {
         void (*free)(ucall_server_t);
         void (*take_call)(ucall_server_take_call_t*);
@@ -151,10 +147,11 @@ struct ucall_server_handle_t {
         void (*request_path_parameter)(ucall_server_request_path_parameter_t*);
         void (*request_query_parameter)(ucall_server_request_query_parameter_t*);
         void (*request_header)(ucall_server_request_header_t*);
+        void (*request_peer)(ucall_server_request_peer_t*);
         void (*request_body)(ucall_server_request_body_t*);
         void (*reply_content)(ucall_server_reply_content_t*);
         void (*reply_error)(ucall_server_reply_error_t*);
-        void (*add_batch_endpoint)(ucall_server_add_batch_endpoint_t*);
+        void (*add_http_batch_endpoint)(ucall_server_add_http_batch_endpoint_t*);
     };
     api_t const* api {};
     std::uint64_t string_capabilities {}, atomic_capabilities {};
@@ -177,6 +174,7 @@ struct ucall_client_handle_t {
     std::uint64_t string_capabilities {}, atomic_capabilities {};
 };
 struct ucall_received_http_request_handle_t {};
+struct ucall_http_batch_endpoint_handle_t {};
 struct ucall_received_http_response_handle_t {};
 
 namespace unum::ucall {

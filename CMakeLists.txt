@@ -149,7 +149,7 @@ endfunction ()
 
 ucall_sibling(
     stringzilla STRINGZILLA stringzilla::header https://github.com/ashvardanian/StringZilla
-    a87834b78549d9da1e1b824b14e47e7411684f08
+    2d9c8cc0889c24acdc95e8ded99761cddeb532d4
 )
 ucall_sibling(
     forkunion FORKUNION forkunion::header https://github.com/ashvardanian/ForkUnion

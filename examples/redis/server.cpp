@@ -160,13 +160,14 @@ int main(int argc, char** argv) {
                                           ucall_verb_any_k, key_value, &service};
     ucall_server_add_http_endpoint(&add);
     if (!application.succeeded(outcome)) return 1;
-    ucall_server_add_batch_endpoint_t batch {};
+    ucall_server_add_http_batch_endpoint_t batch {};
     batch.server = application.server;
     batch.outcome = &outcome;
     batch.uri_template = view("/batch/kv/{*key}");
     batch.verb = ucall_verb_any_k;
     batch.callback = key_value_batch;
     batch.context = &service;
-    ucall_server_add_batch_endpoint(&batch);
+    batch.endpoint = &application.batch_endpoint;
+    ucall_server_add_http_batch_endpoint(&batch);
     return application.succeeded(outcome) ? application.run() : 1;
 }

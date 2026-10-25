@@ -22,6 +22,11 @@ typedef struct ucall_client_config_t {
     /** Required positive budget for simultaneously open connections. */
     size_t max_concurrent_connections;
 
+    /** Calls one connection may carry before the next call opens or waits for another; zero means
+     *  one. A connection lost mid-pipeline retries its unanswered idempotent calls and fails the
+     *  rest with @c ucall_status_connection_closed_k. */
+    size_t max_pipelined_calls;
+
     /** Time budget for establishing a connection. Default: 5'000'000. */
     size_t connect_timeout_microseconds;
 
@@ -40,7 +45,8 @@ typedef struct ucall_client_config_t {
     /** Where log lines go. Default: nowhere. */
     ucall_log_t log;
 
-    /** Accepted calls, including unretrieved completions; zero uses the connection budget. */
+    /** Accepted calls, including unretrieved completions; zero uses the connection budget times
+     *  @c max_pipelined_calls. */
     size_t max_concurrent_calls;
 
     /** Requested I/O backend; automatic chooses an available native backend. */

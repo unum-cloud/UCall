@@ -50,6 +50,7 @@ struct server_t {
     bool running {};
     std::vector<ucall_outcome_t> outcomes;
     ucall_server_t server {};
+    ucall_http_batch_endpoint_t batch_endpoint {};
     ucall_network_interface_t network_interface {};
     char address[sizeof("127.0.0.1:65535")] {};
 #if !defined(_WIN32)
@@ -134,7 +135,7 @@ struct server_t {
         ucall_server_init(&init);
         if (!succeeded(outcome)) return -1;
         auto loops = resolved.interfaces[0].event_loops;
-        outcomes.resize(loops + 1); // The last thread drains batch endpoints.
+        outcomes.resize(loops + 1); // The last thread drains the one batch endpoint each example registers.
         fu_topology_t topology {};
         auto status = fu_topology_new(&topology);
         if (status == fu_success_k) status = fu_pool_new("ucall-example", fu_capabilities_all_k, &pool);
@@ -153,7 +154,8 @@ struct server_t {
         auto& application = *static_cast<server_t*>(context);
         auto& outcome = application.outcomes[index];
         if (index + 1 == application.outcomes.size()) {
-            ucall_server_take_batches_t draining {application.server, &outcome};
+            if (!application.batch_endpoint) return; // This example registered no batch endpoint.
+            ucall_server_take_batches_t draining {application.server, &outcome, application.batch_endpoint};
             ucall_server_take_batches(&draining);
         }
         else {

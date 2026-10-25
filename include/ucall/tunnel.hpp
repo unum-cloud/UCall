@@ -599,7 +599,8 @@ struct secure_tunnel_step_t {
  */
 struct secure_tunnel_opened_t {
 
-    /** The plaintext, uncovered in place: a window into the record buffer handed in. */
+    /** The plaintext: a window into the destination handed in,
+     *  or into the record when nothing is framed. */
     span<byte_t> payload {};
 
     /** Bytes of the record buffer absorbed, framing included. Zero means nothing opened. */
@@ -612,11 +613,11 @@ struct secure_tunnel_opened_t {
 
 #pragma region Tunnel
 
-/** Cryptographic primitives and pattern state specialized for the admitted instruction set. */
-template <sz_capability_t capabilities_>
+/** Cryptographic primitives and pattern state over the hashing and cipher kits it is handed. */
+template <typename sha256_kit_type_, typename aes256_gcm_kit_type_>
 struct secure_tunnel_crypto {
-    using sha256_kit_t = sha256_kit<capabilities_>;
-    using aes256_gcm_kit_t = aes256_gcm_kit<capabilities_>;
+    using sha256_kit_t = sha256_kit_type_;
+    using aes256_gcm_kit_t = aes256_gcm_kit_type_;
 
     static constexpr auto sha_init = sha256_kit_t::init;
     static constexpr auto sha_update = sha256_kit_t::update;
@@ -934,26 +935,32 @@ struct secure_tunnel_crypto {
         }
 
         /**
-         *  @brief Verifies a tag and opens @p text in place.
-         *  @param[inout] text The ciphertext body, without its tag, which the plaintext replaces.
+         *  @brief Verifies a tag and opens @p text into @p plaintext.
+         *  @param[in] text The ciphertext body, without its tag.
          *  @param[in] tag Sixteen bytes immediately behind @p text.
+         *  @param[out] plaintext Room for @p text.size() bytes: @p text itself to open in place, or
+         *      memory that does not overlap it, as AES-GCM allows nothing in between.
          *  @return False when the tag does not verify or the key is exhausted, which closes the
          *      connection either way.
          *
-         *  @warning StringZilla zeroes @p text when the tag is rejected rather than leaving
+         *  @warning StringZilla zeroes @p plaintext when the tag is rejected rather than leaving
          *      unauthenticated plaintext behind, so a caller that ignores the result still cannot
          *      act on forged data - and cannot retry, which suits a caller that drops the
          *      connection anyway.
          */
-        [[nodiscard]] bool open(span<byte_t const> associated, span<byte_t> text, byte_t const* tag) noexcept {
-            if (!keyed_) return true;
+        [[nodiscard]] bool open(span<byte_t const> associated, span<byte_t const> text, byte_t const* tag,
+                                byte_t* plaintext) noexcept {
+            if (!keyed_) {
+                if (text.size() && plaintext != text.data()) std::memcpy(plaintext, text.data(), text.size());
+                return true;
+            }
             if (exhausted()) return false;
             byte_t nonce[nonce_size_k];
             encode_nonce(nonce);
             sz_status_t const status = aes_decrypt(&schedule_, reinterpret_cast<sz_u8_t const*>(nonce),               //
                                                    reinterpret_cast<sz_cptr_t>(associated.data()), associated.size(), //
                                                    reinterpret_cast<sz_cptr_t>(text.data()), text.size(),             //
-                                                   reinterpret_cast<sz_ptr_t>(text.data()),
+                                                   reinterpret_cast<sz_ptr_t>(plaintext),
                                                    reinterpret_cast<sz_u8_t const*>(tag), nullptr);
             secure_zero(nonce);
             if (status != sz_success_k) return false;
@@ -1080,8 +1087,8 @@ struct secure_tunnel_crypto {
             if (sealed.size()) sha_update(&state, reinterpret_cast<sz_cptr_t>(sealed.data()), sealed.size(), nullptr);
             sha_digest(&state, reinterpret_cast<sz_u8_t*>(next_hash), nullptr);
 
-            if (body) std::memcpy(plain.data(), sealed.data(), body);
-            if (!cipher_.open(hash(), {plain.data(), plain.data() + body}, sealed.data() + body)) return false;
+            if (!cipher_.open(hash(), {sealed.data(), sealed.data() + body}, sealed.data() + body, plain.data()))
+                return false;
 
             std::memcpy(hash_, next_hash, hash_size_k);
             produced = body;
@@ -1667,15 +1674,15 @@ struct secure_tunnel_crypto {
  *      deliberate: a pooled connection needs no separate "built yet" flag, and a recycled one is
  *      plaintext until configured. Every Noise operation requires @c make first.
  *
- *  @warning A record buffer handed to @c open and a slot handed to @c stage must not overlap the
- *      inbound buffer given to @c advance. Absorbing the peer's message and writing the reply
- *      happen in one call, and opening works in place, so a returned payload aliases the buffer it
- *      came from. Overlap corrupts a record pipelined behind a handshake message, silently, inside
- *      one live allocation that no sanitizer sees.
+ *  @warning A record buffer or destination handed to @c open and a slot handed to @c stage must not
+ *      overlap the inbound buffer given to @c advance. Absorbing the peer's message and writing the
+ *      reply happen in one call, and opening may work in place, so a returned payload can alias the
+ *      buffer it came from. Overlap corrupts a record pipelined behind a handshake message,
+ *      silently, inside one live allocation that no sanitizer sees.
  */
-template <sz_capability_t capabilities_ = sz_cap_serial_k>
-class secure_tunnel : private secure_tunnel_crypto<capabilities_> {
-    using crypto_t = secure_tunnel_crypto<capabilities_>;
+template <typename sha256_kit_type_, typename aes256_gcm_kit_type_>
+class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_> {
+    using crypto_t = secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_>;
     using crypto_t::bytes_until_prefixed_boundary;
     using crypto_t::hash_size_k;
     using crypto_t::kind_size_k;
@@ -2151,18 +2158,21 @@ class secure_tunnel : private secure_tunnel_crypto<capabilities_> {
     }
 
     /**
-     *  @brief Opens the first whole record in @p record, in place.
-     *  @param[inout] record A buffer whose front holds a complete record.
-     *  @return The plaintext as a window into @p record, or a zero @c consumed on a malformed or
-     *      unauthenticated record - in which case @c fault() says why and the tunnel is
-     *      @c broken_k.
+     *  @brief Opens the first whole record in @p record into @p destination.
+     *  @param[in] record A buffer whose front holds a complete record.
+     *  @param[out] destination Room for the payload and its kind byte: the record's own body, one
+     *      prefix in, to open in place, or memory that does not overlap the record. The record's
+     *      declared length, which @c bytes_until_boundary of its prefix alone answers, always fits.
+     *  @return The plaintext as a window into @p destination, or into @p record for a plaintext
+     *      tunnel, which frames nothing; a zero @c consumed on a malformed or unauthenticated
+     *      record - in which case @c fault() says why and the tunnel is @c broken_k.
      *
      *  @warning A whole record must be present - @c bytes_until_boundary must have returned zero
      *      for this buffer. Calling with a partial record is a caller error, not an incomplete
      *      read, and is answered as one. That is what makes the outcome two-valued instead of
      *      three, and it costs nothing: both drivers already ask the boundary first.
      */
-    [[nodiscard]] secure_tunnel_opened_t open(span<byte_t> record) noexcept {
+    [[nodiscard]] secure_tunnel_opened_t open(span<byte_t> record, span<byte_t> destination) noexcept {
 
         secure_tunnel_opened_t opened;
         if (!encrypts()) {
@@ -2188,17 +2198,17 @@ class secure_tunnel : private secure_tunnel_crypto<capabilities_> {
         if (record.size() < prefix_size_k) return fail(secure_tunnel_fault_t::malformed_k);
 
         std::size_t const declared = peek_length(readable);
-        if (declared < min_record_body_k || declared > max_message_k) return fail(secure_tunnel_fault_t::malformed_k);
+        // Bounded by this side's cap, as the peer's sender may have been configured wider.
+        if (declared < min_record_body_k || declared - min_record_body_k > max_payload_)
+            return fail(secure_tunnel_fault_t::malformed_k);
         std::size_t const whole = prefix_size_k + declared;
-        if (record.size() < whole) return fail(secure_tunnel_fault_t::malformed_k);
+        std::size_t const plain_size = declared - tag_size_k;
+        if (record.size() < whole || destination.size() < plain_size) return fail(secure_tunnel_fault_t::malformed_k);
 
-        // Opened where it lies: the plaintext replaces the ciphertext it came from, which the
-        // underlying AES-GCM permits when the output pointer exactly equals the input pointer.
         auto& noise = noise_of(storage_);
         byte_t* const body = record.data() + prefix_size_k;
-        std::size_t const plain_size = declared - tag_size_k;
         if (!noise.receiving.open({record.data(), record.data() + prefix_size_k}, {body, body + plain_size},
-                                  body + plain_size))
+                                  body + plain_size, destination.data()))
             return fail(secure_tunnel_fault_t::authentication_failed_k);
 
         if (++noise.records_opened % rekey_interval_k == 0) noise.receiving.rekey();
@@ -2206,7 +2216,7 @@ class secure_tunnel : private secure_tunnel_crypto<capabilities_> {
         // The kind is the last byte of the plaintext, inside the tag rather than beside it, so it
         // cannot be forged by flipping a cleartext byte.
         std::size_t const payload_size = plain_size - kind_size_k;
-        auto const kind = static_cast<secure_tunnel_record_t>(body[payload_size]);
+        auto const kind = static_cast<secure_tunnel_record_t>(destination[payload_size]);
 
         switch (kind) {
         case secure_tunnel_record_t::application_k: break;
@@ -2223,7 +2233,7 @@ class secure_tunnel : private secure_tunnel_crypto<capabilities_> {
             return fail(secure_tunnel_fault_t::malformed_k);
         }
 
-        opened.payload = {body, body + payload_size};
+        opened.payload = destination.first(payload_size);
         opened.consumed = whole;
         opened.kind = kind;
         return opened;
@@ -2233,6 +2243,6 @@ class secure_tunnel : private secure_tunnel_crypto<capabilities_> {
 #pragma endregion Tunnel
 
 /** Portable tunnel specialization for callers without a CPU dispatch point. */
-using secure_tunnel_t = secure_tunnel<sz_cap_serial_k>;
+using secure_tunnel_t = secure_tunnel<serial_sha256_kit_t, serial_aes256_gcm_kit_t>;
 
 } // namespace unum::ucall

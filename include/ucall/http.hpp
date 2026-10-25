@@ -471,13 +471,19 @@ struct received_response : received_response_t {
 
 extern template struct received_response<st::default_allocator<byte_t>>;
 
-template <sz_capability_t capabilities_>
+template <typename compare_kit_type_, typename find_kit_type_, typename byteset_kit_type_, typename hash_kit_type_,
+          typename fold_kit_type_>
 struct http {
-    using compare_kit_t = compare_kit<capabilities_>;
-    using find_kit_t = find_kit<capabilities_>;
-    using byteset_kit_t = byteset_kit<capabilities_>;
-    using hash_kit_t = hash_kit<capabilities_>;
-    using fold_kit_t = fold_kit<capabilities_>;
+    using compare_kit_t = compare_kit_type_;
+    using find_kit_t = find_kit_type_;
+    using byteset_kit_t = byteset_kit_type_;
+    using hash_kit_t = hash_kit_type_;
+    using fold_kit_t = fold_kit_type_;
+
+    /** Every capability the kits call into, which a thread must report to use them. */
+    static constexpr sz_capability_t capabilities_k = compare_kit_t::capability_k | find_kit_t::capability_k |
+                                                      byteset_kit_t::capability_k | hash_kit_t::capability_k |
+                                                      fold_kit_t::capability_k;
 
     static std::string_view text_view(span<byte_t const> bytes) noexcept {
         return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};

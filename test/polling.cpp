@@ -5,6 +5,7 @@
  *  @brief Caller-driven progress, retained requests, completion credits, and application batching.
  */
 #include <cstring> // `std::memcmp`, `std::strcmp`, `std::strlen`
+#include <ctime>   // `std::clock`
 
 #include <array>   // `std::array`
 #include <atomic>  // `std::atomic`
@@ -38,6 +39,7 @@ static bool expired(std::chrono::steady_clock::time_point deadline) {
 
 struct fixture_t {
     ucall_server_t server {};
+    ucall_http_batch_endpoint_t batch_endpoint {};
     std::array<ucall_client_t, 2> clients {};
     ucall_received_http_request_t held {};
     std::size_t echoes {};
@@ -69,8 +71,7 @@ struct fixture_t {
         fixture.failures += expect(!fixture.held, "a second request arrived while one is held");
         fixture.held = request;
     }
-    explicit fixture_t(ucall_received_batch_http_request_callback_t batch_callback = nullptr,
-                       void* batch_context = nullptr) {
+    explicit fixture_t(ucall_received_http_batch_callback_t batch_callback = nullptr, void* batch_context = nullptr) {
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
         network_interface.address = "127.0.0.1:0";
@@ -99,9 +100,10 @@ struct fixture_t {
             if ((status = outcome.status) != ucall_status_success_k) return;
         }
         if (batch_callback) {
-            ucall_server_add_batch_endpoint_t add {
-                server, &outcome, view("/batch"), ucall_verb_post_k, batch_callback, batch_context, 2, 2, 100000};
-            ucall_server_add_batch_endpoint(&add);
+            ucall_server_add_http_batch_endpoint_t add {
+                server, &outcome, view("/batch"), ucall_verb_post_k, batch_callback, batch_context,
+                2,      2,        100000,         &batch_endpoint};
+            ucall_server_add_http_batch_endpoint(&add);
             status = outcome.status;
         }
     }
@@ -281,7 +283,7 @@ static case_result_t test_capability_admission_unit() {
 
 static case_result_t test_origin_reuse_and_fairness_unit() {
 #if UCALL_WITH_POSIX
-    using network_t = uc::network_variant<uc::posix_engine_t, uc::cpu_class_t::serial_k>;
+    using network_t = uc::serial_network<uc::posix_engine_t>;
     std::size_t failures = 0;
     ucall_client_t handle {};
     ucall_outcome_t outcome {};
@@ -314,27 +316,34 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
         failures += expect(peer.connection.configure({}) == ucall_status_success_k);
         descriptors[i] = peer.connection.descriptor = client.engine.open_socket(AF_INET);
         failures += expect(descriptors[i] >= 0);
+        peer.connection.stage = network_t::connection_stage_t::open_k;
     }
     auto& busy = *client.peers[2];
-    busy.exchange = &client.exchanges[3];
-    busy.connection.flags = network_t::connection_pending_k;
-    busy.connection.stage = network_t::connection_stage_t::transmitting_k;
+    busy.oldest_exchange = busy.newest_exchange = &client.exchanges[3];
+    busy.exchanges_in_flight = 1;
+    busy.connection.transmitting = network_t::transmit_state_t::sending_k;
+    busy.connection.transmit_operation = network_t::operation_state_t::pending_k;
+    network_t::unqueue_call(client, client.exchanges[3], &client.exchanges[2]);
     client.exchanges[3].stage = network_t::client_exchange_t::stage_t::active_k;
     network_t::client_progress(client);
-    failures += expect(client.peers[0]->exchange == &client.exchanges[0]);
-    failures += expect(client.peers[1]->exchange == &client.exchanges[2]);
+    // Each idle connection takes its origin's waiting call due first, leaving the rest in order.
+    failures += expect(client.peers[0]->oldest_exchange == &client.exchanges[0]);
+    failures += expect(client.peers[1]->oldest_exchange == &client.exchanges[2]);
     failures += expect(client.exchanges[1].stage == network_t::client_exchange_t::stage_t::queued_k &&
-                       client.next_exchange == 1);
+                       client.waiting_head == &client.exchanges[1] && client.waiting_tail == &client.exchanges[1]);
     for (std::size_t i = 0; i != descriptors.size(); ++i)
         failures += expect(client.peers[i]->connection.descriptor == descriptors[i]);
     client.engine.stop();
     auto& released = *client.peers[1];
-    released.exchange = nullptr;
-    released.connection.flags = network_t::connection_none_k;
-    released.connection.stage = network_t::connection_stage_t::idle_k;
+    released.oldest_exchange = released.newest_exchange = nullptr;
+    released.exchanges_in_flight = 0;
+    released.connection.transmitting = network_t::transmit_state_t::idle_k;
+    released.connection.transmit_operation = network_t::operation_state_t::idle_k;
     client.exchanges[2].stage = network_t::client_exchange_t::stage_t::idle_k;
     network_t::client_progress(client);
-    failures += expect(released.exchange == &client.exchanges[1] && client.next_exchange == 2);
+    // The waiting call closes an idle connection to another origin, and dials once it has closed.
+    failures += expect(client.exchanges[1].stage == network_t::client_exchange_t::stage_t::queued_k &&
+                       client.waiting_head == &client.exchanges[1]);
     failures += expect(released.connection.stage == network_t::connection_stage_t::closing_k);
     ucall_client_free(handle);
     return failures;
@@ -351,6 +360,7 @@ struct batch_context_t {
     fixture_t* fixture {};
     std::array<ucall_received_http_request_t, 4> requests {};
     std::array<std::size_t, 2> sizes {};
+    std::chrono::steady_clock::time_point fired {};
     std::atomic<std::size_t> completed {};
 
     /** Checks that failed on the draining thread. */
@@ -367,6 +377,7 @@ struct batch_context_t {
         auto completed = state.completed.load(std::memory_order_relaxed);
         state.failures += expect(completed < state.sizes.size(), "batch {} is one too many", completed);
         if (completed < state.sizes.size()) state.sizes[completed] = count;
+        state.fired = std::chrono::steady_clock::now();
         state.completed.store(completed + 1, std::memory_order_release);
     }
 
@@ -382,12 +393,13 @@ struct batch_context_t {
     }
 };
 
-static std::thread drain_batches(ucall_server_t server, batch_context_t& batches) {
-    return std::thread {[server, &batches] {
+static std::thread drain_batches(ucall_server_t server, std::atomic<std::size_t>& failures,
+                                 ucall_http_batch_endpoint_t endpoint) {
+    return std::thread {[server, &failures, endpoint] {
         ucall_outcome_t outcome {};
-        ucall_server_take_batches_t take {server, &outcome};
+        ucall_server_take_batches_t take {server, &outcome, endpoint};
         ucall_server_take_batches(&take);
-        batches.failures += expect(outcome.status == ucall_status_success_k);
+        failures += expect(outcome.status == ucall_status_success_k);
     }};
 }
 
@@ -397,7 +409,21 @@ static case_result_t test_application_batches_unit() {
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     batches.fixture = &fixture;
     std::size_t failures = 0;
-    auto drain = drain_batches(fixture.server, batches);
+    ucall_outcome_t outcome {};
+    ucall_http_batch_endpoint_t prompt {};
+    ucall_server_add_http_batch_endpoint_t add {
+        fixture.server, &outcome, view("/prompt"), ucall_verb_post_k, batch_context_t::receive, &batches, 2, 2, 300,
+        &prompt};
+    ucall_server_add_http_batch_endpoint(&add);
+    require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
+    auto requests = [&] {
+        ucall_event_loop_statistics_t counters {};
+        ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &counters};
+        ucall_server_event_loop_statistics(&query);
+        return counters.requests;
+    };
+    auto drain = drain_batches(fixture.server, batches.failures, fixture.batch_endpoint);
+    auto prompt_drain = drain_batches(fixture.server, batches.failures, prompt);
     call_t first, second, partial;
     first.submit(fixture, 0, "/batch");
     second.submit(fixture, 1, "/batch");
@@ -409,15 +435,32 @@ static case_result_t test_application_batches_unit() {
         fixture.reply(batches.requests[0]);
         failures += first.success(fixture.wait(0));
         failures += second.success(fixture.wait(1));
-        partial.submit(fixture, 0, "/batch");
-        failures += expect(batches.wait(2), "the partial batch never fired");
-        failures += expect(batches.sizes[1] == 1);
-        fixture.reply(batches.requests[0]);
-        failures += partial.success(fixture.wait(0));
+        // The serving round that dispatched the request began no later than its deposit.
+        auto const dispatched_before = requests();
+        auto const deadline = deadline_after(5000);
+        std::chrono::steady_clock::time_point deposited {};
+        partial.submit(fixture, 0, "/prompt");
+        while (batches.completed.load(std::memory_order_acquire) != 2 && !expired(deadline)) {
+            fixture.take(0);
+            auto const round = std::chrono::steady_clock::now();
+            fixture.serve();
+            if (deposited == std::chrono::steady_clock::time_point {} && requests() != dispatched_before)
+                deposited = round;
+        }
+        bool const partial_fired = batches.completed.load(std::memory_order_acquire) == 2;
+        failures += expect(partial_fired, "the partial batch never fired");
+        if (partial_fired) {
+            auto const late = std::chrono::duration_cast<std::chrono::microseconds>(batches.fired - deposited).count();
+            failures += expect(batches.sizes[1] == 1);
+            failures += expect(late < 1000, "a 300 microsecond budget fired {} microseconds after the deposit", late);
+            fixture.reply(batches.requests[0]);
+            failures += partial.success(fixture.wait(0));
+        }
     }
     ucall_server_stop(fixture.server);
     fixture.serve();
     drain.join();
+    prompt_drain.join();
     return failures + fixture.failures + batches.failures;
 }
 
@@ -439,16 +482,18 @@ static case_result_t test_batches_across_loops_unit() {
     require(failures, outcome.status == ucall_status_success_k && resolved.interfaces[0].event_loops == 2, "{}",
             ucall_status_name(outcome.status));
     batch_context_t batches;
-    ucall_server_add_batch_endpoint_t add {
-        server, &outcome, view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 4, 4, 10000000};
-    ucall_server_add_batch_endpoint(&add);
+    ucall_http_batch_endpoint_t endpoint {};
+    ucall_server_add_http_batch_endpoint_t add {
+        server, &outcome, view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches,
+        4,      4,        10000000,       &endpoint};
+    ucall_server_add_http_batch_endpoint(&add);
     failures += expect(outcome.status == ucall_status_success_k);
     ucall_client_config_t client_config {};
     client_config.max_concurrent_connections = 4;
     ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
     ucall_client_init(&client_init);
     failures += expect(outcome.status == ucall_status_success_k);
-    auto drain = drain_batches(server, batches);
+    auto drain = drain_batches(server, batches.failures, endpoint);
     // Each loop owns two of the four connections, so each receives exactly half of the batch.
     std::string url = std::string {"http://"} + resolved.interfaces[0].address + "/batch";
     for (std::size_t i = 0; i != 4; ++i) {
@@ -502,6 +547,172 @@ static case_result_t test_batches_across_loops_unit() {
     return failures + batches.failures;
 }
 
+/** Two batch endpoints, the first of whose callbacks blocks until the second's batch arrives. */
+struct relay_t {
+    std::array<std::atomic<ucall_received_http_request_t>, 2> requests {};
+    std::atomic<std::size_t> failures {};
+
+    static void first(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
+        auto& relay = *static_cast<relay_t*>(context);
+        relay.requests[0].store(requests[0], std::memory_order_release);
+        auto const deadline = deadline_after(5000);
+        while (!relay.requests[1].load(std::memory_order_acquire) && !expired(deadline)) std::this_thread::yield();
+        relay.failures += expect(count == 1 && relay.requests[1].load(std::memory_order_acquire),
+                                 "the second endpoint's batch waited behind the first's callback");
+    }
+    static void second(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
+        auto& relay = *static_cast<relay_t*>(context);
+        relay.failures += expect(count == 1);
+        relay.requests[1].store(requests[0], std::memory_order_release);
+    }
+};
+
+static case_result_t test_batch_endpoints_drain_apart_unit() {
+    fixture_t fixture;
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    relay_t relay;
+    using route_t = std::pair<char const*, ucall_received_http_batch_callback_t>;
+    std::array routes {route_t {"/first", relay_t::first}, route_t {"/second", relay_t::second}};
+    std::array<ucall_http_batch_endpoint_t, 2> endpoints {};
+    for (std::size_t i = 0; i != routes.size(); ++i) {
+        ucall_outcome_t outcome {};
+        ucall_server_add_http_batch_endpoint_t add {
+            fixture.server, &outcome, view(routes[i].first), ucall_verb_post_k, routes[i].second, &relay, 1, 1, 0,
+            &endpoints[i]};
+        ucall_server_add_http_batch_endpoint(&add);
+        require(failures, outcome.status == ucall_status_success_k && endpoints[i], "{}",
+                ucall_status_name(outcome.status));
+    }
+    auto first_drain = drain_batches(fixture.server, relay.failures, endpoints[0]);
+    auto second_drain = drain_batches(fixture.server, relay.failures, endpoints[1]);
+    auto const deadline = deadline_after(5000);
+    auto serve_until = [&](std::size_t endpoint) {
+        while (!relay.requests[endpoint].load(std::memory_order_acquire) && !expired(deadline)) {
+            for (std::size_t client = 0; client != fixture.clients.size(); ++client) fixture.take(client);
+            fixture.serve(1000);
+        }
+        return relay.requests[endpoint].load(std::memory_order_acquire);
+    };
+    call_t first, second;
+    first.submit(fixture, 0, "/first");
+    auto first_request = serve_until(0);
+    failures += expect(first_request, "the first batch never fired");
+    second.submit(fixture, 1, "/second");
+    auto second_request = serve_until(1);
+    failures += expect(second_request, "the second batch never fired");
+    if (first_request && second_request) {
+        fixture.reply(second_request);
+        fixture.reply(first_request);
+        failures += first.success(fixture.wait(0));
+        failures += second.success(fixture.wait(1));
+    }
+    ucall_server_stop(fixture.server);
+    fixture.serve();
+    first_drain.join();
+    second_drain.join();
+    return failures + fixture.failures + relay.failures;
+}
+
+static case_result_t test_batch_timeout_sleeps_unit() {
+    batch_context_t batches;
+    fixture_t fixture {batch_context_t::receive, &batches};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    ucall_outcome_t outcome {};
+    ucall_server_take_batch_t missing {fixture.server, &outcome, nullptr, 0};
+    ucall_server_take_batch(&missing);
+    failures += expect(outcome.status == ucall_status_invalid_argument_k, "{}", ucall_status_name(outcome.status));
+    // No event loop is ever polled, so only the drain's own wait can end the call.
+    auto const started = std::chrono::steady_clock::now();
+    auto const processor_started = std::clock();
+    ucall_server_take_batch_t take {fixture.server, &outcome, fixture.batch_endpoint, 100000};
+    ucall_server_take_batch(&take);
+    auto const processor_spent = std::clock() - processor_started;
+    auto const waited =
+        std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
+    failures += expect(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
+    failures += expect(waited >= 100 && waited < 2000, "returned after {} ms", waited);
+    failures += expect(processor_spent < CLOCKS_PER_SEC / 20, "spent {} processor ticks waiting",
+                       static_cast<long long>(processor_spent));
+    failures += expect(!batches.completed.load());
+    return failures + fixture.failures + batches.failures;
+}
+
+/** Four requests in one segment over one connection fill a batch of four, and their replies,
+ *  given in reverse, leave in request order. */
+static case_result_t test_pipelined_batches_unit() {
+#if UCALL_OS_POSIX_
+    std::size_t failures = 0;
+    ucall_server_t server {};
+    ucall_outcome_t outcome {};
+    ucall_network_interface_t network_interface {};
+    network_interface.address = "127.0.0.1:0";
+    network_interface.max_concurrent_connections = 1;
+    network_interface.max_pipelined_requests = 4;
+    ucall_server_config_t config {}, resolved {};
+    config.interfaces = &network_interface;
+    config.interfaces_count = 1;
+    ucall_server_init_t init {&server, &outcome, &config, &resolved};
+    ucall_server_init(&init);
+    require(failures, outcome.status == ucall_status_success_k && resolved.interfaces[0].max_pipelined_requests == 4,
+            "{}", ucall_status_name(outcome.status));
+    batch_context_t batches;
+    ucall_http_batch_endpoint_t endpoint {};
+    ucall_server_add_http_batch_endpoint_t add {
+        server, &outcome, view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches,
+        4,      4,        10000000,       &endpoint};
+    ucall_server_add_http_batch_endpoint(&add);
+    failures += expect(outcome.status == ucall_status_success_k);
+    auto drain = drain_batches(server, batches.failures, endpoint);
+    std::thread serving {[&] {
+        ucall_outcome_t served {};
+        ucall_server_take_calls_t take {server, &served, 0};
+        ucall_server_take_calls(&take);
+        batches.failures += expect(served.status == ucall_status_success_k);
+    }};
+    std::string burst;
+    for (std::size_t i = 0; i != 4; ++i)
+        burst += fmt::format("POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n{}", i);
+    raw_client_t client;
+    bool const written = client.connect(resolved.interfaces[0].address) &&
+                         client.write(ascii_bytes(burst.data(), burst.size()), burst.size(), deadline_after(5000));
+    failures += expect(written, "the burst was not written");
+    auto const deadline = deadline_after(5000);
+    while (written && !batches.completed.load(std::memory_order_acquire) && !expired(deadline))
+        std::this_thread::sleep_for(std::chrono::milliseconds {1});
+    bool const fired = batches.completed.load(std::memory_order_acquire) == 1 && batches.sizes[0] == 4;
+    failures += expect(fired, "{} batches, the first of {}", batches.completed.load(), batches.sizes[0]);
+    if (fired) {
+        for (std::size_t i = 4; i--;) {
+            ucall_bytes_view_t body {};
+            ucall_server_request_body_t extract {server, &outcome, batches.requests[i], &body};
+            ucall_server_request_body(&extract);
+            failures += expect(outcome.status == ucall_status_success_k && body.length == 1 && body.data[0] == '0' + i,
+                               "request {} of the batch", i);
+            ucall_server_reply_content_t response {server, &outcome, batches.requests[i], nullptr, 0, body};
+            ucall_server_reply_content(&response);
+            failures += expect(outcome.status == ucall_status_success_k);
+        }
+        std::size_t offset = 0;
+        for (std::size_t i = 0; i != 4; ++i) {
+            auto const response = read_response(client, offset);
+            failures += expect(response.status == 200 && response.body == std::to_string(i), "response {}: {} {}", i,
+                               response.status, response.body);
+            if (!response.length) break;
+            offset += response.length;
+        }
+    }
+    ucall_server_stop(server);
+    serving.join();
+    drain.join();
+    ucall_server_free(server);
+    return failures + batches.failures;
+#else
+    return case_result_t::skipped("raw sockets need POSIX");
+#endif
+}
+
 #pragma endregion Batches
 
 #pragma region Allocators
@@ -536,8 +747,7 @@ struct counting_allocator {
 };
 
 #if UCALL_WITH_POSIX
-using counted_network_t =
-    uc::network_variant<uc::posix_engine_t, uc::cpu_class_t::serial_k, counting_allocator<uc::byte_t>>;
+using counted_network_t = uc::serial_network<uc::posix_engine_t, counting_allocator<uc::byte_t>>;
 
 /** A server whose echo route keeps the outcome of its last reply, which no client can observe. */
 struct echo_route_t {
@@ -736,5 +946,8 @@ int main(int, char** argv) {
     run_test(totals, "test_timeout_and_cancel_unit", test_timeout_and_cancel_unit);
     run_test(totals, "test_application_batches_unit", test_application_batches_unit);
     run_test(totals, "test_batches_across_loops_unit", test_batches_across_loops_unit);
+    run_test(totals, "test_batch_endpoints_drain_apart_unit", test_batch_endpoints_drain_apart_unit);
+    run_test(totals, "test_batch_timeout_sleeps_unit", test_batch_timeout_sleeps_unit);
+    run_test(totals, "test_pipelined_batches_unit", test_pipelined_batches_unit);
     return suite_exit_code(totals);
 }

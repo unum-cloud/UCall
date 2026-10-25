@@ -564,6 +564,38 @@ struct raw_client_t {
     }
 };
 
+/** The first response on the wire, with zero @c length while it is still incomplete. */
+struct wire_response_t {
+    unsigned status = 0;
+    std::string_view body {};
+    std::size_t length = 0;
+};
+
+inline wire_response_t parse_response(std::string_view wire) {
+    wire_response_t response;
+    auto const headers_end = wire.find("\r\n\r\n");
+    if (headers_end == std::string_view::npos || headers_end < 12) return response;
+    auto const headers = wire.substr(0, headers_end + 2);
+    std::size_t body_length = 0;
+    if (auto field = headers.find("\r\ncontent-length: "); field != std::string_view::npos)
+        std::from_chars(headers.data() + field + 18, headers.data() + headers.size(), body_length);
+    if (wire.size() - headers_end - 4 < body_length) return response;
+    std::from_chars(wire.data() + 9, wire.data() + 12, response.status);
+    response.body = wire.substr(headers_end + 4, body_length);
+    response.length = headers_end + 4 + body_length;
+    return response;
+}
+
+/** Reads until a whole response follows @p offset, or answers a partial one on close or timeout. */
+inline wire_response_t read_response(raw_client_t& client, std::size_t offset) {
+    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds {5};
+    for (;;) {
+        auto response = parse_response(std::string_view {client.received}.substr(offset));
+        if (response.length) return response;
+        if (client.read(client.received.size() + 1, deadline) != read_end_t::filled_k) return response;
+    }
+}
+
 #endif // UCALL_OS_POSIX_
 #pragma endregion Raw Sockets
 

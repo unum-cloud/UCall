@@ -13,7 +13,7 @@
 using namespace unum::ucall;
 using namespace unum::ucall::test;
 
-using crypto_t = secure_tunnel_crypto<sz_cap_serial_k>;
+using crypto_t = secure_tunnel_crypto<serial_sha256_kit_t, serial_aes256_gcm_kit_t>;
 
 #pragma region Fixtures
 
@@ -219,9 +219,12 @@ struct connected_pair_t {
     return expect(wire.length > 0u, "the tunnel refused a {}-byte payload with {}", payload.size(), tunnel.fault());
 }
 
-/** Opens one whole record from a wire buffer, in place, exactly as a driver would. */
+/** Opens one whole record from a wire buffer, in place,
+ *  passing the record's own body as the destination. */
 [[nodiscard]] static secure_tunnel_opened_t open_from(secure_tunnel_t& tunnel, wire_t& wire) noexcept {
-    return tunnel.open(wire.arrived());
+    span<byte_t> const arrived = wire.arrived();
+    return tunnel.open(arrived, arrived.subspan(arrived.size() < secure_tunnel_headroom_k ? arrived.size()
+                                                                                          : secure_tunnel_headroom_k));
 }
 
 /** The big-endian length a record declares in its prefix. */
@@ -490,13 +493,10 @@ case_result_t test_config_safety() {
 }
 
 /**
- *  @brief What a bind's `max_payload` does and does not bound.
+ *  @brief What a bind's `max_payload` bounds on ingress.
  *
- *  The sender sizes records from `geometry().record_size()`. Ingress accepts the wire ceiling,
- *  so a peer with a larger outgoing record can make `bytes_until_boundary` request more bytes
- *  than the local sender's record buffer holds.
- *
- *  Pinned as it behaves today. If ingress is ever bounded too, this is the case that says so.
+ *  The sender sizes records from its own `geometry().record_size()`, so a peer configured wider can
+ *  seal records this side never agreed to hold. `open` bounds every record by this side's cap.
  */
 case_result_t test_geometry_safety() {
     std::size_t failures = 0;
@@ -504,7 +504,7 @@ case_result_t test_geometry_safety() {
     require(failures, wire.reserve());
 
     for (secure_tunnel_mode_t const mode : tunnel_modes_k) {
-        announce("{} an_ingress_record_is_not_bounded_by_this_binds_cap", mode);
+        announce("{} an_ingress_record_wider_than_this_binds_cap_is_refused", mode);
 
         keypair_t client_identity, server_identity;
         failures += expect(client_identity.draw());
@@ -536,22 +536,24 @@ case_result_t test_geometry_safety() {
         span<byte_t> const window = client.payload_window(wire.whole());
         failures += expect(window.size() == secure_tunnel_payload_ceiling_k);
         fill_with(window, byte_t {'X'});
-        wire.length = client.seal(wire.whole(), window.size()).size();
+        wire.length = client.seal(wire.whole(), 1024).size();
+        secure_tunnel_opened_t const at_cap = open_from(server, wire);
+        failures += expect(at_cap.consumed == wire.length, "{} refused a record at its cap with {}", mode,
+                           server.fault());
+        failures += expect(at_cap.payload.size() == 1024u);
+
+        fill_with(window, byte_t {'X'});
+        wire.length = client.seal(wire.whole(), 1025).size();
         failures += expect(wire.length > server_buffer, "the capped side was not the smaller one");
 
-        // What a driver sees first: two bytes of prefix, and a demand for the rest.
+        // What a driver sees first: two bytes of prefix, and a demand the boundary rule trusts.
         std::size_t const demanded = server.bytes_until_boundary(
             {wire.bytes(), wire.bytes() + secure_tunnel_headroom_k});
         failures += expect(demanded == wire.length - secure_tunnel_headroom_k);
-        failures += expect(demanded + secure_tunnel_headroom_k > server_buffer,
-                           "the boundary asked for {} bytes into a {}-byte buffer", demanded + secure_tunnel_headroom_k,
-                           server_buffer);
 
-        // And `open` accepts it, because ingress is bounded by `max_message_k` and nothing else.
-        secure_tunnel_opened_t const opened = open_from(server, wire);
-        failures += expect(opened.consumed == wire.length, "{} refused an over-cap record with {}", mode,
-                           server.fault());
-        failures += expect(opened.payload.size() == secure_tunnel_payload_ceiling_k);
+        failures += expect(open_from(server, wire).consumed == 0u, "{} opened a record past its cap", mode);
+        failures += expect(server.fault() == secure_tunnel_fault_t::malformed_k);
+        failures += expect(server.state() == secure_tunnel_state_t::broken_k);
     }
     return failures;
 }
@@ -796,6 +798,18 @@ case_result_t test_records_unit() {
         failures += expect(reply.consumed > 0u);
         failures += expect_bytes(reply.payload, ascii_bytes("HTTP/1.1 200 OK"));
 
+        // A driver opening into its own buffer finds the payload there
+        // and the record as it arrived.
+        failures += seal_into(pair.client, ascii_bytes("into a destination"), wire);
+        byte_t sealed[64] {}, destination[64] {};
+        std::memcpy(sealed, wire.bytes(), wire.length);
+        secure_tunnel_opened_t const apart = pair.server.open(wire.arrived(), destination);
+        failures += expect(apart.consumed == wire.length);
+        failures += expect(apart.payload.data() == destination);
+        failures += expect_bytes(apart.payload, ascii_bytes("into a destination"));
+        failures += expect(bytes_equal(wire.received(), {sealed, sealed + wire.length}),
+                           "opening into a destination rewrote the record");
+
         // One byte less than this minimum decrypts to nothing, after which reading the kind byte
         // would run off the end of the plaintext.
         failures += seal_into(pair.client, {}, wire);
@@ -913,13 +927,13 @@ case_result_t test_records_unit() {
     failures += expect(
         honest.open({first_record, first_record + secure_tunnel_headroom_k},
                     {first_record + secure_tunnel_headroom_k, first_record + secure_tunnel_headroom_k + body_size},
-                    first_record + secure_tunnel_headroom_k + body_size));
+                    first_record + secure_tunnel_headroom_k + body_size, first_record + secure_tunnel_headroom_k));
 
     crypto_t::secure_tunnel_cipher_t forgetful;
     forgetful.initialize(key);
     failures += expect(!forgetful.open(
         {}, {second_record + secure_tunnel_headroom_k, second_record + secure_tunnel_headroom_k + body_size},
-        second_record + secure_tunnel_headroom_k + body_size));
+        second_record + secure_tunnel_headroom_k + body_size, second_record + secure_tunnel_headroom_k));
     return failures;
 }
 

@@ -99,6 +99,11 @@ The requested ForkUnion worker count remains fixed; workers beyond the available
 Add `--close` to request connection closure after every response and measure connection churn separately from keep-alive reuse.
 The same byte checks, target quotas, and latency boundaries apply to both modes.
 
+`--pipeline-depth N` lets each connection carry up to `N` calls before their responses arrive, through the client's `max_pipelined_calls`; the default of 1 waits a round trip per call.
+The server answers pipelined requests in order at any depth, and its interface's `max_pipelined_requests` decides how many of them it dispatches at once.
+With `--reorder`, partners may share a connection, so the server must dispatch at least two requests per connection.
+The report prints the depth beside the connection and in-flight budgets.
+
 ## Python Adapters
 
 The semantic workload is an exact binary echo: `N` application bytes, a leading zero followed by `x` bytes, returned unchanged.
@@ -162,7 +167,7 @@ ghz --insecure --proto bench/echo.proto --call ucall.bench.Echo.Exchange \
 ```
 
 The application work matches, while the wire protocols differ: native HTTP and FastAPI use an HTTP/1.1 body; gRPC adds protobuf serialization, gRPC framing, and HTTP/2 multiplexing.
-A gRPC connection can carry concurrent streams, while the native HTTP/1.1 client keeps one exchange active per connection and queues the rest.
+A gRPC connection multiplexes concurrent streams, while a native HTTP/1.1 connection pipelines up to `--pipeline-depth` calls and receives their responses in order.
 The Python client and the native driver without `--rate` are closed-loop drivers; wrk2 and the native driver with `--rate` schedule an offered rate and account for delayed sends in their latency distributions.
 Report those load models separately, and inspect saturation and errors before interpreting their percentiles together.
 The Lua driver verifies response bytes; ghz reports RPC status and decoding, so use the Python gRPC client to check echoed bytes before its independent load run.

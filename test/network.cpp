@@ -2,7 +2,8 @@
  *  @file test/network.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief C ABI loopback framing, connection reuse, shared admission, and Noise authentication.
+ *  @brief C ABI loopback framing, connection reuse, shared admission, Noise authentication, and
+ *      engine duplex.
  *
  *  Every case runs against the backend `--backend` names, or the automatic one without it. Backend
  *  parity runs only in the automatic invocation, since it walks every backend the build carries.
@@ -23,6 +24,11 @@
 
 #include "ucall/ucall.h"
 #include "ucall/curve25519.hpp"
+#include "ucall/io.hpp"
+#if UCALL_WITH_LINUX_URING
+#include "ucall/uring612.hpp"
+#include "ucall/uring700.hpp"
+#endif
 
 #include "harness.hpp" // `expect`, `require`, `run_test`, `raw_client_t`
 
@@ -52,6 +58,12 @@ struct fixture_config_t {
     /** Open-connection budget of the server and the client alike. */
     std::size_t connections = 1;
 
+    /** Requests the server reads ahead on one connection; zero means one. */
+    std::size_t pipelined_requests = 0;
+
+    /** Calls the client sends ahead on one connection; zero means one. */
+    std::size_t pipelined_calls = 0;
+
     ucall_io_backend_t backend = backend_under_test;
 };
 
@@ -65,6 +77,7 @@ struct fixture_t {
     ucall_server_t server {};
     ucall_client_t client {};
     ucall_server_config_t resolved {};
+    ucall_client_config_t resolved_client {};
     ucall_noise_key_t server_private {}, server_public {}, client_private {}, client_public {};
     std::string address {}, url {};
 
@@ -81,9 +94,19 @@ struct fixture_t {
     std::vector<ucall_received_http_request_t> held {};
     std::vector<std::thread> pollers {};
 
-    /** Replies with the request body and an `X-UCall: passed` header. */
+    /** Checks the peer is the fixture's client, then replies with the request body and an
+     *  `X-UCall: passed` header. */
     void reply_echo(ucall_received_http_request_t request) {
         ucall_outcome_t outcome {};
+        std::size_t network_interface_index = resolved.interfaces_count;
+        ucall_noise_key_t peer_static_key {}, expected_key {};
+        if (resolved.interfaces[0].security_mode != ucall_security_mode_none_k)
+            std::memcpy(expected_key, client_public, sizeof(expected_key));
+        ucall_server_request_peer_t peer {server, &outcome, request, &network_interface_index, &peer_static_key};
+        ucall_server_request_peer(&peer);
+        failures += expect(outcome.status == ucall_status_success_k && network_interface_index == 0 &&
+                               std::memcmp(peer_static_key, expected_key, sizeof(expected_key)) == 0,
+                           "peer: {} on interface {}", ucall_status_name(outcome.status), network_interface_index);
         ucall_bytes_view_t body {};
         ucall_server_request_body_t extract {server, &outcome, request, &body};
         ucall_server_request_body(&extract);
@@ -125,6 +148,11 @@ struct fixture_t {
         fixture.failures += expect(outcome.status == ucall_status_success_k);
     }
 
+    std::size_t held_count() {
+        std::lock_guard lock {held_mutex};
+        return held.size();
+    }
+
     /** Pops one request the `/gate` route retained, or null when none waits. */
     ucall_received_http_request_t take_held() {
         std::lock_guard lock {held_mutex};
@@ -147,6 +175,7 @@ struct fixture_t {
         network_interface.address = "127.0.0.1:0";
         network_interface.event_loops = settings.event_loops;
         network_interface.max_concurrent_connections = settings.connections;
+        network_interface.max_pipelined_requests = settings.pipelined_requests;
         network_interface.security_mode = settings.security;
         network_interface.noise_private_key = &server_private;
         network_interface.peer_authorizer = authorize;
@@ -169,13 +198,15 @@ struct fixture_t {
         }
         ucall_client_config_t client_config {};
         client_config.max_concurrent_connections = settings.connections;
-        client_config.max_concurrent_calls = 2 * settings.connections;
+        client_config.max_pipelined_calls = settings.pipelined_calls;
+        client_config.max_concurrent_calls = 2 * settings.connections *
+                                             (settings.pipelined_calls ? settings.pipelined_calls : 1);
         client_config.noise_private_key = &client_private;
         client_config.peer_authorizer = authorize;
         client_config.peer_authorizer_context = server_public;
         client_config.backend = settings.backend;
         client_config.cpu_class = cpu_class_under_test;
-        ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
+        ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};
         ucall_client_init(&client_init);
         if ((status = outcome.status) != ucall_status_success_k) return;
         address = resolved.interfaces[0].address;
@@ -262,7 +293,8 @@ static case_result_t exchanges(ucall_security_mode_t security) {
     fixture_t fixture {{.security = security}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
-    std::string payload(65536, 'x');
+    // Four records under Noise, which seals and opens them where they lie.
+    std::string payload(200 * 1024, 'x');
     payload[0] = '\0';
     auto url = fixture.url + "/echo/42?key=value";
     ucall_outcome_t outcome {};
@@ -282,9 +314,31 @@ static case_result_t exchanges(ucall_security_mode_t security) {
                            ucall_status_name(completed.outcome.status));
         if (completed.response) failures += check_response(fixture, completed.response, expected);
     };
+    auto copies_beyond_receipt = [&] {
+        ucall_event_loop_statistics_t counters {};
+        ucall_outcome_t queried {};
+        ucall_server_event_loop_statistics_t query {fixture.server, &queried, 0, &counters};
+        ucall_server_event_loop_statistics(&query);
+        return counters.bytes_copied - counters.bytes_received;
+    };
+    // A reply's copy is counted once its send completes, which can trail the client's completion.
+    auto settled_copies = [&](std::uint64_t since, std::uint64_t expected) {
+        auto const deadline = deadline_after(2000);
+        ucall_completed_call_t completed {};
+        auto copies = copies_beyond_receipt();
+        while (copies - since < expected && std::chrono::steady_clock::now() < deadline) {
+            failures += expect(!fixture.poll(completed), "a call completed unasked");
+            copies = copies_beyond_receipt();
+        }
+        return copies;
+    };
     announce("two calls over one connection");
     exchange(payload);
+    auto const before = settled_copies(0, payload.size());
     exchange(payload);
+    auto const copied = settled_copies(before, payload.size()) - before;
+    failures += expect(copied == payload.size(), "{} bytes copied beyond those received for a {}-byte echo", copied,
+                       payload.size());
     if (security != ucall_security_mode_none_k) return failures + fixture.stop();
     announce("a named host");
     auto named_url = url;
@@ -390,42 +444,117 @@ static case_result_t test_cross_thread_replies_stress() {
     return failures + fixture.stop();
 }
 
+/** Polls until the `/gate` route holds @p count requests, with no call completing meanwhile. */
+static std::size_t await_held(fixture_t& fixture, std::size_t count) {
+    std::size_t failures = 0;
+    auto const deadline = deadline_after(5000);
+    while (fixture.held_count() != count && !failures) {
+        ucall_completed_call_t completed {};
+        failures += expect(!fixture.poll(completed), "a call completed early");
+        failures += expect(std::chrono::steady_clock::now() < deadline, "the server holds {} of {} requests",
+                           fixture.held_count(), count);
+    }
+    return failures;
+}
+
+/** Eight calls at depth four share one connection: the server holds four at once, which lockstep
+ *  calls never reach, and the responses to replies given in reverse complete in call order. */
+static case_result_t pipelined_calls(ucall_security_mode_t security) {
+    fixture_t fixture {{.security = security, .pipelined_requests = 4, .pipelined_calls = 4}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    require(0, fixture.resolved_client.max_pipelined_calls == 4);
+    std::size_t failures = 0;
+    std::string const gate_url = fixture.url + "/gate";
+    std::array<std::string, 8> bodies;
+    for (std::size_t i = 0; i != bodies.size(); ++i) {
+        // Growing bodies, so later replies span several records each behind shorter ones.
+        bodies[i] = fmt::format("call {}", i) + std::string(i * 40 * 1024, '.');
+        ucall_outcome_t outcome {};
+        ucall_client_call_t call {};
+        call.client = fixture.client;
+        call.outcome = &outcome;
+        call.url = view(gate_url);
+        call.verb = ucall_verb_post_k;
+        call.body = view(bodies[i]);
+        call.context = &bodies[i];
+        call.options.security = security;
+        call.options.server_key = &fixture.server_public;
+        ucall_client_call(&call);
+        failures += expect(outcome.status == ucall_status_success_k);
+    }
+    for (std::size_t next = 0; next != bodies.size() && !failures;) {
+        failures += await_held(fixture, 4);
+        while (auto request = fixture.take_held()) fixture.reply_echo(request);
+        for (auto const end = next + 4; next != end && !failures; ++next) {
+            auto completed = fixture.wait();
+            failures += expect(completed.context == &bodies[next] && completed.response, "call {} completed {}: {}",
+                               next, static_cast<std::string const*>(completed.context) - bodies.data(),
+                               ucall_status_name(completed.outcome.status));
+            if (completed.response) failures += check_response(fixture, completed.response, bodies[next]);
+        }
+    }
+    return failures + fixture.stop();
+}
+
+static case_result_t test_pipelined_calls_plain() { return pipelined_calls(ucall_security_mode_none_k); }
+static case_result_t test_pipelined_calls_noise_xx() { return pipelined_calls(ucall_security_mode_noise_xx_k); }
+
+/** The server closes after its second response with a POST and a GET still on the connection: the
+ *  POST finishes as closed without reaching the server, and the GET is retried and answered. */
+static case_result_t test_pipelined_call_loss() {
+    fixture_t fixture {{.pipelined_requests = 4, .pipelined_calls = 4}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    std::string const gate_url = fixture.url + "/gate", post_url = fixture.url + "/echo/3",
+                      get_url = fixture.url + "/echo/4";
+    ucall_bytes_view_t const close = view("Connection: close");
+    struct planned_call_t {
+        std::string const* url;
+        ucall_verb_t verb;
+        ucall_status_t expected;
+    };
+    std::array<planned_call_t, 4> plan {{{&gate_url, ucall_verb_get_k, ucall_status_success_k},
+                                         {&gate_url, ucall_verb_get_k, ucall_status_success_k},
+                                         {&post_url, ucall_verb_post_k, ucall_status_connection_closed_k},
+                                         {&get_url, ucall_verb_get_k, ucall_status_success_k}}};
+    for (auto& planned : plan) {
+        ucall_outcome_t outcome {};
+        ucall_client_call_t call {};
+        call.client = fixture.client;
+        call.outcome = &outcome;
+        call.url = view(*planned.url);
+        call.verb = planned.verb;
+        call.context = &planned;
+        if (&planned == &plan[1]) {
+            call.headers = &close;
+            call.headers_count = 1;
+        }
+        ucall_client_call(&call);
+        failures += expect(outcome.status == ucall_status_success_k);
+    }
+    failures += await_held(fixture, 2);
+    // The server stops reading at the closing request; meanwhile the last two calls leave too.
+    for (auto const settled = deadline_after(100); std::chrono::steady_clock::now() < settled;) {
+        ucall_completed_call_t completed {};
+        failures += expect(!fixture.poll(completed), "a call completed early");
+    }
+    while (auto request = fixture.take_held()) fixture.reply_echo(request);
+    for (auto const& planned : plan) {
+        auto completed = fixture.wait();
+        failures += expect(completed.context == &planned && completed.outcome.status == planned.expected,
+                           "call {} completed {}: {}", &planned - plan.data(),
+                           static_cast<planned_call_t const*>(completed.context) - plan.data(),
+                           ucall_status_name(completed.outcome.status));
+        if (completed.response) failures += check_response(fixture, completed.response, {});
+    }
+    failures += expect(fixture.dispatched.load() == 1, "{} echo requests were dispatched", fixture.dispatched.load());
+    return failures + fixture.stop();
+}
+
 #pragma endregion Library Clients
 
 #pragma region Raw Clients
 #if UCALL_OS_POSIX_
-
-/** The first response on the wire, with zero @c length while it is still incomplete. */
-struct wire_response_t {
-    unsigned status = 0;
-    std::string_view body {};
-    std::size_t length = 0;
-};
-
-static wire_response_t parse_response(std::string_view wire) {
-    wire_response_t response;
-    auto const headers_end = wire.find("\r\n\r\n");
-    if (headers_end == std::string_view::npos || headers_end < 12) return response;
-    auto const headers = wire.substr(0, headers_end + 2);
-    std::size_t body_length = 0;
-    if (auto field = headers.find("\r\ncontent-length: "); field != std::string_view::npos)
-        std::from_chars(headers.data() + field + 18, headers.data() + headers.size(), body_length);
-    if (wire.size() - headers_end - 4 < body_length) return response;
-    std::from_chars(wire.data() + 9, wire.data() + 12, response.status);
-    response.body = wire.substr(headers_end + 4, body_length);
-    response.length = headers_end + 4 + body_length;
-    return response;
-}
-
-/** Reads until a whole response follows @p offset, or answers a partial one on close or timeout. */
-static wire_response_t read_response(raw_client_t& client, std::size_t offset) {
-    auto const deadline = deadline_after(5000);
-    for (;;) {
-        auto response = parse_response(std::string_view {client.received}.substr(offset));
-        if (response.length) return response;
-        if (client.read(client.received.size() + 1, deadline) != read_end_t::filled_k) return response;
-    }
-}
 
 static uc::span<uc::byte_t const> wire_bytes(std::string_view text) { return ascii_bytes(text.data(), text.size()); }
 
@@ -446,24 +575,31 @@ static wire_response_t exchange_until_close(raw_client_t& client, std::string_vi
     return response;
 }
 
-/** Two requests arriving in one segment come back as two responses, in order. */
+/** Three requests arriving in one segment, the second closing, come back as two responses in
+ *  order, then the close, even when the server may read four ahead. */
 static case_result_t test_pipelined_delivery() {
-    fixture_t fixture {{}};
+    fixture_t fixture {{.pipelined_requests = 4}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;
     raw_client_t client;
     require(failures, client.connect(fixture.address));
-    auto const first = exchange_until_close(client,
-                                            "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nfirst"
-                                            "POST /echo/2 HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n"
-                                            "Connection: close\r\n\r\nsecond",
-                                            0, failures);
+    std::string_view const burst = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nfirst"
+                                   "POST /echo/2 HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n"
+                                   "Connection: close\r\n\r\nsecond"
+                                   "POST /echo/3 HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\nthird";
+    // One send, so the server has read the third request before it closes,
+    // and the close is no reset.
+    failures += expect(::send(client.descriptor, burst.data(), burst.size(), 0) == static_cast<ssize_t>(burst.size()));
+    auto const end = client.read_until_close(deadline_after(10000));
+    failures += expect(end == read_end_t::closed_k, "the read ended as {}", static_cast<int>(end));
+    auto const first = parse_response(client.received);
     auto const second = parse_response(std::string_view {client.received}.substr(first.length));
     failures += expect(first.status == 200 && first.body == "first", "first answered {} {}", first.status, first.body);
     failures += expect(second.status == 200 && second.body == "second", "second answered {} {}", second.status,
                        second.body);
     failures += expect(first.length + second.length == client.received.size());
+    failures += expect(fixture.dispatched.load() == 2, "{} requests were dispatched", fixture.dispatched.load());
     return failures + fixture.stop();
 }
 
@@ -632,6 +768,109 @@ static case_result_t test_backend_parity() {
 #endif // UCALL_OS_POSIX_
 #pragma endregion Raw Clients
 
+#pragma region Engines
+#if UCALL_OS_POSIX_
+
+/** A mebibyte send and a receive wait on one socket together,
+ *  and each completes as its own request. */
+template <typename engine_type_>
+static case_result_t engine_duplex() {
+    engine_type_ engine;
+    auto const status = engine.open(2, 2);
+    if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this backend");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    int sockets[2] {-1, -1};
+    require(failures, socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    // A send buffer far below a mebibyte keeps the send pending until the peer drains it.
+    int const send_buffer = static_cast<int>(fixture_buffer_bytes_k);
+    require(failures, uc::nonblocking(sockets[0]) && uc::nonblocking(sockets[1]) &&
+                          uc::socket_option(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) == 0);
+    auto const owned = engine.import_socket(sockets[0]);
+    require(failures, owned >= 0, "importing ended with {}", owned);
+    auto const peer = sockets[1];
+
+    std::vector<uc::byte_t> payload(std::size_t {1} << 20), drained(payload.size());
+    auto& generator = global_random_generator();
+    for (auto& byte : payload) byte = static_cast<uc::byte_t>(generator());
+    auto const message = ascii_bytes("receive");
+    std::array<uc::byte_t, fixture_buffer_bytes_k> buffer {};
+    uc::io_request_t receiving {uc::io_operation_t::receive_k, owned, buffer.data(), buffer.size()};
+    uc::io_request_t sending {uc::io_operation_t::send_k, owned, payload.data(), payload.size()};
+    require(failures, engine.submit(receiving) == ucall_status_success_k);
+    require(failures, engine.submit(sending) == ucall_status_success_k);
+
+    std::size_t received = 0, sent = 0, read = 0;
+    bool written = false;
+    uc::io_completion_t completions[2] {};
+    auto const deadline = uc::deadline_after(5000000);
+    while (!received || sent != payload.size() || read != payload.size()) {
+        // Nothing drains the peer before the receive completes,
+        // so the send stays pending throughout.
+        auto const wait = written && !received ? uc::io_wait_t::blocking_k : uc::io_wait_t::nonblocking_k;
+        int const count = engine.poll(uc::span<uc::io_completion_t> {completions}, wait, deadline);
+        require(failures, count >= 0, "polling ended with {}", count);
+        for (auto const& completed :
+             uc::span<uc::io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+            if (completed.request == &sending) {
+                require(failures, completed.result > 0, "sending ended with {}", completed.result);
+                sent += static_cast<std::size_t>(completed.result);
+                sending.data = payload.data() + sent;
+                sending.length = payload.size() - sent;
+                if (sent != payload.size()) require(failures, engine.submit(sending) == ucall_status_success_k);
+            }
+            else {
+                require(failures, completed.request == &receiving, "a completion named neither request");
+                require(failures, completed.result > 0, "receiving ended with {}", completed.result);
+                received = static_cast<std::size_t>(completed.result);
+                uc::span<uc::byte_t const> const delivered {completed.data ? completed.data : receiving.data, received};
+                failures += expect_bytes(delivered, message);
+                failures += expect(sent != payload.size(), "the send finished before the peer read");
+            }
+            engine.release(completed);
+        }
+        if (!written && !count) {
+            require(failures,
+                    ::send(peer, message.data(), message.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(message.size()));
+            written = true;
+        }
+        if (received && read != drained.size()) {
+            auto const length = ::recv(peer, drained.data() + read, drained.size() - read, 0);
+            if (length > 0) read += static_cast<std::size_t>(length);
+            else require(failures, length < 0 && uc::io_pending(-errno), "draining ended with {}", length);
+        }
+        require(failures, uc::monotonic_ns() < deadline, "{} received, {} sent and {} read of {}", received, sent, read,
+                payload.size());
+    }
+    failures += expect(drained == payload);
+    failures += expect(engine.close_socket(owned) == 0);
+    uc::socket_close(peer);
+    return failures;
+}
+
+/** The engine `--backend` names keeps a receive and a send pending on one socket at once. */
+static case_result_t test_engine_duplex_delivery() {
+    switch (backend_under_test) {
+#if UCALL_WITH_POSIX
+    case ucall_io_backend_posix_k: return engine_duplex<uc::posix_engine_t>();
+#endif
+#if UCALL_WITH_LINUX_EPOLL
+    case ucall_io_backend_linux_epoll_k: return engine_duplex<uc::linux_epoll_engine_t>();
+#endif
+#if UCALL_WITH_LINUX_URING
+    case ucall_io_backend_linux_uring612_k: return engine_duplex<uc::linux_uring612_engine_t>();
+    case ucall_io_backend_linux_uring700_k: return engine_duplex<uc::linux_uring700_engine_t>();
+#endif
+#if UCALL_WITH_KQUEUE
+    case ucall_io_backend_macos_kqueue_k: return engine_duplex<uc::kqueue_engine_t>();
+#endif
+    default: return case_result_t::skipped("no named POSIX engine");
+    }
+}
+
+#endif // UCALL_OS_POSIX_
+#pragma endregion Engines
+
 int main(int argc, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
@@ -682,6 +921,9 @@ int main(int argc, char** argv) {
     run_test(totals, "test_exchanges_noise_ik", test_exchanges_noise_ik);
     run_test(totals, "test_multiloop_retention", test_multiloop_retention);
     run_test(totals, "test_cross_thread_replies_stress", test_cross_thread_replies_stress);
+    run_test(totals, "test_pipelined_calls_plain", test_pipelined_calls_plain);
+    run_test(totals, "test_pipelined_calls_noise_xx", test_pipelined_calls_noise_xx);
+    run_test(totals, "test_pipelined_call_loss", test_pipelined_call_loss);
 #if UCALL_OS_POSIX_
     run_test(totals, "test_pipelined_delivery", test_pipelined_delivery);
     run_test(totals, "test_fragmented_headers_delivery", test_fragmented_headers_delivery);
@@ -689,6 +931,7 @@ int main(int argc, char** argv) {
     run_test(totals, "test_smuggling_safety", test_smuggling_safety);
     run_test(totals, "test_header_lookup_unit", test_header_lookup_unit);
     run_test(totals, "test_admission_across_loops", test_admission_across_loops);
+    run_test(totals, "test_engine_duplex_delivery", test_engine_duplex_delivery);
     if (backend_under_test == ucall_io_backend_automatic_k)
         run_test(totals, "test_backend_parity", test_backend_parity);
 #endif

@@ -13,9 +13,19 @@ namespace unum::ucall {
 
 template <typename engine_type_, cpu_class_t cpu_class_, typename init_type_>
 void make_network_for_engine(init_type_* arguments) noexcept {
-    if constexpr (std::is_same_v<init_type_, ucall_server_init_t>)
-        network_variant<engine_type_, cpu_class_>::server_init(arguments);
-    else network_variant<engine_type_, cpu_class_>::client_init(arguments);
+    using traits_t = cpu_traits<cpu_class_>;
+    using network_t =
+        network_variant<engine_type_, atomic_ref_for_cpu_class<cpu_class_>::template type,
+                        typename traits_t::compare_kit_t, typename traits_t::find_kit_t,
+                        typename traits_t::byteset_kit_t, typename traits_t::hash_kit_t, typename traits_t::fold_kit_t,
+                        typename traits_t::sha256_kit_t, typename traits_t::aes256_gcm_kit_t>;
+    // The network reports the class it was built for, which only this layer names.
+    auto config = *arguments->config;
+    config.cpu_class = static_cast<ucall_cpu_class_t>(cpu_class_);
+    auto forwarded = *arguments;
+    forwarded.config = &config;
+    if constexpr (std::is_same_v<init_type_, ucall_server_init_t>) network_t::server_init(&forwarded);
+    else network_t::client_init(&forwarded);
 }
 
 template <cpu_class_t cpu_class_, typename init_type_>

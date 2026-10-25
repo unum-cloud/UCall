@@ -69,6 +69,11 @@ typedef struct ucall_network_interface_t {
      *  descriptor resources. Receive storage grows with the actual framed message. */
     size_t max_concurrent_connections;
 
+    /** Requests one connection may have in flight before UCall stops reading from it; zero means
+     *  one. Replies leave in request order. Batch rings hold @c max_concurrent_connections times
+     *  this many requests. */
+    size_t max_pipelined_requests;
+
 } ucall_network_interface_t;
 
 /**
@@ -146,7 +151,7 @@ UCALL_EXPORT void ucall_server_init(ucall_server_init_t* arguments);
  */
 UCALL_EXPORT void ucall_server_free(ucall_server_t server);
 
-/** Requests shutdown and wakes blocked polling callers.
+/** Requests shutdown and wakes blocked polling and draining callers.
  *  Safe from an endpoint callback or a separate thread. */
 UCALL_EXPORT void ucall_server_stop(ucall_server_t server);
 
@@ -256,34 +261,41 @@ UCALL_EXPORT void ucall_server_event_loop_statistics(ucall_server_event_loop_sta
 /** Arguments of @c ucall_server_take_batch(). */
 typedef struct ucall_server_take_batch_t {
 
-    /** Initialized server with at least one batch endpoint. */
+    /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Outcome of this draining round; @c ucall_status_not_found_k without batch endpoints. */
+    /** Outcome of this draining round; @c ucall_status_invalid_argument_k for a NULL endpoint. */
     ucall_outcome_t* outcome;
+
+    /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one draining owner. */
+    ucall_http_batch_endpoint_t endpoint;
 
     /** Maximum wait for a due batch; zero performs one nonblocking round. */
     size_t timeout_microseconds;
 
 } ucall_server_take_batch_t;
 
-/** Invokes the batch callbacks that are due, from every event loop, on the calling thread.
- *  Call from one thread at a time; UCall creates none. A bounded wait yields the core between
- *  checks. */
+/** Invokes one batch endpoint's callback if a batch is due, with requests from every event loop,
+ *  on the calling thread. UCall creates no thread; a bounded wait sleeps until a deposit, the
+ *  partial batch's deadline, or the timeout, without polling any event loop. */
 UCALL_EXPORT void ucall_server_take_batch(ucall_server_take_batch_t* arguments);
 
 /** Arguments of @c ucall_server_take_batches(). */
 typedef struct ucall_server_take_batches_t {
 
-    /** Initialized server with at least one batch endpoint. */
+    /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Final outcome after draining stops; @c ucall_status_not_found_k without batch endpoints. */
+    /** Final outcome after draining stops; @c ucall_status_invalid_argument_k for a NULL
+     *  endpoint. */
     ucall_outcome_t* outcome;
+
+    /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one draining owner. */
+    ucall_http_batch_endpoint_t endpoint;
 
 } ucall_server_take_batches_t;
 
-/** Invokes due batch callbacks on the calling thread, sleeping in between, until
+/** Invokes one batch endpoint's due callbacks on the calling thread, sleeping in between, until
  *  @c ucall_server_stop(). Requests still queued then are released without a callback. */
 UCALL_EXPORT void ucall_server_take_batches(ucall_server_take_batches_t* arguments);
 
@@ -341,19 +353,20 @@ UCALL_EXPORT void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_
  *  @note The array is valid only during the callback. Each request stays valid until a reply
  *      consumes it or the server is freed, independently of the array and the other requests.
  */
-typedef void (*ucall_received_batch_http_request_callback_t)( //
+typedef void (*ucall_received_http_batch_callback_t)( //
     ucall_received_http_request_t const* requests, size_t count, void* context);
 
-/** Arguments of @c ucall_server_add_batch_endpoint().
+/** Arguments of @c ucall_server_add_http_batch_endpoint().
  *
  *  Batching improves throughput for high-latency operations (e.g., GPU inference) by
  *  accumulating multiple requests and processing them together. */
-typedef struct ucall_server_add_batch_endpoint_t {
+typedef struct ucall_server_add_http_batch_endpoint_t {
 
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives a failure for a duplicate endpoint, an invalid template, or a lack of memory. */
+    /** Receives a failure for a NULL @c endpoint, a duplicate endpoint, an invalid template, or a
+     *  lack of memory. */
     ucall_outcome_t* outcome;
 
     /** URI template, with an explicit byte length. */
@@ -363,7 +376,7 @@ typedef struct ucall_server_add_batch_endpoint_t {
     ucall_verb_t verb;
 
     /** Function pointer to the batch callback. */
-    ucall_received_batch_http_request_callback_t callback;
+    ucall_received_http_batch_callback_t callback;
 
     /** Optional payload/tag for metadata (e.g., for CPython runtime). */
     void* context;
@@ -377,7 +390,11 @@ typedef struct ucall_server_add_batch_endpoint_t {
     /** Maximum wait time for partial batches. Default: 10'000, i.e. 10 milliseconds. */
     size_t max_latency_microseconds;
 
-} ucall_server_add_batch_endpoint_t;
+    /** Receives the endpoint that @c ucall_server_take_batch() and @c ucall_server_take_batches()
+     *  drain; required. */
+    ucall_http_batch_endpoint_t* endpoint;
+
+} ucall_server_add_http_batch_endpoint_t;
 
 /**
  *  @brief Registers a batching callback to collect multiple requests and process them together.
@@ -391,15 +408,16 @@ typedef struct ucall_server_add_batch_endpoint_t {
  *  - Batch size >= @c min_batch_size: Dispatch immediately (optimal utilization).
  *  - Batch size >= @c max_batch_size: Force dispatch (prevent unbounded growth).
  *
- *
- *  Requests from every event loop share one queue per server. The callback receives a counted array
- *  of request handles on the thread calling @c ucall_server_take_batch() or
- *  @c ucall_server_take_batches(), never on an event loop. Copy the handles into application-owned
- *  storage to process them later; received bytes need no copy.
+ *  Requests from every event loop share one queue per batch endpoint. The callback receives a
+ *  counted array of request handles on the thread draining that endpoint through
+ *  @c ucall_server_take_batch() or @c ucall_server_take_batches(), never on an event loop.
+ *  Registration returns the endpoint's handle, so each endpoint can have its own draining thread.
+ *  Copy the request handles into application-owned storage to process them later; received bytes
+ *  need no copy.
  *
  *  @note Call during setup only, before any loop is polled.
  */
-UCALL_EXPORT void ucall_server_add_batch_endpoint(ucall_server_add_batch_endpoint_t* arguments);
+UCALL_EXPORT void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments);
 
 /** Arguments of @c ucall_server_add_websocket_endpoint(). */
 typedef struct ucall_server_add_websocket_endpoint_t {
@@ -574,6 +592,37 @@ typedef struct ucall_server_request_header_t {
  *      concurrently.
  */
 UCALL_EXPORT void ucall_server_request_header(ucall_server_request_header_t* arguments);
+
+/** Arguments of @c ucall_server_request_peer(). */
+typedef struct ucall_server_request_peer_t {
+
+    /** The server this call operates on. */
+    ucall_server_t server;
+
+    /** Output for the outcome. */
+    ucall_outcome_t* outcome;
+
+    /** A request from any endpoint, plain or batch, until its reply. */
+    ucall_received_http_request_t request;
+
+    /** Output for the position of its interface in @c ucall_server_config_t::interfaces. */
+    size_t* network_interface_index;
+
+    /** Output for the peer's authenticated Noise static key; zeroed on plaintext interfaces. */
+    ucall_noise_key_t* static_key;
+
+} ucall_server_request_peer_t;
+
+/**
+ *  @brief Reports which interface a request arrived on and which authenticated key sent it.
+ *
+ *  Both facts are copied when the request is received, so they remain readable after its
+ *  connection closes, as batched requests often outlive theirs.
+ *
+ *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
+ *      concurrently.
+ */
+UCALL_EXPORT void ucall_server_request_peer(ucall_server_request_peer_t* arguments);
 
 /** Arguments of @c ucall_server_request_body(). */
 typedef struct ucall_server_request_body_t {

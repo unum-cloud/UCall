@@ -209,10 +209,6 @@ void ucall_server_stop(ucall_server_t server) {
     if (!server) return;
     std::atomic_ref<std::uint32_t> {server->stopped}.store(1, std::memory_order_release);
     for (auto* wake : server->wakeups) wake->notify();
-    if (!server->batch_tail) return;
-    std::atomic_ref<std::uint64_t> {*server->batch_tail}.fetch_or(ucall_server_handle_t::batch_signal_k,
-                                                                  std::memory_order_release);
-    std::atomic_ref<std::uint64_t> {*server->batch_tail}.notify_one();
 }
 void ucall_client_free(ucall_client_t client) {
     if (!client) return;
@@ -244,6 +240,11 @@ void ucall_server_request_header(ucall_server_request_header_t* arguments) {
     if (!arguments) return;
     if (!admit(arguments->server, arguments->outcome)) return;
     arguments->server->api->request_header(arguments);
+}
+void ucall_server_request_peer(ucall_server_request_peer_t* arguments) {
+    if (!arguments) return;
+    if (!admit(arguments->server, arguments->outcome)) return;
+    arguments->server->api->request_peer(arguments);
 }
 void ucall_server_request_body(ucall_server_request_body_t* arguments) {
     if (!arguments) return;
@@ -314,10 +315,10 @@ void ucall_client_websocket_close(ucall_client_websocket_close_t* arguments) {
     publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
-void ucall_server_add_batch_endpoint(ucall_server_add_batch_endpoint_t* arguments) {
+void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments) {
     if (!arguments) return;
     if (!admit(arguments->server, arguments->outcome)) return;
-    arguments->server->api->add_batch_endpoint(arguments);
+    arguments->server->api->add_http_batch_endpoint(arguments);
 }
 
 void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* arguments) {

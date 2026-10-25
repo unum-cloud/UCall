@@ -44,11 +44,13 @@ A name identifies the resource or operation it represents; do not introduce anot
 Class, alias, and variable templates have bare names, template parameters end in an underscore, concrete types use `_t`, and concrete constants use `_k`.
 Declare sibling namespace aliases once and use `st::`, `fu::`, and `sz::` at use sites.
 Spell full sibling namespaces only when declaring those aliases.
+Each template in `include/` takes its kits and atomic reference as template arguments, and `src/` picks them per CPU class.
+No template in `include/` names a CPU class or a capability mask; classes, masks, and the ladder that chooses rungs stay in `src/`.
 
 Every mutable object has one owner and one authoritative state.
 Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
 That owner holds its connections, protocol transitions, deadlines, and backend operation records.
-Endpoint and batch callbacks execute synchronously on the polling caller.
+Endpoint callbacks execute synchronously on the polling caller, and batch callbacks on the batch endpoint's draining caller.
 Cross-thread retained replies and server shutdown publish state atomically rather than changing the loop's I/O records directly.
 Public contracts say when inputs may be reused, when an outcome becomes final, and which owner must outlive which handle.
 Cancellation requests work to stop; only retirement permits its storage to be reused.

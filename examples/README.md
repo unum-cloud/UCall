@@ -11,7 +11,8 @@ The backend defaults to automatic, the CPU class to serial, and the application 
 | [Ledger](ledger/server.cpp)         | `GET /accounts/{id}`, `POST /transfers/{from}/{to}` | `POST /batch/transfers/{from}/{to}`   |
 
 Each batch callback receives a borrowed array of request handles and its count, and reuses the individual handler for each request.
-These routes coalesce requests ready on one polling loop without waiting for a minimum group size.
+These routes coalesce requests from every polling loop without waiting for a minimum group size.
+The last pool thread drains the batch endpoint through the handle its registration returned, so batch callbacks never run on a polling loop.
 Each request keeps its own response; ledger transfers and key-value operations keep their individual transaction boundaries.
 
 The echo service also exposes `POST /echo/reordered` for the benchmark driver's `--reorder` workload.
@@ -22,7 +23,7 @@ Build with `UCALL_BUILD_EXAMPLES=ON` and select `ucall_example_echo`, `ucall_exa
 Each executable selects among the backends compiled into the single UCall library.
 `--connections` supplies the admission budget, and `--threads` selects the application-owned polling loops.
 The application dispatches those loops through its ForkUnion pool; UCall creates no threads.
-Callbacks run on the polling caller, and the examples stop and join their polling threads on SIGINT or SIGTERM.
+Individual callbacks run on the polling caller, and the examples stop and join their threads on SIGINT or SIGTERM.
 The [benchmark driver](../bench/README.md) measures the same raw HTTP echo workload across backends.
 
 [fastapi_server.py](fastapi_server.py) exposes the same echo and health routes for a Python comparison.
