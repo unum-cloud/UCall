@@ -11,15 +11,8 @@
 #include <cstdlib>
 #include <cstring>
 
-#if defined(__linux__)
-#include <sys/random.h>
-#elif defined(_WIN32)
-#include <winsock2.h>
-#include <windows.h>
-#include <bcrypt.h>
-#endif
-
-#include <new>
+#include <memory>      // `std::construct_at`
+#include <string_view> // `std::string_view`
 
 #include <stringzilla/capabilities.h>
 #include <stringzilla/hash/serial.h>
@@ -46,6 +39,12 @@
 
 #include "ucall/curve25519.hpp"
 #include "ucall/types.hpp"
+
+#if UCALL_OS_LINUX_
+#include <sys/random.h> // `getrandom`
+#elif UCALL_OS_WINDOWS_
+#include <bcrypt.h> // `BCryptGenRandom`
+#endif
 
 namespace unum::ucall {
 
@@ -493,8 +492,8 @@ static constexpr std::size_t secure_tunnel_default_payload_k = secure_tunnel_pay
  *  make it: real entropy, never a fast pseudo-random generator, and the public half derived rather
  *  than invented. A bind draws one at startup and a client handle draws one per process.
  */
-[[nodiscard]] bool secure_tunnel_generate_keypair(byte_t private_half[secure_tunnel_key_size_k],
-                                                  byte_t public_half[secure_tunnel_key_size_k]) noexcept;
+[[nodiscard]] bool secure_tunnel_generate_keypair(span<byte_t, secure_tunnel_key_size_k> private_half,
+                                                  span<byte_t, secure_tunnel_key_size_k> public_half) noexcept;
 
 /**
  *  @brief Everything @c make needs, so a new knob does not re-sign every construction site.
@@ -709,21 +708,22 @@ struct secure_tunnel_crypto {
      *  afterwards, which makes a plain @c memset a dead store the compiler may legally delete.
      *  Writing through a volatile pointer is what keeps it.
      */
-    static void secure_zero(void* data, std::size_t length) noexcept {
-        auto volatile* cursor = static_cast<byte_t volatile*>(data);
-        for (std::size_t index = 0; index != length; ++index) cursor[index] = byte_t {};
+    static void secure_zero(span<byte_t> bytes) noexcept {
+        byte_t volatile* const cursor = bytes.data();
+        for (std::size_t index = 0; index != bytes.size(); ++index) cursor[index] = byte_t {};
     }
 
     /**
      *  @brief Wipes a whole object or array, taking its width from the type.
      *
-     *  One overload covers a fixed-width key, a key schedule, and a table of derived outputs alike,
-     *  which is why no separate span-over-an-array helper exists: the width a caller would have had
-     *  to spell is the width the compiler already knows.
+     *  One overload covers a key schedule, a table of derived outputs, and a C key alike: the width
+     *  a caller would have had to spell is the width the compiler already knows. A byte array or a
+     *  span wipes the bytes it holds or views, never the span itself.
      */
     template <typename secret_type_>
     static void secure_zero(secret_type_& secret) noexcept {
-        secure_zero(&secret, sizeof(secret));
+        if constexpr (std::is_convertible_v<secret_type_&, span<byte_t>>) secure_zero(span<byte_t> {secret});
+        else secure_zero(std::as_writable_bytes(span<secret_type_, 1> {&secret, 1}));
     }
 
     /**
@@ -734,21 +734,20 @@ struct secure_tunnel_crypto {
      *  @warning Never substitute a fast pseudo-random generator here. StringZilla's
      *      @c sz_fill_random is an AES-based hash - excellent for buffers, and fatal for keys.
      */
-    [[nodiscard]] static bool secure_random_bytes(byte_t* output, std::size_t length) noexcept {
+    [[nodiscard]] static bool secure_random_bytes(span<byte_t> output) noexcept {
 #if UCALL_OS_LINUX_
-        while (length) {
-            ssize_t const taken = ::getrandom(output, length, 0);
+        while (!output.empty()) {
+            ssize_t const taken = ::getrandom(output.data(), output.size(), 0);
             if (taken < 0 && errno == EINTR) continue;
             if (taken <= 0) return false;
-            output += taken;
-            length -= static_cast<std::size_t>(taken);
+            output = output.subspan(static_cast<std::size_t>(taken));
         }
         return true;
 #elif UCALL_OS_WINDOWS_
-        return BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(output), static_cast<ULONG>(length),
+        return BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(output.data()), static_cast<ULONG>(output.size()),
                                BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
 #else
-        arc4random_buf(output, length);
+        arc4random_buf(output.data(), output.size());
         return true;
 #endif
     }
@@ -765,7 +764,7 @@ struct secure_tunnel_crypto {
         return (static_cast<std::size_t>(input[0]) << 8) | static_cast<std::size_t>(input[1]);
     }
 
-    static void poke_length(byte_t* output, std::size_t length) noexcept {
+    static void poke_length(span<byte_t, prefix_size_k> output, std::size_t length) noexcept {
         assert(length <= max_message_k && "a length prefix names at most sixty-five thousand bytes");
         output[0] = static_cast<byte_t>((length >> 8) & 0xFFu);
         output[1] = static_cast<byte_t>(length & 0xFFu);
@@ -829,7 +828,8 @@ struct secure_tunnel_crypto {
         }
 
         /** Computes the tag over one or two concatenated inputs, reusing both midstates. */
-        void compute(span<byte_t const> first, span<byte_t const> second, byte_t output[hash_size_k]) const noexcept {
+        void compute(span<byte_t const> first, span<byte_t const> second,
+                     span<byte_t, hash_size_k> output) const noexcept {
             sz_sha256_state_t inner = inner_;
             if (first.size()) sha_update(&inner, reinterpret_cast<sz_cptr_t>(first.data()), first.size(), nullptr);
             if (second.size()) sha_update(&inner, reinterpret_cast<sz_cptr_t>(second.data()), second.size(), nullptr);
@@ -838,13 +838,14 @@ struct secure_tunnel_crypto {
 
             sz_sha256_state_t outer = outer_;
             sha_update(&outer, reinterpret_cast<sz_cptr_t>(digest), sizeof(digest), nullptr);
-            sha_digest(&outer, reinterpret_cast<sz_u8_t*>(output), nullptr);
+            sha_digest(&outer, reinterpret_cast<sz_u8_t*>(output.data()), nullptr);
             secure_zero(digest);
         }
     };
 
     /** One-shot HMAC-SHA256, for callers with no key to reuse. */
-    static void hmac_sha256(span<byte_t const> key, span<byte_t const> data, byte_t output[hash_size_k]) noexcept {
+    static void hmac_sha256(span<byte_t const> key, span<byte_t const> data,
+                            span<byte_t, hash_size_k> output) noexcept {
         hmac_sha256_t hmac;
         hmac.reset(key);
         hmac.compute(data, {}, output);
@@ -856,7 +857,7 @@ struct secure_tunnel_crypto {
      *      pre-shared key. Each feeds the next, so they must be produced in order.
      */
     static void hkdf_sha256(span<byte_t const> chaining_key, span<byte_t const> material, std::size_t outputs,
-                            byte_t results[3][hash_size_k]) noexcept {
+                            span<byte_t[hash_size_k], 3> results) noexcept {
         byte_t temporary_key[hash_size_k];
         hmac_sha256(chaining_key, material, temporary_key);
 
@@ -883,8 +884,8 @@ struct secure_tunnel_crypto {
         bool keyed_ {};
 
         /** Noise encodes the 96-bit nonce as 32 zero bits then the counter, big-endian. */
-        void encode_nonce(byte_t output[nonce_size_k]) const noexcept {
-            std::memset(output, 0, 4);
+        void encode_nonce(span<byte_t, nonce_size_k> output) const noexcept {
+            std::memset(output.data(), 0, 4);
             for (std::size_t index = 0; index != 8; ++index)
                 output[4 + index] = static_cast<byte_t>(nonce_ >> (56 - 8 * index));
         }
@@ -895,8 +896,8 @@ struct secure_tunnel_crypto {
         /** True once this key has sealed or opened everything it may, and must be replaced. */
         [[nodiscard]] bool exhausted() const noexcept { return keyed_ && nonce_ == nonce_exhausted_k; }
 
-        void initialize(byte_t const key[secure_tunnel_key_size_k]) noexcept {
-            std::memcpy(key_, key, secure_tunnel_key_size_k);
+        void initialize(span<byte_t const, secure_tunnel_key_size_k> key) noexcept {
+            std::memcpy(key_, key.data(), key.size_bytes());
             aes_init(&schedule_, reinterpret_cast<sz_u8_t const*>(key_), nullptr);
             nonce_ = 0;
             keyed_ = true;
@@ -1016,15 +1017,15 @@ struct secure_tunnel_crypto {
         [[nodiscard]] secure_tunnel_cipher_t& cipher() noexcept { return cipher_; }
         [[nodiscard]] span<byte_t const> hash() const noexcept { return {hash_, hash_ + hash_size_k}; }
 
-        void initialize(char const* protocol_name, std::size_t name_length) noexcept {
-            if (name_length <= hash_size_k) {
+        void initialize(std::string_view protocol_name) noexcept {
+            if (protocol_name.size() <= hash_size_k) {
                 std::memset(hash_, 0, hash_size_k);
-                std::memcpy(hash_, protocol_name, name_length);
+                std::memcpy(hash_, protocol_name.data(), protocol_name.size());
             }
             else {
                 sz_sha256_state_t state;
                 sha_init(&state, nullptr);
-                sha_update(&state, protocol_name, name_length, nullptr);
+                sha_update(&state, protocol_name.data(), protocol_name.size(), nullptr);
                 sha_digest(&state, reinterpret_cast<sz_u8_t*>(hash_), nullptr);
             }
             std::memcpy(chaining_key_, hash_, hash_size_k);
@@ -1039,10 +1040,9 @@ struct secure_tunnel_crypto {
             sha_digest(&state, reinterpret_cast<sz_u8_t*>(hash_), nullptr);
         }
 
-        void mix_key(byte_t const material[secure_tunnel_key_size_k]) noexcept {
+        void mix_key(span<byte_t const, secure_tunnel_key_size_k> material) noexcept {
             byte_t derived[3][hash_size_k];
-            hkdf_sha256({chaining_key_, chaining_key_ + hash_size_k}, {material, material + secure_tunnel_key_size_k},
-                        2, derived);
+            hkdf_sha256({chaining_key_, chaining_key_ + hash_size_k}, material, 2, derived);
             std::memcpy(chaining_key_, derived[0], hash_size_k);
             cipher_.initialize(derived[1]);
             secure_zero(derived);
@@ -1332,13 +1332,12 @@ struct secure_tunnel_crypto {
          *  @return False on a small-order peer point, which must abort rather than continue with a
          *      shared secret an attacker already knows.
          *
-         *  @warning Both parameters are exactly this wide and swapping them still compiles. A span
-         *      would not help, since two dynamic spans are equally interchangeable; the fixed
-         *      extent is what lets the compiler object to a digest or a nonce arriving here by
-         *      mistake.
+         *  @warning Both parameters are exactly this wide and swapping them still compiles. A
+         *      dynamic span would not help, since two of them are equally interchangeable; the
+         *      fixed extent is what lets the compiler object to a nonce or a tag arriving here.
          */
-        [[nodiscard]] bool mix_diffie_hellman(byte_t const scalar[secure_tunnel_key_size_k],
-                                              byte_t const point[secure_tunnel_key_size_k]) noexcept {
+        [[nodiscard]] bool mix_diffie_hellman(span<byte_t const, secure_tunnel_key_size_k> scalar,
+                                              span<byte_t const, secure_tunnel_key_size_k> point) noexcept {
             byte_t shared[secure_tunnel_key_size_k];
             if (!x25519_scalar_multiply(shared, scalar, point)) return false;
             transcript.mix_key(shared);
@@ -1347,7 +1346,7 @@ struct secure_tunnel_crypto {
         }
 
         [[nodiscard]] bool generate_ephemeral() noexcept {
-            if (!secure_random_bytes(local_ephemeral_private, secure_tunnel_key_size_k)) return false;
+            if (!secure_random_bytes(local_ephemeral_private)) return false;
             x25519_derive_public(local_ephemeral_public, local_ephemeral_private);
             return true;
         }
@@ -1516,7 +1515,7 @@ struct secure_tunnel_crypto {
         }
         written += trailer;
 
-        poke_length(noise.outbound, written);
+        poke_length(span<byte_t> {noise.outbound}.first<prefix_size_k>(), written);
         noise.outbound_length = prefix_size_k + written;
         ++noise.message_index;
         if (noise.handshake_complete()) finish_handshake(noise);
@@ -1629,15 +1628,16 @@ struct secure_tunnel_crypto {
      *  wait. Only encrypting the length would close that, and BOLT #8 pays an
      *  authenticated-encryption invocation per record to do it.
      */
-    [[nodiscard]] static std::size_t seal_record(secure_tunnel_noise_t& noise, byte_t* record, std::size_t filled,
+    [[nodiscard]] static std::size_t seal_record(secure_tunnel_noise_t& noise, span<byte_t> record, std::size_t filled,
                                                  secure_tunnel_record_t kind) noexcept {
         std::size_t const declared = filled + kind_size_k + tag_size_k;
-        poke_length(record, declared);
+        assert(record.size() >= prefix_size_k + declared && "the record must hold its prefix, payload and tag");
+        poke_length(record.first<prefix_size_k>(), declared);
         record[prefix_size_k + filled] = static_cast<byte_t>(kind);
 
-        byte_t* const body = record + prefix_size_k;
+        span<byte_t> const body = record.subspan(prefix_size_k);
         std::size_t const plain_size = filled + kind_size_k;
-        if (!noise.sending.seal({record, record + prefix_size_k}, {body, body + plain_size}, body + plain_size))
+        if (!noise.sending.seal(record.first(prefix_size_k), body.first(plain_size), body.data() + plain_size))
             return 0;
 
         if (++noise.records_sealed % rekey_interval_k == 0) noise.sending.rekey();
@@ -1684,19 +1684,16 @@ template <typename sha256_kit_type_, typename aes256_gcm_kit_type_>
 class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_> {
     using crypto_t = secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_>;
     using crypto_t::bytes_until_prefixed_boundary;
-    using crypto_t::hash_size_k;
     using crypto_t::kind_size_k;
     using crypto_t::max_message_k;
     using crypto_t::min_record_body_k;
     using crypto_t::noise_of;
-    using crypto_t::outbound_capacity_k;
     using crypto_t::pattern_for;
     using crypto_t::peek_length;
     using crypto_t::prefix_size_k;
     using crypto_t::read_handshake_message;
     using crypto_t::rekey_interval_k;
     using crypto_t::seal_record;
-    using crypto_t::secure_zero;
     using crypto_t::tag_size_k;
     using crypto_t::write_handshake_message;
     using typename crypto_t::remote_static_t;
@@ -1806,7 +1803,7 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
         if (needs_remote && config.remote_public.size() != secure_tunnel_key_size_k)
             return fault_ = secure_tunnel_fault_t::misconfigured_k;
 
-        auto& noise = *new (storage_) secure_tunnel_noise_t {};
+        auto& noise = *std::construct_at(reinterpret_cast<secure_tunnel_noise_t*>(storage_));
         noise.pattern = pattern;
         noise.role = config.role;
 
@@ -1820,9 +1817,7 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
             noise.remote_static_state = remote_static_t::configured_k;
         }
 
-        std::size_t name_length = 0;
-        while (pattern->name[name_length]) ++name_length;
-        noise.transcript.initialize(pattern->name, name_length);
+        noise.transcript.initialize(pattern->name);
         noise.transcript.mix_hash({}); // an empty prologue
 
         // Pre-message keys enter the transcript before any message, the initiator's first.
@@ -1860,8 +1855,6 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
         max_payload_ = secure_tunnel_default_payload_k;
     }
 
-    [[nodiscard]] secure_tunnel_mode_t mode() const noexcept { return mode_; }
-    [[nodiscard]] secure_tunnel_role_t role() const noexcept { return role_; }
     [[nodiscard]] secure_tunnel_state_t state() const noexcept { return state_; }
     [[nodiscard]] secure_tunnel_fault_t fault() const noexcept { return fault_; }
 
@@ -1891,12 +1884,11 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
     /**
      *  @brief Records sealed into, and opened from, this connection so far.
      *
-     *  Diagnostics rather than telemetry - @c traffic_stats_t already counts bytes and packets, and
-     *  these are neither. They earn their place because the two counts drive the rekey schedules on
-     *  the two ends independently, and a schedule that desynchronises is the one failure in this
-     *  layer with no distinguishable symptom: every record after it fails authentication and looks
-     *  exactly like an attack. Peers that agree must end a conversation with these two mirrored,
-     *  which is a thing a test can assert and a log can print.
+     *  Diagnostics rather than telemetry. They earn their place because the two counts drive the
+     *  rekey schedules on the two ends independently, and a schedule that desynchronises is the one
+     *  failure in this layer with no distinguishable symptom: every record after it fails
+     *  authentication and looks exactly like an attack. Peers that agree must end a conversation
+     *  with these two mirrored, which is a thing a test can assert and a log can print.
      */
     [[nodiscard]] std::size_t records_sealed() const noexcept {
         return encrypts() ? noise_of(storage_).records_sealed : 0;
@@ -1922,17 +1914,17 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
      *      and the one caller does one thing with it: run the authorizer, or not.
      *
      *  A copy rather than a view, because this is the one answer that crosses the C ABI into code
-     *  with no way to learn when a borrowed pointer went stale. A fixed extent rather than a span,
-     *  because a parameter can carry one and a struct member cannot - so the width is checked by
-     *  the compiler here and by @c make there, and neither is assumed. A key merely supplied by
-     *  configuration - as @c IK and @c KK both do - is assumed, not proven, and is not reported
-     *  here until the exchange completes.
+     *  with no way to learn when a borrowed pointer went stale. A fixed extent rather than a
+     *  dynamic span, because a parameter can carry one and a struct member cannot - so the width is
+     *  checked by the compiler here and by @c make there, and neither is assumed. A key merely
+     *  supplied by configuration - as @c IK and @c KK both do - is assumed, not proven, and is not
+     *  reported here until the exchange completes.
      */
-    [[nodiscard]] bool peer_key(byte_t out[secure_tunnel_key_size_k]) const noexcept {
+    [[nodiscard]] bool peer_key(span<byte_t, secure_tunnel_key_size_k> out) const noexcept {
         if (!encrypts()) return false;
         auto const& noise = noise_of(storage_);
         if (noise.remote_static_state != remote_static_t::authenticated_k) return false;
-        std::memcpy(out, noise.remote_static, secure_tunnel_key_size_k);
+        std::memcpy(out.data(), noise.remote_static, out.size_bytes());
         return true;
     }
 
@@ -2133,7 +2125,7 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
             return fail(secure_tunnel_fault_t::malformed_k);
 
         auto& noise = noise_of(storage_);
-        std::size_t const written = seal_record(noise, record.data(), filled, secure_tunnel_record_t::application_k);
+        std::size_t const written = seal_record(noise, record, filled, secure_tunnel_record_t::application_k);
         if (!written) return fail(secure_tunnel_fault_t::keys_exhausted_k);
         return {record.data(), record.data() + written};
     }

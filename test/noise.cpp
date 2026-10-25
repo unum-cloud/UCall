@@ -4,7 +4,9 @@
  *  @date August 9, 2026
  *  @brief Known-answer cryptographic vectors, Noise handshakes, framing, and record authentication.
  */
-#include <cstring> // `std::memcpy`, `std::memmove`, `std::memset`, `std::strlen`
+#include <cstring> // `std::memcpy`, `std::memmove`, `std::memset`
+
+#include <string_view> // `std::string_view`
 
 #include "harness.hpp" // `expect`, `require`, `run_test`, `scale_iterations`
 
@@ -86,8 +88,6 @@ struct wire_t {
     [[nodiscard]] span<byte_t> whole() noexcept { return {storage.data(), storage.data() + storage.capacity()}; }
     [[nodiscard]] span<byte_t> arrived() noexcept { return {storage.data(), storage.data() + length}; }
     [[nodiscard]] span<byte_t const> received() const noexcept { return {storage.data(), storage.data() + length}; }
-    [[nodiscard]] byte_t* bytes() noexcept { return storage.data(); }
-    [[nodiscard]] byte_t const* bytes() const noexcept { return storage.data(); }
 };
 
 /** A Curve25519 keypair, drawn through the same call a bind or a client handle uses. */
@@ -229,7 +229,8 @@ struct connected_pair_t {
 
 /** The big-endian length a record declares in its prefix. */
 [[nodiscard]] static std::size_t declared_length(wire_t& wire) noexcept {
-    return (static_cast<std::size_t>(wire.bytes()[0]) << 8) | static_cast<std::size_t>(wire.bytes()[1]);
+    span<byte_t const> const prefix = wire.received();
+    return (static_cast<std::size_t>(prefix[0]) << 8) | static_cast<std::size_t>(prefix[1]);
 }
 
 /**
@@ -245,9 +246,9 @@ struct connected_pair_t {
 
 /** Computes one tag into @p digest and returns a view of it. */
 [[nodiscard]] static span<byte_t const> hmac_of(span<byte_t const> key, span<byte_t const> data,
-                                                byte_t digest[crypto_t::hash_size_k]) noexcept {
+                                                span<byte_t, crypto_t::hash_size_k> digest) noexcept {
     crypto_t::hmac_sha256(key, data, digest);
-    return {digest, digest + crypto_t::hash_size_k};
+    return digest;
 }
 
 #pragma endregion Fixtures
@@ -264,11 +265,11 @@ case_result_t test_hmac_unit() {
     // digest that drifts here is a miscompile rather than a redesign.
     announce("rfc4231_case1");
     failures += expect_hex(
-        hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), ascii_bytes("Hi There"), digest),
+        hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), byte_span("Hi There"), digest),
         "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
 
     announce("rfc4231_case2");
-    failures += expect_hex(hmac_of(ascii_bytes("Jefe"), ascii_bytes("what do ya want for nothing?"), digest),
+    failures += expect_hex(hmac_of(byte_span("Jefe"), byte_span("what do ya want for nothing?"), digest),
                            "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 
     announce("rfc4231_case3");
@@ -278,7 +279,7 @@ case_result_t test_hmac_unit() {
 
     announce("rfc4231_case6_key_longer_than_block");
     failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
-                                   ascii_bytes("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
+                                   byte_span("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
                            "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
 
     announce("cached_state_matches_one_shot");
@@ -286,7 +287,7 @@ case_result_t test_hmac_unit() {
     crypto_t::hmac_sha256_t cached;
     cached.reset(cached_key);
     for (char const* message : {"", "a", "the quick brown fox", "0123456789012345678901234567890123456789"}) {
-        span<byte_t const> const data = ascii_bytes(message, std::strlen(message));
+        span<byte_t const> const data = byte_span(message);
         byte_t reused[crypto_t::hash_size_k], fresh[crypto_t::hash_size_k];
         cached.compute(data, {}, reused);
         crypto_t::hmac_sha256(cached_key, data, fresh);
@@ -299,7 +300,7 @@ case_result_t test_hmac_unit() {
     crypto_t::hmac_sha256_t split_hmac;
     split_hmac.reset(run_of({key_storage, key_storage + 32}, byte_t {0x0b}));
     byte_t split[crypto_t::hash_size_k];
-    split_hmac.compute(ascii_bytes("chaining"), ascii_bytes("-material"), split);
+    split_hmac.compute(byte_span("chaining"), byte_span("-material"), split);
     failures += expect_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
     return failures;
 }
@@ -361,22 +362,21 @@ case_result_t test_hkdf_unit() {
 
 case_result_t test_transcript_unit() {
     std::size_t failures = 0;
-    char const* const name = "Noise_XX_25519_AESGCM_SHA256";
-    std::size_t const name_length = std::strlen(name);
+    std::string_view const name = "Noise_XX_25519_AESGCM_SHA256";
 
     announce("a_short_protocol_name_is_zero_padded");
-    require(failures, name_length <= crypto_t::hash_size_k);
+    require(failures, name.size() <= crypto_t::hash_size_k);
     crypto_t::secure_tunnel_transcript_t padded;
-    padded.initialize(name, name_length);
+    padded.initialize(name);
     byte_t expected[crypto_t::hash_size_k] {};
-    std::memcpy(expected, name, name_length);
+    std::memcpy(expected, name.data(), name.size());
     failures += expect_bytes(padded.hash(), expected);
 
     announce("a_long_protocol_name_is_hashed");
     char long_name[40];
     for (char& character : long_name) character = 'x';
     crypto_t::secure_tunnel_transcript_t hashed;
-    hashed.initialize(long_name, sizeof(long_name));
+    hashed.initialize({long_name, sizeof(long_name)});
 
     sz_sha256_state_t digest_state;
     crypto_t::sha_init(&digest_state, nullptr);
@@ -387,8 +387,8 @@ case_result_t test_transcript_unit() {
 
     announce("mixing_is_order_sensitive");
     crypto_t::secure_tunnel_transcript_t forward, backward;
-    forward.initialize(name, name_length);
-    backward.initialize(name, name_length);
+    forward.initialize(name);
+    backward.initialize(name);
     byte_t const first[4] = {byte_t {1}, byte_t {2}, byte_t {3}, byte_t {4}};
     byte_t const second[4] = {byte_t {5}, byte_t {6}, byte_t {7}, byte_t {8}};
     forward.mix_hash(first);
@@ -400,7 +400,7 @@ case_result_t test_transcript_unit() {
 
     announce("an_empty_prologue_still_advances_the_transcript");
     crypto_t::secure_tunnel_transcript_t prologued;
-    prologued.initialize(name, name_length);
+    prologued.initialize(name);
     byte_t before[crypto_t::hash_size_k];
     std::memcpy(before, prologued.hash().data(), crypto_t::hash_size_k);
     prologued.mix_hash({});
@@ -414,8 +414,8 @@ case_result_t test_entropy_unit() {
     // destroy every ephemeral key.
     announce("distinct_and_never_all_zero");
     byte_t first[32] {}, second[32] {};
-    failures += expect(crypto_t::secure_random_bytes(first, sizeof(first)));
-    failures += expect(crypto_t::secure_random_bytes(second, sizeof(second)));
+    failures += expect(crypto_t::secure_random_bytes(first));
+    failures += expect(crypto_t::secure_random_bytes(second));
     failures += expect(!all_zero(first));
     failures += expect(!bytes_equal(first, second));
     return failures;
@@ -547,8 +547,7 @@ case_result_t test_geometry_safety() {
         failures += expect(wire.length > server_buffer, "the capped side was not the smaller one");
 
         // What a driver sees first: two bytes of prefix, and a demand the boundary rule trusts.
-        std::size_t const demanded = server.bytes_until_boundary(
-            {wire.bytes(), wire.bytes() + secure_tunnel_headroom_k});
+        std::size_t const demanded = server.bytes_until_boundary(wire.whole().first(secure_tunnel_headroom_k));
         failures += expect(demanded == wire.length - secure_tunnel_headroom_k);
 
         failures += expect(open_from(server, wire).consumed == 0u, "{} opened a record past its cap", mode);
@@ -784,29 +783,29 @@ case_result_t test_records_unit() {
         connected_pair_t pair;
         failures += pair.connect(mode);
 
-        failures += seal_into(pair.client, ascii_bytes("GET / HTTP/1.1"), wire);
+        failures += seal_into(pair.client, byte_span("GET / HTTP/1.1"), wire);
         failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const request = open_from(pair.server, wire);
         failures += expect(request.consumed > 0u);
         failures += expect(request.kind == secure_tunnel_record_t::application_k);
-        failures += expect(request.payload.data() == wire.bytes() + secure_tunnel_headroom_k);
-        failures += expect_bytes(request.payload, ascii_bytes("GET / HTTP/1.1"));
+        failures += expect(request.payload.data() == wire.whole().subspan(secure_tunnel_headroom_k).data());
+        failures += expect_bytes(request.payload, byte_span("GET / HTTP/1.1"));
 
-        failures += seal_into(pair.server, ascii_bytes("HTTP/1.1 200 OK"), wire);
+        failures += seal_into(pair.server, byte_span("HTTP/1.1 200 OK"), wire);
         failures += expect(pair.client.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const reply = open_from(pair.client, wire);
         failures += expect(reply.consumed > 0u);
-        failures += expect_bytes(reply.payload, ascii_bytes("HTTP/1.1 200 OK"));
+        failures += expect_bytes(reply.payload, byte_span("HTTP/1.1 200 OK"));
 
         // A driver opening into its own buffer finds the payload there
         // and the record as it arrived.
-        failures += seal_into(pair.client, ascii_bytes("into a destination"), wire);
+        failures += seal_into(pair.client, byte_span("into a destination"), wire);
         byte_t sealed[64] {}, destination[64] {};
-        std::memcpy(sealed, wire.bytes(), wire.length);
+        std::memcpy(sealed, wire.received().data(), wire.received().size_bytes());
         secure_tunnel_opened_t const apart = pair.server.open(wire.arrived(), destination);
         failures += expect(apart.consumed == wire.length);
         failures += expect(apart.payload.data() == destination);
-        failures += expect_bytes(apart.payload, ascii_bytes("into a destination"));
+        failures += expect_bytes(apart.payload, byte_span("into a destination"));
         failures += expect(bytes_equal(wire.received(), {sealed, sealed + wire.length}),
                            "opening into a destination rewrote the record");
 
@@ -824,9 +823,9 @@ case_result_t test_records_unit() {
         std::size_t const already_sealed = pair.client.records_sealed();
         std::size_t const already_opened = pair.server.records_opened();
         for (std::size_t index = 0; index != 16; ++index) {
-            failures += seal_into(pair.client, ascii_bytes("ping"), wire);
+            failures += seal_into(pair.client, byte_span("ping"), wire);
             failures += expect(open_from(pair.server, wire).consumed > 0u);
-            failures += seal_into(pair.server, ascii_bytes("pong"), wire);
+            failures += seal_into(pair.server, byte_span("pong"), wire);
             failures += expect(open_from(pair.client, wire).consumed > 0u);
         }
         failures += expect(pair.client.records_sealed() == pair.server.records_opened());
@@ -895,8 +894,8 @@ case_result_t test_records_unit() {
     connected_pair_t earlier, later;
     failures += earlier.connect_with(secure_tunnel_mode_t::noise_xx_k, reused_client, reused_server);
     failures += later.connect_with(secure_tunnel_mode_t::noise_xx_k, reused_client, reused_server);
-    failures += seal_into(earlier.client, ascii_bytes("identical plaintext"), first_session);
-    failures += seal_into(later.client, ascii_bytes("identical plaintext"), second_session);
+    failures += seal_into(earlier.client, byte_span("identical plaintext"), first_session);
+    failures += seal_into(later.client, byte_span("identical plaintext"), second_session);
     failures += expect(first_session.length == second_session.length);
     failures += expect(!bytes_equal(first_session.received(), second_session.received()),
                        "two sessions on one identity produced the same ciphertext");
@@ -905,10 +904,10 @@ case_result_t test_records_unit() {
     byte_t key[secure_tunnel_key_size_k];
     for (std::size_t index = 0; index != sizeof(key); ++index) key[index] = static_cast<byte_t>(index * 7u + 1u);
 
-    auto seal_from_a_fresh_sender = [&key, &failures](byte_t* record) {
+    auto seal_from_a_fresh_sender = [&key, &failures](span<byte_t> record) {
         crypto_t::secure_tunnel_noise_t sender;
         sender.sending.initialize(key);
-        std::memcpy(record + secure_tunnel_headroom_k, "bound", 5);
+        std::memcpy(record.subspan(secure_tunnel_headroom_k).data(), "bound", 5);
         std::size_t const produced = crypto_t::seal_record(sender, record, 5, secure_tunnel_record_t::application_k);
         failures += expect(produced > 0u, "a fresh sender refused a five-byte payload");
         return produced;
@@ -948,8 +947,8 @@ case_result_t test_records_safety() {
             announce("{} a_forged_tag_breaks_the_connection", mode);
             connected_pair_t pair;
             failures += pair.connect(mode);
-            failures += seal_into(pair.client, ascii_bytes("authentic"), wire);
-            auto* bytes = wire.bytes();
+            failures += seal_into(pair.client, byte_span("authentic"), wire);
+            span<byte_t> const bytes = wire.whole();
             bytes[wire.length - 1] ^= byte_t {0x01u};
             failures += expect(open_from(pair.server, wire).consumed == 0u);
             failures += expect(pair.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
@@ -961,8 +960,8 @@ case_result_t test_records_safety() {
             announce("{} a_shortened_prefix_yields_no_plaintext", mode);
             connected_pair_t pair;
             failures += pair.connect(mode);
-            failures += seal_into(pair.client, ascii_bytes("prefix authenticated"), wire);
-            auto* bytes = wire.bytes();
+            failures += seal_into(pair.client, byte_span("prefix authenticated"), wire);
+            span<byte_t> const bytes = wire.whole();
             bytes[1] = byte_t {static_cast<unsigned char>(std::to_integer<unsigned>(bytes[1]) - 1)};
             failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
             failures += expect(open_from(pair.server, wire).consumed == 0u);
@@ -972,8 +971,8 @@ case_result_t test_records_safety() {
             announce("{} a_sixteen_byte_record_is_refused", mode);
             connected_pair_t pair;
             failures += pair.connect(mode);
-            std::memset(wire.bytes(), 0, 2 + 16);
-            auto* bytes = wire.bytes();
+            span<byte_t> const bytes = wire.whole();
+            std::memset(bytes.data(), 0, 2 + 16);
             bytes[1] = byte_t {16};
             wire.length = 2 + 16;
             failures += expect(open_from(pair.server, wire).consumed == 0u);
@@ -996,7 +995,7 @@ case_result_t test_records_safety() {
                 failures += seal_into(pair.client, {}, wire);
                 failures += expect(open_from(pair.server, wire).consumed > 0u);
             }
-            failures += seal_into(pair.client, ascii_bytes("still open"), wire);
+            failures += seal_into(pair.client, byte_span("still open"), wire);
             failures += expect(open_from(pair.server, wire).consumed > 0u);
         }
         {
@@ -1005,11 +1004,11 @@ case_result_t test_records_safety() {
             announce("{} a_replayed_record_is_refused", mode);
             connected_pair_t pair;
             failures += pair.connect(mode);
-            failures += seal_into(pair.client, ascii_bytes("once"), wire);
+            failures += seal_into(pair.client, byte_span("once"), wire);
 
             // Kept before opening, because `open` uncovers the plaintext over the ciphertext.
             replayed.length = wire.length;
-            std::memcpy(replayed.bytes(), wire.bytes(), wire.length);
+            std::memcpy(replayed.whole().data(), wire.received().data(), wire.received().size_bytes());
             failures += expect(open_from(pair.server, wire).consumed > 0u);
 
             failures += expect(open_from(pair.server, replayed).consumed == 0u, "a replayed record was accepted");
@@ -1027,7 +1026,7 @@ case_result_t test_records_safety() {
             failures += earlier.connect_with(mode, client_identity, server_identity);
             failures += later.connect_with(mode, client_identity, server_identity);
 
-            failures += seal_into(earlier.client, ascii_bytes("session one"), wire);
+            failures += seal_into(earlier.client, byte_span("session one"), wire);
             failures += expect(open_from(later.server, wire).consumed == 0u, "a record crossed between sessions");
             failures += expect(later.server.fault() == secure_tunnel_fault_t::authentication_failed_k);
         }
@@ -1035,7 +1034,7 @@ case_result_t test_records_safety() {
     return failures;
 }
 
-case_result_t test_records_delivery() {
+case_result_t test_records_delivery(random_generator_t& generator) {
     std::size_t failures = 0;
     wire_t wire, second_wire;
     require(failures, wire.reserve());
@@ -1049,12 +1048,12 @@ case_result_t test_records_delivery() {
 
         // Until the length prefix has landed there is nothing to read a length from, so the
         // answer is the rest of the prefix - a progress guarantee rather than the record's width.
-        failures += seal_into(pair.client, ascii_bytes("boundary"), wire);
+        failures += seal_into(pair.client, byte_span("boundary"), wire);
         std::size_t const stride = sweep_stride(wire.length);
         for (std::size_t prefix = 0; prefix < wire.length; prefix += stride) {
             std::size_t const expected = prefix < secure_tunnel_headroom_k ? secure_tunnel_headroom_k - prefix
                                                                            : wire.length - prefix;
-            std::size_t const answered = pair.server.bytes_until_boundary({wire.bytes(), wire.bytes() + prefix});
+            std::size_t const answered = pair.server.bytes_until_boundary(wire.whole().first(prefix));
             failures += expect(answered == expected, "{} at prefix {} of {} the boundary answered {}, expected {}",
                                mode, prefix, wire.length, answered, expected);
         }
@@ -1065,25 +1064,26 @@ case_result_t test_records_delivery() {
         // the two ends' schedules and read as a tunnel defect rather than a skipped step.
         secure_tunnel_opened_t const swept = open_from(pair.server, wire);
         failures += expect(swept.consumed > 0u, "the record the boundary sweep walked would not open");
-        failures += expect_bytes(swept.payload, ascii_bytes("boundary"));
+        failures += expect_bytes(swept.payload, byte_span("boundary"));
 
-        failures += seal_into(pair.client, ascii_bytes("first"), wire);
-        failures += seal_into(pair.client, ascii_bytes("second"), second_wire);
-        std::memcpy(wire.bytes() + wire.length, second_wire.bytes(), second_wire.length);
+        failures += seal_into(pair.client, byte_span("first"), wire);
+        failures += seal_into(pair.client, byte_span("second"), second_wire);
+        std::memcpy(wire.whole().subspan(wire.length).data(), second_wire.received().data(),
+                    second_wire.received().size_bytes());
         wire.length += second_wire.length;
 
         failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const one = open_from(pair.server, wire);
         failures += expect(one.consumed > 0u);
         failures += expect(one.consumed < wire.length);
-        failures += expect_bytes(one.payload, ascii_bytes("first"));
+        failures += expect_bytes(one.payload, byte_span("first"));
 
-        std::memmove(wire.bytes(), wire.bytes() + one.consumed, wire.length - one.consumed);
+        std::memmove(wire.whole().data(), wire.received().subspan(one.consumed).data(), wire.length - one.consumed);
         wire.length -= one.consumed;
         failures += expect(pair.server.bytes_until_boundary(wire.received()) == 0u);
         secure_tunnel_opened_t const two = open_from(pair.server, wire);
         failures += expect(two.consumed > 0u);
-        failures += expect_bytes(two.payload, ascii_bytes("second"));
+        failures += expect_bytes(two.payload, byte_span("second"));
 
         // A stream of records arriving in chunks a driver never chose, reassembled the way a
         // driver has to: read, ask the boundary rule, open only when it answers zero.
@@ -1094,10 +1094,11 @@ case_result_t test_records_delivery() {
         require(failures, sent.reserve());
         std::size_t produced = 0;
         for (std::size_t index = 0; index != records; ++index) {
-            failures += seal_into(pair.client, ascii_bytes("chunked payload"), second_wire);
+            failures += seal_into(pair.client, byte_span("chunked payload"), second_wire);
             require(failures, produced + second_wire.length <= sent.storage.capacity(),
                     "the stream outgrew its buffer");
-            std::memcpy(sent.bytes() + produced, second_wire.bytes(), second_wire.length);
+            std::memcpy(sent.whole().subspan(produced).data(), second_wire.received().data(),
+                        second_wire.received().size_bytes());
             produced += second_wire.length;
         }
 
@@ -1111,8 +1112,8 @@ case_result_t test_records_delivery() {
                 // A chunk no larger than what is still owed, and never zero, so this terminates.
                 std::size_t const remaining = produced - offered;
                 require(failures, remaining > 0u, "the boundary asked for {} more bytes than were ever sent", wanted);
-                std::size_t const chunk = 1 + global_random_generator().below(remaining < wanted ? remaining : wanted);
-                std::memcpy(inbox.bytes() + inbox.length, sent.bytes() + offered, chunk);
+                std::size_t const chunk = 1 + generator.below(remaining < wanted ? remaining : wanted);
+                std::memcpy(inbox.whole().subspan(inbox.length).data(), sent.whole().subspan(offered).data(), chunk);
                 inbox.length += chunk;
                 offered += chunk;
                 continue;
@@ -1120,8 +1121,9 @@ case_result_t test_records_delivery() {
             secure_tunnel_opened_t const next = open_from(pair.server, inbox);
             require(failures, next.consumed > 0u, "record {} of {} failed with {}", opened_count, records,
                     pair.server.fault());
-            failures += expect_bytes(next.payload, ascii_bytes("chunked payload"));
-            std::memmove(inbox.bytes(), inbox.bytes() + next.consumed, inbox.length - next.consumed);
+            failures += expect_bytes(next.payload, byte_span("chunked payload"));
+            std::memmove(inbox.whole().data(), inbox.received().subspan(next.consumed).data(),
+                         inbox.length - next.consumed);
             inbox.length -= next.consumed;
             ++opened_count;
         }
@@ -1144,7 +1146,7 @@ case_result_t test_close_unit() {
             announce("{} a_close_shuts_one_direction", mode);
             connected_pair_t pair;
             failures += pair.connect(mode);
-            failures += seal_into(pair.client, ascii_bytes("before"), wire);
+            failures += seal_into(pair.client, byte_span("before"), wire);
             failures += expect(open_from(pair.server, wire).consumed > 0u);
 
             secure_tunnel_step_t const closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
@@ -1153,7 +1155,7 @@ case_result_t test_close_unit() {
             failures += expect(!pair.client.may_seal());
             failures += expect(pair.client.may_open());
 
-            std::memcpy(wire.bytes(), closing.outbound.data(), closing.outbound.size());
+            std::memcpy(wire.whole().data(), closing.outbound.data(), closing.outbound.size_bytes());
             wire.length = closing.outbound.size();
             secure_tunnel_opened_t const received = open_from(pair.server, wire);
             failures += expect(received.consumed > 0u);
@@ -1167,11 +1169,11 @@ case_result_t test_close_unit() {
             failures += expect(pair.client.records_sealed() == 2u);
             failures += expect(pair.server.records_opened() == 2u);
 
-            failures += seal_into(pair.server, ascii_bytes("last words"), wire);
+            failures += seal_into(pair.server, byte_span("last words"), wire);
             failures += expect(open_from(pair.client, wire).consumed > 0u);
 
             // Nothing legitimate follows an authenticated close, so this is a protocol violation.
-            std::memset(wire.bytes(), 0, 64);
+            std::memset(wire.whole().data(), 0, 64);
             wire.length = 64;
             failures += expect(open_from(pair.server, wire).consumed == 0u);
             failures += expect(pair.server.fault() == secure_tunnel_fault_t::malformed_k);
@@ -1182,7 +1184,7 @@ case_result_t test_close_unit() {
             failures += pair.connect(mode);
 
             secure_tunnel_step_t const server_closing = pair.server.advance({}, secure_tunnel_request_t::close_k);
-            std::memcpy(wire.bytes(), server_closing.outbound.data(), server_closing.outbound.size());
+            std::memcpy(wire.whole().data(), server_closing.outbound.data(), server_closing.outbound.size_bytes());
             wire.length = server_closing.outbound.size();
             failures += expect(open_from(pair.client, wire).consumed > 0u);
             failures += expect(!pair.client.may_open());
@@ -1211,11 +1213,11 @@ case_result_t test_close_delivery() {
 
         connected_pair_t pair;
         failures += pair.connect(mode);
-        failures += seal_into(pair.client, ascii_bytes("last request"), wire);
+        failures += seal_into(pair.client, byte_span("last request"), wire);
 
         secure_tunnel_step_t const closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
         failures += expect(closing.outbound.size() > 0u);
-        std::memcpy(wire.bytes() + wire.length, closing.outbound.data(), closing.outbound.size());
+        std::memcpy(wire.whole().subspan(wire.length).data(), closing.outbound.data(), closing.outbound.size_bytes());
         wire.length += closing.outbound.size();
 
         // The data record has to come out first, with the close still untouched behind it.
@@ -1223,10 +1225,10 @@ case_result_t test_close_delivery() {
         secure_tunnel_opened_t const data = open_from(pair.server, wire);
         failures += expect(data.consumed > 0u);
         failures += expect(data.kind == secure_tunnel_record_t::application_k);
-        failures += expect_bytes(data.payload, ascii_bytes("last request"));
+        failures += expect_bytes(data.payload, byte_span("last request"));
         failures += expect(pair.server.may_open(), "the close took effect before its record was opened");
 
-        std::memmove(wire.bytes(), wire.bytes() + data.consumed, wire.length - data.consumed);
+        std::memmove(wire.whole().data(), wire.received().subspan(data.consumed).data(), wire.length - data.consumed);
         wire.length -= data.consumed;
         secure_tunnel_opened_t const shut = open_from(pair.server, wire);
         failures += expect(shut.consumed > 0u);
@@ -1258,7 +1260,7 @@ case_result_t test_reuse_unit() {
         connected_pair_t pair;
         failures += pair.connect(mode);
         for (std::size_t index = 0; index != 4; ++index) {
-            failures += seal_into(pair.client, ascii_bytes("first session"), wire);
+            failures += seal_into(pair.client, byte_span("first session"), wire);
             failures += expect(open_from(pair.server, wire).consumed > 0u);
         }
         [[maybe_unused]] secure_tunnel_step_t const closing = pair.client.advance({}, secure_tunnel_request_t::close_k);
@@ -1279,10 +1281,10 @@ case_result_t test_reuse_unit() {
         failures += expect(pair.client.fault() == secure_tunnel_fault_t::none_k);
 
         // The nonces reset with everything else, so the second session's first record opens.
-        failures += seal_into(pair.client, ascii_bytes("second session"), wire);
+        failures += seal_into(pair.client, byte_span("second session"), wire);
         secure_tunnel_opened_t const opened = open_from(pair.server, wire);
         failures += expect(opened.consumed > 0u, "a reused tunnel's first record failed with {}", pair.server.fault());
-        failures += expect_bytes(opened.payload, ascii_bytes("second session"));
+        failures += expect_bytes(opened.payload, byte_span("second session"));
     }
     return failures;
 }
@@ -1297,7 +1299,7 @@ case_result_t test_reuse_unit() {
  *  The named cases above each pin one property at one width. This is the cross-product, so a width
  *  that only misbehaves under a particular pattern has somewhere to show up.
  */
-case_result_t test_tunnel_stress() {
+case_result_t test_tunnel_stress(random_generator_t& generator) {
     std::size_t failures = 0;
     wire_t wire;
     require(failures, wire.reserve());
@@ -1316,7 +1318,7 @@ case_result_t test_tunnel_stress() {
             failures += pair.connect(mode, secure_tunnel_payload_ceiling_k);
 
             for (std::size_t exchange = 0; exchange != rounds; ++exchange) {
-                byte_t const marker = static_cast<byte_t>(global_random_generator()());
+                byte_t const marker = static_cast<byte_t>(generator());
                 span<byte_t> const scratch {payload.data(), payload.data() + filled};
                 fill_with(scratch, marker);
                 span<byte_t const> const sent = scratch;
@@ -1328,7 +1330,7 @@ case_result_t test_tunnel_stress() {
                                    exchange, pair.server.fault());
                 failures += expect(request.payload.size() == filled, "opened {} bytes, sealed {}",
                                    request.payload.size(), filled);
-                failures += expect(request.payload.data() == wire.bytes() + secure_tunnel_headroom_k);
+                failures += expect(request.payload.data() == wire.whole().subspan(secure_tunnel_headroom_k).data());
                 failures += expect(all_equal_to(request.payload, marker));
 
                 failures += seal_into(pair.server, sent, wire);

@@ -1,6 +1,5 @@
 foreach (suite_ shared routes x25519 noise)
     add_executable(ucall_test_${suite_} ${suite_}.cpp)
-    target_include_directories(ucall_test_${suite_} PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_link_libraries(ucall_test_${suite_} PRIVATE ucall::ucall ucall_sanitizers fmt::fmt)
     add_test(NAME ${suite_} COMMAND ucall_test_${suite_})
     set_tests_properties(${suite_} PROPERTIES SKIP_RETURN_CODE 77)

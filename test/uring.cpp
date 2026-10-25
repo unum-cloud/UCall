@@ -9,88 +9,25 @@
 #include <cstring> // `std::memcmp`
 
 #include <algorithm> // `std::fill`
-#include <limits>    // `std::numeric_limits`
 #include <vector>    // `std::vector`
 
 #include "ucall/uring612.hpp"
 #include "ucall/uring700.hpp"
 
-#include "harness.hpp" // `expect`, `require`, `run_test`
+#include "harness.hpp" // `expect`, `require`, `run_test`, `counting_allocator`, `loopback_pair`
 
 using namespace unum::ucall;
 using namespace unum::ucall::test;
 
-struct allocation_counts_t {
-    std::size_t attempts {}, allocations {}, deallocations {}, bytes {};
-    std::size_t fail_at {std::numeric_limits<std::size_t>::max()};
-};
-
-template <typename value_type_>
-struct counting_allocator {
-    using value_type = value_type_;
-    using propagate_on_container_move_assignment = std::true_type;
-    allocation_counts_t* counts {};
-    counting_allocator() noexcept = default;
-    explicit counting_allocator(allocation_counts_t& state) noexcept : counts(&state) {}
-    template <typename other_type_>
-    counting_allocator(counting_allocator<other_type_> const& other) noexcept : counts(other.counts) {}
-    value_type_* allocate(std::size_t count) noexcept {
-        if (counts->attempts++ == counts->fail_at) return nullptr;
-        auto* result = st::default_allocator<value_type_> {}.allocate(count);
-        if (result) {
-            ++counts->allocations;
-            counts->bytes += count * sizeof(value_type_);
-        }
-        return result;
+/** Sends all of @p bytes through @p descriptor, blocking. */
+[[nodiscard]] static bool send_all(int descriptor, span<byte_t const> bytes) noexcept {
+    while (!bytes.empty()) {
+        ssize_t const count = ::send(descriptor, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+        if (count <= 0) return false;
+        bytes = bytes.subspan(static_cast<std::size_t>(count));
     }
-    void deallocate(value_type_* pointer, std::size_t count) noexcept {
-        ++counts->deallocations;
-        counts->bytes -= count * sizeof(value_type_);
-        st::default_allocator<value_type_> {}.deallocate(pointer, count);
-    }
-    template <typename other_type_>
-    bool operator==(counting_allocator<other_type_> const& other) const noexcept {
-        return counts == other.counts;
-    }
-};
-
-struct tcp_pair_t {
-    descriptor_t client {-1}, peer {-1};
-
-    /** Whether both ends connected, and the accepted end inherited `TCP_NODELAY`. */
-    bool ready {};
-
-    tcp_pair_t() {
-        auto listener = socket_open(AF_INET);
-        if (listener < 0) return;
-        sockaddr_in address {};
-        address.sin_family = AF_INET;
-        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-        socket_length_t address_length = sizeof(address);
-        if (bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
-            getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0 &&
-            listen(listener, 1) == 0)
-            client = socket(AF_INET, SOCK_STREAM, 0);
-        if (client >= 0 && connect(client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0)
-            peer = accept(listener, nullptr, nullptr);
-        int enabled {};
-        socket_length_t option_length = sizeof(enabled);
-        ready = peer >= 0 && getsockopt(peer, IPPROTO_TCP, TCP_NODELAY, &enabled, &option_length) == 0 && enabled == 1;
-        socket_close(listener);
-    }
-    ~tcp_pair_t() {
-        if (client >= 0) socket_close(client);
-        if (peer >= 0) socket_close(peer);
-    }
-    [[nodiscard]] bool send(span<byte_t const> bytes) {
-        while (!bytes.empty()) {
-            auto count = ::send(peer, bytes.data(), bytes.size(), MSG_NOSIGNAL);
-            if (count <= 0) return false;
-            bytes = bytes.subspan(static_cast<std::size_t>(count));
-        }
-        return true;
-    }
-};
+    return true;
+}
 
 /** Checks the registered socket @p handle has `TCP_NODELAY`, through a descriptor it installs. */
 template <typename engine_type_>
@@ -122,8 +59,8 @@ static case_result_t failed_submission() {
     require(failures, direct >= 0);
     failures += expect_nodelay(engine, direct);
     failures += expect(engine.close_socket(direct) == 0);
-    tcp_pair_t sockets;
-    require(failures, sockets.ready);
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
     auto owned = engine.import_socket(sockets.client);
     require(failures, owned >= 0);
     sockets.client = -1;
@@ -164,8 +101,8 @@ static case_result_t streamed_transmit() {
     if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this generation");
     require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
     std::size_t failures = 0;
-    tcp_pair_t sockets;
-    require(failures, sockets.ready);
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
     auto owned = engine.import_socket(sockets.client);
     require(failures, owned >= 0);
     sockets.client = -1;
@@ -215,8 +152,8 @@ static case_result_t test_uring700_paused_receive() {
         auto status = engine.open(8, 4);
         if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this generation");
         require(failures, status == ucall_status_success_k, "{}", ucall_status_name(status));
-        tcp_pair_t held, other;
-        require(failures, held.ready && other.ready);
+        loopback_pair_t held = loopback_pair(), other = loopback_pair();
+        require(failures, held.connected() && other.connected());
         auto first = engine.import_socket(held.client);
         auto second = engine.import_socket(other.client);
         require(failures, first >= 0 && second >= 0);
@@ -226,7 +163,7 @@ static case_result_t test_uring700_paused_receive() {
         std::fill(payload.begin() + static_cast<std::ptrdiff_t>(original), payload.end(), byte_t {34});
         io_request_t receiving {io_operation_t::receive_k, first, nullptr, engine.page};
         require(failures, engine.submit(receiving) == ucall_status_success_k);
-        require(failures, held.send(span<byte_t const> {payload}.first(original)));
+        require(failures, send_all(held.peer, span<byte_t const> {payload}.first(original)));
         io_completion_t completed[2] {};
         require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline_after(1000000)) == 1);
         require(failures, completed[0].result > 0, "receiving ended with {}", completed[0].result);
@@ -243,12 +180,12 @@ static case_result_t test_uring700_paused_receive() {
         }
         engine.receive_pause(first);
         engine.release(completed[0]);
-        require(failures, held.send(span<byte_t const> {payload}.subspan(original)));
+        require(failures, send_all(held.peer, span<byte_t const> {payload}.subspan(original)));
 
         byte_t marker[1] {byte_t {51}};
         io_request_t independent {io_operation_t::receive_k, second, nullptr, engine.page};
         require(failures, engine.submit(independent) == ucall_status_success_k);
-        require(failures, other.send(marker));
+        require(failures, send_all(other.peer, marker));
         require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline) == 1);
         failures += expect(completed[0].request == &independent && completed[0].result == 1 &&
                            completed[0].data[0] == marker[0]);
@@ -263,7 +200,7 @@ static case_result_t test_uring700_paused_receive() {
         announce("pausing with a receive in flight, then cancelling one");
         require(failures, engine.submit(independent) == ucall_status_success_k);
         engine.receive_pause(second);
-        require(failures, other.send(marker));
+        require(failures, send_all(other.peer, marker));
         require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline) == 1);
         failures += expect(completed[0].request == &independent && completed[0].result == 1 &&
                            completed[0].data[0] == marker[0]);
@@ -313,18 +250,18 @@ static case_result_t test_uring612_allocation_failure() {
     }
     std::size_t failures = 0;
     // Only a kernel with rings reaches the sixth allocation.
-    for (auto fail_at : {std::size_t {0}, std::size_t {4}, std::size_t {5}}) {
-        if (fail_at == 5 && !kernel_available) continue;
+    for (auto fail_from : {std::size_t {0}, std::size_t {4}, std::size_t {5}}) {
+        if (fail_from == 5 && !kernel_available) continue;
         allocation_counts_t counts;
-        counts.fail_at = fail_at;
+        counts.fail_from = fail_from;
         {
             linux_uring612_engine<counting_allocator<byte_t>> engine {counting_allocator<byte_t> {counts}};
             auto status = engine.open(4, 4);
-            failures += expect(status == ucall_status_out_of_memory_k, "failing allocation {} answered {}", fail_at,
+            failures += expect(status == ucall_status_out_of_memory_k, "failing allocation {} answered {}", fail_from,
                                ucall_status_name(status));
         }
         failures += expect(!counts.bytes && counts.allocations == counts.deallocations,
-                           "failing allocation {} kept {} bytes", fail_at, counts.bytes);
+                           "failing allocation {} kept {} bytes", fail_from, counts.bytes);
     }
     return failures;
 }

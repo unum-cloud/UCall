@@ -471,6 +471,13 @@ struct received_response : received_response_t {
 
 extern template struct received_response<st::default_allocator<byte_t>>;
 
+/** The text a byte vector holds, borrowing it. */
+template <typename element_type_, typename allocator_type_>
+std::string_view text_view(st::basic_vector<element_type_, allocator_type_> const& bytes) noexcept {
+    static_assert(sizeof(element_type_) == 1);
+    return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+}
+
 template <typename compare_kit_type_, typename find_kit_type_, typename byteset_kit_type_, typename hash_kit_type_,
           typename fold_kit_type_>
 struct http {
@@ -485,21 +492,6 @@ struct http {
                                                       byteset_kit_t::capability_k | hash_kit_t::capability_k |
                                                       fold_kit_t::capability_k;
 
-    static std::string_view text_view(span<byte_t const> bytes) noexcept {
-        return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
-    }
-    template <typename element_type_, typename allocator_type_>
-    static std::string_view text_view(st::basic_vector<element_type_, allocator_type_> const& bytes) noexcept {
-        static_assert(sizeof(element_type_) == 1);
-        return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
-    }
-    static ucall_bytes_view_t c_view(std::string_view text) noexcept {
-        return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
-    }
-    static std::string_view text_view(ucall_bytes_view_t bytes) noexcept {
-        return bytes.length ? std::string_view {reinterpret_cast<char const*>(bytes.data), bytes.length}
-                            : std::string_view {};
-    }
     static bool valid_view(ucall_bytes_view_t bytes) noexcept { return bytes.data || !bytes.length; }
     static bool equal(std::string_view left, std::string_view right) noexcept {
         if (left.size() != right.size()) return false;
@@ -537,17 +529,17 @@ struct http {
         find_kit_t::rfind(text.data(), text.size(), &needle, 1, &match, nullptr);
         return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
     }
-    static char const* find_set(std::string_view text, sz_byteset_t const& set) noexcept {
-        if (text.empty()) return nullptr;
+    static std::size_t find_set(std::string_view text, sz_byteset_t const& set) noexcept {
+        if (text.empty()) return std::string_view::npos;
         char const* match;
         byteset_kit_t::find_byteset(text.data(), text.size(), &set, &match, nullptr);
-        return match;
+        return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
     }
-    static char const* rfind_set(std::string_view text, sz_byteset_t const& set) noexcept {
-        if (text.empty()) return nullptr;
+    static std::size_t rfind_set(std::string_view text, sz_byteset_t const& set) noexcept {
+        if (text.empty()) return std::string_view::npos;
         char const* match;
         byteset_kit_t::rfind_byteset(text.data(), text.size(), &set, &match, nullptr);
-        return match;
+        return match ? static_cast<std::size_t>(match - text.data()) : std::string_view::npos;
     }
     static std::uint64_t hash(std::string_view text, std::uint64_t seed = 0) noexcept {
         sz_u64_t result;
@@ -555,18 +547,20 @@ struct http {
         return result;
     }
     static bool http_token(std::string_view text) noexcept {
-        return !text.empty() && !find_set(text, http_non_token_bytes_k);
+        return !text.empty() && find_set(text, http_non_token_bytes_k) == std::string_view::npos;
     }
-    static bool http_value(std::string_view text) noexcept { return !find_set(text, http_control_bytes_k); }
+    static bool http_value(std::string_view text) noexcept {
+        return find_set(text, http_control_bytes_k) == std::string_view::npos;
+    }
     static std::string_view trim_http(std::string_view text) noexcept {
-        auto* first = find_set(text, http_non_padding_bytes_k);
-        if (!first) return text.substr(text.size());
-        auto* last = rfind_set({first, text.size() - (first - text.data())}, http_non_padding_bytes_k);
-        return {first, static_cast<std::size_t>(last - first) + 1};
+        std::size_t const first = find_set(text, http_non_padding_bytes_k);
+        if (first == std::string_view::npos) return text.substr(text.size());
+        std::size_t const last = rfind_set(text, http_non_padding_bytes_k);
+        return text.substr(first, last - first + 1);
     }
-    static void lowercase_ascii(char* text, std::size_t length) noexcept {
+    static void lowercase_ascii(span<char> text) noexcept {
         sz_size_t written = 0;
-        fold_kit_t::uncased_fold(text, length, text, &written, nullptr);
+        fold_kit_t::uncased_fold(text.data(), text.size(), text.data(), &written, nullptr);
     }
     static bool http_has_token(std::string_view text, std::string_view token) noexcept {
         while (!text.empty()) {
@@ -681,7 +675,7 @@ struct http {
                 auto name = text.substr(start, colon - start),
                      value = trim_http(text.substr(colon + 1, line_end - colon - 1));
                 if (!http_token(name) || !http_value(value)) return http_parse_t::malformed_k;
-                lowercase_ascii(reinterpret_cast<char*>(bytes.data()) + start, name.size());
+                lowercase_ascii({reinterpret_cast<char*>(bytes.data()) + start, name.size()});
                 if (equal(name, "connection") || equal(name, "transfer-encoding")) {
                     auto tokens = value;
                     while (!tokens.empty()) {
@@ -690,7 +684,8 @@ struct http {
                         if (comma == std::string_view::npos) break;
                         tokens.remove_prefix(comma + 1);
                     }
-                    lowercase_ascii(reinterpret_cast<char*>(bytes.data()) + (value.data() - text.data()), value.size());
+                    lowercase_ascii(
+                        {reinterpret_cast<char*>(bytes.data()) + (value.data() - text.data()), value.size()});
                 }
                 if (equal(name, "content-length")) {
                     if (has_length || value.empty()) return http_parse_t::malformed_k;
@@ -766,7 +761,7 @@ struct http {
                         !http_value(text.substr(colon + 1, trailer_end - colon - 1)))
                         return http_parse_t::malformed_k;
                     auto name = text.substr(trailer, colon - trailer);
-                    lowercase_ascii(reinterpret_cast<char*>(bytes.data()) + trailer, name.size());
+                    lowercase_ascii({reinterpret_cast<char*>(bytes.data()) + trailer, name.size()});
                     if (equal(name, "content-length") || equal(name, "transfer-encoding") || equal(name, "host"))
                         return http_parse_t::malformed_k;
                     trailer = trailer_end + 2;

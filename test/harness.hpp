@@ -43,15 +43,19 @@
 #include <cstdlib> // `std::abort`, `std::getenv`, `std::strtod`, `std::strtoull`
 #include <cstring> // `std::strstr`, `std::memcmp`
 
-#include <charconv> // `std::from_chars`
-#include <chrono>   // `std::chrono::steady_clock`
-#include <random>   // `std::uniform_random_bit_generator`
-#include <string>   // `std::string`
-#include <utility>  // `std::forward`
+#include <charconv>    // `std::from_chars`
+#include <chrono>      // `std::chrono::steady_clock`
+#include <limits>      // `std::numeric_limits`
+#include <random>      // `std::uniform_random_bit_generator`
+#include <string>      // `std::string`
+#include <type_traits> // `std::true_type`, `std::is_invocable_v`
+#include <utility>     // `std::forward`, `std::exchange`
 
 #include <fmt/base.h>   // `fmt::print`, `fmt::format_string`
 #include <fmt/color.h>  // `fmt::text_style`, `fmt::fg`, `fmt::emphasis`
 #include <fmt/format.h> // `fmt::formatter`, `fmt::format_to`
+
+#include <forkunion/types.hpp> // `fu::split_mix`
 
 #include "ucall/types.hpp" // `byte_t`, `span`
 
@@ -75,20 +79,7 @@ namespace unum::ucall::test {
 /** Scratch extent shared by buffer and record fixtures. */
 inline constexpr std::size_t fixture_buffer_bytes_k = 4096;
 
-#pragma region Spans
-
-/** Views a string literal as bytes, without its terminating zero. */
-template <std::size_t length_>
-[[nodiscard]] inline span<byte_t const> ascii_bytes(char const (&text)[length_]) noexcept {
-    byte_t const* const begin = reinterpret_cast<byte_t const*>(text);
-    return {begin, begin + length_ - 1};
-}
-
-/** Views a counted run of characters as bytes. */
-[[nodiscard]] inline span<byte_t const> ascii_bytes(char const* text, std::size_t length) noexcept {
-    byte_t const* const begin = reinterpret_cast<byte_t const*>(text);
-    return {begin, begin + length};
-}
+#pragma region Byte Ranges
 
 /** Fills a range with one repeated value, keeping its pointer and length together. */
 inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
@@ -114,12 +105,8 @@ inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
 /** Whether every byte in the range is zero, which is how a wiped secret is recognised. */
 [[nodiscard]] inline bool all_zero(span<byte_t const> bytes) noexcept { return all_equal_to(bytes, byte_t {}); }
 
-#pragma endregion Spans
-
 /*  Published cryptographic vectors arrive as hex, so two of the four suites speak it. Names ending
  *  in an underscore are this header's own workings and have no callers outside it. */
-
-#pragma region Hexadecimal
 
 /**
  *  @brief Decodes one hex digit into @p value.
@@ -184,7 +171,7 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
     if (shown < bytes.size()) fmt::print(stderr, "... ({} bytes total)", bytes.size());
 }
 
-#pragma endregion Hexadecimal
+#pragma endregion Byte Ranges
 
 #pragma region Diagnostics
 
@@ -292,7 +279,8 @@ inline void announce(fmt::format_string<argument_types_...> format, argument_typ
 #pragma region Environment
 
 /**
- *  @brief Minimal SplitMix64 generator, modelling @c std::uniform_random_bit_generator.
+ *  @brief A counter over ForkUnion's SplitMix64 avalanche, modelling
+ *      @c std::uniform_random_bit_generator.
  *
  *  Deliberately independent of the library's own entropy, so a bug in @c secure_random_bytes can
  *  never shape the inputs the tests run against.
@@ -305,19 +293,15 @@ inline void announce(fmt::format_string<argument_types_...> format, argument_typ
 struct random_generator_t {
     using result_type = std::uint64_t;
 
-    result_type state {};
+    /** The next draw's input, starting at the seed. */
+    result_type counter {};
 
-    explicit random_generator_t(result_type seed) noexcept : state(seed) {}
+    explicit random_generator_t(result_type seed) noexcept : counter(seed) {}
 
     [[nodiscard]] static constexpr result_type min() noexcept { return 0; }
     [[nodiscard]] static constexpr result_type max() noexcept { return ~result_type {0}; }
 
-    [[nodiscard]] result_type operator()() noexcept {
-        result_type mixed = (state += 0x9E3779B97F4A7C15ull);
-        mixed = (mixed ^ (mixed >> 30)) * 0xBF58476D1CE4E5B9ull;
-        mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EBull;
-        return mixed ^ (mixed >> 31);
-    }
+    [[nodiscard]] result_type operator()() noexcept { return fu::split_mix(counter++); }
 
     /**
      *  @brief The next value in `[0, bound)`, or zero when the bound is empty.
@@ -393,20 +377,14 @@ inline void configure_tests() {
     std::fflush(stdout);
 }
 
-/** The shared generator. Reseeded per test, so a filtered run reproduces an unfiltered one. */
-[[nodiscard]] inline random_generator_t& global_random_generator() noexcept {
-    static random_generator_t generator(test_environment.seed);
-    return generator;
-}
-
-/** Reseeds the shared generator from the run's seed and a test's name. */
-inline void seed_generator_for_test_(char const* name) noexcept {
+/** A test's seed, from the run's and the name, so a filtered run reproduces an unfiltered one. */
+[[nodiscard]] inline std::uint64_t test_seed_(char const* name) noexcept {
     std::uint64_t hashed = 0xCBF29CE484222325ull;
     for (char const* character = name; *character; ++character) {
         hashed ^= static_cast<std::uint64_t>(static_cast<unsigned char>(*character));
         hashed *= 0x100000001B3ull;
     }
-    global_random_generator().state = test_environment.seed ^ hashed;
+    return test_environment.seed ^ hashed;
 }
 
 /**
@@ -433,6 +411,50 @@ inline void seed_generator_for_test_(char const* name) noexcept {
 }
 
 #pragma endregion Environment
+
+#pragma region Allocators
+
+/** What a @c counting_allocator saw, and the attempt from which it refuses. */
+struct allocation_counts_t {
+    std::size_t attempts {}, allocations {}, deallocations {}, bytes {};
+
+    /** Every attempt from this one onward fails, so a case can starve setup at any step. */
+    std::size_t fail_from {std::numeric_limits<std::size_t>::max()};
+
+    [[nodiscard]] std::size_t live() const noexcept { return allocations - deallocations; }
+};
+
+/** Counts every allocation through @c allocation_counts_t, and fails them on request. */
+template <typename value_type_>
+struct counting_allocator {
+    using value_type = value_type_;
+    using propagate_on_container_move_assignment = std::true_type;
+    allocation_counts_t* counts {};
+    counting_allocator() noexcept = default;
+    explicit counting_allocator(allocation_counts_t& state) noexcept : counts(&state) {}
+    template <typename other_type_>
+    counting_allocator(counting_allocator<other_type_> const& other) noexcept : counts(other.counts) {}
+    value_type_* allocate(std::size_t count) noexcept {
+        if (counts->attempts++ >= counts->fail_from) return nullptr;
+        value_type_* const result = st::default_allocator<value_type_> {}.allocate(count);
+        if (result) {
+            ++counts->allocations;
+            counts->bytes += count * sizeof(value_type_);
+        }
+        return result;
+    }
+    void deallocate(value_type_* pointer, std::size_t count) noexcept {
+        ++counts->deallocations;
+        counts->bytes -= count * sizeof(value_type_);
+        st::default_allocator<value_type_> {}.deallocate(pointer, count);
+    }
+    template <typename other_type_>
+    bool operator==(counting_allocator<other_type_> const& other) const noexcept {
+        return counts == other.counts;
+    }
+};
+
+#pragma endregion Allocators
 
 #pragma region Raw Sockets
 #if UCALL_OS_POSIX_
@@ -500,11 +522,12 @@ struct raw_client_t {
     }
 
     /**
-     *  @brief Writes all of @p bytes in chunks of one to @p max_chunk bytes, drawn from the shared
-     *      generator, so a seed reproduces the fragmentation.
+     *  @brief Writes all of @p bytes in chunks of one to @p max_chunk bytes, drawn from
+     *      @p generator, so a seed reproduces the fragmentation.
      *  @return False when the peer stopped taking bytes or the deadline passed.
      */
-    [[nodiscard]] bool write(span<byte_t const> bytes, std::size_t max_chunk, deadline_t deadline) noexcept {
+    [[nodiscard]] bool write(span<byte_t const> bytes, std::size_t max_chunk, random_generator_t& generator,
+                             deadline_t deadline) noexcept {
 #if defined(MSG_NOSIGNAL)
         constexpr int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
 #else
@@ -513,7 +536,7 @@ struct raw_client_t {
         std::size_t offset = 0;
         while (offset != bytes.size()) {
             std::size_t const remaining = bytes.size() - offset;
-            std::size_t chunk = 1 + global_random_generator().below(max_chunk);
+            std::size_t chunk = 1 + generator.below(max_chunk);
             if (chunk > remaining) chunk = remaining;
             std::size_t sent = 0;
             while (sent != chunk) {
@@ -596,6 +619,43 @@ inline wire_response_t read_response(raw_client_t& client, std::size_t offset) {
     }
 }
 
+/** Both ends of a loopback TCP connection, closed with the pair unless a case takes one. */
+struct loopback_pair_t {
+    int client = -1, peer = -1;
+
+    loopback_pair_t() noexcept = default;
+    loopback_pair_t(loopback_pair_t&& other) noexcept
+        : client(std::exchange(other.client, -1)), peer(std::exchange(other.peer, -1)) {}
+    loopback_pair_t& operator=(loopback_pair_t&&) = delete;
+    ~loopback_pair_t() noexcept {
+        if (client >= 0) ::close(client);
+        if (peer >= 0) ::close(peer);
+    }
+
+    [[nodiscard]] bool connected() const noexcept { return client >= 0 && peer >= 0; }
+};
+
+/** Connects a fresh loopback TCP pair without Nagle's delay, or answers one not @c connected. */
+[[nodiscard]] inline loopback_pair_t loopback_pair() noexcept {
+    loopback_pair_t pair;
+    int const listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (listener < 0) return pair;
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_length = sizeof(address);
+    int enabled = 1;
+    if (::setsockopt(listener, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0 &&
+        ::bind(listener, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0 &&
+        ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0 &&
+        ::listen(listener, 1) == 0)
+        pair.client = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (pair.client >= 0 && ::connect(pair.client, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0)
+        pair.peer = ::accept(listener, nullptr, nullptr);
+    ::close(listener);
+    return pair;
+}
+
 #endif // UCALL_OS_POSIX_
 #pragma endregion Raw Sockets
 
@@ -672,12 +732,14 @@ struct suite_totals_t {
 };
 
 /**
- *  @brief Runs the case @p name unless the filter leaves it out: reseeds, times it, and rolls its
+ *  @brief Runs the case @p name unless the filter leaves it out: seeds, times it, and rolls its
  *      result into @p totals.
  *
- *  A failed case also prints the command that reruns only it, under the same seed and multiplier.
+ *  A case that takes a @c random_generator_t gets one seeded from its name, owned by this call. A
+ *  failed case also prints the command that reruns only it, under the same seed and multiplier.
  */
-inline void run_test(suite_totals_t& totals, char const* name, case_result_t (*case_function)()) {
+template <typename case_function_type_>
+inline void run_test(suite_totals_t& totals, char const* name, case_function_type_ case_function) {
     if (!test_should_run_(name)) {
         fmt::print("- {} ... skipped (UCALL_FILTER)\n", name);
         std::fflush(stdout);
@@ -685,9 +747,11 @@ inline void run_test(suite_totals_t& totals, char const* name, case_result_t (*c
     }
     fmt::print("- {} ...\n", name);
     std::fflush(stdout);
-    seed_generator_for_test_(name);
+    random_generator_t generator {test_seed_(name)};
     auto const start = std::chrono::steady_clock::now();
-    case_result_t const result = case_function();
+    case_result_t result {0};
+    if constexpr (std::is_invocable_v<case_function_type_&, random_generator_t&>) result = case_function(generator);
+    else result = case_function();
     double const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
 
     totals.failures += result.failures;

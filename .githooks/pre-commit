@@ -1043,6 +1043,44 @@ check_gcc_atomics() {
         "            naming the memory order at every access:"
 }
 
+check_path_hops() {
+    local hops
+    hops=$(printf '%s\n' "$added" |
+        grep -E '^\+[[:space:]]*#[[:space:]]*include[[:space:]]*"\.\./|#\[path|include_(str|bytes)!\("\.\.' || true)
+    [ -z "$hops" ] || fail "$hops" \
+        "$file reaches a file through a parent-directory hop - add its folder to the target's include" \
+        "            directories, or read the value through Cargo, as env!(\"CARGO_PKG_VERSION\") does:"
+}
+
+check_void_discards() {
+    local casts
+    casts=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -E '\(void\)[[:space:]]*[A-Za-z_:(]' || true)
+    [ -z "$casts" ] || fail "$casts" \
+        "$file casts a result to void - bind it to a [[maybe_unused]] variable instead:"
+}
+
+check_platform_macros_through_vocabulary() {
+    local raw
+    raw=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -oE '__linux__|__APPLE__|__FreeBSD__|\b_WIN(32|64)\b|__GNUC__|__clang__|_MSC_VER|\b__x86_64__\b|_M_X64|\b__aarch64__\b|_M_ARM64' |
+        sort -u || true)
+    [ -z "$raw" ] || fail "$raw" \
+        "$file asks a raw platform macro - include ucall/types.hpp and use its vocabulary," \
+        "            UCALL_OS_*, UCALL_ARCH_* or UCALL_COMPILER_*:"
+}
+
+check_library_filesystem() {
+    local uses
+    uses=$(printf '%s\n' "$added" |
+        grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
+        grep -E '#[[:space:]]*include[[:space:]]*<filesystem>|\bstd::filesystem\b' || true)
+    [ -z "$uses" ] || fail "$uses" \
+        "$file uses std::filesystem in library code - it is allowed only in test/, bench/ and tools/ harnesses:"
+}
+
 check_workflow_names() {
     local nameless
     nameless=$(
@@ -1301,6 +1339,8 @@ judge_path() {
         check_preprocessor_nesting
         check_trailing_returns
         check_iterator_laundering
+        check_path_hops
+        case "$file" in include/ucall/types.hpp | c/*.h | python/*.c) ;; *) check_platform_macros_through_vocabulary ;; esac
         ;;&
     *.hpp | *.cpp | *.cc | *.cxx)
         case "$file" in test/harness.hpp) ;; *) check_qualified_namespace ;; esac
@@ -1319,6 +1359,7 @@ judge_path() {
         check_call_chained_call
         check_gcc_atomics
         check_mutable_and_const_cast
+        check_void_discards
         ;;&
     test/*.hpp | bench/*.hpp)
         check_harness_namespace
@@ -1372,9 +1413,11 @@ judge_path() {
         check_rust_use_groups ucall "$file" < "$staged_blob" || rejection_count=$((rejection_count + 1))
         check_rust_modules
         check_substring_assertions
+        check_path_hops
         ;;
     esac
     case "$file" in include/ucall/*.hpp | src/*.cpp | src/*.hpp) check_allocating_new ;; esac
+    case "$file" in include/* | src/* | c/* | python/*) check_library_filesystem ;; esac
     case "$file" in
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx)
         if command -v clang-format > /dev/null 2>&1 &&
@@ -1398,24 +1441,31 @@ run_tree_checks() {
             fail "Cargo.toml" "Run cargo +nightly fmt."
         fi
     fi
-    for sibling in stringzilla forkunion smashtable; do
+    while read -r sibling pinned; do
         recorded=$(git ls-files --stage -- "$sibling" | awk '$1 == "160000" { print $2 }')
-        pinned=$(git show :CMakeLists.txt | awk -v sibling="$sibling" '
-            /^ucall_sibling\(/ { in_call = 1; name = "" }
-            in_call {
-                for (i = 1; i <= NF; ++i) {
-                    token = $i; gsub(/[()]/, "", token)
-                    if (token == "ucall_sibling") continue
-                    if (name == "") name = token
-                    if (name == sibling && token ~ /^[0-9a-f]+$/ && length(token) == 40) print token
-                }
-                if (/\)/) in_call = 0
-            }
-        ')
         if [ -z "$pinned" ] || [ "$recorded" != "$pinned" ]; then
             fail "$sibling" "The CMake pin and the staged submodule must name the same commit."
         fi
+    done < <(git show :CMakeLists.txt | awk '
+        /^[[:space:]]*ucall_sibling\(/ { in_call = 1; name = ""; pin = "" }
+        in_call {
+            for (i = 1; i <= NF; ++i) {
+                token = $i; gsub(/[()]/, "", token)
+                if (token == "ucall_sibling" || token == "") continue
+                if (name == "") name = token
+                else if (token ~ /^[0-9a-f]+$/ && length(token) == 40) pin = token
+            }
+            if (/\)/) { in_call = 0; print name, pin }
+        }
+    ')
+    for example in $(git ls-files -- 'examples/*/*' | cut -d/ -f2 | sort -u); do
+        for required in README.md server.cpp; do
+            git ls-files --error-unmatch -- "examples/$example/$required" > /dev/null 2>&1 ||
+                fail "examples/$example/$required" "Every example folder holds its own README.md and server.cpp."
+        done
     done
+    nested=$(git ls-files -- 'bench/*/*')
+    [ -z "$nested" ] || fail "$nested" "bench/ stays flat: name each file by its backend and role instead of nesting it."
 }
 
 lint_base=${UCALL_LINT_BASE:-HEAD}

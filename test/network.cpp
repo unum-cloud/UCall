@@ -34,20 +34,16 @@
 
 namespace uc = unum::ucall;
 using namespace unum::ucall::test;
+using namespace std::chrono_literals;
+using std::chrono::steady_clock;
 
 /** The backend under test, which `--backend` names. */
 static ucall_io_backend_t backend_under_test = ucall_io_backend_automatic_k;
 static ucall_cpu_class_t cpu_class_under_test = ucall_cpu_class_unknown_k;
 
-static ucall_bytes_view_t view(std::string_view text) {
-    return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
-}
 static ucall_status_t authorize(ucall_noise_key_t const* key, void* context) {
     return std::memcmp(*key, context, sizeof(ucall_noise_key_t)) == 0 ? ucall_status_success_k
                                                                       : ucall_status_peer_rejected_k;
-}
-static std::chrono::steady_clock::time_point deadline_after(long milliseconds) {
-    return std::chrono::steady_clock::now() + std::chrono::milliseconds {milliseconds};
 }
 
 /** What a fixture varies between cases; every other setting is fixed. */
@@ -111,7 +107,7 @@ struct fixture_t {
         ucall_server_request_body_t extract {server, &outcome, request, &body};
         ucall_server_request_body(&extract);
         failures += expect(outcome.status == ucall_status_success_k);
-        ucall_bytes_view_t header = view("X-UCall: passed");
+        ucall_bytes_view_t header = uc::bytes_view("X-UCall: passed");
         ucall_server_reply_content_t reply {server, &outcome, request, &header, 1, body};
         ucall_server_reply_content(&reply);
         failures += expect(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
@@ -141,7 +137,7 @@ struct fixture_t {
         for (std::string_view name : {"Content-TYPE", "X-~", "x-^", "X-Absent"}) {
             ucall_outcome_t outcome {};
             ucall_bytes_view_t value {};
-            ucall_server_request_header_t get {fixture.server, &outcome, request, view(name), &value};
+            ucall_server_request_header_t get {fixture.server, &outcome, request, uc::bytes_view(name), &value};
             ucall_server_request_header(&get);
             if (outcome.status == ucall_status_success_k)
                 answer.append(reinterpret_cast<char const*>(value.data), value.length);
@@ -149,7 +145,7 @@ struct fixture_t {
             answer += ';';
         }
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {fixture.server, &outcome, request, nullptr, 0, view(answer)};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, request, nullptr, 0, uc::bytes_view(answer)};
         ucall_server_reply_content(&reply);
         fixture.failures += expect(outcome.status == ucall_status_success_k);
     }
@@ -198,7 +194,8 @@ struct fixture_t {
         using route_t = std::pair<char const*, ucall_received_http_request_callback_t>;
         for (auto [route, callback] :
              {route_t {"/echo/{id}", echo}, route_t {"/gate", gate}, route_t {"/headers", lookup}}) {
-            ucall_server_add_http_endpoint_t add {server, &outcome, view(route), ucall_verb_any_k, callback, this};
+            ucall_server_add_http_endpoint_t add {server,           &outcome, uc::bytes_view(route),
+                                                  ucall_verb_any_k, callback, this};
             ucall_server_add_http_endpoint(&add);
             if ((status = outcome.status) != ucall_status_success_k) return;
         }
@@ -261,10 +258,10 @@ struct fixture_t {
 
     /** The next completed call, or one with a timeout outcome after five seconds. */
     ucall_completed_call_t wait() {
-        auto const deadline = deadline_after(5000);
+        steady_clock::time_point const deadline = steady_clock::now() + 5s;
         ucall_completed_call_t completed {};
         while (!poll(completed))
-            if (std::chrono::steady_clock::now() > deadline) {
+            if (steady_clock::now() > deadline) {
                 completed.outcome.status = ucall_status_timeout_k;
                 break;
             }
@@ -284,7 +281,7 @@ static std::size_t check_response(ucall_received_http_response_t response, std::
                        "{} body bytes against {}", body.length, expected.size());
     failures += expect(body.length != expected.size() || !body.length ||
                        std::memcmp(body.data, expected.data(), body.length) == 0);
-    ucall_client_response_header_t get_header {response, &outcome, view("X-UCALL"), &header};
+    ucall_client_response_header_t get_header {response, &outcome, uc::bytes_view("X-UCALL"), &header};
     ucall_client_response_header(&get_header);
     failures += expect(outcome.status == ucall_status_success_k && header.length == 6 &&
                        std::memcmp(header.data, "passed", 6) == 0);
@@ -306,9 +303,9 @@ static case_result_t exchanges(ucall_security_mode_t security) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = view(url);
+    call.url = uc::bytes_view(url);
     call.verb = ucall_verb_post_k;
-    call.body = view(payload);
+    call.body = uc::bytes_view(payload);
     call.options.security = security;
     call.options.server_key = &fixture.server_public;
     auto exchange = [&](std::string_view expected) {
@@ -328,10 +325,10 @@ static case_result_t exchanges(ucall_security_mode_t security) {
     };
     // A reply's copy is counted once its send completes, which can trail the client's completion.
     auto settled_copies = [&](std::uint64_t since, std::uint64_t expected) {
-        auto const deadline = deadline_after(2000);
+        steady_clock::time_point const deadline = steady_clock::now() + 2s;
         ucall_completed_call_t completed {};
         auto copies = copies_beyond_receipt();
-        while (copies - since < expected && std::chrono::steady_clock::now() < deadline) {
+        while (copies - since < expected && steady_clock::now() < deadline) {
             failures += expect(!fixture.poll(completed), "a call completed unasked");
             copies = copies_beyond_receipt();
         }
@@ -348,11 +345,11 @@ static case_result_t exchanges(ucall_security_mode_t security) {
     announce("a named host");
     auto named_url = url;
     named_url.replace(named_url.find("127.0.0.1"), std::strlen("127.0.0.1"), "localhost");
-    call.url = view(named_url);
+    call.url = uc::bytes_view(named_url);
     exchange(payload);
     announce("a closing call, then a fresh connection");
-    call.url = view(url);
-    ucall_bytes_view_t close = view("Connection: close");
+    call.url = uc::bytes_view(url);
+    ucall_bytes_view_t close = uc::bytes_view("Connection: close");
     call.headers = &close;
     call.headers_count = 1;
     exchange(payload);
@@ -386,19 +383,19 @@ static case_result_t test_multiloop_retention() {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = view(gate_url);
+    call.url = uc::bytes_view(gate_url);
     call.verb = ucall_verb_post_k;
     call.context = &gate_url;
     ucall_client_call(&call);
     failures += expect(outcome.status == ucall_status_success_k);
-    auto const deadline = deadline_after(5000);
+    steady_clock::time_point const deadline = steady_clock::now() + 5s;
     ucall_received_http_request_t held {};
     while (!(held = fixture.take_held())) {
         ucall_completed_call_t completed {};
         failures += expect(!fixture.poll(completed));
-        require(failures, std::chrono::steady_clock::now() < deadline, "the gated request never arrived");
+        require(failures, steady_clock::now() < deadline, "the gated request never arrived");
     }
-    call.url = view(echo_url);
+    call.url = uc::bytes_view(echo_url);
     call.context = &echo_url;
     ucall_client_call(&call);
     failures += expect(outcome.status == ucall_status_success_k);
@@ -436,9 +433,9 @@ static case_result_t test_cross_thread_replies_stress() {
             ucall_client_call_t call {};
             call.client = fixture.client;
             call.outcome = &outcome;
-            call.url = view(gate_url);
+            call.url = uc::bytes_view(gate_url);
             call.verb = ucall_verb_post_k;
-            call.body = view(bodies[i]);
+            call.body = uc::bytes_view(bodies[i]);
             call.context = &bodies[i];
             ucall_client_call(&call);
             failures += expect(outcome.status == ucall_status_success_k);
@@ -459,12 +456,12 @@ static case_result_t test_cross_thread_replies_stress() {
 /** Polls until the `/gate` route holds @p count requests, with no call completing meanwhile. */
 static std::size_t await_held(fixture_t& fixture, std::size_t count) {
     std::size_t failures = 0;
-    auto const deadline = deadline_after(5000);
+    steady_clock::time_point const deadline = steady_clock::now() + 5s;
     while (fixture.held_count() != count && !failures) {
         ucall_completed_call_t completed {};
         failures += expect(!fixture.poll(completed), "a call completed early");
-        failures += expect(std::chrono::steady_clock::now() < deadline, "the server holds {} of {} requests",
-                           fixture.held_count(), count);
+        failures += expect(steady_clock::now() < deadline, "the server holds {} of {} requests", fixture.held_count(),
+                           count);
     }
     return failures;
 }
@@ -485,9 +482,9 @@ static case_result_t pipelined_calls(ucall_security_mode_t security) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = view(gate_url);
+        call.url = uc::bytes_view(gate_url);
         call.verb = ucall_verb_post_k;
-        call.body = view(bodies[i]);
+        call.body = uc::bytes_view(bodies[i]);
         call.context = &bodies[i];
         call.options.security = security;
         call.options.server_key = &fixture.server_public;
@@ -519,7 +516,7 @@ static case_result_t test_pipelined_call_loss() {
     std::size_t failures = 0;
     std::string const gate_url = fixture.url + "/gate", post_url = fixture.url + "/echo/3",
                       get_url = fixture.url + "/echo/4";
-    ucall_bytes_view_t const close = view("Connection: close");
+    ucall_bytes_view_t const close = uc::bytes_view("Connection: close");
     struct planned_call_t {
         std::string const* url;
         ucall_verb_t verb;
@@ -534,7 +531,7 @@ static case_result_t test_pipelined_call_loss() {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = view(*planned.url);
+        call.url = uc::bytes_view(*planned.url);
         call.verb = planned.verb;
         call.context = &planned;
         if (&planned == &plan[1]) {
@@ -546,7 +543,7 @@ static case_result_t test_pipelined_call_loss() {
     }
     failures += await_held(fixture, 2);
     // The server stops reading at the closing request; meanwhile the last two calls leave too.
-    for (auto const settled = deadline_after(100); std::chrono::steady_clock::now() < settled;) {
+    for (steady_clock::time_point const settled = steady_clock::now() + 100ms; steady_clock::now() < settled;) {
         ucall_completed_call_t completed {};
         failures += expect(!fixture.poll(completed), "a call completed early");
     }
@@ -568,13 +565,11 @@ static case_result_t test_pipelined_call_loss() {
 #pragma region Raw Clients
 #if UCALL_OS_POSIX_
 
-static uc::span<uc::byte_t const> wire_bytes(std::string_view text) { return ascii_bytes(text.data(), text.size()); }
-
 /** Sends @p request whole, reads until the server closes, and answers the first response. */
 static wire_response_t exchange_until_close(raw_client_t& client, std::string_view request, std::size_t max_chunk,
-                                            std::size_t& failures) {
-    auto const deadline = deadline_after(10000);
-    auto const written = client.write(wire_bytes(request), max_chunk, deadline);
+                                            random_generator_t& generator, std::size_t& failures) {
+    steady_clock::time_point const deadline = steady_clock::now() + 10s;
+    auto const written = client.write(uc::byte_span(request), max_chunk, generator, deadline);
     auto const end = client.read_until_close(deadline);
     int const error = end == read_end_t::failed_k ? errno : 0;
     auto const response = parse_response(client.received);
@@ -603,7 +598,7 @@ static case_result_t test_pipelined_delivery() {
     // One send, so the server has read the third request before it closes,
     // and the close is no reset.
     failures += expect(::send(client.descriptor, burst.data(), burst.size(), 0) == static_cast<ssize_t>(burst.size()));
-    auto const end = client.read_until_close(deadline_after(10000));
+    auto const end = client.read_until_close(steady_clock::now() + 10s);
     failures += expect(end == read_end_t::closed_k, "the read ended as {}", static_cast<int>(end));
     auto const first = parse_response(client.received);
     auto const second = parse_response(std::string_view {client.received}.substr(first.length));
@@ -616,7 +611,7 @@ static case_result_t test_pipelined_delivery() {
 }
 
 /** Headers written one byte per segment still parse. */
-static case_result_t test_fragmented_headers_delivery() {
+static case_result_t test_fragmented_headers_delivery(random_generator_t& generator) {
     fixture_t fixture {{}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
@@ -624,14 +619,15 @@ static case_result_t test_fragmented_headers_delivery() {
     raw_client_t client;
     require(failures, client.connect(fixture.address));
     auto const response = exchange_until_close(
-        client, "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody", 1, failures);
+        client, "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\nConnection: close\r\n\r\nbody", 1, generator,
+        failures);
     failures += expect(response.status == 200 && response.body == "body", "answered {} {}", response.status,
                        response.body);
     return failures + fixture.stop();
 }
 
 /** A mebibyte body sent in random fragments echoes back byte for byte, in full-length sends. */
-static case_result_t test_megabyte_echo_delivery() {
+static case_result_t test_megabyte_echo_delivery(random_generator_t& generator) {
     fixture_t fixture {{}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
@@ -640,13 +636,13 @@ static case_result_t test_megabyte_echo_delivery() {
     std::string request = fmt::format(
         "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\nConnection: close\r\n\r\n", body_length);
     std::size_t const headers_length = request.size();
-    auto& generator = global_random_generator();
     for (std::size_t i = 0; i != body_length; ++i) request.push_back(static_cast<char>(generator()));
     raw_client_t client;
     require(failures, client.connect(fixture.address));
-    auto const response = exchange_until_close(client, request, 65536, failures);
+    auto const response = exchange_until_close(client, request, 65536, generator, failures);
     failures += expect(response.status == 200, "answered {}", response.status);
-    failures += expect_bytes(wire_bytes(response.body), wire_bytes(std::string_view {request}.substr(headers_length)));
+    failures += expect_bytes(uc::byte_span(response.body),
+                             uc::byte_span(std::string_view {request}.substr(headers_length)));
     return failures + fixture.stop();
 }
 
@@ -670,7 +666,7 @@ static constexpr smuggling_row_t smuggling_rows_k[] {
 };
 
 /** Every smuggling row is answered with an error status and a close, and never dispatched. */
-static case_result_t test_smuggling_safety() {
+static case_result_t test_smuggling_safety(random_generator_t& generator) {
     fixture_t fixture {{}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
@@ -680,7 +676,7 @@ static case_result_t test_smuggling_safety() {
         auto const dispatched = fixture.dispatched.load();
         raw_client_t client;
         require(failures, client.connect(fixture.address));
-        auto const response = exchange_until_close(client, row.request, 0, failures);
+        auto const response = exchange_until_close(client, row.request, 0, generator, failures);
         failures += expect(response.status == row.expected_status, "{} answered {} bytes: {:?}", row.name,
                            client.received.size(), client.received);
         failures += expect(fixture.dispatched.load() == dispatched, "{} was dispatched", row.name);
@@ -690,7 +686,7 @@ static case_result_t test_smuggling_safety() {
 
 /** Paths keep their slashes and drop the query, and header names match without regard to letter
  *  case, where only letters fold. */
-static case_result_t test_header_lookup_unit() {
+static case_result_t test_header_lookup_unit(random_generator_t& generator) {
     fixture_t fixture {{}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
@@ -699,7 +695,7 @@ static case_result_t test_header_lookup_unit() {
     require(failures, client.connect(fixture.address));
     std::string_view const request = "GET //headers?x=1 HTTP/1.1\r\nHost: a\r\nContent-Type: text/plain\r\n"
                                      "X-~: tilde\r\nConnection: close\r\n\r\n";
-    auto const response = exchange_until_close(client, request, 8, failures);
+    auto const response = exchange_until_close(client, request, 8, generator, failures);
     // `^` and `~` differ only in the bit that folds ASCII letters.
     failures += expect(response.body == "//headers;text/plain;tilde;not-found;not-found;", "answered {} {}",
                        response.status, response.body);
@@ -708,7 +704,7 @@ static case_result_t test_header_lookup_unit() {
 
 /** Frees a server from a thread other than its poller while a keep-alive peer stays connected.
  *  An engine stopped off its poller hangs there, or leaks its ring storage under LeakSanitizer. */
-static case_result_t test_cross_thread_teardown_delivery() {
+static case_result_t test_cross_thread_teardown_delivery(random_generator_t& generator) {
     fixture_t fixture {{}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
@@ -716,7 +712,7 @@ static case_result_t test_cross_thread_teardown_delivery() {
     raw_client_t client;
     require(failures, client.connect(fixture.address));
     std::string_view const request = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-    failures += expect(client.write(wire_bytes(request), 0, deadline_after(5000)));
+    failures += expect(client.write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
     failures += expect(read_response(client, 0).status == 200, "the keep-alive request was not served");
     failures += fixture.stop();
     // A hang here is the failure, so a stuck free ends the process instead of the case.
@@ -734,7 +730,7 @@ static case_result_t test_cross_thread_teardown_delivery() {
 }
 
 /** Two loops share a budget of two: a third client waits in the backlog until one closes. */
-static case_result_t test_admission_across_loops() {
+static case_result_t test_admission_across_loops(random_generator_t& generator) {
     if (UCALL_OS_WINDOWS_) return case_result_t::skipped("IOCP accepts one loop per interface");
     fixture_t fixture {{.event_loops = 2, .connections = 2}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
@@ -745,10 +741,10 @@ static case_result_t test_admission_across_loops() {
     raw_client_t clients[3];
     for (std::size_t i = 0; i != 3; ++i) {
         require(failures, clients[i].connect(fixture.address), "client {} could not connect", i);
-        failures += expect(clients[i].write(wire_bytes(request), 0, deadline_after(5000)));
+        failures += expect(clients[i].write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
         if (i != 2) failures += expect(read_response(clients[i], 0).status == 200, "client {} was not served", i);
     }
-    failures += expect(clients[2].read(1, deadline_after(300)) == read_end_t::timed_out_k,
+    failures += expect(clients[2].read(1, steady_clock::now() + 300ms) == read_end_t::timed_out_k,
                        "the third client was served over budget");
     clients[0].close();
     failures += expect(read_response(clients[2], 0).status == 200, "the third client was not served after a close");
@@ -763,7 +759,7 @@ static std::string without_dates(std::string wire) {
 }
 
 /** Every backend this process can create answers one raw transcript with the same bytes. */
-static case_result_t test_backend_parity() {
+static case_result_t test_backend_parity(random_generator_t& generator) {
     static constexpr ucall_io_backend_t backends_k[] {
         ucall_io_backend_posix_k,          ucall_io_backend_linux_epoll_k,  ucall_io_backend_linux_uring612_k,
         ucall_io_backend_linux_uring700_k, ucall_io_backend_macos_kqueue_k, ucall_io_backend_windows_iocp_k};
@@ -784,13 +780,13 @@ static case_result_t test_backend_parity() {
         for (std::string_view request : {"GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n",
                                          "POST /echo/2 HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\nposted",
                                          "GET /missing HTTP/1.1\r\nHost: a\r\n\r\n"}) {
-            failures += expect(client.write(wire_bytes(request), 16, deadline_after(5000)));
+            failures += expect(client.write(uc::byte_span(request), 16, generator, steady_clock::now() + 5s));
             offset += read_response(client, offset).length;
         }
         exchange_until_close(client,
                              "POST /echo/3 HTTP/1.1\r\nHost: a\r\nContent-Length: 4\r\n\r\nleft"
                              "POST /echo/4 HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\nConnection: close\r\n\r\nright",
-                             0, failures);
+                             0, generator, failures);
         failures += fixture.stop();
         auto transcript = without_dates(client.received);
         if (!compared++) {
@@ -814,26 +810,26 @@ static case_result_t test_backend_parity() {
 /** A mebibyte send and a receive wait on one socket together,
  *  and each completes as its own request. */
 template <typename engine_type_>
-static case_result_t engine_duplex() {
+static case_result_t engine_duplex(random_generator_t& generator) {
     engine_type_ engine;
     auto const status = engine.open(2, 2);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this backend");
     require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
     std::size_t failures = 0;
-    int sockets[2] {-1, -1};
-    require(failures, socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) == 0);
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
     // A send buffer far below a mebibyte keeps the send pending until the peer drains it.
     int const send_buffer = static_cast<int>(fixture_buffer_bytes_k);
-    require(failures, uc::nonblocking(sockets[0]) && uc::nonblocking(sockets[1]) &&
-                          uc::socket_option(sockets[0], SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) == 0);
-    auto const owned = engine.import_socket(sockets[0]);
+    require(failures,
+            uc::nonblocking(sockets.client) && uc::nonblocking(sockets.peer) &&
+                uc::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) == 0);
+    auto const owned = engine.import_socket(std::exchange(sockets.client, -1));
     require(failures, owned >= 0, "importing ended with {}", owned);
-    auto const peer = sockets[1];
+    int const peer = sockets.peer;
 
     std::vector<uc::byte_t> payload(std::size_t {1} << 20), drained(payload.size());
-    auto& generator = global_random_generator();
     for (auto& byte : payload) byte = static_cast<uc::byte_t>(generator());
-    auto const message = ascii_bytes("receive");
+    uc::span<uc::byte_t const> const message = uc::byte_span("receive");
     std::array<uc::byte_t, fixture_buffer_bytes_k> buffer {};
     uc::io_request_t receiving {uc::io_operation_t::receive_k, owned, buffer.data(), buffer.size()};
     uc::io_request_t sending {uc::io_operation_t::send_k, owned, payload.data(), payload.size()};
@@ -884,25 +880,24 @@ static case_result_t engine_duplex() {
     }
     failures += expect(drained == payload);
     failures += expect(engine.close_socket(owned) == 0);
-    uc::socket_close(peer);
     return failures;
 }
 
 /** The engine `--backend` names keeps a receive and a send pending on one socket at once. */
-static case_result_t test_engine_duplex_delivery() {
+static case_result_t test_engine_duplex_delivery(random_generator_t& generator) {
     switch (backend_under_test) {
 #if UCALL_WITH_POSIX
-    case ucall_io_backend_posix_k: return engine_duplex<uc::posix_engine_t>();
+    case ucall_io_backend_posix_k: return engine_duplex<uc::posix_engine_t>(generator);
 #endif
 #if UCALL_WITH_LINUX_EPOLL
-    case ucall_io_backend_linux_epoll_k: return engine_duplex<uc::linux_epoll_engine_t>();
+    case ucall_io_backend_linux_epoll_k: return engine_duplex<uc::linux_epoll_engine_t>(generator);
 #endif
 #if UCALL_WITH_LINUX_URING
-    case ucall_io_backend_linux_uring612_k: return engine_duplex<uc::linux_uring612_engine_t>();
-    case ucall_io_backend_linux_uring700_k: return engine_duplex<uc::linux_uring700_engine_t>();
+    case ucall_io_backend_linux_uring612_k: return engine_duplex<uc::linux_uring612_engine_t>(generator);
+    case ucall_io_backend_linux_uring700_k: return engine_duplex<uc::linux_uring700_engine_t>(generator);
 #endif
 #if UCALL_WITH_KQUEUE
-    case ucall_io_backend_macos_kqueue_k: return engine_duplex<uc::kqueue_engine_t>();
+    case ucall_io_backend_macos_kqueue_k: return engine_duplex<uc::kqueue_engine_t>(generator);
 #endif
     default: return case_result_t::skipped("no named POSIX engine");
     }
@@ -921,14 +916,14 @@ int main(int argc, char** argv) {
         std::string_view flag = argv[index], name = index + 1 != argc ? argv[index + 1] : "";
         if (name.empty()) flag = {};
         if (flag == "--backend") {
-            backend_under_test = ucall_io_backend_from_name(view(argv[index + 1]));
+            backend_under_test = ucall_io_backend_from_name(uc::bytes_view(argv[index + 1]));
             if (name != ucall_io_backend_name(backend_under_test)) {
                 fmt::print(stderr, "Unknown backend {}\n", name);
                 return 1;
             }
         }
         else if (flag == "--cpu-class") {
-            cpu_class_under_test = ucall_cpu_class_from_name(view(argv[index + 1]));
+            cpu_class_under_test = ucall_cpu_class_from_name(uc::bytes_view(argv[index + 1]));
             if (name != ucall_cpu_class_name(cpu_class_under_test)) {
                 fmt::print(stderr, "Unknown CPU class {}\n", name);
                 return 1;

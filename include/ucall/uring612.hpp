@@ -128,8 +128,8 @@ struct linux_uring612_engine {
                    ? &socket_slots[index]
                    : nullptr;
     }
-    byte_t* receive_data(unsigned index) noexcept {
-        return storage->receive.data() + static_cast<std::size_t>(index) * page;
+    span<byte_t> receive_data(unsigned index) noexcept {
+        return span<byte_t> {storage->receive}.subspan(static_cast<std::size_t>(index) * page, page);
     }
     unsigned index_of(operation_t const& operation) const noexcept {
         return static_cast<unsigned>(&operation - operations.data());
@@ -225,7 +225,7 @@ struct linux_uring612_engine {
             std::min(depth, static_cast<std::size_t>(std::numeric_limits<unsigned>::max() / 2)) * 2);
         int result = io_uring_queue_init_params(entries, &ring, &parameters);
         if (result < 0) return result == -ENOMEM ? ucall_status_out_of_memory_k : ucall_status_unsupported_k;
-        (void)io_uring_register_ring_fd(&ring);
+        [[maybe_unused]] int const registered = io_uring_register_ring_fd(&ring);
         stage = engine_stage_t::running_k;
         constexpr auto probe_length = unsigned {std::numeric_limits<decltype(io_uring_probe_op::op)>::max()} + 1;
         struct alignas(io_uring_probe) probe_scratch_t {
@@ -260,7 +260,7 @@ struct linux_uring612_engine {
             return ucall_status_unsupported_k;
         }
         for (unsigned i = 0; i != buffer_count; ++i)
-            io_uring_buf_ring_add(receive_ring, receive_data(i), static_cast<unsigned>(page),
+            io_uring_buf_ring_add(receive_ring, receive_data(i).data(), static_cast<unsigned>(page),
                                   static_cast<unsigned short>(i), buffer_mask, i);
         io_uring_buf_ring_advance(receive_ring, buffer_count);
         return ucall_status_success_k;
@@ -330,7 +330,7 @@ struct linux_uring612_engine {
         auto handle = registered_socket_t {target->index}.handle();
         submission = entry();
         if (!submission) {
-            (void)close_socket(handle);
+            [[maybe_unused]] int const closed = close_socket(handle);
             return -EIO;
         }
         storage->socket_option_value = 1;
@@ -341,7 +341,7 @@ struct linux_uring612_engine {
         io_uring_sqe_set_data64(submission, tag(&control, control_tag_k));
         result = wait_control();
         if (result < 0) {
-            (void)close_socket(handle);
+            [[maybe_unused]] int const closed = close_socket(handle);
             return result;
         }
         return handle;
@@ -349,7 +349,7 @@ struct linux_uring612_engine {
     void recycle(unsigned index) noexcept {
         buffers[index] = {};
         ++available_buffers;
-        io_uring_buf_ring_add(receive_ring, receive_data(index), static_cast<unsigned>(page),
+        io_uring_buf_ring_add(receive_ring, receive_data(index).data(), static_cast<unsigned>(page),
                               static_cast<unsigned short>(index), buffer_mask, 0);
         io_uring_buf_ring_advance(receive_ring, 1);
     }
@@ -585,7 +585,7 @@ struct linux_uring612_engine {
                               ? -ETIMEDOUT
                               : operation->result;
             auto index = operation->buffer;
-            byte_t* data = index != absent_k ? receive_data(index) : nullptr;
+            byte_t* data = index != absent_k ? receive_data(index).data() : nullptr;
             std::uintptr_t lease = index != absent_k ? static_cast<std::uintptr_t>(index) + 1 : 0;
             output[count++] = {operation->request, result, data,
                                data && result >= 0 ? static_cast<std::size_t>(result) : 0, lease};
@@ -684,8 +684,9 @@ struct linux_uring612_engine {
         if (!fault) {
             for (auto& operation : operations)
                 if (operation.request && operation.stage != operation_stage_t::completed_k &&
-                    operation.request->operation != io_operation_t::close_k)
-                    (void)cancel(*operation.request);
+                    operation.request->operation != io_operation_t::close_k) {
+                    [[maybe_unused]] ucall_status_t const cancelled = cancel(*operation.request);
+                }
             for (auto& owner : socket_slots)
                 if (owner.stage != socket_stage_t::vacant_k) retire(owner);
             while (has_kernel_work() && !fault) {
@@ -710,7 +711,7 @@ struct linux_uring612_engine {
         }
         if (!retired) {
             // A failed retirement barrier must not make registered memory reusable.
-            (void)storage.release();
+            [[maybe_unused]] storage_t* const leaked = storage.release();
         }
         io_uring_queue_exit(&ring);
         stage = engine_stage_t::stopped_k;

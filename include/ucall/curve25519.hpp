@@ -57,7 +57,7 @@
 
 /** Saturated limbs recompiled for ADX and BMI2. Needs the attribute those compilers accept. */
 #if !defined(UCALL_TARGET_X86_ADX)
-#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+#if (UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_) && UCALL_ARCH_X8664_
 #define UCALL_TARGET_X86_ADX 1
 #else
 #define UCALL_TARGET_X86_ADX 0
@@ -87,10 +87,6 @@ enum class x25519_tiers_t : std::uint8_t {
     /** Four limbs built for ADX and BMI2, so it runs only where CPUID reports them. */
     adx_k = 1u << 2,
 };
-
-[[nodiscard]] constexpr x25519_tiers_t operator|(x25519_tiers_t left, x25519_tiers_t right) noexcept {
-    return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(left) | static_cast<std::uint8_t>(right));
-}
 
 [[nodiscard]] constexpr x25519_tiers_t operator&(x25519_tiers_t left, x25519_tiers_t right) noexcept {
     return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(left) & static_cast<std::uint8_t>(right));
@@ -142,33 +138,33 @@ enum class x25519_tiers_t : std::uint8_t {
  *  @warning Must execute in time independent of @p scalar. Any implementation swapped in here has
  *      to preserve that - it is the whole reason this primitive is isolated.
  */
-[[nodiscard]] bool x25519_scalar_multiply(  //
-    byte_t out[x25519_key_size_k],          //
-    byte_t const scalar[x25519_key_size_k], //
-    byte_t const point[x25519_key_size_k]) noexcept;
+[[nodiscard]] bool x25519_scalar_multiply(        //
+    span<byte_t, x25519_key_size_k> out,          //
+    span<byte_t const, x25519_key_size_k> scalar, //
+    span<byte_t const, x25519_key_size_k> point) noexcept;
 
 /** Baseline tier of @c x25519_scalar_multiply. Always built, and runs on any supported CPU. */
 [[nodiscard]] bool x25519_scalar_multiply_serial( //
-    byte_t out[x25519_key_size_k],                //
-    byte_t const scalar[x25519_key_size_k],       //
-    byte_t const point[x25519_key_size_k]) noexcept;
+    span<byte_t, x25519_key_size_k> out,          //
+    span<byte_t const, x25519_key_size_k> scalar, //
+    span<byte_t const, x25519_key_size_k> point) noexcept;
 
 #if UCALL_HAS_INT128_
 
 /** Radix-51 tier of @c x25519_scalar_multiply. Needs 128-bit integers, so absent under MSVC. */
 [[nodiscard]] bool x25519_scalar_multiply_radix51( //
-    byte_t out[x25519_key_size_k],                 //
-    byte_t const scalar[x25519_key_size_k],        //
-    byte_t const point[x25519_key_size_k]) noexcept;
+    span<byte_t, x25519_key_size_k> out,           //
+    span<byte_t const, x25519_key_size_k> scalar,  //
+    span<byte_t const, x25519_key_size_k> point) noexcept;
 #endif
 
 #if UCALL_TARGET_X86_ADX
 
 /** ADX tier of @c x25519_scalar_multiply. Faults where @c x25519_tiers_runtime omits it. */
-[[nodiscard]] bool x25519_scalar_multiply_adx( //
-    byte_t out[x25519_key_size_k],             //
-    byte_t const scalar[x25519_key_size_k],    //
-    byte_t const point[x25519_key_size_k]) noexcept;
+[[nodiscard]] bool x25519_scalar_multiply_adx(    //
+    span<byte_t, x25519_key_size_k> out,          //
+    span<byte_t const, x25519_key_size_k> scalar, //
+    span<byte_t const, x25519_key_size_k> point) noexcept;
 #endif
 
 /**
@@ -176,8 +172,8 @@ enum class x25519_tiers_t : std::uint8_t {
  *  @param[out] out The 32-byte public key.
  *  @param[in] scalar The 32-byte secret scalar.
  */
-void x25519_derive_public(         //
-    byte_t out[x25519_key_size_k], //
-    byte_t const scalar[x25519_key_size_k]) noexcept;
+void x25519_derive_public(               //
+    span<byte_t, x25519_key_size_k> out, //
+    span<byte_t const, x25519_key_size_k> scalar) noexcept;
 
 } // namespace unum::ucall

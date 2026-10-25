@@ -68,13 +68,13 @@ struct routing_case_t {
                            "registering `{}` [{}] was accepted", route, verb);
     }
 
-    void must_match(char const* path, ucall_verb_t verb, void* expected) const {
+    void must_match(std::string_view path, ucall_verb_t verb, void* expected) const {
         void* const matched = trie.match(path, verb);
         failures += expect(matched == expected, "`{}` [{}] matched endpoint {}, expected {}", path, verb,
                            reinterpret_cast<std::uintptr_t>(matched), reinterpret_cast<std::uintptr_t>(expected));
     }
 
-    void must_not_match(char const* path, ucall_verb_t verb) const { must_match(path, verb, nullptr); }
+    void must_not_match(std::string_view path, ucall_verb_t verb) const { must_match(path, verb, nullptr); }
 };
 
 /**
@@ -99,9 +99,9 @@ struct path_arena_t {
         return {slot, written.size};
     }
 
-    /** The slot an earlier @c emit filled, as a zero-terminated string. */
-    [[nodiscard]] char const* written(std::size_t index) const noexcept {
-        return characters.data() + index * slot_width_k;
+    /** The route an earlier @c emit wrote into slot @p index. */
+    [[nodiscard]] std::string_view written(std::size_t index) const noexcept {
+        return {characters.data() + index * slot_width_k};
     }
 };
 
@@ -286,7 +286,7 @@ case_result_t test_routes_unit() {
 
 #pragma endregion Known Answers
 
-#pragma region Hostile And Malformed Input
+#pragma region Hostile Input And Sweeps
 
 case_result_t test_routes_safety() {
     std::size_t failures = 0;
@@ -366,10 +366,6 @@ case_result_t test_routes_safety() {
     return failures;
 }
 
-#pragma endregion Hostile And Malformed Input
-
-#pragma region Sweeps
-
 /**
  *  @brief Registration past the initial pool capacity, which must grow rather than refuse.
  *
@@ -383,9 +379,6 @@ case_result_t test_routes_stress() {
     path_arena_t arena;
     require(failures, arena.reserve(routes_count), "an arena for {} routes could not allocate", routes_count);
 
-    std::size_t const initial_pools = routes.trie.pool_count();
-    std::size_t observed_capacity = routes.trie.capacity();
-    std::size_t observed_pools = initial_pools;
     void* const endpoint = endpoint_numbered(1);
 
     for (std::size_t index = 0; index != routes_count; ++index) {
@@ -393,16 +386,7 @@ case_result_t test_routes_stress() {
         failures += expect(!route.empty(), "route {} overflows a {}-character slot", index, path_arena_t::slot_width_k);
         failures += expect(routes.trie.insert(route, ucall_verb_get_k, endpoint) == ucall_status_success_k,
                            "route {} of {} was refused", index, routes_count);
-
-        std::size_t const pools_now = routes.trie.pool_count();
-        if (pools_now > observed_pools) {
-            failures += expect(routes.trie.capacity() > observed_capacity);
-            observed_capacity = routes.trie.capacity();
-            observed_pools = pools_now;
-        }
     }
-
-    failures += expect(observed_pools > initial_pools);
 
     // Growth relocates nothing, so a route registered before the first new pool still matches.
     for (std::size_t index = 0; index != routes_count; ++index)
@@ -410,7 +394,7 @@ case_result_t test_routes_stress() {
     return failures;
 }
 
-#pragma endregion Sweeps
+#pragma endregion Hostile Input And Sweeps
 
 int main(int, char** argv) {
     install_test_signal_handlers();

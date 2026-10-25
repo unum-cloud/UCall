@@ -8,10 +8,9 @@
 
 namespace unum::ucall {
 
-bool secure_tunnel_generate_keypair(byte_t private_half[secure_tunnel_key_size_k],
-                                    byte_t public_half[secure_tunnel_key_size_k]) noexcept {
-    if (!secure_tunnel_crypto<serial_sha256_kit_t, serial_aes256_gcm_kit_t>::secure_random_bytes(
-            private_half, secure_tunnel_key_size_k))
+bool secure_tunnel_generate_keypair(span<byte_t, secure_tunnel_key_size_k> private_half,
+                                    span<byte_t, secure_tunnel_key_size_k> public_half) noexcept {
+    if (!secure_tunnel_crypto<serial_sha256_kit_t, serial_aes256_gcm_kit_t>::secure_random_bytes(private_half))
         return false;
     x25519_derive_public(public_half, private_half);
     return true;

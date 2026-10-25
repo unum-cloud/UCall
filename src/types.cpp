@@ -5,9 +5,9 @@
  *  @brief Status names, outcome synchronization, and the version of the linked library.
  */
 #include <cstddef> // `std::size_t`
-#include <cstring> // `std::strlen`, `std::memcmp`
 
-#include <atomic> // `std::atomic_ref`
+#include <atomic>      // `std::atomic_ref`
+#include <string_view> // `std::string_view`
 
 #include "ucall/types.h"
 
@@ -53,6 +53,7 @@ char const* ucall_status_name(ucall_status_t status) {
 
 ucall_status_t ucall_status_from_name(ucall_bytes_view_t name) {
     if (!name.data || !name.length) return ucall_status_invalid_argument_k;
+    std::string_view const text {reinterpret_cast<char const*>(name.data), name.length};
     ucall_status_t const statuses[] = {ucall_status_success_k,           ucall_status_deferred_k,
                                        ucall_status_out_of_memory_k,     ucall_status_io_k,
                                        ucall_status_malformed_k,         ucall_status_internal_k,
@@ -64,8 +65,7 @@ ucall_status_t ucall_status_from_name(ucall_bytes_view_t name) {
                                        ucall_status_handshake_failed_k,  ucall_status_peer_rejected_k,
                                        ucall_status_would_block_k};
     for (ucall_status_t status : statuses) {
-        char const* spelling = ucall_status_name(status);
-        if (std::strlen(spelling) == name.length && std::memcmp(spelling, name.data, name.length) == 0) return status;
+        if (std::string_view {ucall_status_name(status)} == text) return status;
     }
     return ucall_status_invalid_argument_k;
 }

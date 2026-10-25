@@ -22,7 +22,6 @@ set_target_properties(
                C_VISIBILITY_PRESET hidden
                LINKER_LANGUAGE CXX
 )
-target_include_directories(ucall_python PRIVATE ${CMAKE_CURRENT_SOURCE_DIR})
 target_link_libraries(ucall_python PRIVATE ucall::ucall)
 if (NOT MSVC)
     target_compile_options(ucall_python PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)

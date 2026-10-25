@@ -105,7 +105,10 @@ struct x25519_backend_t {
 
     /** Which tier must be runnable here, or @c none_k for one that always is. */
     x25519_tiers_t tier;
-    bool (*multiply)(byte_t*, byte_t const*, byte_t const*) noexcept;
+
+    /** Called with spans, as GCC 16 decays an array argument of an indirect call to a pointer. */
+    bool (*multiply)(span<byte_t, x25519_key_size_k>, span<byte_t const, x25519_key_size_k>,
+                     span<byte_t const, x25519_key_size_k>) noexcept;
 };
 
 /*  The dispatcher leads, so whatever it picks is checked against the tiers themselves, and the
@@ -209,7 +212,8 @@ case_result_t test_x25519_all() {
         for (x25519_vector_t const& vector : x25519_vectors_k) {
             decoded_vector_t const decoded(vector, failures);
             byte_t produced[x25519_key_size_k];
-            shared_secret_t const answer = reported(backend.multiply(produced, decoded.scalar, decoded.point));
+            shared_secret_t const answer = reported(
+                backend.multiply(std::span {produced}, std::span {decoded.scalar}, std::span {decoded.point}));
             failures += expect(answer == vector.expected, "{} called {} a {} secret, expected {}", backend.name,
                                vector.label, answer, vector.expected);
             failures += expect_hex(produced, vector.shared_hex);
@@ -226,8 +230,10 @@ case_result_t test_x25519_all() {
         scalar[0] = byte_t {9}, point[0] = byte_t {9};
         for (std::size_t iteration = 0; iteration != scale_iterations(100); ++iteration) {
             byte_t expected[x25519_key_size_k], produced[x25519_key_size_k];
-            [[maybe_unused]] bool const reference_usable = x25519_reference_k.multiply(expected, scalar, point);
-            [[maybe_unused]] bool const candidate_usable = backend.multiply(produced, scalar, point);
+            [[maybe_unused]] bool const reference_usable = x25519_reference_k.multiply(
+                std::span {expected}, std::span {scalar}, std::span {point});
+            [[maybe_unused]] bool const candidate_usable = backend.multiply(std::span {produced}, std::span {scalar},
+                                                                            std::span {point});
             failures += expect(bytes_equal(produced, expected), "{} left {} at iteration {}", backend.name,
                                x25519_reference_k.name, iteration);
             std::memcpy(point, scalar, x25519_key_size_k);

@@ -45,14 +45,14 @@
 #include <cstdint> // `std::uint64_t`
 #include <cstring> // `std::memcpy`
 
-#if defined(_MSC_VER) && !defined(__clang__)
+#include "ucall/curve25519.hpp"
+
+#if UCALL_COMPILER_MSVC_
 #include <intrin.h> // `_umul128`, `__umulh`, `_addcarry_u64`, `_subborrow_u64`
 #endif
-#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+#if (UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_) && UCALL_ARCH_X8664_
 #include <cpuid.h> // `__get_cpuid_count`
 #endif
-
-#include "ucall/curve25519.hpp"
 
 namespace unum::ucall {
 namespace {
@@ -85,7 +85,7 @@ __extension__ typedef unsigned __int128 fiat_25519_uint128_t;
  *  round-trip is strictly stronger.
  */
 [[nodiscard]] inline std::uint64_t value_barrier(std::uint64_t value) noexcept {
-#if defined(__GNUC__) || defined(__clang__)
+#if UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_
     __asm__("" : "+r"(value));
     return value;
 #else
@@ -126,9 +126,9 @@ struct multiply_widening_t {
 #if defined(__SIZEOF_INT128__)
         fiat_25519_uint128_t const product = (fiat_25519_uint128_t)arg1 * arg2;
         *out1 = (std::uint64_t)product, *out2 = (std::uint64_t)(product >> 64);
-#elif defined(_M_X64)
+#elif UCALL_COMPILER_MSVC_ && UCALL_ARCH_X8664_
         *out1 = _umul128(arg1, arg2, out2);
-#elif defined(_M_ARM64)
+#elif UCALL_COMPILER_MSVC_ && UCALL_ARCH_ARM64_
         *out1 = arg1 * arg2, *out2 = __umulh(arg1, arg2);
 #else
         multiply_serial_t::wide(out1, out2, arg1, arg2);
@@ -143,7 +143,7 @@ struct multiply_widening_t {
  */
 inline void fiat_addcarryx_u64(std::uint64_t* out1, fiat_25519_uint1_t* out2, fiat_25519_uint1_t arg1,
                                std::uint64_t arg2, std::uint64_t arg3) noexcept {
-#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+#if UCALL_COMPILER_MSVC_ && UCALL_ARCH_X8664_
     unsigned long long summed;
     *out2 = _addcarry_u64(arg1, arg2, arg3, &summed), *out1 = summed;
 #else
@@ -164,7 +164,7 @@ inline void fiat_addcarryx_u64(std::uint64_t* out1, fiat_25519_uint1_t* out2, fi
  */
 inline void fiat_subborrowx_u64(std::uint64_t* out1, fiat_25519_uint1_t* out2, fiat_25519_uint1_t arg1,
                                 std::uint64_t arg2, std::uint64_t arg3) noexcept {
-#if defined(_MSC_VER) && !defined(__clang__) && defined(_M_X64)
+#if UCALL_COMPILER_MSVC_ && UCALL_ARCH_X8664_
     unsigned long long differenced;
     *out2 = _subborrow_u64(arg1, arg2, arg3, &differenced), *out1 = differenced;
 #else
@@ -190,7 +190,7 @@ inline void fiat_25519_cmovznz_u64(std::uint64_t* out1, fiat_25519_uint1_t arg1,
 /** True when the CPU executes the ADX and BMI2 instruction sets the saturated tier is compiled
  *  for. */
 [[nodiscard]] inline bool cpu_supports_adx_and_bmi2() noexcept {
-#if (defined(__GNUC__) || defined(__clang__)) && defined(__x86_64__)
+#if (UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_) && UCALL_ARCH_X8664_
     unsigned eax = 0, ebx = 0, ecx = 0, edx = 0;
     if (!__get_cpuid_count(7, 0, &eax, &ebx, &ecx, &edx)) return false;
     bool const has_bmi2 = (ebx >> 8) & 1u;
@@ -973,24 +973,24 @@ template <typename field_type_>
 
 } // namespace
 
-bool x25519_scalar_multiply_serial(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k],
-                                   byte_t const point[x25519_key_size_k]) noexcept {
-    return scalar_multiply_through<field_serial_t>(reinterpret_cast<std::uint8_t*>(out),
-                                                   reinterpret_cast<std::uint8_t const*>(scalar),
-                                                   reinterpret_cast<std::uint8_t const*>(point));
+bool x25519_scalar_multiply_serial(span<byte_t, x25519_key_size_k> out, span<byte_t const, x25519_key_size_k> scalar,
+                                   span<byte_t const, x25519_key_size_k> point) noexcept {
+    return scalar_multiply_through<field_serial_t>(reinterpret_cast<std::uint8_t*>(out.data()),
+                                                   reinterpret_cast<std::uint8_t const*>(scalar.data()),
+                                                   reinterpret_cast<std::uint8_t const*>(point.data()));
 }
 
 #if UCALL_HAS_INT128_
-bool x25519_scalar_multiply_radix51(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k],
-                                    byte_t const point[x25519_key_size_k]) noexcept {
-    return scalar_multiply_through<field_radix51_t>(reinterpret_cast<std::uint8_t*>(out),
-                                                    reinterpret_cast<std::uint8_t const*>(scalar),
-                                                    reinterpret_cast<std::uint8_t const*>(point));
+bool x25519_scalar_multiply_radix51(span<byte_t, x25519_key_size_k> out, span<byte_t const, x25519_key_size_k> scalar,
+                                    span<byte_t const, x25519_key_size_k> point) noexcept {
+    return scalar_multiply_through<field_radix51_t>(reinterpret_cast<std::uint8_t*>(out.data()),
+                                                    reinterpret_cast<std::uint8_t const*>(scalar.data()),
+                                                    reinterpret_cast<std::uint8_t const*>(point.data()));
 }
 #endif
 
 #if UCALL_TARGET_X86_ADX
-#if defined(__clang__)
+#if UCALL_COMPILER_CLANG_
 #pragma clang attribute push(__attribute__((target("adx,bmi2"))), apply_to = function)
 #else
 #pragma GCC push_options
@@ -1002,15 +1002,15 @@ bool x25519_scalar_multiply_radix51(byte_t out[x25519_key_size_k], byte_t const 
  *  where the template is defined - outside. Without forcing the kernels into this body they compile
  *  untargeted: measured 5 `MULX` against 566. Correctness never depended on it, and neither does
  *  `serial` staying free of `MULX` - the schoolbook multiply has nothing to lower. */
-__attribute__((flatten)) bool x25519_scalar_multiply_adx(byte_t out[x25519_key_size_k],
-                                                         byte_t const scalar[x25519_key_size_k],
-                                                         byte_t const point[x25519_key_size_k]) noexcept {
-    return scalar_multiply_through<field_adx_t>(reinterpret_cast<std::uint8_t*>(out),
-                                                reinterpret_cast<std::uint8_t const*>(scalar),
-                                                reinterpret_cast<std::uint8_t const*>(point));
+__attribute__((flatten)) bool x25519_scalar_multiply_adx(span<byte_t, x25519_key_size_k> out,
+                                                         span<byte_t const, x25519_key_size_k> scalar,
+                                                         span<byte_t const, x25519_key_size_k> point) noexcept {
+    return scalar_multiply_through<field_adx_t>(reinterpret_cast<std::uint8_t*>(out.data()),
+                                                reinterpret_cast<std::uint8_t const*>(scalar.data()),
+                                                reinterpret_cast<std::uint8_t const*>(point.data()));
 }
 
-#if defined(__clang__)
+#if UCALL_COMPILER_CLANG_
 #pragma clang attribute pop
 #else
 #pragma GCC pop_options
@@ -1041,8 +1041,8 @@ char const* x25519_tier_name(x25519_tiers_t tier) noexcept {
     return "mixed";
 }
 
-bool x25519_scalar_multiply(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k],
-                            byte_t const point[x25519_key_size_k]) noexcept {
+bool x25519_scalar_multiply(span<byte_t, x25519_key_size_k> out, span<byte_t const, x25519_key_size_k> scalar,
+                            span<byte_t const, x25519_key_size_k> point) noexcept {
     // The chain ends in the baseline, the way every `sz_find_*` chain ends in its serial arm.
     [[maybe_unused]] x25519_tiers_t const tier = x25519_tier_preferred();
 #if UCALL_TARGET_X86_ADX
@@ -1054,7 +1054,7 @@ bool x25519_scalar_multiply(byte_t out[x25519_key_size_k], byte_t const scalar[x
     return x25519_scalar_multiply_serial(out, scalar, point);
 }
 
-void x25519_derive_public(byte_t out[x25519_key_size_k], byte_t const scalar[x25519_key_size_k]) noexcept {
+void x25519_derive_public(span<byte_t, x25519_key_size_k> out, span<byte_t const, x25519_key_size_k> scalar) noexcept {
     static constexpr byte_t base_point_k[x25519_key_size_k] = {byte_t {9}};
     // The standard base point has prime order, so a clamped scalar never maps it to zero.
     [[maybe_unused]] bool const nonzero = x25519_scalar_multiply(out, scalar, base_point_k);

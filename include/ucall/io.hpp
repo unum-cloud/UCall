@@ -585,7 +585,7 @@ struct readiness_engine {
         fresh_operations.push(operations, index);
         if (request.deadline) {
             operation.timed = static_cast<unsigned>(timed.size());
-            (void)timed.push_back(st::assume_reserved, unsigned {index});
+            [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
         ++active;
         tally(statistics.submissions);
@@ -719,7 +719,8 @@ struct epoll_readiness {
         free_watches.clear();
         for (std::size_t index = 0; index != capacity; ++index) {
             watches[index] = {};
-            (void)free_watches.push_back(st::assume_reserved, static_cast<std::uint32_t>(index));
+            [[maybe_unused]] st::status_t const freed = free_watches.push_back(st::assume_reserved,
+                                                                               static_cast<std::uint32_t>(index));
         }
         for (auto& slot : watch_slots) slot = absent_k;
         descriptor = epoll_create1(EPOLL_CLOEXEC);
@@ -763,7 +764,7 @@ struct epoll_readiness {
         if (chosen == absent_k) return;
         epoll_ctl(descriptor, EPOLL_CTL_DEL, static_cast<int>(watched), nullptr);
         watches[chosen] = {-1, watches[chosen].generation + 1};
-        (void)free_watches.push_back(st::assume_reserved, std::uint32_t {chosen});
+        [[maybe_unused]] st::status_t const freed = free_watches.push_back(st::assume_reserved, std::uint32_t {chosen});
         std::size_t mask = watch_slots.size() - 1;
         for (std::size_t next = (slot + 1) & mask; watch_slots[next] != absent_k; next = (next + 1) & mask) {
             std::size_t home = static_cast<std::size_t>(watches[watch_slots[next]].descriptor) & mask;
@@ -1006,7 +1007,7 @@ struct windows_iocp_engine {
         }
         if (request.deadline) {
             operation->timed = static_cast<unsigned>(timed.size());
-            (void)timed.push_back(st::assume_reserved, unsigned {index});
+            [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
         ++active;
         return ucall_status_success_k;

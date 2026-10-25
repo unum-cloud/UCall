@@ -10,16 +10,17 @@
 
 #include <atomic> // `std::atomic_ref`
 #include <bit>    // `std::bit_ceil`
-
-#if defined(__linux__)
-#include <dirent.h>
-#endif
+#include <chrono> // `std::chrono::year_month_day`, `std::chrono::hh_mm_ss`, `std::chrono::weekday`
 
 #include "ucall/http.hpp"
 #include "ucall/io.hpp"
 #include "ucall/routes.hpp"
 #include "ucall/tunnel.hpp"
 #include "ucall/curve25519.hpp"
+
+#if UCALL_OS_LINUX_
+#include <dirent.h> // `opendir`, `readdir`, `closedir`
+#endif
 
 namespace unum::ucall {
 
@@ -45,19 +46,15 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     using atomic_ref = atomic_ref_template_<value_type_>;
     using http_message_t = typename http_t::http_message_t;
     using http_t::append_text;
-    using http_t::c_view;
     using http_t::drop_bytes;
     using http_t::equal;
     using http_t::find;
     using http_t::http_decode_chunks;
-    using http_t::http_has_token;
     using http_t::http_parse;
     using http_t::http_token;
     using http_t::http_value;
-    using http_t::http_verb;
     using http_t::http_verb_name;
     using http_t::lowercase_ascii;
-    using http_t::text_view;
     using http_t::trim_http;
     using http_t::valid_view;
     enum class server_mode_t { serving_k, stopping_k };
@@ -217,7 +214,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                         stage = connection_stage_t::closed_k;
                         return nullptr;
                     }
-                    return emit(receive_request, io_operation_t::close_k, nullptr, 0);
+                    return emit(receive_request, io_operation_t::close_k, {});
                 }
                 if (stage == connection_stage_t::closed_k || stage == connection_stage_t::idle_k ||
                     stage == connection_stage_t::open_k)
@@ -226,8 +223,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 if (in_flight()) return nullptr;
                 if (stage == connection_stage_t::connecting_k) return &transmit_request;
                 if (sending)
-                    return emit(transmit_request, io_operation_t::send_k, sending + sending_offset,
-                                sending_length - sending_offset);
+                    return emit(transmit_request, io_operation_t::send_k,
+                                {sending + sending_offset, sending_length - sending_offset});
                 auto step = tunnel.advance({encrypted.data(), encrypted.data() + encrypted.size()});
                 drop_bytes(encrypted, step.consumed);
                 if (step.state == secure_tunnel_state_t::broken_k || step.state == secure_tunnel_state_t::closed_k) {
@@ -251,10 +248,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                         fail(ucall_status_connection_closed_k);
                         continue;
                     }
-                    return emit(receive_request, io_operation_t::receive_k, received.data(), received.size());
+                    return emit(receive_request, io_operation_t::receive_k, received);
                 }
                 if (!(flags & connection_authorized_k)) {
-                    if (!tunnel.peer_key(std::as_writable_bytes(std::span {peer_static_key}).data())) {
+                    if (!tunnel.peer_key(std::as_writable_bytes(std::span {peer_static_key}))) {
                         fail(ucall_status_handshake_failed_k);
                         continue;
                     }
@@ -270,8 +267,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 return nullptr;
             }
         }
-        io_request_t* emit(io_request_t& request, io_operation_t operation, byte_t* data, std::size_t length) noexcept {
-            request = {operation, descriptor, data, length, operation == io_operation_t::close_k ? 0 : deadline, this};
+        io_request_t* emit(io_request_t& request, io_operation_t operation, span<byte_t> bytes) noexcept {
+            request = {
+                operation, descriptor, bytes.data(), bytes.size(), operation == io_operation_t::close_k ? 0 : deadline,
+                this};
             return &request;
         }
 
@@ -291,14 +290,14 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
          *  Null once @p source is all sent, or when sealing failed the connection. */
         io_request_t* transmit_from(vector<byte_t>& source) noexcept {
             if (sending)
-                return emit(transmit_request, io_operation_t::send_k, sending + sending_offset,
-                            sending_length - sending_offset);
+                return emit(transmit_request, io_operation_t::send_k,
+                            {sending + sending_offset, sending_length - sending_offset});
             if (output_offset == source.size()) return nullptr;
             sending_offset = 0;
             sending = source.data() + output_offset;
             if (!tunnel.encrypts()) {
                 sending_length = output_advance = source.size() - output_offset;
-                return emit(transmit_request, io_operation_t::send_k, sending, sending_length);
+                return emit(transmit_request, io_operation_t::send_k, {sending, sending_length});
             }
             // A later record's prefix lands on the last two payload bytes
             // of the one already sent before it.
@@ -313,7 +312,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             }
             sending_length = sealed.size();
             output_advance = output_offset + sending_length == source.size() ? sending_length : payload_length;
-            return emit(transmit_request, io_operation_t::send_k, sending, sending_length);
+            return emit(transmit_request, io_operation_t::send_k, {sending, sending_length});
         }
 
         /** Opens every whole record waiting in `encrypted` straight into the tail of `input`,
@@ -341,7 +340,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             stage = connection_stage_t::closing_k;
             crypto_t::secure_zero(peer_static_key);
         }
-        std::string_view text() const noexcept { return http_t::text_view(input); }
+        std::string_view text() const noexcept { return text_view(input); }
     };
 
     enum class drain_state_t : std::uint32_t { draining_k, sleeping_k };
@@ -409,7 +408,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::uint32_t state {};
         std::uint64_t deposited {};
         std::size_t copied {}; // Reply body bytes, counted later by the event loop, as any thread may reply.
-        std::string_view text() const noexcept { return http_t::text_view(input); }
+        std::string_view text() const noexcept { return text_view(input); }
     };
     struct network_interface_t {
         explicit network_interface_t(allocator_t const& allocator = {}) noexcept
@@ -691,52 +690,47 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
     static constexpr std::size_t http_date_length_k = sizeof("Sun, 06 Nov 1994 08:49:37 GMT") - 1;
 
-    /** Formats the RFC 9110 IMF-fixdate with Howard Hinnant's civil-from-days arithmetic. */
+    /** Formats the RFC 9110 IMF-fixdate through the calendar types, without allocating. */
     static std::string_view format_date(char (&output)[http_date_length_k], std::time_t now) noexcept {
-        static constexpr char weekdays_k[] = "ThuFriSatSunMonTueWed",
-                              months_k[] = "MarAprMayJunJulAugSepOctNovDecJanFeb";
-        auto seconds = static_cast<std::uint64_t>(std::max<std::time_t>(now, 0));
-        auto days = seconds / 86400, time = seconds % 86400;
-        auto shifted = days + 719468, era = shifted / 146097, day_of_era = shifted % 146097;
-        auto year_of_era = (day_of_era - day_of_era / 1460 + day_of_era / 36524 - day_of_era / 146096) / 365;
-        auto day_of_year = day_of_era - (365 * year_of_era + year_of_era / 4 - year_of_era / 100);
-        auto month_from_march = (5 * day_of_year + 2) / 153;
-        auto day = day_of_year - (153 * month_from_march + 2) / 5 + 1;
-        auto year = year_of_era + era * 400 + (month_from_march >= 10);
+        static constexpr char weekdays_k[] = "SunMonTueWedThuFriSat",
+                              months_k[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
+        std::chrono::sys_seconds const seconds {std::chrono::seconds {std::max<std::time_t>(now, 0)}};
+        std::chrono::sys_days const days = std::chrono::floor<std::chrono::days>(seconds);
+        std::chrono::year_month_day const date {days};
+        std::chrono::hh_mm_ss<std::chrono::seconds> const time {seconds - days};
         auto put = [&](std::size_t offset, std::uint64_t value, std::size_t width) {
             for (auto position = offset + width; position != offset; value /= 10)
                 output[--position] = static_cast<char>('0' + value % 10);
         };
-        std::memcpy(output, weekdays_k + days % 7 * 3, 3);
+        std::memcpy(output, weekdays_k + std::chrono::weekday {days}.c_encoding() * 3, 3);
         std::memcpy(output + 3, ", ", 2);
-        put(5, day, 2);
+        put(5, static_cast<unsigned>(date.day()), 2);
         output[7] = ' ';
-        std::memcpy(output + 8, months_k + month_from_march * 3, 3);
+        std::memcpy(output + 8, months_k + (static_cast<unsigned>(date.month()) - 1) * 3, 3);
         output[11] = ' ';
-        put(12, year, 4);
+        put(12, static_cast<std::uint64_t>(static_cast<int>(date.year())), 4);
         output[16] = ' ';
-        put(17, time / 3600, 2);
+        put(17, static_cast<std::uint64_t>(time.hours().count()), 2);
         output[19] = ':';
-        put(20, time / 60 % 60, 2);
+        put(20, static_cast<std::uint64_t>(time.minutes().count()), 2);
         output[22] = ':';
-        put(23, time % 60, 2);
+        put(23, static_cast<std::uint64_t>(time.seconds().count()), 2);
         std::memcpy(output + 25, " GMT", 4);
         return {output, http_date_length_k};
     }
 
-    static ucall_status_t append_headers(vector<byte_t>& output, ucall_bytes_view_t const* headers, std::size_t count,
+    static ucall_status_t append_headers(vector<byte_t>& output, span<ucall_bytes_view_t const> headers,
                                          http_role_t role) noexcept {
-        if (count && !headers) return ucall_status_invalid_argument_k;
-        for (std::size_t i = 0; i != count; ++i) {
-            if (!valid_view(headers[i])) return ucall_status_invalid_argument_k;
-            auto line = text_view(headers[i]);
+        for (ucall_bytes_view_t const header : headers) {
+            if (!valid_view(header)) return ucall_status_invalid_argument_k;
+            auto line = text_view(header);
             auto colon = find(line, ':');
             if (colon == std::string_view::npos || !http_token(line.substr(0, colon)) ||
                 !http_value(line.substr(colon + 1)))
                 return ucall_status_invalid_argument_k;
             auto previous = output.size();
             if (!append_text(output, line.substr(0, colon))) return ucall_status_out_of_memory_k;
-            lowercase_ascii(reinterpret_cast<char*>(output.data()) + previous, colon);
+            lowercase_ascii({reinterpret_cast<char*>(output.data()) + previous, colon});
             std::string_view name {reinterpret_cast<char const*>(output.data()) + previous, colon};
             if (equal(name, "content-length") || equal(name, "transfer-encoding") ||
                 (role == http_role_t::request_k && (equal(name, "host") || equal(name, "user-agent"))) ||
@@ -749,8 +743,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return ucall_status_success_k;
     }
     static ucall_status_t serialize_reply(server_exchange_t& exchange, unsigned status,
-                                          ucall_bytes_view_t const* headers, std::size_t count,
-                                          std::string_view body) noexcept {
+                                          span<ucall_bytes_view_t const> headers, std::string_view body) noexcept {
         if (!exchange.output.empty()) return ucall_status_already_exists_k;
         if (status < 200 || status > 599 || ((status == 204 || status == 304) && !body.empty()))
             return ucall_status_invalid_argument_k;
@@ -770,7 +763,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             exchange.output.clear();
             return ucall_status_out_of_memory_k;
         }
-        auto result = append_headers(exchange.output, headers, count, http_role_t::response_k);
+        auto result = append_headers(exchange.output, headers, http_role_t::response_k);
         if (result != ucall_status_success_k) {
             exchange.output.clear();
             return result;
@@ -789,8 +782,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         exchange.copied = exchange.message.verb != ucall_verb_head_k ? body.size() : 0;
         return ucall_status_success_k;
     }
-    static ucall_status_t reply(server_exchange_t& exchange, unsigned status, ucall_bytes_view_t const* headers,
-                                std::size_t count, std::string_view body) noexcept {
+    static ucall_status_t reply(server_exchange_t& exchange, unsigned status, span<ucall_bytes_view_t const> headers,
+                                std::string_view body) noexcept {
         auto state = atomic_ref<std::uint32_t> {exchange.state};
         auto previous = state.fetch_or(claimed_k, std::memory_order_acq_rel);
         if (previous & claimed_k) return ucall_status_already_exists_k;
@@ -800,7 +793,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             push_replied(exchange);
             return ucall_status_connection_closed_k;
         }
-        auto result = serialize_reply(exchange, status, headers, count, body);
+        auto result = serialize_reply(exchange, status, headers, body);
         if (result != ucall_status_success_k) {
             exchange.output.clear();
             state.fetch_and(~std::uint32_t {claimed_k}, std::memory_order_release);
@@ -874,7 +867,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** Answers on the event loop itself, failing the connection when no reply was queued. */
     static void refuse(connection_t& connection, server_exchange_t& exchange, unsigned status,
                        std::string_view body) noexcept {
-        auto result = reply(exchange, status, nullptr, 0, body);
+        auto result = reply(exchange, status, {}, body);
         if (result == ucall_status_success_k || result == ucall_status_connection_closed_k) return;
         exchange.stage = exchange_stage_t::collected_k; // Never pushed, so the close recycles it.
         connection.fail(ucall_status_out_of_memory_k);
@@ -1026,8 +1019,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         if (connection.receiving == receive_state_t::reading_k &&
             connection.receive_operation == operation_state_t::idle_k)
-            return connection.emit(connection.receive_request, io_operation_t::receive_k, connection.received.data(),
-                                   connection.received.size());
+            return connection.emit(connection.receive_request, io_operation_t::receive_k, connection.received);
         if (connection.receiving == receive_state_t::ended_k && !oldest &&
             connection.transmitting == transmit_state_t::idle_k) {
             connection.fail(ucall_status_success_k);
@@ -1258,7 +1250,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             event_loops_count = std::max(event_loops_count, settings.event_loops);
             if (settings.noise_private_key)
                 x25519_derive_public(network_interface.public_key,
-                                     std::as_bytes(std::span {*settings.noise_private_key}).data());
+                                     std::as_bytes(std::span {*settings.noise_private_key}));
         }
         {
             engine_t probe {allocator};
@@ -1552,7 +1544,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 exchange = slot.load(std::memory_order_acquire);
             }
             slot.store(nullptr, std::memory_order_relaxed);
-            (void)endpoint.pending.push_back(st::assume_reserved, exchange);
+            [[maybe_unused]] st::status_t const queued = endpoint.pending.push_back(st::assume_reserved, exchange);
             if (endpoint.pending.size() == endpoint.max_batch_size &&
                 flush_pending(endpoint, mode, endpoint.statistics.filled_batches) == ucall_status_success_k)
                 drained = ucall_status_success_k;
@@ -1723,8 +1715,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if constexpr (requires { arguments->min_batch_size; }) {
             auto& batch = *endpoint->batch;
             batch.callback = arguments->callback;
-            (void)server.batch_endpoints.emplace_back(st::assume_reserved, &batch);
-            (void)server.owned_wakeups.push_back(st::assume_reserved, &batch.wake);
+            [[maybe_unused]] st::status_t const listed = server.batch_endpoints.emplace_back(st::assume_reserved,
+                                                                                             &batch);
+            [[maybe_unused]] st::status_t const woken = server.owned_wakeups.push_back(st::assume_reserved,
+                                                                                       &batch.wake);
             server.wakeups = server.owned_wakeups;
             *arguments->endpoint = &batch;
         }
@@ -1758,7 +1752,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
-        *arguments->path = c_view(extract_path_component<http_t>(exchange.message.target(exchange.text())));
+        *arguments->path = bytes_view(extract_path_component<http_t>(exchange.message.target(exchange.text())));
         publish(arguments->outcome, ucall_status_success_k);
     }
     static std::string_view path_segment(std::string_view path, std::size_t index) noexcept {
@@ -1783,7 +1777,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         auto value = path_segment(extract_path_component<http_t>(exchange.message.target(exchange.text())),
                                   arguments->index);
-        *arguments->segment = c_view(value);
+        *arguments->segment = bytes_view(value);
         publish(arguments->outcome, value.empty() ? ucall_status_not_found_k : ucall_status_success_k);
     }
     static void server_request_path_parameter(ucall_server_request_path_parameter_t* arguments) noexcept {
@@ -1807,7 +1801,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             if (parsed.type != segment_type_t::literal_k && equal(parsed.content, name)) {
                 if (parsed.type == segment_type_t::wildcard_k)
                     value = path.substr(static_cast<std::size_t>(value.data() - path.data()));
-                *arguments->value = c_view(value);
+                *arguments->value = bytes_view(value);
                 publish(arguments->outcome, ucall_status_success_k);
                 return;
             }
@@ -1830,8 +1824,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             auto field = query.substr(0, end);
             auto equals = find(field, '=');
             if (equal(field.substr(0, equals), text_view(arguments->name))) {
-                *arguments->value = c_view(equals == std::string_view::npos ? std::string_view {}
-                                                                            : field.substr(equals + 1));
+                *arguments->value = bytes_view(equals == std::string_view::npos ? std::string_view {}
+                                                                                : field.substr(equals + 1));
                 publish(arguments->outcome, ucall_status_success_k);
                 return;
             }
@@ -1850,7 +1844,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         auto value = exchange.message.header(exchange.text(), text_view(arguments->name));
-        *arguments->value = c_view(value);
+        *arguments->value = bytes_view(value);
         publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
     }
     static void server_request_peer(ucall_server_request_peer_t* arguments) noexcept {
@@ -1877,18 +1871,19 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
-        *arguments->body = c_view(exchange.message.body(exchange.text()));
+        *arguments->body = bytes_view(exchange.message.body(exchange.text()));
         publish(arguments->outcome, ucall_status_success_k);
     }
     static void server_reply_content(ucall_server_reply_content_t* arguments) noexcept {
         if (!arguments) return;
-        if (!arguments->server || !arguments->request || !valid_view(arguments->body)) {
+        if (!arguments->server || !arguments->request || !valid_view(arguments->body) ||
+            (arguments->headers_count && !arguments->headers)) {
             publish(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         publish(arguments->outcome, reply(*static_cast<server_exchange_t*>(arguments->request),
-                                          arguments->http_status ? arguments->http_status : 200, arguments->headers,
-                                          arguments->headers_count, text_view(arguments->body)));
+                                          arguments->http_status ? arguments->http_status : 200,
+                                          {arguments->headers, arguments->headers_count}, text_view(arguments->body)));
     }
     static void server_reply_error(ucall_server_reply_error_t* arguments) noexcept {
         if (!arguments) return;
@@ -1897,9 +1892,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             publish(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        ucall_bytes_view_t header = c_view("content-type: text/plain");
+        ucall_bytes_view_t const header = bytes_view("content-type: text/plain");
         publish(arguments->outcome, reply(*static_cast<server_exchange_t*>(arguments->request), arguments->http_status,
-                                          &header, 1, text_view(arguments->message)));
+                                          {&header, 1}, text_view(arguments->message)));
     }
     struct client_exchange_t {
         explicit client_exchange_t(allocator_t const& allocator = {}) noexcept
@@ -2094,7 +2089,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             !append_text(connection.output, {exchange.authority.data(), exchange.authority.size() - 1}) ||
             !append_text(connection.output, "\r\nuser-agent: UCall\r\n"))
             return ucall_status_out_of_memory_k;
-        auto result = append_headers(connection.output, arguments.headers, arguments.headers_count,
+        auto result = append_headers(connection.output, {arguments.headers, arguments.headers_count},
                                      http_role_t::request_k);
         if (result != ucall_status_success_k) return result;
         char digits[std::numeric_limits<std::size_t>::digits10 + 1];
@@ -2208,7 +2203,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             !text_view(next).starts_with("http+noise://"))
             return ucall_status_peer_rejected_k;
         exchange.redirect = std::move(next);
-        exchange.arguments.url = c_view(text_view(exchange.redirect));
+        exchange.arguments.url = bytes_view(text_view(exchange.redirect));
         if (message.status == 303 ||
             ((message.status == 301 || message.status == 302) && exchange.arguments.verb == ucall_verb_post_k)) {
             if (exchange.arguments.verb != ucall_verb_head_k) exchange.arguments.verb = ucall_verb_get_k;
@@ -2413,8 +2408,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 return connection.advance(); // Sealing failed the connection.
             }
             if (connection.receive_operation == operation_state_t::idle_k && awaits_response(peer))
-                return connection.emit(connection.receive_request, io_operation_t::receive_k,
-                                       connection.received.data(), connection.received.size());
+                return connection.emit(connection.receive_request, io_operation_t::receive_k, connection.received);
             return nullptr;
         }
         connection.fail(peer.oldest_exchange ? ucall_status_connection_closed_k : ucall_status_success_k);

@@ -7,19 +7,20 @@
  */
 #include <cassert>
 #include <cstdint>
-#include <cstring> // `std::strlen`, `std::memcmp`, `std::memset`
+#include <cstring> // `std::memset`
 
-#if defined(_WIN32)
-#include <io.h>
-#else
-#include <unistd.h>
-#endif
-
-#include <span> // `std::as_bytes`, `std::as_writable_bytes`
+#include <span>        // `std::as_bytes`, `std::as_writable_bytes`
+#include <string_view> // `std::string_view`
 
 #include "ucall/http.hpp"
 #include "ucall/io.hpp"
 #include "lib.hpp"
+
+#if UCALL_OS_WINDOWS_
+#include <io.h> // `_close`
+#else
+#include <unistd.h> // `close`
+#endif
 
 using namespace unum::ucall;
 
@@ -61,9 +62,7 @@ static bool admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept
     return true;
 }
 
-static bool named(char const* spelling, ucall_bytes_view_t name) noexcept {
-    return std::strlen(spelling) == name.length && std::memcmp(spelling, name.data, name.length) == 0;
-}
+static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept { return spelling == text_view(name); }
 
 template <typename init_type_>
 static void init_network(init_type_* arguments) noexcept {
@@ -157,8 +156,8 @@ void ucall_noise_key_generate(ucall_noise_key_generate_t* arguments) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    if (!secure_tunnel_generate_keypair(std::as_writable_bytes(std::span {*arguments->private_key}).data(),
-                                        std::as_writable_bytes(std::span {*arguments->public_key}).data())) {
+    if (!secure_tunnel_generate_keypair(std::as_writable_bytes(std::span {*arguments->private_key}),
+                                        std::as_writable_bytes(std::span {*arguments->public_key}))) {
         std::memset(*arguments->private_key, 0, sizeof(ucall_noise_key_t));
         publish(arguments->outcome, ucall_status_io_k);
         return;
@@ -173,8 +172,8 @@ void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    x25519_derive_public(std::as_writable_bytes(std::span {*arguments->public_key}).data(),
-                         std::as_bytes(std::span {*arguments->private_key}).data());
+    x25519_derive_public(std::as_writable_bytes(std::span {*arguments->public_key}),
+                         std::as_bytes(std::span {*arguments->private_key}));
     publish(arguments->outcome, ucall_status_success_k);
 }
 
@@ -318,16 +317,15 @@ void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     if (!arguments) return;
     if (arguments->value) *arguments->value = {};
     if (!arguments->response || !arguments->value || !response_http_t::valid_view(arguments->name) ||
-        !response_http_t::http_token(response_http_t::text_view(arguments->name))) {
+        !response_http_t::http_token(text_view(arguments->name))) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
     auto& response = *static_cast<received_response_t*>(arguments->response);
     response_http_t::http_message_t message {};
     message.headers_length = response.headers_length;
-    auto value = message.header(response_http_t::text_view(response.bytes()),
-                                response_http_t::text_view(arguments->name));
-    *arguments->value = response_http_t::c_view(value);
+    auto value = message.header(text_view(response.bytes()), text_view(arguments->name));
+    *arguments->value = bytes_view(value);
     publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
 }
 void ucall_client_response_body(ucall_client_response_body_t* arguments) {
@@ -338,8 +336,8 @@ void ucall_client_response_body(ucall_client_response_body_t* arguments) {
         return;
     }
     auto& response = *static_cast<received_response_t*>(arguments->response);
-    auto bytes = response_http_t::text_view(response.bytes());
-    *arguments->body = response_http_t::c_view(bytes.substr(response.headers_length, response.body_length));
+    auto bytes = text_view(response.bytes());
+    *arguments->body = bytes_view(bytes.substr(response.headers_length, response.body_length));
     publish(arguments->outcome, ucall_status_success_k);
 }
 

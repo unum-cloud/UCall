@@ -8,17 +8,17 @@
 #include <cstddef> // `std::byte`
 #include <cstdint> // `std::intptr_t`
 #include <cassert> // `assert`
-#include <cstring> // `std::strlen`, `std::memset`, `std::memcpy`
+#include <cstring> // `std::memset`, `std::memcpy`
 
-#include <atomic>    // `std::atomic`
-#include <algorithm> // `std::max`
-#include <limits>    // `std::numeric_limits`
-#include <memory>    // `std::uninitialized_default_construct`, `std::destroy_n`
-#include <span>
+#include <atomic>      // `std::atomic`
+#include <algorithm>   // `std::max`
+#include <limits>      // `std::numeric_limits`
+#include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
+#include <span>        // `std::span`, `std::as_bytes`
 #include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_convertible_v`
-#include <utility>     // `std::exchange`, `std::swap`
+#include <utility>     // `std::move`
 
 #if !defined(UCALL_OS_LINUX_)
 #if defined(__linux__)
@@ -94,23 +94,15 @@
 
 #define UCALL_OS_POSIX_ (UCALL_OS_LINUX_ || UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_)
 
-#if UCALL_OS_LINUX_ || UCALL_OS_FREEBSD_
-#include <sys/mman.h> // `mmap`, `munmap`
-#include <unistd.h>   // `sysconf`, `_SC_LEVEL1_DCACHE_LINESIZE`
-#endif
-
-#if UCALL_OS_APPLE_
-#include <sys/mman.h>   // `mmap`, `munmap`, `PROT_*`, `MAP_*`
-#include <sys/sysctl.h> // `sysctlbyname`
-#endif
-
 /*  `<winsock2.h>` has to precede `<windows.h>`, which otherwise drags in the Winsock 1.1
  *  declarations and leaves the socket backends with two incompatible definitions of each. */
 #if UCALL_OS_WINDOWS_
+#if !defined(WIN32_LEAN_AND_MEAN)
 #define WIN32_LEAN_AND_MEAN
-#include <winsock2.h>
-#include <windows.h> // `HANDLE`, `CreateFileMapping`, `MapViewOfFile`
 #endif
+#include <winsock2.h>
+#include <windows.h>
+#endif // UCALL_OS_WINDOWS_
 
 #include <forkunion/atomics.hpp>
 #include <forkunion/capabilities.hpp>
@@ -262,121 +254,6 @@ using descriptor_t = std::intptr_t;
 using descriptor_t = int;
 #endif
 
-/** Invalid file descriptor constant. */
-static constexpr descriptor_t bad_descriptor_k {-1};
-
-/**
- *  @brief Returns string length, using provided length or computing with strlen.
- *  @param[in] c_str The C string to measure.
- *  @param[in] optional_length Pre-computed length, or 0 to compute with strlen.
- *  @return Length of the string, or 0 if c_str is null.
- */
-inline std::size_t string_length(char const* c_str, std::size_t optional_length) noexcept {
-    if (!c_str) return 0;
-    return optional_length ? optional_length : std::strlen(c_str);
-}
-
-/**
- *  @brief RAII wrapper for memory-mapped pages, portable between UNIX and Windows.
- *
- *  Uses @c mmap on POSIX systems and @c MapViewOfFile on Windows for anonymous memory mapping.
- *  Automatically unmaps on destruction. Provides zero-initialized memory pages suitable for large
- *  allocations that benefit from virtual memory backing.
- *
- *  Platform Differences:
- *  - On POSIX - uses @c mmap with @c MAP_ANONYMOUS flag.
- *  - On Windows - uses @c CreateFileMapping / @c MapViewOfFile with page file backing. Both provide
- *    similar semantics: zero-initialized, anonymous memory regions.
- */
-class memory_map_t {
-    byte_t* data_ {};
-    std::size_t size_ {};
-#if UCALL_OS_WINDOWS_
-    HANDLE mapping_handle_ {};
-#endif
-
-  public:
-    memory_map_t() = default;
-    memory_map_t(memory_map_t const&) = delete;
-    memory_map_t& operator=(memory_map_t const&) = delete;
-    ~memory_map_t() noexcept { reset(); }
-
-#if UCALL_OS_WINDOWS_
-    inline memory_map_t(memory_map_t&& other) noexcept
-        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)),
-          mapping_handle_(std::exchange(other.mapping_handle_, nullptr)) {}
-#else
-    inline memory_map_t(memory_map_t&& other) noexcept
-        : data_(std::exchange(other.data_, nullptr)), size_(std::exchange(other.size_, 0)) {}
-#endif
-
-    inline memory_map_t& operator=(memory_map_t&& other) noexcept {
-        if (this == &other) return *this;
-        reset();
-        data_ = std::exchange(other.data_, nullptr);
-        size_ = std::exchange(other.size_, 0);
-#if UCALL_OS_WINDOWS_
-        mapping_handle_ = std::exchange(other.mapping_handle_, nullptr);
-#endif
-        return *this;
-    }
-
-    inline byte_t* data() const noexcept { return data_; }
-    inline std::size_t size() const noexcept { return size_; }
-
-    void reset() noexcept {
-        if (!data_) return;
-
-#if UCALL_OS_WINDOWS_
-        UnmapViewOfFile(data_);
-        if (mapping_handle_) CloseHandle(mapping_handle_);
-        mapping_handle_ = nullptr;
-#else
-        munmap(data_, size_);
-#endif
-        data_ = nullptr;
-        size_ = 0;
-    }
-
-    /**
-     *  @brief Reserves @p size bytes of anonymous, zeroed address space.
-     *  @return False when the kernel refuses the mapping.
-     *
-     *  Reserves rather than commits: neither backend is asked to touch a page here, so the physical
-     *  page behind an address is allocated by the thread that first writes to it and lands on that
-     *  thread's NUMA node. Committing from the builder thread instead - which is what an eager @c
-     *  memset does - places every worker's buffers on whichever node ran @c ucall_server_init. Both
-     *  @c mmap and @c CreateFileMapping already guarantee the pages read as zero, so nothing is
-     *  lost by not writing them.
-     */
-    [[nodiscard]] bool remap(std::size_t size) noexcept {
-        reset();
-
-#if UCALL_OS_WINDOWS_
-        HANDLE file_handle = INVALID_HANDLE_VALUE;
-        auto mapping_size = static_cast<std::uint64_t>(size);
-        mapping_handle_ = CreateFileMapping(file_handle, nullptr, PAGE_READWRITE,
-                                            static_cast<DWORD>(mapping_size >> 32), static_cast<DWORD>(mapping_size),
-                                            nullptr);
-        if (mapping_handle_ == nullptr) return false;
-
-        byte_t* new_ptr = static_cast<byte_t*>(MapViewOfFile(mapping_handle_, FILE_MAP_ALL_ACCESS, 0, 0, size));
-        if (new_ptr == nullptr) {
-            CloseHandle(mapping_handle_);
-            mapping_handle_ = nullptr;
-            return false;
-        }
-#else
-        byte_t* new_ptr = static_cast<byte_t*>(
-            mmap(nullptr, size, PROT_WRITE | PROT_READ, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0));
-        if (new_ptr == MAP_FAILED) return false;
-#endif
-        data_ = new_ptr;
-        size_ = size;
-        return true;
-    }
-};
-
 /**
  *  @brief Object pool for efficient allocation/deallocation of fixed-size elements.
  *
@@ -408,23 +285,8 @@ class pool {
         : elements_(allocator), free_offsets_(offsets_allocator_t {allocator}) {}
     pool(pool const&) = delete;
     pool& operator=(pool const&) = delete;
-    pool(pool&& other) noexcept
-        : elements_(std::move(other.elements_)), free_offsets_(std::move(other.free_offsets_)),
-          free_count_(std::exchange(other.free_count_, 0)) {}
-    pool& operator=(pool&& other) noexcept {
-        if (this == &other) return *this;
-        elements_ = std::move(other.elements_);
-        free_offsets_ = std::move(other.free_offsets_);
-        free_count_ = std::exchange(other.free_count_, 0);
-        return *this;
-    }
     ~pool() noexcept = default;
 
-    void reset() noexcept {
-        elements_ = decltype(elements_) {elements_.get_allocator()};
-        free_offsets_ = decltype(free_offsets_) {free_offsets_.get_allocator()};
-        free_count_ = 0;
-    }
     bool reserve(std::size_t count) noexcept {
         assert(elements_.empty());
         decltype(elements_) elements {elements_.get_allocator()};
@@ -441,13 +303,6 @@ class pool {
         assert(contains(released) && free_count_ < elements_.size());
         free_offsets_[free_count_++] = static_cast<std::size_t>(released - elements_.data());
     }
-    std::size_t offset_of(element_t& element) const noexcept {
-        return static_cast<std::size_t>(&element - elements_.data());
-    }
-    element_t& at_offset(std::size_t index) noexcept { return elements_[index]; }
-    element_t const& at_offset(std::size_t index) const noexcept { return elements_[index]; }
-    element_t const* data() const noexcept { return elements_.data(); }
-    std::size_t capacity() const noexcept { return elements_.size(); }
     bool contains(element_t const* pointer) const noexcept {
         return !elements_.empty() && pointer >= elements_.data() && pointer < elements_.data() + elements_.size();
     }
@@ -501,10 +356,6 @@ class successive_pools {
     /** Newest pool, tried first. */
     pool_node_t* head_ {};
     std::size_t initial_capacity_ {};
-    std::size_t total_capacity_ {};
-
-    /** Tracks total allocations for statistics. */
-    std::size_t allocated_count_ {};
 
   public:
     using element_t = element_type_;
@@ -517,26 +368,8 @@ class successive_pools {
     explicit successive_pools(std::size_t initial_capacity = 100, allocator_type_ const& allocator = {}) noexcept
         : allocator_(allocator), initial_capacity_(initial_capacity) {}
 
-    // Disable copying, allow moving
     successive_pools(successive_pools const&) = delete;
     successive_pools& operator=(successive_pools const&) = delete;
-
-    successive_pools(successive_pools&& other) noexcept
-        : allocator_(std::move(other.allocator_)), head_(std::exchange(other.head_, nullptr)),
-          initial_capacity_(std::exchange(other.initial_capacity_, 0)),
-          total_capacity_(std::exchange(other.total_capacity_, 0)),
-          allocated_count_(std::exchange(other.allocated_count_, 0)) {}
-
-    successive_pools& operator=(successive_pools&& other) noexcept {
-        if (this == &other) return *this;
-        reset();
-        allocator_ = std::move(other.allocator_);
-        head_ = std::exchange(other.head_, nullptr);
-        initial_capacity_ = std::exchange(other.initial_capacity_, 0);
-        total_capacity_ = std::exchange(other.total_capacity_, 0);
-        allocated_count_ = std::exchange(other.allocated_count_, 0);
-        return *this;
-    }
 
     ~successive_pools() noexcept { reset(); }
 
@@ -551,10 +384,7 @@ class successive_pools {
         // Try existing pools (newest to oldest)
         for (pool_node_t* node = head_; node != nullptr; node = node->next_) {
             element_t* elem = node->pool_.alloc();
-            if (elem) {
-                ++allocated_count_;
-                return elem;
-            }
+            if (elem) return elem;
         }
 
         // All pools exhausted - grow
@@ -562,9 +392,7 @@ class successive_pools {
         if (!grow(new_capacity)) return nullptr;
 
         // Try allocation from newly created pool
-        element_t* elem = head_->pool_.alloc();
-        if (elem) ++allocated_count_;
-        return elem;
+        return head_->pool_.alloc();
     }
 
     /**
@@ -580,25 +408,11 @@ class successive_pools {
         for (pool_node_t* node = head_; node != nullptr; node = node->next_) {
             if (node->pool_.contains(released)) {
                 node->pool_.release(released);
-                --allocated_count_;
                 return;
             }
         }
 
         assert(false && "successive_pools::release() pointer not from this pool");
-    }
-
-    /** Returns total capacity across all pools. */
-    [[nodiscard]] std::size_t capacity() const noexcept { return total_capacity_; }
-
-    /** Returns number of currently allocated elements. */
-    [[nodiscard]] std::size_t allocated() const noexcept { return allocated_count_; }
-
-    /** Returns number of pools currently allocated. */
-    [[nodiscard]] std::size_t pool_count() const noexcept {
-        std::size_t count = 0;
-        for (pool_node_t* node = head_; node != nullptr; node = node->next_) ++count;
-        return count;
     }
 
     /** Releases all pools and resets to empty state. */
@@ -610,8 +424,6 @@ class successive_pools {
             current = next;
         }
         head_ = nullptr;
-        total_capacity_ = 0;
-        allocated_count_ = 0;
     }
 
   private:
@@ -632,111 +444,31 @@ class successive_pools {
         // Prepend to linked list (newest first)
         new_node->next_ = head_;
         head_ = owned.release();
-        total_capacity_ += capacity;
 
         return true;
     }
 };
 
-template <typename element_type_>
-using span = std::span<element_type_>;
+template <typename element_type_, std::size_t extent_ = std::dynamic_extent>
+using span = std::span<element_type_, extent_>;
 
-struct number_and_suffix_t {
-    float number {};
-    char suffix {};
-};
-
-inline number_and_suffix_t printable(std::size_t n) noexcept {
-    if (n > 1'000'000'000) return {n / 1'000'000'000.0f, 'G'};
-    if (n > 1'000'000) return {n / 1'000'000.0f, 'M'};
-    if (n > 1'000) return {n / 1'000.0f, 'K'};
-    return {n + 0.0f, ' '};
+/** The C view of @p text, borrowing its bytes. */
+inline ucall_bytes_view_t bytes_view(std::string_view text) noexcept {
+    return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
 }
 
-/**
- *  @brief Aggregate network traffic, for periodic logging.
- *
- *  Atomic because the logging thread drains these while the engines keep counting. Nothing on the
- *  request path touches it.
- */
-struct alignas(false_sharing_bytes_k) traffic_stats_t {
+/** The text a C view holds, borrowing its bytes; empty for a null view. */
+inline std::string_view text_view(ucall_bytes_view_t bytes) noexcept {
+    return bytes.length ? std::string_view {reinterpret_cast<char const*>(bytes.data), bytes.length}
+                        : std::string_view {};
+}
 
-    static constexpr std::size_t default_frequency_secs_k {5};
+/** The text @p bytes spell, borrowing them. */
+inline std::string_view text_view(span<byte_t const> bytes) noexcept {
+    return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+}
 
-    std::atomic<std::size_t> added_connections {};
-    std::atomic<std::size_t> closed_connections {};
-    std::atomic<std::size_t> bytes_received {};
-    std::atomic<std::size_t> bytes_sent {};
-    std::atomic<std::size_t> packets_received {};
-    std::atomic<std::size_t> packets_sent {};
-
-    /**
-     *  @brief Logs statistical data in a human-readable format, normalized for a time period.
-     *
-     *  @param[in] buffer Pointer to the buffer where the log string will be written.
-     *  @param[in] buffer_capacity Size of the buffer.
-     *  @param[in] seconds Time span over which the statistics were collected.
-     *  @return The number of characters written to the buffer.
-     */
-    inline std::size_t log_human_readable(char* buffer, std::size_t buffer_capacity, std::size_t seconds) noexcept {
-        if (seconds == 0) seconds = 1; // Prevent division by zero
-        auto& s = *this;
-        auto printable_normalized = [=](std::atomic<std::size_t>& i) noexcept {
-            return printable(double(i.exchange(0, std::memory_order_relaxed)) / seconds);
-        };
-        auto added_connections = printable_normalized(s.added_connections);
-        auto closed_connections = printable_normalized(s.closed_connections);
-        auto bytes_received = printable_normalized(s.bytes_received);
-        auto bytes_sent = printable_normalized(s.bytes_sent);
-        auto packets_received = printable_normalized(s.packets_received);
-        auto packets_sent = printable_normalized(s.packets_sent);
-        auto len = snprintf( //
-            buffer, buffer_capacity,
-            "connections: +%.1f %c/s, "
-            "-%.1f %c/s, "
-            "RX: %.1f %c msgs/s, "
-            "%.1f %cb/s, "
-            "TX: %.1f %c msgs/s, "
-            "%.1f %cb/s. \n",
-            added_connections.number, added_connections.suffix,   //
-            closed_connections.number, closed_connections.suffix, //
-            packets_received.number, packets_received.suffix,     //
-            bytes_received.number, bytes_received.suffix,         //
-            packets_sent.number, packets_sent.suffix,             //
-            bytes_sent.number, bytes_sent.suffix                  //
-        );
-        return static_cast<std::size_t>(len);
-    }
-
-    /**
-     *  @brief Logs statistical data in a JSON format.
-     *
-     *  @param[in] buffer Pointer to the buffer where the log string will be written.
-     *  @param[in] buffer_capacity Size of the buffer.
-     *  @return The number of characters written to the buffer.
-     */
-    inline std::size_t log_json(char* buffer, std::size_t buffer_capacity) noexcept {
-        auto& s = *this;
-        auto added_connections = s.added_connections.exchange(0, std::memory_order_relaxed);
-        auto closed_connections = s.closed_connections.exchange(0, std::memory_order_relaxed);
-        auto bytes_received = s.bytes_received.exchange(0, std::memory_order_relaxed);
-        auto bytes_sent = s.bytes_sent.exchange(0, std::memory_order_relaxed);
-        auto packets_received = s.packets_received.exchange(0, std::memory_order_relaxed);
-        auto packets_sent = s.packets_sent.exchange(0, std::memory_order_relaxed);
-        auto format =
-            R"( {"add":%zu,"close":%zu,"recv_bytes":%zu,"sent_bytes":%zu,"recv_packs":%zu,"sent_packs":%zu} \n )";
-        auto len = snprintf(         //
-            buffer, buffer_capacity, //
-            format,                  //
-            added_connections,       //
-            closed_connections,      //
-            bytes_received,          //
-            bytes_sent,              //
-            packets_received,        //
-            packets_sent             //
-        );
-        return static_cast<std::size_t>(len);
-    }
-};
+/** The bytes of @p text, as engines and tunnels take their input. */
+inline span<byte_t const> byte_span(std::string_view text) noexcept { return std::as_bytes(std::span {text}); }
 
 } // namespace unum::ucall

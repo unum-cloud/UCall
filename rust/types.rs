@@ -685,7 +685,7 @@ mod tests {
         assert_eq!(Status::OutOfMemory.to_string(), "out-of-memory");
         assert_eq!(Backend::LinuxURing700.to_string(), "linux-uring700");
         assert_eq!(CPUClass::Automatic.to_string(), "automatic");
-        assert_eq!(version(), include_str!("../VERSION").trim());
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
