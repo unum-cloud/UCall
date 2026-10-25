@@ -20,7 +20,7 @@ case_result_t test_pool_unit() {
     std::size_t failures = 0;
     announce("allocation_hands_out_distinct_slots");
     pool<int> slots;
-    require(failures, slots.reserve(5));
+    require(failures, slots.reserve(5) == ucall_status_success_k);
 
     int* const first = slots.alloc();
     int* const second = slots.alloc();
@@ -41,7 +41,7 @@ case_result_t test_containers_safety() {
     std::size_t failures = 0;
     announce("a_pool_refuses_rather_than_overruns");
     pool<int> slots;
-    require(failures, slots.reserve(5));
+    require(failures, slots.reserve(5) == ucall_status_success_k);
     int* taken[5];
     for (std::size_t index = 0; index != 5; ++index) {
         taken[index] = slots.alloc();

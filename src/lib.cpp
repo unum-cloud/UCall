@@ -50,16 +50,12 @@ static bool compatible(handle_type_ const* handle) noexcept {
 }
 
 template <typename handle_type_>
-static bool admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept {
-    if (!handle) {
-        publish(outcome, ucall_status_uninitialized_k);
-        return false;
-    }
-    if (!compatible(handle)) {
-        publish(outcome, ucall_status_unsupported_k);
-        return false;
-    }
-    return true;
+[[nodiscard]] static ucall_status_t admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept {
+    ucall_status_t const status = !handle               ? ucall_status_uninitialized_k
+                                  : !compatible(handle) ? ucall_status_unsupported_k
+                                                        : ucall_status_success_k;
+    if (status != ucall_status_success_k) publish(outcome, status);
+    return status;
 }
 
 static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept { return spelling == text_view(name); }
@@ -156,8 +152,10 @@ void ucall_noise_key_generate(ucall_noise_key_generate_t* arguments) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    if (!secure_tunnel_generate_keypair(std::as_writable_bytes(std::span {*arguments->private_key}),
-                                        std::as_writable_bytes(std::span {*arguments->public_key}))) {
+    // Entropy the platform refused is an I/O failure at the ABI, which names no tunnel faults.
+    if (secure_tunnel_generate_keypair(std::as_writable_bytes(std::span {*arguments->private_key}),
+                                       std::as_writable_bytes(std::span {*arguments->public_key})) !=
+        secure_tunnel_fault_t::none_k) {
         std::memset(*arguments->private_key, 0, sizeof(ucall_noise_key_t));
         publish(arguments->outcome, ucall_status_io_k);
         return;
@@ -199,46 +197,46 @@ void ucall_client_init(ucall_client_init_t* arguments) {
 
 void ucall_server_take_call(ucall_server_take_call_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->take_call(arguments);
 }
 
 void ucall_server_take_calls(ucall_server_take_calls_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->take_calls(arguments);
 }
 
 void ucall_server_event_loop_statistics(ucall_server_event_loop_statistics_t* arguments) {
     if (!arguments) return;
     if (arguments->statistics) *arguments->statistics = {};
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->event_loop_statistics(arguments);
 }
 
 void ucall_server_take_batch(ucall_server_take_batch_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->take_batch(arguments);
 }
 
 void ucall_server_take_batches(ucall_server_take_batches_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->take_batches(arguments);
 }
 
 void ucall_server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments) {
     if (!arguments) return;
     if (arguments->statistics) *arguments->statistics = {};
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->batch_endpoint_statistics(arguments);
 }
 
 void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     if (!arguments) return;
     if (arguments->count) *arguments->count = 0;
-    if (!admit(arguments->client, arguments->outcome)) return;
+    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
     arguments->client->api->take_completed(arguments);
 }
 
@@ -260,57 +258,57 @@ void ucall_client_free(ucall_client_t client) {
 
 void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->add_http_endpoint(arguments);
 }
 void ucall_server_request_path(ucall_server_request_path_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_path(arguments);
 }
 void ucall_server_request_path_segment(ucall_server_request_path_segment_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_path_segment(arguments);
 }
 void ucall_server_request_path_parameter(ucall_server_request_path_parameter_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_path_parameter(arguments);
 }
 void ucall_server_request_query_parameter(ucall_server_request_query_parameter_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_query_parameter(arguments);
 }
 void ucall_server_request_header(ucall_server_request_header_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_header(arguments);
 }
 void ucall_server_request_peer(ucall_server_request_peer_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_peer(arguments);
 }
 void ucall_server_request_body(ucall_server_request_body_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_body(arguments);
 }
 void ucall_server_reply_content(ucall_server_reply_content_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->reply_content(arguments);
 }
 void ucall_server_reply_error(ucall_server_reply_error_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->reply_error(arguments);
 }
 void ucall_client_call(ucall_client_call_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->client, arguments->outcome)) return;
+    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
     arguments->client->api->call(arguments);
 }
 void ucall_client_response_header(ucall_client_response_header_t* arguments) {
@@ -381,7 +379,7 @@ void ucall_client_websocket_close(ucall_client_websocket_close_t* arguments) {
 
 void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments) {
     if (!arguments) return;
-    if (!admit(arguments->server, arguments->outcome)) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->add_http_batch_endpoint(arguments);
 }
 

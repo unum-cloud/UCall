@@ -149,9 +149,9 @@ class route_trie {
     route_trie(route_trie const&) = delete;
     route_trie& operator=(route_trie const&) = delete;
 
-    bool init() noexcept {
+    [[nodiscard]] ucall_status_t init() noexcept {
         if (!root_) root_ = child(nullptr, segment_type_t::literal_k);
-        return root_;
+        return root_ ? ucall_status_success_k : ucall_status_out_of_memory_k;
     }
     ucall_status_t insert(std::string_view path, ucall_verb_t verb, void* callback, void* tag = nullptr) noexcept {
         if (!root_) return ucall_status_uninitialized_k;

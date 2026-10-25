@@ -53,7 +53,7 @@ struct routing_case_t {
 
     routing_case_t(std::size_t& case_failures, char const* label) : failures(case_failures) {
         announce("{}", label);
-        failures += expect(trie.init(), "the trie for `{}` could not allocate", label);
+        failures += expect(trie.init() == ucall_status_success_k, "the trie for `{}` could not allocate", label);
     }
 
     /** Registers a route that must be accepted. */

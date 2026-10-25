@@ -7,6 +7,7 @@
 #pragma once
 
 #include <charconv>
+#include <initializer_list>
 #include <limits>
 #include <string_view>
 
@@ -793,15 +794,22 @@ struct http {
         message.body_state = http_body_state_t::decoded_k;
     }
 
+    /** Appends every one of @p texts to @p bytes in one resize, or nothing at all. */
     template <typename element_type_, typename allocator_type_>
-    static bool append_text(st::basic_vector<element_type_, allocator_type_>& bytes, std::string_view text) noexcept {
+    [[nodiscard]] static ucall_status_t append_text(st::basic_vector<element_type_, allocator_type_>& bytes,
+                                                    std::initializer_list<std::string_view> texts) noexcept {
         static_assert(sizeof(element_type_) == 1);
-        auto previous = bytes.size();
-        if (text.size() > std::numeric_limits<std::size_t>::max() - previous ||
-            st::failed(bytes.resize(previous + text.size())))
-            return false;
-        if (!text.empty()) std::memcpy(bytes.data() + previous, text.data(), text.size());
-        return true;
+        std::size_t offset = bytes.size(), length = offset;
+        for (std::string_view const text : texts) {
+            if (text.size() > std::numeric_limits<std::size_t>::max() - length) return ucall_status_overflow_k;
+            length += text.size();
+        }
+        if (st::failed(bytes.resize(length))) return ucall_status_out_of_memory_k;
+        for (std::string_view const text : texts) {
+            if (!text.empty()) std::memcpy(bytes.data() + offset, text.data(), text.size());
+            offset += text.size();
+        }
+        return ucall_status_success_k;
     }
     template <typename allocator_type_>
     static void drop_bytes(st::basic_vector<byte_t, allocator_type_>& bytes, std::size_t count) noexcept {

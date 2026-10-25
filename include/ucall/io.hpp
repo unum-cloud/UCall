@@ -71,19 +71,21 @@ inline int socket_error(int error) noexcept {
     }
 }
 inline int socket_last_error() noexcept { return socket_error(WSAGetLastError()); }
-inline bool start_windows_sockets() noexcept {
+inline ucall_status_t start_windows_sockets() noexcept {
     WSADATA data {};
-    return WSAStartup(MAKEWORD(2, 2), &data) == 0;
+    return WSAStartup(MAKEWORD(2, 2), &data) == 0 ? ucall_status_success_k : ucall_status_io_k;
 }
-inline bool sockets_start() noexcept {
-    static bool const ready = start_windows_sockets();
-    return ready;
+[[nodiscard]] inline ucall_status_t sockets_start() noexcept {
+    static ucall_status_t const started = start_windows_sockets();
+    return started;
 }
 inline int socket_close(descriptor_t descriptor) noexcept { return closesocket(static_cast<SOCKET>(descriptor)); }
-inline bool nonblocking(descriptor_t descriptor) noexcept {
+[[nodiscard]] inline ucall_status_t nonblocking(descriptor_t descriptor) noexcept {
     u_long enabled = 1;
     return ioctlsocket(static_cast<SOCKET>(descriptor), FIONBIO, &enabled) == 0 &&
-           SetHandleInformation(reinterpret_cast<HANDLE>(descriptor), HANDLE_FLAG_INHERIT, 0);
+                   SetHandleInformation(reinterpret_cast<HANDLE>(descriptor), HANDLE_FLAG_INHERIT, 0)
+               ? ucall_status_success_k
+               : ucall_status_io_k;
 }
 inline std::size_t page_size() noexcept {
     SYSTEM_INFO info {};
@@ -93,12 +95,14 @@ inline std::size_t page_size() noexcept {
 #else
 using socket_length_t = socklen_t;
 inline int socket_last_error() noexcept { return errno; }
-inline bool sockets_start() noexcept { return true; }
+[[nodiscard]] inline ucall_status_t sockets_start() noexcept { return ucall_status_success_k; }
 inline int socket_close(descriptor_t descriptor) noexcept { return close(static_cast<int>(descriptor)); }
-inline bool nonblocking(descriptor_t descriptor) noexcept {
+[[nodiscard]] inline ucall_status_t nonblocking(descriptor_t descriptor) noexcept {
     int flags = fcntl(static_cast<int>(descriptor), F_GETFL, 0);
     return flags != -1 && fcntl(static_cast<int>(descriptor), F_SETFL, flags | O_NONBLOCK) != -1 &&
-           fcntl(static_cast<int>(descriptor), F_SETFD, FD_CLOEXEC) != -1;
+                   fcntl(static_cast<int>(descriptor), F_SETFD, FD_CLOEXEC) != -1
+               ? ucall_status_success_k
+               : ucall_status_io_k;
 }
 inline std::size_t page_size() noexcept {
     long result = sysconf(_SC_PAGESIZE);
@@ -114,7 +118,7 @@ inline int socket_option(descriptor_t descriptor, int level, int name, void cons
 #endif
 }
 inline descriptor_t socket_open(int family) noexcept {
-    if (!sockets_start()) return -1;
+    if (sockets_start() != ucall_status_success_k) return -1;
 #if UCALL_OS_WINDOWS_
     descriptor_t descriptor = static_cast<descriptor_t>(
         WSASocketW(family, SOCK_STREAM, IPPROTO_TCP, nullptr, 0, WSA_FLAG_OVERLAPPED));
@@ -122,7 +126,7 @@ inline descriptor_t socket_open(int family) noexcept {
     descriptor_t descriptor = socket(family, SOCK_STREAM, 0);
 #endif
     if (descriptor == -1) return -1;
-    if (!nonblocking(descriptor)) {
+    if (nonblocking(descriptor) != ucall_status_success_k) {
         socket_close(descriptor);
         return -1;
     }
@@ -143,7 +147,7 @@ inline descriptor_t socket_open(int family) noexcept {
 }
 inline descriptor_t accepted_socket(descriptor_t descriptor) noexcept {
     if (descriptor == -1) return -socket_last_error();
-    if (!nonblocking(descriptor)) {
+    if (nonblocking(descriptor) != ucall_status_success_k) {
         int error = socket_last_error();
         socket_close(descriptor);
         return -error;
@@ -166,14 +170,16 @@ inline descriptor_t accepted_socket(descriptor_t descriptor) noexcept {
 
 enum class io_wait_t { blocking_k, nonblocking_k };
 
-enum class io_operation_t { accept_k, connect_k, receive_k, send_k, read_k, close_k };
+enum class io_operation_t { accept_k, connect_k, receive_k, send_k, read_k, shutdown_k, close_k };
 
 /** The readiness an operation waits for; a socket keeps at most one pending operation per
  *  direction. */
 enum class io_direction_t : std::uint8_t { receive_k, transmit_k };
 inline io_direction_t io_direction(io_operation_t operation) noexcept {
-    return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ? io_direction_t::transmit_k
-                                                                                         : io_direction_t::receive_k;
+    return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ||
+                   operation == io_operation_t::shutdown_k
+               ? io_direction_t::transmit_k
+               : io_direction_t::receive_k;
 }
 
 /** The submitter keeps this request and its buffer alive until its completion is polled. */
@@ -221,10 +227,10 @@ struct wake_channel_t {
         for (auto descriptor : descriptors)
             if (descriptor >= 0) socket_close(descriptor);
     }
-    bool open() noexcept {
+    [[nodiscard]] ucall_status_t open() noexcept {
 #if UCALL_OS_WINDOWS_
         auto listener = socket_open(AF_INET);
-        if (listener < 0) return false;
+        if (listener < 0) return ucall_status_io_k;
         sockaddr_in address {};
         address.sin_family = AF_INET;
         address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -241,20 +247,23 @@ struct wake_channel_t {
         }
         if (ready) descriptors[0] = static_cast<descriptor_t>(accept(static_cast<SOCKET>(listener), nullptr, nullptr));
         socket_close(listener);
-        if (!ready || descriptors[0] < 0 || !nonblocking(descriptors[0]) || !nonblocking(descriptors[1])) return false;
+        if (!ready || descriptors[0] < 0) return ucall_status_io_k;
 #else
         int sockets[2];
-        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return false;
+        if (socketpair(AF_UNIX, SOCK_STREAM, 0, sockets) != 0) return ucall_status_io_k;
         descriptors[0] = sockets[0];
         descriptors[1] = sockets[1];
-        if (!nonblocking(descriptors[0]) || !nonblocking(descriptors[1])) return false;
+#endif // UCALL_OS_WINDOWS_
+        if (nonblocking(descriptors[0]) != ucall_status_success_k ||
+            nonblocking(descriptors[1]) != ucall_status_success_k)
+            return ucall_status_io_k;
 #if defined(SO_NOSIGPIPE)
         int enabled = 1;
-        if (socket_option(descriptors[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0) return false;
+        if (socket_option(descriptors[1], SOL_SOCKET, SO_NOSIGPIPE, &enabled, sizeof(enabled)) != 0)
+            return ucall_status_io_k;
 #endif // defined(SO_NOSIGPIPE)
-#endif // UCALL_OS_WINDOWS_
         request = {io_operation_t::read_k, descriptors[0], bytes, sizeof(bytes), 0, nullptr};
-        return true;
+        return ucall_status_success_k;
     }
     void notify() noexcept {
         char value = 1;
@@ -371,6 +380,7 @@ inline descriptor_t attempt_io(readiness_operation_t& operation, io_interest_t i
         break;
 #endif
     case io_operation_t::read_k: result = read(descriptor, request.data, length); break;
+    case io_operation_t::shutdown_k: return ::shutdown(descriptor, SHUT_WR) == 0 ? 0 : -errno;
     case io_operation_t::close_k: return socket_close(request.descriptor) == 0 || errno == EINTR ? 0 : -errno;
     }
     return result >= 0 ? static_cast<descriptor_t>(result) : -errno;
@@ -910,7 +920,7 @@ struct windows_iocp_engine {
     std::size_t active {};
     io_statistics_t statistics {};
     ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
-        if (!sockets_start()) return ucall_status_io_k;
+        if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
         if (st::failed(operations.resize(capacity)) || st::failed(timed.reserve(capacity)) ||
             st::failed(entries.resize(capacity)))
             return ucall_status_out_of_memory_k;
@@ -925,10 +935,12 @@ struct windows_iocp_engine {
         operation.timed = absent_k;
     }
     template <typename function_type_>
-    bool extension(SOCKET socket, GUID id, function_type_& function) noexcept {
+    [[nodiscard]] ucall_status_t extension(SOCKET socket, GUID id, function_type_& function) noexcept {
         DWORD bytes {};
         return WSAIoctl(socket, SIO_GET_EXTENSION_FUNCTION_POINTER, &id, sizeof(id), &function, sizeof(function),
-                        &bytes, nullptr, nullptr) == 0;
+                        &bytes, nullptr, nullptr) == 0
+                   ? ucall_status_success_k
+                   : ucall_status_io_k;
     }
     ucall_status_t submit(io_request_t& request) noexcept {
         auto index = free_operations.pop(operations);
@@ -947,6 +959,8 @@ struct windows_iocp_engine {
         };
         if (request.operation == io_operation_t::close_k)
             return complete_immediately(socket_close(request.descriptor) == 0 ? 0 : -socket_last_error());
+        if (request.operation == io_operation_t::shutdown_k)
+            return complete_immediately(shutdown(socket, SD_SEND) == 0 ? 0 : -socket_last_error());
         if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(socket), port, 0, 0)) return complete_immediately(-EIO);
         DWORD bytes {}, flags {};
         int result = SOCKET_ERROR;
@@ -955,7 +969,7 @@ struct windows_iocp_engine {
             LPFN_ACCEPTEX accept_ex {};
             sockaddr_storage address {};
             int length = sizeof(address);
-            if (!extension(socket, WSAID_ACCEPTEX, accept_ex) ||
+            if (extension(socket, WSAID_ACCEPTEX, accept_ex) != ucall_status_success_k ||
                 getsockname(socket, reinterpret_cast<sockaddr*>(&address), &length) != 0)
                 return complete_immediately(-socket_last_error());
             operation->accepted = static_cast<SOCKET>(socket_open(address.ss_family));
@@ -968,7 +982,8 @@ struct windows_iocp_engine {
         }
         case io_operation_t::connect_k: {
             LPFN_CONNECTEX connect_ex {};
-            if (!extension(socket, WSAID_CONNECTEX, connect_ex)) return complete_immediately(-socket_last_error());
+            if (extension(socket, WSAID_CONNECTEX, connect_ex) != ucall_status_success_k)
+                return complete_immediately(-socket_last_error());
             auto remote = reinterpret_cast<sockaddr*>(request.data);
             sockaddr_storage local {};
             local.ss_family = remote->sa_family;
@@ -994,6 +1009,7 @@ struct windows_iocp_engine {
             result = WSASend(socket, &buffer, 1, &bytes, 0, &operation->overlapped, nullptr);
             break;
         }
+        case io_operation_t::shutdown_k:
         case io_operation_t::close_k: break;
         }
         tally(statistics.kernel_enters);

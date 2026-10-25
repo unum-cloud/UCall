@@ -287,16 +287,17 @@ class pool {
     pool& operator=(pool const&) = delete;
     ~pool() noexcept = default;
 
-    bool reserve(std::size_t count) noexcept {
+    [[nodiscard]] ucall_status_t reserve(std::size_t count) noexcept {
         assert(elements_.empty());
         decltype(elements_) elements {elements_.get_allocator()};
         decltype(free_offsets_) offsets {free_offsets_.get_allocator()};
-        if (st::failed(elements.resize(count)) || st::failed(offsets.resize(count))) return false;
+        if (st::failed(elements.resize(count)) || st::failed(offsets.resize(count)))
+            return ucall_status_out_of_memory_k;
         std::iota(offsets.begin(), offsets.end(), std::size_t {0});
         elements_ = std::move(elements);
         free_offsets_ = std::move(offsets);
         free_count_ = count;
-        return true;
+        return ucall_status_success_k;
     }
     element_t* alloc() noexcept { return free_count_ ? elements_.data() + free_offsets_[--free_count_] : nullptr; }
     void release(element_t* released) noexcept {
@@ -389,7 +390,7 @@ class successive_pools {
 
         // All pools exhausted - grow
         std::size_t new_capacity = head_ ? head_->capacity_ * 2 : initial_capacity_;
-        if (!grow(new_capacity)) return nullptr;
+        if (grow(new_capacity) != ucall_status_success_k) return nullptr;
 
         // Try allocation from newly created pool
         return head_->pool_.alloc();
@@ -431,21 +432,22 @@ class successive_pools {
     /**
      *  @brief Grows pool list by adding a new pool at the head.
      *  @param[in] capacity Capacity for the new pool.
-     *  @return True on success, false on allocation failure.
+     *  @return @c ucall_status_out_of_memory_k when the pool or its storage cannot be allocated.
      */
-    [[nodiscard]] bool grow(std::size_t capacity) noexcept {
+    [[nodiscard]] ucall_status_t grow(std::size_t capacity) noexcept {
         auto owned = allocate_unique<pool_node_t>(allocator_, capacity, allocator_);
         auto* new_node = owned.get();
-        if (!new_node) return false;
+        if (!new_node) return ucall_status_out_of_memory_k;
 
         // Reserve the pool capacity
-        if (!new_node->pool_.reserve(capacity)) return false;
+        if (ucall_status_t const reserved = new_node->pool_.reserve(capacity); reserved != ucall_status_success_k)
+            return reserved;
 
         // Prepend to linked list (newest first)
         new_node->next_ = head_;
         head_ = owned.release();
 
-        return true;
+        return ucall_status_success_k;
     }
 };
 

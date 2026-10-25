@@ -286,7 +286,7 @@ struct linux_uring700_engine {
                          (parameters.features & IORING_FEAT_NODROP) && (parameters.features & IORING_FEAT_EXT_ARG);
         for (auto opcode :
              {IORING_OP_SOCKET, IORING_OP_ACCEPT, IORING_OP_CONNECT, IORING_OP_RECV, IORING_OP_SEND, IORING_OP_READ,
-              IORING_OP_CLOSE, IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD})
+              IORING_OP_SHUTDOWN, IORING_OP_CLOSE, IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD})
             supported = supported && io_uring_opcode_supported(probe, opcode);
         scratch.reset();
         if (!supported) {
@@ -594,6 +594,9 @@ struct linux_uring700_engine {
         case io_operation_t::read_k:
             io_uring_prep_read(submission, static_cast<int>(owner->index), request.data, length, -1);
             break;
+        case io_operation_t::shutdown_k:
+            io_uring_prep_shutdown(submission, static_cast<int>(owner->index), SHUT_WR);
+            break;
         case io_operation_t::receive_k:
         case io_operation_t::close_k: break;
         }
@@ -879,15 +882,15 @@ struct linux_uring700_engine {
         do { result = function(); } while (result == -EINTR);
         return result;
     }
-    bool unregister_files() noexcept {
-        if (!(registrations & registration_files_k)) return true;
+    [[nodiscard]] ucall_status_t unregister_files() noexcept {
+        if (!(registrations & registration_files_k)) return ucall_status_success_k;
         int result = retry_interrupted([&] { return io_uring_unregister_files(&ring); });
         if (result && result != -ENXIO) {
             fault = result;
-            return false;
+            return ucall_status_io_k;
         }
         registrations = static_cast<registration_flags_t>(registrations & ~registration_files_k);
-        return true;
+        return ucall_status_success_k;
     }
     void discard(std::uint64_t user_data) noexcept {
         auto kind = static_cast<std::uintptr_t>(user_data) & 7;
@@ -912,31 +915,34 @@ struct linux_uring700_engine {
         for (unsigned i = 0; i != pending_sqes; ++i) discard(ring.sq.sqes[i].user_data);
         pending_sqes = 0;
     }
-    bool drain_after_fault() noexcept {
+    [[nodiscard]] ucall_status_t drain_after_fault() noexcept {
         stage = engine_stage_t::recovering_k;
         discard_unsubmitted();
-        if (!cancel_synchronously() || !unregister_files()) return false;
+        if (ucall_status_t const cancelled = cancel_synchronously(); cancelled != ucall_status_success_k)
+            return cancelled;
+        if (ucall_status_t const unregistered = unregister_files(); unregistered != ucall_status_success_k)
+            return unregistered;
         reap();
         while (has_kernel_work()) {
             int result = retry_interrupted(
                 [&] { return io_uring_enter(ring.ring_fd, 0, 1, IORING_ENTER_GETEVENTS, nullptr); });
             if (result < 0) {
                 fault = result;
-                return false;
+                return ucall_status_io_k;
             }
             reap();
         }
-        return true;
+        return ucall_status_success_k;
     }
-    bool cancel_synchronously() noexcept {
+    [[nodiscard]] ucall_status_t cancel_synchronously() noexcept {
         io_uring_sync_cancel_reg cancellation {};
         cancellation.flags = IORING_ASYNC_CANCEL_ANY | IORING_ASYNC_CANCEL_ALL;
         cancellation.timeout.tv_sec = -1;
         cancellation.timeout.tv_nsec = -1;
         int result = retry_interrupted([&] { return io_uring_register_sync_cancel(&ring, &cancellation); });
-        if (result >= 0 || result == -ENOENT) return true;
+        if (result >= 0 || result == -ENOENT) return ucall_status_success_k;
         fault = result;
-        return false;
+        return ucall_status_io_k;
     }
     void stop() noexcept {
         if (!is_open()) return;
@@ -959,17 +965,17 @@ struct linux_uring700_engine {
             }
         }
         // Failed submission must not bypass terminal CQEs that still reference caller memory.
-        bool retired = fault ? drain_after_fault() : unregister_files();
-        if (receive_ring && retired) {
+        ucall_status_t retirement = fault ? drain_after_fault() : unregister_files();
+        if (receive_ring && retirement == ucall_status_success_k) {
             int result = retry_interrupted(
                 [&] { return io_uring_free_buf_ring(&ring, receive_ring, buffer_count, 0); });
             if (result) {
                 fault = result;
-                retired = false;
+                retirement = ucall_status_io_k;
             }
             else receive_ring = nullptr;
         }
-        if (!retired) {
+        if (retirement != ucall_status_success_k) {
             // A failed retirement barrier must not make registered memory reusable.
             [[maybe_unused]] storage_t* const leaked = storage.release();
         }

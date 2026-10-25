@@ -302,7 +302,8 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
         auto& peer = *client.peers[i];
         auto& exchange = client.exchanges[i == 1 ? 2 : 0];
         failures += expect(
-            network_t::copy_text(peer.authority, {exchange.authority.data(), exchange.authority.size() - 1}));
+            network_t::copy_text(peer.authority, {exchange.authority.data(), exchange.authority.size() - 1}) ==
+            ucall_status_success_k);
         peer.authority_hash = exchange.authority_hash;
         failures += expect(peer.connection.configure({}) == ucall_status_success_k);
         descriptors[i] = peer.connection.descriptor = client.engine.open_socket(AF_INET);

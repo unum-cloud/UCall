@@ -485,15 +485,15 @@ static constexpr std::size_t secure_tunnel_default_payload_k = secure_tunnel_pay
  *  @brief Draws a fresh static keypair from the operating system's entropy.
  *  @param[out] private_half The secret scalar, which never leaves the process.
  *  @param[out] public_half Its Curve25519 public point, which the peer will see.
- *  @return False when the platform refused entropy, which must abort rather than proceed with
- *      whatever was in the buffer.
+ *  @return @c secure_tunnel_fault_t::entropy_unavailable_k when the platform refused entropy, which
+ *      must abort rather than proceed with whatever was in the buffer.
  *
  *  Here rather than in a caller because every mode needs one and there is exactly one right way to
  *  make it: real entropy, never a fast pseudo-random generator, and the public half derived rather
  *  than invented. A bind draws one at startup and a client handle draws one per process.
  */
-[[nodiscard]] bool secure_tunnel_generate_keypair(span<byte_t, secure_tunnel_key_size_k> private_half,
-                                                  span<byte_t, secure_tunnel_key_size_k> public_half) noexcept;
+[[nodiscard]] secure_tunnel_fault_t secure_tunnel_generate_keypair(
+    span<byte_t, secure_tunnel_key_size_k> private_half, span<byte_t, secure_tunnel_key_size_k> public_half) noexcept;
 
 /**
  *  @brief Everything @c make needs, so a new knob does not re-sign every construction site.
@@ -728,27 +728,29 @@ struct secure_tunnel_crypto {
 
     /**
      *  @brief Fills @p output with bytes from the operating system's cryptographic generator.
-     *  @return False when the platform refused, which must abort key generation rather than
-     *      continue.
+     *  @return @c secure_tunnel_fault_t::entropy_unavailable_k when the platform refused, which
+     *      must abort key generation rather than continue.
      *
      *  @warning Never substitute a fast pseudo-random generator here. StringZilla's
      *      @c sz_fill_random is an AES-based hash - excellent for buffers, and fatal for keys.
      */
-    [[nodiscard]] static bool secure_random_bytes(span<byte_t> output) noexcept {
+    [[nodiscard]] static secure_tunnel_fault_t secure_random_bytes(span<byte_t> output) noexcept {
 #if UCALL_OS_LINUX_
         while (!output.empty()) {
             ssize_t const taken = ::getrandom(output.data(), output.size(), 0);
             if (taken < 0 && errno == EINTR) continue;
-            if (taken <= 0) return false;
+            if (taken <= 0) return secure_tunnel_fault_t::entropy_unavailable_k;
             output = output.subspan(static_cast<std::size_t>(taken));
         }
-        return true;
+        return secure_tunnel_fault_t::none_k;
 #elif UCALL_OS_WINDOWS_
         return BCryptGenRandom(nullptr, reinterpret_cast<PUCHAR>(output.data()), static_cast<ULONG>(output.size()),
-                               BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0;
+                               BCRYPT_USE_SYSTEM_PREFERRED_RNG) == 0
+                   ? secure_tunnel_fault_t::none_k
+                   : secure_tunnel_fault_t::entropy_unavailable_k;
 #else
         arc4random_buf(output.data(), output.size());
-        return true;
+        return secure_tunnel_fault_t::none_k;
 #endif
     }
 
@@ -914,16 +916,17 @@ struct secure_tunnel_crypto {
          *  @brief Seals @p plaintext in place and appends a tag behind it.
          *  @param[inout] text The bytes to seal, which the ciphertext replaces.
          *  @param[out] tag Sixteen bytes immediately behind @p text, written on success.
-         *  @return False when the key is exhausted.
+         *  @return @c secure_tunnel_fault_t::keys_exhausted_k when the key is exhausted.
          *
          *  Before the first @c MixKey the state has no key and the specification says plaintext
          *  passes through untouched with no tag, which is how a handshake's opening message stays
          *  readable. A caller learns which happened from @c has_key rather than from a length it
          *  must compare.
          */
-        [[nodiscard]] bool seal(span<byte_t const> associated, span<byte_t> text, byte_t* tag) noexcept {
-            if (!keyed_) return true;
-            if (exhausted()) return false;
+        [[nodiscard]] secure_tunnel_fault_t seal(span<byte_t const> associated, span<byte_t> text,
+                                                 byte_t* tag) noexcept {
+            if (!keyed_) return secure_tunnel_fault_t::none_k;
+            if (exhausted()) return secure_tunnel_fault_t::keys_exhausted_k;
             byte_t nonce[nonce_size_k];
             encode_nonce(nonce);
             aes_encrypt(&schedule_, reinterpret_cast<sz_u8_t const*>(nonce),               //
@@ -932,7 +935,7 @@ struct secure_tunnel_crypto {
                         reinterpret_cast<sz_ptr_t>(text.data()), reinterpret_cast<sz_u8_t*>(tag), nullptr);
             ++nonce_;
             secure_zero(nonce);
-            return true;
+            return secure_tunnel_fault_t::none_k;
         }
 
         /**
@@ -941,7 +944,8 @@ struct secure_tunnel_crypto {
          *  @param[in] tag Sixteen bytes immediately behind @p text.
          *  @param[out] plaintext Room for @p text.size() bytes: @p text itself to open in place, or
          *      memory that does not overlap it, as AES-GCM allows nothing in between.
-         *  @return False when the tag does not verify or the key is exhausted, which closes the
+         *  @return @c secure_tunnel_fault_t::authentication_failed_k when the tag does not verify,
+         *      or @c secure_tunnel_fault_t::keys_exhausted_k when the key is, which closes the
          *      connection either way.
          *
          *  @warning StringZilla zeroes @p plaintext when the tag is rejected rather than leaving
@@ -949,13 +953,13 @@ struct secure_tunnel_crypto {
          *      act on forged data - and cannot retry, which suits a caller that drops the
          *      connection anyway.
          */
-        [[nodiscard]] bool open(span<byte_t const> associated, span<byte_t const> text, byte_t const* tag,
-                                byte_t* plaintext) noexcept {
+        [[nodiscard]] secure_tunnel_fault_t open(span<byte_t const> associated, span<byte_t const> text,
+                                                 byte_t const* tag, byte_t* plaintext) noexcept {
             if (!keyed_) {
                 if (text.size() && plaintext != text.data()) std::memcpy(plaintext, text.data(), text.size());
-                return true;
+                return secure_tunnel_fault_t::none_k;
             }
-            if (exhausted()) return false;
+            if (exhausted()) return secure_tunnel_fault_t::keys_exhausted_k;
             byte_t nonce[nonce_size_k];
             encode_nonce(nonce);
             sz_status_t const status = aes_decrypt(&schedule_, reinterpret_cast<sz_u8_t const*>(nonce),               //
@@ -964,9 +968,9 @@ struct secure_tunnel_crypto {
                                                    reinterpret_cast<sz_ptr_t>(plaintext),
                                                    reinterpret_cast<sz_u8_t const*>(tag), nullptr);
             secure_zero(nonce);
-            if (status != sz_success_k) return false;
+            if (status != sz_success_k) return secure_tunnel_fault_t::authentication_failed_k;
             ++nonce_;
-            return true;
+            return secure_tunnel_fault_t::none_k;
         }
 
         /**
@@ -1052,15 +1056,17 @@ struct secure_tunnel_crypto {
          *  @brief Seals in place with the running hash as associated data, then absorbs the result.
          *  @param[out] written Bytes now occupying @p text and what follows: its width, plus a tag
          *      once a key exists - so zero is a legitimate answer for an empty payload before the
-         *      first @c MixKey, and is why this reports success separately rather than through the
-         *      count.
+         *      first @c MixKey, and is why this reports its fault separately rather than through
+         *      the count.
          */
-        [[nodiscard]] bool seal_and_hash(span<byte_t> text, std::size_t& written) noexcept {
+        [[nodiscard]] secure_tunnel_fault_t seal_and_hash(span<byte_t> text, std::size_t& written) noexcept {
             byte_t* const tag = text.data() + text.size();
-            if (!cipher_.seal(hash(), text, tag)) return false;
+            if (secure_tunnel_fault_t const fault = cipher_.seal(hash(), text, tag);
+                fault != secure_tunnel_fault_t::none_k)
+                return fault;
             written = text.size() + (cipher_.has_key() ? tag_size_k : 0);
             mix_hash({text.data(), text.data() + written});
-            return true;
+            return secure_tunnel_fault_t::none_k;
         }
 
         /**
@@ -1074,11 +1080,11 @@ struct secure_tunnel_crypto {
          *  the plaintext beyond it, with the divergence surfacing one message later as an
          *  unexplained authentication failure.
          */
-        [[nodiscard]] bool open_and_hash(span<byte_t const> sealed, span<byte_t> plain,
-                                         std::size_t& produced) noexcept {
-            if (cipher_.has_key() && sealed.size() < tag_size_k) return false;
+        [[nodiscard]] secure_tunnel_fault_t open_and_hash(span<byte_t const> sealed, span<byte_t> plain,
+                                                          std::size_t& produced) noexcept {
+            if (cipher_.has_key() && sealed.size() < tag_size_k) return secure_tunnel_fault_t::malformed_k;
             std::size_t const body = cipher_.has_key() ? sealed.size() - tag_size_k : sealed.size();
-            if (plain.size() < body) return false;
+            if (plain.size() < body) return secure_tunnel_fault_t::malformed_k;
 
             byte_t next_hash[hash_size_k];
             sz_sha256_state_t state;
@@ -1087,12 +1093,14 @@ struct secure_tunnel_crypto {
             if (sealed.size()) sha_update(&state, reinterpret_cast<sz_cptr_t>(sealed.data()), sealed.size(), nullptr);
             sha_digest(&state, reinterpret_cast<sz_u8_t*>(next_hash), nullptr);
 
-            if (!cipher_.open(hash(), {sealed.data(), sealed.data() + body}, sealed.data() + body, plain.data()))
-                return false;
+            if (secure_tunnel_fault_t const fault = cipher_.open(hash(), {sealed.data(), sealed.data() + body},
+                                                                 sealed.data() + body, plain.data());
+                fault != secure_tunnel_fault_t::none_k)
+                return fault;
 
             std::memcpy(hash_, next_hash, hash_size_k);
             produced = body;
-            return true;
+            return secure_tunnel_fault_t::none_k;
         }
 
         /** Derives the two record-layer keys once the pattern's tokens are exhausted. */
@@ -1329,26 +1337,30 @@ struct secure_tunnel_crypto {
 
         /**
          *  @brief Mixes a Diffie-Hellman result into the chaining key.
-         *  @return False on a small-order peer point, which must abort rather than continue with a
-         *      shared secret an attacker already knows.
+         *  @return @c secure_tunnel_fault_t::authentication_failed_k on a small-order peer
+         *      point, which must abort rather than continue with a shared secret an attacker
+         *      already knows.
          *
          *  @warning Both parameters are exactly this wide and swapping them still compiles. A
          *      dynamic span would not help, since two of them are equally interchangeable; the
          *      fixed extent is what lets the compiler object to a nonce or a tag arriving here.
          */
-        [[nodiscard]] bool mix_diffie_hellman(span<byte_t const, secure_tunnel_key_size_k> scalar,
-                                              span<byte_t const, secure_tunnel_key_size_k> point) noexcept {
+        [[nodiscard]] secure_tunnel_fault_t mix_diffie_hellman(
+            span<byte_t const, secure_tunnel_key_size_k> scalar,
+            span<byte_t const, secure_tunnel_key_size_k> point) noexcept {
             byte_t shared[secure_tunnel_key_size_k];
-            if (!x25519_scalar_multiply(shared, scalar, point)) return false;
+            if (!x25519_scalar_multiply(shared, scalar, point)) return secure_tunnel_fault_t::authentication_failed_k;
             transcript.mix_key(shared);
             secure_zero(shared);
-            return true;
+            return secure_tunnel_fault_t::none_k;
         }
 
-        [[nodiscard]] bool generate_ephemeral() noexcept {
-            if (!secure_random_bytes(local_ephemeral_private)) return false;
+        [[nodiscard]] secure_tunnel_fault_t generate_ephemeral() noexcept {
+            if (secure_tunnel_fault_t const fault = secure_random_bytes(local_ephemeral_private);
+                fault != secure_tunnel_fault_t::none_k)
+                return fault;
             x25519_derive_public(local_ephemeral_public, local_ephemeral_private);
-            return true;
+            return secure_tunnel_fault_t::none_k;
         }
 
         void clear() noexcept {
@@ -1371,38 +1383,31 @@ struct secure_tunnel_crypto {
 
     /**
      *  @brief Applies one Diffie-Hellman token, picking the operands by role.
-     *  @param[out] fault Why it failed, so a peer's small-order point is never logged as ours.
+     *  @return Why it failed, so a peer's small-order point is never logged as ours.
      *
      *  The only way this fails on well-formed input is a peer point of small order, which is a
      *  deliberate act: it forces a shared secret the attacker already knows. Reporting it as
      *  anything but hostile would put an attack and an operating-system problem on the same line in
      *  the logs.
      */
-    [[nodiscard]] static bool apply_diffie_hellman(secure_tunnel_noise_t& noise, secure_tunnel_token_t token,
-                                                   secure_tunnel_fault_t& fault) noexcept {
+    [[nodiscard]] static secure_tunnel_fault_t apply_diffie_hellman(secure_tunnel_noise_t& noise,
+                                                                    secure_tunnel_token_t token) noexcept {
         bool const initiator = noise.initiates();
-        bool agreed = false;
         switch (token) {
         case secure_tunnel_token_t::ephemeral_ephemeral_k:
-            agreed = noise.mix_diffie_hellman(noise.local_ephemeral_private, noise.remote_ephemeral);
-            break;
+            return noise.mix_diffie_hellman(noise.local_ephemeral_private, noise.remote_ephemeral);
         case secure_tunnel_token_t::ephemeral_static_k:
-            agreed = initiator ? noise.mix_diffie_hellman(noise.local_ephemeral_private, noise.remote_static)
-                               : noise.mix_diffie_hellman(noise.local_static_private, noise.remote_ephemeral);
-            break;
+            return initiator ? noise.mix_diffie_hellman(noise.local_ephemeral_private, noise.remote_static)
+                             : noise.mix_diffie_hellman(noise.local_static_private, noise.remote_ephemeral);
         case secure_tunnel_token_t::static_ephemeral_k:
-            agreed = initiator ? noise.mix_diffie_hellman(noise.local_static_private, noise.remote_ephemeral)
-                               : noise.mix_diffie_hellman(noise.local_ephemeral_private, noise.remote_static);
-            break;
+            return initiator ? noise.mix_diffie_hellman(noise.local_static_private, noise.remote_ephemeral)
+                             : noise.mix_diffie_hellman(noise.local_ephemeral_private, noise.remote_static);
         case secure_tunnel_token_t::static_static_k:
-            agreed = noise.mix_diffie_hellman(noise.local_static_private, noise.remote_static);
-            break;
+            return noise.mix_diffie_hellman(noise.local_static_private, noise.remote_static);
         // A token no pattern in this file emits, which means the pattern table and this switch
         // disagree - a build-time mistake rather than anything the peer did.
-        default: fault = secure_tunnel_fault_t::misconfigured_k; return false;
+        default: return secure_tunnel_fault_t::misconfigured_k;
         }
-        if (!agreed) fault = secure_tunnel_fault_t::authentication_failed_k;
-        return agreed;
     }
 
     /**
@@ -1444,20 +1449,16 @@ struct secure_tunnel_crypto {
 
     /**
      *  @brief Writes the pattern message at @c message_index into the tunnel's outbound buffer.
-     *  @param[out] fault Why it failed. Never a single code for every cause - an exhausted entropy
-     *      pool, a peer forcing a known shared secret, and an outbound buffer this build sized
-     *      wrongly are three different problems calling for three different responses.
+     *  @return Why it failed. Never a single code for every cause - an exhausted entropy pool, a
+     *      peer forcing a known shared secret, and an outbound buffer this build sized wrongly are
+     *      three different problems calling for three different responses.
      *
      *  Runs @c finish_handshake when this was the pattern's last message, which is what makes the
      *  record layer usable on the write path - a caller may put its first record in the same write
      *  as the final handshake message rather than waiting a round trip to discover it could have.
      */
-    [[nodiscard]] static bool write_handshake_message(secure_tunnel_noise_t& noise,
-                                                      secure_tunnel_fault_t& fault) noexcept {
-        if (noise.handshake_complete()) {
-            fault = secure_tunnel_fault_t::misconfigured_k;
-            return false;
-        }
+    [[nodiscard]] static secure_tunnel_fault_t write_handshake_message(secure_tunnel_noise_t& noise) noexcept {
+        if (noise.handshake_complete()) return secure_tunnel_fault_t::misconfigured_k;
 
         byte_t* const body = noise.outbound + prefix_size_k;
         std::size_t const capacity = outbound_capacity_k - prefix_size_k;
@@ -1467,14 +1468,10 @@ struct secure_tunnel_crypto {
             if (token == secure_tunnel_token_t::end_k) break;
             switch (token) {
             case secure_tunnel_token_t::ephemeral_k: {
-                if (!noise.generate_ephemeral()) {
-                    fault = secure_tunnel_fault_t::entropy_unavailable_k;
-                    return false;
-                }
-                if (written + secure_tunnel_key_size_k > capacity) {
-                    fault = secure_tunnel_fault_t::misconfigured_k;
-                    return false;
-                }
+                if (secure_tunnel_fault_t const fault = noise.generate_ephemeral();
+                    fault != secure_tunnel_fault_t::none_k)
+                    return fault;
+                if (written + secure_tunnel_key_size_k > capacity) return secure_tunnel_fault_t::misconfigured_k;
                 std::memcpy(body + written, noise.local_ephemeral_public, secure_tunnel_key_size_k);
                 noise.transcript.mix_hash(
                     {noise.local_ephemeral_public, noise.local_ephemeral_public + secure_tunnel_key_size_k});
@@ -1482,51 +1479,47 @@ struct secure_tunnel_crypto {
                 break;
             }
             case secure_tunnel_token_t::static_k: {
-                if (written + secure_tunnel_key_size_k + tag_size_k > capacity) {
-                    fault = secure_tunnel_fault_t::misconfigured_k;
-                    return false;
-                }
+                if (written + secure_tunnel_key_size_k + tag_size_k > capacity)
+                    return secure_tunnel_fault_t::misconfigured_k;
                 std::memcpy(body + written, noise.local_static_public, secure_tunnel_key_size_k);
                 std::size_t sealed = 0;
-                if (!noise.transcript.seal_and_hash({body + written, body + written + secure_tunnel_key_size_k},
-                                                    sealed)) {
-                    fault = secure_tunnel_fault_t::keys_exhausted_k;
-                    return false;
-                }
+                if (secure_tunnel_fault_t const fault = noise.transcript.seal_and_hash(
+                        {body + written, body + written + secure_tunnel_key_size_k}, sealed);
+                    fault != secure_tunnel_fault_t::none_k)
+                    return fault;
                 written += sealed;
                 break;
             }
             default:
-                if (!apply_diffie_hellman(noise, token, fault)) return false;
+                if (secure_tunnel_fault_t const fault = apply_diffie_hellman(noise, token);
+                    fault != secure_tunnel_fault_t::none_k)
+                    return fault;
                 break;
             }
         }
 
         // Every handshake message ends with a sealed payload. Ours are empty, which still
         // contributes a tag once a key exists, and nothing at all before that.
-        if (written + tag_size_k > capacity) {
-            fault = secure_tunnel_fault_t::misconfigured_k;
-            return false;
-        }
+        if (written + tag_size_k > capacity) return secure_tunnel_fault_t::misconfigured_k;
         std::size_t trailer = 0;
-        if (!noise.transcript.seal_and_hash({body + written, body + written}, trailer)) {
-            fault = secure_tunnel_fault_t::keys_exhausted_k;
-            return false;
-        }
+        if (secure_tunnel_fault_t const fault = noise.transcript.seal_and_hash({body + written, body + written},
+                                                                               trailer);
+            fault != secure_tunnel_fault_t::none_k)
+            return fault;
         written += trailer;
 
         poke_length(span<byte_t> {noise.outbound}.first<prefix_size_k>(), written);
         noise.outbound_length = prefix_size_k + written;
         ++noise.message_index;
         if (noise.handshake_complete()) finish_handshake(noise);
-        return true;
+        return secure_tunnel_fault_t::none_k;
     }
 
     /**
      *  @brief Reads the pattern message at @c message_index, discarding whatever payload it
      *      carried.
      *  @param[in] body The message without its length prefix.
-     *  @param[out] fault Why it failed. A message too short to hold the field a token demands is
+     *  @return Why it failed. A message too short to hold the field a token demands is
      *      @c malformed_k; a tag that did not verify is @c authentication_failed_k. Collapsing the
      *      two would make a truncating middlebox and an active attacker indistinguishable in the
      *      logs.
@@ -1536,12 +1529,9 @@ struct secure_tunnel_crypto {
      *  conformant peer; a tampered handshake prefix mis-frames the message and is caught by the
      *  very next tag check regardless.
      */
-    [[nodiscard]] static bool read_handshake_message(secure_tunnel_noise_t& noise, span<byte_t const> body,
-                                                     secure_tunnel_fault_t& fault) noexcept {
-        if (noise.handshake_complete()) {
-            fault = secure_tunnel_fault_t::misconfigured_k;
-            return false;
-        }
+    [[nodiscard]] static secure_tunnel_fault_t read_handshake_message(secure_tunnel_noise_t& noise,
+                                                                      span<byte_t const> body) noexcept {
+        if (noise.handshake_complete()) return secure_tunnel_fault_t::misconfigured_k;
 
         std::size_t const length = body.size();
         std::size_t consumed = 0;
@@ -1550,10 +1540,7 @@ struct secure_tunnel_crypto {
             if (token == secure_tunnel_token_t::end_k) break;
             switch (token) {
             case secure_tunnel_token_t::ephemeral_k: {
-                if (consumed + secure_tunnel_key_size_k > length) {
-                    fault = secure_tunnel_fault_t::malformed_k;
-                    return false;
-                }
+                if (consumed + secure_tunnel_key_size_k > length) return secure_tunnel_fault_t::malformed_k;
                 std::memcpy(noise.remote_ephemeral, body.data() + consumed, secure_tunnel_key_size_k);
                 noise.transcript.mix_hash({noise.remote_ephemeral, noise.remote_ephemeral + secure_tunnel_key_size_k});
                 consumed += secure_tunnel_key_size_k;
@@ -1562,21 +1549,14 @@ struct secure_tunnel_crypto {
             case secure_tunnel_token_t::static_k: {
                 std::size_t const expected = noise.transcript.cipher().has_key() ? secure_tunnel_key_size_k + tag_size_k
                                                                                  : secure_tunnel_key_size_k;
-                if (consumed + expected > length) {
-                    fault = secure_tunnel_fault_t::malformed_k;
-                    return false;
-                }
+                if (consumed + expected > length) return secure_tunnel_fault_t::malformed_k;
                 std::size_t produced = 0;
-                if (!noise.transcript.open_and_hash(
+                if (secure_tunnel_fault_t const fault = noise.transcript.open_and_hash(
                         {body.data() + consumed, body.data() + consumed + expected},
-                        {noise.remote_static, noise.remote_static + secure_tunnel_key_size_k}, produced)) {
-                    fault = secure_tunnel_fault_t::authentication_failed_k;
-                    return false;
-                }
-                if (produced != secure_tunnel_key_size_k) {
-                    fault = secure_tunnel_fault_t::malformed_k;
-                    return false;
-                }
+                        {noise.remote_static, noise.remote_static + secure_tunnel_key_size_k}, produced);
+                    fault != secure_tunnel_fault_t::none_k)
+                    return fault;
+                if (produced != secure_tunnel_key_size_k) return secure_tunnel_fault_t::malformed_k;
                 // The tag verified against the transcript, so this key is proven rather than
                 // assumed.
                 noise.remote_static_state = remote_static_t::authenticated_k;
@@ -1584,7 +1564,9 @@ struct secure_tunnel_crypto {
                 break;
             }
             default:
-                if (!apply_diffie_hellman(noise, token, fault)) return false;
+                if (secure_tunnel_fault_t const fault = apply_diffie_hellman(noise, token);
+                    fault != secure_tunnel_fault_t::none_k)
+                    return fault;
                 break;
             }
         }
@@ -1593,20 +1575,16 @@ struct secure_tunnel_crypto {
         // be authenticated so that both transcripts advance identically.
         byte_t payload[max_handshake_payload_k];
         std::size_t produced = 0;
-        if (length - consumed > sizeof(payload) + tag_size_k) {
-            fault = secure_tunnel_fault_t::malformed_k;
-            return false;
-        }
-        if (!noise.transcript.open_and_hash({body.data() + consumed, body.data() + length},
-                                            {payload, payload + sizeof(payload)}, produced)) {
-            fault = secure_tunnel_fault_t::authentication_failed_k;
-            return false;
-        }
+        if (length - consumed > sizeof(payload) + tag_size_k) return secure_tunnel_fault_t::malformed_k;
+        if (secure_tunnel_fault_t const fault = noise.transcript.open_and_hash(
+                {body.data() + consumed, body.data() + length}, {payload, payload + sizeof(payload)}, produced);
+            fault != secure_tunnel_fault_t::none_k)
+            return fault;
         secure_zero(payload);
 
         ++noise.message_index;
         if (noise.handshake_complete()) finish_handshake(noise);
-        return true;
+        return secure_tunnel_fault_t::none_k;
     }
 
 #pragma endregion Handshake Steps
@@ -1637,7 +1615,8 @@ struct secure_tunnel_crypto {
 
         span<byte_t> const body = record.subspan(prefix_size_k);
         std::size_t const plain_size = filled + kind_size_k;
-        if (!noise.sending.seal(record.first(prefix_size_k), body.first(plain_size), body.data() + plain_size))
+        if (noise.sending.seal(record.first(prefix_size_k), body.first(plain_size), body.data() + plain_size) !=
+            secure_tunnel_fault_t::none_k)
             return 0;
 
         if (++noise.records_sealed % rekey_interval_k == 0) noise.sending.rekey();
@@ -1985,8 +1964,9 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
 
             case secure_tunnel_state_t::starting_k:
                 if (role_ == secure_tunnel_role_t::initiator_k) {
-                    secure_tunnel_fault_t reason = secure_tunnel_fault_t::none_k;
-                    if (!write_handshake_message(noise, reason)) return fail(reason);
+                    if (secure_tunnel_fault_t const reason = write_handshake_message(noise);
+                        reason != secure_tunnel_fault_t::none_k)
+                        return fail(reason);
                     if (noise.handshake_complete()) {
                         sending_ = direction_t::open_k;
                         receiving_ = direction_t::open_k;
@@ -2015,9 +1995,9 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
                 }
                 std::size_t const declared = peek_length(pending);
                 if (declared > max_message_k) return fail(secure_tunnel_fault_t::malformed_k);
-                secure_tunnel_fault_t reason = secure_tunnel_fault_t::none_k;
-                if (!read_handshake_message(
-                        noise, {pending.data() + prefix_size_k, pending.data() + prefix_size_k + declared}, reason))
+                if (secure_tunnel_fault_t const reason = read_handshake_message(
+                        noise, {pending.data() + prefix_size_k, pending.data() + prefix_size_k + declared});
+                    reason != secure_tunnel_fault_t::none_k)
                     return fail(reason);
                 step.consumed += prefix_size_k + declared;
 
@@ -2030,7 +2010,9 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
 
                 // The peer's message obliged a reply, so it goes out in this same call rather than
                 // making the caller come back and ask.
-                if (!write_handshake_message(noise, reason)) return fail(reason);
+                if (secure_tunnel_fault_t const reason = write_handshake_message(noise);
+                    reason != secure_tunnel_fault_t::none_k)
+                    return fail(reason);
                 if (noise.handshake_complete()) {
                     sending_ = direction_t::open_k;
                     receiving_ = direction_t::open_k;
@@ -2199,9 +2181,11 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
 
         auto& noise = noise_of(storage_);
         byte_t* const body = record.data() + prefix_size_k;
-        if (!noise.receiving.open({record.data(), record.data() + prefix_size_k}, {body, body + plain_size},
-                                  body + plain_size, destination.data()))
-            return fail(secure_tunnel_fault_t::authentication_failed_k);
+        if (secure_tunnel_fault_t const opened = noise.receiving.open({record.data(), record.data() + prefix_size_k},
+                                                                      {body, body + plain_size}, body + plain_size,
+                                                                      destination.data());
+            opened != secure_tunnel_fault_t::none_k)
+            return fail(opened);
 
         if (++noise.records_opened % rekey_interval_k == 0) noise.receiving.rekey();
 

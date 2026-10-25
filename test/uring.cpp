@@ -106,7 +106,7 @@ static case_result_t streamed_transmit() {
     auto owned = engine.import_socket(sockets.client);
     require(failures, owned >= 0);
     sockets.client = -1;
-    require(failures, nonblocking(sockets.peer));
+    require(failures, nonblocking(sockets.peer) == ucall_status_success_k);
     std::vector<byte_t> payload(65536, byte_t {85}), received(payload.size());
     std::size_t sent {}, read {};
     bool pending {};

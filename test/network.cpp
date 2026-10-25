@@ -565,20 +565,18 @@ static case_result_t test_pipelined_call_loss() {
 #pragma region Raw Clients
 #if UCALL_OS_POSIX_
 
-/** Sends @p request whole, reads until the server closes, and answers the first response. */
+/** Sends @p request whole, reads until the server closes in order, never with a reset, and
+ *  answers the first response. */
 static wire_response_t exchange_until_close(raw_client_t& client, std::string_view request, std::size_t max_chunk,
                                             random_generator_t& generator, std::size_t& failures) {
     steady_clock::time_point const deadline = steady_clock::now() + 10s;
-    auto const written = client.write(uc::byte_span(request), max_chunk, generator, deadline);
+    failures += expect(client.write(uc::byte_span(request), max_chunk, generator, deadline),
+                       "the server stopped reading");
     auto const end = client.read_until_close(deadline);
     int const error = end == read_end_t::failed_k ? errno : 0;
     auto const response = parse_response(client.received);
-    // Closing over unread request bytes cuts writes short and resets reads, until servers linger.
-    bool const answered = response.length && response.length == client.received.size();
-    failures += expect(written || answered, "the server stopped reading");
-    failures += expect(end == read_end_t::closed_k || (error == ECONNRESET && answered),
-                       "the read ended as {} after {} bytes, errno {}", static_cast<int>(end), client.received.size(),
-                       error);
+    failures += expect(end == read_end_t::closed_k && response.length, "the read ended as {} after {} bytes, errno {}",
+                       static_cast<int>(end), client.received.size(), error);
     return response;
 }
 
@@ -663,22 +661,28 @@ static constexpr smuggling_row_t smuggling_rows_k[] {
     {"bare line feed", "POST /echo/1 HTTP/1.1\r\nHost: a\r\nX-Pad: 1\nContent-Length: 4\r\n\r\nbody"},
     {"space before colon", "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length : 4\r\n\r\nbody"},
     {"no host", "GET /echo/1 HTTP/1.1\r\n\r\n"},
+    {"length past size_t", "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 18446744073709551615\r\n\r\nbody", 413},
 };
 
-/** Every smuggling row is answered with an error status and a close, and never dispatched. */
+/** Every smuggling row is answered with an error status and an orderly close, and never
+ *  dispatched, though the client keeps sending far past one receive after the row. */
 static case_result_t test_smuggling_safety(random_generator_t& generator) {
     fixture_t fixture {{}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;
+    // Past what any engine reads ahead, so a server closing without lingering leaves bytes unread.
+    std::string const unread(std::size_t {64} << 10, 'x');
     for (auto const& row : smuggling_rows_k) {
         announce("{}", row.name);
         auto const dispatched = fixture.dispatched.load();
         raw_client_t client;
         require(failures, client.connect(fixture.address));
-        auto const response = exchange_until_close(client, row.request, 0, generator, failures);
-        failures += expect(response.status == row.expected_status, "{} answered {} bytes: {:?}", row.name,
-                           client.received.size(), client.received);
+        failures += expect(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + 5s),
+                           "{} was cut short", row.name);
+        auto const response = exchange_until_close(client, unread, 4096, generator, failures);
+        failures += expect(response.status == row.expected_status && response.length == client.received.size(),
+                           "{} answered {} bytes: {:?}", row.name, client.received.size(), client.received);
         failures += expect(fixture.dispatched.load() == dispatched, "{} was dispatched", row.name);
     }
     return failures + fixture.stop();
@@ -821,7 +825,8 @@ static case_result_t engine_duplex(random_generator_t& generator) {
     // A send buffer far below a mebibyte keeps the send pending until the peer drains it.
     int const send_buffer = static_cast<int>(fixture_buffer_bytes_k);
     require(failures,
-            uc::nonblocking(sockets.client) && uc::nonblocking(sockets.peer) &&
+            uc::nonblocking(sockets.client) == ucall_status_success_k &&
+                uc::nonblocking(sockets.peer) == ucall_status_success_k &&
                 uc::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) == 0);
     auto const owned = engine.import_socket(std::exchange(sockets.client, -1));
     require(failures, owned >= 0, "importing ended with {}", owned);

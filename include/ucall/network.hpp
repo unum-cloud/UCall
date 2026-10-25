@@ -58,7 +58,21 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     using http_t::trim_http;
     using http_t::valid_view;
     enum class server_mode_t { serving_k, stopping_k };
-    enum class connection_stage_t : std::uint8_t { idle_k, connecting_k, handshake_k, open_k, closing_k, closed_k };
+    enum class connection_stage_t : std::uint8_t {
+        idle_k,
+        connecting_k,
+        handshake_k,
+        open_k,
+        lingering_k, // Half-closed after the last reply, discarding what the peer still sends.
+        closing_k,
+        closed_k
+    };
+
+    /** RFC 6298's initial retransmission timeout bounds the round trip a peer's last bytes take. */
+    static constexpr std::size_t linger_microseconds_k = 1'000'000;
+
+    /** Linux's default receive buffer, `tcp_rmem`, bounds what a peer has in flight at our FIN. */
+    static constexpr std::size_t linger_bytes_k = 128 * 1024;
 
     /** Whether a direction's one engine request is in flight; only submission and completion
      *  write it. */
@@ -126,6 +140,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         byte_t* sending {};
         std::size_t sending_length {}, sending_offset {};
         std::size_t output_offset {}, output_advance {}; // The next send's start, and how far its completion moves it.
+        std::size_t discarded {};                        // Bytes read and dropped while lingering.
         byte_t stash[secure_tunnel_tailroom_k] {};       // What a record sealed in place wrote its framing over.
         network_interface_t* network_interface {};
         client_peer_t* peer {};
@@ -146,7 +161,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             input.clear();
             encrypted.clear();
             sending = nullptr;
-            sending_length = sending_offset = output_offset = output_advance = 0;
+            sending_length = sending_offset = output_offset = output_advance = discarded = 0;
             deadline = 0;
             flags = connection_none_k;
             crypto_t::secure_zero(peer_static_key);
@@ -188,15 +203,21 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 }
                 sending = nullptr;
             }
+            else if (stage == connection_stage_t::lingering_k) {
+                if (completed.operation == io_operation_t::shutdown_k) return;
+                discarded += static_cast<std::size_t>(result);
+                if (statistics) tally(statistics->bytes_received, static_cast<std::uint64_t>(result));
+                if (!result || discarded >= linger_bytes_k) fail(ucall_status_success_k);
+            }
             else if (!result) flags = static_cast<connection_flags_t>(flags | connection_peer_closed_k);
             else {
                 auto& destination = tunnel.encrypts() ? encrypted : input;
-                auto limit = std::numeric_limits<std::size_t>::max();
-                if (static_cast<std::size_t>(result) > limit - destination.size()) fail(ucall_status_overflow_k);
-                else if (!append_text(destination, {reinterpret_cast<char const*>(completion.data ? completion.data
-                                                                                                  : received.data()),
-                                                    static_cast<std::size_t>(result)}))
-                    fail(ucall_status_out_of_memory_k);
+                std::string_view const arrived {
+                    reinterpret_cast<char const*>(completion.data ? completion.data : received.data()),
+                    static_cast<std::size_t>(result)};
+                if (ucall_status_t const appended = append_text(destination, {arrived});
+                    appended != ucall_status_success_k)
+                    fail(appended);
                 else if (statistics) {
                     tally(statistics->bytes_received, static_cast<std::uint64_t>(result));
                     tally(statistics->bytes_copied, static_cast<std::uint64_t>(result));
@@ -219,15 +240,20 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 if (stage == connection_stage_t::closed_k || stage == connection_stage_t::idle_k ||
                     stage == connection_stage_t::open_k)
                     return nullptr;
-                // The handshake takes turns between the two directions.
+                // The handshake takes turns between the two directions, and so does lingering.
                 if (in_flight()) return nullptr;
                 if (stage == connection_stage_t::connecting_k) return &transmit_request;
                 if (sending)
                     return emit(transmit_request, io_operation_t::send_k,
                                 {sending + sending_offset, sending_length - sending_offset});
-                auto step = tunnel.advance({encrypted.data(), encrypted.data() + encrypted.size()});
+                secure_tunnel_request_t const tunnel_request = stage == connection_stage_t::lingering_k
+                                                                   ? secure_tunnel_request_t::close_k
+                                                                   : secure_tunnel_request_t::proceed_k;
+                auto step = tunnel.advance({encrypted.data(), encrypted.data() + encrypted.size()}, tunnel_request);
                 drop_bytes(encrypted, step.consumed);
-                if (step.state == secure_tunnel_state_t::broken_k || step.state == secure_tunnel_state_t::closed_k) {
+                if (step.state == secure_tunnel_state_t::broken_k ||
+                    (step.state == secure_tunnel_state_t::closed_k &&
+                     tunnel_request == secure_tunnel_request_t::proceed_k)) {
                     fail(ucall_status_handshake_failed_k);
                     continue;
                 }
@@ -243,6 +269,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                     sending_offset = 0;
                     continue;
                 }
+                // The FIN follows any Noise close record, then receives drain the peer.
+                if (stage == connection_stage_t::lingering_k)
+                    return transmit_request.operation == io_operation_t::shutdown_k
+                               ? emit(receive_request, io_operation_t::receive_k, received)
+                               : emit(transmit_request, io_operation_t::shutdown_k, {});
                 if (step.state != secure_tunnel_state_t::ready_k) {
                     if (flags & connection_peer_closed_k) {
                         fail(ucall_status_connection_closed_k);
@@ -552,9 +583,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (peer_key) config.remote_public = std::as_bytes(std::span {*peer_key});
         return config;
     }
-    static bool copy_text(vector<char>& destination, std::string_view text) noexcept {
+    [[nodiscard]] static ucall_status_t copy_text(vector<char>& destination, std::string_view text) noexcept {
         destination.clear();
-        return append_text(destination, text) && append_text(destination, std::string_view {"\0", 1});
+        return append_text(destination, {text, std::string_view {"\0", 1}});
     }
     static ucall_status_t split_address(std::string_view address, vector<char>& host, vector<char>& service) noexcept {
         auto colon = http_t::rfind(address, ':');
@@ -571,8 +602,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (parsed.ec != std::errc {} || parsed.ptr != port.data() + port.size() || number > 65535 || name.empty() ||
             find(name, '\0') != std::string_view::npos)
             return ucall_status_invalid_argument_k;
-        return copy_text(host, name) && copy_text(service, port) ? ucall_status_success_k
-                                                                 : ucall_status_out_of_memory_k;
+        if (ucall_status_t const copied = copy_text(host, name); copied != ucall_status_success_k) return copied;
+        return copy_text(service, port);
     }
     static std::size_t interface_event_loops(char const* device) noexcept {
         if (!device) return 1;
@@ -596,7 +627,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                         interface_acceptor_t& acceptor) noexcept {
         vector<char> host {rebound_allocator<char> {network_interface.address.get_allocator()}},
             service {host.get_allocator()};
-        if (!sockets_start()) return ucall_status_io_k;
+        if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
         if (auto status = split_address(network_interface.config.address, host, service);
             status != ucall_status_success_k)
             return status;
@@ -646,9 +677,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         std::snprintf(text, sizeof(text), bound.ss_family == AF_INET6 ? "[%s]:%s" : "%s:%s", numeric_host,
                       numeric_service);
-        if (!copy_text(network_interface.address, text)) {
+        if (ucall_status_t const copied = copy_text(network_interface.address, text);
+            copied != ucall_status_success_k) {
             socket_close(descriptor);
-            return ucall_status_out_of_memory_k;
+            return copied;
         }
         network_interface.config.address = network_interface.address.data();
         acceptor.network_interface = &network_interface;
@@ -729,16 +761,18 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 !http_value(line.substr(colon + 1)))
                 return ucall_status_invalid_argument_k;
             auto previous = output.size();
-            if (!append_text(output, line.substr(0, colon))) return ucall_status_out_of_memory_k;
+            if (ucall_status_t const appended = append_text(output, {line.substr(0, colon)});
+                appended != ucall_status_success_k)
+                return appended;
             lowercase_ascii({reinterpret_cast<char*>(output.data()) + previous, colon});
             std::string_view name {reinterpret_cast<char const*>(output.data()) + previous, colon};
             if (equal(name, "content-length") || equal(name, "transfer-encoding") ||
                 (role == http_role_t::request_k && (equal(name, "host") || equal(name, "user-agent"))) ||
                 (role != http_role_t::request_k && (equal(name, "date") || equal(name, "server"))))
                 return ucall_status_invalid_argument_k;
-            if (!append_text(output, ": ") || !append_text(output, trim_http(line.substr(colon + 1))) ||
-                !append_text(output, "\r\n"))
-                return ucall_status_out_of_memory_k;
+            if (ucall_status_t const appended = append_text(output, {": ", trim_http(line.substr(colon + 1)), "\r\n"});
+                appended != ucall_status_success_k)
+                return appended;
         }
         return ucall_status_success_k;
     }
@@ -751,33 +785,28 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         char digits[std::numeric_limits<std::size_t>::digits10 + 1], date[http_date_length_k];
         if (st::failed(exchange.output.resize(exchange.geometry.headroom))) return ucall_status_out_of_memory_k;
         auto line = status_line(status);
-        bool appended = line.empty() ? append_text(exchange.output, "HTTP/1.1 ") &&
-                                           append_text(exchange.output, format_decimal(digits, status)) &&
-                                           append_text(exchange.output, " ") &&
-                                           append_text(exchange.output, classes_k[status / 100 - 2]) &&
-                                           append_text(exchange.output, "\r\n")
-                                     : append_text(exchange.output, line);
-        if (!appended || !append_text(exchange.output, "server: UCall\r\ndate: ") ||
-            !append_text(exchange.output, format_date(date, std::time(nullptr))) ||
-            !append_text(exchange.output, "\r\n")) {
-            exchange.output.clear();
-            return ucall_status_out_of_memory_k;
-        }
-        auto result = append_headers(exchange.output, headers, http_role_t::response_k);
+        ucall_status_t result = line.empty()
+                                    ? append_text(exchange.output, {"HTTP/1.1 ", format_decimal(digits, status), " ",
+                                                                    classes_k[status / 100 - 2], "\r\n"})
+                                    : append_text(exchange.output, {line});
+        if (result == ucall_status_success_k)
+            result = append_text(exchange.output,
+                                 {"server: UCall\r\ndate: ", format_date(date, std::time(nullptr)), "\r\n"});
+        if (result == ucall_status_success_k)
+            result = append_headers(exchange.output, headers, http_role_t::response_k);
+        if (result == ucall_status_success_k && status != 204 && status != 304)
+            result = append_text(exchange.output, {"content-length: ", format_decimal(digits, body.size()), "\r\n"});
+        if (result == ucall_status_success_k)
+            result = append_text(
+                exchange.output,
+                {exchange.message.keep_alive() ? "connection: keep-alive\r\n\r\n" : "connection: close\r\n\r\n",
+                 exchange.message.verb != ucall_verb_head_k ? body : std::string_view {}});
+        if (result == ucall_status_success_k &&
+            st::failed(exchange.output.resize(exchange.output.size() + exchange.geometry.tailroom)))
+            result = ucall_status_out_of_memory_k;
         if (result != ucall_status_success_k) {
             exchange.output.clear();
             return result;
-        }
-        if ((status != 204 && status != 304 &&
-             (!append_text(exchange.output, "content-length: ") ||
-              !append_text(exchange.output, format_decimal(digits, body.size())) ||
-              !append_text(exchange.output, "\r\n"))) ||
-            !append_text(exchange.output, exchange.message.keep_alive() ? "connection: keep-alive\r\n\r\n"
-                                                                        : "connection: close\r\n\r\n") ||
-            (exchange.message.verb != ucall_verb_head_k && !append_text(exchange.output, body)) ||
-            st::failed(exchange.output.resize(exchange.output.size() + exchange.geometry.tailroom))) {
-            exchange.output.clear();
-            return ucall_status_out_of_memory_k;
         }
         exchange.copied = exchange.message.verb != ucall_verb_head_k ? body.size() : 0;
         return ucall_status_success_k;
@@ -909,11 +938,13 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (!exchange) return;
         auto wire = connection.message.wire_length;
         if (!offset && wire == connection.input.size()) std::swap(exchange->input, connection.input);
-        else if (append_text(exchange->input, text_view(connection.input).substr(offset, wire)))
+        else if (ucall_status_t const appended = append_text(exchange->input,
+                                                             {text_view(connection.input).substr(offset, wire)});
+                 appended == ucall_status_success_k)
             tally(event_loop.statistics.bytes_copied, wire);
         else {
             exchange->stage = exchange_stage_t::collected_k; // Never handed out, so the close recycles it.
-            return connection.fail(ucall_status_out_of_memory_k);
+            return connection.fail(appended);
         }
         tally(event_loop.statistics.requests);
         exchange->message = std::exchange(connection.message, http_message_t {});
@@ -963,7 +994,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
      *  R3 next reply: an idle transmit side starts on the oldest exchange once its reply is
      *     collected.
      *  R4 emit: the next chunk of that reply while its send is idle, else a receive while reading.
-     *  R5 done: ended with every reply sent, the connection closes. */
+     *  R5 done: ended with every reply sent, the connection lingers half-closed until the peer
+     *     closes, so request bytes it never read cannot turn the close into a reset. */
     static io_request_t* serve_open(server_t& server, event_loop_t& event_loop, connection_t& connection) noexcept {
         auto* oldest = connection.oldest_exchange;
         if (connection.transmitting == transmit_state_t::sending_k &&
@@ -1022,7 +1054,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return connection.emit(connection.receive_request, io_operation_t::receive_k, connection.received);
         if (connection.receiving == receive_state_t::ended_k && !oldest &&
             connection.transmitting == transmit_state_t::idle_k) {
-            connection.fail(ucall_status_success_k);
+            // A peer that closed left nothing unread, so only a live receive side lingers.
+            if (connection.flags & connection_peer_closed_k) connection.fail(ucall_status_success_k);
+            else {
+                connection.stage = connection_stage_t::lingering_k;
+                connection.deadline = deadline_after(linger_microseconds_k);
+            }
             return connection.advance();
         }
         return nullptr;
@@ -1177,8 +1214,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return;
         }
         auto server = allocate_unique<server_t>(allocator, allocator);
-        if (!server || st::failed(server->resolved.resize(config->interfaces_count)) || !server->routes.init()) {
+        if (!server || st::failed(server->resolved.resize(config->interfaces_count))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
+            return;
+        }
+        if (ucall_status_t const routed = server->routes.init(); routed != ucall_status_success_k) {
+            publish(arguments->outcome, routed);
             return;
         }
         rebound_allocator<network_interface_t> network_interface_allocator {allocator};
@@ -1201,8 +1242,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             }
             auto& settings = network_interface.config;
             if (settings.device_name) {
-                if (!copy_text(network_interface.device, settings.device_name)) {
-                    publish(arguments->outcome, ucall_status_out_of_memory_k);
+                if (ucall_status_t const copied = copy_text(network_interface.device, settings.device_name);
+                    copied != ucall_status_success_k) {
+                    publish(arguments->outcome, copied);
                     return;
                 }
                 settings.device_name = network_interface.device.data();
@@ -1274,8 +1316,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             auto& event_loop = *server->event_loops[event_loop_index];
             event_loop.server = server.get();
             server->owned_wakeups[event_loop_index] = &event_loop.wake;
-            if (!event_loop.wake.open()) {
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+            if (ucall_status_t const opened = event_loop.wake.open(); opened != ucall_status_success_k) {
+                publish(arguments->outcome, opened);
                 return;
             }
             std::size_t connections_count = 0, acceptors_count = 0;
@@ -1678,9 +1720,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 return;
             }
         auto* endpoint = allocate_unique<endpoint_t>(server.allocator, server.allocator).release();
-        if (!endpoint || !copy_text(endpoint->storage, path)) {
+        ucall_status_t const copied = endpoint ? copy_text(endpoint->storage, path) : ucall_status_out_of_memory_k;
+        if (copied != ucall_status_success_k) {
             allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish(arguments->outcome, copied);
             return;
         }
         endpoint->path = {endpoint->storage.data(), path.size()};
@@ -1690,12 +1733,15 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             auto* batch = endpoint->batch.get();
             auto slots = server.requests_budget + server.event_loops.size();
             auto max_batch_size = arguments->max_batch_size ? arguments->max_batch_size : 32;
-            if (!batch || st::failed(batch->pending.reserve(max_batch_size)) ||
-                st::failed(batch->slots.resize(std::bit_ceil(slots))) || !batch->wake.open() ||
-                st::failed(server.batch_endpoints.reserve(server.batch_endpoints.size() + 1)) ||
-                st::failed(server.owned_wakeups.reserve(server.owned_wakeups.size() + 1))) {
+            ucall_status_t prepared = ucall_status_out_of_memory_k;
+            if (batch && !st::failed(batch->pending.reserve(max_batch_size)) &&
+                !st::failed(batch->slots.resize(std::bit_ceil(slots))) &&
+                !st::failed(server.batch_endpoints.reserve(server.batch_endpoints.size() + 1)) &&
+                !st::failed(server.owned_wakeups.reserve(server.owned_wakeups.size() + 1)))
+                prepared = batch->wake.open();
+            if (prepared != ucall_status_success_k) {
                 allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+                publish(arguments->outcome, prepared);
                 return;
             }
             batch->min_batch_size = arguments->min_batch_size ? arguments->min_batch_size : 1;
@@ -1999,15 +2045,17 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             find(authority, ' ') != std::string_view::npos || find(authority, '\t') != std::string_view::npos ||
             find(authority, '\0') != std::string_view::npos)
             return ucall_status_invalid_argument_k;
-        if (!copy_text(exchange.authority, authority)) return ucall_status_out_of_memory_k;
+        if (ucall_status_t const copied = copy_text(exchange.authority, authority); copied != ucall_status_success_k)
+            return copied;
         exchange.authority_hash = http_t::hash(authority);
         auto tail = boundary == std::string_view::npos ? std::string_view {} : rest.substr(boundary);
         fragment = find(tail, '#');
         tail = tail.substr(0, fragment);
         exchange.target.clear();
-        if ((tail.empty() || tail.front() != '/') && !append_text(exchange.target, "/"))
-            return ucall_status_out_of_memory_k;
-        if (!append_text(exchange.target, tail)) return ucall_status_out_of_memory_k;
+        std::string_view const root = tail.empty() || tail.front() != '/' ? "/" : "";
+        if (ucall_status_t const appended = append_text(exchange.target, {root, tail});
+            appended != ucall_status_success_k)
+            return appended;
         auto host = authority;
         std::string_view port = "80";
         if (host.front() == '[') {
@@ -2031,7 +2079,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (parsed.ec != std::errc {} || parsed.ptr != port.data() + port.size() || !number ||
             number > std::numeric_limits<std::uint16_t>::max() || host.empty())
             return ucall_status_invalid_argument_k;
-        if (!copy_text(exchange.host, host) || !copy_text(exchange.service, port)) return ucall_status_out_of_memory_k;
+        if (ucall_status_t const copied = copy_text(exchange.host, host); copied != ucall_status_success_k)
+            return copied;
+        if (ucall_status_t const copied = copy_text(exchange.service, port); copied != ucall_status_success_k)
+            return copied;
         exchange.addresses.reset();
         exchange.numeric_address = {};
         exchange.address = nullptr;
@@ -2041,7 +2092,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     static ucall_status_t resolve_exchange(client_exchange_t& exchange) noexcept {
         sockaddr_in ipv4 {};
         sockaddr_in6 ipv6 {};
-        if (!sockets_start()) return ucall_status_io_k;
+        if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
         if (inet_pton(AF_INET, exchange.host.data(), &ipv4.sin_addr) == 1) {
             ipv4.sin_family = AF_INET;
             ipv4.sin_port = htons(exchange.port);
@@ -2084,21 +2135,24 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         bool const framed = secure_tunnel_mode_encrypts(tunnel_mode(arguments.options.security));
         if (st::failed(connection.output.resize(framed ? secure_tunnel_headroom_k : 0)))
             return ucall_status_out_of_memory_k;
-        if (!append_text(connection.output, http_verb_name(arguments.verb)) || !append_text(connection.output, " ") ||
-            !append_text(connection.output, target) || !append_text(connection.output, " HTTP/1.1\r\nhost: ") ||
-            !append_text(connection.output, {exchange.authority.data(), exchange.authority.size() - 1}) ||
-            !append_text(connection.output, "\r\nuser-agent: UCall\r\n"))
-            return ucall_status_out_of_memory_k;
-        auto result = append_headers(connection.output, {arguments.headers, arguments.headers_count},
-                                     http_role_t::request_k);
-        if (result != ucall_status_success_k) return result;
+        ucall_status_t result = append_text(connection.output,
+                                            {http_verb_name(arguments.verb),
+                                             " ",
+                                             target,
+                                             " HTTP/1.1\r\nhost: ",
+                                             {exchange.authority.data(), exchange.authority.size() - 1},
+                                             "\r\nuser-agent: UCall\r\n"});
+        if (result == ucall_status_success_k)
+            result = append_headers(connection.output, {arguments.headers, arguments.headers_count},
+                                    http_role_t::request_k);
         char digits[std::numeric_limits<std::size_t>::digits10 + 1];
-        if (!append_text(connection.output, "content-length: ") ||
-            !append_text(connection.output, format_decimal(digits, arguments.body.length)) ||
-            !append_text(connection.output, "\r\n\r\n") || !append_text(connection.output, text_view(arguments.body)) ||
+        if (result == ucall_status_success_k)
+            result = append_text(connection.output, {"content-length: ", format_decimal(digits, arguments.body.length),
+                                                     "\r\n\r\n", text_view(arguments.body)});
+        if (result == ucall_status_success_k &&
             st::failed(connection.output.resize(connection.output.size() + (framed ? secure_tunnel_tailroom_k : 0))))
-            return ucall_status_out_of_memory_k;
-        return ucall_status_success_k;
+            result = ucall_status_out_of_memory_k;
+        return result;
     }
     static void finish_exchange(client_t& client, client_exchange_t& exchange, ucall_status_t status,
                                 response_t* response = nullptr) noexcept {
@@ -2131,8 +2185,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     static ucall_status_t dial_peer(client_t& client, client_peer_t& peer) noexcept {
         auto& exchange = *peer.oldest_exchange;
         auto& connection = peer.connection;
-        if (!copy_text(peer.authority, {exchange.authority.data(), exchange.authority.size() - 1}))
-            return ucall_status_out_of_memory_k;
+        if (ucall_status_t const copied = copy_text(peer.authority,
+                                                    {exchange.authority.data(), exchange.authority.size() - 1});
+            copied != ucall_status_success_k)
+            return copied;
         peer.authority_hash = exchange.authority_hash;
         while (exchange.address) {
             auto descriptor = client.engine.open_socket(exchange.address->ai_family);
@@ -2181,24 +2237,20 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         auto scheme = find(previous, "://");
         auto origin_end = scheme + 3 + exchange.authority.size() - 1;
         vector<char> next {exchange.redirect.get_allocator()};
-        if (find(location, "://") != std::string_view::npos) {
-            if (!append_text(next, location)) return ucall_status_out_of_memory_k;
-        }
-        else if (location.starts_with("//")) {
-            if (!append_text(next, previous.substr(0, scheme + 1)) || !append_text(next, location))
-                return ucall_status_out_of_memory_k;
-        }
+        ucall_status_t appended = ucall_status_success_k;
+        if (find(location, "://") != std::string_view::npos) appended = append_text(next, {location});
+        else if (location.starts_with("//")) appended = append_text(next, {previous.substr(0, scheme + 1), location});
         else {
-            if (!append_text(next, previous.substr(0, origin_end))) return ucall_status_out_of_memory_k;
+            std::string_view directory {};
             if (location.front() != '/') {
                 auto path = text_view(exchange.target);
                 path = path.substr(0, find(path, '?'));
                 auto last = http_t::rfind(path, '/');
-                if (!append_text(next, last != path.npos ? path.substr(0, last + 1) : "/"))
-                    return ucall_status_out_of_memory_k;
+                directory = last != path.npos ? path.substr(0, last + 1) : "/";
             }
-            if (!append_text(next, location)) return ucall_status_out_of_memory_k;
+            appended = append_text(next, {previous.substr(0, origin_end), directory, location});
         }
+        if (appended != ucall_status_success_k) return appended;
         if (exchange.arguments.options.security != ucall_security_mode_none_k &&
             !text_view(next).starts_with("http+noise://"))
             return ucall_status_peer_rejected_k;
@@ -2311,9 +2363,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 response->storage = std::move(connection.input);
                 connection.input.clear();
             }
-            else if (!append_text(response->storage, text_view(connection.input).substr(offset, message.wire_length))) {
+            else if (ucall_status_t const appended = append_text(
+                         response->storage, {text_view(connection.input).substr(offset, message.wire_length)});
+                     appended != ucall_status_success_k) {
                 response_t::release(response);
-                return connection.fail(ucall_status_out_of_memory_k);
+                return connection.fail(appended);
             }
             response->headers_length = message.headers_length;
             response->body_length = message.body_length;

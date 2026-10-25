@@ -95,7 +95,9 @@ struct keypair_t {
     byte_t secret[secure_tunnel_key_size_k] {};
     byte_t shared[secure_tunnel_key_size_k] {};
 
-    [[nodiscard]] bool draw() noexcept { return secure_tunnel_generate_keypair(secret, shared); }
+    [[nodiscard]] bool draw() noexcept {
+        return secure_tunnel_generate_keypair(secret, shared) == secure_tunnel_fault_t::none_k;
+    }
     [[nodiscard]] span<byte_t const> private_half() const noexcept { return secret; }
     [[nodiscard]] span<byte_t const> public_half() const noexcept { return shared; }
 };
@@ -414,8 +416,8 @@ case_result_t test_entropy_unit() {
     // destroy every ephemeral key.
     announce("distinct_and_never_all_zero");
     byte_t first[32] {}, second[32] {};
-    failures += expect(crypto_t::secure_random_bytes(first));
-    failures += expect(crypto_t::secure_random_bytes(second));
+    failures += expect(crypto_t::secure_random_bytes(first) == secure_tunnel_fault_t::none_k);
+    failures += expect(crypto_t::secure_random_bytes(second) == secure_tunnel_fault_t::none_k);
     failures += expect(!all_zero(first));
     failures += expect(!bytes_equal(first, second));
     return failures;
@@ -926,13 +928,16 @@ case_result_t test_records_unit() {
     failures += expect(
         honest.open({first_record, first_record + secure_tunnel_headroom_k},
                     {first_record + secure_tunnel_headroom_k, first_record + secure_tunnel_headroom_k + body_size},
-                    first_record + secure_tunnel_headroom_k + body_size, first_record + secure_tunnel_headroom_k));
+                    first_record + secure_tunnel_headroom_k + body_size,
+                    first_record + secure_tunnel_headroom_k) == secure_tunnel_fault_t::none_k);
 
     crypto_t::secure_tunnel_cipher_t forgetful;
     forgetful.initialize(key);
-    failures += expect(!forgetful.open(
-        {}, {second_record + secure_tunnel_headroom_k, second_record + secure_tunnel_headroom_k + body_size},
-        second_record + secure_tunnel_headroom_k + body_size, second_record + secure_tunnel_headroom_k));
+    failures += expect(
+        forgetful.open({},
+                       {second_record + secure_tunnel_headroom_k, second_record + secure_tunnel_headroom_k + body_size},
+                       second_record + secure_tunnel_headroom_k + body_size,
+                       second_record + secure_tunnel_headroom_k) == secure_tunnel_fault_t::authentication_failed_k);
     return failures;
 }
 
