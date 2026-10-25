@@ -50,6 +50,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     using http_t::equal;
     using http_t::find;
     using http_t::http_decode_chunks;
+    using http_t::http_has_token;
     using http_t::http_parse;
     using http_t::http_token;
     using http_t::http_value;
@@ -1967,7 +1968,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         vector<ucall_bytes_view_t> redirect_headers {};
         std::size_t attempts {}, redirects {};
         std::uint64_t authority_hash {};
-        client_exchange_t* next {}; // Idle or waiting calls of the client, or a peer's calls in order.
+        http_connection_t connection_intent {}; // Close, when the caller's own `connection` header asks to.
+        client_exchange_t* next {};             // Idle or waiting calls of the client, or a peer's calls in order.
     };
     struct client_peer_t {
         explicit client_peer_t(allocator_t const& allocator = {}) noexcept
@@ -1981,6 +1983,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         client_exchange_t* oldest_exchange {}; // Responses arrive in this order.
         client_exchange_t* newest_exchange {}; // While sending, its request is the one in `connection.output`.
         std::uint32_t exchanges_in_flight {};
+        std::size_t answered_calls {}; // Since the dial, telling a reused connection from a fresh one.
         vector<char> authority {};
         ucall_security_mode_t security {};
         std::uint64_t authority_hash {};
@@ -2206,6 +2209,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 return result;
             }
             connection.descriptor = descriptor;
+            peer.answered_calls = 0;
             connection.output_offset = 0;
             connection.sending = nullptr;
             connection.message = {};
@@ -2278,20 +2282,29 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return result == ucall_status_success_k ? resolve_exchange(exchange) : result;
     }
 
-    /** Appends @p exchange to @p peer's calls;
+    /** Appends @p exchange to @p peer's calls, whose earliest deadline becomes the connection's;
      *  its request is composed into `output` before it starts sending. */
     static void push_call(client_peer_t& peer, client_exchange_t& exchange) noexcept {
         exchange.stage = client_exchange_t::stage_t::active_k;
+        std::uint64_t& deadline = peer.connection.deadline;
+        deadline = peer.oldest_exchange ? std::min(deadline, exchange.deadline) : exchange.deadline;
         if (peer.newest_exchange) peer.newest_exchange->next = &exchange;
         else peer.oldest_exchange = &exchange;
         peer.newest_exchange = &exchange;
         ++peer.exchanges_in_flight;
     }
+
+    /** Unlinks @p peer's oldest call, and moves the connection's deadline to the earliest of the
+     *  calls left, a walk over at most `max_pipelined_calls` of them. */
     static client_exchange_t& pop_call(client_peer_t& peer) noexcept {
         auto& exchange = *peer.oldest_exchange;
         peer.oldest_exchange = std::exchange(exchange.next, nullptr);
         if (!peer.oldest_exchange) peer.newest_exchange = nullptr;
         --peer.exchanges_in_flight;
+        std::uint64_t deadline = 0;
+        for (client_exchange_t const* left = peer.oldest_exchange; left; left = left->next)
+            deadline = deadline ? std::min(deadline, left->deadline) : left->deadline;
+        peer.connection.deadline = deadline;
         return exchange;
     }
 
@@ -2320,18 +2333,45 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return exchange.arguments.options.max_retries ? exchange.arguments.options.max_retries : 3;
     }
 
+    /** Whether the server may act on @p exchange twice to the same effect, per RFC 9110 §9.2.2. */
+    static bool idempotent(client_exchange_t const& exchange) noexcept {
+        ucall_verb_t verb = exchange.arguments.verb;
+        return verb == ucall_verb_get_k || verb == ucall_verb_head_k || verb == ucall_verb_put_k ||
+               verb == ucall_verb_delete_k || verb == ucall_verb_options_k;
+    }
+
+    /** Whether the caller's own @p headers ask to close the connection after the call. */
+    static http_connection_t connection_intent(span<ucall_bytes_view_t const> headers) noexcept {
+        for (ucall_bytes_view_t const header : headers) {
+            if (!valid_view(header)) continue;
+            std::string_view line = text_view(header);
+            std::size_t colon = find(line, ':');
+            if (colon != std::string_view::npos && http_t::equal_ascii_uncased(line.substr(0, colon), "connection") &&
+                http_has_token(line.substr(colon + 1), "close"))
+                return http_connection_t::close_k;
+        }
+        return http_connection_t::keep_alive_k;
+    }
+
+    /** Whether @p peer may pipeline one more call: below the depth, and behind no call that closes
+     *  the connection or, per RFC 9112 §9.3.2, cannot be replayed. */
+    static bool accepts_another_call(client_t const& client, client_peer_t const& peer) noexcept {
+        client_exchange_t const* newest = peer.newest_exchange;
+        return peer.exchanges_in_flight < client.config.max_pipelined_calls &&
+               (!newest || (newest->connection_intent == http_connection_t::keep_alive_k && idempotent(*newest)));
+    }
+
     /** Whether a call older than the one being sent waits for its response. */
     static bool awaits_response(client_peer_t const& peer) noexcept {
         return peer.exchanges_in_flight > (peer.connection.transmitting == transmit_state_t::sending_k ? 1u : 0u);
     }
 
-    /** Whether @p peer carries no call and awaits no operation,
-     *  so a call of any origin may take it. */
+    /** Whether @p peer carries no call, so a call of any origin may take it,
+     *  though an open connection keeps a receive posted meanwhile. */
     static bool vacant(client_peer_t const& peer) noexcept {
         auto stage = peer.connection.stage;
-        return !peer.oldest_exchange && !peer.connection.in_flight() &&
-               (stage == connection_stage_t::idle_k || stage == connection_stage_t::open_k ||
-                stage == connection_stage_t::closed_k);
+        return !peer.oldest_exchange && (stage == connection_stage_t::idle_k || stage == connection_stage_t::open_k ||
+                                         stage == connection_stage_t::closed_k);
     }
 
     /** Takes the waiting call due first that @p peer's connection can carry. */
@@ -2375,7 +2415,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             response->content = response->storage;
             status = ucall_status_success_k;
         }
-        if (!message.keep_alive()) connection.receiving = receive_state_t::ended_k;
+        ++peer.answered_calls;
+        if (!message.keep_alive() || exchange.connection_intent == http_connection_t::close_k)
+            connection.fail(ucall_status_success_k);
         message = {};
         pop_call(peer);
         if (status != ucall_status_success_k || response) return finish_exchange(client, exchange, status, response);
@@ -2386,14 +2428,14 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** Steps an open client connection, answering its next engine request or null, by these rules
      *  in order:
      *  C1 responses: while reading and a sent call awaits, each whole response answers the oldest
-     *     call, a redirect queueing it again as a fresh call; a response without keep-alive, or a
-     *     peer close, ends the receive side.
-     *  C2 requests: while reading, an idle transmit side below `max_pipelined_calls` composes the
-     *     next queued call this peer can carry into `output` and appends it to the FIFO.
+     *     call, a redirect queueing it again as a fresh call; a response without keep-alive, or to
+     *     a call that asked to close, closes the connection.
+     *  C2 requests: while reading, an idle transmit side composes the next queued call this peer
+     *     can carry into `output` and appends it to the FIFO, if `accepts_another_call` allows.
      *  C3 emit: while reading, the next chunk of that request while its send is idle, else a
-     *     receive while a sent call awaits.
-     *  C4 done: an ended receive side closes the connection, losing any call still on the FIFO;
-     *     with the FIFO empty and the side reading, the peer stays open for reuse.
+     *     receive, posted even with no call so a peer close is seen before reuse.
+     *  C4 done: a peer close, or bytes no call asked for, close the connection, losing any call
+     *     still on the FIFO; with the FIFO empty and the side reading, the peer stays open.
      *  C5 loss: `call_lost` settles the calls of the closed connection. */
     static io_request_t* call_open(client_t& client, client_peer_t& peer) noexcept {
         auto& connection = peer.connection;
@@ -2442,10 +2484,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         if (consumed) drop_bytes(input, consumed);
         if (connection.stage != connection_stage_t::open_k) return connection.advance();
-        if (connection.flags & connection_peer_closed_k) connection.receiving = receive_state_t::ended_k;
+        if ((connection.flags & connection_peer_closed_k) || (!peer.oldest_exchange && !input.empty()))
+            connection.receiving = receive_state_t::ended_k;
         if (connection.receiving == receive_state_t::reading_k) {
-            if (connection.transmitting == transmit_state_t::idle_k &&
-                peer.exchanges_in_flight < client.config.max_pipelined_calls)
+            if (connection.transmitting == transmit_state_t::idle_k && accepts_another_call(client, peer))
                 if (auto* exchange = take_waiting_call(client, peer)) {
                     auto result = compose_request(connection, *exchange);
                     if (result != ucall_status_success_k) finish_exchange(client, *exchange, result);
@@ -2455,13 +2497,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                         connection.output_offset = 0;
                     }
                 }
-            if (peer.oldest_exchange) connection.deadline = peer.oldest_exchange->deadline;
             if (connection.transmitting == transmit_state_t::sending_k &&
                 connection.transmit_operation == operation_state_t::idle_k) {
                 if (auto* next = connection.transmit_from(connection.output)) return next;
                 return connection.advance(); // Sealing failed the connection.
             }
-            if (connection.receive_operation == operation_state_t::idle_k && awaits_response(peer))
+            if (connection.receive_operation == operation_state_t::idle_k)
                 return connection.emit(connection.receive_request, io_operation_t::receive_k, connection.received);
             return nullptr;
         }
@@ -2469,19 +2510,26 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return connection.advance();
     }
 
-    /** Settles the calls of @p peer's closed connection, rule C5 of `call_open`: a failed connect
-     *  queues its one call again on the next address or attempt; otherwise the oldest call finishes
-     *  with the failure unless the connection was only lost, and every lost idempotent call queues
-     *  again within its retry budget while the rest finish with
-     *  @c ucall_status_connection_closed_k. */
-    static void call_lost(client_t& client, client_peer_t& peer) noexcept {
-        auto status = peer.connection.status;
-        bool lost = status == ucall_status_connection_closed_k || status == ucall_status_io_k;
+    /** Settles the calls of @p peer's closed connection at @p now, rule C5 of `call_open`:
+     *  - a failed connect queues its one call again on the next address or attempt;
+     *  - a call past its deadline finishes with @c ucall_status_timeout_k;
+     *  - after a close the server announced, every unread call queues again, as RFC 9112 §9.6 bars
+     *    the server from processing it;
+     *  - a lost connection, or one dropped for a later call's deadline, queues its idempotent calls
+     *    again within their retry budget, and its oldest call too when a reused connection read no
+     *    byte of its response, as the server had closed before the request reached it;
+     *  - the oldest of the rest finishes with the connection's failure, and the others with
+     *    @c ucall_status_connection_closed_k. */
+    static void call_lost(client_t& client, client_peer_t& peer, std::uint64_t now) noexcept {
+        connection_t& connection = peer.connection;
+        ucall_status_t status = connection.status;
+        // A timeout with several calls aboard expired one of them and dropped the rest with it.
+        bool const lost = status == ucall_status_connection_closed_k || status == ucall_status_io_k ||
+                          (status == ucall_status_timeout_k && peer.oldest_exchange != peer.newest_exchange);
+        bool const unread = lost && peer.answered_calls && connection.input.empty() && connection.encrypted.empty();
         for (bool oldest = true; peer.oldest_exchange; oldest = false) {
             auto& exchange = pop_call(peer);
-            auto verb = exchange.arguments.verb;
-            bool idempotent = verb == ucall_verb_get_k || verb == ucall_verb_head_k || verb == ucall_verb_put_k ||
-                              verb == ucall_verb_delete_k || verb == ucall_verb_options_k;
+            ucall_status_t outcome = oldest ? status : ucall_status_connection_closed_k;
             if (status == ucall_status_connection_failed_k) {
                 // A connection carries no second call before it opens, so this request never left.
                 exchange.address = exchange.address ? exchange.address->ai_next : nullptr;
@@ -2489,19 +2537,24 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                     exchange.address = exchange.first_address();
                 if (exchange.address) queue_call(client, exchange);
             }
-            else if ((lost || !oldest) && idempotent && exchange.attempts++ < retry_budget(exchange)) {
+            else if (now >= exchange.deadline) outcome = ucall_status_timeout_k;
+            else if (status == ucall_status_success_k ||
+                     ((lost || !oldest) && (idempotent(exchange) || (oldest && unread)) &&
+                      exchange.attempts++ < retry_budget(exchange))) {
                 exchange.address = exchange.first_address(); // Null for a call that rode a connection it never dialed.
                 queue_call(client, exchange);
             }
-            if (exchange.stage != client_exchange_t::stage_t::queued_k)
-                finish_exchange(client, exchange, oldest ? status : ucall_status_connection_closed_k);
+            if (exchange.stage != client_exchange_t::stage_t::queued_k) finish_exchange(client, exchange, outcome);
         }
     }
 
     /** Advances one client peer as `advance_connection` advances a server's,
      *  submitting each request it asks for. */
-    static void step_peer(client_t& client, client_peer_t& peer) noexcept {
+    static void step_peer(client_t& client, client_peer_t& peer, std::uint64_t now) noexcept {
         auto& connection = peer.connection;
+        // A pending receive keeps the deadline it was posted with, which a later call may undercut.
+        if (connection.stage == connection_stage_t::open_k && peer.oldest_exchange && now >= connection.deadline)
+            connection.fail(ucall_status_timeout_k);
         for (;;) {
             auto* next = connection.advance();
             if (!next && connection.stage == connection_stage_t::open_k) next = call_open(client, peer);
@@ -2518,7 +2571,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             if (connection.transmit_operation == operation_state_t::pending_k)
                 client.engine.cancel(connection.transmit_request);
         }
-        if (connection.stage == connection_stage_t::closed_k && peer.oldest_exchange) call_lost(client, peer);
+        if (connection.stage == connection_stage_t::closed_k && peer.oldest_exchange) call_lost(client, peer, now);
     }
     static std::uint64_t client_progress(client_t& client) noexcept {
         auto now = monotonic_ns();
@@ -2527,7 +2580,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         // Completions only record bytes, so peers answer and take calls
         // before the rest look for peers.
         for (auto& peer : client.peers) {
-            step_peer(client, *peer);
+            step_peer(client, *peer, now);
             vacancies += vacant(*peer);
         }
         // The queue runs by deadline, so expiry and the next wake-up read only its front.
@@ -2553,8 +2606,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                         (connection.stage == connection_stage_t::connecting_k ||
                          connection.stage == connection_stage_t::handshake_k ||
                          connection.stage == connection_stage_t::open_k) &&
-                        peer->exchanges_in_flight < client.config.max_pipelined_calls &&
-                        same_peer(client, *peer, exchange)) {
+                        accepts_another_call(client, *peer) && same_peer(client, *peer, exchange)) {
                         carried = true;
                         break;
                     }
@@ -2589,12 +2641,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 }
             }
         }
-        // Calls in flight time out through their connection's deadline, set by the oldest one.
+        // Calls in flight time out through their connection's deadline, the earliest of its calls'.
         for (auto& peer : client.peers)
             if (peer->oldest_exchange)
-                deadline = !deadline ? peer->oldest_exchange->deadline
-                                     : std::min(deadline, peer->oldest_exchange->deadline);
-        for (auto& peer : client.peers) step_peer(client, *peer);
+                deadline = !deadline ? peer->connection.deadline : std::min(deadline, peer->connection.deadline);
+        for (auto& peer : client.peers) step_peer(client, *peer, now);
         return deadline;
     }
     static void client_init(ucall_client_init_t* arguments, allocator_t const& allocator = {}) noexcept {
@@ -2714,6 +2765,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         client.idle = exchange.next;
         exchange.deadline = deadline_after(timeout);
+        exchange.connection_intent = connection_intent({arguments->headers, arguments->headers_count});
         exchange.attempts = exchange.redirects = 0;
         queue_call(client, exchange);
         ++client.admitted;

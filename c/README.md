@@ -46,7 +46,9 @@ All byte views carry an explicit length, including empty and binary values.
 
 HTTP calls support connection reuse, pipelining, chunked receive framing, redirects, and request deadlines.
 A server interface's `max_pipelined_requests` and a client's `max_pipelined_calls` bound the requests one connection carries at once; zero means one, and replies leave in request order.
+No call is pipelined behind one that is not idempotent or that sends `Connection: close`.
 A pipelined connection lost mid-flight retries its unanswered idempotent calls and finishes the rest with `ucall_status_connection_closed_k`.
+Calls a server left unread when it announced a close are sent again on a new connection.
 Servers support immutable routes, size and latency based application batching, retained request views, and content and error replies.
 XX and IK servers authenticate clients; KK clients can connect to a separately configured peer, while the server interface cannot specify KK's preknown initiator key.
 `ucall_noise_key_generate()` draws a static keypair from the operating system's entropy, reporting `ucall_status_io_k` when it is refused, and `ucall_noise_key_derive()` recovers the public key of a stored private key.

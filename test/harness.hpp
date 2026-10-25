@@ -70,7 +70,7 @@
 #include <netinet/in.h>  // `sockaddr_in`
 #include <netinet/tcp.h> // `TCP_NODELAY`
 #include <poll.h>        // `poll`
-#include <sys/socket.h>  // `socket`, `connect`, `send`, `recv`
+#include <sys/socket.h>  // `socket`, `connect`, `send`, `recv`, `accept`
 #include <unistd.h>      // `close`
 #endif
 
@@ -618,6 +618,47 @@ inline wire_response_t read_response(raw_client_t& client, std::size_t offset) {
         if (client.read(client.received.size() + 1, deadline) != read_end_t::filled_k) return response;
     }
 }
+
+/** A loopback TCP listener on an ephemeral port, for cases that script a server's bytes. */
+struct raw_listener_t {
+    int descriptor = -1;
+
+    /** The bound `127.0.0.1:port`, empty when listening failed. */
+    std::string address;
+
+    raw_listener_t() {
+        descriptor = ::socket(AF_INET, SOCK_STREAM, 0);
+        if (descriptor < 0) return;
+        sockaddr_in bound {};
+        bound.sin_family = AF_INET;
+        bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        socklen_t bound_length = sizeof(bound);
+        if (::bind(descriptor, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) == 0 &&
+            ::getsockname(descriptor, reinterpret_cast<sockaddr*>(&bound), &bound_length) == 0 &&
+            ::listen(descriptor, 4) == 0)
+            address = fmt::format("127.0.0.1:{}", ntohs(bound.sin_port));
+    }
+    raw_listener_t(raw_listener_t const&) = delete;
+    raw_listener_t& operator=(raw_listener_t const&) = delete;
+    ~raw_listener_t() noexcept {
+        if (descriptor >= 0) ::close(descriptor);
+    }
+
+    /** Accepts the next connection into @p client without Nagle's delay, or answers false once
+     *  @p deadline passes. */
+    [[nodiscard]] bool accept(raw_client_t& client, raw_client_t::deadline_t deadline) noexcept {
+        client.close();
+        auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline -
+                                                                                std::chrono::steady_clock::now());
+        pollfd watched {descriptor, POLLIN, 0};
+        if (left.count() < 0 || ::poll(&watched, 1, static_cast<int>(left.count()) + 1) <= 0) return false;
+        client.descriptor = ::accept(descriptor, nullptr, nullptr);
+        int enabled = 1;
+        if (client.descriptor >= 0)
+            ::setsockopt(client.descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled));
+        return client.descriptor >= 0;
+    }
+};
 
 /** Both ends of a loopback TCP connection, closed with the pair unless a case takes one. */
 struct loopback_pair_t {

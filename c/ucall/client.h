@@ -23,8 +23,9 @@ typedef struct ucall_client_config_t {
     size_t max_concurrent_connections;
 
     /** Calls one connection may carry before the next call opens or waits for another; zero means
-     *  one. A connection lost mid-pipeline retries its unanswered idempotent calls and fails the
-     *  rest with @c ucall_status_connection_closed_k. */
+     *  one. No call follows one that is not idempotent or that asks to close the connection. A
+     *  connection lost mid-pipeline retries its unanswered idempotent calls and fails the rest with
+     *  @c ucall_status_connection_closed_k. Calls a closing server never read are sent again. */
     size_t max_pipelined_calls;
 
     /** Time budget for establishing a connection. Default: 5'000'000. */

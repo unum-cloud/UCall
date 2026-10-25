@@ -11,10 +11,12 @@
 #include <cstdlib> // `std::quick_exit`
 #include <cstring> // `std::memcmp`, `std::strlen`
 
+#include <algorithm>   // `std::max`
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic`
 #include <charconv>    // `std::from_chars`
 #include <chrono>      // `std::chrono::steady_clock`
+#include <functional>  // `std::function`
 #include <future>      // `std::promise`
 #include <mutex>       // `std::mutex`, `std::lock_guard`
 #include <string>      // `std::string`
@@ -64,7 +66,8 @@ struct fixture_config_t {
 };
 
 /**
- *  @brief A loopback server with echo, gated, and header-lookup routes, and a client to call it.
+ *  @brief A loopback server with echo, gated, header-lookup, and bodiless status routes, and a
+ *      client to call it.
  *
  *  Cases either poll both from their own thread, or serve every loop in the background while raw
  *  clients block on the wire.
@@ -150,6 +153,24 @@ struct fixture_t {
         fixture.failures += expect(outcome.status == ucall_status_success_k);
     }
 
+    /** Replies with no body and the status the `{code}` segment names. */
+    static void status_only(ucall_received_http_request_t request, void* context) {
+        auto& fixture = *static_cast<fixture_t*>(context);
+        fixture.dispatched.fetch_add(1, std::memory_order_relaxed);
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t code {};
+        ucall_server_request_path_parameter_t get {fixture.server, &outcome, request, uc::bytes_view("code"), &code};
+        ucall_server_request_path_parameter(&get);
+        fixture.failures += expect(outcome.status == ucall_status_success_k);
+        ucall_http_status_t status {};
+        std::from_chars(reinterpret_cast<char const*>(code.data),
+                        reinterpret_cast<char const*>(code.data) + code.length, status);
+        ucall_server_reply_content_t reply {fixture.server, &outcome, request, nullptr, 0, {}, status};
+        ucall_server_reply_content(&reply);
+        fixture.failures += expect(outcome.status == ucall_status_success_k, "reply {}: {}", status,
+                                   ucall_status_name(outcome.status));
+    }
+
     std::size_t held_count() {
         std::lock_guard lock {held_mutex};
         return held.size();
@@ -192,8 +213,8 @@ struct fixture_t {
         ucall_server_init(&init);
         if ((status = outcome.status) != ucall_status_success_k) return;
         using route_t = std::pair<char const*, ucall_received_http_request_callback_t>;
-        for (auto [route, callback] :
-             {route_t {"/echo/{id}", echo}, route_t {"/gate", gate}, route_t {"/headers", lookup}}) {
+        for (auto [route, callback] : {route_t {"/echo/{id}", echo}, route_t {"/gate", gate},
+                                       route_t {"/headers", lookup}, route_t {"/status/{code}", status_only}}) {
             ucall_server_add_http_endpoint_t add {server,           &outcome, uc::bytes_view(route),
                                                   ucall_verb_any_k, callback, this};
             ucall_server_add_http_endpoint(&add);
@@ -466,8 +487,9 @@ static std::size_t await_held(fixture_t& fixture, std::size_t count) {
     return failures;
 }
 
-/** Eight calls at depth four share one connection: the server holds four at once, which lockstep
- *  calls never reach, and the responses to replies given in reverse complete in call order. */
+/** Eight idempotent calls at depth four share one connection: the server holds four at once,
+ *  which lockstep calls never reach, and the responses to replies given in reverse complete in
+ *  call order. */
 static case_result_t pipelined_calls(ucall_security_mode_t security) {
     fixture_t fixture {{.security = security, .pipelined_requests = 4, .pipelined_calls = 4}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
@@ -483,7 +505,7 @@ static case_result_t pipelined_calls(ucall_security_mode_t security) {
         call.client = fixture.client;
         call.outcome = &outcome;
         call.url = uc::bytes_view(gate_url);
-        call.verb = ucall_verb_post_k;
+        call.verb = ucall_verb_put_k;
         call.body = uc::bytes_view(bodies[i]);
         call.context = &bodies[i];
         call.options.security = security;
@@ -508,8 +530,8 @@ static case_result_t pipelined_calls(ucall_security_mode_t security) {
 static case_result_t test_pipelined_calls_plain() { return pipelined_calls(ucall_security_mode_none_k); }
 static case_result_t test_pipelined_calls_noise_xx() { return pipelined_calls(ucall_security_mode_noise_xx_k); }
 
-/** The server closes after its second response with a POST and a GET still on the connection: the
- *  POST finishes as closed without reaching the server, and the GET is retried and answered. */
+/** A caller's `Connection: close` on the second call keeps the POST and GET behind it off that
+ *  connection: both wait for the next one and are answered there. */
 static case_result_t test_pipelined_call_loss() {
     fixture_t fixture {{.pipelined_requests = 4, .pipelined_calls = 4}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
@@ -524,7 +546,7 @@ static case_result_t test_pipelined_call_loss() {
     };
     std::array<planned_call_t, 4> plan {{{&gate_url, ucall_verb_get_k, ucall_status_success_k},
                                          {&gate_url, ucall_verb_get_k, ucall_status_success_k},
-                                         {&post_url, ucall_verb_post_k, ucall_status_connection_closed_k},
+                                         {&post_url, ucall_verb_post_k, ucall_status_success_k},
                                          {&get_url, ucall_verb_get_k, ucall_status_success_k}}};
     for (auto& planned : plan) {
         ucall_outcome_t outcome {};
@@ -542,7 +564,7 @@ static case_result_t test_pipelined_call_loss() {
         failures += expect(outcome.status == ucall_status_success_k);
     }
     failures += await_held(fixture, 2);
-    // The server stops reading at the closing request; meanwhile the last two calls leave too.
+    // Neither call behind the closing one leaves before its response.
     for (steady_clock::time_point const settled = steady_clock::now() + 100ms; steady_clock::now() < settled;) {
         ucall_completed_call_t completed {};
         failures += expect(!fixture.poll(completed), "a call completed early");
@@ -556,7 +578,49 @@ static case_result_t test_pipelined_call_loss() {
                            ucall_status_name(completed.outcome.status));
         if (completed.response) failures += check_response(completed.response, {});
     }
-    failures += expect(fixture.dispatched.load() == 1, "{} echo requests were dispatched", fixture.dispatched.load());
+    failures += expect(fixture.dispatched.load() == 2, "{} echo requests were dispatched", fixture.dispatched.load());
+    return failures + fixture.stop();
+}
+
+/** 204 and 304 replies, which UCall sends without `content-length`, keep the connection: calls
+ *  pipelined ahead of and behind them all complete over the one connection the server accepted. */
+static case_result_t test_bodiless_responses_keep_connection() {
+    fixture_t fixture {{.pipelined_requests = 4, .pipelined_calls = 4}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    struct planned_status_t {
+        std::string url;
+        ucall_http_status_t expected;
+    };
+    std::array<planned_status_t, 5> plan {{{fixture.url + "/echo/1", ucall_http_status_ok_k},
+                                           {fixture.url + "/status/204", ucall_http_status_no_content_k},
+                                           {fixture.url + "/echo/2", ucall_http_status_ok_k},
+                                           {fixture.url + "/status/304", ucall_http_status_not_modified_k},
+                                           {fixture.url + "/echo/3", ucall_http_status_ok_k}}};
+    ucall_outcome_t outcome {};
+    for (auto& planned : plan) {
+        ucall_client_call_t call {};
+        call.client = fixture.client;
+        call.outcome = &outcome;
+        call.url = uc::bytes_view(planned.url);
+        call.verb = ucall_verb_get_k;
+        call.context = &planned;
+        ucall_client_call(&call);
+        failures += expect(outcome.status == ucall_status_success_k);
+    }
+    for (auto const& planned : plan) {
+        auto completed = fixture.wait();
+        failures += expect(completed.context == &planned && completed.response &&
+                               ucall_client_response_status(completed.response) == planned.expected,
+                           "call {} completed {}: {}", &planned - plan.data(),
+                           static_cast<planned_status_t const*>(completed.context) - plan.data(),
+                           ucall_status_name(completed.outcome.status));
+        if (completed.response) ucall_client_response_free(completed.response);
+    }
+    ucall_event_loop_statistics_t counters {};
+    ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &counters};
+    ucall_server_event_loop_statistics(&query);
+    failures += expect(counters.accepts == 1, "the server accepted {} connections", counters.accepts);
     return failures + fixture.stop();
 }
 
@@ -808,6 +872,351 @@ static case_result_t test_backend_parity(random_generator_t& generator) {
 #endif // UCALL_OS_POSIX_
 #pragma endregion Raw Clients
 
+#pragma region Scripted Servers
+#if UCALL_OS_POSIX_
+
+/** The length of the first whole request in @p wire, framed by its `content-length`, or zero. */
+static std::size_t request_length(std::string_view wire) {
+    auto const headers_end = wire.find("\r\n\r\n");
+    if (headers_end == std::string_view::npos) return 0;
+    std::size_t body_length = 0;
+    if (auto field = wire.substr(0, headers_end + 2).find("\r\ncontent-length: "); field != std::string_view::npos)
+        std::from_chars(wire.data() + field + 18, wire.data() + headers_end, body_length);
+    std::size_t const length = headers_end + 4 + body_length;
+    return wire.size() >= length ? length : 0;
+}
+
+static std::size_t whole_requests(std::string_view wire) {
+    std::size_t count = 0;
+    for (std::size_t length; (length = request_length(wire)); wire.remove_prefix(length)) ++count;
+    return count;
+}
+
+/** The target of @p request, between its verb and its version. */
+static std::string_view request_target(std::string_view request) {
+    auto const start = request.find(' ') + 1;
+    return request.substr(start, request.find(' ', start) - start);
+}
+
+/** What a scripted server does with a connection once it has written an answer. */
+enum class after_answer_t { keep_open_k, close_k };
+
+struct scripted_answer_t {
+    std::string bytes {};
+    after_answer_t after = after_answer_t::keep_open_k;
+};
+
+/** A 200 carrying @p body, announcing `connection: close` when @p after closes. */
+static scripted_answer_t answer_ok(std::string_view body, after_answer_t after = after_answer_t::keep_open_k) {
+    return {fmt::format("HTTP/1.1 200 OK\r\ncontent-length: {}\r\n{}\r\n{}", body.size(),
+                        after == after_answer_t::close_k ? "connection: close\r\n" : "", body),
+            after};
+}
+
+/**
+ *  @brief A loopback server thread that answers each whole request as its script says, for cases
+ *      whose server behaves in ways UCall's own never does.
+ *
+ *  It serves one connection at a time. Once a request arrives it waits @c pause for any the client
+ *  pipelines behind it. After an answer that closes, it shuts its side and drains the client until
+ *  it closes too, so the close is never a reset.
+ */
+struct scripted_server_t {
+    using script_t =
+        std::function<scripted_answer_t(std::string_view request, std::size_t connection, std::size_t index)>;
+    raw_listener_t listener;
+    script_t script;
+    std::chrono::milliseconds pause {};
+    random_generator_t generator;
+
+    /** Whole requests read on each connection, in accept order; read them after @c stop. */
+    std::vector<std::size_t> requests_per_connection;
+
+    /** The most requests read and not yet answered at once; read it after @c stop. */
+    std::size_t deepest = 0;
+
+    std::atomic<bool> stopping {false};
+    std::thread thread;
+
+    scripted_server_t(random_generator_t& seeds, script_t script, std::chrono::milliseconds pause = {})
+        : script(std::move(script)), pause(pause), generator(seeds()) {
+        if (!listener.address.empty()) thread = std::thread {[this] { serve(); }};
+    }
+    ~scripted_server_t() { stop(); }
+
+    std::string url(std::string_view target) const { return "http://" + listener.address + std::string {target}; }
+
+    void stop() {
+        stopping.store(true, std::memory_order_release);
+        if (thread.joinable()) thread.join();
+    }
+
+    void serve() {
+        auto running = [&] { return !stopping.load(std::memory_order_acquire); };
+        while (running()) {
+            raw_client_t peer;
+            if (!listener.accept(peer, steady_clock::now() + 20ms)) continue;
+            std::size_t const connection = requests_per_connection.size();
+            requests_per_connection.push_back(0);
+            std::size_t answered_bytes = 0, answered = 0;
+            for (bool open = true; open && running();) {
+                if (!request_length(std::string_view {peer.received}.substr(answered_bytes))) {
+                    auto const end = peer.read(peer.received.size() + 1, steady_clock::now() + 20ms);
+                    open = end == read_end_t::filled_k || end == read_end_t::timed_out_k;
+                    continue;
+                }
+                for (auto const until = steady_clock::now() + pause;
+                     peer.read(peer.received.size() + 1, until) == read_end_t::filled_k;) {}
+                deepest = std::max(deepest, whole_requests(std::string_view {peer.received}.substr(answered_bytes)));
+                for (std::size_t length;
+                     open && (length = request_length(std::string_view {peer.received}.substr(answered_bytes)));) {
+                    auto const answer = script(std::string_view {peer.received}.substr(answered_bytes, length),
+                                               connection, answered++);
+                    answered_bytes += length;
+                    if (!answer.bytes.empty())
+                        open = peer.write(uc::byte_span(answer.bytes), answer.bytes.size(), generator,
+                                          steady_clock::now() + 5s);
+                    if (answer.after != after_answer_t::close_k) continue;
+                    ::shutdown(peer.descriptor, SHUT_WR);
+                    for (auto const until = steady_clock::now() + 5s;
+                         running() && steady_clock::now() < until &&
+                         peer.read_until_close(steady_clock::now() + 20ms) == read_end_t::timed_out_k;) {}
+                    open = false;
+                }
+            }
+            requests_per_connection[connection] = whole_requests(peer.received);
+        }
+    }
+};
+
+/** One call a case sends a scripted server, and the body of the 200 that must answer it. */
+struct scripted_call_t {
+    std::string url {};
+    ucall_verb_t verb = ucall_verb_get_k;
+    std::string_view expected {};
+    ucall_bytes_view_t header {};
+    std::size_t timeout_microseconds = 0;
+};
+
+static std::size_t submit(fixture_t& fixture, scripted_call_t& planned) {
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(planned.url);
+    call.verb = planned.verb;
+    call.context = &planned;
+    call.headers = planned.header.length ? &planned.header : nullptr;
+    call.headers_count = planned.header.length ? 1 : 0;
+    call.options.timeout_microseconds = planned.timeout_microseconds;
+    ucall_client_call(&call);
+    return expect(outcome.status == ucall_status_success_k, "submitting {}: {}", planned.url,
+                  ucall_status_name(outcome.status));
+}
+
+/** Checks a completed call is a 200 carrying its own planned body, then frees the response. */
+static std::size_t check_answer(ucall_completed_call_t const& completed) {
+    auto const* planned = static_cast<scripted_call_t const*>(completed.context);
+    std::size_t failures = expect(planned && completed.outcome.status == ucall_status_success_k && completed.response,
+                                  "{} completed {}", planned ? planned->url : "no call",
+                                  ucall_status_name(completed.outcome.status));
+    if (!completed.response) return failures;
+    ucall_outcome_t outcome {};
+    ucall_bytes_view_t body {};
+    ucall_client_response_body_t get {completed.response, &outcome, &body};
+    ucall_client_response_body(&get);
+    std::string_view const text {reinterpret_cast<char const*>(body.data), body.length};
+    auto const status = ucall_client_response_status(completed.response);
+    failures += expect(status == ucall_http_status_ok_k && planned && text == planned->expected, "{} answered {} {:?}",
+                       planned ? planned->url : "no call", status, text);
+    ucall_client_response_free(completed.response);
+    return failures;
+}
+
+/** Submits every call of @p plan in order, then checks each answer in whatever order they come. */
+template <std::size_t count_>
+static std::size_t exchange_all(fixture_t& fixture, std::array<scripted_call_t, count_>& plan) {
+    std::size_t failures = 0;
+    for (auto& planned : plan) failures += submit(fixture, planned);
+    for (std::size_t i = 0; i != count_ && !failures; ++i) failures += check_answer(fixture.wait());
+    return failures;
+}
+
+/** Answers every request with its own target, closing when the request asks to. */
+static scripted_answer_t answer_target(std::string_view request, std::size_t, std::size_t) {
+    bool const closes = request.find("\r\nconnection: close\r\n") != std::string_view::npos;
+    return answer_ok(request_target(request), closes ? after_answer_t::close_k : after_answer_t::keep_open_k);
+}
+
+/** A HEAD answered without `content-length` keeps the connection for the GET behind it. */
+static case_result_t test_lengthless_head_keeps_connection(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {generator,
+                              [](std::string_view request, std::size_t connection, std::size_t index) {
+                                  return request.starts_with("HEAD ") ? scripted_answer_t {"HTTP/1.1 200 OK\r\n\r\n"}
+                                                                      : answer_target(request, connection, index);
+                              },
+                              100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 2> plan {{{server.url("/head"), ucall_verb_head_k, ""}, {server.url("/get")}}};
+    plan[1].expected = "/get";
+    std::size_t failures = exchange_all(fixture, plan);
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {2}),
+                       "{} connections carried the calls", server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
+/** A caller's `Connection: close` on the second of four calls keeps the last two off its
+ *  connection: they leave on the next one, and every call is answered. */
+static case_result_t test_caller_close_mid_pipeline(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {generator, answer_target, 100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 4> plan {
+        {{server.url("/a"), ucall_verb_get_k, "/a"},
+         {server.url("/b"), ucall_verb_get_k, "/b", uc::bytes_view("Connection: close")},
+         {server.url("/c"), ucall_verb_get_k, "/c"},
+         {server.url("/d"), ucall_verb_get_k, "/d"}}};
+    std::size_t failures = exchange_all(fixture, plan);
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {2, 2}),
+                       "{} connections, the first carrying {} requests", server.requests_per_connection.size(),
+                       server.requests_per_connection.empty() ? 0 : server.requests_per_connection[0]);
+    return failures + fixture.stop();
+}
+
+/** A POST waits for the response to the POST before it, per RFC 9112 §9.3.2, rather than
+ *  pipelining behind it. */
+static case_result_t test_post_waits_behind_post(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {generator, answer_target, 100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 2> plan {
+        {{server.url("/first"), ucall_verb_post_k, "/first"}, {server.url("/second"), ucall_verb_post_k, "/second"}}};
+    std::size_t failures = exchange_all(fixture, plan);
+    server.stop();
+    failures += expect(server.deepest == 1, "the server held {} requests at once", server.deepest);
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {2}), "{} connections",
+                       server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
+/** A call with a short timeout behind one with a long timeout times out on its own deadline, and
+ *  the longer call is answered on a fresh connection. */
+static case_result_t test_short_timeout_behind_long(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {generator, [](std::string_view request, std::size_t connection, std::size_t index) {
+                                  return connection ? answer_target(request, connection, index) : scripted_answer_t {};
+                              }};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 2> plan {{{server.url("/long"), ucall_verb_get_k, "/long", {}, 3'000'000},
+                                          {server.url("/short"), ucall_verb_get_k, "/short", {}, 200'000}}};
+    // The queue runs by deadline, so the short call follows only once the long one has left.
+    std::size_t failures = submit(fixture, plan[0]);
+    for (steady_clock::time_point const settled = steady_clock::now() + 100ms; steady_clock::now() < settled;) {
+        ucall_completed_call_t completed {};
+        failures += expect(!fixture.poll(completed), "a call completed early");
+    }
+    failures += submit(fixture, plan[1]);
+    auto const submitted = steady_clock::now();
+    auto completed = fixture.wait();
+    auto const elapsed = steady_clock::now() - submitted;
+    failures += expect(completed.context == &plan[1] && completed.outcome.status == ucall_status_timeout_k &&
+                           elapsed >= 200ms && elapsed < 1s,
+                       "{} completed {} after {} ms", completed.context == &plan[1] ? "the short call" : "another",
+                       ucall_status_name(completed.outcome.status),
+                       std::chrono::duration_cast<std::chrono::milliseconds>(elapsed).count());
+    if (completed.response) ucall_client_response_free(completed.response);
+    if (!failures) failures += check_answer(fixture.wait());
+    return failures + fixture.stop();
+}
+
+/** A keep-alive connection the server closes while idle is noticed, so the POST after it opens a
+ *  new one; and a POST whose reused connection closes before any byte of its response is sent
+ *  again. */
+static case_result_t test_stale_idle_connection(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {
+        generator, [](std::string_view request, std::size_t connection, std::size_t index) -> scripted_answer_t {
+            if (connection == 0) return {answer_target(request, connection, index).bytes, after_answer_t::close_k};
+            if (connection == 1 && index == 1) return {{}, after_answer_t::close_k};
+            return answer_target(request, connection, index);
+        }};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 3> plan {{{server.url("/first"), ucall_verb_get_k, "/first"},
+                                          {server.url("/second"), ucall_verb_post_k, "/second"},
+                                          {server.url("/third"), ucall_verb_post_k, "/third"}}};
+    std::size_t failures = submit(fixture, plan[0]);
+    failures += check_answer(fixture.wait());
+    for (steady_clock::time_point const settled = steady_clock::now() + 200ms; steady_clock::now() < settled;) {
+        ucall_completed_call_t completed {};
+        failures += expect(!fixture.poll(completed), "a call completed unasked");
+    }
+    for (std::size_t i = 1; i != plan.size(); ++i) {
+        failures += submit(fixture, plan[i]);
+        failures += check_answer(fixture.wait());
+    }
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {1, 2, 1}), "{} connections",
+                       server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
+/** The server closes after answering the first of two pipelined calls: the POST it never read is
+ *  sent again on a new connection, per RFC 9112 §9.6, and answered. */
+static case_result_t test_server_close_mid_pipeline(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {generator,
+                              [](std::string_view request, std::size_t connection, std::size_t index) {
+                                  return connection ? answer_target(request, connection, index)
+                                                    : answer_ok(request_target(request), after_answer_t::close_k);
+                              },
+                              100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 2> plan {
+        {{server.url("/first"), ucall_verb_get_k, "/first"}, {server.url("/second"), ucall_verb_post_k, "/second"}}};
+    std::size_t failures = exchange_all(fixture, plan);
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {2, 1}), "{} connections",
+                       server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
+/** A redirect in the middle of a pipeline, sent with `connection: close`, is followed, and the POST
+ *  behind it is sent again on the next connection; each call gets its own answer. */
+static case_result_t test_redirect_mid_pipeline(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_calls = 4}};
+    scripted_server_t server {generator,
+                              [](std::string_view request, std::size_t connection, std::size_t index) {
+                                  if (request_target(request) != "/moved")
+                                      return answer_target(request, connection, index);
+                                  return scripted_answer_t {"HTTP/1.1 302 Found\r\nlocation: /landed\r\n"
+                                                            "content-length: 0\r\nconnection: close\r\n\r\n",
+                                                            after_answer_t::close_k};
+                              },
+                              100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    std::array<scripted_call_t, 3> plan {{{server.url("/first"), ucall_verb_get_k, "/first"},
+                                          {server.url("/moved"), ucall_verb_get_k, "/landed"},
+                                          {server.url("/last"), ucall_verb_post_k, "/last"}}};
+    std::size_t failures = exchange_all(fixture, plan);
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {3, 2}), "{} connections",
+                       server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
+#endif // UCALL_OS_POSIX_
+#pragma endregion Scripted Servers
+
 #pragma region Engines
 #if UCALL_OS_POSIX_
 
@@ -964,7 +1373,15 @@ int main(int argc, char** argv) {
     run_test(totals, "test_pipelined_calls_plain", test_pipelined_calls_plain);
     run_test(totals, "test_pipelined_calls_noise_xx", test_pipelined_calls_noise_xx);
     run_test(totals, "test_pipelined_call_loss", test_pipelined_call_loss);
+    run_test(totals, "test_bodiless_responses_keep_connection", test_bodiless_responses_keep_connection);
 #if UCALL_OS_POSIX_
+    run_test(totals, "test_lengthless_head_keeps_connection", test_lengthless_head_keeps_connection);
+    run_test(totals, "test_caller_close_mid_pipeline", test_caller_close_mid_pipeline);
+    run_test(totals, "test_post_waits_behind_post", test_post_waits_behind_post);
+    run_test(totals, "test_short_timeout_behind_long", test_short_timeout_behind_long);
+    run_test(totals, "test_stale_idle_connection", test_stale_idle_connection);
+    run_test(totals, "test_server_close_mid_pipeline", test_server_close_mid_pipeline);
+    run_test(totals, "test_redirect_mid_pipeline", test_redirect_mid_pipeline);
     run_test(totals, "test_pipelined_delivery", test_pipelined_delivery);
     run_test(totals, "test_fragmented_headers_delivery", test_fragmented_headers_delivery);
     run_test(totals, "test_megabyte_echo_delivery", test_megabyte_echo_delivery);

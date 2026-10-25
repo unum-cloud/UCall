@@ -197,7 +197,7 @@ def test_batch_replies_in_reverse_arrive_in_order(backend, loopback, serving):
     server = ucall.Server(loopback(connections=1, pipelined_requests=4), backend=backend)
     batches = []
 
-    @server.batch("/batch", min_size=4, max_size=4, max_latency_us=5_000_000)
+    @server.batch("/batch", "PUT", min_size=4, max_size=4, max_latency_us=5_000_000)
     def reverse(requests: list[ucall.Request]):
         batches.append(len(requests))
         for request in reversed(requests):
@@ -210,7 +210,7 @@ def test_batch_replies_in_reverse_arrive_in_order(backend, loopback, serving):
     with serving(server) as base:
         client = ucall.Client(connections=1, pipelined_calls=4, calls=4, backend=backend)
         for index in range(4):
-            client.submit("POST", f"{base}/batch", str(index).encode(), context=index)
+            client.submit("PUT", f"{base}/batch", str(index).encode(), context=index)
         finished = []
         while len(finished) != 4:
             finished += client.take_completed(timeout_us=1_000_000)

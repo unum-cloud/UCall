@@ -1284,7 +1284,7 @@ mod tests {
         };
         let observed = Arc::clone(&sizes);
         let endpoint = server
-            .batch("/score", Verb::Post, batching, move |batch: Batch| {
+            .batch("/score", Verb::Put, batching, move |batch: Batch| {
                 observed.lock().unwrap().push(batch.len());
                 for request in batch.into_iter().rev() {
                     let body = request.body().to_vec();
@@ -1304,10 +1304,14 @@ mod tests {
                 })
                 .unwrap();
                 for context in 0..4u64 {
-                    let call = CallRequest::post(
-                        format!("http://{address}/score"),
-                        vec![b'0' + context as u8],
-                    );
+                    // PUT, because a POST never pipelines behind another one.
+                    let call = CallRequest {
+                        verb: Verb::Put,
+                        ..CallRequest::post(
+                            format!("http://{address}/score"),
+                            vec![b'0' + context as u8],
+                        )
+                    };
                     client.submit(call, context).unwrap();
                 }
                 let mut completed: [Completed; 4] = Default::default();

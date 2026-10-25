@@ -192,6 +192,7 @@ UCall's Python bindings parse and convert both parameters in C before calling th
 
 How much does pipelining raise the throughput of a few connections, and what does it cost in latency?
 The server's `--pipelined-requests` must be at least the driver's `--pipeline-depth`, or the server reads a connection's later requests only as earlier ones finish.
+The driver sends PUT, because a client never pipelines behind a POST, which RFC 9112 §9.3.2 forbids replaying.
 Restart the server for every point, so its counters cover that point alone:
 
 ```sh
@@ -201,7 +202,7 @@ for connections in 1 4 64; do
             --pipelined-requests $depth --stats json &
         server=$!
         sleep 1
-        taskset -c 8 build_release/ucall_bench_http --url http://127.0.0.1:8545/echo --bytes 1024 --verify-echo \
+        taskset -c 8 build_release/ucall_bench_http --url http://127.0.0.1:8545/echo --verb put --bytes 1024 --verify-echo \
             --threads 1 --connections $connections --in-flight $((connections * depth)) --pipeline-depth $depth \
             --warmup 1s --time-limit 8s --format json
         kill -INT $server && wait $server
@@ -397,6 +398,7 @@ Adding `--server-key`, the server's public key in the same spelling, switches th
 
 `--close` requests connection closure after every response, measuring connection churn separately from keep-alive reuse.
 `--pipeline-depth N` lets each connection carry up to `N` calls before their responses arrive, through the client's `max_pipelined_calls`; the default of 1 waits a round trip per call.
+Only idempotent calls pipeline: a POST, or a call whose headers close the connection, waits for every call ahead of it.
 The server answers pipelined requests in order at any depth, and its interface's `max_pipelined_requests` decides how many of them it dispatches at once.
 
 ## Open-Loop Load

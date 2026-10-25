@@ -563,10 +563,12 @@ struct http {
         sz_size_t written = 0;
         fold_kit_t::uncased_fold(text.data(), text.size(), text.data(), &written, nullptr);
     }
+
+    /** Whether the comma-separated list @p text names @p token, in any letter case. */
     static bool http_has_token(std::string_view text, std::string_view token) noexcept {
         while (!text.empty()) {
             std::size_t end = find(text, ',');
-            if (equal(trim_http(text.substr(0, end)), token)) return true;
+            if (equal_ascii_uncased(trim_http(text.substr(0, end)), token)) return true;
             if (end == std::string_view::npos) break;
             text.remove_prefix(end + 1);
         }
@@ -717,14 +719,16 @@ struct http {
             message.headers_length = end + 4;
             message.cursor = message.headers_length;
             message.framing = has_transfer ? http_framing_t::chunked_k : http_framing_t::length_k;
-            if (role != http_role_t::request_k && !has_transfer && !has_length) {
-                message.framing = http_framing_t::until_close_k;
-                message.connection = http_connection_t::close_k;
-            }
-            if (role == http_role_t::head_response_k || (message.status >= 100 && message.status < 200) ||
-                message.status == 204 || message.status == 304) {
+            bool const bodiless = role == http_role_t::head_response_k ||
+                                  (message.status >= 100 && message.status < 200) || message.status == 204 ||
+                                  message.status == 304;
+            if (bodiless) {
                 message.framing = http_framing_t::length_k;
                 message.content_length = 0;
+            }
+            else if (role != http_role_t::request_k && !has_transfer && !has_length) {
+                message.framing = http_framing_t::until_close_k;
+                message.connection = http_connection_t::close_k;
             }
         }
         if (message.framing == http_framing_t::until_close_k) return http_parse_t::incomplete_k;

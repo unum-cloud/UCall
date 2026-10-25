@@ -57,7 +57,7 @@ static void sum(ucall_received_http_request_t request, void* context) {
 int main(int argc, char** argv) {
     uc::tools::server_t application {};
     if (int const result = application.init(argc, argv)) return result < 0 ? 1 : 0;
-    if (!application.add_endpoint("/echo", ucall_verb_post_k, echo, &application.server) ||
+    if (!application.add_endpoint("/echo", ucall_verb_any_k, echo, &application.server) ||
         !application.add_endpoint("/sum", ucall_verb_get_k, sum, &application.server))
         return 1;
     return application.run();
