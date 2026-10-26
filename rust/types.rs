@@ -487,7 +487,7 @@ impl Verb {
 
 /// The I/O implementation a server or client runs on.
 ///
-/// Prints and parses its stable name, like "linux-uring700".
+/// Prints and parses its stable name, like "linux-uring618".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub enum Backend {
     /// The best native backend this machine and build offer.
@@ -495,12 +495,12 @@ pub enum Backend {
     Automatic,
     /// Portable readiness polling on any POSIX system.
     POSIX,
-    /// Linux readiness polling over `epoll`.
-    LinuxEpoll,
+    /// Linux readiness polling over `epoll`, reading files through Linux AIO.
+    LinuxEpollAIO,
     /// Linux io_uring as kernel 6.12 offers it.
     LinuxURing612,
-    /// Linux io_uring as kernel 7.0 offers it.
-    LinuxURing700,
+    /// Linux io_uring as kernel 6.18 offers it.
+    LinuxURing618,
     /// macOS and FreeBSD readiness polling over `kqueue`.
     MacOSKqueue,
     /// Windows I/O completion ports.
@@ -515,9 +515,9 @@ impl Backend {
     pub(crate) fn from_raw(value: ucall_io_backend_t) -> Self {
         match value {
             1 => Backend::POSIX,
-            2 => Backend::LinuxEpoll,
+            2 => Backend::LinuxEpollAIO,
             3 => Backend::LinuxURing612,
-            4 => Backend::LinuxURing700,
+            4 => Backend::LinuxURing618,
             5 => Backend::MacOSKqueue,
             6 => Backend::WindowsIOCP,
             _ => Backend::Automatic,
@@ -683,14 +683,17 @@ mod tests {
     #[test]
     fn names_come_from_the_library() {
         assert_eq!(Status::OutOfMemory.to_string(), "out-of-memory");
-        assert_eq!(Backend::LinuxURing700.to_string(), "linux-uring700");
+        assert_eq!(Backend::LinuxURing618.to_string(), "linux-uring618");
         assert_eq!(CPUClass::Automatic.to_string(), "automatic");
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
     fn names_parse_back_and_unknown_ones_fail() {
-        assert_eq!("linux-epoll".parse::<Backend>(), Ok(Backend::LinuxEpoll));
+        assert_eq!(
+            "linux-epollaio".parse::<Backend>(),
+            Ok(Backend::LinuxEpollAIO)
+        );
         assert_eq!("automatic".parse::<Backend>(), Ok(Backend::Automatic));
         assert_eq!("serial".parse::<CPUClass>(), Ok(CPUClass::Serial));
         let unknown = "linux-epol".parse::<Backend>().unwrap_err();

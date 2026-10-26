@@ -37,8 +37,8 @@ if (UCALL_IS_MAIN_PROJECT)
 endif ()
 
 option(UCALL_WITH_POSIX "Include the portable POSIX backend" ${ucall_default_posix_})
-option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 7.0 backends" ${ucall_default_linux_})
-option(UCALL_WITH_LINUX_EPOLL "Include the Linux epoll backend" ${ucall_default_linux_})
+option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 6.18 backends" ${ucall_default_linux_})
+option(UCALL_WITH_LINUX_EPOLLAIO "Include the Linux epoll and AIO backend" ${ucall_default_linux_})
 option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${ucall_default_kqueue_})
 option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${ucall_default_iocp_})
 option(UCALL_BUILD_PYTHON "Build the CPython extension; `pyproject.toml` switches it on" OFF)
@@ -67,8 +67,8 @@ endif ()
 if (UCALL_WITH_POSIX AND NOT UNIX)
     message(FATAL_ERROR "The POSIX backend requires a POSIX platform")
 endif ()
-if ((UCALL_WITH_LINUX_URING OR UCALL_WITH_LINUX_EPOLL) AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "The epoll and io_uring backends require Linux")
+if ((UCALL_WITH_LINUX_URING OR UCALL_WITH_LINUX_EPOLLAIO) AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The epoll-AIO and io_uring backends require Linux")
 endif ()
 if (UCALL_WITH_KQUEUE AND NOT (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD"))
     message(FATAL_ERROR "The kqueue backend requires macOS or FreeBSD")
@@ -236,7 +236,7 @@ target_compile_features(ucall PUBLIC cxx_std_20)
 target_compile_definitions(
     ucall
     PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${ucall_version_name_}"
-    PUBLIC UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}> UCALL_WITH_LINUX_EPOLL=$<BOOL:${UCALL_WITH_LINUX_EPOLL}>
+    PUBLIC UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}> UCALL_WITH_LINUX_EPOLLAIO=$<BOOL:${UCALL_WITH_LINUX_EPOLLAIO}>
            UCALL_WITH_LINUX_URING=$<BOOL:${UCALL_WITH_LINUX_URING}> UCALL_WITH_KQUEUE=$<BOOL:${UCALL_WITH_KQUEUE}>
            UCALL_WITH_IOCP=$<BOOL:${UCALL_WITH_IOCP}>
 )

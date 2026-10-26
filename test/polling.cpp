@@ -7,19 +7,25 @@
 #include <cstring> // `std::memcmp`
 #include <ctime>   // `std::clock`
 
-#include <array>   // `std::array`
-#include <atomic>  // `std::atomic`
-#include <chrono>  // `std::chrono::steady_clock`
-#include <limits>  // `std::numeric_limits`
-#include <string>  // `std::string`
-#include <thread>  // `std::thread`
-#include <utility> // `std::pair`
+#include <array>       // `std::array`
+#include <atomic>      // `std::atomic`
+#include <chrono>      // `std::chrono::steady_clock`
+#include <limits>      // `std::numeric_limits`
+#include <string>      // `std::string`
+#include <string_view> // `std::string_view`
+#include <thread>      // `std::thread`
+#include <utility>     // `std::pair`
 
 #include "ucall/ucall.h"
 #include "ucall/types.hpp"
 #include "ucall/network.hpp"
 
-#include "harness.hpp" // `expect`, `require`, `run_test`
+#include "harness.hpp" // `expect`, `require`, `run_test`, `direct_directory_t`, `aligned_bytes_t`
+
+#if UCALL_OS_POSIX_
+#include <fcntl.h>    // `open`, `O_DIRECT`
+#include <sys/stat.h> // `mkfifo`, `mkdir`
+#endif
 
 namespace uc = unum::ucall;
 using namespace unum::ucall::test;
@@ -928,6 +934,285 @@ static case_result_t test_allocation_failure_safety() {
 
 #pragma endregion Allocators
 
+#pragma region Direct Files
+#if UCALL_OS_POSIX_
+
+/** The byte at @p offset of the patterned file the file cases read. */
+static uc::byte_t file_byte(std::uint64_t offset) noexcept {
+    return static_cast<uc::byte_t>((offset * 2654435761u) >> 13);
+}
+
+/** Polls @p engine until @p request completes, answering its result, or `-ETIMEDOUT` once
+ *  @p deadline passes; other completions are dropped. */
+template <typename engine_type_>
+static uc::descriptor_t finish(engine_type_& engine, uc::io_request_t const& request, std::uint64_t deadline) {
+    uc::io_completion_t completed[1] {};
+    while (uc::monotonic_ns() < deadline)
+        if (engine.poll(completed, uc::io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+            return completed[0].result;
+    return -ETIMEDOUT;
+}
+template <typename engine_type_>
+static uc::descriptor_t await(engine_type_& engine, uc::io_request_t& request, std::uint64_t deadline) {
+    return engine.submit(request) == ucall_status_success_k ? finish(engine, request, deadline) : -EIO;
+}
+
+/** A disk-backed directory holding `data.bin`, 64 alignments and 123 bytes of patterned content,
+ *  beside a FIFO, a subdirectory and a symlink out of it. */
+struct direct_files_t {
+    direct_directory_t directory;
+    std::string content;
+    [[nodiscard]] bool fill() {
+        content.resize(64 * directory.alignment + 123);
+        for (std::size_t i = 0; i != content.size(); ++i) content[i] = static_cast<char>(file_byte(i));
+        return directory.write("data.bin", content) && mkfifo(directory.name("fifo").c_str(), 0600) == 0 &&
+               symlink("/etc/hostname", directory.name("absolute").c_str()) == 0 &&
+               mkdir(directory.name("subdir").c_str(), 0700) == 0;
+    }
+};
+
+/** Opens beneath a directory for unbuffered reads, refusing escapes, FIFOs and directories without
+ *  waiting on a writer; refuses a buffered descriptor; then reads aligned extents, a short tail and
+ *  vectors, counting each read as asynchronous or blocking as the engine performed it. */
+template <typename engine_type_>
+static case_result_t direct_files() {
+    direct_files_t files;
+    if (!files.directory.ready()) {
+        announce("{}", files.directory.reason);
+        return case_result_t::skipped("the directory serves no unbuffered reads");
+    }
+    engine_type_ engine;
+    require(0, engine.open(4, 4) == ucall_status_success_k);
+    std::size_t failures = 0;
+    require(failures, files.fill());
+    std::size_t const alignment = files.directory.alignment;
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected() && uc::nonblocking(sockets.client) == ucall_status_success_k);
+    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    auto const deadline = uc::deadline_after(5000000);
+
+    announce("opening beneath a directory");
+    int file = -1;
+    for (std::string_view path : {"data.bin", "fifo", "subdir", "absolute", "../data.bin", "missing"}) {
+        std::string terminated {path};
+        uc::io_request_t opening {.operation = uc::io_operation_t::file_open_k,
+                                  .descriptor = socket,
+                                  .data = reinterpret_cast<uc::byte_t*>(terminated.data()),
+                                  .length = terminated.size() + 1,
+                                  .file = {0, -1, files.directory.descriptor}};
+        uc::descriptor_t const opened = await(engine, opening, deadline);
+        if (path == "data.bin") {
+            uc::file_geometry_t const geometry = opened >= 0 ? uc::file_direct_alignment(opened)
+                                                             : uc::file_geometry_t {};
+            failures += expect(opened >= 0 && !geometry.error && geometry.size == files.content.size(),
+                               "{} opened as {} measuring {}", path, opened, geometry.size);
+            file = static_cast<int>(opened);
+        }
+        else {
+            failures += expect(opened < 0, "{} opened as {}", path, opened);
+            if (opened >= 0) ::close(opened);
+        }
+    }
+    require(failures, file >= 0);
+
+    announce("refusing a buffered descriptor");
+    int const buffered = ::open(files.directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC);
+    failures += expect(uc::file_direct_check(buffered) == ucall_status_invalid_argument_k &&
+                       uc::file_direct_check(file) == ucall_status_success_k);
+    ::close(buffered);
+
+    announce("reading aligned extents, a short tail and vectors");
+    aligned_bytes_t window {4 * alignment};
+    failures += expect(engine.register_memory(window.bytes()).pinning == uc::range_pinning_t::unpinned_k);
+    uc::io_request_t reading {.operation = uc::io_operation_t::file_read_k,
+                              .descriptor = socket,
+                              .data = window.data,
+                              .length = 2 * alignment,
+                              .file = {3 * alignment, file, -1}};
+    failures += expect(await(engine, reading, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+                       std::memcmp(window.data, files.content.data() + 3 * alignment, 2 * alignment) == 0);
+    reading.file.offset = 64 * alignment;
+    reading.length = alignment;
+    failures += expect(await(engine, reading, deadline) == 123 &&
+                       std::memcmp(window.data, files.content.data() + 64 * alignment, 123) == 0);
+    uc::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
+    uc::io_request_t scattering {.operation = uc::io_operation_t::file_read_vectors_k,
+                                 .descriptor = socket,
+                                 .data = reinterpret_cast<uc::byte_t*>(vectors),
+                                 .length = 2,
+                                 .file = {5 * alignment, file, -1}};
+    failures += expect(await(engine, scattering, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+                       std::memcmp(window.data, files.content.data() + 5 * alignment, alignment) == 0 &&
+                       std::memcmp(window.data + 2 * alignment, files.content.data() + 6 * alignment, alignment) == 0);
+    failures += expect(engine.statistics.file_reads_asynchronous + engine.statistics.file_reads_blocking == 3);
+    ::close(file);
+    failures += expect(engine.close_socket(socket) == 0);
+    return failures;
+}
+
+static case_result_t test_direct_files_unit() {
+    std::size_t failures = 0;
+#if UCALL_WITH_POSIX
+    announce("posix");
+    failures += keeping_descriptors(direct_files<uc::posix_engine_t>).failures;
+#endif
+#if UCALL_WITH_LINUX_EPOLLAIO
+    announce("linux-epollaio");
+    failures += keeping_descriptors(direct_files<uc::linux_epollaio_engine_t>).failures;
+#endif
+#if UCALL_WITH_KQUEUE
+    announce("macos-kqueue");
+    failures += keeping_descriptors(direct_files<uc::kqueue_engine_t>).failures;
+#endif
+    return failures;
+}
+
+#endif // UCALL_OS_POSIX_
+
+#if UCALL_WITH_LINUX_EPOLLAIO
+
+/** Linux AIO reads land asynchronously; a cancel in flight completes once the kernel answered;
+ *  one AIO event serializes several reads without losing any; and a host refusing AIO refuses the
+ *  engine, naming the setting to raise. */
+static case_result_t epollaio_reads() {
+    direct_files_t files;
+    if (!files.directory.ready()) {
+        announce("{}", files.directory.reason);
+        return case_result_t::skipped("the directory serves no unbuffered reads");
+    }
+    std::size_t failures = 0;
+    require(failures, files.fill());
+    std::size_t const alignment = files.directory.alignment;
+    int const file = ::open(files.directory.name("data.bin").c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+    require(failures, file >= 0);
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
+    auto const deadline = uc::deadline_after(5000000);
+
+    announce("a host refusing AIO refuses the engine");
+    {
+        uc::linux_epollaio_engine_t engine;
+        engine.files.depth = 0;
+        failures += expect(engine.open(4, 4) == ucall_status_unsupported_k && engine.refusal &&
+                           std::strstr(engine.refusal, "fs.aio-max-nr"));
+    }
+
+    announce("one AIO event serializes four reads");
+    uc::linux_epollaio_engine_t engine;
+    engine.files.depth = 1;
+    require(failures, engine.open(8, 8) == ucall_status_success_k && engine.files.depth == 1);
+    std::array<aligned_bytes_t, 4> windows {aligned_bytes_t {alignment}, aligned_bytes_t {alignment},
+                                            aligned_bytes_t {alignment}, aligned_bytes_t {alignment}};
+    std::array<uc::io_request_t, 4> reads {};
+    for (std::size_t i = 0; i != reads.size(); ++i) {
+        reads[i] = {.operation = uc::io_operation_t::file_read_k,
+                    .descriptor = sockets.client,
+                    .data = windows[i].data,
+                    .length = alignment,
+                    .file = {(2 * i + 1) * alignment, file, -1}};
+        require(failures, engine.submit(reads[i]) == ucall_status_success_k);
+    }
+    std::size_t landed = 0;
+    while (landed != reads.size() && uc::monotonic_ns() < deadline) {
+        uc::io_completion_t completed[4] {};
+        int const count = engine.poll(completed, uc::io_wait_t::blocking_k, deadline);
+        require(failures, count >= 0, "polling ended with {}", count);
+        for (int i = 0; i != count; ++i) {
+            auto const index = static_cast<std::size_t>(completed[i].request - reads.data());
+            failures += expect(
+                index < reads.size() && completed[i].result == static_cast<uc::descriptor_t>(alignment) &&
+                    std::memcmp(windows[index].data, files.content.data() + (2 * index + 1) * alignment, alignment) ==
+                        0,
+                "read {} ended with {}", index, completed[i].result);
+            ++landed;
+        }
+    }
+    failures += expect(landed == reads.size() && engine.statistics.file_reads_asynchronous == reads.size() &&
+                           !engine.statistics.file_reads_blocking,
+                       "{} of {} reads landed", landed, reads.size());
+
+    announce("cancelling reads in flight and waiting for an event");
+    aligned_bytes_t large {32 * alignment};
+    reads[0] = {.operation = uc::io_operation_t::file_read_k,
+                .descriptor = sockets.client,
+                .data = large.data,
+                .length = large.size,
+                .file = {0, file, -1}};
+    reads[1] = reads[0];
+    require(failures,
+            engine.submit(reads[0]) == ucall_status_success_k && engine.submit(reads[1]) == ucall_status_success_k);
+    failures += expect(engine.cancel(reads[1]) == ucall_status_success_k &&
+                       engine.cancel(reads[0]) == ucall_status_success_k);
+    std::array<uc::descriptor_t, 2> cancelled {0, 0};
+    for (std::size_t count = 0; count != cancelled.size() && uc::monotonic_ns() < deadline;) {
+        uc::io_completion_t completed[2] {};
+        int const polled = engine.poll(completed, uc::io_wait_t::blocking_k, deadline);
+        require(failures, polled >= 0, "polling ended with {}", polled);
+        for (int i = 0; i != polled; ++i, ++count)
+            cancelled[static_cast<std::size_t>(completed[i].request - reads.data())] = completed[i].result;
+    }
+    failures += expect(cancelled[0] == -ECANCELED && cancelled[1] == -ECANCELED, "the reads ended with {} and {}",
+                       cancelled[0], cancelled[1]);
+    failures += expect(await(engine, reads[0], deadline) == static_cast<uc::descriptor_t>(large.size) &&
+                       std::memcmp(large.data, files.content.data(), large.size) == 0);
+    ::close(file);
+    return failures;
+}
+
+/** A `MSG_ZEROCOPY` send completes once the socket took its bytes, and its release only once the
+ *  error queue reported it; loopback copies, so that report demotes the socket, whose next
+ *  zero-copy send copies and whose next release completes at once. */
+static case_result_t epollaio_zero_copy_sends() {
+    uc::linux_epollaio_engine_t engine;
+    require(0, engine.open(8, 8) == ucall_status_success_k);
+    std::size_t failures = 0;
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected() && uc::nonblocking(sockets.client) == ucall_status_success_k &&
+                          uc::nonblocking(sockets.peer) == ucall_status_success_k);
+    aligned_bytes_t window {16384};
+    for (std::size_t i = 0; i != window.size; ++i) window.data[i] = file_byte(i);
+    auto const deadline = uc::deadline_after(5000000);
+    std::string received;
+    auto drain = [&](std::size_t expected) {
+        char buffer[16384];
+        while (received.size() < expected && uc::monotonic_ns() < deadline)
+            if (ssize_t const length = recv(sockets.peer, buffer, sizeof(buffer), 0); length > 0)
+                received.append(buffer, static_cast<std::size_t>(length));
+        return received.size() == expected && std::memcmp(received.data(), window.data, received.size()) == 0;
+    };
+
+    announce("a release completes only after its notification, and cancelling it changes nothing");
+    uc::io_request_t release {.operation = uc::io_operation_t::zero_copy_release_k};
+    uc::io_request_t sending {.operation = uc::io_operation_t::send_zero_copy_k,
+                              .descriptor = sockets.client,
+                              .data = window.data,
+                              .length = window.size,
+                              .release_request = &release};
+    uc::descriptor_t const sent = await(engine, sending, deadline);
+    failures += expect(sent > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
+                       engine.statistics.zero_copy_sends);
+    require(failures, engine.submit(release) == ucall_status_success_k);
+    failures += expect(engine.cancel(release) == ucall_status_success_k);
+    failures += expect(finish(engine, release, deadline) == 0 && engine.statistics.zero_copy_fallbacks == 1,
+                       "the release completed with {} fallbacks counted", engine.statistics.zero_copy_fallbacks);
+    failures += expect(drain(static_cast<std::size_t>(sent)));
+
+    announce("a copied notification demotes the socket");
+    received.clear();
+    uc::descriptor_t const copied = await(engine, sending, deadline);
+    failures += expect(copied > 0 && engine.statistics.zero_copy_sends == 1);
+    failures += expect(await(engine, release, deadline) == 0);
+    failures += expect(drain(static_cast<std::size_t>(copied)));
+    failures += expect(engine.close_socket(std::exchange(sockets.client, -1)) == 0);
+    return failures;
+}
+
+static case_result_t test_epollaio_reads_unit() { return keeping_descriptors(epollaio_reads); }
+static case_result_t test_epollaio_zero_copy_sends_unit() { return keeping_descriptors(epollaio_zero_copy_sends); }
+
+#endif // UCALL_WITH_LINUX_EPOLLAIO
+#pragma endregion Direct Files
+
 int main(int, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
@@ -946,5 +1231,12 @@ int main(int, char** argv) {
     run_test(totals, "test_batch_endpoints_drain_apart_unit", test_batch_endpoints_drain_apart_unit);
     run_test(totals, "test_batch_timeout_sleeps_unit", test_batch_timeout_sleeps_unit);
     run_test(totals, "test_pipelined_batches_unit", test_pipelined_batches_unit);
+#if UCALL_OS_POSIX_
+    run_test(totals, "test_direct_files_unit", test_direct_files_unit);
+#endif
+#if UCALL_WITH_LINUX_EPOLLAIO
+    run_test(totals, "test_epollaio_reads_unit", test_epollaio_reads_unit);
+    run_test(totals, "test_epollaio_zero_copy_sends_unit", test_epollaio_zero_copy_sends_unit);
+#endif
     return suite_exit_code(totals);
 }

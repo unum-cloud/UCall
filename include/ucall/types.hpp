@@ -148,7 +148,7 @@ struct ucall_server_handle_t {
         void (*add_http_batch_endpoint)(ucall_server_add_http_batch_endpoint_t*);
         void (*reply_vectored)(ucall_server_reply_vectored_t*);
         void (*reply_begin)(ucall_server_reply_begin_t*);
-        void (*reply_chunk)(ucall_server_reply_chunk_t*);
+        void (*reply_append)(ucall_server_reply_append_t*);
         void (*reply_end)(ucall_server_reply_end_t*);
     };
     api_t const* api {};
@@ -177,12 +177,15 @@ namespace unum::ucall {
 using server_api_t = ucall_server_handle_t::api_t;
 using client_api_t = ucall_client_handle_t::api_t;
 
-inline void publish(ucall_outcome_t* outcome, ucall_status_t status) noexcept {
+inline void publish(ucall_outcome_t* outcome, ucall_status_t status, char const* message) noexcept {
     if (!outcome) return;
-    outcome->message = status == ucall_status_success_k ? nullptr : ucall_status_name(status);
+    outcome->message = status == ucall_status_success_k ? nullptr : message;
     std::atomic_ref<ucall_status_t> word {outcome->status};
     word.store(status, std::memory_order_release);
     word.notify_all();
+}
+inline void publish(ucall_outcome_t* outcome, ucall_status_t status) noexcept {
+    publish(outcome, status, ucall_status_name(status));
 }
 namespace fu = ashvardanian::forkunion;
 namespace st = ashvardanian::smashtable;

@@ -16,26 +16,35 @@ target_link_libraries(ucall_test_network PRIVATE ucall::ucall ucall_sanitizers f
 function (ucall_network_case name_ enabled_ backend_)
     if (enabled_)
         add_test(NAME ${name_} COMMAND ucall_test_network --backend ${backend_})
-        set_tests_properties(${name_} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+        set_tests_properties(
+            ${name_} PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT
+                                UCALL_TEST_DIRECT_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}
+        )
     endif ()
 endfunction ()
 ucall_network_case(parity ON automatic)
 set_tests_properties(parity PROPERTIES ENVIRONMENT UCALL_FILTER=test_backend_parity)
 ucall_network_case(posix ${UCALL_WITH_POSIX} posix)
-ucall_network_case(epoll ${UCALL_WITH_LINUX_EPOLL} linux-epoll)
+ucall_network_case(epollaio ${UCALL_WITH_LINUX_EPOLLAIO} linux-epollaio)
 ucall_network_case(uring612 ${UCALL_WITH_LINUX_URING} linux-uring612)
-ucall_network_case(uring700 ${UCALL_WITH_LINUX_URING} linux-uring700)
+ucall_network_case(uring618 ${UCALL_WITH_LINUX_URING} linux-uring618)
 ucall_network_case(kqueue ${UCALL_WITH_KQUEUE} macos-kqueue)
 ucall_network_case(iocp ${UCALL_WITH_IOCP} windows-iocp)
 
 add_executable(ucall_test_polling polling.cpp)
 target_link_libraries(ucall_test_polling PRIVATE ucall::ucall ucall_sanitizers fmt::fmt)
 add_test(NAME polling COMMAND ucall_test_polling)
-set_tests_properties(polling PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+set_tests_properties(
+    polling PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT
+                       UCALL_TEST_DIRECT_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}
+)
 
 if (UCALL_WITH_LINUX_URING)
     add_executable(ucall_test_uring uring.cpp)
     target_link_libraries(ucall_test_uring PRIVATE ucall::ucall ucall_sanitizers uring_internal fmt::fmt)
     add_test(NAME uring COMMAND ucall_test_uring)
-    set_tests_properties(uring PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77)
+    set_tests_properties(
+        uring PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT
+                         UCALL_TEST_DIRECT_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}
+    )
 endif ()

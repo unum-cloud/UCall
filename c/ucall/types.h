@@ -52,9 +52,9 @@ typedef struct ucall_bytes_view_t {
 typedef enum ucall_io_backend_t {
     ucall_io_backend_automatic_k = 0,
     ucall_io_backend_posix_k,
-    ucall_io_backend_linux_epoll_k,
+    ucall_io_backend_linux_epollaio_k,
     ucall_io_backend_linux_uring612_k,
-    ucall_io_backend_linux_uring700_k,
+    ucall_io_backend_linux_uring618_k,
     ucall_io_backend_macos_kqueue_k,
     ucall_io_backend_windows_iocp_k
 } ucall_io_backend_t;
@@ -409,6 +409,9 @@ enum {
 
     /** Request body is too large. */
     ucall_http_status_payload_too_large_k = 413,
+
+    /** A requested byte range starts or ends past the end of the resource. */
+    ucall_http_status_range_not_satisfiable_k = 416,
 
     /** Rate limit exceeded. */
     ucall_http_status_too_many_requests_k = 429,

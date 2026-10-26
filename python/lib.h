@@ -188,7 +188,7 @@ extern ucall_py_enum_mirror_t ucall_py_verb_enum;
  */
 int ucall_py_enums_register(PyObject* module);
 
-/** Reads a member of @p mirror from an `int` or a name such as "POST", "post" or "linux-epoll". */
+/** Reads a member of @p mirror from an `int` or a name such as "POST" or "linux-epollaio". */
 int ucall_py_enum_from_object(PyObject* object, char const* field, ucall_py_enum_mirror_t const* mirror, int* value);
 
 /** The member of @p mirror valued @p value, or a plain `int` for a value it does not name. */

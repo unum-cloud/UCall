@@ -25,8 +25,8 @@ int main(void) {
     name.length = 0;
     assert(ucall_status_from_name(name) == ucall_status_invalid_argument_k);
 
-    ucall_bytes_view_t backend = {(ucall_byte_t const*)"linux-epoll", 11};
-    assert(ucall_io_backend_from_name(backend) == ucall_io_backend_linux_epoll_k);
+    ucall_bytes_view_t backend = {(ucall_byte_t const*)"linux-epollaio", 14};
+    assert(ucall_io_backend_from_name(backend) == ucall_io_backend_linux_epollaio_k);
     backend.length = 5;
     assert(ucall_io_backend_from_name(backend) == ucall_io_backend_automatic_k);
     ucall_bytes_view_t cpu_class = {(ucall_byte_t const*)"apple-m2", 8};

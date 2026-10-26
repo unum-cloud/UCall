@@ -138,7 +138,7 @@ static constexpr std::array flags_k {
         [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.threads, 1); }},
     flag_t {"--bytes", "count", "request body bytes (1024)",
             [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.bytes); }},
-    flag_t {"--backend", "name", "automatic, posix, linux-epoll, linux-uring612, linux-uring700, ... (automatic)",
+    flag_t {"--backend", "name", "automatic, posix, linux-epollaio, linux-uring612, linux-uring618, ... (automatic)",
             [](std::string_view text, settings_t& settings) noexcept {
                 settings.backend = ucall_io_backend_from_name(bytes_view(text));
                 return text == ucall_io_backend_name(settings.backend);

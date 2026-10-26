@@ -74,6 +74,14 @@ typedef struct ucall_network_interface_t {
      *  this many requests. */
     size_t max_pipelined_requests;
 
+    /** Directories that path parts of replies to this interface's requests resolve beneath, by
+     *  position, each copied during @c ucall_server_init(). UCall opens each then and closes it in
+     *  @c ucall_server_free(); one that cannot be opened fails initialization. Default: NULL. */
+    ucall_bytes_view_t const* reply_directories;
+
+    /** Entries in @c reply_directories. */
+    size_t reply_directories_count;
+
 } ucall_network_interface_t;
 
 /**
@@ -223,7 +231,7 @@ typedef struct ucall_event_loop_statistics_t {
     /** HTTP requests parsed and dispatched to an endpoint or an error reply. */
     uint64_t requests;
 
-    /** Multishot receives armed again on a socket that already streamed, only on io_uring 7.0. */
+    /** Multishot receives armed again on a socket that already streamed, only on io_uring 6.18. */
     uint64_t receive_rearms;
 
     /** Bytes the kernel reported received on this loop's connections, ciphertext under Noise. */
@@ -234,6 +242,15 @@ typedef struct ucall_event_loop_statistics_t {
 
     /** Bytes UCall copied: receive appends, reply bodies, Noise records and parked receives. */
     uint64_t bytes_copied;
+
+    /** Sends that left without copying: reply segments and file windows. */
+    uint64_t zero_copy_sends;
+
+    /** Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does. */
+    uint64_t zero_copy_fallbacks;
+
+    /** File reads submitted while an earlier window of the same stream waited to send or sent. */
+    uint64_t file_window_overlaps;
 
 } ucall_event_loop_statistics_t;
 
@@ -869,13 +886,88 @@ typedef struct ucall_server_reply_error_t {
  */
 UCALL_EXPORT void ucall_server_reply_error(ucall_server_reply_error_t* arguments);
 
+/** What one part of a reply body holds. */
+typedef enum ucall_reply_part_kind_t {
+
+    /** @c data.bytes, copied before the call returns. */
+    ucall_reply_part_bytes_k = 0,
+
+    /** @c data.file, a range of a descriptor the event loop reads unbuffered and sends without
+     *  copying where the kernel allows. */
+    ucall_reply_part_file_k = 1,
+
+    /** @c data.path, a range of a file the event loop opens beneath a registered directory. */
+    ucall_reply_part_path_k = 2,
+
+} ucall_reply_part_kind_t;
+
+/** A byte range of a file the caller opened. UCall never closes the descriptor: the caller keeps
+ *  it open until the reply's outcome leaves @c ucall_status_deferred_k, and may close it right
+ *  after any synchronous refusal. */
+typedef struct ucall_file_range_t {
+
+    /** A regular file opened with @c O_DIRECT, borrowed; a descriptor without it is refused with
+     *  @c ucall_status_invalid_argument_k. */
+    int file_descriptor;
+
+    /** The range's first byte. */
+    uint64_t offset;
+
+    /** The range's byte count; zero sends through the end of the file. */
+    uint64_t length;
+
+} ucall_file_range_t;
+
+/** A byte range of a file UCall opens unbuffered beneath a registered directory, and closes once
+ *  the part is sent or dropped. Empty, absolute paths, @c ".." components and NUL bytes are
+ *  refused, and so is any resolution leaving the directory, symbolic links included. */
+typedef struct ucall_path_range_t {
+
+    /** A position below the @c reply_directories_count of the interface the request arrived on. */
+    size_t directory_index;
+
+    /** The file beneath that directory, copied before the call returns. */
+    ucall_bytes_view_t relative_path;
+
+    /** The range's first byte. */
+    uint64_t offset;
+
+    /** The range's byte count; zero sends through the end of the file. */
+    uint64_t length;
+
+} ucall_path_range_t;
+
+/** One part of a reply body: bytes in memory, or a byte range of a file, which the event loop
+ *  reads after the call returns. */
+typedef struct ucall_reply_part_t {
+
+    /** Which member of @c data the part uses. */
+    ucall_reply_part_kind_t kind;
+
+    /** The part's content, as @c kind selects. */
+    union {
+
+        /** Content of a @c ucall_reply_part_bytes_k part. */
+        ucall_bytes_view_t bytes;
+
+        /** Range of a @c ucall_reply_part_file_k part. */
+        ucall_file_range_t file;
+
+        /** Range of a @c ucall_reply_part_path_k part. */
+        ucall_path_range_t path;
+
+    } data;
+
+} ucall_reply_part_t;
+
 /** Arguments of @c ucall_server_reply_vectored(). */
 typedef struct ucall_server_reply_vectored_t {
 
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. Kept alive by
+     *  the caller until then. */
     ucall_outcome_t* outcome;
 
     /** The received request to reply to. */
@@ -890,8 +982,8 @@ typedef struct ucall_server_reply_vectored_t {
     /** Number of counted header lines. */
     size_t headers_count;
 
-    /** Buffers concatenated, in order, into the body; copied before the call returns. */
-    ucall_bytes_view_t const* parts;
+    /** Parts concatenated, in order, into the body. */
+    ucall_reply_part_t const* parts;
 
     /** Number of entries in @c parts. Empty parts are allowed. */
     size_t parts_count;
@@ -899,11 +991,18 @@ typedef struct ucall_server_reply_vectored_t {
 } ucall_server_reply_vectored_t;
 
 /**
- *  @brief Sends a response assembled from several non-contiguous buffers.
+ *  @brief Sends a response assembled from several non-contiguous buffers and file ranges.
  *
- *  Lets a handler reply with a header, a tensor, and a trailer without concatenating them into a
+ *  Lets a handler reply with a header, a tensor, and a file without concatenating them into a
  *  staging buffer first. Sets @c Content-Length to the sum of the parts, and sends no body to a
  *  @c HEAD request.
+ *
+ *  Memory-only replies are final on return. With any file or path part, the outcome reads
+ *  @c ucall_status_deferred_k on return: the event loop opens and sizes every part before it sends
+ *  the head, so @c Content-Length is measured, then publishes success once every part is sent, or
+ *  the cause of a failure. A part failing before the head replaces the whole reply: @c 404 for a
+ *  missing, unreadable or irregular file, @c 416 for a range past its end, @c 500 otherwise. A part
+ *  failing after the head resets the connection.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
@@ -936,7 +1035,7 @@ typedef struct ucall_server_reply_begin_t {
 /**
  *  @brief Begins a streamed response, emitting the status line and headers.
  *
- *  Must be followed by zero or more @c ucall_server_reply_chunk() calls and exactly one @c
+ *  Must be followed by zero or more @c ucall_server_reply_append() calls and exactly one @c
  *  ucall_server_reply_end() once this call reports success or @c ucall_status_connection_closed_k;
  *  any other failure leaves the request unanswered. The body is chunked for HTTP/1.1 peers.
  *  Supplying @c Content-Length switches to identity encoding, which is what @c Range responses
@@ -949,8 +1048,8 @@ typedef struct ucall_server_reply_begin_t {
  */
 UCALL_EXPORT void ucall_server_reply_begin(ucall_server_reply_begin_t* arguments);
 
-/** Arguments of @c ucall_server_reply_chunk(). */
-typedef struct ucall_server_reply_chunk_t {
+/** Arguments of @c ucall_server_reply_append(). */
+typedef struct ucall_server_reply_append_t {
 
     /** The server this call operates on. */
     ucall_server_t server;
@@ -961,25 +1060,32 @@ typedef struct ucall_server_reply_chunk_t {
     /** The received request being replied to. */
     ucall_received_http_request_t request;
 
-    /** Chunk payload. Copied before returning. */
-    ucall_bytes_view_t data;
+    /** Parts appended, in order, to the body: queued together or not at all. */
+    ucall_reply_part_t const* parts;
 
-} ucall_server_reply_chunk_t;
+    /** Number of entries in @c parts. */
+    size_t parts_count;
+
+} ucall_server_reply_append_t;
 
 /**
- *  @brief Appends one chunk to a response opened with @c ucall_server_reply_begin().
+ *  @brief Appends parts to a response opened with @c ucall_server_reply_begin().
  *
  *  Can be called from any thread, long after the request callback returned. Reports @c
- *  ucall_status_would_block_k without queuing @p data while the chunks already queued for this
- *  request and not yet taken by the socket exceed the bytes a reading peer takes per round trip;
- *  retry once the peer catches up. Reports @c ucall_status_overflow_k for a chunk that would run
- *  past a declared @c Content-Length, and @c ucall_status_connection_closed_k once the peer left.
- *  An empty chunk sends nothing.
+ *  ucall_status_would_block_k without queuing anything while the bytes parts already queued for
+ *  this request and not yet taken by the socket exceed the bytes a reading peer takes per round
+ *  trip, or while too many file and path parts wait; retry once the peer catches up. Reports @c
+ *  ucall_status_overflow_k for parts that would run past a declared @c Content-Length, whose
+ *  stream refuses file and path parts of zero length with @c ucall_status_invalid_argument_k, as
+ *  their size is unknown. Reports @c ucall_status_connection_closed_k once the peer left. Empty
+ *  bytes parts send nothing, and so do file ranges of zero bytes.
+ *
+ *  A file or path part that fails once the head left resets the connection.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
  */
-UCALL_EXPORT void ucall_server_reply_chunk(ucall_server_reply_chunk_t* arguments);
+UCALL_EXPORT void ucall_server_reply_append(ucall_server_reply_append_t* arguments);
 
 /** Arguments of @c ucall_server_reply_end(). */
 typedef struct ucall_server_reply_end_t {
@@ -987,7 +1093,8 @@ typedef struct ucall_server_reply_end_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. Kept alive by
+     *  the caller until then. */
     ucall_outcome_t* outcome;
 
     /** The received request being replied to. Invalid once the call returns. */
@@ -1002,87 +1109,13 @@ typedef struct ucall_server_reply_end_t {
  *  chunks fell short of a declared @c Content-Length, and then closes the connection after the
  *  bytes already sent, so the peer cannot mistake the truncated body for a whole one.
  *
+ *  While file or path parts are still unsent, the outcome reads @c ucall_status_deferred_k on
+ *  return, and the event loop publishes success once they are sent, or the cause of a failure.
+ *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
  */
 UCALL_EXPORT void ucall_server_reply_end(ucall_server_reply_end_t* arguments);
-
-/** Arguments of @c ucall_server_reply_file(). */
-typedef struct ucall_server_reply_file_t {
-
-    /** The server this call operates on. */
-    ucall_server_t server;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** The received request to reply to. */
-    ucall_received_http_request_t request;
-
-    /** An open, readable, seekable descriptor. @b Ownership transfers to UCall. */
-    int file_descriptor;
-
-    /** Byte offset within the file at which to start. */
-    uint64_t offset;
-
-    /** Number of bytes to send. Zero sends through end of file. */
-    uint64_t length;
-
-} ucall_server_reply_file_t;
-
-/**
- *  @brief Replies with a byte range of an open file, bypassing user space entirely.
- *
- *  On the @c io_uring backend this splices the file straight into the socket, so payload bytes
- *  never enter user space. UCall closes @c file_descriptor once the reply completes or fails,
- *  because the caller cannot otherwise know when the asynchronous send is done.
- *
- *  @warning Mutually exclusive with Noise. Encryption requires the payload in user space, so
- *      connections using @c ucall_security_noise_* fall back to a buffered copy.
- *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
- */
-UCALL_EXPORT void ucall_server_reply_file(ucall_server_reply_file_t* arguments);
-
-/** Arguments of @c ucall_server_reply_path(). */
-typedef struct ucall_server_reply_path_t {
-
-    /** The server this call operates on. */
-    ucall_server_t server;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** The received request to reply to. */
-    ucall_received_http_request_t request;
-
-    /** An open directory acting as the containment root. */
-    int directory_descriptor;
-
-    /** Path resolved beneath @c directory_descriptor. */
-    ucall_bytes_view_t relative_path;
-
-    /** Byte offset within the file at which to start. */
-    uint64_t offset;
-
-    /** Number of bytes to send. Zero sends through end of file. */
-    uint64_t length;
-
-} ucall_server_reply_path_t;
-
-/**
- *  @brief Replies with a byte range of a file named relative to a directory descriptor.
- *
- *  Preferred over @c ucall_server_reply_file() on the @c io_uring backend, where the open, splice,
- *  and close are chained into one submission and the handler thread issues no syscalls. Resolution
- *  is confined beneath @c directory_descriptor, so a @c "../" in @c relative_path fails rather than
- *  escaping. UCall retains no reference to @c directory_descriptor.
- *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
- */
-UCALL_EXPORT void ucall_server_reply_path(ucall_server_reply_path_t* arguments);
 
 /** Arguments of @c ucall_server_websocket_send(). */
 typedef struct ucall_server_websocket_send_t {

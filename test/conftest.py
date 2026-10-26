@@ -17,16 +17,16 @@ def pytest_report_header() -> list[str]:
 
 
 def pytest_make_parametrize_id(config: pytest.Config, val: object, argname: str) -> str | None:
-    """Names a parametrized enum by its member, such as `linux_epoll`, where pytest would print its value."""
+    """Names a parametrized enum by its member, such as `linux_epollaio`, where pytest would print its value."""
     return val.name.lower() if isinstance(val, IntEnum) else None
 
 
 @pytest.fixture(
     params=[
         ucall.Backend.POSIX,
-        ucall.Backend.LINUX_EPOLL,
+        ucall.Backend.LINUX_EPOLLAIO,
         ucall.Backend.LINUX_URING612,
-        ucall.Backend.LINUX_URING700,
+        ucall.Backend.LINUX_URING618,
     ]
 )
 def backend(request: pytest.FixtureRequest) -> ucall.Backend:

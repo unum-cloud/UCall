@@ -225,7 +225,7 @@ match client.get("http://127.0.0.1:1/") {
 
 A submitted call that fails completes with `Err` in `Completed::response`: `Status::ConnectionFailed`, `Status::ConnectionClosed`, `Status::Timeout`, `Status::HandshakeFailed` or `Status::PeerRejected`.
 A request lookup that finds nothing answers `None`, and HTTP error statuses are ordinary responses.
-`Backend` and `CPUClass` print and parse their stable names, like "linux-uring700" and "intel-icelake", failing with `Status::InvalidArgument` on a name no value has, and `ucall::version()` names the linked library.
+`Backend` and `CPUClass` print and parse their stable names, like "linux-uring618" and "intel-icelake", failing with `Status::InvalidArgument` on a name no value has, and `ucall::version()` names the linked library.
 
 ## Threads & Polling
 

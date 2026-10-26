@@ -1930,7 +1930,8 @@ static char const doc_Server_event_loop_statistics[] =                          
     "Returns:\n"                                                                                 //
     "  dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,\n" //
     "    `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,\n"          //
-    "    `bytes_sent` and `bytes_copied`, each read on its own.\n"                               //
+    "    `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks` and\n"           //
+    "    `file_window_overlaps`, each read on its own.\n"                                        //
     "\n"                                                                                         //
     "Raises:\n"                                                                                  //
     "  Error: An `event_loop` past the last one.\n"                                              //
@@ -1952,19 +1953,22 @@ static PyObject* Server_event_loop_statistics(Server* self, PyObject* const* val
     ucall_server_event_loop_statistics_t query = {self->handle, &outcome, index, &counters};
     ucall_server_event_loop_statistics(&query);
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
-    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsK}",                                  //
-                         "polls", (unsigned long long)counters.polls,                   //
-                         "empty_polls", (unsigned long long)counters.empty_polls,       //
-                         "kernel_enters", (unsigned long long)counters.kernel_enters,   //
-                         "submissions", (unsigned long long)counters.submissions,       //
-                         "completions", (unsigned long long)counters.completions,       //
-                         "cancellations", (unsigned long long)counters.cancellations,   //
-                         "accepts", (unsigned long long)counters.accepts,               //
-                         "requests", (unsigned long long)counters.requests,             //
-                         "receive_rearms", (unsigned long long)counters.receive_rearms, //
-                         "bytes_received", (unsigned long long)counters.bytes_received, //
-                         "bytes_sent", (unsigned long long)counters.bytes_sent,         //
-                         "bytes_copied", (unsigned long long)counters.bytes_copied);
+    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                                      //
+                         "polls", (unsigned long long)counters.polls,                             //
+                         "empty_polls", (unsigned long long)counters.empty_polls,                 //
+                         "kernel_enters", (unsigned long long)counters.kernel_enters,             //
+                         "submissions", (unsigned long long)counters.submissions,                 //
+                         "completions", (unsigned long long)counters.completions,                 //
+                         "cancellations", (unsigned long long)counters.cancellations,             //
+                         "accepts", (unsigned long long)counters.accepts,                         //
+                         "requests", (unsigned long long)counters.requests,                       //
+                         "receive_rearms", (unsigned long long)counters.receive_rearms,           //
+                         "bytes_received", (unsigned long long)counters.bytes_received,           //
+                         "bytes_sent", (unsigned long long)counters.bytes_sent,                   //
+                         "bytes_copied", (unsigned long long)counters.bytes_copied,               //
+                         "zero_copy_sends", (unsigned long long)counters.zero_copy_sends,         //
+                         "zero_copy_fallbacks", (unsigned long long)counters.zero_copy_fallbacks, //
+                         "file_window_overlaps", (unsigned long long)counters.file_window_overlaps);
 }
 
 static PyObject* Server_get_event_loops(Server* self, void* closure) {

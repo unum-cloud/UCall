@@ -34,16 +34,17 @@ void make_network_variant(init_type_* arguments) noexcept {
 #if UCALL_WITH_POSIX
     case ucall_io_backend_posix_k: return make_network_for_engine<posix_engine_t, cpu_class_>(arguments);
 #endif
-#if UCALL_WITH_LINUX_EPOLL
-    case ucall_io_backend_linux_epoll_k: return make_network_for_engine<linux_epoll_engine_t, cpu_class_>(arguments);
+#if UCALL_WITH_LINUX_EPOLLAIO
+    case ucall_io_backend_linux_epollaio_k:
+        return make_network_for_engine<linux_epollaio_engine_t, cpu_class_>(arguments);
 #endif
 #if UCALL_WITH_LINUX_URING
     case ucall_io_backend_linux_uring612_k:
         return make_network_for_engine<linux_uring612_engine_t, cpu_class_>(arguments);
 #endif
 #if UCALL_WITH_LINUX_URING
-    case ucall_io_backend_linux_uring700_k:
-        return make_network_for_engine<linux_uring700_engine_t, cpu_class_>(arguments);
+    case ucall_io_backend_linux_uring618_k:
+        return make_network_for_engine<linux_uring618_engine_t, cpu_class_>(arguments);
 #endif
 #if UCALL_WITH_KQUEUE
     case ucall_io_backend_macos_kqueue_k: return make_network_for_engine<kqueue_engine_t, cpu_class_>(arguments);

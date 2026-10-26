@@ -42,6 +42,8 @@ struct ucall_network_interface_t {
     event_loops: usize,
     max_concurrent_connections: usize,
     max_pipelined_requests: usize,
+    reply_directories: *const ucall_bytes_view_t,
+    reply_directories_count: usize,
 }
 
 #[repr(C)]
@@ -494,6 +496,8 @@ impl Server {
                     event_loops: interface.event_loops,
                     max_concurrent_connections: interface.connections,
                     max_pipelined_requests: interface.pipelined_requests,
+                    reply_directories: ptr::null(),
+                    reply_directories_count: 0,
                 }
             })
             .collect();
@@ -787,6 +791,12 @@ pub struct EventLoopStatistics {
     pub bytes_sent: u64,
     /// Bytes UCall copied: receive appends, reply bodies, Noise records and parked receives.
     pub bytes_copied: u64,
+    /// Sends that left without copying: reply segments and file windows.
+    pub zero_copy_sends: u64,
+    /// Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does.
+    pub zero_copy_fallbacks: u64,
+    /// File reads submitted while an earlier window of the same stream waited to send or sent.
+    pub file_window_overlaps: u64,
 }
 
 /// When a batch endpoint hands its queue to the handler; zero fields take the defaults of 1

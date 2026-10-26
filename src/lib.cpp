@@ -16,13 +16,9 @@
 #include "ucall/io.hpp"
 #include "lib.hpp"
 
-#if UCALL_OS_WINDOWS_
-#include <io.h> // `_close`
-#else
-#include <unistd.h> // `close`
-#endif
-
 using namespace unum::ucall;
+
+static_assert(sizeof(void*) != 8 || sizeof(ucall_reply_part_t) == 48, "a reply part is 48 bytes on 64-bit targets");
 
 namespace unum::ucall {
 
@@ -78,11 +74,11 @@ static void init_network(init_type_* arguments) noexcept {
     else {
         bool finished = false;
 #if UCALL_WITH_LINUX_URING
-        finished = try_backend(ucall_io_backend_linux_uring700_k);
+        finished = try_backend(ucall_io_backend_linux_uring618_k);
         if (!finished) finished = try_backend(ucall_io_backend_linux_uring612_k);
 #endif
-#if UCALL_WITH_LINUX_EPOLL
-        if (!finished) finished = try_backend(ucall_io_backend_linux_epoll_k);
+#if UCALL_WITH_LINUX_EPOLLAIO
+        if (!finished) finished = try_backend(ucall_io_backend_linux_epollaio_k);
 #endif
 #if UCALL_WITH_KQUEUE
         if (!finished) finished = try_backend(ucall_io_backend_macos_kqueue_k);
@@ -105,9 +101,9 @@ char const* ucall_io_backend_name(ucall_io_backend_t backend) {
     switch (backend) {
     case ucall_io_backend_automatic_k: return "automatic";
     case ucall_io_backend_posix_k: return "posix";
-    case ucall_io_backend_linux_epoll_k: return "linux-epoll";
+    case ucall_io_backend_linux_epollaio_k: return "linux-epollaio";
     case ucall_io_backend_linux_uring612_k: return "linux-uring612";
-    case ucall_io_backend_linux_uring700_k: return "linux-uring700";
+    case ucall_io_backend_linux_uring618_k: return "linux-uring618";
     case ucall_io_backend_macos_kqueue_k: return "macos-kqueue";
     case ucall_io_backend_windows_iocp_k: return "windows-iocp";
     }
@@ -416,33 +412,16 @@ void ucall_server_reply_begin(ucall_server_reply_begin_t* arguments) {
     arguments->server->api->reply_begin(arguments);
 }
 
-void ucall_server_reply_chunk(ucall_server_reply_chunk_t* arguments) {
+void ucall_server_reply_append(ucall_server_reply_append_t* arguments) {
     if (!arguments) return;
     if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_chunk(arguments);
+    arguments->server->api->reply_append(arguments);
 }
 
 void ucall_server_reply_end(ucall_server_reply_end_t* arguments) {
     if (!arguments) return;
     if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->reply_end(arguments);
-}
-
-void ucall_server_reply_file(ucall_server_reply_file_t* arguments) {
-    if (!arguments) return;
-    if (arguments->file_descriptor >= 0) {
-#if UCALL_OS_WINDOWS_
-        _close(arguments->file_descriptor);
-#else
-        close(arguments->file_descriptor);
-#endif
-    }
-    publish(arguments->outcome, ucall_status_unsupported_k);
-}
-
-void ucall_server_reply_path(ucall_server_reply_path_t* arguments) {
-    if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
 void ucall_server_websocket_send(ucall_server_websocket_send_t* arguments) {

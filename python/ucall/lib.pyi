@@ -103,9 +103,9 @@ class Backend(enum.IntEnum):
 
     AUTOMATIC = 0
     POSIX = 1
-    LINUX_EPOLL = 2
+    LINUX_EPOLLAIO = 2
     LINUX_URING612 = 3
-    LINUX_URING700 = 4
+    LINUX_URING618 = 4
     MACOS_KQUEUE = 5
     WINDOWS_IOCP = 6
 
@@ -709,7 +709,8 @@ class Server:
         Returns:
           dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,
             `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,
-            `bytes_sent` and `bytes_copied`, each read on its own.
+            `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks` and
+            `file_window_overlaps`, each read on its own.
 
         Raises:
           Error: An `event_loop` past the last one.

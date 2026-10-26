@@ -26,7 +26,7 @@ UCall is a ¹ performance-oriented, ² portable, and ³ compact HTTP/RPC framewo
 How ¹ fast?
 About 291,000 1 KiB echoes per second from one server thread natively, about 278,000 through its Rust bindings and about 268,000 through its Python bindings, against about 83,000 for gRPC on tonic, 21,000 for FastAPI and 15,000 for Python gRPC, in the [framework comparison](bench/README.md#framework-comparison).
 How ² portable?
-A C ABI fronts a C++20 core with POSIX, Linux epoll and io_uring, macOS/FreeBSD kqueue, and Windows IOCP backends.
+A C ABI fronts a C++20 core with POSIX, Linux epoll with AIO and io_uring, macOS/FreeBSD kqueue, and Windows IOCP backends.
 Python and Rust bindings wrap that ABI directly, with the same caller-owned polling threads.
 How ³ compact?
 HTTP framing, routing, and transport state live in templated headers, with one native library exporting the C interface.
@@ -286,7 +286,7 @@ Only the Noise transport and application peer-authorization callbacks are implem
 
 ### Engineered for Performance
 
-The shared connection automata consume completions and emit I/O requests for POSIX, epoll, Linux io_uring 6.12 or 7.0, kqueue, and IOCP.
+The shared connection automata consume completions and emit I/O requests for POSIX, Linux epoll with AIO, Linux io_uring 6.12 or 6.18, kqueue, and IOCP.
 HTTP framing, routing, and Noise stay in templated headers under `include/ucall/`.
 One library exposes the C ABI once; server and client configuration select the backend and a compiled CPU class.
 Per-CPU instantiation units specialize every enabled native engine, while ordinary C calls use their handle's fixed operation table.
@@ -382,7 +382,7 @@ Each request keeps its own response and transaction boundary, as the [key-value 
 
 ### Resumable Uploads & Downloads
 
-__Roadmap:__ Resumable-transfer policies, streaming multipart access, and file-reply backends are not implemented.
+__Roadmap:__ Resumable-transfer policies and streaming multipart access are not implemented.
 
 There is no one unique way to deal with resumable or chunked uploads and downloads.
 The most common approaches for uploads and downloads are sadly not symmetric.
@@ -397,9 +397,10 @@ The most common approaches for uploads and downloads are sadly not symmetric.
 
 Streaming multipart is another upload design, but continuation after a failure requires an application-level protocol rather than multipart framing alone.
 
-A future file backend could splice plaintext data between sockets and file descriptors where the operating system supports it.
-Splicing and user-space encryption have different buffer requirements: Noise must access the bytes it encrypts.
-The current file-reply entry points return unsupported, so this is a backend direction rather than an available zero-copy transfer API.
+Replies can carry byte ranges of files, as descriptors or as paths beneath directories an interface registers, which is what a `Range` response needs.
+The event loop reads them with `O_DIRECT`, past the page cache, into windows borrowed from its pool, reading the next window while the previous one sends.
+Every reply leaves through zero-copy sends wherever the kernel offers them, and a window returns to the pool once the kernel let go of it.
+Under Noise each read leaves a gap behind every record's payload for its tag and the next record's header, so records seal in place inside the window.
 
 ### Other Functional HTTP Headers
 
@@ -443,7 +444,7 @@ __Security__ (Server → Client):
 ### WebSockets and Streaming
 
 __Roadmap:__ The declared WebSocket operations currently return unsupported.
-Streamed replies are implemented: `ucall_server_reply_begin()`, `ucall_server_reply_chunk()` and `ucall_server_reply_end()` send a chunked body from any thread, long after the callback returned.
+Streamed replies are implemented: `ucall_server_reply_begin()`, `ucall_server_reply_append()` and `ucall_server_reply_end()` send a chunked body from any thread, long after the callback returned.
 
 WebSockets have very different semantics from remaining request-response one-shot functionality.
 Communication is bidirectional and long-lived, with messages flowing in both directions independently.

@@ -45,6 +45,7 @@
 
 #include <charconv>    // `std::from_chars`
 #include <chrono>      // `std::chrono::steady_clock`
+#include <filesystem>  // `std::filesystem::remove_all`
 #include <limits>      // `std::numeric_limits`
 #include <random>      // `std::uniform_random_bit_generator`
 #include <string>      // `std::string`
@@ -69,9 +70,15 @@
 #include <arpa/inet.h>   // `inet_pton`, `htons`
 #include <netinet/in.h>  // `sockaddr_in`
 #include <netinet/tcp.h> // `TCP_NODELAY`
+#include <fcntl.h>       // `fcntl`
 #include <poll.h>        // `poll`
 #include <sys/socket.h>  // `socket`, `connect`, `send`, `recv`, `accept`
+#include <sys/stat.h>    // `statx`, `STATX_DIOALIGN`
 #include <unistd.h>      // `close`
+#endif
+#if UCALL_OS_LINUX_
+#include <linux/magic.h> // `TMPFS_MAGIC`
+#include <sys/vfs.h>     // `statfs`
 #endif
 
 namespace unum::ucall::test {
@@ -455,6 +462,157 @@ struct counting_allocator {
 };
 
 #pragma endregion Allocators
+
+#pragma region Scratch Files
+#if UCALL_OS_POSIX_
+
+/** Open descriptors of this process, which every file case leaves as it found them. */
+[[nodiscard]] inline std::size_t open_descriptors() noexcept {
+    std::size_t count = 0;
+    for (int descriptor = 0; descriptor != 4096; ++descriptor) count += fcntl(descriptor, F_GETFD) != -1;
+    return count;
+}
+
+/** What @p case_function answers, failing it when it left a descriptor open or closed one it
+ *  found. */
+template <typename case_type_>
+[[nodiscard]] auto keeping_descriptors(case_type_ case_function) {
+    std::size_t const before = open_descriptors();
+    auto result = case_function();
+    std::size_t const after = open_descriptors();
+    result.failures += expect_(after == before, "after == before", __FILE__, __LINE__,
+                               "{} descriptors open before the case, {} after", before, after);
+    return result;
+}
+
+/** A fresh directory under `/tmp` for cases that read files, removed with everything in it. */
+struct scratch_directory_t {
+    std::string path;
+
+    scratch_directory_t() {
+        char pattern[] = "/tmp/ucall-test-XXXXXX";
+        if (mkdtemp(pattern)) path = pattern;
+    }
+    scratch_directory_t(scratch_directory_t const&) = delete;
+    scratch_directory_t& operator=(scratch_directory_t const&) = delete;
+    ~scratch_directory_t() {
+        std::error_code ignored;
+        if (!path.empty()) std::filesystem::remove_all(path, ignored);
+    }
+
+    [[nodiscard]] bool ready() const noexcept { return !path.empty(); }
+    [[nodiscard]] std::string name(std::string_view relative) const { return path + "/" + std::string {relative}; }
+
+    /** Writes @p content to the file @p relative names, answering whether all of it landed. */
+    [[nodiscard]] bool write(std::string_view relative, std::string_view content) const {
+        std::FILE* file = std::fopen(name(relative).c_str(), "wb");
+        if (!file) return false;
+        bool const written = std::fwrite(content.data(), 1, content.size(), file) == content.size();
+        return std::fclose(file) == 0 && written;
+    }
+};
+
+/** A fresh directory whose filesystem serves unbuffered reads, for cases that read files with
+ *  `O_DIRECT`: under `$UCALL_TEST_DIRECT_DIRECTORY`, else the working directory, which CTest sets
+ *  to the build tree, since `/tmp` is often tmpfs. It probes with one aligned read, and @c reason
+ *  says why a filesystem cannot serve, naming the path and the filesystem. */
+struct direct_directory_t {
+    std::string path;
+    std::string reason;
+    int descriptor = -1;
+    std::uint32_t alignment = 0;
+
+    direct_directory_t() {
+        char const* base = std::getenv("UCALL_TEST_DIRECT_DIRECTORY");
+        std::string pattern = std::string {base && *base ? base : "."} + "/ucall-direct-XXXXXX";
+        if (!mkdtemp(pattern.data())) {
+            reason = fmt::format("no directory could be made as {}", pattern);
+            return;
+        }
+        path = pattern;
+        descriptor = ::open(path.c_str(), O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+        reason = probe();
+    }
+    direct_directory_t(direct_directory_t const&) = delete;
+    direct_directory_t& operator=(direct_directory_t const&) = delete;
+    ~direct_directory_t() {
+        if (descriptor >= 0) ::close(descriptor);
+        std::error_code ignored;
+        if (!path.empty()) std::filesystem::remove_all(path, ignored);
+    }
+
+    [[nodiscard]] bool ready() const noexcept { return reason.empty(); }
+    [[nodiscard]] std::string name(std::string_view relative) const { return path + "/" + std::string {relative}; }
+
+    /** Writes @p content to the file @p relative names, answering whether all of it landed. */
+    [[nodiscard]] bool write(std::string_view relative, std::string_view content) const {
+        std::FILE* file = std::fopen(name(relative).c_str(), "wb");
+        if (!file) return false;
+        bool const written = std::fwrite(content.data(), 1, content.size(), file) == content.size();
+        return std::fclose(file) == 0 && written;
+    }
+
+#if UCALL_OS_LINUX_
+
+    /** Why this directory cannot serve unbuffered reads, or nothing. */
+    std::string probe() {
+        struct statfs filesystem {};
+        if (descriptor < 0 || fstatfs(descriptor, &filesystem) != 0) return fmt::format("{} cannot be opened", path);
+        if (static_cast<unsigned long>(filesystem.f_type) == TMPFS_MAGIC)
+            return fmt::format("{} is on tmpfs; set UCALL_TEST_DIRECT_DIRECTORY to a disk-backed directory", path);
+        std::string const content(1 << 16, 'x');
+        if (!write("probe.bin", content)) return fmt::format("{} takes no writes", path);
+        int const file = ::open(name("probe.bin").c_str(), O_RDONLY | O_DIRECT | O_CLOEXEC);
+        if (file < 0)
+            return fmt::format("{} on filesystem {:#x} refuses O_DIRECT: {}", path,
+                               static_cast<unsigned long>(filesystem.f_type), std::strerror(errno));
+        struct statx status {};
+        bool const answered = statx(file, "", AT_EMPTY_PATH, STATX_DIOALIGN, &status) == 0 &&
+                              (status.stx_mask & STATX_DIOALIGN) && status.stx_dio_offset_align;
+        alignment = answered ? std::max(status.stx_dio_mem_align, status.stx_dio_offset_align) : 0;
+        void* block = nullptr;
+        bool const read = alignment && posix_memalign(&block, alignment, alignment) == 0 &&
+                          ::pread(file, block, alignment, 0) == static_cast<ssize_t>(alignment);
+        std::free(block);
+        ::close(file);
+        std::remove(name("probe.bin").c_str());
+        if (!answered)
+            return fmt::format("{} on filesystem {:#x} reports no STATX_DIOALIGN", path,
+                               static_cast<unsigned long>(filesystem.f_type));
+        if (!read)
+            return fmt::format("{} on filesystem {:#x} failed an aligned unbuffered read", path,
+                               static_cast<unsigned long>(filesystem.f_type));
+        return {};
+    }
+#else
+
+    /** Darwin and FreeBSD report no unbuffered alignment, so a page serves. */
+    std::string probe() {
+        alignment = 4096;
+        return descriptor < 0 ? fmt::format("{} cannot be opened", path) : std::string {};
+    }
+#endif
+};
+
+/** Bytes aligned to a page, as unbuffered reads and registered buffers want them. */
+struct aligned_bytes_t {
+    byte_t* data = nullptr;
+    std::size_t size = 0;
+
+    explicit aligned_bytes_t(std::size_t bytes) noexcept {
+        void* allocated = nullptr;
+        if (posix_memalign(&allocated, 4096, bytes) != 0) return;
+        data = static_cast<byte_t*>(allocated);
+        size = bytes;
+    }
+    aligned_bytes_t(aligned_bytes_t const&) = delete;
+    aligned_bytes_t& operator=(aligned_bytes_t const&) = delete;
+    ~aligned_bytes_t() noexcept { std::free(data); }
+
+    [[nodiscard]] span<byte_t> bytes() const noexcept { return {data, size}; }
+};
+#endif // UCALL_OS_POSIX_
+#pragma endregion Scratch Files
 
 #pragma region Raw Sockets
 #if UCALL_OS_POSIX_

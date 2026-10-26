@@ -19,7 +19,7 @@ ctest --preset debug
 The `relwithdebinfo` and `release` presets build the same suites with optimization.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
 The build exposes one library as `ucall::ucall`.
-`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLL`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
+`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
 CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
 
 `UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.

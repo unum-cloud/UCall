@@ -39,7 +39,7 @@ assert bytes(response.body) == b"Hello, world!"
 
 ## Serving
 
-`ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epoll".
+`ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
 Without interfaces it answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545".
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.

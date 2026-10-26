@@ -82,7 +82,7 @@ def main() -> None:
     parser.add_argument("--dimensions", type=int, default=1024)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--port", type=int, default=8545)
-    parser.add_argument("--backend", default="automatic", help="I/O backend, such as linux-epoll or posix")
+    parser.add_argument("--backend", default="automatic", help="I/O backend, such as linux-epollaio or posix")
     parser.add_argument("--threads", type=int, default=1, help="event loops, each polled by its own thread")
     parser.add_argument("--connections", type=int, default=1024)
     parser.add_argument("--pipelined-requests", type=int, default=0)
