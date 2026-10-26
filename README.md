@@ -104,7 +104,7 @@ Each run records the selected backend, CPU kernel class, application polling thr
 On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
 The [framework comparison](bench/README.md#framework-comparison) serves a 1 KiB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
 The guide also measures pipelining depth, Noise against TLS 1.3 behind nginx, scaling across event loops, and 10,000 connections.
-The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, streaming, and authorization plans below are labeled as such.
+The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, and authorization plans below are labeled as such.
 
 ## Design Principles
 
@@ -442,7 +442,8 @@ __Security__ (Server → Client):
 
 ### WebSockets and Streaming
 
-__Roadmap:__ The declared WebSocket and streaming-reply operations currently return unsupported.
+__Roadmap:__ The declared WebSocket operations currently return unsupported.
+Streamed replies are implemented: `ucall_server_reply_begin()`, `ucall_server_reply_chunk()` and `ucall_server_reply_end()` send a chunked body from any thread, long after the callback returned.
 
 WebSockets have very different semantics from remaining request-response one-shot functionality.
 Communication is bidirectional and long-lived, with messages flowing in both directions independently.

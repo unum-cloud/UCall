@@ -881,16 +881,19 @@ typedef struct ucall_server_reply_vectored_t {
     /** The received request to reply to. */
     ucall_received_http_request_t request;
 
+    /** Response status. Zero sends @c ucall_http_status_ok_k. */
+    ucall_http_status_t http_status;
+
     /** Every HTTP header line, each as a counted byte view. */
     ucall_bytes_view_t const* headers;
 
     /** Number of counted header lines. */
     size_t headers_count;
 
-    /** Array of buffers concatenated, in order, to form the body. */
+    /** Buffers concatenated, in order, into the body; copied before the call returns. */
     ucall_bytes_view_t const* parts;
 
-    /** Number of entries in @c parts. */
+    /** Number of entries in @c parts. Empty parts are allowed. */
     size_t parts_count;
 
 } ucall_server_reply_vectored_t;
@@ -899,7 +902,8 @@ typedef struct ucall_server_reply_vectored_t {
  *  @brief Sends a response assembled from several non-contiguous buffers.
  *
  *  Lets a handler reply with a header, a tensor, and a trailer without concatenating them into a
- *  staging buffer first.
+ *  staging buffer first. Sets @c Content-Length to the sum of the parts, and sends no body to a
+ *  @c HEAD request.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
@@ -918,10 +922,10 @@ typedef struct ucall_server_reply_begin_t {
     /** The received request to reply to. */
     ucall_received_http_request_t request;
 
-    /** HTTP status code for the response. */
+    /** Response status. Zero sends @c ucall_http_status_ok_k. */
     ucall_http_status_t http_status;
 
-    /** Every HTTP header line, each as a counted byte view. */
+    /** Every HTTP header line, each as a counted byte view. May include @c Content-Length. */
     ucall_bytes_view_t const* headers;
 
     /** Number of counted header lines. */
@@ -933,8 +937,12 @@ typedef struct ucall_server_reply_begin_t {
  *  @brief Begins a streamed response, emitting the status line and headers.
  *
  *  Must be followed by zero or more @c ucall_server_reply_chunk() calls and exactly one @c
- *  ucall_server_reply_end(). Supplying @c Content-Length switches to identity encoding, which is
- *  what @c Range responses need.
+ *  ucall_server_reply_end() once this call reports success or @c ucall_status_connection_closed_k;
+ *  any other failure leaves the request unanswered. The body is chunked for HTTP/1.1 peers.
+ *  Supplying @c Content-Length switches to identity encoding, which is what @c Range responses
+ *  need, and @c ucall_server_reply_end() checks the chunks summed to it. An HTTP/1.0 peer without
+ *  it gets a body delimited by closing the connection. A @c HEAD request, @c 204 and @c 304 carry
+ *  no body: chunks for a @c HEAD request are accepted and dropped.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
@@ -961,6 +969,13 @@ typedef struct ucall_server_reply_chunk_t {
 /**
  *  @brief Appends one chunk to a response opened with @c ucall_server_reply_begin().
  *
+ *  Can be called from any thread, long after the request callback returned. Reports @c
+ *  ucall_status_would_block_k without queuing @p data while the chunks already queued for this
+ *  request and not yet taken by the socket exceed the bytes a reading peer takes per round trip;
+ *  retry once the peer catches up. Reports @c ucall_status_overflow_k for a chunk that would run
+ *  past a declared @c Content-Length, and @c ucall_status_connection_closed_k once the peer left.
+ *  An empty chunk sends nothing.
+ *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
  */
@@ -982,6 +997,10 @@ typedef struct ucall_server_reply_end_t {
 
 /**
  *  @brief Completes a response opened with @c ucall_server_reply_begin().
+ *
+ *  Consumes the request handle on every outcome. Reports @c ucall_status_malformed_k when the
+ *  chunks fell short of a declared @c Content-Length, and then closes the connection after the
+ *  bytes already sent, so the peer cannot mistake the truncated body for a whole one.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.

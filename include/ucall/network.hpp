@@ -8,9 +8,10 @@
 
 #include <cstdio>
 
-#include <atomic> // `std::atomic_ref`
-#include <bit>    // `std::bit_ceil`
-#include <chrono> // `std::chrono::year_month_day`, `std::chrono::hh_mm_ss`, `std::chrono::weekday`
+#include <atomic>   // `std::atomic_ref`
+#include <bit>      // `std::bit_ceil`
+#include <chrono>   // `std::chrono::year_month_day`, `std::chrono::hh_mm_ss`, `std::chrono::weekday`
+#include <optional> // `std::optional`
 
 #include "ucall/http.hpp"
 #include "ucall/io.hpp"
@@ -86,9 +87,31 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** The transmit side: idle, or sending the oldest reply or a client's newest request. */
     enum class transmit_state_t : std::uint8_t { idle_k, sending_k };
 
-    /** Whether an exchange's reply was collected from the replied list; only its event loop
-     *  writes this. */
-    enum class exchange_stage_t : std::uint8_t { dispatched_k, collected_k };
+    /** Whether the event loop adopted any segment of an exchange's reply yet, and whether the last
+     *  one; only it writes this. */
+    enum class exchange_stage_t : std::uint8_t { dispatched_k, collected_k, ended_k };
+
+    /** How a streamed reply delimits its body: by a declared length, in chunks, by the close, or
+     *  not at all, as for @c HEAD, @c 204 and @c 304. */
+    enum class reply_framing_t : std::uint8_t { length_k, chunked_k, until_close_k, bodiless_k };
+
+    /** A reading peer takes Linux's default `tcp_rmem` per round trip, so more unsent chunk bytes
+     *  only queue. */
+    static constexpr std::size_t unsent_chunk_bytes_k = 128 * 1024;
+
+    /** One slice of a reply, linked into its exchange's pending stack, its send queue, or a free
+     *  list; never moved while linked, so the event loop sends from it in place. */
+    struct reply_segment_t {
+        explicit reply_segment_t(allocator_t const& allocator = {}) noexcept
+            : bytes(rebound_allocator<byte_t> {allocator}) {}
+        reply_segment_t(reply_segment_t const&) = delete;
+        reply_segment_t& operator=(reply_segment_t const&) = delete;
+        reply_segment_t(reply_segment_t&&) = delete;
+        reply_segment_t& operator=(reply_segment_t&&) = delete;
+
+        vector<byte_t> bytes {}; // Framed bytes between the tunnel's headroom and tailroom.
+        reply_segment_t* next {};
+    };
 
     enum connection_flags_t : std::uint8_t {
         connection_none_k = 0,
@@ -416,14 +439,26 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         void* context {};
         endpoint_t* next {};
     };
+
+    /** Set once a reply began and once it ended, so a claimed reply short of ready is an open
+     *  stream, and once the connection left. */
     enum exchange_state_t : std::uint32_t { claimed_k = 1, ready_k = 2, detached_k = 4 };
     struct server_exchange_t : ucall_received_http_request_handle_t {
         explicit server_exchange_t(allocator_t const& allocator = {}) noexcept
-            : input(rebound_allocator<byte_t> {allocator}), output(rebound_allocator<byte_t> {allocator}) {}
+            : input(rebound_allocator<byte_t> {allocator}), opening(allocator), closing(allocator) {}
         server_exchange_t(server_exchange_t const&) = delete;
         server_exchange_t& operator=(server_exchange_t const&) = delete;
         server_exchange_t(server_exchange_t&&) = delete;
         server_exchange_t& operator=(server_exchange_t&&) = delete;
+        ~server_exchange_t() noexcept {
+            for (reply_segment_t* segment : {idle_segments, spare_segments, pending, oldest_segment})
+                while (segment) {
+                    reply_segment_t* next = segment->next;
+                    if (segment != &opening && segment != &closing)
+                        allocator_delete<reply_segment_t, allocator_t> {event_loop->allocator}(segment);
+                    segment = next;
+                }
+        }
 
         event_loop_t* event_loop {};
         connection_t* connection {};
@@ -436,10 +471,23 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         server_exchange_t* connection_next {}; // Links its connection's exchanges in request order.
         exchange_stage_t stage {};
         http_message_t message {};
-        vector<byte_t> input {}, output {};
+        vector<byte_t> input {};
         std::uint32_t state {};
         std::uint64_t deposited {};
         std::size_t copied {}; // Reply body bytes, counted later by the event loop, as any thread may reply.
+
+        /** A stream's status line and headers, and the segment ending every reply: a whole one, or
+         *  a stream's last chunk. The loop learns a reply ended by adopting `closing`, and only the
+         *  chunks between the two ever allocate. */
+        reply_segment_t opening, closing;
+        reply_segment_t* pending {};        // Pushed by the replier, newest first; taken whole by the loop.
+        reply_segment_t* spare_segments {}; // Sent chunks the loop pushes back; taken whole by the replier.
+        reply_segment_t* idle_segments {};  // Free chunks only the replier touches.
+        reply_segment_t* oldest_segment {}; // The adopted segments the loop sends, in order.
+        reply_segment_t* newest_segment {};
+        std::size_t unsent {};                  // Queued chunk bytes the socket has not taken; any thread.
+        std::uint64_t declared {}, streamed {}; // A streamed body's `content-length` and bytes so far.
+        reply_framing_t framing {};             // How the replier frames its chunks.
         std::string_view text() const noexcept { return text_view(input); }
     };
     struct network_interface_t {
@@ -752,8 +800,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return {output, http_date_length_k};
     }
 
+    /** Appends validated, lowercased @p headers. A `content-length` is refused, unless @p declared
+     *  takes its value instead, as a streamed reply's framing. */
     static ucall_status_t append_headers(vector<byte_t>& output, span<ucall_bytes_view_t const> headers,
-                                         http_role_t role) noexcept {
+                                         http_role_t role, std::optional<std::uint64_t>* declared = nullptr) noexcept {
         for (ucall_bytes_view_t const header : headers) {
             if (!valid_view(header)) return ucall_status_invalid_argument_k;
             auto line = text_view(header);
@@ -767,6 +817,16 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 return appended;
             lowercase_ascii({reinterpret_cast<char*>(output.data()) + previous, colon});
             std::string_view name {reinterpret_cast<char const*>(output.data()) + previous, colon};
+            if (declared && !*declared && equal(name, "content-length")) {
+                std::string_view const value = trim_http(line.substr(colon + 1));
+                std::uint64_t length {};
+                auto parsed = std::from_chars(value.data(), value.data() + value.size(), length);
+                if (value.empty() || parsed.ec != std::errc {} || parsed.ptr != value.data() + value.size())
+                    return ucall_status_invalid_argument_k;
+                *declared = length;
+                [[maybe_unused]] st::status_t const dropped = output.resize(previous);
+                continue;
+            }
             if (equal(name, "content-length") || equal(name, "transfer-encoding") ||
                 (role == http_role_t::request_k && (equal(name, "host") || equal(name, "user-agent"))) ||
                 (role != http_role_t::request_k && (equal(name, "date") || equal(name, "server"))))
@@ -777,64 +837,249 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         return ucall_status_success_k;
     }
-    static ucall_status_t serialize_reply(server_exchange_t& exchange, unsigned status,
-                                          span<ucall_bytes_view_t const> headers, std::string_view body) noexcept {
-        if (!exchange.output.empty()) return ucall_status_already_exists_k;
-        if (status < 200 || status > 599 || ((status == 204 || status == 304) && !body.empty()))
-            return ucall_status_invalid_argument_k;
+
+    /** Starts a reply head after the tunnel's headroom: the status line, `server` and `date`. */
+    static ucall_status_t open_head(vector<byte_t>& output, secure_tunnel_geometry_t const& geometry,
+                                    unsigned status) noexcept {
+        if (status < 200 || status > 599) return ucall_status_invalid_argument_k;
         static constexpr std::string_view classes_k[] {"Successful", "Redirection", "Client Error", "Server Error"};
         char digits[std::numeric_limits<std::size_t>::digits10 + 1], date[http_date_length_k];
-        if (st::failed(exchange.output.resize(exchange.geometry.headroom))) return ucall_status_out_of_memory_k;
+        output.clear();
+        if (st::failed(output.resize(geometry.headroom))) return ucall_status_out_of_memory_k;
         auto line = status_line(status);
-        ucall_status_t result = line.empty()
-                                    ? append_text(exchange.output, {"HTTP/1.1 ", format_decimal(digits, status), " ",
+        ucall_status_t result = line.empty() ? append_text(output, {"HTTP/1.1 ", format_decimal(digits, status), " ",
                                                                     classes_k[status / 100 - 2], "\r\n"})
-                                    : append_text(exchange.output, {line});
+                                             : append_text(output, {line});
+        if (result != ucall_status_success_k) return result;
+        return append_text(output, {"server: UCall\r\ndate: ", format_date(date, std::time(nullptr)), "\r\n"});
+    }
+
+    /** Ends a reply head with the field @p framing announces, `connection`, and the blank line. */
+    static ucall_status_t close_head(vector<byte_t>& output, server_exchange_t const& exchange, reply_framing_t framing,
+                                     std::uint64_t length) noexcept {
+        char digits[std::numeric_limits<std::uint64_t>::digits10 + 1];
+        std::string_view const connection = exchange.message.keep_alive() ? "connection: keep-alive\r\n\r\n"
+                                                                          : "connection: close\r\n\r\n";
+        switch (framing) {
+        case reply_framing_t::length_k:
+            return append_text(output, {"content-length: ", format_decimal(digits, length), "\r\n", connection});
+        case reply_framing_t::chunked_k: return append_text(output, {"transfer-encoding: chunked\r\n", connection});
+        case reply_framing_t::until_close_k:
+        case reply_framing_t::bodiless_k: break;
+        }
+        return append_text(output, {connection});
+    }
+
+    /** Lays @p texts out between the tunnel's headroom and tailroom, ready to seal in place. */
+    static ucall_status_t frame_segment(vector<byte_t>& bytes, secure_tunnel_geometry_t const& geometry,
+                                        std::initializer_list<std::string_view> texts) noexcept {
+        bytes.clear();
+        if (st::failed(bytes.resize(geometry.headroom))) return ucall_status_out_of_memory_k;
+        if (ucall_status_t const appended = append_text(bytes, texts); appended != ucall_status_success_k)
+            return appended;
+        return st::failed(bytes.resize(bytes.size() + geometry.tailroom)) ? ucall_status_out_of_memory_k
+                                                                          : ucall_status_success_k;
+    }
+
+    /** Serializes a whole reply into the closing segment, its body the parts concatenated. */
+    static ucall_status_t serialize_reply(server_exchange_t& exchange, unsigned status,
+                                          span<ucall_bytes_view_t const> headers,
+                                          span<ucall_bytes_view_t const> parts) noexcept {
+        auto& output = exchange.closing.bytes;
+        if (!output.empty()) return ucall_status_already_exists_k;
+        std::size_t length = 0;
+        for (ucall_bytes_view_t const part : parts) {
+            if (!valid_view(part)) return ucall_status_invalid_argument_k;
+            if (part.length > std::numeric_limits<std::size_t>::max() - length) return ucall_status_overflow_k;
+            length += part.length;
+        }
+        bool const bodiless = status == 204 || status == 304;
+        if (bodiless && length) return ucall_status_invalid_argument_k;
+        std::size_t const sent = exchange.message.verb != ucall_verb_head_k ? length : 0;
+        ucall_status_t result = open_head(output, exchange.geometry, status);
+        if (result == ucall_status_success_k) result = append_headers(output, headers, http_role_t::response_k);
         if (result == ucall_status_success_k)
-            result = append_text(exchange.output,
-                                 {"server: UCall\r\ndate: ", format_date(date, std::time(nullptr)), "\r\n"});
-        if (result == ucall_status_success_k)
-            result = append_headers(exchange.output, headers, http_role_t::response_k);
-        if (result == ucall_status_success_k && status != 204 && status != 304)
-            result = append_text(exchange.output, {"content-length: ", format_decimal(digits, body.size()), "\r\n"});
-        if (result == ucall_status_success_k)
-            result = append_text(
-                exchange.output,
-                {exchange.message.keep_alive() ? "connection: keep-alive\r\n\r\n" : "connection: close\r\n\r\n",
-                 exchange.message.verb != ucall_verb_head_k ? body : std::string_view {}});
-        if (result == ucall_status_success_k &&
-            st::failed(exchange.output.resize(exchange.output.size() + exchange.geometry.tailroom)))
+            result = close_head(output, exchange, bodiless ? reply_framing_t::bodiless_k : reply_framing_t::length_k,
+                                length);
+        std::size_t offset = output.size();
+        if (result == ucall_status_success_k && st::failed(output.resize(offset + sent + exchange.geometry.tailroom)))
             result = ucall_status_out_of_memory_k;
         if (result != ucall_status_success_k) {
-            exchange.output.clear();
+            output.clear();
             return result;
         }
-        exchange.copied = exchange.message.verb != ucall_verb_head_k ? body.size() : 0;
+        if (sent)
+            for (ucall_bytes_view_t const part : parts) {
+                if (part.length) std::memcpy(output.data() + offset, part.data, part.length);
+                offset += part.length;
+            }
+        exchange.copied = sent;
         return ucall_status_success_k;
     }
+    static bool stopping(server_exchange_t const& exchange) noexcept {
+        return atomic_ref<std::uint32_t> {exchange.event_loop->server->stopped}.load(std::memory_order_acquire);
+    }
+
+    /** Whether the request line names HTTP/1.0, whose peers take no chunked body. */
+    static bool legacy_request(server_exchange_t const& exchange) noexcept {
+        std::string_view const text = exchange.text();
+        std::size_t const end = find(text, "\r\n");
+        return end != std::string_view::npos && end >= 8 && equal(text.substr(end - 8, 8), "HTTP/1.0");
+    }
     static ucall_status_t reply(server_exchange_t& exchange, unsigned status, span<ucall_bytes_view_t const> headers,
-                                std::string_view body) noexcept {
+                                span<ucall_bytes_view_t const> parts) noexcept {
         auto state = atomic_ref<std::uint32_t> {exchange.state};
         auto previous = state.fetch_or(claimed_k, std::memory_order_acq_rel);
         if (previous & claimed_k) return ucall_status_already_exists_k;
-        if ((previous & detached_k) ||
-            atomic_ref<std::uint32_t> {exchange.event_loop->server->stopped}.load(std::memory_order_acquire)) {
+        if ((previous & detached_k) || stopping(exchange)) {
             state.fetch_or(detached_k | ready_k, std::memory_order_release);
-            push_replied(exchange);
+            abandon(exchange);
             return ucall_status_connection_closed_k;
         }
-        auto result = serialize_reply(exchange, status, headers, body);
+        auto result = serialize_reply(exchange, status, headers, parts);
         if (result != ucall_status_success_k) {
-            exchange.output.clear();
             state.fetch_and(~std::uint32_t {claimed_k}, std::memory_order_release);
             return result;
         }
         previous = state.fetch_or(ready_k, std::memory_order_release);
-        push_replied(exchange);
+        push_segment(exchange, exchange.closing);
         return previous & detached_k ? ucall_status_connection_closed_k : ucall_status_success_k;
     }
 
-    /** Hands a finished exchange back to its event loop from any thread; only it recycles one. */
+    /** Ends a reply with an empty closing segment, so its exchange recycles whether the connection
+     *  lives or not. */
+    static void abandon(server_exchange_t& exchange) noexcept {
+        exchange.closing.bytes.clear();
+        push_segment(exchange, exchange.closing);
+    }
+
+    /** Opens a streamed reply: claims the exchange, picks its body's framing, queues the head. */
+    static ucall_status_t begin_reply(server_exchange_t& exchange, unsigned status,
+                                      span<ucall_bytes_view_t const> headers) noexcept {
+        auto state = atomic_ref<std::uint32_t> {exchange.state};
+        auto previous = state.fetch_or(claimed_k, std::memory_order_acq_rel);
+        if (previous & claimed_k) return ucall_status_already_exists_k;
+        exchange.declared = exchange.streamed = 0;
+        exchange.framing = reply_framing_t::bodiless_k;
+        if ((previous & detached_k) || stopping(exchange)) {
+            state.fetch_or(detached_k, std::memory_order_release);
+            return ucall_status_connection_closed_k;
+        }
+        std::optional<std::uint64_t> declared;
+        auto& output = exchange.opening.bytes;
+        ucall_status_t result = open_head(output, exchange.geometry, status);
+        if (result == ucall_status_success_k)
+            result = append_headers(output, headers, http_role_t::response_k, &declared);
+        bool const head_request = exchange.message.verb == ucall_verb_head_k;
+        reply_framing_t framing = declared                    ? reply_framing_t::length_k
+                                  : !legacy_request(exchange) ? reply_framing_t::chunked_k
+                                  : head_request              ? reply_framing_t::bodiless_k
+                                                              : reply_framing_t::until_close_k;
+        if (status == 204 || status == 304) {
+            if (declared) result = ucall_status_invalid_argument_k;
+            framing = reply_framing_t::bodiless_k;
+        }
+        if (framing == reply_framing_t::until_close_k) exchange.message.connection = http_connection_t::close_k;
+        if (result == ucall_status_success_k) result = close_head(output, exchange, framing, declared.value_or(0));
+        if (result == ucall_status_success_k && st::failed(output.resize(output.size() + exchange.geometry.tailroom)))
+            result = ucall_status_out_of_memory_k;
+        if (result != ucall_status_success_k) {
+            output.clear();
+            state.fetch_and(~std::uint32_t {claimed_k}, std::memory_order_release);
+            return result;
+        }
+        exchange.framing = head_request ? reply_framing_t::bodiless_k : framing;
+        exchange.declared = declared.value_or(0);
+        push_segment(exchange, exchange.opening);
+        return ucall_status_success_k;
+    }
+
+    /** A free chunk segment for @p exchange's replier: its own, then those the loop sent, else one
+     *  it allocates. */
+    static reply_segment_t* take_segment(server_exchange_t& exchange) noexcept {
+        if (!exchange.idle_segments)
+            exchange.idle_segments = atomic_ref<reply_segment_t*> {exchange.spare_segments}.exchange(
+                nullptr, std::memory_order_acquire);
+        if (reply_segment_t* segment = exchange.idle_segments) {
+            exchange.idle_segments = segment->next;
+            return segment;
+        }
+        return allocate_unique<reply_segment_t>(exchange.event_loop->allocator, exchange.event_loop->allocator)
+            .release();
+    }
+
+    /** Copies @p data into a fresh framed chunk of the open reply, unless the socket lags. */
+    static ucall_status_t append_chunk(server_exchange_t& exchange, std::string_view data) noexcept {
+        std::uint32_t const state = atomic_ref<std::uint32_t> {exchange.state}.load(std::memory_order_acquire);
+        if (!(state & claimed_k) || (state & ready_k)) return ucall_status_invalid_argument_k;
+        if ((state & detached_k) || stopping(exchange)) return ucall_status_connection_closed_k;
+        if (data.empty()) return ucall_status_success_k;
+        if (exchange.framing == reply_framing_t::bodiless_k)
+            return exchange.message.verb == ucall_verb_head_k ? ucall_status_success_k
+                                                              : ucall_status_invalid_argument_k;
+        if (exchange.framing == reply_framing_t::length_k && data.size() > exchange.declared - exchange.streamed)
+            return ucall_status_overflow_k;
+        auto unsent = atomic_ref<std::size_t> {exchange.unsent};
+        if (unsent.load(std::memory_order_relaxed) > unsent_chunk_bytes_k) return ucall_status_would_block_k;
+        reply_segment_t* segment = take_segment(exchange);
+        if (!segment) return ucall_status_out_of_memory_k;
+        char digits[sizeof(std::size_t) * 2];
+        auto written = std::to_chars(digits, digits + sizeof(digits), data.size(), 16);
+        std::string_view const size {digits, static_cast<std::size_t>(written.ptr - digits)};
+        ucall_status_t const framed = exchange.framing == reply_framing_t::chunked_k
+                                          ? frame_segment(segment->bytes, exchange.geometry,
+                                                          {size, "\r\n", data, "\r\n"})
+                                          : frame_segment(segment->bytes, exchange.geometry, {data});
+        if (framed != ucall_status_success_k) {
+            segment->next = exchange.idle_segments;
+            exchange.idle_segments = segment;
+            return framed;
+        }
+        exchange.streamed += data.size();
+        exchange.copied += data.size();
+        unsent.fetch_add(segment->bytes.size(), std::memory_order_relaxed);
+        push_segment(exchange, *segment);
+        return ucall_status_success_k;
+    }
+
+    /** Closes the open reply with its last chunk, closing the connection after a body cut short of
+     *  its declared length. */
+    static ucall_status_t end_reply(server_exchange_t& exchange) noexcept {
+        auto state = atomic_ref<std::uint32_t> {exchange.state};
+        std::uint32_t const current = state.load(std::memory_order_acquire);
+        if (!(current & claimed_k) || (current & ready_k)) return ucall_status_invalid_argument_k;
+        auto& closing = exchange.closing;
+        closing.bytes.clear();
+        ucall_status_t result = ucall_status_success_k;
+        if ((current & detached_k) || stopping(exchange)) result = ucall_status_connection_closed_k;
+        else if (exchange.framing == reply_framing_t::length_k && exchange.streamed != exchange.declared)
+            result = ucall_status_malformed_k;
+        else if (exchange.framing == reply_framing_t::chunked_k)
+            result = frame_segment(closing.bytes, exchange.geometry, {"0\r\n\r\n"});
+        if (result != ucall_status_success_k && result != ucall_status_connection_closed_k) {
+            closing.bytes.clear();
+            exchange.message.connection = http_connection_t::close_k;
+        }
+        if (state.fetch_or(ready_k, std::memory_order_release) & detached_k) result = ucall_status_connection_closed_k;
+        push_segment(exchange, closing);
+        return result;
+    }
+
+    /** Pushes @p segment onto its exchange's pending stack, listing the exchange for its event loop
+     *  only when the stack was empty. The loop takes the stack after unlisting the exchange, so a
+     *  push that finds it empty knows the exchange is listed nowhere. */
+    static void push_segment(server_exchange_t& exchange, reply_segment_t& segment) noexcept {
+        auto stack = atomic_ref<reply_segment_t*> {exchange.pending};
+        auto* next = stack.load(std::memory_order_relaxed);
+        // Acquiring the loop's take orders its read of `replied_next` before the relisting below.
+        do {
+            segment.next = next;
+        } while (!stack.compare_exchange_weak(next, &segment, std::memory_order_acq_rel, std::memory_order_relaxed));
+        if (!next) push_replied(exchange);
+    }
+
+    /** Hands an exchange with more reply segments to its event loop from any thread; only it
+     *  recycles one. */
     static void push_replied(server_exchange_t& exchange) noexcept {
         auto* event_loop = exchange.event_loop;
         auto head = atomic_ref<server_exchange_t*> {event_loop->replied};
@@ -846,14 +1091,57 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         event_loop->notify();
     }
 
-    /** Unlinks every exchange of a closed connection: collected ones recycle now, the rest once
-     *  their reply or the stop path returns them. */
+    /** Moves the pending stack to the back of the send queue in push order, noting whether the
+     *  reply ended. */
+    static void adopt_segments(server_exchange_t& exchange) noexcept {
+        reply_segment_t* newest = atomic_ref<reply_segment_t*> {exchange.pending}.exchange(nullptr,
+                                                                                           std::memory_order_acq_rel);
+        if (!newest) return;
+        reply_segment_t* ordered = nullptr;
+        for (reply_segment_t* segment = newest; segment;) {
+            reply_segment_t* next = segment->next;
+            segment->next = ordered;
+            ordered = segment;
+            segment = next;
+        }
+        if (exchange.newest_segment) exchange.newest_segment->next = ordered;
+        else exchange.oldest_segment = ordered;
+        exchange.newest_segment = newest;
+        exchange.stage = newest == &exchange.closing ? exchange_stage_t::ended_k : exchange_stage_t::collected_k;
+    }
+
+    /** Closes what a sent or abandoned segment holds, and hands a chunk back to its replier. */
+    static void retire_segment(server_exchange_t& exchange, reply_segment_t& segment) noexcept {
+        if (&segment == &exchange.opening || &segment == &exchange.closing) return;
+        atomic_ref<std::size_t> {exchange.unsent}.fetch_sub(segment.bytes.size(), std::memory_order_relaxed);
+        auto spare = atomic_ref<reply_segment_t*> {exchange.spare_segments};
+        auto* next = spare.load(std::memory_order_relaxed);
+        do {
+            segment.next = next;
+        } while (!spare.compare_exchange_weak(next, &segment, std::memory_order_release, std::memory_order_relaxed));
+    }
+
+    /** Retires every adopted segment of @p exchange, sent or not. */
+    static void release_segments(server_exchange_t& exchange) noexcept {
+        for (reply_segment_t* segment = std::exchange(exchange.oldest_segment, nullptr); segment;) {
+            reply_segment_t* next = segment->next;
+            retire_segment(exchange, *segment);
+            segment = next;
+        }
+        exchange.newest_segment = nullptr;
+    }
+
+    /** Unlinks every exchange of a closed connection: ended ones recycle now, the rest once their
+     *  reply or the stop path ends them. */
     static void detach(event_loop_t& event_loop, connection_t& connection) noexcept {
         for (auto* exchange = connection.oldest_exchange; exchange;) {
             auto* next = std::exchange(exchange->connection_next, nullptr);
             exchange->connection = nullptr;
-            if (exchange->stage == exchange_stage_t::collected_k) recycle_exchange(event_loop, *exchange);
-            else atomic_ref<std::uint32_t> {exchange->state}.fetch_or(detached_k, std::memory_order_release);
+            if (exchange->stage == exchange_stage_t::ended_k) recycle_exchange(event_loop, *exchange);
+            else {
+                atomic_ref<std::uint32_t> {exchange->state}.fetch_or(detached_k, std::memory_order_release);
+                release_segments(*exchange);
+            }
             exchange = next;
         }
         connection.oldest_exchange = connection.newest_exchange = nullptr;
@@ -862,7 +1150,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     static void recycle_exchange(event_loop_t& event_loop, server_exchange_t& exchange) noexcept {
         tally(event_loop.statistics.bytes_copied, std::exchange(exchange.copied, 0));
         exchange.input.clear();
-        exchange.output.clear();
+        release_segments(exchange);
+        exchange.opening.bytes.clear();
+        exchange.closing.bytes.clear();
         crypto_t::secure_zero(exchange.peer_static_key);
         exchange.replied_next = event_loop.free_exchanges;
         event_loop.free_exchanges = &exchange;
@@ -874,21 +1164,24 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         event_loop.ready = &connection;
     }
 
-    /** Takes the replied list whole; a reply stays on its connection until sent,
-     *  and only orphans recycle here. */
+    /** Takes the replied list whole and adopts each exchange's pushed segments; a reply stays on
+     *  its connection until sent, and only orphans release theirs here, recycling once ended. */
     static ucall_status_t collect_replies(event_loop_t& event_loop) noexcept {
         auto* exchange = atomic_ref<server_exchange_t*> {event_loop.replied}.exchange(nullptr,
                                                                                       std::memory_order_acq_rel);
         if (!exchange) return ucall_status_would_block_k;
         while (exchange) {
             auto* next = exchange->replied_next;
+            adopt_segments(*exchange);
             if (auto* connection = exchange->connection) {
-                exchange->stage = exchange_stage_t::collected_k;
                 if (atomic_ref<std::uint32_t> {exchange->state}.load(std::memory_order_acquire) & detached_k)
                     connection->fail(ucall_status_connection_closed_k);
                 mark_ready(event_loop, *connection);
             }
-            else recycle_exchange(event_loop, *exchange);
+            else {
+                release_segments(*exchange);
+                if (exchange->stage == exchange_stage_t::ended_k) recycle_exchange(event_loop, *exchange);
+            }
             exchange = next;
         }
         return ucall_status_success_k;
@@ -897,9 +1190,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** Answers on the event loop itself, failing the connection when no reply was queued. */
     static void refuse(connection_t& connection, server_exchange_t& exchange, unsigned status,
                        std::string_view body) noexcept {
-        auto result = reply(exchange, status, {}, body);
+        ucall_bytes_view_t const part = bytes_view(body);
+        auto result = reply(exchange, status, {}, {&part, 1});
         if (result == ucall_status_success_k || result == ucall_status_connection_closed_k) return;
-        exchange.stage = exchange_stage_t::collected_k; // Never pushed, so the close recycles it.
+        exchange.stage = exchange_stage_t::ended_k; // Never pushed, so the close recycles it.
         connection.fail(ucall_status_out_of_memory_k);
     }
 
@@ -919,6 +1213,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         exchange->state = 0;
         exchange->stage = exchange_stage_t::dispatched_k;
+        exchange->unsent = 0;
         exchange->event_loop = &event_loop;
         exchange->connection = &connection;
         exchange->endpoint = nullptr;
@@ -944,7 +1239,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                  appended == ucall_status_success_k)
             tally(event_loop.statistics.bytes_copied, wire);
         else {
-            exchange->stage = exchange_stage_t::collected_k; // Never handed out, so the close recycles it.
+            exchange->stage = exchange_stage_t::ended_k; // Never handed out, so the close recycles it.
             return connection.fail(appended);
         }
         tally(event_loop.statistics.requests);
@@ -985,32 +1280,51 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                {});
     }
 
-    /** Steps an open server connection, answering its next engine request or null, by these rules
-     *  in order:
-     *  R1 reply finished: the oldest reply is all sent, so pop and recycle it, and a full receive
-     *     side reads again.
-     *  R2 requests: while reading, dispatch each complete request; the depth makes the side full,
-     *     and `connection: close`, a peer close, or an unparsable request, refused in its turn,
-     *     ends it.
-     *  R3 next reply: an idle transmit side starts on the oldest exchange once its reply is
-     *     collected.
-     *  R4 emit: the next chunk of that reply while its send is idle, else a receive while reading.
-     *  R5 done: ended with every reply sent, the connection lingers half-closed until the peer
-     *     closes, so request bytes it never read cannot turn the close into a reset. */
-    static io_request_t* serve_open(server_t& server, event_loop_t& event_loop, connection_t& connection) noexcept {
-        auto* oldest = connection.oldest_exchange;
-        if (connection.transmitting == transmit_state_t::sending_k &&
-            connection.transmit_operation == operation_state_t::idle_k && !connection.sending &&
-            connection.output_offset == oldest->output.size()) {
+    /** Retires the oldest replies' sent segments, then each exchange whose reply ended with nothing
+     *  left to send, reading again on a full receive side. A reply delimited by the close, or cut
+     *  short of its length, ends the connection after it. */
+    static void retire_sent(event_loop_t& event_loop, connection_t& connection) noexcept {
+        while (auto* oldest = connection.oldest_exchange) {
+            if (reply_segment_t* segment = oldest->oldest_segment) {
+                if (connection.output_offset != segment->bytes.size()) return;
+                oldest->oldest_segment = segment->next;
+                if (!oldest->oldest_segment) oldest->newest_segment = nullptr;
+                connection.output_offset = 0;
+                retire_segment(*oldest, *segment);
+                continue;
+            }
+            connection.transmitting = transmit_state_t::idle_k;
+            if (oldest->stage != exchange_stage_t::ended_k) return;
             connection.oldest_exchange = std::exchange(oldest->connection_next, nullptr);
             if (!connection.oldest_exchange) connection.newest_exchange = nullptr;
             --connection.exchanges_in_flight;
             oldest->connection = nullptr;
+            bool const closes = !oldest->message.keep_alive();
             recycle_exchange(event_loop, *oldest);
-            connection.transmitting = transmit_state_t::idle_k;
-            connection.output_offset = 0;
             if (connection.receiving == receive_state_t::full_k) connection.receiving = receive_state_t::reading_k;
+            if (closes) {
+                connection.receiving = receive_state_t::ended_k;
+                if (connection.oldest_exchange) connection.fail(ucall_status_connection_closed_k);
+                return;
+            }
         }
+    }
+
+    /** Steps an open server connection, answering its next engine request or null, by these rules
+     *  in order:
+     *  R1 replies sent: with the transmit side free, retire the oldest replies' sent segments, then
+     *     each exchange whose reply ended, and a full receive side reads again.
+     *  R2 requests: while reading, dispatch each complete request; the depth makes the side full,
+     *     and `connection: close`, a peer close, or an unparsable request, refused in its turn,
+     *     ends it.
+     *  R3 next segment: a free transmit side sends the oldest reply's front segment once adopted.
+     *  R4 receive: a receive while reading.
+     *  R5 done: ended with every reply sent, the connection lingers half-closed until the peer
+     *     closes, so request bytes it never read cannot turn the close into a reset. */
+    static io_request_t* serve_open(server_t& server, event_loop_t& event_loop, connection_t& connection) noexcept {
+        if (connection.transmit_operation == operation_state_t::idle_k && !connection.sending)
+            retire_sent(event_loop, connection);
+        if (connection.stage != connection_stage_t::open_k) return connection.advance();
         connection.open_records();
         auto depth = connection.network_interface->config.max_pipelined_requests;
         // Requests dispatched this round, erased from `input` once after it rather than one by one.
@@ -1041,13 +1355,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         if (consumed) drop_bytes(connection.input, consumed);
         if (connection.stage != connection_stage_t::open_k) return connection.advance();
-        oldest = connection.oldest_exchange;
-        if (connection.transmitting == transmit_state_t::idle_k && oldest &&
-            oldest->stage == exchange_stage_t::collected_k)
+        auto* oldest = connection.oldest_exchange;
+        if (connection.transmit_operation == operation_state_t::idle_k && oldest && oldest->oldest_segment) {
             connection.transmitting = transmit_state_t::sending_k;
-        if (connection.transmitting == transmit_state_t::sending_k &&
-            connection.transmit_operation == operation_state_t::idle_k) {
-            if (auto* next = connection.transmit_from(oldest->output)) return next;
+            if (auto* next = connection.transmit_from(oldest->oldest_segment->bytes)) return next;
             return connection.advance(); // Sealing failed the connection.
         }
         if (connection.receiving == receive_state_t::reading_k &&
@@ -1559,7 +1870,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 auto& exchange = *static_cast<server_exchange_t*>(handle);
                 atomic_ref<std::uint32_t> {exchange.state}.fetch_or(claimed_k | ready_k | detached_k,
                                                                     std::memory_order_release);
-                push_replied(exchange);
+                abandon(exchange);
             }
         else {
             tally(endpoint.statistics.batches);
@@ -1930,7 +2241,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         publish(arguments->outcome, reply(*static_cast<server_exchange_t*>(arguments->request),
                                           arguments->http_status ? arguments->http_status : 200,
-                                          {arguments->headers, arguments->headers_count}, text_view(arguments->body)));
+                                          {arguments->headers, arguments->headers_count}, {&arguments->body, 1}));
     }
     static void server_reply_error(ucall_server_reply_error_t* arguments) noexcept {
         if (!arguments) return;
@@ -1941,7 +2252,46 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         ucall_bytes_view_t const header = bytes_view("content-type: text/plain");
         publish(arguments->outcome, reply(*static_cast<server_exchange_t*>(arguments->request), arguments->http_status,
-                                          {&header, 1}, text_view(arguments->message)));
+                                          {&header, 1}, {&arguments->message, 1}));
+    }
+    static void server_reply_vectored(ucall_server_reply_vectored_t* arguments) noexcept {
+        if (!arguments) return;
+        if (!arguments->server || !arguments->request || (arguments->headers_count && !arguments->headers) ||
+            (arguments->parts_count && !arguments->parts)) {
+            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        publish(arguments->outcome,
+                reply(*static_cast<server_exchange_t*>(arguments->request),
+                      arguments->http_status ? arguments->http_status : 200,
+                      {arguments->headers, arguments->headers_count}, {arguments->parts, arguments->parts_count}));
+    }
+    static void server_reply_begin(ucall_server_reply_begin_t* arguments) noexcept {
+        if (!arguments) return;
+        if (!arguments->server || !arguments->request || (arguments->headers_count && !arguments->headers)) {
+            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        publish(arguments->outcome, begin_reply(*static_cast<server_exchange_t*>(arguments->request),
+                                                arguments->http_status ? arguments->http_status : 200,
+                                                {arguments->headers, arguments->headers_count}));
+    }
+    static void server_reply_chunk(ucall_server_reply_chunk_t* arguments) noexcept {
+        if (!arguments) return;
+        if (!arguments->server || !arguments->request || !valid_view(arguments->data)) {
+            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        publish(arguments->outcome,
+                append_chunk(*static_cast<server_exchange_t*>(arguments->request), text_view(arguments->data)));
+    }
+    static void server_reply_end(ucall_server_reply_end_t* arguments) noexcept {
+        if (!arguments) return;
+        if (!arguments->server || !arguments->request) {
+            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        publish(arguments->outcome, end_reply(*static_cast<server_exchange_t*>(arguments->request)));
     }
     struct client_exchange_t {
         explicit client_exchange_t(allocator_t const& allocator = {}) noexcept
@@ -2839,7 +3189,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                                    &server_request_body,
                                                    &server_reply_content,
                                                    &server_reply_error,
-                                                   &server_add_http_batch_endpoint};
+                                                   &server_add_http_batch_endpoint,
+                                                   &server_reply_vectored,
+                                                   &server_reply_begin,
+                                                   &server_reply_chunk,
+                                                   &server_reply_end};
     inline static client_api_t const client_api_k {&client_free, &client_call, &client_take_completed};
 };
 

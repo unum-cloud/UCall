@@ -146,6 +146,10 @@ struct ucall_server_handle_t {
         void (*reply_content)(ucall_server_reply_content_t*);
         void (*reply_error)(ucall_server_reply_error_t*);
         void (*add_http_batch_endpoint)(ucall_server_add_http_batch_endpoint_t*);
+        void (*reply_vectored)(ucall_server_reply_vectored_t*);
+        void (*reply_begin)(ucall_server_reply_begin_t*);
+        void (*reply_chunk)(ucall_server_reply_chunk_t*);
+        void (*reply_end)(ucall_server_reply_end_t*);
     };
     api_t const* api {};
     std::uint64_t string_capabilities {}, atomic_capabilities {};

@@ -49,11 +49,12 @@ A server interface's `max_pipelined_requests` and a client's `max_pipelined_call
 No call is pipelined behind one that is not idempotent or that sends `Connection: close`.
 A pipelined connection lost mid-flight retries its unanswered idempotent calls and finishes the rest with `ucall_status_connection_closed_k`.
 Calls a server left unread when it announced a close are sent again on a new connection.
-Servers support immutable routes, size and latency based application batching, retained request views, and content and error replies.
+Servers support immutable routes, size and latency based application batching, retained request views, and content, error, vectored and streamed replies.
+A streamed reply is chunked for HTTP/1.1 peers, keeps identity framing when its headers declare `Content-Length`, and is delimited by the close for HTTP/1.0 peers; a chunk reports `ucall_status_would_block_k` while the socket lags too far behind.
 XX and IK servers authenticate clients; KK clients can connect to a separately configured peer, while the server interface cannot specify KK's preknown initiator key.
 `ucall_noise_key_generate()` draws a static keypair from the operating system's entropy, reporting `ucall_status_io_k` when it is refused, and `ucall_noise_key_derive()` recovers the public key of a stored private key.
 
-WebSockets, multipart access, streaming replies, file replies, and metrics remain unsupported and return `ucall_status_unsupported_k` where an outcome is available.
+WebSockets, multipart access, file replies, and metrics remain unsupported and return `ucall_status_unsupported_k` where an outcome is available.
 Numeric addresses are handled directly, and reusing a connection does not resolve its host again.
 A new connection to a hostname still uses the synchronous system resolver on the polling caller; request deadlines cannot interrupt that resolver.
 The [Python](../python/README.md) and [Rust](../rust/README.md) bindings wrap this ABI and keep its polling model: the application starts every thread.

@@ -406,22 +406,26 @@ void ucall_server_request_part(ucall_server_request_part_t* arguments) {
 
 void ucall_server_reply_vectored(ucall_server_reply_vectored_t* arguments) {
     if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->reply_vectored(arguments);
 }
 
 void ucall_server_reply_begin(ucall_server_reply_begin_t* arguments) {
     if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->reply_begin(arguments);
 }
 
 void ucall_server_reply_chunk(ucall_server_reply_chunk_t* arguments) {
     if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->reply_chunk(arguments);
 }
 
 void ucall_server_reply_end(ucall_server_reply_end_t* arguments) {
     if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->reply_end(arguments);
 }
 
 void ucall_server_reply_file(ucall_server_reply_file_t* arguments) {

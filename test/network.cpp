@@ -93,6 +93,39 @@ struct fixture_t {
     std::vector<ucall_received_http_request_t> held {};
     std::vector<std::thread> pollers {};
 
+    /** The query parameter @p name of @p request, empty when absent. */
+    std::string query(ucall_received_http_request_t request, std::string_view name) {
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t value {};
+        ucall_server_request_query_parameter_t get {server, &outcome, request, uc::bytes_view(name), &value};
+        ucall_server_request_query_parameter(&get);
+        return outcome.status == ucall_status_success_k
+                   ? std::string {reinterpret_cast<char const*>(value.data), value.length}
+                   : std::string {};
+    }
+    std::uint64_t query_number(ucall_received_http_request_t request, std::string_view name) {
+        std::string const text = query(request, name);
+        std::uint64_t number = 0;
+        std::from_chars(text.data(), text.data() + text.size(), number);
+        return number;
+    }
+
+    /** Replies 201 with five parts, two of them empty, behind two headers. */
+    static void vectored(ucall_received_http_request_t request, void* context) {
+        auto& fixture = *static_cast<fixture_t*>(context);
+        static std::string const middle(100 * 1024, 'v');
+        ucall_bytes_view_t const headers[] {uc::bytes_view("X-UCall: passed"),
+                                            uc::bytes_view("Content-Type: application/octet-stream")};
+        ucall_bytes_view_t const parts[] {uc::bytes_view(""), uc::bytes_view("first|"), uc::bytes_view(middle),
+                                          uc::bytes_view(""), uc::bytes_view("|last")};
+        ucall_outcome_t outcome {};
+        ucall_server_reply_vectored_t reply {fixture.server, &outcome, request, ucall_http_status_created_k,
+                                             headers,        2,        parts,   5};
+        ucall_server_reply_vectored(&reply);
+        fixture.failures += expect(outcome.status == ucall_status_success_k, "vectored: {}",
+                                   ucall_status_name(outcome.status));
+    }
+
     /** Checks the peer is the fixture's client, then replies with the request body and an
      *  `X-UCall: passed` header. */
     void reply_echo(ucall_received_http_request_t request) {
@@ -213,8 +246,9 @@ struct fixture_t {
         ucall_server_init(&init);
         if ((status = outcome.status) != ucall_status_success_k) return;
         using route_t = std::pair<char const*, ucall_received_http_request_callback_t>;
-        for (auto [route, callback] : {route_t {"/echo/{id}", echo}, route_t {"/gate", gate},
-                                       route_t {"/headers", lookup}, route_t {"/status/{code}", status_only}}) {
+        for (auto [route, callback] :
+             {route_t {"/echo/{id}", echo}, route_t {"/gate", gate}, route_t {"/headers", lookup},
+              route_t {"/status/{code}", status_only}, route_t {"/vectored", vectored}}) {
             ucall_server_add_http_endpoint_t add {server,           &outcome, uc::bytes_view(route),
                                                   ucall_verb_any_k, callback, this};
             ucall_server_add_http_endpoint(&add);
@@ -624,6 +658,228 @@ static case_result_t test_bodiless_responses_keep_connection() {
     return failures + fixture.stop();
 }
 
+/** Calls @p target with @p verb, then waits for the completion, whose response the caller frees. */
+static ucall_completed_call_t call_and_wait(fixture_t& fixture, ucall_verb_t verb, std::string_view target,
+                                            ucall_security_mode_t security, std::size_t& failures) {
+    std::string const url = fixture.url + std::string {target};
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(url);
+    call.verb = verb;
+    call.options.security = security;
+    call.options.server_key = &fixture.server_public;
+    ucall_client_call(&call);
+    failures += expect(outcome.status == ucall_status_success_k, "call: {}", ucall_status_name(outcome.status));
+    auto completed = fixture.wait();
+    failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}: {}", target,
+                       ucall_status_name(completed.outcome.status));
+    return completed;
+}
+static std::string_view response_body(ucall_received_http_response_t response) {
+    ucall_outcome_t outcome {};
+    ucall_bytes_view_t body {};
+    ucall_client_response_body_t get {response, &outcome, &body};
+    ucall_client_response_body(&get);
+    return {reinterpret_cast<char const*>(body.data), body.length};
+}
+static std::string_view response_header(ucall_received_http_response_t response, std::string_view name) {
+    ucall_outcome_t outcome {};
+    ucall_bytes_view_t value {};
+    ucall_client_response_header_t get {response, &outcome, uc::bytes_view(name), &value};
+    ucall_client_response_header(&get);
+    return {reinterpret_cast<char const*>(value.data), value.length};
+}
+
+/** Checks @p completed answered @p status with @p body, then frees its response. */
+static std::size_t check_answer(ucall_completed_call_t const& completed, ucall_http_status_t status,
+                                std::string_view body) {
+    if (!completed.response) return 1;
+    std::size_t failures = 0;
+    auto const answered = response_body(completed.response);
+    failures += expect(ucall_client_response_status(completed.response) == status, "answered {} rather than {}",
+                       ucall_client_response_status(completed.response), status);
+    failures += expect(answered == body, "a {}-byte body rather than {} bytes", answered.size(), body.size());
+    ucall_client_response_free(completed.response);
+    return failures;
+}
+
+/** The body `stream_reply` sends as @p count chunks of growing, labelled sizes. */
+static std::vector<std::string> stream_chunks(std::size_t count, char label) {
+    std::vector<std::string> chunks;
+    for (std::size_t i = 0; i != count; ++i)
+        chunks.push_back(fmt::format("{}{}:", label, i) + std::string(i * 37, label));
+    return chunks;
+}
+
+/** Streams @p chunks to @p request from the calling thread, retrying a chunk the socket lags
+ *  behind, and answers how many checks failed, expecting @p ended from the end. */
+static std::size_t stream_reply(ucall_server_t server, ucall_received_http_request_t request,
+                                std::vector<std::string> const& chunks, std::vector<ucall_bytes_view_t> headers = {},
+                                ucall_status_t ended = ucall_status_success_k) {
+    std::size_t failures = 0;
+    ucall_outcome_t outcome {};
+    ucall_server_reply_begin_t begin {server, &outcome, request, 0, headers.data(), headers.size()};
+    ucall_server_reply_begin(&begin);
+    failures += expect(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
+    for (auto const& chunk : chunks) {
+        ucall_server_reply_chunk_t append {server, &outcome, request, uc::bytes_view(chunk)};
+        for (ucall_server_reply_chunk(&append); outcome.status == ucall_status_would_block_k;
+             ucall_server_reply_chunk(&append))
+            std::this_thread::sleep_for(100us);
+        failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
+    }
+    ucall_server_reply_end_t end {server, &outcome, request};
+    ucall_server_reply_end(&end);
+    failures += expect(outcome.status == ended, "end: {}", ucall_status_name(outcome.status));
+    return failures;
+}
+static std::string joined(std::vector<std::string> const& chunks) {
+    std::string whole;
+    for (auto const& chunk : chunks) whole += chunk;
+    return whole;
+}
+
+/** Five parts, two of them empty, arrive concatenated under the status and headers given, and a
+ *  @c HEAD request gets the same head without a body. */
+static case_result_t reply_vectored(ucall_security_mode_t security) {
+    fixture_t fixture {{.security = security}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    std::string const expected = "first|" + std::string(100 * 1024, 'v') + "|last";
+    auto completed = call_and_wait(fixture, ucall_verb_get_k, "/vectored", security, failures);
+    if (completed.response) {
+        failures += expect(response_header(completed.response, "x-ucall") == "passed");
+        failures += expect(response_header(completed.response, "content-type") == "application/octet-stream");
+    }
+    failures += check_answer(completed, ucall_http_status_created_k, expected);
+    completed = call_and_wait(fixture, ucall_verb_head_k, "/vectored", security, failures);
+    if (completed.response)
+        failures += expect(response_header(completed.response, "content-length") == std::to_string(expected.size()));
+    failures += check_answer(completed, ucall_http_status_created_k, {});
+    return failures + fixture.stop();
+}
+static case_result_t test_reply_vectored_plain() { return reply_vectored(ucall_security_mode_none_k); }
+static case_result_t test_reply_vectored_noise_xx() { return reply_vectored(ucall_security_mode_noise_xx_k); }
+
+/** An application thread streams a reply of many chunks long after the callback returned, while
+ *  this thread polls, and the client reads the chunked body whole. */
+static case_result_t streamed_reply(ucall_security_mode_t security) {
+    fixture_t fixture {{.security = security}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    std::string const url = fixture.url + "/gate";
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(url);
+    call.verb = ucall_verb_get_k;
+    call.options.security = security;
+    call.options.server_key = &fixture.server_public;
+    ucall_client_call(&call);
+    failures += await_held(fixture, 1);
+    auto const chunks = stream_chunks(300, 's');
+    std::atomic<std::size_t> streamed_failures {};
+    std::thread streamer {
+        [&, request = fixture.take_held()] { streamed_failures += stream_reply(fixture.server, request, chunks); }};
+    auto completed = fixture.wait();
+    streamer.join();
+    failures += streamed_failures.load();
+    if (completed.response) failures += expect(response_header(completed.response, "transfer-encoding") == "chunked");
+    failures += check_answer(completed, ucall_http_status_ok_k, joined(chunks));
+    return failures + fixture.stop();
+}
+static case_result_t test_streamed_reply_plain() { return streamed_reply(ucall_security_mode_none_k); }
+static case_result_t test_streamed_reply_noise_xx() { return streamed_reply(ucall_security_mode_noise_xx_k); }
+
+/** Two threads stream to two requests pipelined on one connection at once, the second thread
+ *  starting first, and both replies arrive whole and in request order. */
+static case_result_t pipelined_streams(ucall_security_mode_t security) {
+    fixture_t fixture {{.security = security, .pipelined_requests = 2, .pipelined_calls = 2}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    std::array<std::string, 2> urls {fixture.url + "/gate?n=0", fixture.url + "/gate?n=1"};
+    std::array<std::vector<std::string>, 2> const chunks {stream_chunks(200, 'a'), stream_chunks(250, 'b')};
+    for (auto& url : urls) {
+        ucall_outcome_t outcome {};
+        ucall_client_call_t call {};
+        call.client = fixture.client;
+        call.outcome = &outcome;
+        call.url = uc::bytes_view(url);
+        call.verb = ucall_verb_get_k;
+        call.context = &url;
+        call.options.security = security;
+        call.options.server_key = &fixture.server_public;
+        ucall_client_call(&call);
+        failures += expect(outcome.status == ucall_status_success_k);
+    }
+    failures += await_held(fixture, 2);
+    std::array<ucall_received_http_request_t, 2> requests {};
+    while (auto request = fixture.take_held()) requests[fixture.query_number(request, "n")] = request;
+    std::atomic<std::size_t> streamed_failures {};
+    std::thread later {[&] { streamed_failures += stream_reply(fixture.server, requests[1], chunks[1]); }};
+    std::thread earlier {[&] { streamed_failures += stream_reply(fixture.server, requests[0], chunks[0]); }};
+    for (std::size_t i = 0; i != 2; ++i) {
+        auto completed = fixture.wait();
+        failures += expect(completed.context == &urls[i], "call {} completed out of order", i);
+        failures += check_answer(completed, ucall_http_status_ok_k, joined(chunks[i]));
+    }
+    later.join();
+    earlier.join();
+    failures += streamed_failures.load();
+    ucall_outcome_t outcome {};
+    ucall_event_loop_statistics_t counters {};
+    ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &counters};
+    ucall_server_event_loop_statistics(&query);
+    failures += expect(counters.accepts == 1, "the server accepted {} connections", counters.accepts);
+    return failures + fixture.stop();
+}
+static case_result_t test_pipelined_streams_plain() { return pipelined_streams(ucall_security_mode_none_k); }
+static case_result_t test_pipelined_streams_noise_xx() { return pipelined_streams(ucall_security_mode_noise_xx_k); }
+
+/** @c HEAD on a vectored and two streamed replies answers each head with no body, and the @c GET
+ *  behind each on the same connection still parses. */
+static case_result_t test_head_replies() {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    auto security = ucall_security_mode_none_k;
+    auto completed = call_and_wait(fixture, ucall_verb_head_k, "/vectored", security, failures);
+    if (completed.response)
+        failures += expect(!response_header(completed.response, "content-length").empty(), "no content-length");
+    failures += check_answer(completed, ucall_http_status_created_k, {});
+    completed = call_and_wait(fixture, ucall_verb_get_k, "/echo/1", security, failures);
+    failures += check_answer(completed, ucall_http_status_ok_k, {});
+    std::string const url = fixture.url + "/gate";
+    auto const chunks = stream_chunks(20, 'h');
+    std::string const length = fmt::format("Content-Length: {}", joined(chunks).size());
+    for (std::vector<ucall_bytes_view_t> headers :
+         {std::vector<ucall_bytes_view_t> {}, std::vector<ucall_bytes_view_t> {uc::bytes_view(length)}}) {
+        announce("HEAD on a stream with {} headers", headers.size());
+        ucall_outcome_t outcome {};
+        ucall_client_call_t call {};
+        call.client = fixture.client;
+        call.outcome = &outcome;
+        call.url = uc::bytes_view(url);
+        call.verb = ucall_verb_head_k;
+        ucall_client_call(&call);
+        failures += await_held(fixture, 1);
+        failures += stream_reply(fixture.server, fixture.take_held(), chunks, headers);
+        completed = fixture.wait();
+        failures += check_answer(completed, ucall_http_status_ok_k, {});
+        completed = call_and_wait(fixture, ucall_verb_get_k, "/echo/1", security, failures);
+        failures += check_answer(completed, ucall_http_status_ok_k, {});
+    }
+    ucall_outcome_t outcome {};
+    ucall_event_loop_statistics_t counters {};
+    ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &counters};
+    ucall_server_event_loop_statistics(&query);
+    failures += expect(counters.accepts == 1, "the server accepted {} connections", counters.accepts);
+    return failures + fixture.stop();
+}
+
 #pragma endregion Library Clients
 
 #pragma region Raw Clients
@@ -867,6 +1123,205 @@ static case_result_t test_backend_parity(random_generator_t& generator) {
     }
     if (compared < 2) return case_result_t::skipped("fewer than two backends are available", failures);
     return failures;
+}
+
+/** Waits until the background loops hold @p count requests at `/gate`. */
+static std::size_t await_held_in_background(fixture_t& fixture, std::size_t count) {
+    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    while (fixture.held_count() != count && steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
+    return expect(fixture.held_count() == count, "the server holds {} of {} requests", fixture.held_count(), count);
+}
+
+/** Chunks outrunning a peer that reads nothing report @c ucall_status_would_block_k, and once the
+ *  peer reads, the retried rest completes a body of the declared length byte for byte. */
+static case_result_t test_streamed_reply_would_block() {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    raw_client_t client;
+    require(failures, client.connect(fixture.address));
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                       static_cast<ssize_t>(request.size()));
+    failures += await_held_in_background(fixture, 1);
+    auto* held = fixture.take_held();
+    require(failures + fixture.stop(), held);
+    std::size_t const chunk_length = 64 * 1024, chunks_count = 512;
+    std::string chunk(chunk_length, '\0');
+    std::string const length = fmt::format("Content-Length: {}", chunk_length * chunks_count);
+    ucall_bytes_view_t const header = uc::bytes_view(length);
+    ucall_outcome_t outcome {};
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, &header, 1};
+    ucall_server_reply_begin(&begin);
+    failures += expect(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
+    auto fill = [&](std::size_t index) {
+        for (std::size_t i = 0; i != chunk_length; ++i) chunk[i] = static_cast<char>('a' + (index + i) % 26);
+    };
+    std::size_t queued = 0;
+    for (; queued != chunks_count; ++queued) {
+        fill(queued);
+        ucall_server_reply_chunk_t append {fixture.server, &outcome, held, uc::bytes_view(chunk)};
+        ucall_server_reply_chunk(&append);
+        if (outcome.status == ucall_status_would_block_k) break;
+        failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
+    }
+    failures += expect(queued != chunks_count, "every chunk queued while the peer read nothing");
+    std::atomic<std::size_t> read_failures {};
+    std::thread reader {[&] {
+        auto const response = read_response(client, 0);
+        read_failures += expect(response.status == 200 && response.body.size() == chunk_length * chunks_count,
+                                "read {} with {} body bytes", response.status, response.body.size());
+        for (std::size_t index = 0; index != chunks_count && response.body.size() == chunk_length * chunks_count;
+             ++index)
+            if (response.body[index * chunk_length] != static_cast<char>('a' + index % 26)) {
+                read_failures += expect(false, "chunk {} arrived corrupted", index);
+                break;
+            }
+    }};
+    for (; queued != chunks_count; ++queued) {
+        fill(queued);
+        ucall_server_reply_chunk_t append {fixture.server, &outcome, held, uc::bytes_view(chunk)};
+        for (ucall_server_reply_chunk(&append); outcome.status == ucall_status_would_block_k;
+             ucall_server_reply_chunk(&append))
+            std::this_thread::sleep_for(100us);
+        failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
+    }
+    ucall_server_reply_end_t end {fixture.server, &outcome, held};
+    ucall_server_reply_end(&end);
+    failures += expect(outcome.status == ucall_status_success_k, "end: {}", ucall_status_name(outcome.status));
+    reader.join();
+    return failures + read_failures.load() + fixture.stop();
+}
+
+/** A peer leaving mid-stream turns later chunks and the end into
+ *  @c ucall_status_connection_closed_k, and the server goes on answering others. */
+static case_result_t test_streamed_reply_detach() {
+    fixture_t fixture {{.connections = 2}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    raw_client_t client;
+    require(failures, client.connect(fixture.address));
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                       static_cast<ssize_t>(request.size()));
+    failures += await_held_in_background(fixture, 1);
+    auto* held = fixture.take_held();
+    require(failures + fixture.stop(), held);
+    ucall_outcome_t outcome {};
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, nullptr, 0};
+    ucall_server_reply_begin(&begin);
+    failures += expect(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
+    std::string const chunk(4096, 'd');
+    ucall_server_reply_chunk_t append {fixture.server, &outcome, held, uc::bytes_view(chunk)};
+    ucall_server_reply_chunk(&append);
+    failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
+    client.close();
+    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    do {
+        std::this_thread::sleep_for(1ms);
+        ucall_server_reply_chunk(&append);
+    } while (outcome.status != ucall_status_connection_closed_k && steady_clock::now() < deadline);
+    failures += expect(outcome.status == ucall_status_connection_closed_k, "chunk after the close: {}",
+                       ucall_status_name(outcome.status));
+    ucall_server_reply_end_t end {fixture.server, &outcome, held};
+    ucall_server_reply_end(&end);
+    failures += expect(outcome.status == ucall_status_connection_closed_k, "end: {}",
+                       ucall_status_name(outcome.status));
+    raw_client_t other;
+    require(failures + fixture.stop(), other.connect(fixture.address));
+    std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok";
+    failures += expect(::send(other.descriptor, echo.data(), echo.size(), 0) == static_cast<ssize_t>(echo.size()));
+    auto const response = read_response(other, 0);
+    failures += expect(response.status == 200 && response.body == "ok", "answered {} {}", response.status,
+                       response.body);
+    return failures + fixture.stop();
+}
+
+/** An HTTP/1.0 peer gets a streamed body delimited by the close, with no framing field. */
+static case_result_t test_streamed_reply_http10() {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    raw_client_t client;
+    require(failures, client.connect(fixture.address));
+    std::string_view const request = "GET /gate HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
+    failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                       static_cast<ssize_t>(request.size()));
+    failures += await_held_in_background(fixture, 1);
+    auto* held = fixture.take_held();
+    require(failures + fixture.stop(), held);
+    auto const chunks = stream_chunks(50, 'c');
+    failures += stream_reply(fixture.server, held, chunks);
+    auto const end = client.read_until_close(steady_clock::now() + 5s);
+    failures += expect(end == read_end_t::closed_k, "the read ended as {}", static_cast<int>(end));
+    std::string_view const wire = client.received;
+    auto const headers_end = wire.find("\r\n\r\n");
+    require(failures + fixture.stop(), headers_end != std::string_view::npos);
+    auto const headers = wire.substr(0, headers_end);
+    failures += expect(headers.starts_with("HTTP/1.1 200 OK\r\n"));
+    failures += expect(headers.find("connection: close") != std::string_view::npos);
+    failures += expect(headers.find("content-length") == std::string_view::npos &&
+                           headers.find("transfer-encoding") == std::string_view::npos,
+                       "framed head: {}", headers);
+    failures += expect(wire.substr(headers_end + 4) == joined(chunks), "{} body bytes", wire.size() - headers_end - 4);
+    return failures + fixture.stop();
+}
+
+/** A declared `content-length` frames chunks as identity, refuses a chunk running past it, and an
+ *  end short of it reports @c ucall_status_malformed_k and closes after the bytes sent. */
+static case_result_t test_streamed_reply_identity() {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    raw_client_t client;
+    require(failures, client.connect(fixture.address));
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    ucall_bytes_view_t const header = uc::bytes_view("Content-Length: 10");
+    auto send_and_take = [&] {
+        failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                           static_cast<ssize_t>(request.size()));
+        failures += await_held_in_background(fixture, 1);
+        return fixture.take_held();
+    };
+    ucall_outcome_t outcome {};
+    auto chunk = [&](ucall_received_http_request_t held, std::string_view data) {
+        ucall_server_reply_chunk_t append {fixture.server, &outcome, held, uc::bytes_view(data)};
+        ucall_server_reply_chunk(&append);
+        return outcome.status;
+    };
+    auto* held = send_and_take();
+    require(failures + fixture.stop(), held);
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, &header, 1};
+    ucall_server_reply_begin(&begin);
+    failures += expect(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
+    failures += expect(chunk(held, "hello") == ucall_status_success_k);
+    failures += expect(chunk(held, "worldwide!") == ucall_status_overflow_k, "past the length: {}",
+                       ucall_status_name(outcome.status));
+    failures += expect(chunk(held, "world") == ucall_status_success_k);
+    ucall_server_reply_end_t end {fixture.server, &outcome, held};
+    ucall_server_reply_end(&end);
+    failures += expect(outcome.status == ucall_status_success_k, "end: {}", ucall_status_name(outcome.status));
+    auto const response = read_response(client, 0);
+    failures += expect(response.status == 200 && response.body == "helloworld", "answered {} {}", response.status,
+                       response.body);
+    held = send_and_take();
+    require(failures + fixture.stop(), held);
+    begin.request = held;
+    ucall_server_reply_begin(&begin);
+    failures += expect(chunk(held, "short") == ucall_status_success_k);
+    end.request = held;
+    ucall_server_reply_end(&end);
+    failures += expect(outcome.status == ucall_status_malformed_k, "a short end: {}",
+                       ucall_status_name(outcome.status));
+    auto const closed = client.read_until_close(steady_clock::now() + 5s);
+    failures += expect(closed == read_end_t::closed_k, "the read ended as {}", static_cast<int>(closed));
+    failures += expect(std::string_view {client.received}.substr(response.length).ends_with("\r\n\r\nshort"),
+                       "the cut reply: {}", std::string_view {client.received}.substr(response.length));
+    return failures + fixture.stop();
 }
 
 #endif // UCALL_OS_POSIX_
@@ -1374,7 +1829,18 @@ int main(int argc, char** argv) {
     run_test(totals, "test_pipelined_calls_noise_xx", test_pipelined_calls_noise_xx);
     run_test(totals, "test_pipelined_call_loss", test_pipelined_call_loss);
     run_test(totals, "test_bodiless_responses_keep_connection", test_bodiless_responses_keep_connection);
+    run_test(totals, "test_reply_vectored_plain", test_reply_vectored_plain);
+    run_test(totals, "test_reply_vectored_noise_xx", test_reply_vectored_noise_xx);
+    run_test(totals, "test_streamed_reply_plain", test_streamed_reply_plain);
+    run_test(totals, "test_streamed_reply_noise_xx", test_streamed_reply_noise_xx);
+    run_test(totals, "test_pipelined_streams_plain", test_pipelined_streams_plain);
+    run_test(totals, "test_pipelined_streams_noise_xx", test_pipelined_streams_noise_xx);
+    run_test(totals, "test_head_replies", test_head_replies);
 #if UCALL_OS_POSIX_
+    run_test(totals, "test_streamed_reply_would_block", test_streamed_reply_would_block);
+    run_test(totals, "test_streamed_reply_detach", test_streamed_reply_detach);
+    run_test(totals, "test_streamed_reply_http10", test_streamed_reply_http10);
+    run_test(totals, "test_streamed_reply_identity", test_streamed_reply_identity);
     run_test(totals, "test_lengthless_head_keeps_connection", test_lengthless_head_keeps_connection);
     run_test(totals, "test_caller_close_mid_pipeline", test_caller_close_mid_pipeline);
     run_test(totals, "test_post_waits_behind_post", test_post_waits_behind_post);
