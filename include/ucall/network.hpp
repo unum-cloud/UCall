@@ -236,6 +236,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     struct event_loop_t;
     struct network_interface_t;
     struct client_peer_t;
+    struct client_origin_t;
     struct endpoint_t;
     struct server_exchange_t;
     inline static thread_local event_loop_t* polling_event_loop {};
@@ -4583,11 +4584,32 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::size_t attempts {}, redirects {};
         std::uint64_t authority_hash {};
         http_connection_t connection_intent {}; // Close, when the caller's own `connection` header asks to.
-        client_exchange_t* next {};             // Idle or waiting calls of the client, or a peer's calls in order.
+        client_origin_t* origin {};             // Interned from the authority, security and keys.
+        client_exchange_t* next {};             // Idle calls, an origin's waiting calls, or a peer's in order.
+    };
+
+    /** What makes two calls share a connection, and the calls waiting for one, earliest deadline
+     *  first. A record lives while a call waits on it or a peer remembers it. */
+    struct client_origin_t {
+        explicit client_origin_t(allocator_t const& allocator = {}) noexcept
+            : authority(rebound_allocator<char> {allocator}) {}
+        client_origin_t(client_origin_t const&) = delete;
+        client_origin_t& operator=(client_origin_t const&) = delete;
+        client_origin_t(client_origin_t&&) = delete;
+        client_origin_t& operator=(client_origin_t&&) = delete;
+
+        vector<char> authority {};
+        std::uint64_t authority_hash {};
+        ucall_security_mode_t security {};
+        ucall_noise_key_t private_key {}, remote_key {}; // Zeroed when the calls name none.
+        client_exchange_t *waiting_head {}, *waiting_tail {};
+        std::size_t waiting {};
+        std::size_t room {};      // Calls its connections could still take, counted each round.
+        std::size_t peers {};     // Peers dialed to it, open or not.
+        client_origin_t* next {}; // Live or free origins of the client.
     };
     struct client_peer_t {
-        explicit client_peer_t(allocator_t const& allocator = {}) noexcept
-            : connection(allocator), authority(rebound_allocator<char> {allocator}) {}
+        explicit client_peer_t(allocator_t const& allocator = {}) noexcept : connection(allocator) {}
         client_peer_t(client_peer_t const&) = delete;
         client_peer_t& operator=(client_peer_t const&) = delete;
         client_peer_t(client_peer_t&&) = delete;
@@ -4598,10 +4620,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         client_exchange_t* newest_exchange {}; // While sending, its request is the one in `connection.output`.
         std::uint32_t exchanges_in_flight {};
         std::size_t answered_exchanges {}; // Since the dial, telling a reused connection from a fresh one.
-        vector<char> authority {};
-        ucall_security_mode_t security {};
-        std::uint64_t authority_hash {};
-        ucall_noise_key_t private_key {}, remote_key {};
+        client_origin_t* origin {};        // Of the last dial, kept so an idle connection serves it again.
+        client_peer_t* next_vacant {};     // A round's peers free to dial.
     };
     struct client_t : ucall_client_handle_t {
         allocator_t allocator;
@@ -4622,8 +4642,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         ucall_noise_key_t private_key {};
         vector<owner<client_peer_t>> peers {};
         span<client_exchange_t> exchanges {};
-        client_exchange_t* idle {};                           // Calls free to submit.
-        client_exchange_t *waiting_head {}, *waiting_tail {}; // Queued calls, earliest deadline first.
+        span<client_origin_t> origins {};           // One per call and per peer, so interning never runs out.
+        client_exchange_t* idle {};                 // Calls free to submit.
+        client_origin_t *live {}, *free_origins {}; // `live` may hold origins nothing uses until `intern_origin`.
         std::size_t admitted {}, completed_head {}, completed_count {};
         ~client_t() noexcept {
             engine.stop();
@@ -4636,7 +4657,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                           connection.receive_request.operation == io_operation_t::close_k &&
                           connection.receive_request.descriptor < 0))
                         engine.close_socket(connection.descriptor);
-                    crypto_t::secure_zero(peer->private_key);
                 }
             for (std::size_t i = 0; i != completed_count; ++i)
                 ucall_client_response_free(completed[(completed_head + i) % completed.size()].response);
@@ -4644,6 +4664,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             for (auto& exchange : exchanges) std::destroy_at(&exchange);
             if (!exchanges.empty())
                 rebound_allocator<client_exchange_t> {allocator}.deallocate(exchanges.data(), exchanges.size());
+            for (auto& origin : origins) {
+                crypto_t::secure_zero(origin.private_key);
+                std::destroy_at(&origin);
+            }
+            if (!origins.empty())
+                rebound_allocator<client_origin_t> {allocator}.deallocate(origins.data(), origins.size());
         }
     };
     static ucall_status_t parse_url(client_exchange_t& exchange) noexcept {
@@ -4740,41 +4766,48 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         exchange.address = exchange.addresses.get();
         return ucall_status_success_k;
     }
-    static ucall_status_t compose_request(connection_t& connection, client_exchange_t const& exchange) noexcept {
-        connection.output.clear();
+
+    /** The record layout requests take under @p security, which a dial reads before it
+     *  configures the tunnel. */
+    static secure_tunnel_geometry_t request_geometry(ucall_security_mode_t security) noexcept {
+        bool const framed = secure_tunnel_mode_encrypts(tunnel_mode(security));
+        return {.headroom = framed ? secure_tunnel_headroom_k : 0,
+                .tailroom = framed ? secure_tunnel_tailroom_k : 0,
+                .max_payload = secure_tunnel_default_payload_k};
+    }
+
+    /** Appends @p exchange's request to @p output in plain bytes, behind the requests already
+     *  there, or leaves @p output as it was on failure. */
+    static ucall_status_t append_request(vector<byte_t>& output, client_exchange_t const& exchange) noexcept {
         auto& arguments = exchange.arguments;
         auto target = text_view(exchange.target);
         if (!http_value(target) || find(target, ' ') != std::string_view::npos ||
             find(target, '\t') != std::string_view::npos)
             return ucall_status_invalid_argument_k;
-        // A dial composes before it configures the tunnel,
-        // so the call's own security sizes the framing.
-        bool const framed = secure_tunnel_mode_encrypts(tunnel_mode(arguments.options.security));
-        secure_tunnel_geometry_t const geometry {.headroom = framed ? secure_tunnel_headroom_k : 0,
-                                                 .tailroom = framed ? secure_tunnel_tailroom_k : 0,
-                                                 .max_payload = secure_tunnel_default_payload_k};
-        if (st::failed(connection.output.resize(geometry.headroom))) return ucall_status_out_of_memory_k;
-        ucall_status_t result = append_text(connection.output,
-                                            {http_verb_name(arguments.verb),
-                                             " ",
-                                             target,
-                                             " HTTP/1.1\r\nhost: ",
-                                             {exchange.authority.data(), exchange.authority.size() - 1},
-                                             "\r\nuser-agent: UCall\r\n"});
+        std::size_t const previous = output.size();
+        ucall_status_t result = append_text(output, {http_verb_name(arguments.verb),
+                                                     " ",
+                                                     target,
+                                                     " HTTP/1.1\r\nhost: ",
+                                                     {exchange.authority.data(), exchange.authority.size() - 1},
+                                                     "\r\nuser-agent: UCall\r\n"});
         if (result == ucall_status_success_k)
-            result = append_headers(connection.output, {arguments.headers, arguments.headers_count},
-                                    http_role_t::request_k);
+            result = append_headers(output, {arguments.headers, arguments.headers_count}, http_role_t::request_k);
         char digits[std::numeric_limits<std::size_t>::digits10 + 1];
         if (result == ucall_status_success_k)
-            result = append_text(connection.output,
-                                 {"content-length: ", format_decimal(digits, arguments.body.length), "\r\n\r\n"});
-        if (result == ucall_status_success_k) result = spread_records(connection.output, geometry);
-        if (result == ucall_status_success_k)
-            result = append_records(connection.output, geometry, {text_view(arguments.body)});
-        if (result == ucall_status_success_k &&
-            st::failed(connection.output.resize(connection.output.size() + geometry.tailroom)))
-            result = ucall_status_out_of_memory_k;
+            result = append_text(output, {"content-length: ", format_decimal(digits, arguments.body.length), "\r\n\r\n",
+                                          text_view(arguments.body)});
+        if (result == ucall_status_success_k) return result;
+        [[maybe_unused]] st::status_t const shrunk = output.resize(previous);
         return result;
+    }
+
+    /** Lays the requests appended after @p output's headroom out as records of @p geometry. */
+    static ucall_status_t frame_requests(vector<byte_t>& output, secure_tunnel_geometry_t const& geometry) noexcept {
+        if (ucall_status_t const spread = spread_records(output, geometry); spread != ucall_status_success_k)
+            return spread;
+        return st::failed(output.resize(output.size() + geometry.tailroom)) ? ucall_status_out_of_memory_k
+                                                                            : ucall_status_success_k;
     }
     static void finish_exchange(client_t& client, client_exchange_t& exchange, ucall_status_t status,
                                 response_t* response = nullptr) noexcept {
@@ -4787,31 +4820,58 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         exchange.address = nullptr;
         exchange.redirect.clear();
         exchange.redirect_headers.clear();
+        exchange.origin = nullptr;
         exchange.stage = client_exchange_t::stage_t::idle_k;
         exchange.next = std::exchange(client.idle, &exchange);
     }
-    static bool same_peer(client_t const& client, client_peer_t const& peer,
-                          client_exchange_t const& exchange) noexcept {
+
+    /** Finds or makes the origin of @p exchange, freeing every live origin nothing uses on the
+     *  way. A live origin holds a waiting call or a peer, so one is free while a call is not
+     *  admitted. */
+    static client_origin_t* intern_origin(client_t& client, client_exchange_t const& exchange) noexcept {
         auto& options = exchange.arguments.options;
-        auto* private_key = options.client_key ? options.client_key : client.config.noise_private_key;
-        if (peer.security != options.security || peer.authority_hash != exchange.authority_hash ||
-            peer.authority.size() != exchange.authority.size() ||
-            !equal(text_view(peer.authority), text_view(exchange.authority)))
-            return false;
-        if (options.security == ucall_security_mode_none_k) return true;
-        return private_key && std::memcmp(peer.private_key, *private_key, sizeof(peer.private_key)) == 0 &&
-               (!options.server_key || std::memcmp(peer.remote_key, *options.server_key, sizeof(peer.remote_key)) == 0);
+        ucall_noise_key_t private_key {}, remote_key {};
+        if (options.security != ucall_security_mode_none_k) {
+            std::memcpy(private_key, options.client_key ? *options.client_key : *client.config.noise_private_key,
+                        sizeof(private_key));
+            if (options.server_key) std::memcpy(remote_key, *options.server_key, sizeof(remote_key));
+        }
+        client_origin_t* found = nullptr;
+        for (client_origin_t** link = &client.live; *link;) {
+            client_origin_t& origin = **link;
+            if (!found && origin.authority_hash == exchange.authority_hash && origin.security == options.security &&
+                origin.authority.size() == exchange.authority.size() &&
+                equal(text_view(origin.authority), text_view(exchange.authority)) &&
+                std::memcmp(origin.private_key, private_key, sizeof(private_key)) == 0 &&
+                std::memcmp(origin.remote_key, remote_key, sizeof(remote_key)) == 0)
+                found = &origin;
+            else if (!origin.waiting && !origin.peers) {
+                *link = origin.next;
+                crypto_t::secure_zero(origin.private_key);
+                origin.next = std::exchange(client.free_origins, &origin);
+                continue;
+            }
+            link = &origin.next;
+        }
+        client_origin_t* origin = found ? found : client.free_origins;
+        if (!found && copy_text(origin->authority, {exchange.authority.data(), exchange.authority.size() - 1}) ==
+                          ucall_status_success_k) {
+            client.free_origins = origin->next;
+            origin->authority_hash = exchange.authority_hash;
+            origin->security = options.security;
+            std::memcpy(origin->private_key, private_key, sizeof(private_key));
+            std::memcpy(origin->remote_key, remote_key, sizeof(remote_key));
+            origin->next = std::exchange(client.live, origin);
+            found = origin;
+        }
+        crypto_t::secure_zero(private_key);
+        return found;
     }
 
     /** Dials the address of @p peer's one call, whose request `output` already holds. */
     static ucall_status_t dial_peer(client_t& client, client_peer_t& peer) noexcept {
         auto& exchange = *peer.oldest_exchange;
         auto& connection = peer.connection;
-        if (ucall_status_t const copied = copy_text(peer.authority,
-                                                    {exchange.authority.data(), exchange.authority.size() - 1});
-            copied != ucall_status_success_k)
-            return copied;
-        peer.authority_hash = exchange.authority_hash;
         while (exchange.address) {
             auto descriptor = client.engine.open_socket(exchange.address->ai_family);
             if (descriptor < 0) {
@@ -4846,9 +4906,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                            .length = exchange.address->ai_addrlen,
                                            .deadline = connection.deadline,
                                            .context = &connection};
-            peer.security = options.security;
-            if (key) std::memcpy(peer.private_key, *key, sizeof(peer.private_key));
-            if (options.server_key) std::memcpy(peer.remote_key, *options.server_key, sizeof(peer.remote_key));
             return ucall_status_success_k;
         }
         return ucall_status_connection_failed_k;
@@ -4930,26 +4987,30 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return exchange;
     }
 
-    /** Queues @p exchange by deadline, behind every waiting call due no later, for the next
-     *  connection of its origin. Equal timeouts append every new call at once. */
-    static void queue_call(client_t& client, client_exchange_t& exchange) noexcept {
+    /** Queues @p exchange on its origin by deadline, behind every waiting call due no later.
+     *  Equal timeouts append every new call at once. */
+    static void queue_call(client_exchange_t& exchange) noexcept {
+        client_origin_t& origin = *exchange.origin;
         exchange.stage = client_exchange_t::stage_t::queued_k;
         client_exchange_t* previous = nullptr;
-        if (client.waiting_tail && client.waiting_tail->deadline <= exchange.deadline) previous = client.waiting_tail;
+        if (origin.waiting_tail && origin.waiting_tail->deadline <= exchange.deadline) previous = origin.waiting_tail;
         else
-            for (auto* waiting = client.waiting_head; waiting && waiting->deadline <= exchange.deadline;
+            for (auto* waiting = origin.waiting_head; waiting && waiting->deadline <= exchange.deadline;
                  waiting = waiting->next)
                 previous = waiting;
-        exchange.next = previous ? previous->next : client.waiting_head;
-        (previous ? previous->next : client.waiting_head) = &exchange;
-        if (!exchange.next) client.waiting_tail = &exchange;
+        exchange.next = previous ? previous->next : origin.waiting_head;
+        (previous ? previous->next : origin.waiting_head) = &exchange;
+        if (!exchange.next) origin.waiting_tail = &exchange;
+        ++origin.waiting;
     }
 
-    /** Unlinks the waiting @p exchange, which follows @p previous or, when that is null, leads. */
-    static void unqueue_call(client_t& client, client_exchange_t& exchange, client_exchange_t* previous) noexcept {
-        (previous ? previous->next : client.waiting_head) = exchange.next;
-        if (client.waiting_tail == &exchange) client.waiting_tail = previous;
-        exchange.next = nullptr;
+    /** Unlinks the call of @p origin due first. */
+    static client_exchange_t& unqueue_call(client_origin_t& origin) noexcept {
+        client_exchange_t& exchange = *origin.waiting_head;
+        origin.waiting_head = std::exchange(exchange.next, nullptr);
+        if (!origin.waiting_head) origin.waiting_tail = nullptr;
+        --origin.waiting;
+        return exchange;
     }
     static std::size_t retry_budget(client_exchange_t const& exchange) noexcept {
         return exchange.arguments.options.max_retries ? exchange.arguments.options.max_retries : 3;
@@ -4996,15 +5057,41 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                          stage == connection_stage_t::closed_k);
     }
 
-    /** Takes the waiting call due first that @p peer's connection can carry. */
-    static client_exchange_t* take_waiting_call(client_t& client, client_peer_t const& peer) noexcept {
-        client_exchange_t* previous = nullptr;
-        for (auto* exchange = client.waiting_head; exchange; previous = exchange, exchange = exchange->next)
-            if (same_peer(client, peer, *exchange)) {
-                unqueue_call(client, *exchange, previous);
-                return exchange;
-            }
-        return nullptr;
+    /** Calls @p peer could take on top of those it carries, by `accepts_another_exchange`, counting
+     *  a connection still dialing at its full depth. */
+    static std::size_t peer_room(client_t const& client, client_peer_t const& peer) noexcept {
+        auto& connection = peer.connection;
+        bool const carrying = connection.descriptor >= 0 && connection.receiving == receive_state_t::reading_k &&
+                              (connection.stage == connection_stage_t::connecting_k ||
+                               connection.stage == connection_stage_t::handshake_k ||
+                               connection.stage == connection_stage_t::open_k);
+        return carrying && accepts_another_exchange(client, peer)
+                   ? client.config.max_pipelined_calls - peer.exchanges_in_flight
+                   : 0;
+    }
+
+    /** Dials @p peer, which carries no call, for the call of @p origin due first. */
+    static void dial_call(client_t& client, client_peer_t& peer, client_origin_t& origin) noexcept {
+        client_exchange_t& exchange = unqueue_call(origin);
+        if (peer.origin != &origin) {
+            if (peer.origin) --peer.origin->peers;
+            ++origin.peers;
+            peer.origin = &origin;
+        }
+        auto& output = peer.connection.output;
+        secure_tunnel_geometry_t const geometry = request_geometry(origin.security);
+        output.clear();
+        ucall_status_t result = exchange.address ? ucall_status_success_k : resolve_exchange(exchange);
+        if (result == ucall_status_success_k && st::failed(output.resize(geometry.headroom)))
+            result = ucall_status_out_of_memory_k;
+        if (result == ucall_status_success_k) result = append_request(output, exchange);
+        if (result == ucall_status_success_k) result = frame_requests(output, geometry);
+        if (result == ucall_status_success_k) {
+            push_call(peer, exchange);
+            result = dial_peer(client, peer);
+            if (result != ucall_status_success_k) pop_call(peer);
+        }
+        if (result != ucall_status_success_k) finish_exchange(client, exchange, result);
     }
 
     /** Answers @p peer's oldest call with the whole response at @p offset of `input`:
@@ -5043,8 +5130,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         message = {};
         pop_call(peer);
         if (status != ucall_status_success_k || response) return finish_exchange(client, exchange, status, response);
+        exchange.origin = intern_origin(client, exchange);
+        if (!exchange.origin) return finish_exchange(client, exchange, ucall_status_out_of_memory_k);
         exchange.attempts = 0;
-        queue_call(client, exchange);
+        queue_call(exchange);
     }
 
     /** Steps an open client connection, answering its next engine request or null, by these rules
@@ -5052,9 +5141,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
      *  C1 responses: while reading and a sent call awaits, each whole response answers the oldest
      *     call, a redirect queueing it again as a fresh call; a response without keep-alive, or to
      *     a call that asked to close, closes the connection.
-     *  C2 requests: while reading, an idle transmit side composes the next queued call this peer
-     *     can carry into `output` and appends it to the FIFO, if `accepts_another_exchange` allows.
-     *  C3 emit: while reading, the next chunk of that request while its send is idle, else a
+     *  C2 requests: while reading, an idle transmit side composes every call of the origin's queue
+     *     that `accepts_another_exchange` lets this peer carry into `output`, appending each to the
+     *     FIFO, so one send takes them all.
+     *  C3 emit: while reading, the next chunk of those requests while its send is idle, else a
      *     receive, posted even with no call so a peer close is seen before reuse.
      *  C4 done: a peer close, or bytes no call asked for, close the connection, losing any call
      *     still on the FIFO; with the FIFO empty and the side reading, the peer stays open.
@@ -5109,16 +5199,31 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if ((connection.flags & connection_peer_closed_k) || (!peer.oldest_exchange && !input.empty()))
             connection.receiving = receive_state_t::ended_k;
         if (connection.receiving == receive_state_t::reading_k) {
-            if (connection.transmitting == transmit_state_t::idle_k && accepts_another_exchange(client, peer))
-                if (auto* exchange = take_waiting_call(client, peer)) {
-                    auto result = compose_request(connection, *exchange);
-                    if (result != ucall_status_success_k) finish_exchange(client, *exchange, result);
-                    else {
-                        push_call(peer, *exchange);
-                        connection.transmitting = transmit_state_t::sending_k;
-                        connection.output_offset = 0;
-                    }
+            client_origin_t& origin = *peer.origin;
+            if (connection.transmitting == transmit_state_t::idle_k && origin.waiting_head &&
+                accepts_another_exchange(client, peer)) {
+                secure_tunnel_geometry_t const geometry = request_geometry(origin.security);
+                auto& output = connection.output;
+                output.clear();
+                if (st::failed(output.resize(geometry.headroom))) connection.fail(ucall_status_out_of_memory_k);
+                client_exchange_t* const newest = peer.newest_exchange;
+                while (connection.stage == connection_stage_t::open_k && origin.waiting_head &&
+                       accepts_another_exchange(client, peer)) {
+                    client_exchange_t& exchange = unqueue_call(origin);
+                    if (ucall_status_t const appended = append_request(output, exchange);
+                        appended != ucall_status_success_k)
+                        finish_exchange(client, exchange, appended);
+                    else push_call(peer, exchange);
                 }
+                if (peer.newest_exchange != newest) {
+                    if (ucall_status_t const framed = frame_requests(output, geometry);
+                        framed != ucall_status_success_k)
+                        connection.fail(framed);
+                    connection.transmitting = transmit_state_t::sending_k;
+                    connection.output_offset = 0;
+                }
+                if (connection.stage != connection_stage_t::open_k) return connection.advance();
+            }
             if (connection.transmitting == transmit_state_t::sending_k &&
                 connection.transmit_operation == operation_state_t::idle_k) {
                 if (auto* next = connection.transmit_from(connection.output)) return next;
@@ -5157,14 +5262,14 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 exchange.address = exchange.address ? exchange.address->ai_next : nullptr;
                 if (!exchange.address && exchange.attempts++ < retry_budget(exchange))
                     exchange.address = exchange.first_address();
-                if (exchange.address) queue_call(client, exchange);
+                if (exchange.address) queue_call(exchange);
             }
             else if (now >= exchange.deadline) outcome = ucall_status_timeout_k;
             else if (status == ucall_status_success_k ||
                      ((lost || !oldest) && (idempotent(exchange) || (oldest && unread)) &&
                       exchange.attempts++ < retry_budget(exchange))) {
                 exchange.address = exchange.first_address(); // Null for a call that rode a connection it never dialed.
-                queue_call(client, exchange);
+                queue_call(exchange);
             }
             if (exchange.stage != client_exchange_t::stage_t::queued_k) finish_exchange(client, exchange, outcome);
         }
@@ -5197,71 +5302,43 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
     static std::uint64_t client_progress(client_t& client) noexcept {
         auto now = monotonic_ns();
+        // Completions only record bytes, so peers answer and take calls before the rest dial.
+        for (auto& peer : client.peers) step_peer(client, *peer, now);
+        // Each origin's queue runs by deadline, so expiry and the next wake-up read only its front.
         std::uint64_t deadline = 0;
-        std::size_t vacancies = 0;
-        // Completions only record bytes, so peers answer and take calls
-        // before the rest look for peers.
-        for (auto& peer : client.peers) {
-            step_peer(client, *peer, now);
-            vacancies += vacant(*peer);
+        for (client_origin_t* origin = client.live; origin; origin = origin->next) {
+            while (origin->waiting_head && now >= origin->waiting_head->deadline)
+                finish_exchange(client, unqueue_call(*origin), ucall_status_timeout_k);
+            if (origin->waiting_head)
+                deadline = !deadline ? origin->waiting_head->deadline
+                                     : std::min(deadline, origin->waiting_head->deadline);
+            origin->room = 0;
         }
-        // The queue runs by deadline, so expiry and the next wake-up read only its front.
-        while (client.waiting_head && now >= client.waiting_head->deadline) {
-            auto& expired = *client.waiting_head;
-            unqueue_call(client, expired, nullptr);
-            finish_exchange(client, expired, ucall_status_timeout_k);
+        client_peer_t *fresh = nullptr, *idle = nullptr;
+        for (auto& owned : client.peers) {
+            client_peer_t& peer = *owned;
+            if (peer.origin) peer.origin->room += peer_room(client, peer);
+            if (!vacant(peer)) continue;
+            if (peer.connection.descriptor < 0) peer.next_vacant = std::exchange(fresh, &peer);
+            else if (!peer.origin || !peer.origin->waiting) peer.next_vacant = std::exchange(idle, &peer);
         }
-        if (client.waiting_head) deadline = client.waiting_head->deadline;
-        bool assigned = false;
-        for (unsigned pass = 0; pass != 2 && vacancies; ++pass) {
-            client_exchange_t* previous = nullptr;
-            for (auto* waiting = client.waiting_head; waiting && vacancies;) {
-                auto& exchange = *waiting;
-                waiting = exchange.next;
-                // A connection of the same origin below the depth takes the call
-                // by `call_open` rule C2.
-                client_peer_t* chosen = nullptr;
-                bool carried = false;
-                for (auto& peer : client.peers) {
-                    auto& connection = peer->connection;
-                    if (connection.descriptor >= 0 && connection.receiving == receive_state_t::reading_k &&
-                        (connection.stage == connection_stage_t::connecting_k ||
-                         connection.stage == connection_stage_t::handshake_k ||
-                         connection.stage == connection_stage_t::open_k) &&
-                        accepts_another_exchange(client, *peer) && same_peer(client, *peer, exchange)) {
-                        carried = true;
-                        break;
-                    }
-                    if (!vacant(*peer) || (!pass && assigned && connection.descriptor >= 0)) continue;
-                    if (!chosen || (chosen->connection.descriptor >= 0 && connection.descriptor < 0))
-                        chosen = peer.get();
-                }
-                if (carried || !chosen) {
-                    previous = &exchange;
-                    continue;
-                }
-                --vacancies;
-                assigned = true;
-                auto& connection = chosen->connection;
-                // An idle connection to another origin closes first; the call dials once it has.
-                if (connection.descriptor >= 0) {
-                    connection.fail(ucall_status_success_k);
-                    previous = &exchange;
-                    continue;
-                }
-                unqueue_call(client, exchange, previous);
-                auto result = exchange.address ? ucall_status_success_k : resolve_exchange(exchange);
-                if (result == ucall_status_success_k) result = compose_request(connection, exchange);
-                if (result == ucall_status_success_k) {
-                    push_call(*chosen, exchange);
-                    result = dial_peer(client, *chosen);
-                    if (result != ucall_status_success_k) pop_call(*chosen);
-                }
-                if (result != ucall_status_success_k) {
-                    ++vacancies;
-                    finish_exchange(client, exchange, result);
-                }
+        // A vacant peer goes to the origin whose call is due first among those waiting for more
+        // calls than their connections have room for.
+        while (fresh || idle) {
+            client_origin_t* neediest = nullptr;
+            for (client_origin_t* origin = client.live; origin; origin = origin->next)
+                if (origin->waiting > origin->room &&
+                    (!neediest || origin->waiting_head->deadline < neediest->waiting_head->deadline))
+                    neediest = origin;
+            if (!neediest) break;
+            if (fresh) {
+                neediest->room += client.config.max_pipelined_calls - 1;
+                dial_call(client, *std::exchange(fresh, fresh->next_vacant), *neediest);
+                continue;
             }
+            // An idle connection to another origin closes first; the call dials once it has.
+            std::exchange(idle, idle->next_vacant)->connection.fail(ucall_status_success_k);
+            neediest->room += client.config.max_pipelined_calls;
         }
         // Calls in flight time out through their connection's deadline, the earliest of its calls'.
         for (auto& peer : client.peers)
@@ -5299,7 +5376,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         // Each connection keeps one operation per direction.
         if (config.max_pipelined_calls > std::numeric_limits<std::uint32_t>::max() ||
-            config.max_concurrent_connections > std::numeric_limits<std::size_t>::max() / 2) {
+            config.max_concurrent_connections > std::numeric_limits<std::size_t>::max() / 2 ||
+            config.max_concurrent_calls > std::numeric_limits<std::size_t>::max() - config.max_concurrent_connections) {
             publish(arguments->outcome, ucall_status_overflow_k);
             return;
         }
@@ -5323,6 +5401,15 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         for (std::size_t i = config.max_concurrent_calls; i != 0; --i)
             std::construct_at(exchanges + i - 1, allocator)->next = std::exchange(client->idle, exchanges + i - 1);
         client->exchanges = {exchanges, config.max_concurrent_calls};
+        std::size_t const origins_count = config.max_concurrent_calls + config.max_concurrent_connections;
+        auto* origins = rebound_allocator<client_origin_t> {allocator}.allocate(origins_count);
+        if (!origins) {
+            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            return;
+        }
+        for (std::size_t i = origins_count; i != 0; --i)
+            std::construct_at(origins + i - 1, allocator)->next = std::exchange(client->free_origins, origins + i - 1);
+        client->origins = {origins, origins_count};
         auto status = client->engine.open(slots, slots);
         if (status != ucall_status_success_k) {
             publish(arguments->outcome, status);
@@ -5385,11 +5472,16 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             publish(arguments->outcome, result);
             return;
         }
+        exchange.origin = intern_origin(client, exchange);
+        if (!exchange.origin) {
+            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            return;
+        }
         client.idle = exchange.next;
         exchange.deadline = deadline_after(timeout);
         exchange.connection_intent = parse_connection_intent({arguments->headers, arguments->headers_count});
         exchange.attempts = exchange.redirects = 0;
-        queue_call(client, exchange);
+        queue_call(exchange);
         ++client.admitted;
         publish(arguments->outcome, ucall_status_success_k);
     }
@@ -5415,7 +5507,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 if (count < 0) {
                     client.failure = ucall_status_io_k;
                     client.engine.stop();
-                    client.waiting_head = client.waiting_tail = nullptr;
+                    for (client_origin_t* origin = client.live; origin; origin = origin->next) {
+                        origin->waiting_head = origin->waiting_tail = nullptr;
+                        origin->waiting = 0;
+                    }
                     for (auto& peer : client.peers) {
                         peer->oldest_exchange = peer->newest_exchange = nullptr;
                         peer->exchanges_in_flight = 0;

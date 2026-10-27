@@ -212,21 +212,21 @@ done
 
 | Connections | Depth | Requests/s | p50, µs | p99, µs | Server CPU, µs/request |
 | ----------: | ----: | ---------: | ------: | ------: | ---------------------: |
-|           1 |     1 |    116,489 |       9 |      12 |                    4.2 |
-|           1 |     4 |    236,228 |      16 |      37 |                    3.8 |
-|           1 |    16 |    252,692 |      63 |      98 |                    3.7 |
-|           1 |    64 |    250,261 |     254 |     344 |                    3.7 |
-|           4 |     1 |    270,479 |      15 |      23 |                    3.4 |
-|           4 |     4 |    288,435 |      55 |      82 |                    3.2 |
-|           4 |    16 |    251,517 |     254 |     590 |                    3.6 |
-|           4 |    64 |    250,310 |   1,016 |   1,507 |                    3.7 |
-|          64 |     1 |    313,900 |     197 |     279 |                    2.7 |
-|          64 |     4 |    281,987 |     885 |   1,507 |                    3.0 |
-|          64 |    16 |    213,004 |   4,719 |   7,340 |                    3.0 |
-|          64 |    64 |     18,690 | 226,492 | 234,881 |                    5.3 |
+|           1 |     1 |    122,282 |       8 |      12 |                    5.1 |
+|           1 |     4 |    277,003 |      14 |      23 |                    4.4 |
+|           1 |    16 |    307,483 |      53 |      74 |                    4.1 |
+|           1 |    64 |    321,304 |     205 |     238 |                    3.9 |
+|           4 |     1 |    291,754 |      14 |      18 |                    4.1 |
+|           4 |     4 |    339,806 |      47 |      74 |                    3.7 |
+|           4 |    16 |    341,152 |     188 |     229 |                    3.7 |
+|           4 |    64 |    348,120 |     754 |     819 |                    3.6 |
+|          64 |     1 |    337,935 |     180 |     246 |                    3.4 |
+|          64 |     4 |    378,116 |     688 |     819 |                    3.3 |
+|          64 |    16 |    361,575 |   2,884 |   3,146 |                    3.4 |
+|          64 |    64 |    369,662 |  11,534 |  12,583 |                    3.4 |
 
-A depth of 4 lets one connection carry 2.0 times the requests of a depth of 1, while deeper pipelines only add latency.
-The collapse at 64 connections and a depth of 64 is a known limit of the client driver: while one connection is below its depth it takes every waiting call, so the others never dial, and a fix is planned.
+A depth of 4 lets one connection carry 2.3 times the requests of a depth of 1, while deeper pipelines mostly add latency.
+The client composes every call a connection may still carry into one send, and dials another connection only while an origin waits for more calls than its open ones have room for.
 
 ## Noise Cost
 

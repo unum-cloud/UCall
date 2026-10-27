@@ -665,6 +665,47 @@ static case_result_t pipelined_calls(ucall_security_mode_t security) {
 }
 
 static case_result_t test_pipelined_calls_plain() { return pipelined_calls(ucall_security_mode_none_k); }
+
+/** Calls made at once open only the connections their depth needs: 64 at a depth of 16 open four
+ *  of eight, and 16 at a depth of one open all eight. */
+static case_result_t test_client_dials_for_depth() {
+    std::size_t failures = 0;
+    struct point_t {
+        std::size_t depth, calls, connections;
+    };
+    for (auto [depth, calls, connections] : {point_t {16, 64, 4}, point_t {1, 16, 8}}) {
+        fixture_t fixture {{.connections = 8, .pipelined_requests = depth, .pipelined_calls = depth}};
+        require(failures, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+        std::vector<std::string> bodies(calls);
+        for (std::size_t i = 0; i != bodies.size(); ++i) {
+            bodies[i] = fmt::format("call {}", i);
+            std::string const url = fmt::format("{}/echo/{}", fixture.url, i);
+            ucall_outcome_t outcome {};
+            ucall_client_call_t call {};
+            call.client = fixture.client;
+            call.outcome = &outcome;
+            call.url = uc::bytes_view(url);
+            call.verb = ucall_verb_put_k;
+            call.body = uc::bytes_view(bodies[i]);
+            call.context = &bodies[i];
+            ucall_client_call(&call);
+            failures += expect(outcome.status == ucall_status_success_k);
+        }
+        for (std::size_t i = 0; i != bodies.size() && !failures; ++i) {
+            auto completed = fixture.wait();
+            failures += expect(completed.response, "depth {}: {}", depth, ucall_status_name(completed.outcome.status));
+            if (completed.response)
+                failures += check_response(completed.response, *static_cast<std::string*>(completed.context));
+        }
+        ucall_outcome_t outcome {};
+        ucall_event_loop_statistics_t counters {};
+        ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &counters};
+        ucall_server_event_loop_statistics(&query);
+        failures += expect(counters.accepts == connections, "depth {} opened {} connections", depth, counters.accepts);
+        failures += fixture.stop();
+    }
+    return failures;
+}
 static case_result_t test_pipelined_calls_noise_xx() { return pipelined_calls(ucall_security_mode_noise_xx_k); }
 
 /** A caller's `Connection: close` on the second call keeps the POST and GET behind it off that
@@ -3549,6 +3590,7 @@ int main(int argc, char** argv) {
     run_test(totals, "test_multiloop_retention", test_multiloop_retention);
     run_test(totals, "test_cross_thread_replies_stress", test_cross_thread_replies_stress);
     run_test(totals, "test_pipelined_calls_plain", test_pipelined_calls_plain);
+    run_test(totals, "test_client_dials_for_depth", test_client_dials_for_depth);
     run_test(totals, "test_pipelined_calls_noise_xx", test_pipelined_calls_noise_xx);
     run_test(totals, "test_pipelined_call_loss", test_pipelined_call_loss);
     run_test(totals, "test_bodiless_responses_keep_connection", test_bodiless_responses_keep_connection);

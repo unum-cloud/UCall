@@ -305,29 +305,28 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
     std::array<uc::descriptor_t, 3> descriptors {};
     for (std::size_t i = 0; i != client.peers.size(); ++i) {
         auto& peer = *client.peers[i];
-        auto& exchange = client.exchanges[i == 1 ? 2 : 0];
-        failures += expect(
-            network_t::copy_text(peer.authority, {exchange.authority.data(), exchange.authority.size() - 1}) ==
-            ucall_status_success_k);
-        peer.authority_hash = exchange.authority_hash;
+        peer.origin = client.exchanges[i == 1 ? 2 : 0].origin;
+        ++peer.origin->peers;
         failures += expect(peer.connection.configure({}) == ucall_status_success_k);
         descriptors[i] = peer.connection.descriptor = client.engine.open_socket(AF_INET);
         failures += expect(descriptors[i] >= 0);
         peer.connection.stage = network_t::connection_stage_t::open_k;
     }
+    auto& origin = *client.exchanges[0].origin;
+    failures += expect(client.exchanges[1].origin == &origin && client.exchanges[3].origin == &origin &&
+                       client.exchanges[2].origin != &origin && origin.waiting == 3);
     auto& busy = *client.peers[2];
-    busy.oldest_exchange = busy.newest_exchange = &client.exchanges[3];
+    busy.oldest_exchange = busy.newest_exchange = &network_t::unqueue_call(origin);
     busy.exchanges_in_flight = 1;
     busy.connection.transmitting = network_t::transmit_state_t::sending_k;
     busy.connection.transmit_operation = network_t::operation_state_t::pending_k;
-    network_t::unqueue_call(client, client.exchanges[3], &client.exchanges[2]);
-    client.exchanges[3].stage = network_t::client_exchange_t::stage_t::active_k;
+    client.exchanges[0].stage = network_t::client_exchange_t::stage_t::active_k;
     network_t::client_progress(client);
     // Each idle connection takes its origin's waiting call due first, leaving the rest in order.
-    failures += expect(client.peers[0]->oldest_exchange == &client.exchanges[0]);
+    failures += expect(client.peers[0]->oldest_exchange == &client.exchanges[1]);
     failures += expect(client.peers[1]->oldest_exchange == &client.exchanges[2]);
-    failures += expect(client.exchanges[1].stage == network_t::client_exchange_t::stage_t::queued_k &&
-                       client.waiting_head == &client.exchanges[1] && client.waiting_tail == &client.exchanges[1]);
+    failures += expect(client.exchanges[3].stage == network_t::client_exchange_t::stage_t::queued_k &&
+                       origin.waiting_head == &client.exchanges[3] && origin.waiting_tail == &client.exchanges[3]);
     for (std::size_t i = 0; i != descriptors.size(); ++i)
         failures += expect(client.peers[i]->connection.descriptor == descriptors[i]);
     client.engine.stop();
@@ -339,9 +338,64 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
     client.exchanges[2].stage = network_t::client_exchange_t::stage_t::idle_k;
     network_t::client_progress(client);
     // The waiting call closes an idle connection to another origin, and dials once it has closed.
-    failures += expect(client.exchanges[1].stage == network_t::client_exchange_t::stage_t::queued_k &&
-                       client.waiting_head == &client.exchanges[1]);
+    failures += expect(client.exchanges[3].stage == network_t::client_exchange_t::stage_t::queued_k &&
+                       origin.waiting_head == &client.exchanges[3]);
     failures += expect(released.connection.stage == network_t::connection_stage_t::closing_k);
+    ucall_client_free(handle);
+    return failures;
+#else
+    return case_result_t::skipped("the POSIX backend is not compiled");
+#endif
+}
+
+/** An open connection at a depth of sixteen takes every one of sixteen waiting calls into one
+ *  output, in call order, so a single send carries them all. */
+static case_result_t test_client_batches_sends_unit() {
+#if UCALL_WITH_POSIX
+    using network_t = uc::serial_network<uc::posix_engine_t>;
+    std::size_t failures = 0;
+    ucall_client_t handle {};
+    ucall_outcome_t outcome {};
+    ucall_client_config_t config {};
+    config.backend = ucall_io_backend_posix_k;
+    config.cpu_class = ucall_cpu_class_serial_k;
+    config.max_concurrent_connections = 1;
+    config.max_pipelined_calls = 16;
+    ucall_client_init_t init {&handle, &outcome, &config, nullptr};
+    ucall_client_init(&init);
+    require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
+    auto& client = *static_cast<network_t::client_t*>(handle);
+    for (std::size_t i = 0; i != 16; ++i) {
+        ucall_client_call_t call {};
+        call.client = handle;
+        call.outcome = &outcome;
+        call.url = uc::bytes_view("http://127.0.0.1:18545/");
+        call.verb = ucall_verb_put_k;
+        ucall_client_call(&call);
+        failures += expect(outcome.status == ucall_status_success_k);
+    }
+    auto& peer = *client.peers[0];
+    auto& origin = *client.exchanges[0].origin;
+    peer.origin = &origin;
+    ++origin.peers;
+    failures += expect(peer.connection.configure({}) == ucall_status_success_k);
+    peer.connection.descriptor = client.engine.open_socket(AF_INET);
+    failures += expect(peer.connection.descriptor >= 0);
+    peer.connection.stage = network_t::connection_stage_t::open_k;
+    network_t::client_progress(client);
+    failures += expect(peer.exchanges_in_flight == 16 && !origin.waiting, "{} calls aboard, {} waiting",
+                       peer.exchanges_in_flight, origin.waiting);
+    std::size_t order = 0;
+    for (auto* exchange = peer.oldest_exchange; exchange; exchange = exchange->next)
+        failures += expect(exchange == &client.exchanges[order++]);
+    std::string_view const output {reinterpret_cast<char const*>(peer.connection.output.data()),
+                                   peer.connection.output.size()};
+    std::size_t requests = 0;
+    for (std::size_t at = output.find("PUT / HTTP/1.1"); at != std::string_view::npos;
+         at = output.find("PUT / HTTP/1.1", at + 1))
+        ++requests;
+    failures += expect(requests == 16, "one output holds {} requests", requests);
+    client.engine.stop();
     ucall_client_free(handle);
     return failures;
 #else
@@ -1230,6 +1284,7 @@ int main(int, char** argv) {
     run_test(totals, "test_allocator_propagation_unit", test_allocator_propagation_unit);
     run_test(totals, "test_allocation_failure_safety", test_allocation_failure_safety);
     run_test(totals, "test_origin_reuse_and_fairness_unit", test_origin_reuse_and_fairness_unit);
+    run_test(totals, "test_client_batches_sends_unit", test_client_batches_sends_unit);
     run_test(totals, "test_capability_admission_unit", test_capability_admission_unit);
     run_test(totals, "test_progress_and_retention_unit", test_progress_and_retention_unit);
     run_test(totals, "test_completion_credits_unit", test_completion_credits_unit);
