@@ -209,7 +209,7 @@ An `http+noise://` URL implies Noise XX, and a handler reads the client's authen
 ## Errors
 
 Every fallible call answers `ucall::Result`, whose `Error` carries the `Status` the library reported and a static message beside it, so nothing allocates on the failure path.
-A mistake the binding catches before calling the library, like a null byte inside an address, reports the status the library would have used.
+A mistake the binding catches before calling the library, like polling an event loop the server lacks, reports the status the library would have used.
 `Status` prints its stable spelling, such as "connection-failed", and a status a newer library added reads as `Status::Internal`.
 
 ```rust
@@ -252,6 +252,7 @@ The crate leaves these out:
 - Streamed request bodies, multipart parts and path segments by index; a handler reads the whole body and the template's named captures.
 - Streamed, vectored and file replies; a reply sends one body from memory.
 - The log sink and StatsD metrics of a server or client, which run silent and report through `event_loop_statistics` and `statistics` instead.
+- The initiator key a server interface admits under Noise KK, so a KK interface is refused at startup.
 - Per-call timeouts, retries, redirect limits and client keys; a call takes its client's.
 - Polling an unfinished outcome, as every method here returns once its result is final.
 

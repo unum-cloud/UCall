@@ -10,19 +10,18 @@
 // The C mirror keeps the C spelling of every name.
 #![allow(non_camel_case_types)]
 
-use core::ffi::{c_char, c_void};
+use core::ffi::{c_int, c_void};
 use core::mem::ManuallyDrop;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
-use std::ffi::{CStr, CString};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::types::{
-    check, fail, lend_authorizer, microseconds, pending_outcome, silent_log, static_string,
-    ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t,
-    ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t,
+    check, fail, lend_authorizer, microseconds, pending_outcome, silent_log, ucall_bytes_view_t,
+    ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t, ucall_io_backend_t,
+    ucall_log_t, ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t,
     ucall_received_http_request_t, ucall_security_mode_t, ucall_server_t,
     ucall_status_connection_closed_k, ucall_status_success_k, ucall_verb_t, view, viewed, Backend,
     BytesView, CPUClass, HTTPStatus, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb,
@@ -33,15 +32,17 @@ use crate::types::{
 #[repr(C)]
 #[derive(Clone, Copy)]
 struct ucall_network_interface_t {
-    address: *const c_char,
-    device_name: *const c_char,
+    address: ucall_bytes_view_t,
+    device_name: ucall_bytes_view_t,
     security_mode: ucall_security_mode_t,
     noise_private_key: *const ucall_noise_key_t,
+    noise_peer_key: *const ucall_noise_key_t,
     peer_authorizer: ucall_peer_authorizer_t,
     peer_authorizer_context: *mut c_void,
     event_loops: usize,
     max_concurrent_connections: usize,
     max_pipelined_requests: usize,
+    max_request_bytes: usize,
     reply_directories: *const ucall_bytes_view_t,
     reply_directories_count: usize,
 }
@@ -52,10 +53,12 @@ struct ucall_server_config_t {
     interfaces: *const ucall_network_interface_t,
     interfaces_count: usize,
     log: ucall_log_t,
-    metrics_address: *const c_char,
+    metrics_address: ucall_bytes_view_t,
     metrics_sample_rate: f32,
-    metrics_prefix: *const c_char,
-    metrics_tags: *const c_char,
+    metrics_prefix: ucall_bytes_view_t,
+    metrics_tags: *const ucall_bytes_view_t,
+    metrics_tags_count: usize,
+    metrics_interval_microseconds: usize,
     backend: ucall_io_backend_t,
     cpu_class: ucall_cpu_class_t,
 }
@@ -137,6 +140,7 @@ struct ucall_server_add_http_endpoint_t {
     verb: ucall_verb_t,
     callback: ucall_received_http_request_callback_t,
     context: *mut c_void,
+    body_delivery: c_int,
 }
 
 #[repr(C)]
@@ -455,22 +459,6 @@ impl Server {
         backend: Backend,
         cpu_class: CPUClass,
     ) -> Result<Server> {
-        let text = |value: &str| {
-            CString::new(value).map_err(|_| {
-                fail(
-                    Status::InvalidArgument,
-                    "an address or device name contains a null byte",
-                )
-            })
-        };
-        let addresses = interfaces
-            .iter()
-            .map(|interface| text(&interface.address))
-            .collect::<Result<Vec<_>>>()?;
-        let devices = interfaces
-            .iter()
-            .map(|interface| interface.device_name.as_deref().map(text).transpose())
-            .collect::<Result<Vec<_>>>()?;
         // The contexts point into this vector, which the core keeps unchanged until the free.
         let authorizers: Vec<Option<Arc<PeerAuthorizer>>> = interfaces
             .iter()
@@ -478,24 +466,24 @@ impl Server {
             .collect();
         let raw_interfaces: Vec<ucall_network_interface_t> = interfaces
             .iter()
-            .zip(&addresses)
-            .zip(&devices)
             .zip(&authorizers)
-            .map(|(((interface, address), device), authorizer)| {
+            .map(|(interface, authorizer)| {
                 let (peer_authorizer, peer_authorizer_context) = lend_authorizer(authorizer);
                 ucall_network_interface_t {
-                    address: address.as_ptr(),
-                    device_name: device.as_deref().map_or(ptr::null(), CStr::as_ptr),
+                    address: view(interface.address.as_bytes()),
+                    device_name: view(interface.device_name.as_deref().unwrap_or("").as_bytes()),
                     security_mode: interface.security.to_raw(),
                     noise_private_key: interface
                         .private_key
                         .as_ref()
                         .map_or(ptr::null(), ptr::from_ref),
+                    noise_peer_key: ptr::null(),
                     peer_authorizer,
                     peer_authorizer_context,
                     event_loops: interface.event_loops,
                     max_concurrent_connections: interface.connections,
                     max_pipelined_requests: interface.pipelined_requests,
+                    max_request_bytes: 0,
                     reply_directories: ptr::null(),
                     reply_directories_count: 0,
                 }
@@ -506,10 +494,12 @@ impl Server {
             interfaces: raw_interfaces.as_ptr(),
             interfaces_count: raw_interfaces.len(),
             log: silent_log(),
-            metrics_address: ptr::null(),
+            metrics_address: view(&[]),
             metrics_sample_rate: 0.0,
-            metrics_prefix: ptr::null(),
+            metrics_prefix: view(&[]),
             metrics_tags: ptr::null(),
+            metrics_tags_count: 0,
+            metrics_interval_microseconds: 0,
             backend: backend.to_raw(),
             cpu_class: cpu_class.to_raw(),
         };
@@ -561,7 +551,8 @@ impl Server {
     /// The numeric address interface `index` listens on, with the port it bound.
     pub fn address(&self, index: usize) -> Option<&str> {
         let address = self.core.interfaces().get(index)?.address;
-        (!address.is_null()).then(|| unsafe { static_string(address) })
+        // The server owns the resolved copy until it is freed.
+        Some(unsafe { core::str::from_utf8_unchecked(viewed(address)) })
     }
 
     /// Routes requests matching `path` and `verb` to `handler`, which runs on the polling thread.
@@ -588,6 +579,7 @@ impl Server {
             verb: verb.to_raw(),
             callback: Some(route_trampoline),
             context: route.cast(),
+            body_delivery: 0,
         };
         unsafe { ucall_server_add_http_endpoint(&mut arguments) };
         let registered = check(outcome);
@@ -797,6 +789,12 @@ pub struct EventLoopStatistics {
     pub zero_copy_fallbacks: u64,
     /// File reads submitted while an earlier window of the same stream waited to send or sent.
     pub file_window_overlaps: u64,
+    /// Requests the loop answered itself with 400, 404, 413, 501 or 503.
+    pub refused_requests: u64,
+    /// Connections whose Noise handshake failed.
+    pub handshake_failures: u64,
+    /// Connections whose authenticated peer key the interface's authorizer refused.
+    pub authorizer_refusals: u64,
 }
 
 /// When a batch endpoint hands its queue to the handler; zero fields take the defaults of 1

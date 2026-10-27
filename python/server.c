@@ -1366,9 +1366,13 @@ static PyObject* Server_new(PyTypeObject* type, PyObject* positional, PyObject* 
     for (Py_ssize_t index = 0; filled == 0 && index != interfaces_count; ++index) {
         Interface const* const source = (Interface const*)PyTuple_GET_ITEM(interfaces, index);
         ucall_network_interface_t* const target = &network_interfaces[index];
-        target->address = PyUnicode_AsUTF8(source->address);
-        target->device_name = source->device_name ? PyUnicode_AsUTF8(source->device_name) : NULL;
-        if (!target->address || (source->device_name && !target->device_name)) filled = -1;
+        Py_ssize_t address_length = 0, device_length = 0;
+        char const* const address = PyUnicode_AsUTF8AndSize(source->address, &address_length);
+        char const* const device = source->device_name ? PyUnicode_AsUTF8AndSize(source->device_name, &device_length)
+                                                       : NULL;
+        if (!address || (source->device_name && !device)) filled = -1;
+        target->address = (ucall_bytes_view_t) {(ucall_byte_t const*)address, (size_t)address_length};
+        target->device_name = (ucall_bytes_view_t) {(ucall_byte_t const*)device, (size_t)device_length};
         target->security_mode = source->security;
         if (source->private_key) {
             memcpy(keys[index], PyBytes_AS_STRING(source->private_key), sizeof(ucall_noise_key_t));
@@ -1930,8 +1934,9 @@ static char const doc_Server_event_loop_statistics[] =                          
     "Returns:\n"                                                                                 //
     "  dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,\n" //
     "    `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,\n"          //
-    "    `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks` and\n"           //
-    "    `file_window_overlaps`, each read on its own.\n"                                        //
+    "    `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,\n"              //
+    "    `file_window_overlaps`, `refused_requests`, `handshake_failures` and\n"                 //
+    "    `authorizer_refusals`, each read on its own.\n"                                         //
     "\n"                                                                                         //
     "Raises:\n"                                                                                  //
     "  Error: An `event_loop` past the last one.\n"                                              //
@@ -1953,22 +1958,25 @@ static PyObject* Server_event_loop_statistics(Server* self, PyObject* const* val
     ucall_server_event_loop_statistics_t query = {self->handle, &outcome, index, &counters};
     ucall_server_event_loop_statistics(&query);
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
-    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                                      //
-                         "polls", (unsigned long long)counters.polls,                             //
-                         "empty_polls", (unsigned long long)counters.empty_polls,                 //
-                         "kernel_enters", (unsigned long long)counters.kernel_enters,             //
-                         "submissions", (unsigned long long)counters.submissions,                 //
-                         "completions", (unsigned long long)counters.completions,                 //
-                         "cancellations", (unsigned long long)counters.cancellations,             //
-                         "accepts", (unsigned long long)counters.accepts,                         //
-                         "requests", (unsigned long long)counters.requests,                       //
-                         "receive_rearms", (unsigned long long)counters.receive_rearms,           //
-                         "bytes_received", (unsigned long long)counters.bytes_received,           //
-                         "bytes_sent", (unsigned long long)counters.bytes_sent,                   //
-                         "bytes_copied", (unsigned long long)counters.bytes_copied,               //
-                         "zero_copy_sends", (unsigned long long)counters.zero_copy_sends,         //
-                         "zero_copy_fallbacks", (unsigned long long)counters.zero_copy_fallbacks, //
-                         "file_window_overlaps", (unsigned long long)counters.file_window_overlaps);
+    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                                  //
+                         "polls", (unsigned long long)counters.polls,                               //
+                         "empty_polls", (unsigned long long)counters.empty_polls,                   //
+                         "kernel_enters", (unsigned long long)counters.kernel_enters,               //
+                         "submissions", (unsigned long long)counters.submissions,                   //
+                         "completions", (unsigned long long)counters.completions,                   //
+                         "cancellations", (unsigned long long)counters.cancellations,               //
+                         "accepts", (unsigned long long)counters.accepts,                           //
+                         "requests", (unsigned long long)counters.requests,                         //
+                         "receive_rearms", (unsigned long long)counters.receive_rearms,             //
+                         "bytes_received", (unsigned long long)counters.bytes_received,             //
+                         "bytes_sent", (unsigned long long)counters.bytes_sent,                     //
+                         "bytes_copied", (unsigned long long)counters.bytes_copied,                 //
+                         "zero_copy_sends", (unsigned long long)counters.zero_copy_sends,           //
+                         "zero_copy_fallbacks", (unsigned long long)counters.zero_copy_fallbacks,   //
+                         "file_window_overlaps", (unsigned long long)counters.file_window_overlaps, //
+                         "refused_requests", (unsigned long long)counters.refused_requests,         //
+                         "handshake_failures", (unsigned long long)counters.handshake_failures,     //
+                         "authorizer_refusals", (unsigned long long)counters.authorizer_refusals);
 }
 
 static PyObject* Server_get_event_loops(Server* self, void* closure) {
@@ -1990,7 +1998,8 @@ static PyObject* Server_get_addresses(Server* self, void* closure) {
     (void)closure;
     PyObject* const addresses = PyTuple_New((Py_ssize_t)self->resolved.interfaces_count);
     for (size_t index = 0; addresses && index != self->resolved.interfaces_count; ++index) {
-        PyObject* const address = PyUnicode_FromString(self->resolved.interfaces[index].address);
+        ucall_bytes_view_t const bound = self->resolved.interfaces[index].address;
+        PyObject* const address = PyUnicode_FromStringAndSize((char const*)bound.data, (Py_ssize_t)bound.length);
         if (!address) {
             Py_DECREF(addresses);
             return NULL;

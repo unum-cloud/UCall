@@ -437,6 +437,7 @@ enum class http_parse_t { incomplete_k, complete_k, malformed_k, unsupported_k, 
 enum class http_framing_t { length_k, chunked_k, until_close_k };
 enum class http_connection_t { close_k, keep_alive_k };
 enum class http_body_state_t { framed_k, decoded_k };
+enum class http_chunk_state_t { size_k, payload_k, payload_end_k, trailers_k };
 
 /** A received response keeps its bytes independently of the client and its CPU specialization. */
 struct received_response_t : ucall_received_http_response_handle_t {
@@ -608,6 +609,8 @@ struct http {
         ucall_http_status_t status {};
         http_connection_t connection {http_connection_t::close_k};
         http_body_state_t body_state {http_body_state_t::framed_k};
+        http_chunk_state_t chunk_state {http_chunk_state_t::size_k}; // Where a streamed body's decoder stands.
+        std::size_t chunk_remaining {};                              // Payload bytes left in its current chunk.
         bool keep_alive() const noexcept { return connection == http_connection_t::keep_alive_k; }
 
         std::string_view target(std::string_view bytes) const noexcept {
@@ -629,6 +632,46 @@ struct http {
             return {};
         }
     };
+
+    /** Reads the chunk-size line at @p cursor into @p length, with @p line_end at its CRLF:
+     *  complete once the line is whole, overflow when @p length would pass @p decoded bytes. */
+    static http_parse_t http_chunk_size(std::string_view text, std::size_t cursor, std::size_t decoded,
+                                        std::size_t& line_end, std::size_t& length) noexcept {
+        line_end = find(text, "\r\n", cursor);
+        if (line_end == std::string_view::npos) return http_parse_t::incomplete_k;
+        auto line = text.substr(cursor, line_end - cursor);
+        auto digits = line.substr(0, find(line, ';'));
+        length = 0;
+        auto result = std::from_chars(digits.data(), digits.data() + digits.size(), length, 16);
+        if (digits.empty() || result.ec != std::errc {} || result.ptr != digits.data() + digits.size() ||
+            !http_value(line))
+            return http_parse_t::malformed_k;
+        if (length > std::numeric_limits<std::size_t>::max() - decoded) return http_parse_t::overflow_k;
+        return http_parse_t::complete_k;
+    }
+
+    /** Walks the trailers from @p trailer to the empty line ending them, lowercasing their names,
+     *  with @p end past that line once complete. */
+    static http_parse_t http_trailers(span<byte_t> bytes, std::size_t trailer, std::size_t& end) noexcept {
+        auto text = text_view(bytes);
+        for (;;) {
+            auto trailer_end = find(text, "\r\n", trailer);
+            if (trailer_end == std::string_view::npos) return http_parse_t::incomplete_k;
+            if (trailer_end == trailer) {
+                end = trailer + 2;
+                return http_parse_t::complete_k;
+            }
+            auto colon = find(text, ':', trailer);
+            if (colon >= trailer_end || !http_token(text.substr(trailer, colon - trailer)) ||
+                !http_value(text.substr(colon + 1, trailer_end - colon - 1)))
+                return http_parse_t::malformed_k;
+            auto name = text.substr(trailer, colon - trailer);
+            lowercase_ascii({reinterpret_cast<char*>(bytes.data()) + trailer, name.size()});
+            if (equal(name, "content-length") || equal(name, "transfer-encoding") || equal(name, "host"))
+                return http_parse_t::malformed_k;
+            trailer = trailer_end + 2;
+        }
+    }
 
     static http_parse_t http_parse(span<byte_t> bytes, http_message_t& message, http_role_t role) noexcept {
         auto text = text_view(bytes);
@@ -740,37 +783,17 @@ struct http {
             return text.size() >= message.wire_length ? http_parse_t::complete_k : http_parse_t::incomplete_k;
         }
         while (message.cursor < text.size()) {
-            auto line_end = find(text, "\r\n", message.cursor);
-            if (line_end == std::string_view::npos) return http_parse_t::incomplete_k;
-            auto line = text.substr(message.cursor, line_end - message.cursor);
-            auto digits = line.substr(0, find(line, ';'));
-            std::size_t length = 0;
-            auto result = std::from_chars(digits.data(), digits.data() + digits.size(), length, 16);
-            if (digits.empty() || result.ec != std::errc {} || result.ptr != digits.data() + digits.size() ||
-                !http_value(line))
-                return http_parse_t::malformed_k;
-            if (length > std::numeric_limits<std::size_t>::max() - message.decoded_length)
-                return http_parse_t::overflow_k;
+            std::size_t line_end = 0, length = 0;
+            if (auto sized = http_chunk_size(text, message.cursor, message.decoded_length, line_end, length);
+                sized != http_parse_t::complete_k)
+                return sized;
             if (!length) {
-                auto trailer = line_end + 2;
-                for (;;) {
-                    auto trailer_end = find(text, "\r\n", trailer);
-                    if (trailer_end == std::string_view::npos) return http_parse_t::incomplete_k;
-                    if (trailer_end == trailer) {
-                        message.wire_length = trailer + 2;
-                        message.body_length = message.decoded_length;
-                        return http_parse_t::complete_k;
-                    }
-                    auto colon = find(text, ':', trailer);
-                    if (colon >= trailer_end || !http_token(text.substr(trailer, colon - trailer)) ||
-                        !http_value(text.substr(colon + 1, trailer_end - colon - 1)))
-                        return http_parse_t::malformed_k;
-                    auto name = text.substr(trailer, colon - trailer);
-                    lowercase_ascii({reinterpret_cast<char*>(bytes.data()) + trailer, name.size()});
-                    if (equal(name, "content-length") || equal(name, "transfer-encoding") || equal(name, "host"))
-                        return http_parse_t::malformed_k;
-                    trailer = trailer_end + 2;
-                }
+                std::size_t end = 0;
+                if (auto trailed = http_trailers(bytes, line_end + 2, end); trailed != http_parse_t::complete_k)
+                    return trailed;
+                message.wire_length = end;
+                message.body_length = message.decoded_length;
+                return http_parse_t::complete_k;
             }
             if (length > std::numeric_limits<std::size_t>::max() - 2 || text.size() - line_end - 2 < length + 2)
                 return http_parse_t::incomplete_k;
@@ -796,6 +819,56 @@ struct http {
             cursor = end + 2 + length + 2;
         }
         message.body_state = http_body_state_t::decoded_k;
+    }
+
+    /** Decodes the body @p bytes holds from its front in place, leaving @p payload decoded bytes
+     *  there, and reports in @p consumed how many bytes it walked; complete once the body and its
+     *  trailers ended. An identity body takes what arrived up to its declared length. */
+    static http_parse_t http_stream_body(span<byte_t> bytes, http_message_t& message, std::size_t& payload,
+                                         std::size_t& consumed) noexcept {
+        auto text = text_view(bytes);
+        payload = consumed = 0;
+        if (message.framing == http_framing_t::length_k) {
+            payload = consumed = std::min(bytes.size(), message.content_length - message.decoded_length);
+            message.decoded_length += payload;
+            return message.decoded_length == message.content_length ? http_parse_t::complete_k
+                                                                    : http_parse_t::incomplete_k;
+        }
+        while (consumed < text.size()) {
+            switch (message.chunk_state) {
+            case http_chunk_state_t::payload_k: {
+                std::size_t const taken = std::min(message.chunk_remaining, text.size() - consumed);
+                std::memmove(bytes.data() + payload, bytes.data() + consumed, taken);
+                payload += taken, consumed += taken, message.chunk_remaining -= taken;
+                message.decoded_length += taken;
+                if (!message.chunk_remaining) message.chunk_state = http_chunk_state_t::payload_end_k;
+                break;
+            }
+            case http_chunk_state_t::payload_end_k:
+                if (text.size() - consumed < 2) return http_parse_t::incomplete_k;
+                if (text.substr(consumed, 2) != "\r\n") return http_parse_t::malformed_k;
+                consumed += 2;
+                message.chunk_state = http_chunk_state_t::size_k;
+                break;
+            case http_chunk_state_t::size_k: {
+                std::size_t line_end = 0, length = 0;
+                if (auto sized = http_chunk_size(text, consumed, message.decoded_length, line_end, length);
+                    sized != http_parse_t::complete_k)
+                    return sized;
+                consumed = line_end + 2;
+                message.chunk_remaining = length;
+                message.chunk_state = length ? http_chunk_state_t::payload_k : http_chunk_state_t::trailers_k;
+                break;
+            }
+            case http_chunk_state_t::trailers_k: {
+                std::size_t end = 0;
+                auto trailed = http_trailers(bytes, consumed, end);
+                if (trailed == http_parse_t::complete_k) consumed = end;
+                return trailed;
+            }
+            }
+        }
+        return http_parse_t::incomplete_k;
     }
 
     /** Appends every one of @p texts to @p bytes in one resize, or nothing at all. */

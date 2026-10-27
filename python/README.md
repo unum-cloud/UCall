@@ -339,6 +339,7 @@ The binding leaves these out:
 - Streamed request bodies, multipart parts and path segments by index; a handler reads the whole body and the template's named captures.
 - Streamed, vectored and file replies; a reply sends one body from memory.
 - The log sink and StatsD metrics of a server or client, which run silent and report through `event_loop_statistics` and `statistics` instead.
+- The initiator key a server interface admits under Noise KK, so a KK interface is refused at startup.
 - Per-call timeouts, retries, redirect limits and client keys; a call takes its client's.
 - Polling an unfinished outcome, as every method here returns once its result is final.
 

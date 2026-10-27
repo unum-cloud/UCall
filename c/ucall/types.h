@@ -131,6 +131,13 @@ typedef struct ucall_http_batch_endpoint_handle_t* ucall_http_batch_endpoint_t;
 /** Opaque handle for a single Remote Procedure Call reply on the @b client side. */
 typedef struct ucall_received_http_response_handle_t* ucall_received_http_response_t;
 
+/** When an endpoint's callback runs: once the body is buffered, or at headers time with the body
+ *  pulled through ucall_server_request_body_chunk(). */
+typedef enum ucall_body_delivery_t {
+    ucall_body_delivery_buffered_k = 0,
+    ucall_body_delivery_streamed_k = 1,
+} ucall_body_delivery_t;
+
 /**
  *  @brief Security modes for UCall server and client.
  *

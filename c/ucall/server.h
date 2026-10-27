@@ -26,24 +26,24 @@ extern "C" {
 typedef struct ucall_network_interface_t {
 
     /** Listening address in "host:port" form. Required. */
-    char const* address;
+    ucall_bytes_view_t address;
 
-    /** Physical device to pin this interface to with @c SO_BINDTODEVICE, such as "eth0", or @c
-     *  NULL to bind by address alone.
+    /** Physical device to pin this interface to with @c SO_BINDTODEVICE, such as "eth0", or empty
+     *  to bind by address alone.
      *
      *  Several interfaces may name one device, and one interface bound to @c 0.0.0.0 spans every
      *  device the machine has - which is why the two are separate fields rather than one. */
-    char const* device_name;
+    ucall_bytes_view_t device_name;
 
-    /**
-     *  Encryption for connections accepted here. Default: ucall_security_mode_none_k.
-     *  @note Server-side @c ucall_security_mode_noise_kk_k is rejected, since an interface cannot
-     *      name the initiator static key that pattern hashes before the first message.
-     */
+    /** Encryption for connections accepted here. Default: ucall_security_mode_none_k. */
     ucall_security_mode_t security_mode;
 
     /** Server identity for handshakes. Required when @c security_mode is not none. */
     ucall_noise_key_t const* noise_private_key;
+
+    /** The initiator's static public key, which KK hashes before the first message. Required for
+     *  KK, copied during initialization. Default: NULL. */
+    ucall_noise_key_t const* noise_peer_key;
 
     /** Vets client static keys. Required for XX. Default: NULL. */
     ucall_peer_authorizer_t peer_authorizer;
@@ -73,6 +73,11 @@ typedef struct ucall_network_interface_t {
      *  one. Replies leave in request order. Batch rings hold @c max_concurrent_connections times
      *  this many requests. */
     size_t max_pipelined_requests;
+
+    /** Largest request head and buffered body; past it the reply is 413 and the connection
+     *  lingers closed. Zero takes the largest receive buffer the kernel grants a socket. Streamed
+     *  bodies are bounded by the application's pulls instead. */
+    size_t max_request_bytes;
 
     /** Directories that path parts of replies to this interface's requests resolve beneath, by
      *  position, each copied during @c ucall_server_init(). UCall opens each then and closes it in
@@ -104,17 +109,23 @@ typedef struct ucall_server_config_t {
     /** Where log lines go. Default: nowhere. */
     ucall_log_t log;
 
-    /** StatsD UDP endpoint "host:port". NULL = disabled. Default: NULL. */
-    char const* metrics_address;
+    /** StatsD UDP endpoint "host:port"; empty disables emission. */
+    ucall_bytes_view_t metrics_address;
 
-    /** Sampling rate [0.0, 1.0]. Default: 1.0. */
+    /** Fraction of finished requests whose latency is reported, in (0.0, 1.0]. Zero takes 1.0. */
     float metrics_sample_rate;
 
-    /** Metric name prefix. Default: "ucall". */
-    char const* metrics_prefix;
+    /** Metric name prefix; empty takes "ucall". */
+    ucall_bytes_view_t metrics_prefix;
 
-    /** Global tags "key:val,key:val". Default: NULL. */
-    char const* metrics_tags;
+    /** Global tags, each "key:value". Default: none. */
+    ucall_bytes_view_t const* metrics_tags;
+
+    /** Entries in @c metrics_tags. */
+    size_t metrics_tags_count;
+
+    /** Microseconds between one event loop's datagrams. Zero takes one second. */
+    size_t metrics_interval_microseconds;
 
     /** Requested I/O backend; automatic chooses an available native backend. */
     ucall_io_backend_t backend;
@@ -252,6 +263,15 @@ typedef struct ucall_event_loop_statistics_t {
     /** File reads submitted while an earlier window of the same stream waited to send or sent. */
     uint64_t file_window_overlaps;
 
+    /** Requests the loop answered itself with 400, 404, 413, 501 or 503. */
+    uint64_t refused_requests;
+
+    /** Connections whose Noise handshake failed. */
+    uint64_t handshake_failures;
+
+    /** Connections whose authenticated peer key the interface's authorizer refused. */
+    uint64_t authorizer_refusals;
+
 } ucall_event_loop_statistics_t;
 
 /** Arguments of @c ucall_server_event_loop_statistics(). */
@@ -388,6 +408,10 @@ typedef struct ucall_server_add_http_endpoint_t {
 
     /** Optional payload/tag for metadata (e.g., for CPython runtime). */
     void* context;
+
+    /** Whether the callback runs once the body is buffered, or at headers time with the body
+     *  pulled through ucall_server_request_body_chunk(). Default: buffered. */
+    ucall_body_delivery_t body_delivery;
 
 } ucall_server_add_http_endpoint_t;
 
@@ -734,6 +758,9 @@ typedef struct ucall_server_request_body_t {
 /**
  *  @brief Extracts the body content from the received request.
  *
+ *  A streamed endpoint's body is pulled through @c ucall_server_request_body_chunk() instead, and
+ *  this answers @c ucall_status_invalid_argument_k for it.
+ *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
  */
@@ -745,13 +772,15 @@ typedef struct ucall_server_request_body_chunk_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_would_block_k if more data is expected but none has arrived. */
+    /** Final with the next bytes, or deferred until they arrive; a deferred pull finishes on the
+     *  request's polling thread, so a pull from that thread finishes on its next poll. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Output for a borrowed view of the next body bytes, empty once the body is complete. */
+    /** Output for a borrowed view of the bytes decoded since the last pull, valid until the next
+     *  pull and written once the outcome is final; empty once the body ended. */
     ucall_bytes_view_t* data;
 
 } ucall_server_request_body_chunk_t;
@@ -759,9 +788,12 @@ typedef struct ucall_server_request_body_chunk_t {
 /**
  *  @brief Pulls the next chunk of a request body that is still arriving.
  *
- *  Endpoints registered as streaming are invoked as soon as headers are parsed, before the body is
- *  complete. Without this, a multi-gigabyte upload must be buffered in full before the handler
- *  runs, which is both a memory hazard and a denial-of-service vector.
+ *  Endpoints registered with @c ucall_body_delivery_streamed_k are invoked as soon as headers are
+ *  parsed, before the body is complete. Without this, a multi-gigabyte upload must be buffered in
+ *  full before the handler runs, which is both a memory hazard and a denial-of-service vector.
+ *  Each pull takes every byte decoded since the last one; the connection reads on only once the
+ *  previous bytes were pulled, and parses no pipelined request until the body ended. On a buffered
+ *  endpoint the first pull answers the whole body and the next one empty.
  *
  *  @warning The returned @c data is valid only until the next call on this @c request.
  *  @sa Use @c ucall_server_request_body() for endpoints that are not registered as streaming.

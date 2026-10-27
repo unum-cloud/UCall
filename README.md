@@ -164,7 +164,7 @@ Several handshake patterns are defined, each suitable for different use cases:
 - __IK__: Client knows the server's public key in advance (Identity Known).
   Provides faster handshakes and is ideal for typical client-server architectures, similar to TLS with certificate pinning.
 - __KK__: Both parties know each other's public keys beforehand (Known Known).
-  The client-side pattern is implemented; the current server interface cannot name its preknown initiator key and rejects KK.
+  A server interface names the one initiator key it admits through `noise_peer_key`, and a client names the server's key per call.
 
 `ucall_noise_key_generate()` draws static keys from the operating system's entropy, and `ucall_noise_key_derive()` recovers the public key that peers see from a stored private one.
 
@@ -325,11 +325,11 @@ Why support JSON-RPC?
 
 ### Multipart Data and Rich Types
 
-__Roadmap:__ Multipart parsing, Python rich-type conversion, and the following SDK example await implementation or migration.
+__Roadmap:__ Python rich-type conversion and the following SDK example await implementation or migration.
 
-The planned `multipart/form-data` interface would let an application send files and metadata in a single HTTP request.
-A client would supply the boundary parameter and the server would parse individual parts.
-Each part gets its own `Content-Disposition` and `Content-Type` and can include rich data types, like images, audio, and binary blobs.
+A `multipart/form-data` body lets an application send files and metadata in a single HTTP request.
+The client supplies the boundary parameter, and `ucall_server_request_parts_count()` and `ucall_server_request_part()` split the buffered body on it the first time a handler asks.
+Each part keeps its own `Content-Disposition` name and `Content-Type`, and its payload is a view into the receive buffer, never copied, so an image or audio decoder reads it in place.
 The intended Python SDK could decode `numpy.ndarray` and `PIL.Image` inputs and outputs.
 The following is an illustrative design sketch, requiring future SDK support and application-provided model and index setup, for a multi-modal semantic search platform built on top of Unum's [UForm](https://github.com/unum-cloud/UForm) models and [USearch](https://github.com/unum-cloud/USearch) engine.
 
@@ -445,6 +445,9 @@ __Security__ (Server → Client):
 
 __Roadmap:__ The declared WebSocket operations currently return unsupported.
 Streamed replies are implemented: `ucall_server_reply_begin()`, `ucall_server_reply_append()` and `ucall_server_reply_end()` send a chunked body from any thread, long after the callback returned.
+Streamed request bodies are implemented too: an endpoint registered with `ucall_body_delivery_streamed_k` runs once the head parsed, and each `ucall_server_request_body_chunk()` takes every byte decoded since the last one, finishing later through its outcome when none arrived yet.
+The connection reads on only as the handler pulls, so a slow handler slows its own peer and nobody else, and no request pipelined behind the body parses before the body ended.
+Buffered requests are capped by `max_request_bytes`, which defaults to the largest receive buffer the kernel grants a socket; past it the reply is 413.
 
 WebSockets have very different semantics from remaining request-response one-shot functionality.
 Communication is bidirectional and long-lived, with messages flowing in both directions independently.
@@ -455,35 +458,34 @@ An application would not be required to form one response for every message insi
 
 ### Observability & Metrics
 
-__Roadmap:__ StatsD emission is not implemented; configuring `metrics_address` currently returns unsupported.
-The wire samples and configuration below describe the intended interface.
-
-The planned observability path would emit StatsD/DogStatsD datagrams to an explicitly configured endpoint.
-Metrics would be __opt-in__: `metrics_address` would name an endpoint such as `127.0.0.1:8125`, with `NULL` retaining the default of no emission.
+Every event loop sends StatsD/DogStatsD datagrams to an explicitly configured endpoint, on a connected UDP socket of its own driven by the loop's I/O backend.
+Metrics are __opt-in__: `metrics_address` names an endpoint such as `127.0.0.1:8125`, and an empty view sends nothing.
 A server should never send packets to a port its operator didn't ask for.
 
-The proposed metric names carry endpoint, method, and status tags:
+Each `metrics_interval_microseconds`, one second by default, a loop reports the deltas of its counters since its last delivered datagram, its live connections per interface, and its refusals by status.
+Loop zero also reports every batch endpoint's queue and counters.
+Request latencies, sampled at `metrics_sample_rate`, ride the same datagrams, which never pass the path MTU:
 
 ```statsd
-ucall.requests:1|c|#endpoint:/sum,method:POST,status:200
-ucall.latency:45|ms|#endpoint:/sum,method:POST,status:200
-ucall.connections.active:127|g
-ucall.queue.depth:8|g|#endpoint:/inference
-ucall.errors:1|c|#endpoint:/sum,error:timeout
+myapp.requests:1830|c|#env:prod,region:us-east,loop:0
+myapp.connections:127|g|#env:prod,region:us-east,loop:0,interface:0
+myapp.refused:4|c|#env:prod,region:us-east,loop:0,interface:0,status:413
+myapp.latency:0.045|ms|@0.1|#env:prod,region:us-east,endpoint:/sum,method:POST,status:200
+myapp.batch.queue:8|g|#env:prod,region:us-east,endpoint:/infer
 ```
 
-The proposed sampling configuration would reduce metric traffic:
-
 ```c
+ucall_bytes_view_t const tags[] = {{(ucall_byte_t const*)"env:prod", 8}, {(ucall_byte_t const*)"region:us-east", 14}};
 ucall_server_config_t config = {
-    .metrics_address = "127.0.0.1:8125", // Reserved; currently returns unsupported
-    .metrics_sample_rate = 0.1,          // Sample 10% of requests, StatsD will multiply counts
-    .metrics_prefix = "myapp",           // Metric names become "myapp.requests", etc.
-    .metrics_tags = "env:prod,region:us-east", // Global tags for all metrics
+    .metrics_address = {(ucall_byte_t const*)"127.0.0.1:8125", 14},
+    .metrics_sample_rate = 0.1,                          // A latency line for one request in ten
+    .metrics_prefix = {(ucall_byte_t const*)"myapp", 5}, // Metric names become "myapp.requests"
+    .metrics_tags = tags,                                // Global tags for every line
+    .metrics_tags_count = 2,
 };
 ```
 
-The intent is to integrate with existing StatsD collectors rather than introduce a framework-specific metrics service.
+A datagram that fails to send is dropped, and the next one carries its counters, so collectors see every request counted once.
 
 ## Design Differences and Limitations
 

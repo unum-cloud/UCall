@@ -501,7 +501,7 @@ struct scratch_directory_t {
     }
 
     [[nodiscard]] bool ready() const noexcept { return !path.empty(); }
-    [[nodiscard]] std::string name(std::string_view relative) const { return path + "/" + std::string {relative}; }
+    [[nodiscard]] std::string name(std::string_view relative) const { return fmt::format("{}/{}", path, relative); }
 
     /** Writes @p content to the file @p relative names, answering whether all of it landed. */
     [[nodiscard]] bool write(std::string_view relative, std::string_view content) const {
@@ -524,7 +524,7 @@ struct direct_directory_t {
 
     direct_directory_t() {
         char const* base = std::getenv("UCALL_TEST_DIRECT_DIRECTORY");
-        std::string pattern = std::string {base && *base ? base : "."} + "/ucall-direct-XXXXXX";
+        std::string pattern = fmt::format("{}/ucall-direct-XXXXXX", base && *base ? base : ".");
         if (!mkdtemp(pattern.data())) {
             reason = fmt::format("no directory could be made as {}", pattern);
             return;
@@ -542,7 +542,7 @@ struct direct_directory_t {
     }
 
     [[nodiscard]] bool ready() const noexcept { return reason.empty(); }
-    [[nodiscard]] std::string name(std::string_view relative) const { return path + "/" + std::string {relative}; }
+    [[nodiscard]] std::string name(std::string_view relative) const { return fmt::format("{}/{}", path, relative); }
 
     /** Writes @p content to the file @p relative names, answering whether all of it landed. */
     [[nodiscard]] bool write(std::string_view relative, std::string_view content) const {

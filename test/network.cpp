@@ -81,7 +81,17 @@ struct fixture_config_t {
 
     /** The one directory path parts resolve beneath, or empty for none. */
     std::string_view directory {};
+
+    /** The largest buffered request the server takes; zero lets the kernel decide. */
+    std::size_t max_request_bytes = 0;
+
+    /** A StatsD listener the server reports to every 10 ms as `probe` with two tags, or empty. */
+    std::string_view metrics_address {};
 };
+
+/** The global tags a fixture reporting metrics attaches to every line. */
+static ucall_bytes_view_t const metrics_tags_k[] {{reinterpret_cast<ucall_byte_t const*>("env:test"), 8},
+                                                  {reinterpret_cast<ucall_byte_t const*>("team:core"), 9}};
 
 /**
  *  @brief A loopback server with echo, gated, header-lookup, and bodiless status routes, and a
@@ -204,6 +214,31 @@ struct fixture_t {
         fixture.failures += expect(outcome.status == ucall_status_success_k);
     }
 
+    /** Replies with the part count, then each multipart part as `name=type=data`, all `;`-ended. */
+    static void parts(ucall_received_http_request_t request, void* context) {
+        auto& fixture = *static_cast<fixture_t*>(context);
+        std::size_t const count = ucall_server_request_parts_count(fixture.server, request);
+        std::string answer = fmt::format("{};", count);
+        for (std::size_t index = 0; index != count; ++index) {
+            ucall_outcome_t outcome {};
+            ucall_bytes_view_t name {}, type {}, data {};
+            ucall_server_request_part_t get {fixture.server, &outcome, request, index, &name, &type, &data};
+            ucall_server_request_part(&get);
+            fixture.failures += expect(outcome.status == ucall_status_success_k, "part {}: {}", index,
+                                       ucall_status_name(outcome.status));
+            answer += fmt::format("{}={}={};", uc::text_view(name), uc::text_view(type), uc::text_view(data));
+        }
+        ucall_outcome_t probe {};
+        ucall_bytes_view_t name {}, type {}, data {};
+        ucall_server_request_part_t past {fixture.server, &probe, request, count, &name, &type, &data};
+        ucall_server_request_part(&past);
+        if (probe.status == ucall_status_malformed_k) answer += "malformed;";
+        ucall_outcome_t outcome {};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, request, nullptr, 0, uc::bytes_view(answer)};
+        ucall_server_reply_content(&reply);
+        fixture.failures += expect(outcome.status == ucall_status_success_k);
+    }
+
     /** Replies with no body and the status the `{code}` segment names. */
     static void status_only(ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
@@ -247,12 +282,14 @@ struct fixture_t {
         ucall_noise_key_derive(&derive);
         if ((status = outcome.status) != ucall_status_success_k) return;
         ucall_network_interface_t network_interface {};
-        network_interface.address = "127.0.0.1:0";
+        network_interface.address = uc::bytes_view("127.0.0.1:0");
         network_interface.event_loops = settings.event_loops;
         network_interface.max_concurrent_connections = settings.connections;
         network_interface.max_pipelined_requests = settings.pipelined_requests;
+        network_interface.max_request_bytes = settings.max_request_bytes;
         network_interface.security_mode = settings.security;
         network_interface.noise_private_key = &server_private;
+        if (settings.security == ucall_security_mode_noise_kk_k) network_interface.noise_peer_key = &client_public;
         network_interface.peer_authorizer = authorize;
         network_interface.peer_authorizer_context = client_public;
         ucall_bytes_view_t const directory = uc::bytes_view(settings.directory);
@@ -263,6 +300,13 @@ struct fixture_t {
         config.interfaces_count = 1;
         config.backend = settings.backend;
         config.cpu_class = cpu_class_under_test;
+        if (!settings.metrics_address.empty()) {
+            config.metrics_address = uc::bytes_view(settings.metrics_address);
+            config.metrics_prefix = uc::bytes_view("probe");
+            config.metrics_tags = metrics_tags_k;
+            config.metrics_tags_count = 2;
+            config.metrics_interval_microseconds = 10'000;
+        }
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
         if ((status = outcome.status) != ucall_status_success_k) return;
@@ -275,6 +319,14 @@ struct fixture_t {
             ucall_server_add_http_endpoint(&add);
             if ((status = outcome.status) != ucall_status_success_k) return;
         }
+        ucall_server_add_http_endpoint_t parts_route {server,           &outcome, uc::bytes_view("/parts"),
+                                                      ucall_verb_any_k, parts,    this};
+        ucall_server_add_http_endpoint(&parts_route);
+        if ((status = outcome.status) != ucall_status_success_k) return;
+        ucall_server_add_http_endpoint_t stream {server, &outcome, uc::bytes_view("/stream"),     ucall_verb_any_k,
+                                                 gate,   this,     ucall_body_delivery_streamed_k};
+        ucall_server_add_http_endpoint(&stream);
+        if ((status = outcome.status) != ucall_status_success_k) return;
         ucall_client_config_t client_config {};
         client_config.max_concurrent_connections = settings.connections;
         client_config.max_pipelined_calls = settings.pipelined_calls;
@@ -288,9 +340,9 @@ struct fixture_t {
         ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};
         ucall_client_init(&client_init);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        address = resolved.interfaces[0].address;
-        url = settings.security == ucall_security_mode_none_k ? "http://" : "http+noise://";
-        url += address;
+        address = uc::text_view(resolved.interfaces[0].address);
+        url = fmt::format("{}{}", settings.security == ucall_security_mode_none_k ? "http://" : "http+noise://",
+                          address);
     }
     ~fixture_t() {
         stop();
@@ -374,7 +426,7 @@ static case_result_t exchanges(ucall_security_mode_t security) {
     // Four records under Noise, which seals and opens them where they lie.
     std::string payload(200 * 1024, 'x');
     payload[0] = '\0';
-    auto url = fixture.url + "/echo/42?key=value";
+    auto url = fmt::format("{}/echo/42?key=value", fixture.url);
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
     call.client = fixture.client;
@@ -447,6 +499,36 @@ static case_result_t exchanges(ucall_security_mode_t security) {
 static case_result_t test_exchanges_plain() { return exchanges(ucall_security_mode_none_k); }
 static case_result_t test_exchanges_noise_xx() { return exchanges(ucall_security_mode_noise_xx_k); }
 static case_result_t test_exchanges_noise_ik() { return exchanges(ucall_security_mode_noise_ik_k); }
+static case_result_t test_exchanges_noise_kk() { return exchanges(ucall_security_mode_noise_kk_k); }
+
+/** A KK interface refuses an initiator whose static key is not the one it names. */
+static case_result_t test_server_kk_wrong_initiator() {
+    fixture_t fixture {{.security = ucall_security_mode_noise_kk_k}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    ucall_noise_key_t stranger {}, stranger_public {};
+    ucall_outcome_t outcome {};
+    ucall_noise_key_generate_t generate {&outcome, &stranger, &stranger_public};
+    ucall_noise_key_generate(&generate);
+    require(failures + fixture.stop(), outcome.status == ucall_status_success_k, "{}",
+            ucall_status_name(outcome.status));
+    auto const url = fmt::format("{}/echo/1", fixture.url);
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(url);
+    call.verb = ucall_verb_get_k;
+    call.options.security = ucall_security_mode_noise_kk_k;
+    call.options.server_key = &fixture.server_public;
+    call.options.client_key = &stranger;
+    ucall_client_call(&call);
+    failures += expect(outcome.status == ucall_status_success_k);
+    auto completed = fixture.wait();
+    failures += expect(completed.outcome.status != ucall_status_success_k, "a stranger's KK call answered {}",
+                       ucall_status_name(completed.outcome.status));
+    failures += expect(!fixture.dispatched, "{} requests reached a route", fixture.dispatched.load());
+    return failures + fixture.stop();
+}
 
 /** A request retained on one loop does not stall a call the other loop serves meanwhile. */
 static case_result_t test_multiloop_retention() {
@@ -455,7 +537,7 @@ static case_result_t test_multiloop_retention() {
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
     ucall_outcome_t outcome {};
-    auto gate_url = fixture.url + "/gate", echo_url = fixture.url + "/echo/42";
+    auto gate_url = fmt::format("{}/gate", fixture.url), echo_url = fmt::format("{}/echo/42", fixture.url);
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
@@ -499,7 +581,7 @@ static case_result_t test_cross_thread_replies_stress() {
                 else std::this_thread::yield();
         });
     std::size_t failures = 0;
-    std::string const gate_url = fixture.url + "/gate";
+    std::string const gate_url = fmt::format("{}/gate", fixture.url);
     std::array<std::string, threads_count> bodies;
     std::size_t const rounds = scale_iterations(64);
     for (std::size_t round = 0; round != rounds && !failures; ++round) {
@@ -550,11 +632,11 @@ static case_result_t pipelined_calls(ucall_security_mode_t security) {
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     require(0, fixture.resolved_client.max_pipelined_calls == 4);
     std::size_t failures = 0;
-    std::string const gate_url = fixture.url + "/gate";
+    std::string const gate_url = fmt::format("{}/gate", fixture.url);
     std::array<std::string, 8> bodies;
     for (std::size_t i = 0; i != bodies.size(); ++i) {
         // Growing bodies, so later replies span several records each behind shorter ones.
-        bodies[i] = fmt::format("call {}", i) + std::string(i * 40 * 1024, '.');
+        bodies[i] = fmt::format("call {}{}", i, std::string(i * 40 * 1024, '.'));
         ucall_outcome_t outcome {};
         ucall_client_call_t call {};
         call.client = fixture.client;
@@ -591,8 +673,8 @@ static case_result_t test_pipelined_call_loss() {
     fixture_t fixture {{.pipelined_requests = 4, .pipelined_calls = 4}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
-    std::string const gate_url = fixture.url + "/gate", post_url = fixture.url + "/echo/3",
-                      get_url = fixture.url + "/echo/4";
+    std::string const gate_url = fmt::format("{}/gate", fixture.url), post_url = fmt::format("{}/echo/3", fixture.url),
+                      get_url = fmt::format("{}/echo/4", fixture.url);
     ucall_bytes_view_t const close = uc::bytes_view("Connection: close");
     struct planned_call_t {
         std::string const* url;
@@ -647,11 +729,12 @@ static case_result_t test_bodiless_responses_keep_connection() {
         std::string url;
         ucall_http_status_t expected;
     };
-    std::array<planned_status_t, 5> plan {{{fixture.url + "/echo/1", ucall_http_status_ok_k},
-                                           {fixture.url + "/status/204", ucall_http_status_no_content_k},
-                                           {fixture.url + "/echo/2", ucall_http_status_ok_k},
-                                           {fixture.url + "/status/304", ucall_http_status_not_modified_k},
-                                           {fixture.url + "/echo/3", ucall_http_status_ok_k}}};
+    std::array<planned_status_t, 5> plan {
+        {{fmt::format("{}/echo/1", fixture.url), ucall_http_status_ok_k},
+         {fmt::format("{}/status/204", fixture.url), ucall_http_status_no_content_k},
+         {fmt::format("{}/echo/2", fixture.url), ucall_http_status_ok_k},
+         {fmt::format("{}/status/304", fixture.url), ucall_http_status_not_modified_k},
+         {fmt::format("{}/echo/3", fixture.url), ucall_http_status_ok_k}}};
     ucall_outcome_t outcome {};
     for (auto& planned : plan) {
         ucall_client_call_t call {};
@@ -682,7 +765,7 @@ static case_result_t test_bodiless_responses_keep_connection() {
 /** Calls @p target with @p verb, then waits for the completion, whose response the caller frees. */
 static ucall_completed_call_t call_and_wait(fixture_t& fixture, ucall_verb_t verb, std::string_view target,
                                             ucall_security_mode_t security, std::size_t& failures) {
-    std::string const url = fixture.url + std::string {target};
+    std::string const url = fmt::format("{}{}", fixture.url, target);
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
     call.client = fixture.client;
@@ -730,7 +813,7 @@ static std::size_t check_answer(ucall_completed_call_t const& completed, ucall_h
 static std::vector<std::string> stream_chunks(std::size_t count, char label) {
     std::vector<std::string> chunks;
     for (std::size_t i = 0; i != count; ++i)
-        chunks.push_back(fmt::format("{}{}:", label, i) + std::string(i * 37, label));
+        chunks.push_back(fmt::format("{}{}:{}", label, i, std::string(i * 37, label)));
     return chunks;
 }
 
@@ -769,7 +852,7 @@ static case_result_t reply_vectored(ucall_security_mode_t security) {
     fixture_t fixture {{.security = security}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
-    std::string const expected = "first|" + std::string(100 * 1024, 'v') + "|last";
+    std::string const expected = fmt::format("first|{}|last", std::string(100 * 1024, 'v'));
     auto completed = call_and_wait(fixture, ucall_verb_get_k, "/vectored", security, failures);
     if (completed.response) {
         failures += expect(response_header(completed.response, "x-ucall") == "passed");
@@ -791,7 +874,7 @@ static case_result_t streamed_reply(ucall_security_mode_t security) {
     fixture_t fixture {{.security = security}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
-    std::string const url = fixture.url + "/gate";
+    std::string const url = fmt::format("{}/gate", fixture.url);
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
     call.client = fixture.client;
@@ -822,7 +905,7 @@ static case_result_t pipelined_streams(ucall_security_mode_t security) {
     fixture_t fixture {{.security = security, .pipelined_requests = 2, .pipelined_calls = 2}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
-    std::array<std::string, 2> urls {fixture.url + "/gate?n=0", fixture.url + "/gate?n=1"};
+    std::array<std::string, 2> urls {fmt::format("{}/gate?n=0", fixture.url), fmt::format("{}/gate?n=1", fixture.url)};
     std::array<std::vector<std::string>, 2> const chunks {stream_chunks(200, 'a'), stream_chunks(250, 'b')};
     for (auto& url : urls) {
         ucall_outcome_t outcome {};
@@ -874,7 +957,7 @@ static case_result_t test_head_replies() {
     failures += check_answer(completed, ucall_http_status_created_k, {});
     completed = call_and_wait(fixture, ucall_verb_get_k, "/echo/1", security, failures);
     failures += check_answer(completed, ucall_http_status_ok_k, {});
-    std::string const url = fixture.url + "/gate";
+    std::string const url = fmt::format("{}/gate", fixture.url);
     auto const chunks = stream_chunks(20, 'h');
     std::string const length = fmt::format("Content-Length: {}", joined(chunks).size());
     for (std::vector<ucall_bytes_view_t> headers :
@@ -968,7 +1051,7 @@ static case_result_t test_fragmented_headers_delivery(random_generator_t& genera
 
 /** A mebibyte body sent in random fragments echoes back byte for byte, in full-length sends. */
 static case_result_t test_megabyte_echo_delivery(random_generator_t& generator) {
-    fixture_t fixture {{}};
+    fixture_t fixture {{.max_request_bytes = std::size_t {2} << 20}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;
@@ -1350,6 +1433,501 @@ static case_result_t test_streamed_reply_identity() {
     return failures + fixture.stop();
 }
 
+/** Configuration strings are views: an address carved from a longer buffer binds by its length
+ *  alone, and a device name holding a zero byte is refused. */
+static case_result_t test_configuration_byte_views() {
+    return keeping_descriptors([]() -> case_result_t {
+        std::string_view const carved = "127.0.0.1:0trailing";
+        ucall_network_interface_t network_interface {};
+        network_interface.address = uc::bytes_view(carved.substr(0, 11));
+        network_interface.max_concurrent_connections = 1;
+        ucall_server_config_t config {}, resolved {};
+        config.interfaces = &network_interface;
+        config.interfaces_count = 1;
+        config.backend = backend_under_test;
+        ucall_server_t server {};
+        ucall_outcome_t outcome {};
+        ucall_server_init_t init {&server, &outcome, &config, &resolved};
+        ucall_server_init(&init);
+        require(0, outcome.status == ucall_status_success_k, "a carved address: {}", ucall_status_name(outcome.status));
+        std::size_t failures = 0;
+        std::string_view const bound = uc::text_view(resolved.interfaces[0].address);
+        failures += expect(bound.starts_with("127.0.0.1:") && bound.size() > 10, "bound {}", bound);
+        raw_client_t client;
+        failures += expect(client.connect(bound), "no connection to {}", bound);
+        client.close();
+        ucall_server_free(server);
+        network_interface.device_name = uc::bytes_view(std::string_view {"lo\0x", 4});
+        ucall_server_init(&init);
+        failures += expect(outcome.status == ucall_status_invalid_argument_k, "a zero byte in a device: {}",
+                           ucall_status_name(outcome.status));
+        ucall_server_free(server);
+        network_interface.device_name = {};
+        ucall_noise_key_t const key {1};
+        network_interface.security_mode = ucall_security_mode_noise_kk_k;
+        network_interface.noise_private_key = &key;
+        ucall_server_init(&init);
+        failures += expect(outcome.status == ucall_status_invalid_argument_k, "KK without the initiator key: {}",
+                           ucall_status_name(outcome.status));
+        ucall_server_free(server);
+        return failures;
+    });
+}
+
+/** A mebibyte of letters, so a misplaced byte shows in the diff. */
+static std::string lettered_body() {
+    std::string body(std::size_t {1} << 20, '\0');
+    for (std::size_t i = 0; i != body.size(); ++i) body[i] = static_cast<char>('a' + i % 23);
+    return body;
+}
+
+/** @p body framed in chunks of random lengths, one with an extension, and a trailer after them. */
+static std::string chunked_body(std::string_view body, random_generator_t& generator) {
+    std::string wire;
+    for (std::size_t offset = 0; offset != body.size();) {
+        std::size_t const length = std::min<std::size_t>(1 + generator.below(70000), body.size() - offset);
+        wire += fmt::format("{:x}{}\r\n{}\r\n", length, offset ? "" : ";first=1", body.substr(offset, length));
+        offset += length;
+    }
+    wire += "0\r\nX-Trailer: done\r\n\r\n";
+    return wire;
+}
+
+/** Pulls @p request's streamed body to its end from this thread, counting the pulls it took. */
+static std::string pull_body(fixture_t& fixture, ucall_received_http_request_t request, std::size_t& failures,
+                             std::size_t& pulls) {
+    std::string body;
+    for (;;) {
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t data {};
+        ucall_server_request_body_chunk_t pull {fixture.server, &outcome, request, &data};
+        ucall_server_request_body_chunk(&pull);
+        ucall_status_t const status = ucall_outcome_wait(&outcome);
+        ++pulls;
+        if (status != ucall_status_success_k) {
+            failures += expect(false, "pull {} ended with {}", pulls, ucall_status_name(status));
+            return body;
+        }
+        if (!data.length) return body;
+        body += uc::text_view(data);
+    }
+}
+
+/** Answers @p request with the length of what it received, once a streamed case pulled it all. */
+static std::size_t reply_length(fixture_t& fixture, ucall_received_http_request_t request, std::size_t length) {
+    std::string const answer = fmt::format("{}", length);
+    ucall_outcome_t outcome {};
+    ucall_server_reply_content_t reply {fixture.server, &outcome, request, nullptr, 0, uc::bytes_view(answer)};
+    ucall_server_reply_content(&reply);
+    return expect(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
+}
+
+/** Identity and chunked mebibyte bodies arrive through several pulls that add up to the bytes
+ *  sent, a streamed request has no parts and no buffered body, and the reply reaches the peer. */
+static case_result_t test_streamed_body_plain(random_generator_t& generator) {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string const body = lettered_body();
+    for (std::string_view const framing : {"Content-Length", "Transfer-Encoding"}) {
+        announce("a body framed by {}", framing);
+        std::string const request =
+            framing == "Content-Length"
+                ? fmt::format("POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}", body.size(), body)
+                : fmt::format("POST /stream HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+                              chunked_body(body, generator));
+        raw_client_t client;
+        require(failures + fixture.stop(), client.connect(fixture.address));
+        bool written = false;
+        std::thread writer {
+            [&] { written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        failures += await_held_in_background(fixture, 1);
+        auto* held = fixture.take_held();
+        if (!held) {
+            writer.join();
+            return failures + fixture.stop();
+        }
+        failures += expect(ucall_server_request_parts_count(fixture.server, held) == 0, "a streamed request had parts");
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t whole {};
+        ucall_server_request_body_t buffered {fixture.server, &outcome, held, &whole};
+        ucall_server_request_body(&buffered);
+        failures += expect(outcome.status == ucall_status_invalid_argument_k, "a streamed body read whole: {}",
+                           ucall_status_name(outcome.status));
+        std::size_t pulls = 0;
+        std::string const received = pull_body(fixture, held, failures, pulls);
+        writer.join();
+        failures += expect(written, "the request was not written");
+        failures += expect(pulls > 2, "{} pulls took a mebibyte", pulls);
+        failures += expect_bytes(uc::byte_span(received), uc::byte_span(body));
+        failures += reply_length(fixture, held, received.size());
+        auto const response = read_response(client, 0);
+        failures += expect(response.status == 200 && response.body == fmt::format("{}", body.size()), "answered {} {}",
+                           response.status, response.body);
+    }
+    return failures + fixture.stop();
+}
+
+/** The next completed call of the fixture's client alone, for cases whose server loops run in the
+ *  background, or one with a timeout outcome after five seconds. */
+static ucall_completed_call_t client_wait(fixture_t& fixture) {
+    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    ucall_completed_call_t completed {};
+    std::size_t count = 0;
+    while (!count && steady_clock::now() < deadline) {
+        ucall_outcome_t outcome {};
+        ucall_client_take_completed_t take {fixture.client, &outcome, &completed, 1, &count, 1000};
+        ucall_client_take_completed(&take);
+    }
+    if (!count) completed.outcome.status = ucall_status_timeout_k;
+    return completed;
+}
+
+/** Over Noise XX, a mebibyte the library client sends arrives through pulls byte for byte, and a
+ *  multipart body splits into its parts. */
+static case_result_t test_streamed_body_noise_xx() {
+    fixture_t fixture {{.security = ucall_security_mode_noise_xx_k}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string const body = lettered_body();
+    std::string const stream_url = fmt::format("{}/stream", fixture.url);
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(stream_url);
+    call.verb = ucall_verb_post_k;
+    call.body = uc::bytes_view(body);
+    call.options.security = ucall_security_mode_noise_xx_k;
+    ucall_client_call(&call);
+    failures += expect(outcome.status == ucall_status_success_k);
+    // The client stays on the thread that made it, as single-issuer rings need; pulls run apart.
+    std::string received;
+    std::size_t pull_failures = 0;
+    std::thread puller {[&] {
+        pull_failures += await_held_in_background(fixture, 1);
+        auto* held = fixture.take_held();
+        std::size_t pulls = 0;
+        if (held) received = pull_body(fixture, held, pull_failures, pulls);
+        if (held) pull_failures += reply_length(fixture, held, received.size());
+    }};
+    ucall_completed_call_t completed = client_wait(fixture);
+    puller.join();
+    failures += pull_failures;
+    failures += expect_bytes(uc::byte_span(received), uc::byte_span(body));
+    failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}",
+                       ucall_status_name(completed.outcome.status));
+    if (completed.response) ucall_client_response_free(completed.response);
+    std::string const parts_url = fmt::format("{}/parts", fixture.url);
+    std::string_view const parts_body = "--zz\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n--zz--";
+    ucall_bytes_view_t const type = uc::bytes_view("Content-Type: multipart/form-data; boundary=zz");
+    call.url = uc::bytes_view(parts_url);
+    call.body = uc::bytes_view(parts_body);
+    call.headers = &type;
+    call.headers_count = 1;
+    ucall_client_call(&call);
+    completed = client_wait(fixture);
+    ucall_bytes_view_t answer {};
+    if (completed.response) {
+        ucall_client_response_body_t get {completed.response, &outcome, &answer};
+        ucall_client_response_body(&get);
+    }
+    failures += expect(uc::text_view(answer) == "1;k==v;", "the parts answered `{}`", uc::text_view(answer));
+    if (completed.response) ucall_client_response_free(completed.response);
+    return failures + fixture.stop();
+}
+
+/** A held stream whose bytes nobody pulls leaves another connection's hundred echoes unhindered. */
+static case_result_t test_streamed_body_slow_puller(random_generator_t& generator) {
+    fixture_t fixture {{.connections = 2}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string const body = lettered_body();
+    std::string const request = fmt::format("POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}",
+                                            body.size(), body);
+    raw_client_t slow, quick;
+    require(failures + fixture.stop(), slow.connect(fixture.address) && quick.connect(fixture.address));
+    bool written = false;
+    std::thread writer {
+        [&] { written = slow.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+    failures += await_held_in_background(fixture, 1);
+    auto* held = fixture.take_held();
+    std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
+    for (std::size_t i = 0; i != 100; ++i) {
+        std::size_t const offset = quick.received.size();
+        failures += expect(::send(quick.descriptor, echo.data(), echo.size(), 0) == static_cast<ssize_t>(echo.size()));
+        auto const response = read_response(quick, offset);
+        if (response.status != 200 || response.body != "hi") {
+            failures += expect(false, "echo {} answered {} {}", i, response.status, response.body);
+            break;
+        }
+    }
+    std::size_t pulls = 0;
+    std::string const received = held ? pull_body(fixture, held, failures, pulls) : std::string {};
+    writer.join();
+    failures += expect(written && received == body, "the held stream took {} of {} bytes", received.size(),
+                       body.size());
+    if (held) failures += reply_length(fixture, held, received.size());
+    return failures + fixture.stop();
+}
+
+/** A request pipelined behind a streamed body reaches its route only once the body was pulled
+ *  through, and a reply sent before any pull still lets the request behind it through. */
+static case_result_t test_streamed_body_barrier(random_generator_t& generator) {
+    fixture_t fixture {{.pipelined_requests = 2}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string const body = lettered_body();
+    std::string const request = fmt::format(
+        "POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n",
+        body.size(), body);
+    for (std::string_view const order : {"pull first", "reply first"}) {
+        announce("{}", order);
+        std::size_t const dispatched = fixture.dispatched.load();
+        raw_client_t client;
+        require(failures + fixture.stop(), client.connect(fixture.address));
+        bool written = false;
+        std::thread writer {
+            [&] { written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        failures += await_held_in_background(fixture, 1);
+        auto* held = fixture.take_held();
+        std::this_thread::sleep_for(20ms);
+        failures += expect(fixture.dispatched.load() == dispatched, "a request behind the stream was dispatched");
+        std::size_t pulls = 0;
+        if (held && order == "pull first") {
+            failures += expect(pull_body(fixture, held, failures, pulls) == body, "the body arrived altered");
+            failures += reply_length(fixture, held, body.size());
+        }
+        else if (held) failures += reply_length(fixture, held, 0);
+        writer.join();
+        failures += expect(written, "the requests were not written");
+        auto const first = read_response(client, 0);
+        auto const second = read_response(client, first.length);
+        failures += expect(first.status == 200 && second.status == 200, "answered {} and {}", first.status,
+                           second.status);
+        failures += expect(fixture.dispatched.load() == dispatched + 1, "the request behind the stream was not served");
+    }
+    return failures + fixture.stop();
+}
+
+/** A chunk size that is not hexadecimal ends the waiting pull as malformed and the stream. */
+static case_result_t test_streamed_body_malformed() {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    raw_client_t client;
+    require(failures + fixture.stop(), client.connect(fixture.address));
+    std::string_view const request =
+        "POST /stream HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\n";
+    failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                       static_cast<ssize_t>(request.size()));
+    failures += await_held_in_background(fixture, 1);
+    auto* held = fixture.take_held();
+    ucall_status_t status = ucall_status_success_k;
+    for (std::size_t pulls = 0; held && status == ucall_status_success_k && pulls != 3; ++pulls) {
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t data {};
+        ucall_server_request_body_chunk_t pull {fixture.server, &outcome, held, &data};
+        ucall_server_request_body_chunk(&pull);
+        status = ucall_outcome_wait(&outcome);
+    }
+    failures += expect(status == ucall_status_malformed_k, "the bad chunk ended the pull with {}",
+                       ucall_status_name(status));
+    failures += expect(client.read_until_close(steady_clock::now() + 5s) == read_end_t::closed_k,
+                       "the connection stayed open");
+    return failures + fixture.stop();
+}
+
+/** Bodies past the request cap get 413 and an orderly close, framed by length or in chunks, and so
+ *  does a head past it; the resolved configuration reports the cap. */
+static case_result_t test_oversized_request_refused(random_generator_t& generator) {
+    std::size_t const cap = 64 * 1024;
+    fixture_t fixture {{.max_request_bytes = cap}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    failures += expect(fixture.resolved.interfaces[0].max_request_bytes == cap, "resolved a cap of {}",
+                       fixture.resolved.interfaces[0].max_request_bytes);
+    fixture.serve_in_background();
+    std::string const body(2 * cap, 'b');
+    std::string const field(cap, 'h');
+    std::string const requests[] {
+        fmt::format("POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}", body.size(), body),
+        fmt::format("POST /echo/1 HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n{}",
+                    chunked_body(body, generator)),
+        fmt::format("GET /echo/1 HTTP/1.1\r\nHost: a\r\nX-Long: {}\r\n\r\n", field),
+    };
+    for (std::string const& request : requests) {
+        announce("{} bytes beginning {}", request.size(), std::string_view {request}.substr(0, 20));
+        raw_client_t client;
+        require(failures + fixture.stop(), client.connect(fixture.address));
+        bool written = false;
+        std::thread writer {
+            [&] { written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        auto const response = read_response(client, 0);
+        failures += expect(response.status == 413, "answered {}", response.status);
+        failures += expect(client.read_until_close(steady_clock::now() + 5s) == read_end_t::closed_k,
+                           "the refusal did not end in an orderly close");
+        writer.join();
+    }
+    // A cap of zero takes what the kernel grants, which a mebibyte echo needs on stock settings.
+    fixture_t derived {{}};
+    require(failures + fixture.stop(), derived.status == ucall_status_success_k, "setup: {}",
+            ucall_status_name(derived.status));
+    failures += expect(derived.resolved.interfaces[0].max_request_bytes > 0, "no cap was derived");
+    return failures + fixture.stop();
+}
+
+/** Parts split on the boundary only where a delimiter line starts, keep quoted names whole, may be
+ *  empty or headerless, and a body missing its closing delimiter answers as malformed. */
+static case_result_t test_multipart_parts() {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    struct row_t {
+        std::string_view name, type, body, expected;
+    };
+    row_t const rows[] {
+        {"quoted boundary", "multipart/form-data; boundary=\"b-1\"",
+         "--b-1\r\nContent-Disposition: form-data; name=\"a;b\"\r\nContent-Type: text/plain\r\n\r\nx--b-1y\r\n"
+         "--b-1\r\nContent-Disposition: form-data; name=empty\r\n\r\n\r\n--b-1\r\n\r\nheaderless\r\n--b-1--\r\n",
+         "3;a;b=text/plain=x--b-1y;empty==;==headerless;"},
+        {"preamble and padding", "Multipart/Form-Data; charset=utf-8; boundary=zz",
+         "preamble\r\n--zz  \r\nContent-Disposition: form-data; name=\"f\"\r\n\r\nv\r\n--zz--epilogue", "1;f==v;"},
+        {"no closing delimiter", "multipart/form-data; boundary=q",
+         "--q\r\nContent-Disposition: form-data; name=\"a\"\r\n\r\nv\r\n", "0;malformed;"},
+        {"not multipart", "application/json", "{}", "0;malformed;"},
+    };
+    raw_client_t client;
+    require(failures + fixture.stop(), client.connect(fixture.address));
+    for (auto const& row : rows) {
+        announce("{}", row.name);
+        std::string const request = fmt::format(
+            "POST /parts HTTP/1.1\r\nHost: a\r\nContent-Type: {}\r\nContent-Length: {}\r\n\r\n{}", row.type,
+            row.body.size(), row.body);
+        std::size_t const offset = client.received.size();
+        failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                           static_cast<ssize_t>(request.size()));
+        auto const response = read_response(client, offset);
+        failures += expect(response.status == 200 && response.body == row.expected, "{} answered {} `{}`", row.name,
+                           response.status, response.body);
+    }
+    return failures + fixture.stop();
+}
+
+/** The value of every `name:value|type` line in @p lines whose tags contain @p tag, summed. */
+static std::uint64_t metric_sum(std::vector<std::string> const& lines, std::string_view name, std::string_view tag) {
+    std::uint64_t sum = 0;
+    for (std::string_view line : lines) {
+        if (!line.starts_with(name) || line.size() <= name.size() || line[name.size()] != ':') continue;
+        if (!tag.empty() && line.find(tag) == std::string_view::npos) continue;
+        std::uint64_t value = 0;
+        std::from_chars(line.data() + name.size() + 1, line.data() + line.size(), value);
+        sum += value;
+    }
+    return sum;
+}
+
+/** A StatsD listener receives counter deltas adding up to the requests served, a refusal tagged by
+ *  status, a latency line per echo, and the prefix and global tags on every line; bad settings are
+ *  refused and the resolved configuration fills the defaults. */
+static case_result_t test_statsd_metrics() {
+    int const listener = ::socket(AF_INET, SOCK_DGRAM, 0);
+    sockaddr_in bound {};
+    bound.sin_family = AF_INET;
+    bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t length = sizeof(bound);
+    require(0,
+            listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) == 0 &&
+                ::getsockname(listener, reinterpret_cast<sockaddr*>(&bound), &length) == 0,
+            "no UDP listener");
+    std::string const address = fmt::format("127.0.0.1:{}", ntohs(bound.sin_port));
+    std::size_t failures = 0;
+    {
+        fixture_t fixture {{.max_request_bytes = 4096, .metrics_address = address}};
+        require(failures, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+        auto const& resolved = fixture.resolved;
+        failures += expect(
+            uc::text_view(resolved.metrics_prefix) == "probe" && resolved.metrics_sample_rate == 1.f &&
+                resolved.metrics_tags_count == 2 && uc::text_view(resolved.metrics_tags[1]) == "team:core",
+            "resolved prefix `{}` at rate {}", uc::text_view(resolved.metrics_prefix), resolved.metrics_sample_rate);
+        std::string const echo_url = fmt::format("{}/echo/1", fixture.url),
+                          missing_url = fmt::format("{}/missing", fixture.url);
+        std::string const large(8192, 'l');
+        auto call = [&](std::string const& url, std::string_view body) {
+            ucall_outcome_t outcome {};
+            ucall_client_call_t call {};
+            call.client = fixture.client;
+            call.outcome = &outcome;
+            call.url = uc::bytes_view(url);
+            call.verb = ucall_verb_post_k;
+            call.body = uc::bytes_view(body);
+            ucall_client_call(&call);
+            auto completed = fixture.wait();
+            if (completed.response) ucall_client_response_free(completed.response);
+        };
+        for (std::size_t i = 0; i != 50; ++i) call(echo_url, "hi");
+        call(missing_url, "");
+        call(echo_url, large);
+        std::vector<std::string> lines;
+        char datagram[65536];
+        steady_clock::time_point const deadline = steady_clock::now() + 2s;
+        while (metric_sum(lines, "probe.requests", "") < 51 || metric_sum(lines, "probe.refused", "status:413") < 1) {
+            if (steady_clock::now() > deadline) break;
+            ucall_completed_call_t completed {};
+            failures += expect(!fixture.poll(completed), "a call completed unasked");
+            for (ssize_t received; (received = ::recv(listener, datagram, sizeof(datagram), MSG_DONTWAIT)) > 0;)
+                for (std::string_view rest {datagram, static_cast<std::size_t>(received)}; !rest.empty();) {
+                    auto const end = std::min(rest.find('\n'), rest.size());
+                    lines.emplace_back(rest.substr(0, end));
+                    rest.remove_prefix(std::min(end + 1, rest.size()));
+                }
+        }
+        failures += expect(metric_sum(lines, "probe.requests", "") == 51, "requests added up to {}",
+                           metric_sum(lines, "probe.requests", ""));
+        failures += expect(metric_sum(lines, "probe.refused", "status:413") == 1 &&
+                               metric_sum(lines, "probe.refused", "status:404") == 1,
+                           "refused {} with 413 and {} with 404", metric_sum(lines, "probe.refused", "status:413"),
+                           metric_sum(lines, "probe.refused", "status:404"));
+        std::size_t latencies = 0, untagged = 0;
+        for (std::string_view line : lines) {
+            latencies += line.starts_with("probe.latency:") &&
+                         line.find("endpoint:/echo/{id}") != std::string_view::npos &&
+                         line.find("status:200") != std::string_view::npos;
+            untagged += line.find("|#env:test,team:core") == std::string_view::npos;
+        }
+        failures += expect(latencies == 50, "{} latency lines for 50 echoes", latencies);
+        failures += expect(!untagged, "{} of {} lines lacked the global tags", untagged, lines.size());
+        failures += fixture.stop();
+    }
+    ucall_network_interface_t network_interface {};
+    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.max_concurrent_connections = 1;
+    ucall_bytes_view_t const bad_tag = uc::bytes_view("a,b");
+    for (std::string_view const case_name : {"a rate past one", "a tag holding a comma"}) {
+        ucall_server_config_t config {};
+        config.interfaces = &network_interface;
+        config.interfaces_count = 1;
+        config.metrics_address = uc::bytes_view(address);
+        if (case_name == "a rate past one") config.metrics_sample_rate = 1.5f;
+        else config.metrics_tags = &bad_tag, config.metrics_tags_count = 1;
+        ucall_server_t server {};
+        ucall_outcome_t outcome {};
+        ucall_server_init_t init {&server, &outcome, &config, nullptr};
+        ucall_server_init(&init);
+        failures += expect(outcome.status == ucall_status_invalid_argument_k, "{} answered {}", case_name,
+                           ucall_status_name(outcome.status));
+        ucall_server_free(server);
+    }
+    ::close(listener);
+    return failures;
+}
+
 #endif // UCALL_OS_POSIX_
 #pragma endregion Raw Clients
 
@@ -1425,7 +2003,7 @@ struct scripted_server_t {
     }
     ~scripted_server_t() { stop(); }
 
-    std::string url(std::string_view target) const { return "http://" + listener.address + std::string {target}; }
+    std::string url(std::string_view target) const { return fmt::format("http://{}{}", listener.address, target); }
 
     void stop() {
         stopping.store(true, std::memory_order_release);
@@ -1725,7 +2303,8 @@ struct file_tree_t {
 
     file_tree_t() : served(directory.name("served")) {
         std::error_code failed;
-        if (!directory.ready() || !std::filesystem::create_directories(served + "/subdir", failed)) return;
+        if (!directory.ready() || !std::filesystem::create_directories(fmt::format("{}/subdir", served), failed))
+            return;
         bool const written = write("hello.txt", hello_k) && write("subdir/inner.txt", "inner") &&
                              write("locked.txt", "locked") && write("big.bin", big()) &&
                              directory.write("outside.txt", "outside");
@@ -1745,12 +2324,13 @@ struct file_tree_t {
     char const* unusable() const {
         if (prepared) return nullptr;
         static std::string reason;
-        reason = directory.ready() ? "the file tree could not be created in " + directory.path : directory.reason;
+        reason = directory.ready() ? fmt::format("the file tree could not be created in {}", directory.path)
+                                   : directory.reason;
         return reason.c_str();
     }
-    std::string name(std::string_view relative) const { return served + "/" + std::string {relative}; }
+    std::string name(std::string_view relative) const { return fmt::format("{}/{}", served, relative); }
     [[nodiscard]] bool write(std::string_view relative, std::string_view content) const {
-        return directory.write("served/" + std::string {relative}, content);
+        return directory.write(fmt::format("served/{}", relative), content);
     }
 
     /** Opens @p relative for the unbuffered reads every file part demands. */
@@ -1783,7 +2363,7 @@ static ucall_reply_part_t path_part(std::string_view path, std::uint64_t offset 
 /** Calls `/gate` with @p verb and polls until the server holds the request, which it answers. */
 static ucall_received_http_request_t hold_call(fixture_t& fixture, ucall_verb_t verb, ucall_security_mode_t security,
                                                std::size_t& failures, std::string_view target = "/gate") {
-    std::string const url = fixture.url + std::string {target};
+    std::string const url = fmt::format("{}{}", fixture.url, target);
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
     call.client = fixture.client;
@@ -1853,8 +2433,8 @@ static case_result_t file_parts_vectored(ucall_security_mode_t security) {
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
     std::string const hello {file_tree_t::hello_k};
-    std::string const expected = "head|" + hello.substr(7) + file_tree_t::big() + "|" +
-                                 std::string {file_tree_t::far_text_k} + hello + "|tail";
+    std::string const expected = fmt::format("head|{}{}|{}{}|tail", hello.substr(7), file_tree_t::big(),
+                                             file_tree_t::far_text_k, hello);
     for (ucall_verb_t verb : {ucall_verb_get_k, ucall_verb_head_k}) {
         announce("{} with every kind of part", verb == ucall_verb_get_k ? "GET" : "HEAD");
         int const file = tree.open("hello.txt");
@@ -2113,7 +2693,7 @@ static case_result_t test_path_beyond_interface() {
         ucall_bytes_view_t directory = uc::bytes_view(tree.served);
         ucall_network_interface_t interfaces[2] {};
         for (auto& network_interface : interfaces) {
-            network_interface.address = "127.0.0.1:0";
+            network_interface.address = uc::bytes_view("127.0.0.1:0");
             network_interface.max_concurrent_connections = 2;
         }
         interfaces[0].reply_directories = &directory;
@@ -2142,7 +2722,7 @@ static case_result_t test_path_beyond_interface() {
         std::string_view const request = "GET /file HTTP/1.1\r\nHost: a\r\n\r\n";
         for (std::size_t index : {0, 1}) {
             raw_client_t client;
-            if (!client.connect(resolved.interfaces[index].address)) {
+            if (!client.connect(uc::text_view(resolved.interfaces[index].address))) {
                 failures += expect(false, "connecting to interface {}", index);
                 continue;
             }
@@ -2159,7 +2739,7 @@ static case_result_t test_path_beyond_interface() {
         failures += expect(ucall_outcome_status(&state.deferred) == ucall_status_success_k, "outcome {}",
                            ucall_status_name(state.deferred.status));
         // A directory that cannot be opened fails initialization with its cause.
-        std::string const missing = tree.served + "/absent";
+        std::string const missing = fmt::format("{}/absent", tree.served);
         directory = uc::bytes_view(missing);
         ucall_server_t refused {};
         ucall_server_init_t again {&refused, &outcome, &config, nullptr};
@@ -2200,7 +2780,7 @@ static std::size_t stream_parts(fixture_t& fixture, ucall_received_http_request_
     return failures;
 }
 static std::string streamed_parts_body() {
-    return "memory|" + std::string {file_tree_t::hello_k.substr(0, 5)} + file_tree_t::big(1000, 300000) + "|memory";
+    return fmt::format("memory|{}{}|memory", file_tree_t::hello_k.substr(0, 5), file_tree_t::big(1000, 300000));
 }
 
 /** A chunked stream mixing memory, file and path parts, a zero-length range among them, arrives
@@ -2212,7 +2792,7 @@ static case_result_t mixed_stream(ucall_security_mode_t security) {
     fixture_t fixture {{.security = security, .pipelined_requests = 2, .pipelined_calls = 2, .directory = tree.served}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
-    std::array<std::string, 2> urls {fixture.url + "/gate?n=0", fixture.url + "/gate?n=1"};
+    std::array<std::string, 2> urls {fmt::format("{}/gate?n=0", fixture.url), fmt::format("{}/gate?n=1", fixture.url)};
     for (auto& url : urls) {
         ucall_outcome_t outcome {};
         ucall_client_call_t call {};
@@ -2235,7 +2815,7 @@ static case_result_t mixed_stream(ucall_security_mode_t security) {
     int const file = tree.open("hello.txt");
     std::atomic<std::size_t> streamed_failures {};
     std::thread streamer {[&] { streamed_failures += stream_parts(fixture, requests[0], file, streamed); }};
-    std::array<std::string, 2> const bodies {streamed_parts_body(), file_tree_t::big() + "|done"};
+    std::array<std::string, 2> const bodies {streamed_parts_body(), fmt::format("{}|done", file_tree_t::big())};
     for (std::size_t i = 0; i != 2; ++i) {
         auto completed = fixture.wait();
         failures += expect(completed.context == &urls[i], "call {} completed out of order", i);
@@ -2370,7 +2950,7 @@ static case_result_t test_noise_record_boundaries() {
             failures += reply_parts(fixture, request, outcome, {path_part("sized.bin")});
             failures += check_answer(fixture.wait(), ucall_http_status_ok_k, body);
             failures += expect_outcome(fixture, outcome, ucall_status_success_k);
-            std::string const echo_url = fixture.url + "/echo/1";
+            std::string const echo_url = fmt::format("{}/echo/1", fixture.url);
             ucall_outcome_t called {};
             ucall_client_call_t call {};
             call.client = fixture.client;
@@ -2749,7 +3329,7 @@ static case_result_t test_warm_file_reply_allocates_nothing() {
         allocation_counts_t counts;
         ucall_bytes_view_t const directory = uc::bytes_view(tree.served);
         ucall_network_interface_t network_interface {};
-        network_interface.address = "127.0.0.1:0";
+        network_interface.address = uc::bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 1;
         network_interface.reply_directories = &directory;
         network_interface.reply_directories_count = 1;
@@ -2766,8 +3346,8 @@ static case_result_t test_warm_file_reply_allocates_nothing() {
                                               ucall_verb_get_k, route_t::serve, &route};
         ucall_server_add_http_endpoint(&add);
         raw_client_t client;
-        require(failures, client.connect(resolved.interfaces[0].address));
-        std::string const file_body = "head|" + file_tree_t::big(3, 600000);
+        require(failures, client.connect(uc::text_view(resolved.interfaces[0].address)));
+        std::string const file_body = fmt::format("head|{}", file_tree_t::big(3, 600000));
         std::string_view const request = "GET /file HTTP/1.1\r\nHost: a\r\n\r\n";
         std::size_t warm_allocations = 0;
         for (std::size_t round = 0; round != 3; ++round) {
@@ -2943,7 +3523,7 @@ int main(int argc, char** argv) {
             fmt::print(stderr, "Usage: {} [--backend <name>] [--cpu-class <name>]\n", argv[0]);
             return 1;
         }
-        command = command + " " + argv[index] + " " + argv[index + 1];
+        command = fmt::format("{} {} {}", command, argv[index], argv[index + 1]);
     }
     fmt::print("  backend          {}\n", ucall_io_backend_name(backend_under_test));
     fmt::print("  CPU class        {}\n", ucall_cpu_class_name(cpu_class_under_test));
@@ -2964,6 +3544,8 @@ int main(int argc, char** argv) {
     run_test(totals, "test_exchanges_plain", test_exchanges_plain);
     run_test(totals, "test_exchanges_noise_xx", test_exchanges_noise_xx);
     run_test(totals, "test_exchanges_noise_ik", test_exchanges_noise_ik);
+    run_test(totals, "test_exchanges_noise_kk", test_exchanges_noise_kk);
+    run_test(totals, "test_server_kk_wrong_initiator", test_server_kk_wrong_initiator);
     run_test(totals, "test_multiloop_retention", test_multiloop_retention);
     run_test(totals, "test_cross_thread_replies_stress", test_cross_thread_replies_stress);
     run_test(totals, "test_pipelined_calls_plain", test_pipelined_calls_plain);
@@ -2982,6 +3564,15 @@ int main(int argc, char** argv) {
     run_test(totals, "test_streamed_reply_detach", test_streamed_reply_detach);
     run_test(totals, "test_streamed_reply_http10", test_streamed_reply_http10);
     run_test(totals, "test_streamed_reply_identity", test_streamed_reply_identity);
+    run_test(totals, "test_configuration_byte_views", test_configuration_byte_views);
+    run_test(totals, "test_streamed_body_plain", test_streamed_body_plain);
+    run_test(totals, "test_streamed_body_noise_xx", test_streamed_body_noise_xx);
+    run_test(totals, "test_streamed_body_slow_puller", test_streamed_body_slow_puller);
+    run_test(totals, "test_streamed_body_barrier", test_streamed_body_barrier);
+    run_test(totals, "test_streamed_body_malformed", test_streamed_body_malformed);
+    run_test(totals, "test_oversized_request_refused", test_oversized_request_refused);
+    run_test(totals, "test_multipart_parts", test_multipart_parts);
+    run_test(totals, "test_statsd_metrics", test_statsd_metrics);
     run_test(totals, "test_lengthless_head_keeps_connection", test_lengthless_head_keeps_connection);
     run_test(totals, "test_caller_close_mid_pipeline", test_caller_close_mid_pipeline);
     run_test(totals, "test_post_waits_behind_post", test_post_waits_behind_post);

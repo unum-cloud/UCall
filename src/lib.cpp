@@ -387,17 +387,21 @@ void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* 
 void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* arguments) {
     if (!arguments) return;
     if (arguments->data) *arguments->data = {};
-    publish(arguments->outcome, ucall_status_unsupported_k);
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->request_body_chunk(arguments);
 }
 
-size_t ucall_server_request_parts_count(ucall_server_t server, ucall_received_http_request_t request) { return 0; }
+size_t ucall_server_request_parts_count(ucall_server_t server, ucall_received_http_request_t request) {
+    return server && compatible(server) ? server->api->request_parts_count(server, request) : 0;
+}
 
 void ucall_server_request_part(ucall_server_request_part_t* arguments) {
     if (!arguments) return;
     if (arguments->name) *arguments->name = {};
     if (arguments->content_type) *arguments->content_type = {};
     if (arguments->data) *arguments->data = {};
-    publish(arguments->outcome, ucall_status_unsupported_k);
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->request_part(arguments);
 }
 
 void ucall_server_reply_vectored(ucall_server_reply_vectored_t* arguments) {

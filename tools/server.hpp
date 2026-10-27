@@ -198,7 +198,7 @@ struct server_t {
         bool const bracketed = host.find(':') != host.npos;
         std::snprintf(address, sizeof(address), bracketed ? "[%.*s]:%zu" : "%.*s:%zu", static_cast<int>(host.size()),
                       host.data(), port);
-        network_interface.address = address;
+        network_interface.address = bytes_view(address);
         network_interface.max_concurrent_connections = connections;
         network_interface.max_pipelined_requests = pipelined_requests;
         network_interface.event_loops = std::min(threads, connections);
@@ -211,8 +211,9 @@ struct server_t {
         if (!succeeded(outcome)) return -1;
         if (!add_endpoint("/health", ucall_verb_get_k, health, &server)) return -1;
         event_loops = resolved.interfaces[0].event_loops;
-        std::printf("Listening on %s using %s, %s, %zu application-owned serving loops\n",
-                    resolved.interfaces[0].address, ucall_io_backend_name(resolved.backend),
+        std::string_view const bound = text_view(resolved.interfaces[0].address);
+        std::printf("Listening on %.*s using %s, %s, %zu application-owned serving loops\n",
+                    static_cast<int>(bound.size()), bound.data(), ucall_io_backend_name(resolved.backend),
                     ucall_cpu_class_name(resolved.cpu_class), event_loops);
         std::fflush(stdout); // Scripts read the public key and the address before the server exits.
         return 0;

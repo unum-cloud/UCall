@@ -69,7 +69,7 @@ struct fixture_t {
     explicit fixture_t(ucall_received_http_batch_callback_t batch_callback = nullptr, void* batch_context = nullptr) {
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = "127.0.0.1:0";
+        network_interface.address = uc::bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 2;
         ucall_server_config_t config {};
         config.interfaces = &network_interface;
@@ -78,8 +78,7 @@ struct fixture_t {
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        address = "http://";
-        address += resolved.interfaces[0].address;
+        address = fmt::format("http://{}", uc::text_view(resolved.interfaces[0].address));
         using route_t = std::pair<char const*, ucall_received_http_request_callback_t>;
         for (auto [route, callback] : {route_t {"/echo", echo}, route_t {"/hold", hold}}) {
             ucall_server_add_http_endpoint_t add {server,   &outcome, uc::bytes_view(route), ucall_verb_post_k,
@@ -152,7 +151,7 @@ struct call_t {
     std::string url;
 
     void submit(fixture_t& fixture, std::size_t client = 0, char const* path = "/echo", std::size_t timeout = 0) {
-        url = fixture.address + path;
+        url = fmt::format("{}{}", fixture.address, path);
         ucall_client_call_t call {};
         call.client = fixture.clients[client];
         call.outcome = &outcome;
@@ -494,7 +493,7 @@ static case_result_t test_batches_across_loops_unit() {
     ucall_client_t client {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = "127.0.0.1:0";
+    network_interface.address = uc::bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 4;
     network_interface.event_loops = 2;
     ucall_server_config_t config {}, resolved {};
@@ -518,7 +517,7 @@ static case_result_t test_batches_across_loops_unit() {
     failures += expect(outcome.status == ucall_status_success_k);
     auto drain = drain_batches(server, batches.failures, endpoint);
     // Each loop owns two of the four connections, so each receives exactly half of the batch.
-    std::string url = std::string {"http://"} + resolved.interfaces[0].address + "/batch";
+    std::string url = fmt::format("http://{}/batch", uc::text_view(resolved.interfaces[0].address));
     for (std::size_t i = 0; i != 4; ++i) {
         ucall_client_call_t call {};
         call.client = client;
@@ -678,7 +677,7 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
     ucall_server_t server {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = "127.0.0.1:0";
+    network_interface.address = uc::bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
     network_interface.max_pipelined_requests = 4;
     ucall_server_config_t config {}, resolved {};
@@ -706,7 +705,7 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
     for (std::size_t i = 0; i != 4; ++i)
         burst += fmt::format("POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n{}", i);
     raw_client_t client;
-    bool const written = client.connect(resolved.interfaces[0].address) &&
+    bool const written = client.connect(uc::text_view(resolved.interfaces[0].address)) &&
                          client.write(uc::byte_span(burst), burst.size(), generator, steady_clock::now() + 5s);
     failures += expect(written, "the burst was not written");
     steady_clock::time_point const deadline = steady_clock::now() + 5s;
@@ -812,7 +811,7 @@ static case_result_t test_allocator_propagation_unit() {
     echo_route_t route;
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = "127.0.0.1:0";
+    network_interface.address = uc::bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
     ucall_server_config_t server_config {}, resolved {};
     server_config.interfaces = &network_interface;
@@ -834,7 +833,7 @@ static case_result_t test_allocator_propagation_unit() {
     counts.fail_from = std::numeric_limits<std::size_t>::max();
     counted_network_t::client_init(&client_init, allocator);
     require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
-    std::string url = std::string {"http://"} + resolved.interfaces[0].address + "/echo/1";
+    std::string url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));
     std::string payload(1024, '\0');
     ucall_client_call_t call {};
     call.client = client;
@@ -879,7 +878,7 @@ static case_result_t test_allocation_failure_safety() {
         echo_route_t route;
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = "127.0.0.1:0";
+        network_interface.address = uc::bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 1;
         ucall_server_config_t server_config {}, resolved {};
         server_config.interfaces = &network_interface;
@@ -895,7 +894,7 @@ static case_result_t test_allocation_failure_safety() {
             ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
             ucall_client_init(&client_init);
             require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
-            std::string url = std::string {"http://"} + resolved.interfaces[0].address + "/echo/1";
+            std::string url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));
             ucall_client_call_t call {};
             call.client = client;
             call.outcome = &outcome;

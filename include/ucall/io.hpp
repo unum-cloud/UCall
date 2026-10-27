@@ -167,6 +167,26 @@ inline descriptor_t socket_open(int family) noexcept {
 #endif
     return descriptor;
 }
+
+/** A nonblocking UDP socket connected to @p address, so sends need no destination, or -1. */
+inline descriptor_t datagram_open(sockaddr const* address, socket_length_t length) noexcept {
+    if (sockets_start() != ucall_status_success_k) return -1;
+#if UCALL_OS_WINDOWS_
+    descriptor_t descriptor = static_cast<descriptor_t>(
+        WSASocketW(address->sa_family, SOCK_DGRAM, IPPROTO_UDP, nullptr, 0, WSA_FLAG_OVERLAPPED));
+    if (descriptor == -1) return -1;
+    bool const connected = connect(static_cast<SOCKET>(descriptor), address, length) == 0;
+#else
+    descriptor_t descriptor = socket(address->sa_family, SOCK_DGRAM, 0);
+    if (descriptor == -1) return -1;
+    bool const connected = connect(static_cast<int>(descriptor), address, length) == 0;
+#endif
+    if (!connected || nonblocking(descriptor) != ucall_status_success_k) {
+        socket_close(descriptor);
+        return -1;
+    }
+    return descriptor;
+}
 inline descriptor_t accepted_socket(descriptor_t descriptor) noexcept {
     if (descriptor == -1) return -socket_last_error();
     if (nonblocking(descriptor) != ucall_status_success_k) {
