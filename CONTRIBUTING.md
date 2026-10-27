@@ -38,6 +38,29 @@ UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset debug
 
 Python suites sit beside them as `test/server.py` and `test/client.py`, and Rust tests sit in each module of `rust/`.
 
+### Arm on an x86 Host
+
+`cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
+`--cpu-class` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
+QEMU's user mode has neither io_uring nor Linux AIO, so those suites skip.
+
+```bash
+cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake
+cmake --build build_aarch64
+ctest --test-dir build_aarch64
+qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class apple-m2
+```
+
+### Model Checking
+
+`verification/` holds Spin models of the protocols replies cross threads by, each naming its expected verdicts in `@verify` lines, including the mutants that must fail.
+`check.sh` runs them, and GenMC clients when `GENMC` names its executable; `weak_memory.pml` models the C++ memory model for Spin.
+
+```bash
+./verification/check.sh
+./verification/check.sh verification/segment_links.pml
+```
+
 ## Python Builds
 
 `pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `UCALL_BUILD_PYTHON=ON` and installs the `ucall_python` target, the extension `ucall.lib`, into the `python/ucall/` package.

@@ -166,6 +166,13 @@ if (UCALL_WITH_LINUX_URING)
         add_library(uring_internal ALIAS PkgConfig::UCALL_URING)
     else ()
         set(ucall_uring_dir_ ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
+        # liburing's own `configure` knows no target, so a cross build names it with the compilers.
+        set(ucall_uring_cc_ ${CMAKE_C_COMPILER})
+        set(ucall_uring_cxx_ ${CMAKE_CXX_COMPILER})
+        if (CMAKE_C_COMPILER_TARGET)
+            string(APPEND ucall_uring_cc_ " --target=${CMAKE_C_COMPILER_TARGET}")
+            string(APPEND ucall_uring_cxx_ " --target=${CMAKE_CXX_COMPILER_TARGET}")
+        endif ()
         ExternalProject_Add(
             liburing-ep
             GIT_REPOSITORY https://github.com/axboe/liburing.git
@@ -173,7 +180,7 @@ if (UCALL_WITH_LINUX_URING)
             GIT_SHALLOW 1
             PREFIX ${CMAKE_BINARY_DIR}/_deps/
             SOURCE_DIR ${ucall_uring_dir_}
-            CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${CMAKE_C_COMPILER} --cxx=${CMAKE_CXX_COMPILER}
+            CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${ucall_uring_cc_} --cxx=${ucall_uring_cxx_}
             BUILD_COMMAND make -C <SOURCE_DIR>/src -s
             BUILD_BYPRODUCTS ${ucall_uring_dir_}/src/liburing.a
             BUILD_IN_SOURCE 1
