@@ -231,7 +231,9 @@ struct linux_uring612_engine {
         while (buffer_count < capacity && buffer_count < 32768) buffer_count *= 2;
         buffer_mask = buffer_count - 1;
         available_buffers = buffer_count;
-        if (st::failed(operations.resize(capacity)) || st::failed(socket_slots.resize(capacity)) ||
+        // Releases take no file, and the kernel registers no more files than descriptors.
+        std::size_t const sockets = std::min(capacity, open_files_limit());
+        if (st::failed(operations.resize(capacity)) || st::failed(socket_slots.resize(sockets)) ||
             st::failed(buffers.resize(buffer_count)) || releases.open(capacity) != ucall_status_success_k ||
             st::failed(storage->receive.resize(static_cast<std::size_t>(buffer_count) * page)))
             return ucall_status_out_of_memory_k;

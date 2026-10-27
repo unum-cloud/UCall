@@ -630,6 +630,16 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return static_cast<unsigned>(std::countr_zero(static_cast<std::uint32_t>(state)));
     }
 
+    /** One of an exchange's two zero-copy releases: what the sends naming it hold, and the
+     *  segments they sent, which return to their free lists once it completes. */
+    struct exchange_release_t {
+        io_request_t request {};
+        reply_segment_t* sent_segments {};
+        file_segment_t* sent_file_segments {};
+        std::size_t held_bytes {};
+        release_state_t state {};
+    };
+
     /** A link of an event loop's replied queue, naming the exchange it carries, or none for the
      *  loop's own stub. */
     struct replied_link_t {
@@ -649,15 +659,16 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         server_exchange_t(server_exchange_t&&) = delete;
         server_exchange_t& operator=(server_exchange_t&&) = delete;
         ~server_exchange_t() noexcept {
-            for (reply_segment_t* segment : {free_segments, returned_segments, queued_segments(), sent_segments})
+            for (reply_segment_t* segment : {free_segments, returned_segments, queued_segments(),
+                                             releases[0].sent_segments, releases[1].sent_segments})
                 while (segment) {
                     reply_segment_t* next = segment->next;
                     if (segment != &head_segment && segment != &end_segment && !holds_file_segment(segment))
                         allocator_delete<reply_segment_t, allocator_t> {event_loop->allocator}(segment);
                     segment = next;
                 }
-            for (file_segment_t* file_segment :
-                 {free_file_segments, returned_file_segments, queued_file_segments(), sent_file_segments})
+            for (file_segment_t* file_segment : {free_file_segments, returned_file_segments, queued_file_segments(),
+                                                 releases[0].sent_file_segments, releases[1].sent_file_segments})
                 while (file_segment) {
                     file_segment_t* next = file_segment->next;
                     if (owns_file_descriptor(*file_segment)) file_close(file_segment->file_descriptor);
@@ -719,7 +730,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         reply_segment_t* oldest_segment {};    // The adopted segments the loop sends, in order.
         reply_segment_t* newest_segment {};    // The loop's cursor, whose `next` the replier may still link.
         reply_segment_t* parked_segment {};    // Retired at the cursor, so handed back only once it moves.
-        reply_segment_t* sent_segments {};     // Sent chunks the kernel may still hold, until the release.
 
         /** File segments, whose own segments sit in the same stacks and queue: the replier
          *  pushes each ahead of its segment, the loop adopts them after the segments, and
@@ -731,16 +741,26 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         file_segment_t* oldest_file_segment {};    // The adopted ones, in order.
         file_segment_t* newest_file_segment {};    // The loop's cursor over file segments.
         file_segment_t* parked_file_segment {};    // Retired at either cursor, handed back once both moved.
-        file_segment_t* sent_file_segments {};     // Sent ones whose framing the kernel may still hold.
         std::uint32_t unsent_file_segments {};     // Queued ones the loop has not retired; any thread.
         ucall_outcome_t* outcome {};               // A reply's deferred outcome, which the loop makes final.
         std::size_t unsent_bytes {};               // Queued chunk bytes the socket has not taken; any thread.
         std::uint64_t declared {}, streamed {};    // A streamed body's `content-length` and bytes so far.
         reply_framing_t framing {};                // How the replier frames its chunks.
         reply_head_t reply_head {};                // Whether the loop completes the head once it sized every file.
-        release_state_t release_state {};          // Of `release_request`, which every segment send names.
-        std::size_t held_bytes {};                 // Sent under the release named now, bounding a stream's hold.
-        io_request_t release_request {};
+
+        /** Sends name `releases[naming]`, each release holding at most half the socket's send
+         *  buffer, so the next one fills while the other is in the kernel's hands. */
+        exchange_release_t releases[2] {};
+        std::uint8_t naming {};
+        bool releasing() const noexcept {
+            return releases[0].state == release_state_t::releasing_k ||
+                   releases[1].state == release_state_t::releasing_k;
+        }
+
+        /** The release @p request is, among the two of this exchange. */
+        exchange_release_t& release_of(io_request_t const* request) noexcept {
+            return releases[request == &releases[1].request];
+        }
 
         /** A streamed request body: the loop decodes into `body_chunk`, and a pull swaps it with
          *  `pulled_chunk`, which the application views until its next pull. Only the loop touches
@@ -1877,9 +1897,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
     /** Hands a retired chunk back, or keeps it while the kernel may hold it. */
     static void return_segment(server_exchange_t& exchange, reply_segment_t& segment) noexcept {
-        if (exchange.release_state != release_state_t::idle_k) {
-            segment.next = exchange.sent_segments;
-            exchange.sent_segments = &segment;
+        // A segment retires before the next send, so the release its send named is still named.
+        exchange_release_t& release = exchange.releases[exchange.naming];
+        if (release.state != release_state_t::idle_k) {
+            segment.next = release.sent_segments;
+            release.sent_segments = &segment;
         }
         else push_returned(exchange.returned_segments, segment, segment);
     }
@@ -1909,9 +1931,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
     /** Hands a retired file segment back, or keeps it while the kernel may hold its framing. */
     static void return_file_segment(server_exchange_t& exchange, file_segment_t& file_segment) noexcept {
-        if (exchange.release_state != release_state_t::idle_k) {
-            file_segment.next = exchange.sent_file_segments;
-            exchange.sent_file_segments = &file_segment;
+        exchange_release_t& release = exchange.releases[exchange.naming];
+        if (release.state != release_state_t::idle_k) {
+            file_segment.next = release.sent_file_segments;
+            release.sent_file_segments = &file_segment;
             return;
         }
         file_segment.segment.bytes.clear();
@@ -1954,13 +1977,13 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
 
     /** Hands back every segment the release of @p exchange covered, once the kernel let go. */
-    static void return_released_segments(server_exchange_t& exchange) noexcept {
-        if (reply_segment_t* newest = std::exchange(exchange.sent_segments, nullptr)) {
+    static void return_released_segments(server_exchange_t& exchange, exchange_release_t& release) noexcept {
+        if (reply_segment_t* newest = std::exchange(release.sent_segments, nullptr)) {
             reply_segment_t* oldest = newest;
             while (oldest->next) oldest = oldest->next;
             push_returned(exchange.returned_segments, *newest, *oldest);
         }
-        if (file_segment_t* newest = std::exchange(exchange.sent_file_segments, nullptr)) {
+        if (file_segment_t* newest = std::exchange(release.sent_file_segments, nullptr)) {
             file_segment_t* oldest = newest;
             for (;; oldest = oldest->next) {
                 oldest->segment.bytes.clear();
@@ -1968,8 +1991,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             }
             push_returned(exchange.returned_file_segments, *newest, *oldest);
         }
-        exchange.release_state = release_state_t::idle_k;
-        exchange.held_bytes = 0;
+        release.state = release_state_t::idle_k;
+        release.held_bytes = 0;
     }
 
     /** Makes a reply's deferred outcome final with @p status, once. */
@@ -2221,7 +2244,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         exchange.input.clear();
         release_all_segments(exchange);
         publish_reply_outcome(exchange, status);
-        if (exchange.release_state == release_state_t::releasing_k) {
+        if (exchange.releasing()) {
             exchange.stage = exchange_stage_t::releasing_k;
             return;
         }
@@ -2496,13 +2519,14 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
     /** Readies the release of @p exchange's segment sends on @p connection's socket. */
     static io_request_t& name_exchange_release(connection_t& connection, server_exchange_t& exchange) noexcept {
-        if (exchange.release_state == release_state_t::idle_k) {
-            exchange.release_request = {.operation = io_operation_t::zero_copy_release_k,
-                                        .descriptor = connection.descriptor,
-                                        .context = &exchange};
-            exchange.release_state = release_state_t::named_k;
+        exchange_release_t& release = exchange.releases[exchange.naming];
+        if (release.state == release_state_t::idle_k) {
+            release.request = {.operation = io_operation_t::zero_copy_release_k,
+                               .descriptor = connection.descriptor,
+                               .context = &exchange};
+            release.state = release_state_t::named_k;
         }
-        return exchange.release_request;
+        return release.request;
     }
 
     /** Retires the oldest replies' sent segments, then each exchange whose reply ended with nothing
@@ -2519,7 +2543,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             }
             connection.transmitting = transmit_state_t::idle_k;
             if (oldest->stage != exchange_stage_t::ended_k || oldest == connection.streaming) return nullptr;
-            if (oldest->release_state == release_state_t::named_k) return &oldest->release_request;
+            for (exchange_release_t& release : oldest->releases)
+                if (release.state == release_state_t::named_k) return &release.request;
             connection.oldest_exchange = std::exchange(oldest->connection_next, nullptr);
             if (!connection.oldest_exchange) connection.newest_exchange = nullptr;
             --connection.exchanges_in_flight;
@@ -2917,8 +2942,17 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
      *  buffer submits that release first, and sends on once it completes. */
     static io_request_t* send_segment(connection_t& connection, server_exchange_t& exchange,
                                       span<byte_t> bytes) noexcept {
-        if (exchange.release_state == release_state_t::named_k && exchange.held_bytes >= connection.send_buffer_bytes)
-            return &exchange.release_request;
+        // A release holding half the buffer goes to the kernel, and sends name the other, waiting
+        // only while that one is still released, so both together hold what a copying send would.
+        exchange_release_t& named = exchange.releases[exchange.naming];
+        exchange_release_t& other = exchange.releases[exchange.naming ^ 1];
+        // A full release whose submission failed is offered again before anything else is sent.
+        if (other.state == release_state_t::named_k) return &other.request;
+        if (named.state == release_state_t::named_k && named.held_bytes >= connection.send_buffer_bytes / 2) {
+            if (other.state == release_state_t::releasing_k) return nullptr;
+            exchange.naming ^= 1;
+            return &named.request;
+        }
         if (ucall_status_t const sealed = connection.seal_records(bytes); sealed != ucall_status_success_k) {
             connection.fail(sealed);
             return nullptr;
@@ -2966,7 +3000,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             auto* exchange = connection.oldest_exchange;
             if (connection.stage != connection_stage_t::open_k || !exchange || !exchange->oldest_segment ||
                 exchange->reply_head == reply_head_t::deferred_k ||
-                exchange->release_state == release_state_t::releasing_k)
+                exchange->releases[exchange->naming].state == release_state_t::releasing_k)
                 return nullptr;
             connection.transmitting = transmit_state_t::sending_k;
             auto& bytes = exchange->oldest_segment->bytes;
@@ -2998,8 +3032,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         io_request_t const* release = completion.request->release_request;
         std::uint32_t const window = event_loop.file_windows.window_of(release);
         if (window == absent_k)
-            static_cast<server_exchange_t*>(release->context)->held_bytes += static_cast<std::size_t>(
-                completion.result);
+            static_cast<server_exchange_t*>(release->context)->release_of(release).held_bytes +=
+                static_cast<std::size_t>(completion.result);
         if (connection.sending) return;
         if (window == absent_k) connection.output_offset += connection.sending_length;
         else
@@ -3014,7 +3048,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         auto& pool = event_loop.file_windows;
         std::uint32_t const window = pool.window_of(&request);
         if (window == absent_k) {
-            static_cast<server_exchange_t*>(request.context)->release_state = release_state_t::releasing_k;
+            static_cast<server_exchange_t*>(request.context)->release_of(&request).state = release_state_t::releasing_k;
             ++connection.releasing_exchanges;
             return;
         }
@@ -3041,8 +3075,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             auto& exchange = *static_cast<server_exchange_t*>(completion.request->context);
             connection = exchange.connection;
             --connection->releasing_exchanges;
-            return_released_segments(exchange);
-            if (exchange.stage == exchange_stage_t::releasing_k) free_exchange(event_loop, exchange);
+            return_released_segments(exchange, exchange.release_of(completion.request));
+            if (exchange.stage == exchange_stage_t::releasing_k && !exchange.releasing())
+                free_exchange(event_loop, exchange);
         }
         if (connection->stage == connection_stage_t::releasing_k && !connection->releases_pending())
             connection->stage = connection_stage_t::closing_k;
@@ -3063,7 +3098,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             vacate_window(event_loop, unlink_oldest_window(event_loop, connection));
         }
         for (auto* exchange = connection.oldest_exchange; exchange; exchange = exchange->connection_next)
-            if (exchange->release_state == release_state_t::named_k) return &exchange->release_request;
+            for (exchange_release_t& release : exchange->releases)
+                if (release.state == release_state_t::named_k) return &release.request;
         return nullptr;
     }
 
@@ -3094,8 +3130,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         while (connection.stage == connection_stage_t::open_k && connection.receiving == receive_state_t::reading_k) {
             // A streamed body is a barrier: nothing behind it parses until it ended.
             if (connection.streaming) {
-                if (stream_body(connection) != http_parse_t::complete_k) break;
-                continue;
+                if (stream_body(connection) == http_parse_t::complete_k) continue;
+                // An engine prefetching into a shared ring parks what an unpulled body holds there.
+                if constexpr (requires { event_loop.engine.receive_pause(connection.descriptor); })
+                    if (connection.streaming && !connection.streaming->body_chunk.empty())
+                        event_loop.engine.receive_pause(connection.descriptor);
+                break;
             }
             if (connection.exchanges_in_flight == depth) {
                 connection.receiving = receive_state_t::full_k;
@@ -3379,9 +3419,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return ucall_status_success_k;
         }
         if (!settings.reply_directories) return ucall_status_invalid_argument_k;
-#if UCALL_OS_WINDOWS_
-        return ucall_status_unsupported_k;
-#else
         auto& names = network_interface.reply_directory_names;
         for (std::size_t i = 0; i != settings.reply_directories_count; ++i) {
             ucall_bytes_view_t const directory = settings.reply_directories[i];
@@ -3394,16 +3431,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (st::failed(network_interface.reply_directory_descriptors.reserve(settings.reply_directories_count)) ||
             st::failed(network_interface.reply_directory_views.resize(settings.reply_directories_count)))
             return ucall_status_out_of_memory_k;
-#if UCALL_OS_LINUX_
-        constexpr int flags = O_PATH | O_DIRECTORY | O_CLOEXEC;
-#else
-        constexpr int flags = O_RDONLY | O_DIRECTORY | O_CLOEXEC;
-#endif
         char const* name = names.data();
         for (std::size_t i = 0; i != settings.reply_directories_count; ++i) {
-            int const directory = ::open(name, flags);
+            int const directory = directory_open(name);
             if (directory < 0)
-                return errno == ENOENT || errno == ENOTDIR ? ucall_status_not_found_k : ucall_status_io_k;
+                return directory == -ENOENT || directory == -ENOTDIR ? ucall_status_not_found_k : ucall_status_io_k;
             [[maybe_unused]] st::status_t const kept = network_interface.reply_directory_descriptors.push_back(
                 st::assume_reserved, int {directory});
             std::size_t const length = settings.reply_directories[i].length;
@@ -3412,7 +3444,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         settings.reply_directories = network_interface.reply_directory_views.data();
         return ucall_status_success_k;
-#endif // UCALL_OS_WINDOWS_
     }
 
     /** Whether @p text may stand in a metric name or tag: no separator StatsD lines use. */
@@ -3736,15 +3767,15 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
     static ucall_status_t open_event_loop(event_loop_t& event_loop) noexcept {
         if (event_loop.stage != event_loop_stage_t::unopened_k) return event_loop.setup_status;
-        // Each connection keeps one operation per direction and one for files, each window and each
-        // pipelined exchange at most one release, and the wakeup one more slot.
+        // Each connection keeps one operation per direction and one for files, each window one
+        // release, each pipelined exchange two, and the wakeup and the metrics socket one each.
         auto connections = event_loop.connections.size(), acceptors = event_loop.interface_acceptors.size();
         std::size_t const counted_limit = std::numeric_limits<std::uint32_t>::max() / 8;
         if (connections > counted_limit || acceptors > counted_limit || event_loop.max_exchanges > counted_limit)
             return ucall_status_overflow_k;
         auto& pool = event_loop.file_windows;
         pool.buffers_limit = static_cast<std::uint32_t>(2 * connections);
-        auto slots = 3 * connections + acceptors + 2 + pool.buffers_limit + event_loop.max_exchanges;
+        auto slots = 3 * connections + acceptors + 2 + pool.buffers_limit + 2 * event_loop.max_exchanges;
         if (st::failed(pool.slabs.reserve(pool.buffers_limit)) ||
             st::failed(pool.windows.reserve(pool.buffers_limit)) ||
             st::failed(pool.release_requests.reserve(pool.buffers_limit)))

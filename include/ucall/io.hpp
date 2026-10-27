@@ -18,16 +18,20 @@
 #include "ucall/types.hpp"
 
 #if UCALL_OS_WINDOWS_
-#include <io.h> // `_get_osfhandle`
+#include <fcntl.h> // `_O_RDONLY`
+#include <io.h>    // `_get_osfhandle`, `_open_osfhandle`
 #include <mswsock.h>
+#include <winternl.h> // `NtCreateFile`, `OBJECT_ATTRIBUTES`
 #include <sys/stat.h> // `_fstat64`
 #include <ws2tcpip.h>
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <netinet/in.h> // `IPPROTO_TCP`, `sockaddr_in6`, which glibc alone pulls in through `<arpa/inet.h>`
 #include <netinet/tcp.h>
 #include <poll.h>
+#include <sys/resource.h> // `getrlimit`
 #include <sys/socket.h>
 #include <sys/stat.h> // `fstat`, `statx`
 #include <sys/uio.h>  // `iovec`, `preadv`
@@ -119,6 +123,13 @@ inline int socket_close(descriptor_t descriptor) noexcept { return close(static_
 inline std::size_t page_size() noexcept {
     long result = sysconf(_SC_PAGESIZE);
     return result > 0 ? static_cast<std::size_t>(result) : 0;
+}
+
+/** The most descriptors the process may hold, which also bounds a registered file table. */
+inline std::size_t open_files_limit() noexcept {
+    rlimit files {};
+    return getrlimit(RLIMIT_NOFILE, &files) == 0 ? static_cast<std::size_t>(files.rlim_cur)
+                                                 : std::numeric_limits<std::size_t>::max();
 }
 #endif
 inline int socket_option(descriptor_t descriptor, int level, int name, void const* value, std::size_t length) noexcept {
@@ -341,6 +352,68 @@ inline file_geometry_t file_direct_alignment(int file) noexcept {
 /** Accepts any descriptor, since the IOCP engine reopens each file unbuffered for its reads. */
 inline ucall_status_t file_direct_check(int) noexcept { return ucall_status_success_k; }
 
+/** @p path as UTF-16 with backslashes, in @p wide of @p capacity characters: its length, or zero
+ *  when it does not convert or fit. */
+inline int file_path_wide(char const* path, wchar_t* wide, int capacity) noexcept {
+    int const length = MultiByteToWideChar(CP_UTF8, MB_ERR_INVALID_CHARS, path, -1, wide, capacity);
+    for (int i = 0; i < length; ++i)
+        if (wide[i] == L'/') wide[i] = L'\\';
+    return length > 1 ? length - 1 : 0;
+}
+
+/** Opens the directory @p path as a CRT descriptor whose handle path parts open beneath. */
+inline int directory_open(char const* path) noexcept {
+    wchar_t wide[MAX_PATH];
+    if (!file_path_wide(path, wide, MAX_PATH)) return -ENOENT;
+    HANDLE const directory = CreateFileW(wide, FILE_LIST_DIRECTORY,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
+                                         FILE_FLAG_BACKUP_SEMANTICS, nullptr);
+    if (directory == INVALID_HANDLE_VALUE)
+        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? -ENOENT : -EIO;
+    int const descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(directory), _O_RDONLY);
+    if (descriptor < 0) CloseHandle(directory);
+    return descriptor < 0 ? -EIO : descriptor;
+}
+
+/** Whether @p path names something beneath its directory: relative, without a drive, a `..`
+ *  segment or a `:` stream. */
+inline bool file_path_beneath(std::string_view path) noexcept {
+    if (path.empty() || path.front() == '/' || path.front() == '\\' || path.find(':') != std::string_view::npos)
+        return false;
+    for (std::size_t start = 0; start <= path.size();) {
+        std::size_t end = path.find_first_of("/\\", start);
+        if (end == std::string_view::npos) end = path.size();
+        if (path.substr(start, end - start) == "..") return false;
+        start = end + 1;
+    }
+    return true;
+}
+
+/** Opens @p path for reads strictly beneath the descriptor @p directory names, following no
+ *  reparse point on the way, as `RESOLVE_BENEATH` does on Linux: a descriptor, or a negated
+ *  errno; every refusal reads as missing, so permissions are never revealed. */
+inline int file_open_beneath(int directory, char const* path) noexcept {
+    wchar_t wide[MAX_PATH];
+    int const length = file_path_beneath(path) ? file_path_wide(path, wide, MAX_PATH) : 0;
+    if (!length) return -ENOENT;
+    UNICODE_STRING name {static_cast<USHORT>(length * sizeof(wchar_t)),
+                         static_cast<USHORT>((length + 1) * sizeof(wchar_t)), wide};
+    OBJECT_ATTRIBUTES attributes {};
+    attributes.Length = sizeof(attributes);
+    attributes.RootDirectory = reinterpret_cast<HANDLE>(_get_osfhandle(directory));
+    attributes.ObjectName = &name;
+    attributes.Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE;
+    IO_STATUS_BLOCK status {};
+    HANDLE file {};
+    NTSTATUS const opened = NtCreateFile(&file, FILE_GENERIC_READ, &attributes, &status, nullptr, 0,
+                                         FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
+                                         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
+    if (opened < 0) return -ENOENT;
+    int const descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_RDONLY);
+    if (descriptor < 0) CloseHandle(file);
+    return descriptor < 0 ? -EIO : descriptor;
+}
+
 #else
 
 #if UCALL_OS_LINUX_
@@ -432,6 +505,16 @@ inline descriptor_t file_read_vectors(int file, span<io_vector_t const> vectors,
                       static_cast<off_t>(offset));
     while (read < 0 && errno == EINTR);
     return read >= 0 ? static_cast<descriptor_t>(read) : -errno;
+}
+
+/** Opens the directory @p path as a descriptor path parts open beneath, or a negated errno. */
+inline int directory_open(char const* path) noexcept {
+#if UCALL_OS_LINUX_
+    int const directory = ::open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
+#else
+    int const directory = ::open(path, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
+#endif
+    return directory >= 0 ? directory : -errno;
 }
 
 /** Opens @p path for unbuffered reads strictly beneath @p directory: a descriptor, or a negated
@@ -716,11 +799,16 @@ struct posix_engine {
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+
+    /** Whether an operation is free, queued fresh, or waiting in `polling`. */
+    enum class operation_place_t : std::uint8_t { free_k, queued_k, polled_k };
     struct operation_t {
         io_request_t* request {};
-        unsigned polled {absent_k}, next {absent_k};
+        unsigned next {absent_k}; // The next free or fresh operation, or its slot in `polling` once polled.
         operation_stage_t stage {operation_stage_t::fresh_k};
+        operation_place_t place {operation_place_t::free_k};
     };
+    static_assert(sizeof(operation_t) == 16);
     st::basic_vector<operation_t, rebound_allocator<operation_t>> operations {};
     st::basic_vector<pollfd, rebound_allocator<pollfd>> polling {};
     st::basic_vector<unsigned, rebound_allocator<unsigned>> polled {};
@@ -740,8 +828,9 @@ struct posix_engine {
             if (operations[i].request == &request) {
                 tally(statistics.cancellations);
                 operations[i].stage = operation_stage_t::cancelled_k;
-                if (operations[i].polled != absent_k) {
+                if (operations[i].place == operation_place_t::polled_k) {
                     unpoll(operations[i]);
+                    operations[i].place = operation_place_t::queued_k;
                     fresh_operations.push(operations, i);
                 }
                 return ucall_status_success_k;
@@ -776,24 +865,26 @@ struct posix_engine {
         if (index == absent_k) return ucall_status_contended_k;
         operations[index] = {};
         operations[index].request = &request;
+        operations[index].place = operation_place_t::queued_k;
         fresh_operations.push(operations, index);
         tally(statistics.submissions);
         return ucall_status_success_k;
     }
     void unpoll(operation_t& operation) noexcept {
-        auto position = operation.polled;
+        auto position = operation.next;
         --waiting;
         polling[position] = polling[waiting];
         polled[position] = polled[waiting];
-        operations[polled[position]].polled = position;
-        operation.polled = absent_k;
+        operations[polled[position]].next = position;
+        operation.next = absent_k;
     }
     io_completion_t finish(unsigned index, descriptor_t result) noexcept {
         auto& operation = operations[index];
         auto& request = *operation.request;
-        if (operation.polled != absent_k) unpoll(operation);
+        if (operation.place == operation_place_t::polled_k) unpoll(operation);
         if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
         operation.request = nullptr;
+        operation.place = operation_place_t::free_k;
         free_operations.push(operations, index);
         tally(statistics.completions);
         return {&request, result};
@@ -817,7 +908,8 @@ struct posix_engine {
                     completions[count++] = finish(index, result);
                     continue;
                 }
-                operation.polled = waiting;
+                operation.place = operation_place_t::polled_k;
+                operation.next = waiting;
                 polling[waiting] = {static_cast<int>(request.descriptor), io_events(request.operation), 0};
                 polled[waiting++] = index;
             }
@@ -1971,9 +2063,9 @@ using linux_epollaio_engine_t = linux_epollaio_engine<>;
 
 /** Overlapped socket operations retain their storage through cancellation completion.
  *
- *  A file read reopens its file unbuffered and overlapped on the port for its own lifetime; path
- *  opens and vectored reads answer `-ENOSYS`, and zero-copy sends copy, so their releases complete
- *  as submitted. */
+ *  A file read reopens its file unbuffered and overlapped on the port for its own lifetime; a path
+ *  opens beneath its directory at once, vectored reads answer `-ENOSYS`, and zero-copy sends copy,
+ *  so their releases complete as submitted. */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
 struct windows_iocp_engine {
     using allocator_t = allocator_type_;
@@ -2073,10 +2165,11 @@ struct windows_iocp_engine {
         if (request.operation == io_operation_t::shutdown_k)
             return complete_immediately(shutdown(socket, SD_SEND) == 0 ? 0 : -socket_last_error());
         if (request.operation == io_operation_t::zero_copy_release_k) return complete_immediately(0);
-        // Directories cannot be registered on Windows, so no path ever reaches an open.
-        if (request.operation == io_operation_t::file_open_k ||
-            request.operation == io_operation_t::file_read_vectors_k)
-            return complete_immediately(-ENOSYS);
+        // The open completes at once, as on POSIX; reads stay overlapped on the reopened handle.
+        if (request.operation == io_operation_t::file_open_k)
+            return complete_immediately(
+                file_open_beneath(request.file.directory_descriptor, reinterpret_cast<char const*>(request.data)));
+        if (request.operation == io_operation_t::file_read_vectors_k) return complete_immediately(-ENOSYS);
         if (request.operation == io_operation_t::file_read_k) return submit_file_read(index);
         if (!CreateIoCompletionPort(reinterpret_cast<HANDLE>(socket), port, 0, 0)) return complete_immediately(-EIO);
         DWORD bytes {}, flags {};

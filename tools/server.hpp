@@ -296,15 +296,18 @@ struct server_t {
             std::printf(json ? "%s{\"index\":%zu,\"requests\":%llu,\"accepts\":%llu,\"polls\":%llu,"
                                "\"empty_polls\":%llu,\"kernel_enters\":%llu,\"submissions\":%llu,"
                                "\"completions\":%llu,\"cancellations\":%llu,\"receive_rearms\":%llu,"
-                               "\"bytes_received\":%llu,\"bytes_sent\":%llu,\"bytes_copied\":%llu}"
+                               "\"bytes_received\":%llu,\"bytes_sent\":%llu,\"bytes_copied\":%llu,"
+                               "\"zero_copy_sends\":%llu,\"zero_copy_fallbacks\":%llu,\"refused_requests\":%llu}"
                              : "%sEvent loop %zu: %llu requests, %llu accepts, %llu polls, %llu empty polls, "
                                "%llu kernel enters, %llu submissions, %llu completions, %llu cancellations, "
-                               "%llu receive re-arms, %llu bytes received, %llu bytes sent, %llu bytes copied\n",
+                               "%llu receive re-arms, %llu bytes received, %llu bytes sent, %llu bytes copied, "
+                               "%llu zero-copy sends, %llu zero-copy fallbacks, %llu refused requests\n",
                         json && index ? "," : "", index, number(counters.requests), number(counters.accepts),
                         number(counters.polls), number(counters.empty_polls), number(counters.kernel_enters),
                         number(counters.submissions), number(counters.completions), number(counters.cancellations),
                         number(counters.receive_rearms), number(counters.bytes_received), number(counters.bytes_sent),
-                        number(counters.bytes_copied));
+                        number(counters.bytes_copied), number(counters.zero_copy_sends),
+                        number(counters.zero_copy_fallbacks), number(counters.refused_requests));
         }
         if (json) std::printf("],\"batch_endpoints\":[");
         for (std::size_t index = 0; index != batch_endpoints.size(); ++index) {

@@ -51,6 +51,21 @@ ctest --test-dir build_aarch64
 qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class apple-m2
 ```
 
+### Windows, FreeBSD and macOS on a Linux Host
+
+The IOCP and kqueue backends compile on Linux with the host's Clang through one toolchain file each, which name a sysroot and nothing else; their suites run on the platforms themselves.
+
+```bash
+cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake  # needs g++-mingw-w64-x86-64-posix
+cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake \
+    -D UCALL_FREEBSD_SYSROOT=/path/to/unpacked/base.txz
+cmake -B build_macos -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-macos-llvm.cmake \
+    -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk -D UCALL_BUILD_TEST=OFF
+cmake --build build_macos --target ucall
+```
+
+Windows and FreeBSD link their test executables; macOS stops at the static library, since linking needs Apple's linker.
+
 ### Model Checking
 
 `verification/` holds Spin models of the protocols replies cross threads by, each naming its expected verdicts in `@verify` lines, including the mutants that must fail.
