@@ -5,7 +5,6 @@ CMakeFiles/
 CMakeCache.txt
 cmake_install.cmake
 Makefile
-!docs/Makefile
 CMakeUserPresets.json
 /compile_commands.json
 *.log

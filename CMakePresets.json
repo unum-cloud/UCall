@@ -9,10 +9,28 @@
       "cacheVariables": {"UCALL_BUILD_TEST": "ON"}
     },
     {
+      "name": "clang",
+      "hidden": true,
+      "cacheVariables": {"CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++"}
+    },
+    {
       "name": "debug",
       "inherits": "base",
       "displayName": "Host Debug",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
+    },
+    {
+      "name": "check",
+      "inherits": ["base", "clang"],
+      "displayName": "Host Check with every target and warnings as errors",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
+        "UCALL_BUILD_TOOLS": "ON",
+        "UCALL_BUILD_BENCH": "ON",
+        "UCALL_WERROR": "ON"
+      }
     },
     {
       "name": "relwithdebinfo",
@@ -27,13 +45,13 @@
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
     },
     {
-      "name": "debug-asan",
+      "name": "asan",
       "inherits": "debug",
       "displayName": "Host Debug with AddressSanitizer and UndefinedBehaviorSanitizer",
       "cacheVariables": {"UCALL_BUILD_SANITIZERS": "address"}
     },
     {
-      "name": "debug-tsan",
+      "name": "tsan",
       "inherits": "debug",
       "displayName": "Host Debug with ThreadSanitizer",
       "cacheVariables": {"UCALL_BUILD_SANITIZERS": "thread"}
@@ -41,24 +59,25 @@
   ],
   "buildPresets": [
     {"name": "debug", "configurePreset": "debug"},
+    {"name": "check", "configurePreset": "check"},
     {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
     {"name": "release", "configurePreset": "release"},
-    {"name": "debug-asan", "configurePreset": "debug-asan"},
-    {"name": "debug-tsan", "configurePreset": "debug-tsan"}
+    {"name": "asan", "configurePreset": "asan"},
+    {"name": "tsan", "configurePreset": "tsan"}
   ],
   "testPresets": [
     {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
     {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": {"outputOnFailure": true}},
     {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
     {
-      "name": "debug-asan",
-      "configurePreset": "debug-asan",
+      "name": "asan",
+      "configurePreset": "asan",
       "output": {"outputOnFailure": true},
       "environment": {"UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"}
     },
     {
-      "name": "debug-tsan",
-      "configurePreset": "debug-tsan",
+      "name": "tsan",
+      "configurePreset": "tsan",
       "output": {"outputOnFailure": true},
       "environment": {"TSAN_OPTIONS": "halt_on_error=1"}
     }

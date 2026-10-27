@@ -20,7 +20,7 @@ Every batch endpoint gets a pool thread of its own that drains it through the ha
 The inference example's `/infer/batch` scores a whole batch with one NumKong packed GEMM across a ForkUnion pool, and `/slow/batch` sleeps in its callback to test that isolation.
 Each request keeps its own response; ledger transfers and key-value operations keep their individual transaction boundaries.
 
-Build with `UCALL_BUILD_EXAMPLES=ON` and select `ucall_example_echo`, `ucall_example_redis`, `ucall_example_ledger`, or `ucall_example_inference`.
+Build with `UCALL_BUILD_TOOLS=ON` and select `ucall_example_echo`, `ucall_example_redis`, `ucall_example_ledger`, or `ucall_example_inference`.
 Each executable selects among the backends compiled into the single UCall library.
 `--connections` supplies the admission budget, and `--threads` selects the application-owned polling loops.
 The application dispatches those loops through its ForkUnion pool; UCall creates no threads.

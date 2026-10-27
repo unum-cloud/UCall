@@ -141,7 +141,7 @@ inline int socket_option(descriptor_t descriptor, int level, int name, void cons
 #endif
 }
 
-/** The `SO_LINGER` setting that makes a close send a reset rather than a FIN. */
+/** The @c SO_LINGER setting that makes a close send a reset rather than a FIN. */
 inline constexpr linger socket_reset_linger_k {1, 0};
 
 /** Makes the close of @p descriptor send a reset rather than a FIN. */
@@ -223,17 +223,17 @@ inline descriptor_t accepted_socket(descriptor_t descriptor) noexcept {
 
 enum class io_wait_t { blocking_k, nonblocking_k };
 
-/** What a request asks of its socket or of a file. File operations keep `descriptor` as the socket
+/** What a request asks of its socket or of a file. File operations keep @c descriptor as the socket
  *  they serve, so its close waits for them.
  *
- *  - `send_zero_copy_k` completes once the socket took bytes of `data`, and names the
- *    `release_request` whose `zero_copy_release_k` completes once the kernel let go of them; the
+ *  - @c send_zero_copy_k completes once the socket took bytes of @c data, and names the
+ *    @c release_request whose @c zero_copy_release_k completes once the kernel let go of them; the
  *    submitter submits the release after the last send naming it completed.
- *  - `file_open_k` opens the NUL-terminated path in `data` beneath `file.directory_descriptor` for
- *    unbuffered reads, completing with a descriptor the submitter owns even after a cancel.
- *  - `file_read_k` reads `length` bytes of `file.file_descriptor` at `file.offset` into `data`;
- *    `file_read_vectors_k` scatters them into the `length` vectors that `data` points at. Offsets,
- *    lengths and buffers meet the file's `file_direct_alignment`. */
+ *  - @c file_open_k opens the NUL-terminated path in @c data beneath @c file.directory_descriptor
+ *    for unbuffered reads, completing with a descriptor the submitter owns even after a cancel.
+ *  - @c file_read_k reads @c length bytes of @c file.file_descriptor at @c file.offset into
+ *    @c data; @c file_read_vectors_k scatters them into the @c length vectors that @c data points
+ *    at. Offsets, lengths and buffers meet the file's @c file_direct_alignment. */
 enum class io_operation_t : std::uint8_t {
     accept_k,
     connect_k,
@@ -252,7 +252,7 @@ enum class io_operation_t : std::uint8_t {
 /** The engine buffer index a request's memory lies in, scoped so no descriptor binds to it. */
 enum class registered_memory_t : std::uint16_t {};
 
-/** The `registered_memory` of a request whose buffer lies in no engine-registered range. */
+/** The @c registered_memory of a request whose buffer lies in no engine-registered range. */
 inline constexpr registered_memory_t io_unregistered_k {std::numeric_limits<std::uint16_t>::max()};
 
 /** The file a file operation reads or opens beneath, borrowed from the submitter. */
@@ -263,8 +263,8 @@ struct io_file_t {
 };
 static_assert(sizeof(io_file_t) == 16);
 
-/** One destination of a `file_read_vectors_k`, the platform's own scatter element, braced as
- *  `{data, length}`. */
+/** One destination of a @c file_read_vectors_k, the platform's own scatter element, braced as
+ *  <tt>{data, length}</tt>. */
 #if UCALL_OS_WINDOWS_
 struct io_vector_t {
     void* iov_base {};
@@ -298,7 +298,7 @@ enum class range_pinning_t : std::uint8_t {
     unpinned_k, // Refused, by the locked-memory cap or a full table; requests pass `io_unregistered_k`.
 };
 
-/** What `register_memory` made of a range. */
+/** What @c register_memory made of a range. */
 struct memory_registration_t {
     registered_memory_t index {io_unregistered_k};
     range_pinning_t pinning {range_pinning_t::unpinned_k};
@@ -325,8 +325,8 @@ inline void file_close(int file) noexcept {
 #endif
 }
 
-/** What `file_direct_alignment` learned of an open file: its size and the alignment its unbuffered
- *  reads meet in offset, length and memory, or a negated errno, `-ENXIO` for anything but a
+/** What @c file_direct_alignment learned of an open file: its size and the alignment its unbuffered
+ *  reads meet in offset, length and memory, or a negated errno, @c -ENXIO for anything but a
  *  regular file. */
 struct file_geometry_t {
     std::uint64_t size {};
@@ -375,8 +375,8 @@ inline int directory_open(char const* path) noexcept {
     return descriptor < 0 ? -EIO : descriptor;
 }
 
-/** Whether @p path names something beneath its directory: relative, without a drive, a `..`
- *  segment or a `:` stream. */
+/** Whether @p path names something beneath its directory: relative, without a drive, a <tt>..</tt>
+ *  segment or a <tt>:</tt> stream. */
 inline bool file_path_beneath(std::string_view path) noexcept {
     if (path.empty() || path.front() == '/' || path.front() == '\\' || path.find(':') != std::string_view::npos)
         return false;
@@ -390,7 +390,7 @@ inline bool file_path_beneath(std::string_view path) noexcept {
 }
 
 /** Opens @p path for reads strictly beneath the descriptor @p directory names, following no
- *  reparse point on the way, as `RESOLVE_BENEATH` does on Linux: a descriptor, or a negated
+ *  reparse point on the way, as @c RESOLVE_BENEATH does on Linux: a descriptor, or a negated
  *  errno; every refusal reads as missing, so permissions are never revealed. */
 inline int file_open_beneath(int directory, char const* path) noexcept {
     wchar_t wide[MAX_PATH];
@@ -449,10 +449,10 @@ inline ucall_status_t file_direct_check(int file) noexcept {
 }
 
 /** The flags every file open beneath a directory takes; a FIFO opens without waiting for a writer,
- *  and `file_open_finish` drops the nonblocking flag from what opened. */
+ *  and @c file_open_finish drops the nonblocking flag from what opened. */
 inline constexpr int file_open_flags_k = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
 
-/** Readies a @p file just opened with `file_open_flags_k` for blocking uncached reads: the
+/** Readies a @p file just opened with @c file_open_flags_k for blocking uncached reads: the
  *  descriptor, or a negated errno with the file closed. */
 inline int file_open_finish(int file) noexcept {
     int const flags = fcntl(file, F_GETFL);
@@ -464,18 +464,19 @@ inline int file_open_finish(int file) noexcept {
 
 #else
 
-/** Refuses a borrowed @p file opened without `O_DIRECT`, whose reads would go through the cache. */
+/** Refuses a borrowed @p file opened without @c O_DIRECT, whose reads would go through the
+ *  cache. */
 inline ucall_status_t file_direct_check(int file) noexcept {
     int const flags = fcntl(file, F_GETFL);
     return flags != -1 && (flags & O_DIRECT) ? ucall_status_success_k : ucall_status_invalid_argument_k;
 }
 
 /** The flags every file open beneath a directory takes; a FIFO opens without waiting for a writer,
- *  then fails the direct check, and `file_open_finish` drops the nonblocking flag from a file, as
- *  io_uring answers a nonblocking file's blocked read with `-EAGAIN` instead of a worker. */
+ *  then fails the direct check, and @c file_open_finish drops the nonblocking flag from a file, as
+ *  io_uring answers a nonblocking file's blocked read with @c -EAGAIN instead of a worker. */
 inline constexpr int file_open_flags_k = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK | O_DIRECT;
 
-/** Readies a @p file just opened with `file_open_flags_k` for blocking unbuffered reads: the
+/** Readies a @p file just opened with @c file_open_flags_k for blocking unbuffered reads: the
  *  descriptor, or a negated errno with the file closed. */
 inline int file_open_finish(int file) noexcept {
     int const flags = fcntl(file, F_GETFL);
@@ -556,7 +557,7 @@ inline int file_open_beneath(int directory, char const* path) noexcept {
 #endif // UCALL_OS_WINDOWS_
 
 /** A byte count, accepted descriptor, or negated errno for exactly one submitted request; a receive
- *  into engine memory names the `data` it filled and the `lease` that `release` returns. */
+ *  into engine memory names the @c data it filled and the @c lease that @c release returns. */
 struct io_completion_t {
     io_request_t* request {};
     descriptor_t result {};
@@ -566,7 +567,7 @@ struct io_completion_t {
 static_assert(sizeof(io_completion_t) == 32);
 
 /** Counters an engine advances for its one polling owner, on lines no other thread writes.
- *  `zero_copy_fallbacks` counts sends the kernel copied anyway or refused to pin. */
+ *  @c zero_copy_fallbacks counts sends the kernel copied anyway or refused to pin. */
 struct alignas(false_sharing_bytes_k) io_statistics_t {
     std::uint64_t submissions {}, completions {}, kernel_enters {}, cancellations {}, receive_rearms {},
         bytes_copied {}, zero_copy_sends {}, zero_copy_fallbacks {}, file_reads_asynchronous {}, file_reads_blocking {};
@@ -676,7 +677,7 @@ struct wake_channel_t {
     }
 };
 
-/** An intrusive FIFO of engine operations, linked through their `next` indices. */
+/** An intrusive FIFO of engine operations, linked through their @c next indices. */
 struct operation_list_t {
     static constexpr unsigned absent_k = std::numeric_limits<unsigned>::max();
     unsigned head {absent_k}, tail {absent_k};
@@ -696,7 +697,7 @@ struct operation_list_t {
         return index;
     }
 
-    /** Unlinks operation @p index, or answers `ucall_status_not_found_k` when it is not queued. */
+    /** Unlinks operation @p index, or answers @c ucall_status_not_found_k when it is not queued. */
     template <typename operations_type_>
     ucall_status_t remove(operations_type_& operations, unsigned index) noexcept {
         for (unsigned previous = absent_k, current = head; current != absent_k;
@@ -711,7 +712,7 @@ struct operation_list_t {
     }
 };
 
-/** The vectors a `file_read_vectors_k` request scatters into, which its `data` points at. */
+/** The vectors a @c file_read_vectors_k request scatters into, which its @c data points at. */
 inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
     return {reinterpret_cast<io_vector_t*>(request.data), request.length};
 }
@@ -728,8 +729,8 @@ inline short io_events(io_operation_t operation) noexcept {
  *  in a kernel queue that completes it without readiness. */
 enum class io_interest_t : std::uint8_t { unarmed_k, armed_k, ready_k, landing_k };
 
-/** The flags a copying send takes so a vanished peer never raises `SIGPIPE`; Apple sockets carry
- *  `SO_NOSIGPIPE` instead. */
+/** The flags a copying send takes so a vanished peer never raises @c SIGPIPE; Apple sockets carry
+ *  @c SO_NOSIGPIPE instead. */
 #if UCALL_OS_APPLE_
 inline constexpr int socket_send_flags_k = 0;
 #else
@@ -800,7 +801,7 @@ struct posix_engine {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
 
-    /** Whether an operation is free, queued fresh, or waiting in `polling`. */
+    /** Whether an operation is free, queued fresh, or waiting in @c polling. */
     enum class operation_place_t : std::uint8_t { free_k, queued_k, polled_k };
     struct operation_t {
         io_request_t* request {};
@@ -948,7 +949,7 @@ using posix_engine_t = posix_engine<>;
 
 #if UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_
 
-/** Each descriptor stays registered edge-triggered until `close_socket` or a close request, aimed
+/** Each descriptor stays registered edge-triggered until @c close_socket or a close request, aimed
  *  at its latest operation in each direction; file reads land through the readiness queue where
  *  the kernel offers asynchronous reads, and zero-copy sends copy, so their releases complete as
  *  submitted. */
@@ -1133,7 +1134,7 @@ struct readiness_engine {
     ~readiness_engine() noexcept { stop(); }
 };
 
-/** kqueue readiness; FreeBSD reads files through `aio_read` completing as `EVFILT_AIO` events,
+/** kqueue readiness; FreeBSD reads files through @c aio_read completing as @c EVFILT_AIO events,
  *  while macOS, lacking kernel file AIO for this, reads them blocking and uncached. */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
 struct kqueue_readiness {
@@ -1185,7 +1186,7 @@ struct kqueue_readiness {
         return st::failed(file_reads.resize(capacity)) ? ucall_status_out_of_memory_k : ucall_status_success_k;
     }
 
-    /** Starts a file read as operation @p index, landing it through `EVFILT_AIO`; a full AIO queue
+    /** Starts a file read as operation @p index, landing it through @c EVFILT_AIO; a full AIO queue
      *  reads blocking instead. Everything else is a plain syscall. */
     descriptor_t attempt(unsigned index, io_request_t& request, operation_stage_t& stage, io_interest_t& interest,
                          io_statistics_t& statistics) noexcept {
@@ -1284,7 +1285,7 @@ using kqueue_engine_t = readiness_engine<kqueue_readiness_t>;
 /** Whether a socket's sends still try zero-copy, which ends once the kernel reports it copied. */
 enum class zero_copy_stage_t : std::uint8_t { untried_k, enabled_k, copying_k };
 
-/** Slots in an io_uring registered-buffer table, the kernel's `IORING_MAX_REG_BUFFERS`. */
+/** Slots in an io_uring registered-buffer table, the kernel's @c IORING_MAX_REG_BUFFERS. */
 inline constexpr unsigned uring_registered_buffers_limit_k = 16384;
 
 /** Finds an engine's zero-copy release operations by the request their sends name, open addressed
@@ -1433,7 +1434,7 @@ struct epoll_readiness {
         return slot;
     }
 
-    /** The watch of @p watched, or `absent_k`. */
+    /** The watch of @p watched, or @c absent_k. */
     std::uint32_t find(descriptor_t watched) const noexcept {
         return watch_slots.empty() ? absent_k : watch_slots[slot_of(watched)];
     }
@@ -1523,8 +1524,8 @@ struct epoll_readiness {
 };
 using epoll_readiness_t = epoll_readiness<>;
 
-/** AIO events one engine keeps in flight; `fs.aio-max-nr`, 65536 by default, bounds the sum on a
- *  host, so a 64-loop server reserves 4096 of them. */
+/** AIO events one engine keeps in flight; <tt>fs.aio-max-nr</tt>, 65536 by default, bounds the sum
+ *  on a host, so a 64-loop server reserves 4096 of them. */
 inline constexpr std::uint32_t linux_aio_depth_k = 64;
 
 /** One Linux AIO context, through raw syscalls, completing into an eventfd an epoll set watches. */
@@ -1538,8 +1539,8 @@ struct linux_aio_t {
     linux_aio_t& operator=(linux_aio_t const&) = delete;
     ~linux_aio_t() noexcept { close(); }
 
-    /** Sets up the context, answering `ucall_status_unsupported_k` when the kernel or the host's
-     *  `fs.aio-max-nr` refuses even one event. */
+    /** Sets up the context, answering @c ucall_status_unsupported_k when the kernel or the host's
+     *  <tt>fs.aio-max-nr</tt> refuses even one event. */
     [[nodiscard]] ucall_status_t open() noexcept {
         if (context) return ucall_status_success_k;
         while (depth && syscall(SYS_io_setup, depth, &context) != 0) depth = errno == EAGAIN ? depth / 2 : 0;
@@ -1562,7 +1563,7 @@ struct linux_aio_t {
         in_flight = 0;
     }
 
-    /** Starts @p request's file read as operation @p index: zero, or a negated errno, `-EAGAIN`
+    /** Starts @p request's file read as operation @p index: zero, or a negated errno, @c -EAGAIN
      *  while every event is taken. */
     int submit(unsigned index, io_request_t const& request) noexcept {
         if (in_flight == depth) return -EAGAIN;
@@ -1602,12 +1603,13 @@ struct linux_aio_t {
 };
 
 /** epoll readiness for sockets with Linux AIO for files, both completing in one epoll set, and
- *  `MSG_ZEROCOPY` sends whose releases land from the error queue.
+ *  @c MSG_ZEROCOPY sends whose releases land from the error queue.
  *
  *  - A file read lands from the AIO eventfd and cannot be cancelled: a cancel completes it with
- *    `-ECANCELED` once the kernel answered, keeping its buffer until then.
+ *    @c -ECANCELED once the kernel answered, keeping its buffer until then.
  *  - A zero-copy send takes the next notification ID of its socket; a socket whose notification
- *    reports a copy, or that refuses `SO_ZEROCOPY`, copies from then on, and `ENOBUFS` copies once.
+ *    reports a copy, or that refuses @c SO_ZEROCOPY, copies from then on, and @c ENOBUFS copies
+ *    once.
  *  - A close with notifications still due keeps the descriptor until they all arrived, resetting
  *    first if the socket was set to reset on close. */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
@@ -1744,7 +1746,7 @@ struct linux_epollaio_engine {
         return {&request, result};
     }
 
-    /** Starts a file read, or queues it for an AIO event; it lands through `files.drain`. */
+    /** Starts a file read, or queues it for an AIO event; it lands through @c files.drain. */
     descriptor_t read_file(unsigned index) noexcept {
         auto& operation = operations[index];
         if (operation.stage == operation_stage_t::cancelled_k) return -ECANCELED;
@@ -1764,7 +1766,7 @@ struct linux_epollaio_engine {
         return sent >= 0 ? static_cast<descriptor_t>(sent) : -errno;
     }
 
-    /** Sends with `MSG_ZEROCOPY`, counting the send against its release under the socket's next
+    /** Sends with @c MSG_ZEROCOPY, counting the send against its release under the socket's next
      *  notification ID; without room to count it, the send copies. */
     descriptor_t send_zero_copy(unsigned index) noexcept {
         auto& operation = operations[index];
@@ -1829,7 +1831,7 @@ struct linux_epollaio_engine {
 
     /** Closes a socket, or keeps it while notifications are due, resetting it first when it was set
      *  to reset on close, so the kernel purges and notifies at once. Answers through @p closing,
-     *  the operation it lands, or `absent_k`. */
+     *  the operation it lands, or @c absent_k. */
     descriptor_t close_watched(descriptor_t descriptor, unsigned closing) noexcept {
         std::uint32_t const chosen = readiness.find(descriptor);
         if (chosen == absent_k || readiness.watches[chosen].oldest_run == absent_k) {
@@ -2064,7 +2066,7 @@ using linux_epollaio_engine_t = linux_epollaio_engine<>;
 /** Overlapped socket operations retain their storage through cancellation completion.
  *
  *  A file read reopens its file unbuffered and overlapped on the port for its own lifetime; a path
- *  opens beneath its directory at once, vectored reads answer `-ENOSYS`, and zero-copy sends copy,
+ *  opens beneath its directory at once, vectored reads answer @c -ENOSYS, and zero-copy sends copy,
  *  so their releases complete as submitted. */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
 struct windows_iocp_engine {

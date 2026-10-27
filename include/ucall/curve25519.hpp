@@ -46,7 +46,7 @@
 
 #include "ucall/types.hpp"
 
-/** Radix-51 limbs over 128-bit products. Absent under MSVC, which has no `__int128`. */
+/** Radix-51 limbs over 128-bit products. Absent under MSVC, which has no @c __int128. */
 #if !defined(UCALL_HAS_INT128_)
 #if defined(__SIZEOF_INT128__)
 #define UCALL_HAS_INT128_ 1

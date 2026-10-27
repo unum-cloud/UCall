@@ -1,7 +1,7 @@
 /**
  *  @file c/ucall/types.h
  *  @author Ash Vardanian
- *  @date Feb 3, 2023
+ *  @date February 3, 2023
  *  @brief Shared handles, counted byte views, statuses, and outcomes.
  */
 
@@ -203,7 +203,19 @@ typedef enum ucall_verb_t {
 /** Library-level outcomes, preserving USearch numbers for shared statuses.
  *
  *  These codes represent library/transport-level outcomes. For HTTP-specific status codes (200,
- *  404, 500), use @c ucall_http_status_t. */
+ *  404, 500), use @c ucall_http_status_t.
+ *
+ *  Statuses fall into five categories. Resources: @c ucall_status_out_of_memory_k,
+ *  @c ucall_status_io_k, @c ucall_status_connection_failed_k and
+ *  @c ucall_status_connection_closed_k. Input: @c ucall_status_invalid_argument_k,
+ *  @c ucall_status_malformed_k, @c ucall_status_handshake_failed_k and
+ *  @c ucall_status_peer_rejected_k. State: @c ucall_status_uninitialized_k,
+ *  @c ucall_status_unsupported_k, @c ucall_status_not_found_k, @c ucall_status_already_exists_k,
+ *  @c ucall_status_overflow_k and @c ucall_status_contended_k. Interruptions:
+ *  @c ucall_status_deferred_k, @c ucall_status_would_block_k and @c ucall_status_timeout_k.
+ *  Defects: @c ucall_status_internal_k. Any verb that allocates, binds a device or touches a file
+ *  or a socket may also return a Resources status. A verb's own block lists only what its contract
+ *  adds. */
 typedef uint32_t ucall_status_t;
 enum {
 
@@ -270,11 +282,14 @@ enum {
  *  @brief Decides whether a peer presenting a given static key may proceed past the handshake.
  *  @param[in] peer_static_key The remote party's 32-byte Curve25519 static public key.
  *  @param[in] context User-supplied context from the server or client configuration.
- *  @return @c ucall_status_success_k to admit the peer. Any other status refuses it and becomes
- *      the connection's outcome, @c ucall_status_peer_rejected_k being the plain refusal.
  *
  *  Required for @c ucall_security_mode_noise_xx_k, where keys are learned during the handshake
  *  rather than known in advance. Called after the key is authenticated, before any payload.
+ *  Returning @c ucall_status_success_k admits the peer.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_peer_rejected_k The plain refusal. Any other status refuses the peer too, and
+ *    becomes the connection's outcome.
  */
 typedef ucall_status_t (*ucall_peer_authorizer_t)(ucall_noise_key_t const* peer_static_key, void* context);
 
@@ -311,17 +326,20 @@ UCALL_EXPORT ucall_status_t ucall_outcome_wait(ucall_outcome_t* outcome);
  *  @brief Reads the outcome without waiting, with acquire ordering, so a final status publishes
  *      every output.
  *  @param[in] outcome An outcome passed to a call.
- *  @return @c ucall_status_deferred_k until final, then the final status.
+ *  @return The final status once the call is final.
  *
  *  Poll through this function; directly reading the field during a deferred call is not an atomic
  *  load.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_deferred_k The call is not final.
  */
 UCALL_EXPORT ucall_status_t ucall_outcome_status(ucall_outcome_t* outcome);
 
 /** Arguments of @c ucall_noise_key_generate(). */
 typedef struct ucall_noise_key_generate_t {
 
-    /** Receives @c ucall_status_io_k when the operating system refuses entropy. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** Output for the secret scalar, drawn from the operating system's entropy. */
@@ -338,6 +356,9 @@ typedef struct ucall_noise_key_generate_t {
  *  Both outputs are zeroed unless the call succeeds.
  *
  *  @note @b Thread-safe.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k An output is @c NULL.
  */
 UCALL_EXPORT void ucall_noise_key_generate(ucall_noise_key_generate_t* arguments);
 
@@ -359,6 +380,9 @@ typedef struct ucall_noise_key_derive_t {
  *  @brief Derives the public key of a stored private key, as peer authorizers compare it.
  *
  *  @note @b Thread-safe.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k The @c private_key or the @c public_key output is @c NULL.
  */
 UCALL_EXPORT void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments);
 
@@ -542,9 +566,12 @@ UCALL_EXPORT char const* ucall_status_name(ucall_status_t status);
 /**
  *  @brief Reads a status back from its canonical spelling.
  *  @param[in] name The counted spelling @c ucall_status_name() returns.
- *  @return The named status, or @c ucall_status_invalid_argument_k for an unrecognized name.
+ *  @return The named status.
  *
  *  @note @b Thread-safe.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k An unrecognized name.
  */
 UCALL_EXPORT ucall_status_t ucall_status_from_name(ucall_bytes_view_t name);
 

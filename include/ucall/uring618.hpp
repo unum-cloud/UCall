@@ -34,8 +34,8 @@ struct linux_uring618_engine {
 
     enum class engine_stage_t : std::uint8_t { idle_k, running_k, stopping_k, recovering_k, stopped_k };
 
-    /** `collecting_k` is a release some zero-copy send named before its request was submitted, and
-     *  `releasing_k` one submitted, waiting for the notifications still due. */
+    /** @c collecting_k is a release some zero-copy send named before its request was submitted, and
+     *  @c releasing_k one submitted, waiting for the notifications still due. */
     enum class operation_stage_t : std::uint8_t {
         waiting_k,
         submitted_k,
@@ -551,7 +551,7 @@ struct linux_uring618_engine {
         return ucall_status_success_k;
     }
 
-    /** Pins @p memory into the next slot of the sparse buffer table, answering `unpinned_k` once
+    /** Pins @p memory into the next slot of the sparse buffer table, answering @c unpinned_k once
      *  the locked-memory cap refuses or the table is full. */
     memory_registration_t register_memory(span<byte_t> memory) noexcept {
         if (!(registrations & registration_buffers_k) || registered_buffers == uring_registered_buffers_limit_k)
@@ -702,7 +702,7 @@ struct linux_uring618_engine {
     }
 
     /** The release a zero-copy send counts against, taking an operation for it on the first send
-     *  naming it; `absent_k` when the send copies instead: its socket was reported copying, or
+     *  naming it; @c absent_k when the send copies instead: its socket was reported copying, or
      *  no operation is free, or another send naming the release is still in flight. */
     unsigned pair_release(operation_t& operation) noexcept {
         io_request_t* const named = operation.request->release_request;
@@ -727,7 +727,7 @@ struct linux_uring618_engine {
         return release;
     }
 
-    /** Prepares a `SEND_ZC` whose result and notification both name @p release, from a registered
+    /** Prepares a @c SEND_ZC whose result and notification both name @p release, from a registered
      *  buffer where the request names one. */
     void prepare_send_zero_copy(io_uring_sqe* submission, operation_t& operation, operation_t& release) noexcept {
         auto const& request = *operation.request;

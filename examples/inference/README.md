@@ -19,7 +19,7 @@ A query is exactly `--dimensions` request bytes read as i8, and each reply holds
 Besides `--rows`, `--dimensions`, `--seed` and `--slow-batch-us`, it takes the server flags every example shares: `--host`, `--port`, `--threads`, `--connections`, `--pipelined-requests`, `--security`, `--key`, `--batch-min`, `--batch-max`, `--batch-latency-us` and `--stats`.
 
 ```sh
-cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DUCALL_BUILD_BENCH=ON -DUCALL_BUILD_EXAMPLES=ON
+cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DUCALL_BUILD_BENCH=ON -DUCALL_BUILD_TOOLS=ON
 cmake --build build_release --target ucall_bench_http ucall_example_inference
 build_release/ucall_example_inference --rows 100000 --dimensions 1024 --threads 1 --connections 2048 \
     --batch-min 8 --batch-max 64 --batch-latency-us 1000 --stats json

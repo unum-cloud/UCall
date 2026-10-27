@@ -229,7 +229,7 @@ enum class secure_tunnel_mode_t : std::uint8_t {
     return "unknown";
 }
 
-/** Lets `{}` print a mode by name. */
+/** Lets <tt>{}</tt> print a mode by name. */
 [[nodiscard]] inline auto format_as(secure_tunnel_mode_t value) noexcept { return secure_tunnel_mode_name(value); }
 
 /**
@@ -257,7 +257,7 @@ enum class secure_tunnel_role_t : std::uint8_t { initiator_k, responder_k };
     return role == secure_tunnel_role_t::initiator_k ? "initiator" : "responder";
 }
 
-/** Lets `{}` print a role by name. */
+/** Lets <tt>{}</tt> print a role by name. */
 [[nodiscard]] inline auto format_as(secure_tunnel_role_t value) noexcept { return secure_tunnel_role_name(value); }
 
 /**
@@ -344,7 +344,7 @@ enum class secure_tunnel_state_t : std::uint8_t {
     return "unknown";
 }
 
-/** Lets `{}` print a state by name. */
+/** Lets <tt>{}</tt> print a state by name. */
 [[nodiscard]] inline auto format_as(secure_tunnel_state_t value) noexcept { return secure_tunnel_state_name(value); }
 
 /**
@@ -387,7 +387,7 @@ enum class secure_tunnel_fault_t : std::uint8_t {
     return "unknown";
 }
 
-/** Lets `{}` print a fault by name. */
+/** Lets <tt>{}</tt> print a fault by name. */
 [[nodiscard]] inline auto format_as(secure_tunnel_fault_t value) noexcept { return secure_tunnel_fault_name(value); }
 
 /**
@@ -798,7 +798,7 @@ struct secure_tunnel_crypto {
          *  key is zero-extended to exactly this width, so any other value computes something that
          *  is not HMAC. Distinct from the 32-byte digest, and confusing the two is the classic way
          *  to produce a tag that looks well-formed and interoperates with nobody - which is what
-         *  the RFC 4231 vectors in `test/noise.cpp` exist to catch.
+         *  the RFC 4231 vectors in <tt>test/noise.cpp</tt> exist to catch.
          */
         static constexpr std::size_t block_size_k = 64;
 
@@ -855,8 +855,11 @@ struct secure_tunnel_crypto {
 
     /**
      *  @brief The Noise specification's HKDF, which is RFC 5869 with an empty info string.
+     *  @param[in] chaining_key The running chaining key, which keys the extraction.
+     *  @param[in] material The input key material to extract from.
      *  @param[in] outputs How many 32-byte outputs to derive: two, or three for a pattern with a
      *      pre-shared key. Each feeds the next, so they must be produced in order.
+     *  @param[out] results Receives the derived outputs, one hash-sized block each.
      */
     static void hkdf_sha256(span<byte_t const> chaining_key, span<byte_t const> material, std::size_t outputs,
                             span<byte_t[hash_size_k], 3> results) noexcept {
@@ -914,7 +917,8 @@ struct secure_tunnel_crypto {
 
         /**
          *  @brief Seals @p plaintext in place and appends a tag behind it.
-         *  @param[inout] text The bytes to seal, which the ciphertext replaces.
+         *  @param[in] associated The bytes authenticated alongside the text but not sealed.
+         *  @param[in,out] text The bytes to seal, which the ciphertext replaces.
          *  @param[out] tag Sixteen bytes immediately behind @p text, written on success.
          *  @return @c secure_tunnel_fault_t::keys_exhausted_k when the key is exhausted.
          *
@@ -940,6 +944,7 @@ struct secure_tunnel_crypto {
 
         /**
          *  @brief Verifies a tag and opens @p text into @p plaintext.
+         *  @param[in] associated The bytes authenticated alongside the text but not sealed.
          *  @param[in] text The ciphertext body, without its tag.
          *  @param[in] tag Sixteen bytes immediately behind @p text.
          *  @param[out] plaintext Room for @p text.size() bytes: @p text itself to open in place, or
@@ -1054,6 +1059,7 @@ struct secure_tunnel_crypto {
 
         /**
          *  @brief Seals in place with the running hash as associated data, then absorbs the result.
+         *  @param[in,out] text The bytes to seal, which the ciphertext replaces.
          *  @param[out] written Bytes now occupying @p text and what follows: its width, plus a tag
          *      once a key exists - so zero is a legitimate answer for an empty payload before the
          *      first @c MixKey, and is why this reports its fault separately rather than through
@@ -1073,6 +1079,7 @@ struct secure_tunnel_crypto {
          *  @brief Verifies against the running hash, then absorbs the ciphertext as it arrived.
          *  @param[in] sealed The message field as it came off the wire, tag included.
          *  @param[out] plain Receives the opened bytes, which must not alias @p sealed.
+         *  @param[out] produced How many opened bytes @p plain now holds.
          *
          *  The successor hash is computed before opening, and committed only once the tag verifies,
          *  because the transcript must absorb the ciphertext rather than the plaintext. Deriving it
@@ -1191,8 +1198,8 @@ struct secure_tunnel_crypto {
     };
 
     /**
-     *  @brief `XX` - neither side knows the other in advance, and both authenticate during.
-     *  @code
+     *  @brief @c XX - neither side knows the other in advance, and both authenticate during.
+     *  @code{.unparsed}
      * → e
      * ← e, ee, s, es
      * → s, se
@@ -1211,8 +1218,8 @@ struct secure_tunnel_crypto {
     };
 
     /**
-     *  @brief `IK` - the initiator already knows the responder's static key.
-     *  @code
+     *  @brief @c IK - the initiator already knows the responder's static key.
+     *  @code{.unparsed}
      * ← s
      * ...
      * → e, es, s, ss
@@ -1232,8 +1239,8 @@ struct secure_tunnel_crypto {
     };
 
     /**
-     *  @brief `KK` - both static keys are configured ahead of time, and neither is transmitted.
-     *  @code
+     *  @brief @c KK - both static keys are configured ahead of time, and neither is transmitted.
+     *  @code{.unparsed}
      * → s
      * ← s
      * ...
@@ -1518,6 +1525,7 @@ struct secure_tunnel_crypto {
     /**
      *  @brief Reads the pattern message at @c message_index, discarding whatever payload it
      *      carried.
+     *  @param[in,out] noise The handshake state the message advances.
      *  @param[in] body The message without its length prefix.
      *  @return Why it failed. A message too short to hold the field a token demands is
      *      @c malformed_k; a tag that did not verify is @c authentication_failed_k. Collapsing the
@@ -1593,6 +1601,9 @@ struct secure_tunnel_crypto {
 
     /**
      *  @brief Seals @p filled payload bytes sitting one prefix into @p record, as one whole record.
+     *  @param[in,out] noise The established session state, whose sending cipher seals the record.
+     *  @param[in,out] record The buffer holding the payload at one prefix in, which becomes it.
+     *  @param[in] filled How many payload bytes sit behind the prefix.
      *  @param[in] kind What the record carries, sealed behind the payload and inside the tag.
      *  @return Bytes the finished record occupies, or zero when the key is exhausted.
      *
@@ -2075,7 +2086,7 @@ class secure_tunnel : private secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_
 
     /**
      *  @brief Seals @p filled payload bytes, written into @c payload_window, into one record.
-     *  @param[inout] record The same buffer that was handed to @c payload_window.
+     *  @param[in,out] record The same buffer that was handed to @c payload_window.
      *  @param[in] filled How many bytes the producer wrote there.
      *  @return The framed record, inside @p record, or an empty span on failure with @c fault()
      *      set.

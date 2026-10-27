@@ -3,6 +3,10 @@
 //! [`Client::submit`] admits a call without driving the network, and [`Client::take_completed`]
 //! drives it and retrieves finished calls in batches tagged with the caller's context. The client
 //! starts no threads, and the type system keeps it on the thread that created it.
+//!
+//! File: rust/client.rs
+//! Author: Ash Vardanian
+//! Date: October 25, 2026
 
 // The C mirror keeps the C spelling of every name.
 #![allow(non_camel_case_types)]

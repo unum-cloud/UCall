@@ -6,6 +6,10 @@
 //! at a time through [`BatchEndpoint::take_batch`] or [`BatchEndpoint::take_batches`]. Plain
 //! handlers run on the polling thread, batch handlers on the draining thread, and either may hand
 //! its [`Request`] to any other thread to reply.
+//!
+//! File: rust/server.rs
+//! Author: Ash Vardanian
+//! Date: October 25, 2026
 
 // The C mirror keeps the C spelling of every name.
 #![allow(non_camel_case_types)]

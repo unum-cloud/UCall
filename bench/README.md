@@ -35,7 +35,7 @@ The library creates no threads; each client drives many sockets and releases eac
 Build the native targets and the Rust servers, then install the Python ones into an activated virtual environment:
 
 ```sh
-cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DUCALL_BUILD_BENCH=ON -DUCALL_BUILD_EXAMPLES=ON
+cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DUCALL_BUILD_BENCH=ON -DUCALL_BUILD_TOOLS=ON
 cmake --build build_release --target ucall_bench_http ucall_bench_server
 cargo build --release --manifest-path bench/Cargo.toml
 uv venv .venv && source .venv/bin/activate

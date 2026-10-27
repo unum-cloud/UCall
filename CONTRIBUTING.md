@@ -16,13 +16,14 @@ cmake --build --preset debug
 ctest --preset debug
 ```
 
-The `relwithdebinfo` and `release` presets build the same suites with optimization.
+The `relwithdebinfo` and `release` presets build the same suites with optimization, `asan` and `tsan` build them under a sanitizer, and `check` builds every target with Clang and `UCALL_WERROR=ON`.
+Tests, tools and benchmarks are off unless a preset or a `-D` switch asks for them.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
 The build exposes one library as `ucall::ucall`.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
 CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
 
-`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
+`UCALL_BUILD_TOOLS=ON` enables `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python-builds) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust-builds) describe.
@@ -45,7 +46,7 @@ Python suites sit beside them as `test/server.py` and `test/client.py`, and Rust
 QEMU's user mode has neither io_uring nor Linux AIO, so those suites skip.
 
 ```bash
-cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake
+cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
 cmake --build build_aarch64
 ctest --test-dir build_aarch64
 qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class apple-m2
@@ -56,11 +57,11 @@ qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network
 The IOCP and kqueue backends compile on Linux with the host's Clang through one toolchain file each, which name a sysroot and nothing else; their suites run on the platforms themselves.
 
 ```bash
-cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake  # needs g++-mingw-w64-x86-64-posix
-cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake \
+cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake -D UCALL_BUILD_TEST=ON  # needs g++-mingw-w64-x86-64-posix
+cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake -D UCALL_BUILD_TEST=ON \
     -D UCALL_FREEBSD_SYSROOT=/path/to/unpacked/base.txz
 cmake -B build_macos -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-macos-llvm.cmake \
-    -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk -D UCALL_BUILD_TEST=OFF
+    -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk
 cmake --build build_macos --target ucall
 ```
 
@@ -143,6 +144,7 @@ Do not tune constants until one benchmark looks good.
 ### Comments and Formatting
 
 Public C and C++ contracts use Doxygen tags; Python public functions and modules describe their purpose in docstrings.
+A closing `@par Statuses:` block lists only the statuses a verb's contract adds, while resource failures, deferral and defects are covered once by the categories in the `ucall_status_t` docblock.
 A code comment explains a non-obvious reason rather than narrating an operation.
 Keep source headers, attribution, and original creation dates consistent with the file's history.
 

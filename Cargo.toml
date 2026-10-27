@@ -17,6 +17,7 @@ links = "ucall"
 name = "ucall"
 publish = true
 repository = "https://github.com/unum-cloud/UCall"
+documentation = "https://docs.rs/ucall"
 version = "1.0.0-rc.1"
 
 [lib]

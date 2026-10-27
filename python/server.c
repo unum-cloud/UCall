@@ -430,21 +430,21 @@ static char const doc_Request_query[] =                                         
 
 static PyObject* Request_query(Request* self, PyObject* name) { return request_lookup(self, name, lookup_query); }
 
-static char const doc_Request_path_parameter[] =                                             //
-    "path_parameter(name, /) -> str | None\n"                                                //
-    "\n"                                                                                     //
-    "Looks up a placeholder the endpoint's URI template captured.\n"                         //
-    "\n"                                                                                     //
-    "Args:\n"                                                                                //
-    "  name (str | bytes): The placeholder name without braces, \"path\" for \"{*path}\".\n" //
-    "\n"                                                                                     //
-    "Returns:\n"                                                                             //
-    "  str | None: The captured text as sent, or None when the template has no such\n"       //
-    "    placeholder.\n"                                                                     //
-    "\n"                                                                                     //
-    "Example:\n"                                                                             //
-    "  >>> @server.get(\"/files/{*path}\")\n"                                                //
-    "  ... def files(request: ucall.Request):\n"                                             //
+static char const doc_Request_path_parameter[] =                                           //
+    "path_parameter(name, /) -> str | None\n"                                              //
+    "\n"                                                                                   //
+    "Looks up a placeholder the endpoint's URI template captured.\n"                       //
+    "\n"                                                                                   //
+    "Args:\n"                                                                              //
+    "  name (str | bytes): The placeholder name without braces, \"path\" for `{*path}`.\n" //
+    "\n"                                                                                   //
+    "Returns:\n"                                                                           //
+    "  str | None: The captured text as sent, or None when the template has no such\n"     //
+    "    placeholder.\n"                                                                   //
+    "\n"                                                                                   //
+    "Example:\n"                                                                           //
+    "  >>> @server.get(\"/files/{*path}\")\n"                                              //
+    "  ... def files(request: ucall.Request):\n"                                           //
     "  ...     return request.path_parameter(\"path\")";
 
 static PyObject* Request_path_parameter(Request* self, PyObject* name) {
@@ -1445,7 +1445,7 @@ static char const doc_Server_add_endpoint[] =                                   
     "reply as binary, `str` as UTF-8 text, and anything else as JSON. An exception answers 500.\n"     //
     "\n"                                                                                               //
     "Args:\n"                                                                                          //
-    "  path (str): A URI template such as \"/users/{name}\" or \"/files/{*path}\".\n"                  //
+    "  path (str): A URI template such as `/users/{name}` or `/files/{*path}`.\n"                      //
     "  verb (Verb): The method to answer; `Verb.ANY` answers every one.\n"                             //
     "  handler (Callable): The function to route to.\n"                                                //
     "\n"                                                                                               //
@@ -1662,7 +1662,7 @@ static char const doc_Server_put[] =                                            
     "Registers the decorated function for PUT requests matching the URI template `path`.\n"      //
     "\n"                                                                                         //
     "Args:\n"                                                                                    //
-    "  path (str): A URI template such as \"/files/{*path}\".\n"                                 //
+    "  path (str): A URI template such as `/files/{*path}`.\n"                                   //
     "\n"                                                                                         //
     "Returns:\n"                                                                                 //
     "  Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.\n" //
@@ -1680,7 +1680,7 @@ static char const doc_Server_delete[] =                                         
     "Registers the decorated function for DELETE requests matching the URI template `path`.\n"   //
     "\n"                                                                                         //
     "Args:\n"                                                                                    //
-    "  path (str): A URI template such as \"/files/{*path}\".\n"                                 //
+    "  path (str): A URI template such as `/files/{*path}`.\n"                                   //
     "\n"                                                                                         //
     "Returns:\n"                                                                                 //
     "  Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.\n" //

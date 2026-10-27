@@ -1,18 +1,6 @@
-API Reference
-==============
+Python Reference
+================
 
-=================
-Regular Server
-=================
-.. automodule:: ucall.posix
-    :members:
-    :undoc-members:
-
-
-
-=================
-Rich Server
-=================
-.. automodule:: ucall.server
+.. automodule:: ucall.lib
     :members:
     :undoc-members:

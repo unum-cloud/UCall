@@ -75,7 +75,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** RFC 6298's initial retransmission timeout bounds the round trip a peer's last bytes take. */
     static constexpr std::size_t linger_microseconds_k = 1'000'000;
 
-    /** Linux's default receive buffer, `tcp_rmem`, bounds what a peer has in flight at our FIN. */
+    /** Linux's default receive buffer, @c tcp_rmem, bounds what a peer has in flight at our FIN. */
     static constexpr std::size_t linger_bytes_k = 128 * 1024;
 
     /** Whether a direction's one engine request is in flight; only submission and completion
@@ -83,7 +83,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     enum class operation_state_t : std::uint8_t { idle_k, pending_k };
 
     /** The receive side: reading, full while it holds as many parsed messages as its consumer
-     *  accepts now, or ended by `connection: close`, a peer close, or an unparsable request. */
+     *  accepts now, or ended by <tt>connection: close</tt>, a peer close, or an unparsable
+     *  request. */
     enum class receive_state_t : std::uint8_t { reading_k, full_k, ended_k };
 
     /** The transmit side: idle, or sending a reply's segment, a window's slice, or a client's
@@ -106,7 +107,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** Whether a request's multipart parts were looked for yet, and whether its body held them. */
     enum class parts_state_t : std::uint8_t { unlocated_k, located_k, malformed_k };
 
-    /** One multipart part's headers and payload, `offset` to `offset + length` of its input. */
+    /** One multipart part's headers and payload, @c offset to <tt>offset + length</tt> of its
+     *  input. */
     struct request_part_t {
         std::uint64_t offset {}, length {};
     };
@@ -122,7 +124,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** Whether a reply's head already left, or waits until the loop sized every file segment. */
     enum class reply_head_t : std::uint8_t { queued_k, deferred_k };
 
-    /** A reading peer takes Linux's default `tcp_rmem` per round trip, so more unsent chunk bytes
+    /** A reading peer takes Linux's default @c tcp_rmem per round trip, so more unsent chunk bytes
      *  only queue. */
     static constexpr std::size_t max_unsent_bytes_k = 128 * 1024;
 
@@ -203,7 +205,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** The largest unbuffered alignment a window serves: past it, no record payload fits a slot. */
     static constexpr std::size_t file_max_alignment_k = 32768;
 
-    /** No index, as `file_window_t` links and borrowers spell it. */
+    /** No index, as @c file_window_t links and borrowers spell it. */
     static constexpr std::uint32_t absent_k = std::numeric_limits<std::uint32_t>::max();
 
     /** Where a pooled window is: free, read into, holding read bytes, being sent, or waiting for
@@ -247,7 +249,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             bytes_copied {}, file_window_overlaps {};
     };
 
-    /** The statuses the loop answers itself with, in `interface_statistics_t::refused` order. */
+    /** The statuses the loop answers itself with, in @c interface_statistics_t::refused order. */
     static constexpr unsigned refused_statuses_k[] {400, 404, 413, 501, 503};
 
     /** One event loop's refusals, handshake failures and live connections on one interface. */
@@ -268,7 +270,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         connection_t(connection_t&&) = delete;
         connection_t& operator=(connection_t&&) = delete;
 
-        /** One engine request per direction and one for files; `receive_request` also closes. */
+        /** One engine request per direction and one for files; @c receive_request also closes. */
         io_request_t receive_request {}, transmit_request {}, file_read_request {};
         operation_state_t receive_operation {}, transmit_operation {}, file_read_operation {};
         file_read_state_t file_reading {};
@@ -394,7 +396,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
 
         /** The next engine request of every stage but open,
-         *  which `serve_open` and `call_open` step. */
+         *  which @c serve_open and @c call_open step. */
         io_request_t* advance() noexcept {
             for (;;) {
                 if (stage == connection_stage_t::closing_k) {
@@ -549,7 +551,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return emit(transmit_request, io_operation_t::send_k, bytes);
         }
 
-        /** Opens every whole record waiting in `encrypted` straight into the tail of `input`,
+        /** Opens every whole record waiting in @c encrypted straight into the tail of @c input,
          *  failing the connection on a broken one. */
         void open_records() noexcept {
             if (!tunnel.encrypts()) return;
@@ -721,8 +723,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::size_t copied {};         // Reply body bytes, counted later by the event loop, as any thread may reply.
 
         /** A stream's status line and headers, and the segment ending every reply: a whole one, or
-         *  a stream's last chunk. The loop learns a reply ended by adopting `end_segment`, and only
-         *  the chunks between the two ever allocate. */
+         *  a stream's last chunk. The loop learns a reply ended by adopting @c end_segment, and
+         *  only the chunks between the two ever allocate. */
         reply_segment_t head_segment, end_segment;
         reply_segment_t* pushed_segments {};   // The reply's first segment, which the replier links once.
         reply_segment_t* pushed_tail {};       // The replier's newest, whose `next` the next chain lands in.
@@ -749,8 +751,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         reply_framing_t framing {};                // How the replier frames its chunks.
         reply_head_t reply_head {};                // Whether the loop completes the head once it sized every file.
 
-        /** Sends name `releases[naming]`, each release holding at most half the socket's send
-         *  buffer, so the next one fills while the other is in the kernel's hands. */
+        /** Sends name <tt>releases[naming]</tt>, each release holding at most half the socket's
+         *  send buffer, so the next one fills while the other is in the kernel's hands. */
         exchange_release_t releases[2] {};
         std::uint8_t naming {};
         bool releasing() const noexcept {
@@ -763,9 +765,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return releases[request == &releases[1].request];
         }
 
-        /** A streamed request body: the loop decodes into `body_chunk`, and a pull swaps it with
-         *  `pulled_chunk`, which the application views until its next pull. Only the loop touches
-         *  either; a pull from another thread only raises `pull_requested`. */
+        /** A streamed request body: the loop decodes into @c body_chunk, and a pull swaps it with
+         *  @c pulled_chunk, which the application views until its next pull. Only the loop touches
+         *  either; a pull from another thread only raises @c pull_requested. */
         vector<byte_t> body_chunk {}, pulled_chunk {};
         ucall_bytes_view_t* pulled_view {}; // A waiting pull's output, written as the loop finishes it.
         ucall_outcome_t* pull_outcome {};   // A waiting pull's outcome, which the loop makes final.
@@ -801,7 +803,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::size_t send_buffer_bytes {};      // The listener's `SO_SNDBUF`, which every accepted socket inherits.
         vector<char> reply_directory_names {}; // Every reply directory, NUL-terminated, back to back.
 
-        /** Views into `reply_directory_names`, as the resolved configuration reports them. */
+        /** Views into @c reply_directory_names, as the resolved configuration reports them. */
         vector<ucall_bytes_view_t> reply_directory_views {};
     };
     using wake_t = wake_channel_t;
@@ -819,11 +821,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         descriptor_t descriptor {-1};
     };
 
-    /** One event loop's windows, after UStore's `registered_memory_arena`: each a slab of a page of
-     *  headroom and four record strides, registered with the engine at its index while the engine
-     *  pins them, grown on demand up to `buffers_limit` and never shrunk. Streams borrow windows in
-     *  file order, and each returns once the kernel let go of it, serving the oldest waiting
-     *  stream. */
+    /** One event loop's windows, after UStore's @c registered_memory_arena: each a slab of a page
+     *  of headroom and four record strides, registered with the engine at its index while the
+     *  engine pins them, grown on demand up to @c buffers_limit and never shrunk. Streams borrow
+     *  windows in file order, and each returns once the kernel let go of it, serving the oldest
+     *  waiting stream. */
     struct file_window_pool_t {
         static constexpr std::size_t buffer_bytes = page_bytes_k + file_window_records_k * file_record_stride_k;
         struct alignas(page_bytes_k) page_t {
@@ -840,14 +842,14 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         vector<byte_t*> slabs {};         // One window each.
         vector<file_window_t> windows {}; // Reserved to `buffers_limit` at open, never moved.
 
-        /** Parallel to `windows`, and engines hold pointers into it; each names the engine buffer
-         *  its window's sends lie in as its `registered_memory`. */
+        /** Parallel to @c windows, and engines hold pointers into it; each names the engine buffer
+         *  its window's sends lie in as its @c registered_memory. */
         vector<io_request_t> release_requests {};
         std::uint32_t free_windows {absent_k}, buffers_count {}, buffers_limit {}, releasing_count {};
         connection_t *oldest_waiting_connection {}, *newest_waiting_connection {};
         range_pinning_t pinning {range_pinning_t::pinned_k};
 
-        /** The window whose release @p request is, or `absent_k` for an exchange's. */
+        /** The window whose release @p request is, or @c absent_k for an exchange's. */
         std::uint32_t window_of(io_request_t const* request) const noexcept {
             std::size_t const index = static_cast<std::size_t>(request - release_requests.data());
             return request >= release_requests.data() && index < buffers_count ? static_cast<std::uint32_t>(index)
@@ -1068,7 +1070,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 #endif // UCALL_OS_LINUX_
     }
 
-    /** The largest `SO_RCVBUF` the kernel grants, probed on a socket of its own, since setting it
+    /** The largest @c SO_RCVBUF the kernel grants, probed on a socket of its own, since setting it
      *  on the listener would pin every accepted socket's buffer and stop receive autotuning. */
     static std::size_t largest_receive_buffer(int family) noexcept {
         descriptor_t const probe = socket_open(family);
@@ -1218,7 +1220,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return {output, http_date_length_k};
     }
 
-    /** Appends validated, lowercased @p headers. A `content-length` is refused, unless @p declared
+    /** Appends validated, lowercased @p headers. A @c content-length is refused, unless @p declared
      *  takes its value instead, as a streamed reply's framing. */
     static ucall_status_t append_headers(vector<byte_t>& output, span<ucall_bytes_view_t const> headers,
                                          http_role_t role, std::optional<std::uint64_t>* declared = nullptr) noexcept {
@@ -1256,7 +1258,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return ucall_status_success_k;
     }
 
-    /** Starts a reply head after the tunnel's headroom: the status line, `server` and `date`. */
+    /** Starts a reply head after the tunnel's headroom: the status line, @c server and @c date. */
     static ucall_status_t write_reply_head(vector<byte_t>& output, secure_tunnel_geometry_t const& geometry,
                                            unsigned status) noexcept {
         if (status < 200 || status > 599) return ucall_status_invalid_argument_k;
@@ -1272,7 +1274,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return append_text(output, {"server: UCall\r\ndate: ", format_date(date, std::time(nullptr)), "\r\n"});
     }
 
-    /** Ends a reply head with the field @p framing announces, `connection`, and the blank line. */
+    /** Ends a reply head with the field @p framing announces, @c connection, and the blank line. */
     static ucall_status_t finish_reply_head(vector<byte_t>& output, server_exchange_t const& exchange,
                                             reply_framing_t framing, std::uint64_t length) noexcept {
         char digits[std::numeric_limits<std::uint64_t>::digits10 + 1];
@@ -1390,7 +1392,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
 
     /** Whether @p path names a file beneath a directory: not empty, not absolute, and free of NUL
-     *  bytes and `..` components. */
+     *  bytes and <tt>..</tt> components. */
     static bool stays_beneath_directory(std::string_view path) noexcept {
         if (path.empty() || path.front() == '/' || find(path, '\0') != std::string_view::npos) return false;
         for (std::size_t start = 0; start <= path.size();) {
@@ -1469,7 +1471,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
     /** Frames @p parts into fresh records held in @p batch: bytes parts copied as the exchange's
      *  framing asks, unless it is bodiless, and file and path parts as file segments. Adds the
-     *  bytes to `streamed`, and the ranges too unless the loop measures them for a deferred
+     *  bytes to @c streamed, and the ranges too unless the loop measures them for a deferred
      *  head. */
     static ucall_status_t build_reply_batch(server_exchange_t& exchange, span<ucall_reply_part_t const> parts,
                                             reply_batch_t& batch) noexcept {
@@ -1581,7 +1583,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
 
     /** Queues a reply whose file segments the loop must measure before its head: the head without
-     *  its framing in `head_segment`, the parts, and an empty `end_segment`. The outcome reads
+     *  its framing in @c head_segment, the parts, and an empty @c end_segment. The outcome reads
      *  deferred before the loop can see the reply, which then makes it final. */
     static ucall_status_t queue_measured_reply(server_exchange_t& exchange, ucall_outcome_t* outcome, unsigned status,
                                                span<ucall_bytes_view_t const> headers,
@@ -2043,8 +2045,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return {output, key.size() + length};
     }
 
-    /** Appends one StatsD line, `prefix.name:value|type` with the global tags and @p tags, or
-     *  leaves @p datagram as it was with overflow when the line would pass the datagram's bound. */
+    /** Appends one StatsD line, <tt>prefix.name:value|type</tt> with the global tags and @p tags,
+     *  or leaves @p datagram as it was with overflow when the line would pass the datagram's
+     *  bound. */
     static ucall_status_t append_metric(server_t const& server, vector<byte_t>& datagram, std::string_view name,
                                         std::string_view value, std::string_view type,
                                         std::initializer_list<std::string_view> tags) noexcept {
@@ -2104,8 +2107,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                     metrics.batches_pending.size() * sizeof(ucall_batch_endpoint_statistics_t));
     }
 
-    /** Writes a latency line for one in every `1 / metrics_sample_rate` finished requests, sending
-     *  early when it would not fit, and dropping it when both datagrams are taken. */
+    /** Writes a latency line for one in every <tt>1 / metrics_sample_rate</tt> finished requests,
+     *  sending early when it would not fit, and dropping it when both datagrams are taken. */
     static void time_request(server_t& server, event_loop_t& event_loop, server_exchange_t const& exchange) noexcept {
         auto& metrics = event_loop.metrics;
         if (metrics.stage == metrics_stage_t::closed_k || !exchange.endpoint || !exchange.reply_status) return;
@@ -2237,7 +2240,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
     /** Frees @p exchange for the next request once its reply ended, making a deferred outcome final
      *  with @p status after the loop let go of every file segment. While the kernel still holds its
-     *  sent segments, it waits as `releasing_k` for the release to complete. */
+     *  sent segments, it waits as @c releasing_k for the release to complete. */
     static void recycle_exchange(event_loop_t& event_loop, server_exchange_t& exchange,
                                  ucall_status_t status) noexcept {
         if (status == ucall_status_success_k) time_request(*event_loop.server, event_loop, exchange);
@@ -2352,7 +2355,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return exchange;
     }
 
-    /** Moves the request parsed at @p offset of `input` into a fresh exchange, and routes it. */
+    /** Moves the request parsed at @p offset of @c input into a fresh exchange, and routes it. */
     static void dispatch(server_t& server, event_loop_t& event_loop, connection_t& connection,
                          std::size_t offset) noexcept {
         auto* exchange = enqueue_exchange(event_loop, connection);
@@ -2395,8 +2398,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return static_cast<endpoint_t*>(server.routes.match(path, connection.message.verb));
     }
 
-    /** Hands a streamed request to its callback once its head parsed at @p offset of `input`:
-     *  the head moves to the exchange, and the body behind it stays in `input` to stream. */
+    /** Hands a streamed request to its callback once its head parsed at @p offset of @c input:
+     *  the head moves to the exchange, and the body behind it stays in @c input to stream. */
     static void dispatch_streamed(event_loop_t& event_loop, connection_t& connection, std::size_t offset) noexcept {
         auto* exchange = enqueue_exchange(event_loop, connection);
         if (!exchange) return;
@@ -2422,7 +2425,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         endpoint->callback(exchange, endpoint->context);
     }
 
-    /** Hands a waiting pull `body_chunk`, or the end of the body, and makes its outcome final. */
+    /** Hands a waiting pull @c body_chunk, or the end of the body, and makes its outcome final. */
     static void finish_pull(server_exchange_t& exchange, ucall_status_t status) noexcept {
         // Acquiring the request orders the puller's outcome and view before these reads.
         auto requested = atomic_ref<std::uint32_t> {exchange.pull_requested};
@@ -2445,9 +2448,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                (!exchange.body_chunk.empty() || exchange.body_stage == body_stage_t::ended_k);
     }
 
-    /** Decodes what `input` holds of the streamed body in place and, once the last chunk was
-     *  pulled, rotates `input` into `body_chunk` and finishes a waiting pull; complete once the
-     *  body ended, leaving the bytes behind it in `input`. */
+    /** Decodes what @c input holds of the streamed body in place and, once the last chunk was
+     *  pulled, rotates @c input into @c body_chunk and finishes a waiting pull; complete once the
+     *  body ended, leaving the bytes behind it in @c input. */
     static http_parse_t stream_body(connection_t& connection) noexcept {
         auto& exchange = *connection.streaming;
         // A reply that ended before its body drains the rest, so nothing behind it stalls.
@@ -2604,7 +2607,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         file_segment.chunk_prefix_bytes = static_cast<std::uint8_t>(prefix);
     }
 
-    /** Measures a file segment's file on the loop, as a `statx` never waits on a peer: its size,
+    /** Measures a file segment's file on the loop, as a @c statx never waits on a peer: its size,
      *  and the alignment its unbuffered reads keep. */
     static void stat_file_segment(server_exchange_t const& exchange, file_segment_t& file_segment) noexcept {
         file_geometry_t const geometry = file_direct_alignment(file_segment.file_descriptor);
@@ -2709,7 +2712,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (result != ucall_status_success_k) connection.fail(result);
     }
 
-    /** Completes a measured reply's head with the measured `content-length` once every file
+    /** Completes a measured reply's head with the measured @c content-length once every file
      *  segment is measured, or replaces the whole reply on the first that cannot be sent; a
      *  @c HEAD request then drops the body. Either way the head is no longer deferred. */
     static void complete_deferred_head(connection_t& connection, server_exchange_t& exchange) noexcept {
@@ -3110,12 +3113,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
      *     each exchange whose reply ended, submitting its release first, and a full receive side
      *     reads again.
      *  R2 requests: while reading, dispatch each complete request; the depth makes the side full,
-     *     and `connection: close`, a peer close, or an unparsable request, refused in its turn,
-     *     ends it.
-     *  R3 file side: a free file request advances the oldest reply's files, as `read_reply` steps
+     *     and <tt>connection: close</tt>, a peer close, or an unparsable request, refused in its
+     *     turn, ends it.
+     *  R3 file side: a free file request advances the oldest reply's files, as @c read_reply steps
      *     them, measuring every file of a deferred head before completing it.
      *  R4 socket side: a free transmit side advances the oldest reply once adopted, as
-     *     `transmit_reply` steps it.
+     *     @c transmit_reply steps it.
      *  R5 receive: a receive while reading.
      *  R6 done: ended with every reply sent, the connection lingers half-closed until the peer
      *     closes, so request bytes it never read cannot turn the close into a reset. */
@@ -3980,7 +3983,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return mode == server_mode_t::serving_k ? ucall_status_success_k : ucall_status_would_block_k;
     }
 
-    /** One drain round of one batch endpoint: moves its deposits to `pending`, invokes the batch
+    /** One drain round of one batch endpoint: moves its deposits to @c pending, invokes the batch
      *  if due, and sets @p expiry to when the waiting remainder falls due, or zero when nothing
      *  waits. Succeeds when the callback fired, or reports @c ucall_status_would_block_k. */
     static ucall_status_t drain_batch(batch_endpoint_t& endpoint, server_mode_t mode, std::uint64_t& expiry) noexcept {
@@ -4337,13 +4340,13 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
 
     /** Whether @p exchange's body streams in through pulls, as its endpoint fixed at dispatch, so
-     *  any thread holding the request may ask, unlike its loop-written `body_stage`. */
+     *  any thread holding the request may ask, unlike its loop-written @c body_stage. */
     static bool streams(server_exchange_t const& exchange) noexcept {
         return exchange.endpoint && exchange.endpoint->body_delivery == ucall_body_delivery_streamed_k;
     }
 
-    /** The value of parameter @p name in a header value such as `form-data; name="x"`, unquoted but
-     *  not unescaped, or an empty dataless view. */
+    /** The value of parameter @p name in a header value such as <tt>form-data; name="x"</tt>,
+     *  unquoted but not unescaped, or an empty dataless view. */
     static std::string_view header_parameter(std::string_view value, std::string_view name) noexcept {
         for (std::size_t cursor = find(value, ';'); cursor != std::string_view::npos;) {
             auto rest = value.substr(cursor + 1);
@@ -4383,9 +4386,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return {};
     }
 
-    /** Splits a buffered `multipart/form-data` body on its boundary into `parts`, once: a delimiter
-     *  is `--` and the boundary at the body's start or after a CRLF, and the one followed by `--`
-     *  closes; a body without it is malformed. */
+    /** Splits a buffered @c multipart/form-data body on its boundary into @c parts, once: a
+     *  delimiter is @c -- and the boundary at the body's start or after a CRLF, and the one
+     *  followed by @c -- closes; a body without it is malformed. */
     static void locate_parts(server_exchange_t& exchange) noexcept {
         if (exchange.parts_state != parts_state_t::unlocated_k) return;
         exchange.parts_state = parts_state_t::malformed_k;
@@ -4868,7 +4871,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return found;
     }
 
-    /** Dials the address of @p peer's one call, whose request `output` already holds. */
+    /** Dials the address of @p peer's one call, whose request @c output already holds. */
     static ucall_status_t dial_peer(client_t& client, client_peer_t& peer) noexcept {
         auto& exchange = *peer.oldest_exchange;
         auto& connection = peer.connection;
@@ -4962,7 +4965,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
 
     /** Appends @p exchange to @p peer's calls, whose earliest deadline becomes the connection's;
-     *  its request is composed into `output` before it starts sending. */
+     *  its request is composed into @c output before it starts sending. */
     static void push_call(client_peer_t& peer, client_exchange_t& exchange) noexcept {
         exchange.stage = client_exchange_t::stage_t::active_k;
         std::uint64_t& deadline = peer.connection.deadline;
@@ -4974,7 +4977,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
 
     /** Unlinks @p peer's oldest call, and moves the connection's deadline to the earliest of the
-     *  calls left, a walk over at most `max_pipelined_calls` of them. */
+     *  calls left, a walk over at most @c max_pipelined_calls of them. */
     static client_exchange_t& pop_call(client_peer_t& peer) noexcept {
         auto& exchange = *peer.oldest_exchange;
         peer.oldest_exchange = std::exchange(exchange.next, nullptr);
@@ -5057,8 +5060,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                          stage == connection_stage_t::closed_k);
     }
 
-    /** Calls @p peer could take on top of those it carries, by `accepts_another_exchange`, counting
-     *  a connection still dialing at its full depth. */
+    /** Calls @p peer could take on top of those it carries, by @c accepts_another_exchange,
+     *  counting a connection still dialing at its full depth. */
     static std::size_t peer_room(client_t const& client, client_peer_t const& peer) noexcept {
         auto& connection = peer.connection;
         bool const carrying = connection.descriptor >= 0 && connection.receiving == receive_state_t::reading_k &&
@@ -5094,7 +5097,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (result != ucall_status_success_k) finish_exchange(client, exchange, result);
     }
 
-    /** Answers @p peer's oldest call with the whole response at @p offset of `input`:
+    /** Answers @p peer's oldest call with the whole response at @p offset of @c input:
      *  a redirect queues the call again as a fresh one, and any other response completes it. */
     static void answer_call(client_t& client, client_peer_t& peer, std::size_t offset) noexcept {
         auto& connection = peer.connection;
@@ -5142,13 +5145,13 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
      *     call, a redirect queueing it again as a fresh call; a response without keep-alive, or to
      *     a call that asked to close, closes the connection.
      *  C2 requests: while reading, an idle transmit side composes every call of the origin's queue
-     *     that `accepts_another_exchange` lets this peer carry into `output`, appending each to the
-     *     FIFO, so one send takes them all.
+     *     that @c accepts_another_exchange lets this peer carry into @c output, appending each to
+     *     the FIFO, so one send takes them all.
      *  C3 emit: while reading, the next chunk of those requests while its send is idle, else a
      *     receive, posted even with no call so a peer close is seen before reuse.
      *  C4 done: a peer close, or bytes no call asked for, close the connection, losing any call
      *     still on the FIFO; with the FIFO empty and the side reading, the peer stays open.
-     *  C5 loss: `call_lost` settles the calls of the closed connection. */
+     *  C5 loss: @c call_lost settles the calls of the closed connection. */
     static io_request_t* call_open(client_t& client, client_peer_t& peer) noexcept {
         auto& connection = peer.connection;
         auto& input = connection.input;
@@ -5237,7 +5240,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return connection.advance();
     }
 
-    /** Settles the calls of @p peer's closed connection at @p now, rule C5 of `call_open`:
+    /** Settles the calls of @p peer's closed connection at @p now, rule C5 of @c call_open:
      *  - a failed connect queues its one call again on the next address or attempt;
      *  - a call past its deadline finishes with @c ucall_status_timeout_k;
      *  - after a close the server announced, every unread call queues again, as RFC 9112 §9.6 bars
@@ -5275,7 +5278,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
     }
 
-    /** Advances one client peer as `advance_connection` advances a server's,
+    /** Advances one client peer as @c advance_connection advances a server's,
      *  submitting each request it asks for. */
     static void step_peer(client_t& client, client_peer_t& peer, std::uint64_t now) noexcept {
         auto& connection = peer.connection;

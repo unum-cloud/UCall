@@ -2,7 +2,7 @@
 #
 # ~~~
 #   sudo apt install clang lld crossbuild-essential-arm64 qemu-user
-#   cmake -B build_aarch64_llvm -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake
+#   cmake -B build_aarch64_llvm -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
 #   cmake --build build_aarch64_llvm
 #   ctest --test-dir build_aarch64_llvm
 # ~~~

@@ -5,7 +5,7 @@ export LC_ALL=C
 rejection_count=0
 project_include_prefix="ucall"
 sibling_projects='numkong|stringzilla|forkunion|smashtable|usearch|ustore|uform'
-cmake_published_variables="UCALL_IS_MAIN_PROJECT"
+cmake_published_variables=""
 cmake_third_party_variables=""
 ids_miscased_pattern='(^|[^[:alnum:]_.:])(id|ids|Id|Ids)([^[:alnum:]_(]|$)'
 
@@ -395,10 +395,10 @@ check_continuation_hanging_indent() {
 
 check_param_directions() {
     local bare
-    bare=$(printf '%s\n' "$added" | grep -E '@param' | grep -vE '@param\[(in|out|inout)\]' || true)
+    bare=$(printf '%s\n' "$added" | grep -E '@param' | grep -vE '@param\[(in|out|in,out)\]' || true)
     [ -z "$bare" ] || fail "$bare" \
-        "$file has a @param without an [in]/[out]/[inout] direction - never a bare @param" \
-        "            nor the comma form @param[in,out] (write @param[inout]):"
+        "$file has a @param without an [in], [out] or [in,out] direction, or writes [inout]," \
+        "            which Clang rejects:"
 }
 
 check_markdown_doxygen() {
@@ -421,6 +421,20 @@ check_doxygen_glued() {
         "            never \`(@c foo)\`; a highlighter only sees a command that follows whitespace:"
 }
 
+# Clang hovers print the backticks of a docblock literally, so a docblock names code with @c, @p or <tt>
+# by token class; backticks stay in `//` comments, and code samples inside @code are exempt.
+check_docblock_code_spans_not_backticked() {
+    local spans
+    spans=$(printf '%s\n' "$added" | awk '
+        /@endcode/ { code = 0; next }
+        /@code/ { code = 1; next }
+        code { next }
+        /^\+[[:space:]]*(\/\*\*|\*|\/\/\/)/ && /`/ { print }')
+    [ -z "$spans" ] || fail "$spans" \
+        "$file has a backtick span in a docblock - write @c name, @p parameter or <tt>punctuated token</tt>;" \
+        "            backticks stay in // comments:"
+}
+
 check_doxygen_in_line_comments() {
     local tagged
     tagged=$(printf '%s\n' "$added" | grep -E '(^\+|[^:])//[^/!]' |
@@ -437,7 +451,7 @@ check_doxygen_trailers() {
 }
 
 check_section_spacing() {
-    grep -q '@section' "$staged_blob" || return 0
+    grep -qE '@(section|par)' "$staged_blob" || return 0
     local cramped
     cramped=$(awk '
         NR == FNR { added[$1 + 0]; next }
@@ -448,10 +462,15 @@ check_section_spacing() {
                     if (lines[i - 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line above the @section\n", i
                     if (lines[i + 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line below the @section\n", i
                 }
+                else if (lines[i] ~ /^[[:space:]]*\*[[:space:]]*@par([^a-z]|$)/ && (i in added)) {
+                    if (lines[i - 1] !~ /^[[:space:]]*\*[[:space:]]*$/) printf "line %d: no empty comment line above the @par\n", i
+                    for (j = i + 1; j <= last && lines[j] ~ /^[[:space:]]*\*[[:space:]]+[^[:space:]\/]/ && lines[j] !~ /^[[:space:]]*\*[[:space:]]*@[a-z]/; ++j);
+                    if (j <= last && lines[j] !~ /^[[:space:]]*\*[[:space:]]*$/ && lines[j] !~ /^[[:space:]]*\*\//) printf "line %d: no empty comment line below the @par section\n", i
+                }
         }' "$staged_lines_path" "$staged_blob")
     [ -z "$cramped" ] || fail "$cramped" \
-        "$file crams an @section against its neighbors - keep one empty comment line" \
-        "            above and below every @section heading:"
+        "$file crams an @section or @par against its neighbors - keep one empty comment line" \
+        "            above and below every @section heading and @par section:"
 }
 
 check_docblock_spacing() {
@@ -481,7 +500,7 @@ check_lone_brief() {
                 for (j = i; j <= last; ++j) {
                     if (j in added) touched = 1
                     if (lines[j] ~ /@brief/) brief = 1
-                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(param|tparam|return|returns|retval|sa|see|note|warning|throws|pre|post|file|author|date|section|code)([^a-z]|$)/) section = 1
+                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(param|tparam|return|returns|retval|par|sa|see|note|warning|throws|pre|post|file|author|date|section|code)([^a-z]|$)/) section = 1
                     if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*$/) blank = 1
                     if (lines[j] ~ /\*\//) break
                 }
@@ -506,7 +525,7 @@ check_brief_length() {
                 span = 1
                 for (j = i + 1; j <= last; ++j) {
                     if (lines[j] !~ /^[[:space:]]*\*[[:space:]]{5,}[^[:space:]]/) break
-                    if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*@(param|tparam|return|returns|retval|sa|see|note|warning|throws|pre|post|file|author|date|section|code)([^a-z]|$)/) break
+                    if (lines[j] ~ /^[[:space:]]*\*[[:space:]]*@(param|tparam|return|returns|retval|par|sa|see|note|warning|throws|pre|post|file|author|date|section|code)([^a-z]|$)/) break
                     ++span
                 }
                 if (span > 3 && (i in added)) printf "line %d: @brief runs %d lines\n", i, span
@@ -557,7 +576,7 @@ check_docblock_brackets() {
                 tagged = 0; touched = 0; single = (lines[i] ~ /\*\//)
                 for (j = i; j <= last; ++j) {
                     if (j in added) touched = 1
-                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(brief|param|tparam|return|retval|sa|see|note|file|author|date|section|code)([^a-z]|$)/) tagged = 1
+                    if (lines[j] ~ /^[[:space:]]*(\/\*\*|\*)[[:space:]]*@(brief|param|tparam|return|retval|par|sa|see|note|file|author|date|section|code)([^a-z]|$)/) tagged = 1
                     if (lines[j] ~ /\*\//) break
                 }
                 bare_open = (lines[i] ~ /^[[:space:]]*\/\*\*[[:space:]]*$/)
@@ -1325,6 +1344,7 @@ judge_path() {
         check_param_directions
         check_markdown_doxygen
         check_doxygen_glued
+        check_docblock_code_spans_not_backticked
         check_doxygen_in_line_comments
         check_doxygen_trailers
         check_section_spacing

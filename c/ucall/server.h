@@ -1,7 +1,7 @@
 /**
  *  @file c/ucall/server.h
  *  @author Ash Vardanian
- *  @date Feb 3, 2023
+ *  @date February 3, 2023
  *  @brief The server lifecycle and HTTP and WebSocket operations of the UCall C interface.
  */
 #ifndef UNUM_UCALL_SERVER_H
@@ -158,6 +158,17 @@ typedef struct ucall_server_init_t {
 /**
  *  @brief Initializes the server state.
  *  @note Call during setup only, before any loop is polled.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k An output, the configuration or its interfaces are missing,
+ *    or a metrics setting, an address, a device name, a security mode with the key or authorizer it
+ *    needs, a connection budget or the reply directories are unusable.
+ *  - @c ucall_status_unsupported_k No compiled CPU class or I/O backend serves the configuration on
+ *    this machine, a device is named outside Linux, or an interface asks Windows for several loops.
+ *  - @c ucall_status_connection_failed_k The metrics address or a listening address does not
+ *    resolve, or no socket binds to it.
+ *  - @c ucall_status_not_found_k A reply directory does not exist.
+ *  - @c ucall_status_overflow_k The connection and pipelining budgets overflow their counters.
  */
 UCALL_EXPORT void ucall_server_init(ucall_server_init_t* arguments);
 
@@ -191,8 +202,18 @@ typedef struct ucall_server_take_call_t {
 
 } ucall_server_take_call_t;
 
-/** Advances one server loop and invokes ready callbacks on the calling thread.
- *  Callbacks run synchronously; the timeout cannot preempt them. */
+/**
+ *  Advances one server loop and invokes ready callbacks on the calling thread.
+ *  Callbacks run synchronously; the timeout cannot preempt them.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class, or the kernel refuses the loop's I/O ring on its first poll.
+ *  - @c ucall_status_invalid_argument_k The @c event_loop_index is past the last loop.
+ *  - @c ucall_status_overflow_k The loop's connections, acceptors or pipelined requests overflow
+ *    the counters its first poll sizes.
+ */
 UCALL_EXPORT void ucall_server_take_call(ucall_server_take_call_t* arguments);
 
 /** Arguments of @c ucall_server_take_calls(). */
@@ -209,7 +230,17 @@ typedef struct ucall_server_take_calls_t {
 
 } ucall_server_take_calls_t;
 
-/** Drives one server loop until @c ucall_server_stop() or an I/O failure. */
+/**
+ *  Drives one server loop until @c ucall_server_stop() or an I/O failure.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class, or the kernel refuses the loop's I/O ring on its first poll.
+ *  - @c ucall_status_invalid_argument_k The @c event_loop_index is past the last loop.
+ *  - @c ucall_status_overflow_k The loop's connections, acceptors or pipelined requests overflow
+ *    the counters its first poll sizes.
+ */
 UCALL_EXPORT void ucall_server_take_calls(ucall_server_take_calls_t* arguments);
 
 /** Counters of one event loop since initialization; divided by @c requests, they price one call.
@@ -280,7 +311,7 @@ typedef struct ucall_server_event_loop_statistics_t {
     /** Initialized server. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_invalid_argument_k for an index past the last loop. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** Zero-based loop index. */
@@ -291,8 +322,17 @@ typedef struct ucall_server_event_loop_statistics_t {
 
 } ucall_server_event_loop_statistics_t;
 
-/** Copies one loop's counters, from any thread whose CPU runs the server's CPU class.
- *  Each counter is read on its own, so a snapshot of a running loop is not one instant. */
+/**
+ *  Copies one loop's counters, from any thread whose CPU runs the server's CPU class.
+ *  Each counter is read on its own, so a snapshot of a running loop is not one instant.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c statistics output is @c NULL, or the loop index is
+ *    past the last loop.
+ */
 UCALL_EXPORT void ucall_server_event_loop_statistics(ucall_server_event_loop_statistics_t* arguments);
 
 /** Arguments of @c ucall_server_take_batch(). */
@@ -301,7 +341,7 @@ typedef struct ucall_server_take_batch_t {
     /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Outcome of this draining round; @c ucall_status_invalid_argument_k for a NULL endpoint. */
+    /** Outcome of this draining round. */
     ucall_outcome_t* outcome;
 
     /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one draining owner. */
@@ -312,9 +352,17 @@ typedef struct ucall_server_take_batch_t {
 
 } ucall_server_take_batch_t;
 
-/** Invokes one batch endpoint's callback if a batch is due, with requests from every event loop,
+/**
+ *  Invokes one batch endpoint's callback if a batch is due, with requests from every event loop,
  *  on the calling thread. UCall creates no thread; a bounded wait sleeps until a deposit, the
- *  partial batch's deadline, or the timeout, without polling any event loop. */
+ *  partial batch's deadline, or the timeout, without polling any event loop.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c endpoint is @c NULL.
+ */
 UCALL_EXPORT void ucall_server_take_batch(ucall_server_take_batch_t* arguments);
 
 /** Arguments of @c ucall_server_take_batches(). */
@@ -323,8 +371,7 @@ typedef struct ucall_server_take_batches_t {
     /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Final outcome after draining stops; @c ucall_status_invalid_argument_k for a NULL
-     *  endpoint. */
+    /** Final outcome after draining stops. */
     ucall_outcome_t* outcome;
 
     /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one draining owner. */
@@ -332,8 +379,16 @@ typedef struct ucall_server_take_batches_t {
 
 } ucall_server_take_batches_t;
 
-/** Invokes one batch endpoint's due callbacks on the calling thread, sleeping in between, until
- *  @c ucall_server_stop(). Requests still queued then are released without a callback. */
+/**
+ *  Invokes one batch endpoint's due callbacks on the calling thread, sleeping in between, until
+ *  @c ucall_server_stop(). Requests still queued then are released without a callback.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c endpoint is @c NULL.
+ */
 UCALL_EXPORT void ucall_server_take_batches(ucall_server_take_batches_t* arguments);
 
 /** Counters of one batch endpoint since registration; they say how large its batches were and
@@ -366,7 +421,7 @@ typedef struct ucall_server_batch_endpoint_statistics_t {
     /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_invalid_argument_k for a NULL endpoint or statistics output. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** Endpoint from @c ucall_server_add_http_batch_endpoint(). */
@@ -377,8 +432,16 @@ typedef struct ucall_server_batch_endpoint_statistics_t {
 
 } ucall_server_batch_endpoint_statistics_t;
 
-/** Copies one batch endpoint's counters, from any thread whose CPU runs the server's CPU class.
- *  Each counter is read on its own, so a snapshot of a draining endpoint is not one instant. */
+/**
+ *  Copies one batch endpoint's counters, from any thread whose CPU runs the server's CPU class.
+ *  Each counter is read on its own, so a snapshot of a draining endpoint is not one instant.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c endpoint or the @c statistics output is @c NULL.
+ */
 UCALL_EXPORT void ucall_server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments);
 
 /**
@@ -394,7 +457,7 @@ typedef struct ucall_server_add_http_endpoint_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives a failure for a duplicate endpoint, an invalid template, or a lack of memory. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** URI template, with an explicit byte length. */
@@ -425,9 +488,20 @@ typedef struct ucall_server_add_http_endpoint_t {
  *
  *  Routing precedence: Literals match before template variables, before greedy wildcards.
  *
- *  @see RFC 6570 Section 3.2.2 for simple string expansion specification.
+ *  @see RFC 6570 Section 3.2.2, simple string expansion: https://www.rfc-editor.org/rfc/rfc6570#section-3.2.2
  *
  *  @note Call during setup only, before any loop is polled.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c callback is @c NULL, the @c verb is unknown, or
+ *    the template is empty, lacks its leading slash, carries a query, a fragment or a malformed
+ *    segment, or names a placeholder another template names differently at the same position.
+ *  - @c ucall_status_contended_k A loop of the server was already polled.
+ *  - @c ucall_status_already_exists_k An endpoint of the same @c verb has the same or an equivalent
+ *    template.
  */
 UCALL_EXPORT void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments);
 
@@ -451,8 +525,7 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives a failure for a NULL @c endpoint, a duplicate endpoint, an invalid template, or a
-     *  lack of memory. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** URI template, with an explicit byte length. */
@@ -502,6 +575,18 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
  *  need no copy.
  *
  *  @note Call during setup only, before any loop is polled.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c endpoint output or the @c callback is @c NULL, the
+ *    minimum batch size exceeds the maximum, the @c verb is unknown, or the template is empty,
+ *    lacks its leading slash, carries a query, a fragment or a malformed segment, or names a
+ *    placeholder another template names differently at the same position.
+ *  - @c ucall_status_contended_k A loop of the server was already polled.
+ *  - @c ucall_status_already_exists_k An endpoint of the same @c verb has the same or an equivalent
+ *    template.
  */
 UCALL_EXPORT void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments);
 
@@ -572,6 +657,12 @@ typedef struct ucall_server_request_path_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c path output is @c NULL.
  */
 UCALL_EXPORT void ucall_server_request_path(ucall_server_request_path_t* arguments);
 
@@ -592,7 +683,7 @@ typedef struct ucall_server_request_path_segment_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_not_found_k when @c index is past the last segment. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -613,6 +704,13 @@ typedef struct ucall_server_request_path_segment_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c segment output is @c NULL.
+ *  - @c ucall_status_not_found_k The @c index is past the last segment.
  */
 UCALL_EXPORT void ucall_server_request_path_segment(ucall_server_request_path_segment_t* arguments);
 
@@ -622,7 +720,7 @@ typedef struct ucall_server_request_path_parameter_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_not_found_k when the template has no such placeholder. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -645,6 +743,14 @@ typedef struct ucall_server_request_path_parameter_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c value output is @c NULL, or the
+ *    placeholder name is not a valid view.
+ *  - @c ucall_status_not_found_k The template has no such placeholder, or the path ends before it.
  */
 UCALL_EXPORT void ucall_server_request_path_parameter(ucall_server_request_path_parameter_t* arguments);
 
@@ -654,7 +760,7 @@ typedef struct ucall_server_request_query_parameter_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_not_found_k when the query has no such parameter. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -676,6 +782,14 @@ typedef struct ucall_server_request_query_parameter_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c value output is @c NULL, or the
+ *    parameter name is not a valid view.
+ *  - @c ucall_status_not_found_k The query has no such parameter.
  */
 UCALL_EXPORT void ucall_server_request_query_parameter(ucall_server_request_query_parameter_t* arguments);
 
@@ -685,7 +799,7 @@ typedef struct ucall_server_request_header_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Receives @c ucall_status_not_found_k when the request has no such header. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -704,6 +818,14 @@ typedef struct ucall_server_request_header_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c value output is @c NULL, or the
+ *    header name is not an HTTP token.
+ *  - @c ucall_status_not_found_k The request has no such header.
  */
 UCALL_EXPORT void ucall_server_request_header(ucall_server_request_header_t* arguments);
 
@@ -735,6 +857,12 @@ typedef struct ucall_server_request_peer_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or an output is @c NULL.
  */
 UCALL_EXPORT void ucall_server_request_peer(ucall_server_request_peer_t* arguments);
 
@@ -758,11 +886,17 @@ typedef struct ucall_server_request_body_t {
 /**
  *  @brief Extracts the body content from the received request.
  *
- *  A streamed endpoint's body is pulled through @c ucall_server_request_body_chunk() instead, and
- *  this answers @c ucall_status_invalid_argument_k for it.
+ *  A streamed endpoint's body is pulled through @c ucall_server_request_body_chunk() instead.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c body output is @c NULL, or the
+ *    endpoint is streamed.
  */
 UCALL_EXPORT void ucall_server_request_body(ucall_server_request_body_t* arguments);
 
@@ -800,6 +934,14 @@ typedef struct ucall_server_request_body_chunk_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c data output is @c NULL.
+ *  - @c ucall_status_malformed_k The streamed body's framing is malformed.
+ *  - @c ucall_status_connection_closed_k The connection closed before the streamed body ended.
  */
 UCALL_EXPORT void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* arguments);
 
@@ -848,6 +990,15 @@ typedef struct ucall_server_request_part_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request or an output is @c NULL, or the @c index is
+ *    past the last part.
+ *  - @c ucall_status_malformed_k The body is not a well-formed @c multipart/form-data body, or the
+ *    part has no blank line closing its headers.
  */
 UCALL_EXPORT void ucall_server_request_part(ucall_server_request_part_t* arguments);
 
@@ -884,6 +1035,17 @@ typedef struct ucall_server_reply_content_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a view is invalid, a status of
+ *    204 or 304 carries a body, the @c http_status is outside 200 to 599, or a header line is
+ *    malformed or sets @c Content-Length, @c Transfer-Encoding, @c Date or @c Server.
+ *  - @c ucall_status_already_exists_k The request was already answered.
+ *  - @c ucall_status_connection_closed_k The peer left or the server stops.
+ *  - @c ucall_status_overflow_k The reply's length overflows its counter.
  */
 UCALL_EXPORT void ucall_server_reply_content(ucall_server_reply_content_t* arguments);
 
@@ -915,6 +1077,16 @@ typedef struct ucall_server_reply_error_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, the @c message is not a valid
+ *    view, or the @c http_status is outside 400 to 599.
+ *  - @c ucall_status_already_exists_k The request was already answered.
+ *  - @c ucall_status_connection_closed_k The peer left or the server stops.
+ *  - @c ucall_status_overflow_k The reply's length overflows its counter.
  */
 UCALL_EXPORT void ucall_server_reply_error(ucall_server_reply_error_t* arguments);
 
@@ -1038,6 +1210,20 @@ typedef struct ucall_server_reply_vectored_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a part or a view is invalid, a
+ *    file descriptor reads buffered, a path leaves its directories, a status of 204 or 304 carries
+ *    a body, the @c http_status is outside 200 to 599, or a header line is malformed or sets a
+ *    length, a transfer encoding, a date or a server name.
+ *  - @c ucall_status_overflow_k A range's end or the reply's length overflows its counter, or a
+ *    range runs past the end of its file.
+ *  - @c ucall_status_already_exists_k The request was already answered.
+ *  - @c ucall_status_connection_closed_k The peer left or the server stops.
+ *  - @c ucall_status_not_found_k A file is missing, unreadable or irregular.
  */
 UCALL_EXPORT void ucall_server_reply_vectored(ucall_server_reply_vectored_t* arguments);
 
@@ -1077,6 +1263,17 @@ typedef struct ucall_server_reply_begin_t {
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, the @c http_status is outside
+ *    200 to 599, a header line is malformed or sets @c Transfer-Encoding, @c Date or @c Server, the
+ *    declared @c Content-Length is no decimal number, or a status of 204 or 304 declares one.
+ *  - @c ucall_status_already_exists_k The request was already answered.
+ *  - @c ucall_status_connection_closed_k The peer left or the server stops.
+ *  - @c ucall_status_overflow_k The head's length overflows its counter.
  */
 UCALL_EXPORT void ucall_server_reply_begin(ucall_server_reply_begin_t* arguments);
 
@@ -1103,19 +1300,29 @@ typedef struct ucall_server_reply_append_t {
 /**
  *  @brief Appends parts to a response opened with @c ucall_server_reply_begin().
  *
- *  Can be called from any thread, long after the request callback returned. Reports @c
- *  ucall_status_would_block_k without queuing anything while the bytes parts already queued for
- *  this request and not yet taken by the socket exceed the bytes a reading peer takes per round
- *  trip, or while too many file and path parts wait; retry once the peer catches up. Reports @c
- *  ucall_status_overflow_k for parts that would run past a declared @c Content-Length, whose
- *  stream refuses file and path parts of zero length with @c ucall_status_invalid_argument_k, as
- *  their size is unknown. Reports @c ucall_status_connection_closed_k once the peer left. Empty
- *  bytes parts send nothing, and so do file ranges of zero bytes.
+ *  Can be called from any thread, long after the request callback returned. Empty bytes parts send
+ *  nothing, and so do file ranges of zero bytes.
  *
  *  A file or path part that fails once the head left resets the connection.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, its reply was not begun or
+ *    already ended, a part or a view is invalid, a file descriptor reads buffered, a path leaves
+ *    its directories, a file or path part of zero length comes on a stream with a declared length,
+ *    as their size is unknown, a status of 204 or 304 gets a body, or one call brings more file and
+ *    path parts than may wait.
+ *  - @c ucall_status_overflow_k A range's end overflows its counter, or parts would run past a
+ *    declared @c Content-Length.
+ *  - @c ucall_status_connection_closed_k The peer left or the server stops.
+ *  - @c ucall_status_would_block_k Nothing was queued, as the bytes parts already queued for this
+ *    request and not yet taken by the socket exceed the bytes a reading peer takes per round trip,
+ *    or too many file and path parts wait; retry once the peer catches up.
  */
 UCALL_EXPORT void ucall_server_reply_append(ucall_server_reply_append_t* arguments);
 
@@ -1137,15 +1344,27 @@ typedef struct ucall_server_reply_end_t {
 /**
  *  @brief Completes a response opened with @c ucall_server_reply_begin().
  *
- *  Consumes the request handle on every outcome. Reports @c ucall_status_malformed_k when the
- *  chunks fell short of a declared @c Content-Length, and then closes the connection after the
- *  bytes already sent, so the peer cannot mistake the truncated body for a whole one.
+ *  Consumes the request handle on every outcome. A response whose chunks fell short of a declared
+ *  @c Content-Length closes the connection after the bytes already sent, so the peer cannot
+ *  mistake the truncated body for a whole one.
  *
  *  While file or path parts are still unsent, the outcome reads @c ucall_status_deferred_k on
  *  return, and the event loop publishes success once they are sent, or the cause of a failure.
  *
  *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
  *      concurrently.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the server's CPU
+ *    class.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, or its reply was not begun or
+ *    already ended.
+ *  - @c ucall_status_connection_closed_k The peer left or the server stops.
+ *  - @c ucall_status_malformed_k The chunks fell short of a declared @c Content-Length.
+ *  - @c ucall_status_overflow_k The last chunk's length overflows its counter, or a file part's
+ *    range runs past the end of its file.
+ *  - @c ucall_status_not_found_k A file part's file is missing, unreadable or irregular.
  */
 UCALL_EXPORT void ucall_server_reply_end(ucall_server_reply_end_t* arguments);
 

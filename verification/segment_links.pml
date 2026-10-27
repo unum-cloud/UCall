@@ -7,28 +7,26 @@
  *      the parking in @c retire_segment.
  *
  *  The replier writes each segment's payload, links it with a release store into the @c next of
- *  its previous segment, or into the exchange's first link, and lists the exchange by setting the
- *  listed bit with an acquire-release or; only the or that finds the bit clear queues the exchange
- *  for the loop. The loop, for each queueing, clears the bit with an acquire-release and, then
- *  adopts from its cursor with acquire loads, reads every payload, and retires each adopted segment:
- *  it hands back all but the cursor, which it parks until the cursor moves past it, and the last
- *  one once the reply ended. Three segments, the third ending the reply.
+ *  its previous segment, and lists the exchange by setting the listed bit with an acquire-release
+ *  or. The loop adopts from its cursor with acquire loads, reads every payload, and retires each
+ *  adopted segment: it hands back all but the cursor, which it parks until the cursor moves past
+ *  it. Three segments, the third ending the reply.
  *
- *  Every segment is adopted, its payload read as written, and the replier never links onto a
- *  segment the loop handed back.
+ *  - Every segment is adopted, its payload read as written.
+ *  - The replier never links onto a segment the loop handed back.
  *
  *  @verify pass sc,rc11
  *  @verify fail sc park=false: handing the cursor back at once lets the replier link its next
  *      segment onto a record it no longer owns
  *  @verify stuck sc unlist_first=false: clearing the bit after adopting drops a push that landed
  *      between the adoption and the clear, which then never queues the exchange again
- *  @verify fail rc11 link_order=order_relaxed: the replier publishes each link with a release;
- *      relaxed, the loop follows a link and reads the payload from before it was written
+ *  @verify fail rc11 link_order=order_relaxed: relaxed, the loop follows a link and reads the
+ *      payload from before it was written
  */
 #define thread_count 2
 #define location_count 9
 #define history_depth 8
-#include "weak_memory.pml"
+#include <weak_memory.pml>
 
 /** The segments, and none, which no link names. */
 #define segments 3

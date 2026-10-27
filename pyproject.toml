@@ -94,10 +94,7 @@ sdist.include = [
 wheel.packages = ["python/ucall"]
 
 [tool.scikit-build.cmake.define]
-UCALL_BUILD_BENCH = "OFF"
-UCALL_BUILD_EXAMPLES = "OFF"
 UCALL_BUILD_PYTHON = "ON"
-UCALL_BUILD_TEST = "OFF"
 
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
 [dependency-groups]
@@ -118,7 +115,7 @@ target-version = "py312"
 extend-exclude = ["stringzilla", "*.md"]
 
 [tool.ruff.lint]
-select = ["E", "W", "F", "I", "UP", "YTT", "B", "SIM", "TID", "D200", "D201", "D202", "D205", "D209", "D210", "D212", "D300", "D415"]
+select = ["E", "W", "F", "I", "UP", "YTT", "B", "SIM", "TID", "D"]
 ignore = ["E501", "E741"]
 
 [tool.ruff.format]
@@ -128,6 +125,11 @@ quote-style = "double"
 "python/ucall/__init__.py" = ["F401", "F403"]
 ".cmake-format.py" = ["F821"]
 "cmake-format.py" = ["F821"]
+"!python/**" = ["D"]
+"*.pyi" = ["D"]
+
+[tool.ruff.lint.pydocstyle]
+convention = "google"
 
 [tool.ruff.lint.flake8-tidy-imports]
 ban-relative-imports = "all"

@@ -3,6 +3,10 @@
 //! No C or C++ is compiled here directly: `CMakeLists.txt` owns the CPU classes, their flags, and
 //! the backends a platform gets, so this drives CMake and links the archive it leaves behind,
 //! together with what that archive's link interface needs.
+//!
+//! File: build.rs
+//! Author: Ash Vardanian
+//! Date: October 25, 2026
 
 use std::env;
 use std::error::Error;
@@ -25,13 +29,13 @@ fn cached<'cache>(cache: &'cache str, name: &str) -> Option<&'cache str> {
 }
 
 fn main() -> Result<(), Box<dyn Error>> {
+    if env::var_os("DOCS_RS").is_some() {
+        return Ok(());
+    }
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
 
     let mut library = cmake::Config::new(&manifest);
-    library
-        .profile("Release")
-        .define("UCALL_BUILD_TEST", "OFF")
-        .build_target("ucall");
+    library.profile("Release").build_target("ucall");
     for sibling in SIBLINGS {
         let variable = format!("FETCHCONTENT_SOURCE_DIR_{sibling}");
         println!("cargo:rerun-if-env-changed={variable}");

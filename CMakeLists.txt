@@ -1,4 +1,4 @@
-cmake_minimum_required(VERSION 3.28 FATAL_ERROR)
+cmake_minimum_required(VERSION 3.28)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ucall_version_name_ LIMIT_COUNT 1)
 project(
     ucall
@@ -8,22 +8,15 @@ project(
     HOMEPAGE_URL "https://github.com/unum-cloud/UCall"
 )
 
-set(UCALL_IS_MAIN_PROJECT OFF)
-if (CMAKE_CURRENT_SOURCE_DIR STREQUAL CMAKE_SOURCE_DIR)
-    set(UCALL_IS_MAIN_PROJECT ON)
-endif ()
-
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
-set(CMAKE_C_STANDARD 11)
-set(CMAKE_CXX_STANDARD 20)
-set(CMAKE_CXX_STANDARD_REQUIRED YES)
+# Each UCall target declares its own language level, so fetched dependencies build at the standard they pick.
 set(CMAKE_CXX_EXTENSIONS NO)
 
 set(ucall_default_posix_ OFF)
 set(ucall_default_linux_ OFF)
 set(ucall_default_kqueue_ OFF)
 set(ucall_default_iocp_ OFF)
-if (UCALL_IS_MAIN_PROJECT)
+if (PROJECT_IS_TOP_LEVEL)
     if (UNIX)
         set(ucall_default_posix_ ON)
     endif ()
@@ -42,31 +35,18 @@ option(UCALL_WITH_LINUX_EPOLLAIO "Include the Linux epoll and AIO backend" ${uca
 option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${ucall_default_kqueue_})
 option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${ucall_default_iocp_})
 option(UCALL_BUILD_PYTHON "Build the CPython extension; `pyproject.toml` switches it on" OFF)
-# `UCALL_BUILD_ALL` only seeds the defaults below, so an explicit choice for any one of them stands
-option(UCALL_BUILD_ALL "Build every target supported on this platform" OFF)
-set(ucall_default_test_ ${UCALL_IS_MAIN_PROJECT})
-if (UCALL_BUILD_ALL)
-    set(ucall_default_test_ ON)
-endif ()
-option(UCALL_BUILD_EXAMPLES "Build the echo, ledger, key-value, and inference examples" ${UCALL_BUILD_ALL})
-option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" ${UCALL_BUILD_ALL})
-option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" ${ucall_default_test_})
+option(UCALL_BUILD_TOOLS "Build the echo, ledger, key-value, and inference examples" OFF)
+option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
+option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" OFF)
+option(UCALL_WERROR "Treat compiler warnings as errors" OFF)
 set(UCALL_BUILD_SANITIZERS
     "off"
     CACHE STRING "Sanitizers for UCall's own targets: off, address (with undefined) or thread"
 )
 set_property(CACHE UCALL_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
 
-# ThreadSanitizer sees no inline assembly, so ForkUnion leaves out its instruction-set atomics and the rungs above them.
-if (UCALL_BUILD_SANITIZERS STREQUAL "thread")
-    set(FORKUNION_TARGET_ARM64_LSE OFF)
-    set(FORKUNION_TARGET_ARM64_RCPC OFF)
-    set(FORKUNION_TARGET_X86_CMPCCXADD OFF)
-    set(FORKUNION_TARGET_X86_RAOINT OFF)
-    set(FORKUNION_TARGET_RISC5_ATOMIC OFF)
-    set(FORKUNION_TARGET_RISC5_ZACAS OFF)
-    set(FORKUNION_TARGET_RISC5_ZABHA OFF)
-endif ()
+# ThreadSanitizer sees no inline assembly, so ForkUnion leaves out the capabilities it cannot see when told.
+set(FORKUNION_BUILD_SANITIZERS ${UCALL_BUILD_SANITIZERS})
 
 if (UCALL_WITH_POSIX AND NOT UNIX)
     message(FATAL_ERROR "The POSIX backend requires a POSIX platform")
@@ -98,12 +78,10 @@ endforeach ()
 message(STATUS "Running on OS: ${CMAKE_SYSTEM_NAME}")
 
 if (MSVC)
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} /W3")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} /DEBUG")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} /O2")
     set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /DEBUG")
 else ()
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -pedantic")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
@@ -114,7 +92,7 @@ if (CMAKE_CXX_COMPILER_ID STREQUAL "GNU")
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fmax-errors=1")
 endif ()
 
-if (UCALL_IS_MAIN_PROJECT AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
+if (PROJECT_IS_TOP_LEVEL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
     execute_process(
         COMMAND git config core.hooksPath .githooks
         WORKING_DIRECTORY "${CMAKE_CURRENT_SOURCE_DIR}"
@@ -135,13 +113,13 @@ function (ucall_sibling name_ source_override_ target_ url_ revision_)
     if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED
                                                                          FETCHCONTENT_SOURCE_DIR_${source_override_}
     )
-        add_subdirectory(${name_} EXCLUDE_FROM_ALL)
+        add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
     else ()
         FetchContent_Declare(
             ${name_}
             GIT_REPOSITORY ${url_}
             GIT_TAG ${revision_}
-            EXCLUDE_FROM_ALL
+            EXCLUDE_FROM_ALL SYSTEM
         )
         FetchContent_MakeAvailable(${name_})
     endif ()
@@ -149,15 +127,15 @@ endfunction ()
 
 ucall_sibling(
     stringzilla STRINGZILLA stringzilla::header https://github.com/ashvardanian/StringZilla
-    2d9c8cc0889c24acdc95e8ded99761cddeb532d4
+    e169620f92db7c5df3a71baf2e035bc43ecf6a39
 )
 ucall_sibling(
     forkunion FORKUNION forkunion::header https://github.com/ashvardanian/ForkUnion
-    9d1a4876d6b8fffb0d5c9bdda4b6ab5165e351a3
+    0c87b0bb539ccf6d945711a12e73b731530c9fa8
 )
 ucall_sibling(
     smashtable SMASHTABLE smashtable::header https://github.com/ashvardanian/SmashTable
-    22ada2272cc7aeb5206b75c58716efcfaec3132a
+    07a8cb3800de52a4c0f90e80014b3937b39121dc
 )
 
 # Prefer a current system liburing; source builds are isolated under the build directory.
@@ -204,9 +182,29 @@ if (UCALL_BUILD_TEST)
         fmt
         GIT_REPOSITORY https://github.com/fmtlib/fmt.git
         GIT_TAG 12.2.0
-        FIND_PACKAGE_ARGS 12.2.0
+        SYSTEM FIND_PACKAGE_ARGS 12.2.0
     )
     FetchContent_MakeAvailable(fmt)
+endif ()
+
+# Warnings apply to UCall's own targets only, so fetched dependencies build with their own flags. The C interface takes
+# named arguments as partially designated structs, leaving the rest zeroed.
+add_library(ucall_warnings INTERFACE)
+if (MSVC)
+    target_compile_options(ucall_warnings INTERFACE /W3)
+    if (UCALL_WERROR)
+        target_compile_options(ucall_warnings INTERFACE /WX)
+    endif ()
+else ()
+    target_compile_options(
+        ucall_warnings
+        INTERFACE
+            "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-Wno-unknown-pragmas;-Wno-missing-field-initializers>"
+            "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-Wdocumentation>"
+    )
+    if (UCALL_WERROR)
+        target_compile_options(ucall_warnings INTERFACE -Werror)
+    endif ()
 endif ()
 
 # Sanitizers instrument UCall's library and tests, while fetched dependencies keep their own flags.
@@ -254,7 +252,7 @@ target_compile_definitions(
 target_link_libraries(
     ucall
     PUBLIC forkunion::header smashtable::header stringzilla::header
-    PRIVATE Threads::Threads ucall_sanitizers
+    PRIVATE Threads::Threads ucall_sanitizers ucall_warnings
 )
 foreach (capabilities_ forkunion::cpu_capabilities_compiled stringzilla::cpu_capabilities_compiled)
     if (TARGET ${capabilities_})
@@ -304,8 +302,8 @@ ucall_cpu_variant(
     intel_haswell
     INTEL_HASWELL
     REQUIRES
-    sz_target_haswell_compiles
-    sz_target_westmere_compiles
+    stringzilla_target_haswell_compiles
+    stringzilla_target_westmere_compiles
     FLAGS
     "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul"
     MSVC_FLAGS
@@ -315,8 +313,8 @@ ucall_cpu_variant(
     intel_skylake
     INTEL_SKYLAKE
     REQUIRES
-    sz_target_skylake_compiles
-    sz_target_westmere_compiles
+    stringzilla_target_skylake_compiles
+    stringzilla_target_westmere_compiles
     FLAGS
     "-mavx2 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mbmi -mbmi2 -mpopcnt -mlzcnt -maes -mpclmul"
     MSVC_FLAGS
@@ -326,8 +324,8 @@ ucall_cpu_variant(
     intel_icelake
     INTEL_ICELAKE
     REQUIRES
-    sz_target_icelake_compiles
-    sz_target_goldmont_compiles
+    stringzilla_target_icelake_compiles
+    stringzilla_target_goldmont_compiles
     FLAGS
     "-mavx2 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx512vbmi -mavx512vbmi2 -mavx512vnni -mbmi -mbmi2 -mpopcnt -mlzcnt -maes -mvaes -mpclmul -mvpclmulqdq -msha"
     MSVC_FLAGS
@@ -337,9 +335,9 @@ ucall_cpu_variant(
     intel_alder
     INTEL_ALDER
     REQUIRES
-    sz_target_haswell_compiles
-    sz_target_westmere_compiles
-    sz_target_goldmont_compiles
+    stringzilla_target_haswell_compiles
+    stringzilla_target_westmere_compiles
+    stringzilla_target_goldmont_compiles
     FLAGS
     "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul -msha"
     MSVC_FLAGS
@@ -349,10 +347,10 @@ ucall_cpu_variant(
     intel_sierra
     INTEL_SIERRA
     REQUIRES
-    sz_target_haswell_compiles
-    sz_target_westmere_compiles
-    sz_target_goldmont_compiles
-    fu_target_x86_cmpccxadd_compiles
+    stringzilla_target_haswell_compiles
+    stringzilla_target_westmere_compiles
+    stringzilla_target_goldmont_compiles
+    forkunion_target_x86_cmpccxadd_compiles
     FLAGS
     "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul -msha"
     MSVC_FLAGS
@@ -362,10 +360,10 @@ ucall_cpu_variant(
     aws_g2
     AWS_G2
     REQUIRES
-    sz_target_neon_compiles
-    sz_target_neonaes_compiles
-    sz_target_neonsha_compiles
-    fu_target_arm64_lse_compiles
+    stringzilla_target_neon_compiles
+    stringzilla_target_neonaes_compiles
+    stringzilla_target_neonsha_compiles
+    forkunion_target_arm64_lse_compiles
     FLAGS
     "-march=armv8-a+simd+crypto+aes+sha2+lse"
 )
@@ -373,11 +371,11 @@ ucall_cpu_variant(
     apple_m2
     APPLE_M2
     REQUIRES
-    sz_target_neon_compiles
-    sz_target_neonaes_compiles
-    sz_target_neonsha_compiles
-    fu_target_arm64_lse_compiles
-    fu_target_arm64_rcpc_compiles
+    stringzilla_target_neon_compiles
+    stringzilla_target_neonaes_compiles
+    stringzilla_target_neonsha_compiles
+    forkunion_target_arm64_lse_compiles
+    forkunion_target_arm64_rcpc_compiles
     FLAGS
     "-march=armv8-a+simd+crypto+aes+sha2+lse+rcpc"
 )
@@ -385,25 +383,25 @@ ucall_cpu_variant(
     aws_g5
     AWS_G5
     REQUIRES
-    sz_target_sve_compiles
-    sz_target_sve2_compiles
-    sz_target_sve2aes_compiles
-    sz_target_neonsha_compiles
-    fu_target_arm64_lse_compiles
-    fu_target_arm64_rcpc_compiles
+    stringzilla_target_sve_compiles
+    stringzilla_target_sve2_compiles
+    stringzilla_target_sve2aes_compiles
+    stringzilla_target_neonsha_compiles
+    forkunion_target_arm64_lse_compiles
+    forkunion_target_arm64_rcpc_compiles
     FLAGS
     "-march=armv8.2-a+sve+sve2+sve2-aes+crypto+lse+rcpc"
 )
 
-if (UCALL_BUILD_EXAMPLES)
+if (UCALL_BUILD_TOOLS)
     ucall_sibling(
         numkong NUMKONG numkong::static https://github.com/ashvardanian/NumKong
-        3ab2df21bf540a11dcc5a7fd6a9dbe9d4a568ede
+        49b5140981945527e0ffca4d8037285022b98ad3
     )
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
-        target_link_libraries(ucall_example_${example_} PRIVATE ucall::ucall forkunion::static)
+        target_link_libraries(ucall_example_${example_} PRIVATE ucall::ucall forkunion::static ucall_warnings)
     endforeach ()
     target_link_libraries(ucall_example_inference PRIVATE numkong::static)
 endif ()
@@ -412,7 +410,7 @@ if (UCALL_BUILD_BENCH)
     add_executable(ucall_bench_server bench/ucall_server.cpp)
     foreach (bench_ ucall_bench_http ucall_bench_server)
         target_include_directories(${bench_} PRIVATE tools)
-        target_link_libraries(${bench_} PRIVATE ucall::ucall forkunion::static)
+        target_link_libraries(${bench_} PRIVATE ucall::ucall forkunion::static ucall_warnings)
     endforeach ()
 endif ()
 if (UCALL_BUILD_PYTHON)

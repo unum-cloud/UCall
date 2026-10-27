@@ -38,6 +38,10 @@
 //! })?;
 //! # Ok::<(), ucall::Error>(())
 //! ```
+//!
+//! File: rust/lib.rs
+//! Author: Ash Vardanian
+//! Date: October 25, 2026
 
 // Acronyms keep their capitals, as in `CPUClass` and `HTTPStatus`.
 #![allow(clippy::upper_case_acronyms)]

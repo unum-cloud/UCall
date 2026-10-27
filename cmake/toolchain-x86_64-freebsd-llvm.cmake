@@ -3,7 +3,7 @@
 # ~~~
 #   curl -O https://download.freebsd.org/releases/amd64/14.5-RELEASE/base.txz
 #   mkdir freebsd-sysroot && tar -xJf base.txz -C freebsd-sysroot ./usr/include ./usr/lib ./lib
-#   cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake \
+#   cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake -D UCALL_BUILD_TEST=ON \
 #       -D UCALL_FREEBSD_SYSROOT=$PWD/freebsd-sysroot
 #   cmake --build build_freebsd
 # ~~~

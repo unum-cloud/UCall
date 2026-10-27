@@ -137,34 +137,62 @@ jobs:
           verbose: true
           print-hash: true
 
-  deploy_docs:
-    name: Deploy Docs
-    environment:
-      name: github-pages
-      url: ${{ steps.deployment.outputs.page_url }}
+  build_docs:
+    name: Build Docs
     runs-on: ubuntu-26.04
     needs: publish_python
+    permissions:
+      contents: write
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           ref: main
-          submodules: recursive
-      - name: Setup GitHub Pages
-        uses: actions/configure-pages@v5
-      - name: Install dependencies
-        run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
-      - name: Install UCall from PyPi
-        run: pip install ucall
-      - name: Build documentation
-        run: cd docs && doxygen conf.dox && make html
-      - name: Copy assets
-        run: cp -r assets build/docs/html/
-      - name: Upload artifacts
-        uses: actions/upload-pages-artifact@v3
+      - name: Set Up Python
+        uses: actions/setup-python@v7
         with:
-          # Upload entire repository
-          path: "./build/docs/html/"
+          python-version: "3.13"
+      - name: Install Doxygen
+        run: |
+          curl -sSfL https://www.doxygen.nl/files/doxygen-1.18.0.linux.bin.tar.gz | tar -xz -C "$RUNNER_TEMP"
+          echo "$RUNNER_TEMP/doxygen-1.18.0/bin" >> "$GITHUB_PATH"
+      - name: Install Sphinx
+        run: pip install -r docs/requirements.txt
+      - name: Install the Released UCall
+        run: pip install "ucall==$(cat VERSION)"
+      - name: Build Docs
+        run: cd docs && doxygen conf.dox && sphinx-build -M html . ../build/docs -W
+      - name: Compress Docs
+        run: tar -czvf docs.tar.gz build/docs/html/
+      - name: Upload Docs to Release
+        uses: xresloader/upload-to-github-release@v1
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          file: docs.tar.gz
+          update_latest_release: true
+
+  deploy_docs_pages:
+    name: Deploy GitHub Pages
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    runs-on: ubuntu-26.04
+    needs: build_docs
+    steps:
+      - name: Download Release Assets
+        uses: robinraju/release-downloader@v1.13
+        with:
+          latest: true
+          fileName: docs.tar.gz
+      - name: Unpack Docs
+        run: tar -xf ./docs.tar.gz
+      - name: Set Up GitHub Pages
+        uses: actions/configure-pages@v6
+      - name: Upload Artifacts
+        uses: actions/upload-pages-artifact@v5
+        with:
+          path: ./build/docs/html
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v4
+        uses: actions/deploy-pages@v5

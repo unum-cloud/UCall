@@ -2,7 +2,7 @@
 #
 # ~~~
 #   sudo apt install clang lld g++-mingw-w64-x86-64-posix
-#   cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake
+#   cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake -D UCALL_BUILD_TEST=ON
 #   cmake --build build_mingw
 # ~~~
 #

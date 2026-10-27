@@ -1,33 +1,18 @@
-==========
-Overview
-==========
-.. mdinclude:: ../README.md
+UCall Reference
+===============
 
-.. toctree:: 
-   :hidden:
+Every public symbol, generated from the documentation comments in the sources.
+Guides for each language live at `unum.cloud/docs/ucall <https://unum.cloud/docs/ucall>`_.
+Rust symbols are on `docs.rs <https://docs.rs/ucall>`_.
 
-   self
+.. toctree::
+   :caption: C
+   :maxdepth: 1
 
-.. toctree:: 
-   :hidden:
-   :caption: �
+   c/reference
 
-   c/index
+.. toctree::
+   :caption: Python
+   :maxdepth: 1
 
-.. toctree:: 
-   :hidden:
-   :caption: �
-
-   python/index
-
-.. toctree:: 
-   :hidden:
-   :caption: �
-
-   benchmarks
-
-.. toctree:: 
-   :hidden:
-   :caption: �
-
-   genindex
+   python/reference

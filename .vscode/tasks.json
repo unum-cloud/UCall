@@ -3,13 +3,13 @@
     "tasks": [
         {
             "label": "Build Debug",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Debug -B ./build_debug && make -j 12 --silent -C ./build_debug",
+            "command": "cmake --preset debug && cmake --build --preset debug",
             "args": [],
             "type": "shell"
         },
         {
             "label": "Build Release",
-            "command": "cmake -DCMAKE_BUILD_TYPE=Release -B ./build_release && make -j 12 --silent -C ./build_release",
+            "command": "cmake --preset release && cmake --build --preset release",
             "args": [],
             "type": "shell"
         },

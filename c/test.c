@@ -2,13 +2,11 @@
  *  @file c/test.c
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief A C caller of the linked library's name, status, outcome, Noise key, and version
- *      functions.
+ *  @brief A C caller of the linked library's name, status, outcome, and Noise key functions.
  */
 #undef NDEBUG
 #include <assert.h>
 #include <stdint.h>
-#include <stdio.h>
 #include <string.h>
 
 #include "ucall/ucall.h"
@@ -53,13 +51,5 @@ int main(void) {
     derive.public_key = NULL;
     ucall_noise_key_derive(&derive);
     assert(outcome.status == ucall_status_invalid_argument_k);
-
-    int major, minor, patch;
-    ucall_version(&major, &minor, &patch);
-    assert(major == UCALL_VERSION_MAJOR && minor == UCALL_VERSION_MINOR && patch == UCALL_VERSION_PATCH);
-    char version[64];
-    int length = snprintf(version, sizeof(version), "%d.%d.%d", major, minor, patch);
-    assert(length > 0 && (size_t)length < sizeof(version));
-    assert(strncmp(ucall_version_name(), version, (size_t)length) == 0);
     return 0;
 }

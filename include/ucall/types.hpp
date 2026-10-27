@@ -248,7 +248,7 @@ struct highest_kit<caps_, floor_, head_, tail_...> {
  *
  *  Not 64. Apple's arm64 cores use 128-byte lines, and x86 pulls adjacent lines in pairs for the
  *  prefetcher, so 64 leaves two hot fields sharing a fetch on both of the architectures we target.
- *  `alignas` needs a constant expression, so this is the conservative upper bound rather than
+ *  @c alignas needs a constant expression, so this is the conservative upper bound rather than
  *  whatever the machine in front of you reports.
  *
  *  Deliberately not @c std::hardware_destructive_interference_size: libstdc++ reports 64 for
@@ -272,7 +272,7 @@ using descriptor_t = int;
  *
  *  @tparam element_type_ Type of pooled elements. Must be nothrow default-constructible.
  *
- *  @code
+ *  @code{.cpp}
  * pool<connection_t> conn_pool;
  * conn_pool.reserve(100);
  * connection_t* conn = conn_pool.alloc();
@@ -343,7 +343,7 @@ class pool {
  *
  *  @tparam element_type_ Type of pooled elements. Must be nothrow default-constructible.
  *
- *  @code
+ *  @code{.cpp}
  * successive_pools<connection_t> conn_pools(100);
  * connection_t* conn = conn_pools.alloc();  // Auto-grows if needed
  * if (conn) { conn->reset(); conn_pools.release(conn); }
@@ -375,6 +375,7 @@ class successive_pools {
     /**
      *  @brief Constructs with initial pool capacity.
      *  @param[in] initial_capacity Number of elements in first pool (default 100).
+     *  @param[in] allocator Allocator the pools draw from.
      */
     explicit successive_pools(std::size_t initial_capacity = 100, allocator_type_ const& allocator = {}) noexcept
         : allocator_(allocator), initial_capacity_(initial_capacity) {}

@@ -24,14 +24,14 @@
  *  cover functional correctness and constant-time execution. Only surface syntax differs: type
  *  spellings, grouped declarations, comma-collapsed assignment runs. The transcription is held to
  *  the RFC 7748 and Wycheproof vectors plus a serial-versus-adx differential suite in
- *  `test/x25519.cpp`, so regenerate a kernel from the pinned sources below rather than hand-editing
- *  its body.
+ *  <tt>test/x25519.cpp</tt>, so regenerate a kernel from the pinned sources below rather than
+ *  hand-editing its body.
  *
- *  @see Fiat Cryptography origin v0.1.6+137, the radix-51 `fiat_25519_*` kernels:
+ *  @see Fiat Cryptography, the radix-51 @c fiat_25519_* kernels:
  *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c
- *  @see Fiat Cryptography origin v0.1.6+137, the saturated `fiat_25519_solinas_*` pair:
+ *  @see Fiat Cryptography, the saturated @c fiat_25519_solinas_* pair:
  *      https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c
- *  @see BoringSSL origin, main of 2026-08-04, the `fe4_*` family and the carry shims:
+ *  @see BoringSSL origin, main of 2026-08-04, the @c fe4_* family and the carry shims:
  *      https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h
  *  @see BoringSSL origin, main of 2026-08-04, the inversion chain's shape - forced by the exponent
  *      p-2 = 2^255-21 itself, so any correct Fermat inversion for this prime performs the same
@@ -67,8 +67,8 @@ using fiat_25519_int1_t = signed char;
 /**
  *  @brief The 128-bit accumulator the radix-51 limbs multiply into.
  *
- *  A typedef rather than a `using` alias because only the former accepts `__extension__`, which
- *  silences the pedantic warning about `__int128` being a language extension.
+ *  A typedef rather than a @c using alias because only the former accepts @c __extension__, which
+ *  silences the pedantic warning about @c __int128 being a language extension.
  */
 __extension__ typedef unsigned __int128 fiat_25519_uint128_t;
 #endif
@@ -761,7 +761,7 @@ struct field_saturated {
     /**
      *  @brief The saturated field backend: four full 64-bit limbs, little-endian, carry-chained.
      *
-     *  `fe4` is fiat's name for this shape - a field element in four limbs. Values stay unreduced
+     *  @c fe4 is fiat's name for this shape - a field element in four limbs. Values stay unreduced
      *  anywhere below 2^256 between operations; @c fe4_canon produces the canonical representative
      *  below 2^255-19 only at serialization.
      */
@@ -837,8 +837,8 @@ void field_square_repeated(typename field_type_::element_t& value, unsigned coun
  *  @brief Modular inversion via Fermat: @p out = @p value ^ (p-2) mod p, p = 2^255-19.
  *
  *  The squaring counts are forced by the exponent p-2 = 2^255-21 in binary - 250 set bits, then
- *  01011 - via the standard square-and-multiply-by-`2^k-1` chain. See the inversion permalink in
- *  this file's header comment for one worked reference.
+ *  01011 - via the standard square-and-multiply-by-<tt>2^k-1</tt> chain. See the inversion
+ *  permalink in this file's header comment for one worked reference.
  */
 template <typename field_type_>
 void field_invert(typename field_type_::element_t& out, typename field_type_::element_t const& value) noexcept {
@@ -1000,8 +1000,8 @@ bool x25519_scalar_multiply_radix51(span<byte_t, x25519_key_size_k> out, span<by
 /*  `flatten` is what makes this tier faster than `serial` rather than merely named differently. A
  *  target region applies to what is generated inside it, and a template's members are generated
  *  where the template is defined - outside. Without forcing the kernels into this body they compile
- *  untargeted: measured 5 `MULX` against 566. Correctness never depended on it, and neither does
- *  `serial` staying free of `MULX` - the schoolbook multiply has nothing to lower. */
+ *  untargeted: measured 5 @c MULX against 566. Correctness never depended on it, and neither does
+ *  @c serial staying free of @c MULX - the schoolbook multiply has nothing to lower. */
 __attribute__((flatten)) bool x25519_scalar_multiply_adx(span<byte_t, x25519_key_size_k> out,
                                                          span<byte_t const, x25519_key_size_k> scalar,
                                                          span<byte_t const, x25519_key_size_k> point) noexcept {

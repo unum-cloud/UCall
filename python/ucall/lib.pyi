@@ -308,7 +308,7 @@ class Request(Buffer):
         """Looks up a placeholder the endpoint's URI template captured.
 
         Args:
-          name (str | bytes): The placeholder name without braces, "path" for "{*path}".
+          name (str | bytes): The placeholder name without braces, "path" for `{*path}`.
 
         Returns:
           str | None: The captured text as sent, or None when the template has no such
@@ -339,7 +339,7 @@ class Request(Buffer):
           ...     request.reply(request.body, headers=("content-type: application/octet-stream",))
         """
     def reply_error(self, status: int, message: str | bytes) -> None:
-        """Answers the request with an error status and a plain-text message, once.
+        r"""Answers the request with an error status and a plain-text message, once.
 
         Args:
           status (int): The HTTP status, 400 or above.
@@ -352,7 +352,7 @@ class Request(Buffer):
         Example:
           >>> @server.get("/teapot")
           ... def teapot(request: ucall.Request):
-          ...     request.reply_error(418, "short and stout\\n")
+          ...     request.reply_error(418, "short and stout\n")
         """
     def __buffer__(self, flags: int, /) -> memoryview: ...
 
@@ -471,7 +471,7 @@ class Server:
         reply as binary, `str` as UTF-8 text, and anything else as JSON. An exception answers 500.
 
         Args:
-          path (str): A URI template such as "/users/{name}" or "/files/{*path}".
+          path (str): A URI template such as `/users/{name}` or `/files/{*path}`.
           verb (Verb): The method to answer; `Verb.ANY` answers every one.
           handler (Callable): The function to route to.
 
@@ -571,7 +571,7 @@ class Server:
         """Registers the decorated function for PUT requests matching the URI template `path`.
 
         Args:
-          path (str): A URI template such as "/files/{*path}".
+          path (str): A URI template such as `/files/{*path}`.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -585,7 +585,7 @@ class Server:
         """Registers the decorated function for DELETE requests matching the URI template `path`.
 
         Args:
-          path (str): A URI template such as "/files/{*path}".
+          path (str): A URI template such as `/files/{*path}`.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.

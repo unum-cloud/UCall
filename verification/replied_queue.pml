@@ -7,22 +7,20 @@
  *
  *  A pusher clears its link's @c next, exchanges the tail to its link, and stores its link into
  *  the @c next of the link it displaced, with a release. The loop alone walks from its head, which
- *  starts at the stub: it steps past the stub, hands out a link once its @c next is set, and with
- *  the last link left re-queues the stub behind it, stopping short whenever a pusher has exchanged
- *  the tail but not linked yet. Two repliers each write a payload, then queue their exchange's
- *  link; the loop drains until it met both.
+ *  starts at the stub. Two repliers each write a payload, then queue their exchange's link; the
+ *  loop drains until it met both.
  *
- *  Each link comes out exactly once, and the loop reads the payload its replier wrote before
- *  queueing it.
+ *  - Each link comes out exactly once.
+ *  - The loop reads the payload its replier wrote before queueing it.
  *
  *  @verify pass sc,rc11
- *  @verify fail rc11 link_order=order_relaxed: a pusher publishes its link with a release store;
- *      relaxed, the loop follows the link and reads the payload from before the replier wrote it
+ *  @verify fail rc11 link_order=order_relaxed: relaxed, the loop follows the link and reads the
+ *      payload from before the replier wrote it
  */
 #define thread_count 3
 #define location_count 6
 #define history_depth 8
-#include "weak_memory.pml"
+#include <weak_memory.pml>
 
 /** The links: the loop's stub and one per replier, and none, which no `next` names. */
 #define stub 0

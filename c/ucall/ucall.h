@@ -1,7 +1,7 @@
 /**
  *  @file c/ucall/ucall.h
  *  @author Ash Vardanian
- *  @date Feb 3, 2023
+ *  @date February 3, 2023
  *  @brief The UCall C interface: shared vocabulary, clients, and servers behind one include.
  */
 #ifndef UNUM_UCALL_H

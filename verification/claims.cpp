@@ -8,14 +8,16 @@
  *  Two repliers claim one exchange with @c fetch_test_and_set_bit on its claimed bit, acquiring
  *  and releasing, then load the state with an acquire to learn whether the connection left. The
  *  loop marks the exchange orphaned with a plain write, as @c detach clears its connection, then
- *  sets the detached bit with a release. Exactly one replier claims, and a claimer that reads the
- *  detached bit reads the orphaned mark too, so it never answers into a connection that is gone.
+ *  sets the detached bit with a release.
+ *
+ *  - Exactly one replier claims.
+ *  - A claimer that reads the detached bit reads the orphaned mark too.
  *
  *  @verify pass sc,rc11,imm claims
- *  @verify fail rc11,imm claims_detach_order_relaxed: @c detach releases with its bit set; relaxed,
- *      a claimer reads the bit without the orphaned mark, racing with its write
- *  @verify fail rc11,imm claims_state_order_relaxed: a claimer acquires with its load of the state;
- *      relaxed, it reads the detached bit without the orphaned mark, racing with its write
+ *  @verify fail rc11,imm claims_detach_order_relaxed: relaxed, a claimer reads the bit without the
+ *      orphaned mark, racing with its write
+ *  @verify fail rc11,imm claims_state_order_relaxed: relaxed, it reads the detached bit without the
+ *      orphaned mark, racing with its write
  */
 #include <cstdint> // `std::uint32_t` - the state word
 
