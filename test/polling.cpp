@@ -981,7 +981,9 @@ static case_result_t direct_files() {
         return case_result_t::skipped("the directory serves no unbuffered reads");
     }
     engine_type_ engine;
-    require(0, engine.open(4, 4) == ucall_status_success_k);
+    ucall_status_t const opened = engine.open(4, 4);
+    if (opened == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this backend");
+    require(0, opened == ucall_status_success_k);
     std::size_t failures = 0;
     require(failures, files.fill());
     std::size_t const alignment = files.directory.alignment;
@@ -1099,7 +1101,12 @@ static case_result_t epollaio_reads() {
     announce("one AIO event serializes four reads");
     uc::linux_epollaio_engine_t engine;
     engine.files.depth = 1;
-    require(failures, engine.open(8, 8) == ucall_status_success_k && engine.files.depth == 1);
+    ucall_status_t const opened = engine.open(8, 8);
+    if (opened == ucall_status_unsupported_k) {
+        ::close(file);
+        return case_result_t::skipped("the kernel lacks Linux AIO");
+    }
+    require(failures, opened == ucall_status_success_k && engine.files.depth == 1);
     std::array<aligned_bytes_t, 4> windows {aligned_bytes_t {alignment}, aligned_bytes_t {alignment},
                                             aligned_bytes_t {alignment}, aligned_bytes_t {alignment}};
     std::array<uc::io_request_t, 4> reads {};
@@ -1163,7 +1170,9 @@ static case_result_t epollaio_reads() {
  *  zero-copy send copies and whose next release completes at once. */
 static case_result_t epollaio_zero_copy_sends() {
     uc::linux_epollaio_engine_t engine;
-    require(0, engine.open(8, 8) == ucall_status_success_k);
+    ucall_status_t const opened = engine.open(8, 8);
+    if (opened == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks Linux AIO");
+    require(0, opened == ucall_status_success_k);
     std::size_t failures = 0;
     loopback_pair_t sockets = loopback_pair();
     require(failures, sockets.connected() && uc::nonblocking(sockets.client) == ucall_status_success_k &&
