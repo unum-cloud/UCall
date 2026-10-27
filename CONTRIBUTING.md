@@ -54,11 +54,13 @@ qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network
 ### Model Checking
 
 `verification/` holds Spin models of the protocols replies cross threads by, each naming its expected verdicts in `@verify` lines, including the mutants that must fail.
-`check.sh` runs them, and GenMC clients when `GENMC` names its executable; `weak_memory.pml` models the C++ memory model for Spin.
+`check.sh` runs them through ForkUnion's runner, which also brings `weak_memory.pml`, its model of the C++ memory model for Spin, and runs GenMC clients when `GENMC` names its executable.
+It takes ForkUnion from the `forkunion` submodule, or from the checkout `FORKUNION_SOURCE` names.
 
 ```bash
+git submodule update --init forkunion
 ./verification/check.sh
-./verification/check.sh verification/segment_links.pml
+./verification/check.sh segment_links.pml
 ```
 
 ## Python Builds
