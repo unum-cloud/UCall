@@ -22,29 +22,32 @@ function (ucall_sibling name_ override_ repository_ tag_)
     endif ()
 endfunction ()
 
-# The siblings tune their own units for the same CPU, and probe what this host runs under `native`.
-if (UCALL_TARGET_ARCH)
-    set(FORKUNION_TARGET_ARCH ${UCALL_TARGET_ARCH})
-    set(STRINGZILLA_TARGET_ARCH ${UCALL_TARGET_ARCH})
-    set(NUMKONG_TARGET_ARCH ${UCALL_TARGET_ARCH})
+# The siblings compile at the same floor and build kind.
+if (UCALL_MARCH)
+    set(FORKUNION_MARCH ${UCALL_MARCH})
+    set(STRINGZILLA_MARCH ${UCALL_MARCH})
+    set(NUMKONG_MARCH ${UCALL_MARCH})
 endif ()
+set(FORKUNION_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
+set(STRINGZILLA_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
+set(NUMKONG_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
 
 ucall_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
-    53fb6a67b188561ffcab506ee3d03901716b1b49
+    a43a398cecd159f6c383843756540b898a45bee7
 )
 ucall_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
-    0b9296ebe0dc3886f4f850f0dc97d6ce382ac909
+    5fac4b88fcd2f611db41055da2b20e1e765449a2
 )
 ucall_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
-    e45080c7ea61a5a9c7fc90ac8b9595b49b341574
+    fe3d32edb4685b925e62a427ef6ebdf74b311af9
 )
 
 if (UCALL_BUILD_TOOLS)
     ucall_sibling(
         numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
-        3fecca8d625ccc89ba2605e195e621e48446c795
+        5d67bd8aafa28867b2d73694f24496c274721397
     )
 endif ()

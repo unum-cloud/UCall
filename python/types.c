@@ -75,7 +75,7 @@ ucall_py_enum_mirror_t ucall_py_backend_enum = {
     "Backend", doc_Backend, ucall_io_backend_automatic_k, ucall_io_backend_windows_iocp_k, spell_backend, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_cpu_class_enum = {
-    "CPUClass", doc_CPUClass, ucall_cpu_class_unknown_k, ucall_cpu_class_aws_g5_k, spell_cpu_class, NULL,
+    "CPUClass", doc_CPUClass, ucall_cpu_class_unknown_k, ucall_cpu_class_monoversioned_k, spell_cpu_class, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_security_enum = {
     "Security", doc_Security, ucall_security_mode_none_k, ucall_security_mode_noise_kk_k, spell_security, NULL,

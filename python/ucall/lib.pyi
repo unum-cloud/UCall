@@ -127,6 +127,7 @@ class CPUClass(enum.IntEnum):
     AWS_G2 = 7
     APPLE_M2 = 8
     AWS_G5 = 9
+    MONOVERSIONED = 10
 
 class Security(enum.IntEnum):
     """Transport encryption of an `Interface` or a client call: plaintext or a Noise pattern.

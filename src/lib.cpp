@@ -108,6 +108,7 @@ char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
     case ucall_cpu_class_aws_g2_k: return "aws-g2";
     case ucall_cpu_class_apple_m2_k: return "apple-m2";
     case ucall_cpu_class_aws_g5_k: return "aws-g5";
+    case ucall_cpu_class_monoversioned_k: return "monoversioned";
     }
     return "unknown";
 }
@@ -120,7 +121,7 @@ ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name) {
 }
 
 ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name) {
-    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_aws_g5_k;
+    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_monoversioned_k;
          cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1))
         if (named(ucall_cpu_class_name(cpu_class), name)) return cpu_class;
     return ucall_cpu_class_unknown_k;

@@ -46,22 +46,12 @@ set(UCALL_BUILD_SANITIZERS
     CACHE STRING "Sanitizers for UCall's own targets: off, address (with undefined) or thread"
 )
 set_property(CACHE UCALL_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
-# Seeded from the environment at the first configure, so `cargo` and `scikit-build-core` honour
-# `UCALL_TARGET_ARCH=native`.
-set(UCALL_TARGET_ARCH
-    "$ENV{UCALL_TARGET_ARCH}"
-    CACHE STRING
-          "CPU the own units and the siblings are tuned for: empty for the toolchain default, native, or a CPU name"
+# Seeded from the environment at the first configure, so `cargo` and `scikit-build-core` honour `UCALL_MARCH=native`.
+set(UCALL_MARCH
+    "$ENV{UCALL_MARCH}"
+    CACHE STRING "The `-march` floor of the own units and the siblings: empty, an ISA level, native, or a CPU name"
 )
-set(UCALL_TARGET_CLASSES
-    ""
-    CACHE STRING "CPU classes compiled beside serial: empty for every class, a list like intel_icelake, or native"
-)
-if (UCALL_TARGET_CLASSES STREQUAL "native" AND NOT UCALL_TARGET_ARCH STREQUAL "native")
-    message(FATAL_ERROR "UCALL_TARGET_CLASSES=native reads what this host runs, which the siblings probe only under "
-                        "UCALL_TARGET_ARCH=native"
-    )
-endif ()
+option(UCALL_MULTIVERSIONED "Keep every CPU class the toolchain compiles, or only the best ones UCALL_MARCH implies" ON)
 
 include(cmake/ucall_flags.cmake)
 include(cmake/ucall_platform.cmake)
@@ -161,7 +151,7 @@ if (UCALL_BUILD_TEST)
     FetchContent_MakeAvailable(fmt)
 endif ()
 
-add_library(ucall STATIC src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp src/variants_serial.cpp)
+add_library(ucall STATIC src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp)
 add_library(ucall::ucall ALIAS ucall)
 add_library(ucall::header ALIAS ucall)
 target_include_directories(
@@ -209,20 +199,19 @@ if (UCALL_WITH_LINUX_URING)
 endif ()
 
 # One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
-# kits and atomics use, each enabled, oldest first. Its unit takes the StringZilla flags of those capabilities in that
-# order, so on Arm the last `-march` holds every extension. A targeted build keeps serial and the named classes, or
-# under `native` the classes this host runs in full; every gate is `UCALL_TARGET_<CLASS>` set to 0 or 1.
+# kits and atomics use, oldest first, `serial` over none. A class exists when each of them is enabled. Its unit takes
+# the StringZilla flags of those capabilities in that order, so on Arm the last `-march` holds every extension. A
+# multiversioned build keeps every class that exists. A monoversioned one keeps none of them, serial included, and
+# compiles the `monoversioned` class instead, over every capability the libraries enabled: what `UCALL_MARCH` implies
+# and what a preset vouches for, with the flags of the vouched ones. Every gate is `UCALL_TARGET_<CLASS>` set to 0 or 1.
 function (ucall_cpu_variant class_ target_macro_)
-    set(kept_ TRUE)
+    set(kept_ FALSE)
+    if (UCALL_MULTIVERSIONED OR class_ STREQUAL "monoversioned")
+        set(kept_ TRUE)
+    endif ()
     set(flags_)
     foreach (capability_ IN LISTS ARGN)
         if (NOT stringzilla_target_${capability_}_enabled AND NOT forkunion_target_${capability_}_enabled)
-            set(kept_ FALSE)
-        elseif (
-            UCALL_TARGET_CLASSES STREQUAL "native"
-            AND NOT stringzilla_target_${capability_}_runs
-            AND NOT forkunion_target_${capability_}_runs
-        )
             set(kept_ FALSE)
         endif ()
         # MSVC takes one `/arch:`, the newest capability's, and warns when a later one overrides an earlier.
@@ -232,12 +221,6 @@ function (ucall_cpu_variant class_ target_macro_)
             list(APPEND flags_ ${stringzilla_target_${capability_}_flags})
         endif ()
     endforeach ()
-    if (UCALL_TARGET_CLASSES
-        AND NOT UCALL_TARGET_CLASSES STREQUAL "native"
-        AND NOT class_ IN_LIST UCALL_TARGET_CLASSES
-    )
-        set(kept_ FALSE)
-    endif ()
     if (kept_)
         target_compile_definitions(ucall PRIVATE UCALL_TARGET_${target_macro_}=1)
         target_sources(ucall PRIVATE src/variants_${class_}.cpp)
@@ -247,6 +230,7 @@ function (ucall_cpu_variant class_ target_macro_)
     endif ()
 endfunction ()
 
+ucall_cpu_variant(serial SERIAL)
 ucall_cpu_variant(intel_haswell INTEL_HASWELL westmere haswell)
 ucall_cpu_variant(intel_skylake INTEL_SKYLAKE westmere haswell skylake)
 ucall_cpu_variant(
@@ -270,18 +254,34 @@ ucall_cpu_variant(
     arm64_lse
     arm64_rcpc
 )
-ucall_cpu_variant(
-    aws_g5
-    AWS_G5
-    neon
-    neonaes
-    neonsha
-    sve
-    sve2
-    sve2aes
-    arm64_lse
-    arm64_rcpc
-)
+
+if (UCALL_MARCH)
+    set(ucall_floor_ "${UCALL_MARCH}")
+else ()
+    set(ucall_floor_ "the portable floor")
+endif ()
+if (UCALL_MULTIVERSIONED)
+    target_compile_definitions(ucall PRIVATE UCALL_TARGET_MONOVERSIONED=0)
+    message(STATUS "UCall: multiversioned above ${ucall_floor_}")
+else ()
+    get_property(ucall_capabilities_enabled_ GLOBAL PROPERTY stringzilla_capabilities_enabled)
+    get_property(forkunion_capabilities_enabled_ GLOBAL PROPERTY forkunion_capabilities_enabled)
+    list(APPEND ucall_capabilities_enabled_ ${forkunion_capabilities_enabled_})
+    # The floor already holds what it implies, and a later `-march` would lower an Arm `-mcpu` floor.
+    set(ucall_capabilities_summary_)
+    set(ucall_capabilities_vouched_)
+    foreach (capability_ IN LISTS ucall_capabilities_enabled_)
+        string(APPEND ucall_capabilities_summary_ " ${capability_}")
+        if (NOT capability_ STREQUAL "serial"
+            AND NOT stringzilla_target_${capability_}_implied
+            AND NOT forkunion_target_${capability_}_implied
+        )
+            list(APPEND ucall_capabilities_vouched_ ${capability_})
+        endif ()
+    endforeach ()
+    message(STATUS "UCall: monoversioned for ${ucall_floor_}:${ucall_capabilities_summary_}")
+    ucall_cpu_variant(monoversioned MONOVERSIONED ${ucall_capabilities_vouched_})
+endif ()
 
 if (UCALL_BUILD_TOOLS)
     foreach (example_ echo ledger redis inference)

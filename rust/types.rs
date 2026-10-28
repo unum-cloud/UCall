@@ -579,6 +579,8 @@ pub enum CPUClass {
     AppleM2 = 8,
     /// Arm server cores from AWS Graviton 5 on.
     AWSG5 = 9,
+    /// The one class of a monoversioned build, with every capability it compiled.
+    Monoversioned = 10,
 }
 
 impl CPUClass {
@@ -598,6 +600,7 @@ impl CPUClass {
             7 => Some(CPUClass::AWSG2),
             8 => Some(CPUClass::AppleM2),
             9 => Some(CPUClass::AWSG5),
+            10 => Some(CPUClass::Monoversioned),
             _ => None,
         }
     }

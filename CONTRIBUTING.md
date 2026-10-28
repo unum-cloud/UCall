@@ -23,8 +23,10 @@ The build exposes one library as `ucall::ucall`.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
 CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
 Each class unit compiles when StringZilla and ForkUnion enable every capability it uses, with StringZilla's flags for them.
-`UCALL_TARGET_ARCH` tunes UCall's own units for one CPU, `native` or a name like `graniterapids`, and hands the same value to the siblings.
-`UCALL_TARGET_CLASSES` compiles `serial` plus the CPU classes it lists, or under `native` the classes this host runs in full, which needs `UCALL_TARGET_ARCH=native`; empty compiles every class.
+`UCALL_MARCH` raises the floor of UCall's own units to an ISA level, `native` or a CPU name like `graniterapids`, and hands the same value to the siblings.
+`UCALL_MULTIVERSIONED`, on by default, compiles every class that exists, `serial` included, and picks among them at run time.
+Off, it builds for one machine and compiles only the `monoversioned` class, over every capability the libraries enabled: what the floor implies and what a preset vouches for with `-D <LIBRARY>_TARGET_<CAPABILITY>=1`.
+A pinned class or ceiling below that class then fails as unsupported rather than running it.
 The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set both, and CI compiles each of them, beside `android_arm64` over the epoll backend and `msvc2026_x64` with Visual Studio.
 `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 

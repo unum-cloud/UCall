@@ -70,7 +70,8 @@ typedef enum ucall_cpu_class_t {
     ucall_cpu_class_intel_sierra_k,
     ucall_cpu_class_aws_g2_k,
     ucall_cpu_class_apple_m2_k,
-    ucall_cpu_class_aws_g5_k
+    ucall_cpu_class_aws_g5_k,
+    ucall_cpu_class_monoversioned_k
 } ucall_cpu_class_t;
 
 /** Returns the stable name of an I/O backend. */
