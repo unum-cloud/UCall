@@ -85,18 +85,29 @@ struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
     template <typename value_type_>
     using type = fu::arm64_rcpc_atomic_ref<value_type_>;
 };
-#else
 template <>
-struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> : atomic_ref_for_cpu_class<cpu_class_t::aws_g2_k> {};
+struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
+};
+#elif FORKUNION_TARGET_ARM64_LSE
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
+    template <typename value_type_>
+    using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
 #endif
-template <>
-struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> : atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {};
 
 /** The kits and atomic reference one CPU class builds its network from, each picked once here. */
 template <cpu_class_t cpu_class_>
 struct cpu_traits {
     static constexpr sz_capability_t stringzilla_capabilities_k = stringzilla_capabilities_of(cpu_class_) &
-                                                                  sz_capabilities_compiled_cpu_();
+                                                                  sz_capabilities_compiled_cpu_mask();
     using compare_kit_t = compare_kit<stringzilla_capabilities_k>;
     using find_kit_t = find_kit<stringzilla_capabilities_k>;
     using byteset_kit_t = byteset_kit<stringzilla_capabilities_k>;
@@ -164,12 +175,46 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
     }
 }
 
-/** Reads the reference's entire mask, so RCpc also requires LSE. */
-template <cpu_class_t cpu_class_>
-constexpr bool cpu_class_admits(sz_capability_t strings, fu::capabilities_t atomics) noexcept {
-    constexpr auto string_mask = cpu_traits<cpu_class_>::stringzilla_capabilities_k;
-    constexpr auto atomic_mask = forkunion_capabilities_of<cpu_class_>();
-    return (strings & string_mask) == string_mask && (atomics & atomic_mask) == atomic_mask;
+/** ForkUnion's mask for a class named at run time, as a pinned class names it. */
+constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept {
+    switch (cpu) {
+    case cpu_class_t::intel_haswell_k: return forkunion_capabilities_of<cpu_class_t::intel_haswell_k>();
+    case cpu_class_t::intel_skylake_k: return forkunion_capabilities_of<cpu_class_t::intel_skylake_k>();
+    case cpu_class_t::intel_icelake_k: return forkunion_capabilities_of<cpu_class_t::intel_icelake_k>();
+    case cpu_class_t::intel_alder_k: return forkunion_capabilities_of<cpu_class_t::intel_alder_k>();
+    case cpu_class_t::intel_sierra_k: return forkunion_capabilities_of<cpu_class_t::intel_sierra_k>();
+    case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
+    case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
+    case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
+    default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
+    }
+}
+
+/** What one server or client may use: the masks this machine runs when nothing is pinned, the
+ *  pinned class's masks when it runs them, refusing a class it does not. The one caller of
+ *  StringZilla's and ForkUnion's detection. */
+inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t pinned, cpu_ceiling_t& ceiling) noexcept {
+    cpu_ceiling_t detected;
+    if (sz_capabilities_detected_cpu(&detected.compute) != sz_success_k) detected.compute = sz_cap_serial_k;
+    detected.sync = fu::cpu_capabilities();
+    if (pinned == ucall_cpu_class_unknown_k) {
+        ceiling = detected;
+        return ucall_status_success_k;
+    }
+    if (pinned > ucall_cpu_class_aws_g5_k) return ucall_status_unsupported_k;
+    cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
+    cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
+    if ((detected.compute & wanted.compute) != wanted.compute || (detected.sync & wanted.sync) != wanted.sync)
+        return ucall_status_unsupported_k;
+    ceiling = wanted;
+    return ucall_status_success_k;
+}
+
+/** Whether @p rung fits under @p ceiling: its compiled string kernels and its atomic reference's
+ *  entire mask, so RCpc with LSE, need nothing the ceiling lacks. */
+constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
+    sz_capability_t const strings = stringzilla_capabilities_of(rung) & sz_capabilities_compiled_cpu_mask();
+    return (strings & ~ceiling.compute) == 0 && (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
 }
 
 template <cpu_class_t cpu_class_, typename init_type_>
@@ -210,82 +255,27 @@ extern template void make_network_variant<cpu_class_t::aws_g5_k>(ucall_server_in
 extern template void make_network_variant<cpu_class_t::aws_g5_k>(ucall_client_init_t*) noexcept;
 #endif
 
-template <cpu_class_t cpu_class_, typename init_type_>
-bool make_network_for_cpu(init_type_* arguments, sz_capability_t strings, fu::capabilities_t atomics) noexcept {
-    if constexpr (cpu_class_compiled(cpu_class_) && rung_advances<cpu_class_>()) {
-        if (cpu_class_admits<cpu_class_>(strings, atomics)) {
-            make_network_variant<cpu_class_>(arguments);
-            return true;
-        }
-    }
-    return false;
-}
+/** CPU classes newest first, the order a ladder tries them in. */
+template <cpu_class_t... classes_>
+struct cpu_ladder {};
 
-template <cpu_class_t head_, cpu_class_t... tail_, typename init_type_>
-void descend_network_ladder(init_type_* arguments, sz_capability_t strings, fu::capabilities_t atomics) noexcept {
-    if (make_network_for_cpu<head_>(arguments, strings, atomics)) return;
-    if constexpr (sizeof...(tail_)) descend_network_ladder<tail_...>(arguments, strings, atomics);
-    else publish(arguments->outcome, ucall_status_unsupported_k);
-}
+/** The classes carrying variants, each lineage newest first and the serial floor last; a rung the
+ *  build left out is skipped by the walk, never by the list. */
+using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k,
+                                cpu_class_t::intel_alder_k, cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k,
+                                cpu_class_t::apple_m2_k, cpu_class_t::aws_g2_k, cpu_class_t::serial_k>;
 
-template <typename init_type_>
-void descend_x86_ladder(init_type_* arguments, sz_capability_t strings, fu::capabilities_t atomics) noexcept {
-    descend_network_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k,
-                           cpu_class_t::intel_alder_k, cpu_class_t::intel_haswell_k, cpu_class_t::serial_k>(
-        arguments, strings, atomics);
-}
-
-template <typename init_type_>
-void descend_arm_ladder(init_type_* arguments, sz_capability_t strings, fu::capabilities_t atomics) noexcept {
-    descend_network_ladder<cpu_class_t::aws_g5_k, cpu_class_t::apple_m2_k, cpu_class_t::aws_g2_k,
-                           cpu_class_t::serial_k>(arguments, strings, atomics);
-}
-
-template <typename init_type_>
-void make_network(init_type_* arguments, sz_capability_t strings, fu::capabilities_t atomics) noexcept {
-    if (!arguments) return;
-    strings &= sz_capabilities_compiled_cpu_();
-    if (arguments->config->cpu_class == ucall_cpu_class_unknown_k) {
-#if STRINGZILLA_ARCH_X8664_
-        descend_x86_ladder(arguments, strings, atomics);
-#elif STRINGZILLA_ARCH_ARM64_
-        descend_arm_ladder(arguments, strings, atomics);
-#else
-        descend_network_ladder<cpu_class_t::serial_k>(arguments, strings, atomics);
-#endif
-        return;
-    }
-    switch (static_cast<cpu_class_t>(arguments->config->cpu_class)) {
-    case cpu_class_t::serial_k:
-        if (make_network_for_cpu<cpu_class_t::serial_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::intel_haswell_k:
-        if (make_network_for_cpu<cpu_class_t::intel_haswell_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::intel_skylake_k:
-        if (make_network_for_cpu<cpu_class_t::intel_skylake_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::intel_icelake_k:
-        if (make_network_for_cpu<cpu_class_t::intel_icelake_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::intel_alder_k:
-        if (make_network_for_cpu<cpu_class_t::intel_alder_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::intel_sierra_k:
-        if (make_network_for_cpu<cpu_class_t::intel_sierra_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::aws_g2_k:
-        if (make_network_for_cpu<cpu_class_t::aws_g2_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::apple_m2_k:
-        if (make_network_for_cpu<cpu_class_t::apple_m2_k>(arguments, strings, atomics)) return;
-        break;
-    case cpu_class_t::aws_g5_k:
-        if (make_network_for_cpu<cpu_class_t::aws_g5_k>(arguments, strings, atomics)) return;
-        break;
-    default: break;
-    }
-    publish(arguments->outcome, ucall_status_unsupported_k);
+/** Builds the network on the newest rung of @p ladder the build compiled and @p ceiling fits; the
+ *  serial floor fits every ceiling, and a class picking its parent's kits and atomics is skipped
+ *  without instantiating its variant. */
+template <cpu_class_t... classes_, typename init_type_>
+void make_network(cpu_ladder<classes_...>, init_type_* arguments, cpu_ceiling_t ceiling) noexcept {
+    bool picked = false;
+    auto rung = [&]<cpu_class_t class_>() noexcept {
+        if constexpr (cpu_class_compiled(class_) && rung_advances<class_>())
+            if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, make_network_variant<class_>(arguments);
+    };
+    (rung.template operator()<classes_>(), ...);
 }
 
 } // namespace unum::ucall

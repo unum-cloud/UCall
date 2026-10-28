@@ -23,6 +23,13 @@ set_target_properties(
                LINKER_LANGUAGE CXX
 )
 target_link_libraries(ucall_python PRIVATE ucall::ucall)
+# The module's one export is its init function; the archives linked inside, UCall's own and its siblings', keep their
+# symbols to themselves.
+set_target_properties(ucall_python PROPERTIES VISIBILITY_INLINES_HIDDEN ON)
+target_link_options(
+    ucall_python PRIVATE $<$<PLATFORM_ID:Linux,Android,FreeBSD>:LINKER:--exclude-libs,ALL>
+    $<$<PLATFORM_ID:Darwin>:LINKER:-exported_symbol,_PyInit_lib>
+)
 if (NOT MSVC)
     target_compile_options(ucall_python PRIVATE -Wall -Wextra -Wno-unused-parameter -Wno-missing-field-initializers)
 endif ()

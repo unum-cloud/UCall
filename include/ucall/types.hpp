@@ -107,12 +107,21 @@
 #include <forkunion/atomics.hpp>
 #include <forkunion/capabilities.hpp>
 #include <smashtable/basic_vector.hpp>
+#include <stringzilla/capabilities.h>
 
 #include "ucall/ucall.h" // `ucall_callback_t`
 
 namespace unum::ucall {
+namespace fu = ashvardanian::forkunion;
 struct wake_channel_t;
-}
+
+/** What one server or client may use: the StringZilla kernels its kits run and the ForkUnion
+ *  atomics it synchronizes with, picked once at init. */
+struct cpu_ceiling_t {
+    sz_capability_t compute = sz_cap_serial_k;
+    fu::capabilities_t sync = fu::capabilities_unknown_k;
+};
+} // namespace unum::ucall
 namespace uc = unum::ucall;
 
 struct ucall_server_handle_t {
@@ -155,7 +164,7 @@ struct ucall_server_handle_t {
         void (*request_part)(ucall_server_request_part_t*);
     };
     api_t const* api {};
-    std::uint64_t string_capabilities {}, atomic_capabilities {};
+    uc::cpu_ceiling_t ceiling;
 };
 struct ucall_client_handle_t {
     ucall_client_handle_t() noexcept = default;
@@ -170,7 +179,7 @@ struct ucall_client_handle_t {
         void (*take_completed)(ucall_client_take_completed_t*);
     };
     api_t const* api {};
-    std::uint64_t string_capabilities {}, atomic_capabilities {};
+    uc::cpu_ceiling_t ceiling;
 };
 struct ucall_received_http_request_handle_t {};
 struct ucall_http_batch_endpoint_handle_t {};
@@ -190,7 +199,6 @@ inline void publish(ucall_outcome_t* outcome, ucall_status_t status, char const*
 inline void publish(ucall_outcome_t* outcome, ucall_status_t status) noexcept {
     publish(outcome, status, ucall_status_name(status));
 }
-namespace fu = ashvardanian::forkunion;
 namespace st = ashvardanian::smashtable;
 
 /** Raw storage, with the same width as the C interface's ucall_byte_t. */

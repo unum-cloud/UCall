@@ -11,6 +11,8 @@ project(
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Each UCall target declares its own language level, so fetched dependencies build at the standard they pick.
 set(CMAKE_CXX_EXTENSIONS NO)
+# No target uses C++20 modules, and a Clang installed without `clang-scan-deps` would fail every C++ unit.
+set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
 set(ucall_default_posix_ OFF)
 set(ucall_default_linux_ OFF)
@@ -44,6 +46,22 @@ set(UCALL_BUILD_SANITIZERS
     CACHE STRING "Sanitizers for UCall's own targets: off, address (with undefined) or thread"
 )
 set_property(CACHE UCALL_BUILD_SANITIZERS PROPERTY STRINGS off address thread)
+# Seeded from the environment at the first configure, so `cargo` and `scikit-build-core` honour
+# `UCALL_TARGET_ARCH=native`.
+set(UCALL_TARGET_ARCH
+    "$ENV{UCALL_TARGET_ARCH}"
+    CACHE STRING
+          "CPU the own units and the siblings are tuned for: empty for the toolchain default, native, or a CPU name"
+)
+set(UCALL_TARGET_CLASSES
+    ""
+    CACHE STRING "CPU classes compiled beside serial: empty for every class, a list like intel_icelake, or native"
+)
+if (UCALL_TARGET_CLASSES STREQUAL "native" AND NOT UCALL_TARGET_ARCH STREQUAL "native")
+    message(FATAL_ERROR "UCALL_TARGET_CLASSES=native reads what this host runs, which the siblings probe only under "
+                        "UCALL_TARGET_ARCH=native"
+    )
+endif ()
 
 # ThreadSanitizer sees no inline assembly, so ForkUnion leaves out the capabilities it cannot see when told.
 set(FORKUNION_BUILD_SANITIZERS ${UCALL_BUILD_SANITIZERS})
@@ -51,8 +69,11 @@ set(FORKUNION_BUILD_SANITIZERS ${UCALL_BUILD_SANITIZERS})
 if (UCALL_WITH_POSIX AND NOT UNIX)
     message(FATAL_ERROR "The POSIX backend requires a POSIX platform")
 endif ()
-if ((UCALL_WITH_LINUX_URING OR UCALL_WITH_LINUX_EPOLLAIO) AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "The epoll-AIO and io_uring backends require Linux")
+if (UCALL_WITH_LINUX_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    message(FATAL_ERROR "The io_uring backends require Linux")
+endif ()
+if (UCALL_WITH_LINUX_EPOLLAIO AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+    message(FATAL_ERROR "The epoll-AIO backend requires Linux or Android")
 endif ()
 if (UCALL_WITH_KQUEUE AND NOT (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD"))
     message(FATAL_ERROR "The kqueue backend requires macOS or FreeBSD")
@@ -83,7 +104,6 @@ if (MSVC)
     set(CMAKE_CXX_FLAGS_RELWITHDEBINFO "${CMAKE_CXX_FLAGS_RELWITHDEBINFO} /O2 /DEBUG")
 else ()
     set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fPIC")
-    set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -fno-exceptions")
     set(CMAKE_CXX_FLAGS_DEBUG "${CMAKE_CXX_FLAGS_DEBUG} -g")
     set(CMAKE_CXX_FLAGS_RELEASE "${CMAKE_CXX_FLAGS_RELEASE} -O3")
 endif ()
@@ -106,36 +126,43 @@ find_package(Threads REQUIRED)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-function (ucall_sibling name_ source_override_ target_ url_ revision_)
-    if (TARGET ${target_})
+# A sibling builds from its nested checkout, or else from the commit its submodule pins, fetched unless the override
+# variable the caller passes, `FETCHCONTENT_SOURCE_DIR_<NAME>`, names a local checkout.
+function (ucall_sibling name_ override_ repository_ tag_)
+    if (TARGET ${name_}::header)
         return()
     endif ()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED
-                                                                         FETCHCONTENT_SOURCE_DIR_${source_override_}
-    )
+    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED ${override_})
         add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
     else ()
         FetchContent_Declare(
             ${name_}
-            GIT_REPOSITORY ${url_}
-            GIT_TAG ${revision_}
+            GIT_REPOSITORY ${repository_}
+            GIT_TAG ${tag_}
             EXCLUDE_FROM_ALL SYSTEM
         )
         FetchContent_MakeAvailable(${name_})
     endif ()
 endfunction ()
 
+# The siblings tune their own units for the same CPU, and probe what this host runs under `native`.
+if (UCALL_TARGET_ARCH)
+    set(FORKUNION_TARGET_ARCH ${UCALL_TARGET_ARCH})
+    set(STRINGZILLA_TARGET_ARCH ${UCALL_TARGET_ARCH})
+    set(NUMKONG_TARGET_ARCH ${UCALL_TARGET_ARCH})
+endif ()
+
 ucall_sibling(
-    stringzilla STRINGZILLA stringzilla::header https://github.com/ashvardanian/StringZilla
-    e169620f92db7c5df3a71baf2e035bc43ecf6a39
+    stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
+    a4e9f5b0ac91481a5c30957e05d2310f3928c1d8
 )
 ucall_sibling(
-    forkunion FORKUNION forkunion::header https://github.com/ashvardanian/ForkUnion
-    0c87b0bb539ccf6d945711a12e73b731530c9fa8
+    forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
+    12a0a2706534452830868b7e33a4697549c898d5
 )
 ucall_sibling(
-    smashtable SMASHTABLE smashtable::header https://github.com/ashvardanian/SmashTable
-    07a8cb3800de52a4c0f90e80014b3937b39121dc
+    smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
+    e0db741da4e7b9cf6bc13aa493eff264aff3cfb8
 )
 
 # Prefer a current system liburing; source builds are isolated under the build directory.
@@ -205,6 +232,28 @@ else ()
     if (UCALL_WERROR)
         target_compile_options(ucall_warnings INTERFACE -Werror)
     endif ()
+    target_compile_options(ucall_warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
+endif ()
+
+# UCALL_TARGET_ARCH tunes UCall's own units, which all link `ucall_warnings`, for one CPU: `native` for this host, or a
+# CPU name like `graniterapids`, also when cross-compiling. Fetched dependencies keep their own flags.
+if (UCALL_TARGET_ARCH STREQUAL "native" AND CMAKE_CROSSCOMPILING)
+    message(FATAL_ERROR "UCALL_TARGET_ARCH=native needs the host as the target; name a CPU instead")
+elseif (
+    UCALL_TARGET_ARCH
+    AND MSVC
+    AND NOT UCALL_TARGET_ARCH STREQUAL "native"
+)
+    message(FATAL_ERROR "MSVC takes UCALL_TARGET_ARCH=native only; pass an /arch: value such as AVX2 or AVX512 "
+                        "through CMAKE_CXX_FLAGS instead of `${UCALL_TARGET_ARCH}`"
+    )
+elseif (UCALL_TARGET_ARCH AND MSVC)
+    # MSVC has no `/arch:native`; each class unit already takes its own `/arch:`, so the toolchain default stays.
+elseif (UCALL_TARGET_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
+    # AArch64 names CPUs through `-mcpu`, like `neoverse-v2`, as `-march` takes only architecture versions.
+    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${UCALL_TARGET_ARCH}>")
+elseif (UCALL_TARGET_ARCH)
+    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=${UCALL_TARGET_ARCH}>")
 endif ()
 
 # Sanitizers instrument UCall's library and tests, while fetched dependencies keep their own flags.
@@ -230,9 +279,6 @@ if (ucall_sanitizer_flags_)
     endif ()
 endif ()
 
-# One compiled class per distinct native kernel bundle; flags stay on its instantiation unit.
-include(CheckCXXCompilerFlag)
-
 add_library(ucall STATIC src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp src/variants_serial.cpp)
 add_library(ucall::ucall ALIAS ucall)
 add_library(ucall::header ALIAS ucall)
@@ -254,11 +300,18 @@ target_link_libraries(
     PUBLIC forkunion::header smashtable::header stringzilla::header
     PRIVATE Threads::Threads ucall_sanitizers ucall_warnings
 )
-foreach (capabilities_ forkunion::cpu_capabilities_compiled stringzilla::cpu_capabilities_compiled)
-    if (TARGET ${capabilities_})
-        target_link_libraries(ucall PUBLIC ${capabilities_})
-    endif ()
-endforeach ()
+target_link_libraries(
+    ucall
+    PUBLIC forkunion::cpu_capabilities_compiled
+    PRIVATE stringzilla::cpu_capabilities_compiled
+)
+# The C ABI is all a binary linking the archive may export; UCALL_EXPORT marks it.
+set_target_properties(
+    ucall
+    PROPERTIES C_VISIBILITY_PRESET hidden
+               CXX_VISIBILITY_PRESET hidden
+               VISIBILITY_INLINES_HIDDEN ON
+)
 if (NOT MSVC)
     target_compile_options(ucall PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>)
 endif ()
@@ -273,130 +326,85 @@ if (UCALL_WITH_LINUX_URING)
     endif ()
 endif ()
 
+# One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
+# kits and atomics use, each enabled, oldest first. Its unit takes the StringZilla flags of those capabilities in that
+# order, so on Arm the last `-march` holds every extension. A targeted build keeps serial and the named classes, or
+# under `native` the classes this host runs in full; every gate is `UCALL_TARGET_<CLASS>` set to 0 or 1.
 function (ucall_cpu_variant class_ target_macro_)
-    cmake_parse_arguments(PARSE_ARGV 2 arg "" "FLAGS;MSVC_FLAGS" "REQUIRES")
-    set(enabled_ TRUE)
-    foreach (requirement_ IN LISTS arg_REQUIRES)
-        if (NOT ${requirement_})
-            set(enabled_ FALSE)
+    set(kept_ TRUE)
+    set(flags_)
+    foreach (capability_ IN LISTS ARGN)
+        if (NOT stringzilla_target_${capability_}_enabled AND NOT forkunion_target_${capability_}_enabled)
+            set(kept_ FALSE)
+        elseif (
+            UCALL_TARGET_CLASSES STREQUAL "native"
+            AND NOT stringzilla_target_${capability_}_runs
+            AND NOT forkunion_target_${capability_}_runs
+        )
+            set(kept_ FALSE)
+        endif ()
+        # MSVC takes one `/arch:`, the newest capability's, and warns when a later one overrides an earlier.
+        if (MSVC AND stringzilla_target_${capability_}_flags)
+            set(flags_ ${stringzilla_target_${capability_}_flags})
+        else ()
+            list(APPEND flags_ ${stringzilla_target_${capability_}_flags})
         endif ()
     endforeach ()
-    if (MSVC)
-        set(flags_ "${arg_MSVC_FLAGS}")
-    else ()
-        set(flags_ "${arg_FLAGS}")
+    if (UCALL_TARGET_CLASSES
+        AND NOT UCALL_TARGET_CLASSES STREQUAL "native"
+        AND NOT class_ IN_LIST UCALL_TARGET_CLASSES
+    )
+        set(kept_ FALSE)
     endif ()
-    if (enabled_)
-        check_cxx_compiler_flag("${flags_}" ucall_class_${class_}_compiles_)
-    endif ()
-    if (enabled_ AND ucall_class_${class_}_compiles_)
-        target_compile_definitions(ucall PUBLIC UCALL_TARGET_${target_macro_}=1)
+    if (kept_)
+        target_compile_definitions(ucall PRIVATE UCALL_TARGET_${target_macro_}=1)
         target_sources(ucall PRIVATE src/variants_${class_}.cpp)
-        set_source_files_properties(src/variants_${class_}.cpp PROPERTIES COMPILE_FLAGS "${flags_}")
+        set_source_files_properties(src/variants_${class_}.cpp PROPERTIES COMPILE_OPTIONS "${flags_}")
     else ()
-        target_compile_definitions(ucall PUBLIC UCALL_TARGET_${target_macro_}=0)
+        target_compile_definitions(ucall PRIVATE UCALL_TARGET_${target_macro_}=0)
     endif ()
 endfunction ()
 
-ucall_cpu_variant(
-    intel_haswell
-    INTEL_HASWELL
-    REQUIRES
-    stringzilla_target_haswell_compiles
-    stringzilla_target_westmere_compiles
-    FLAGS
-    "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul"
-    MSVC_FLAGS
-    "/arch:AVX2"
-)
-ucall_cpu_variant(
-    intel_skylake
-    INTEL_SKYLAKE
-    REQUIRES
-    stringzilla_target_skylake_compiles
-    stringzilla_target_westmere_compiles
-    FLAGS
-    "-mavx2 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mbmi -mbmi2 -mpopcnt -mlzcnt -maes -mpclmul"
-    MSVC_FLAGS
-    "/arch:AVX512"
-)
+ucall_cpu_variant(intel_haswell INTEL_HASWELL westmere haswell)
+ucall_cpu_variant(intel_skylake INTEL_SKYLAKE westmere haswell skylake)
 ucall_cpu_variant(
     intel_icelake
     INTEL_ICELAKE
-    REQUIRES
-    stringzilla_target_icelake_compiles
-    stringzilla_target_goldmont_compiles
-    FLAGS
-    "-mavx2 -mavx512f -mavx512vl -mavx512bw -mavx512dq -mavx512vbmi -mavx512vbmi2 -mavx512vnni -mbmi -mbmi2 -mpopcnt -mlzcnt -maes -mvaes -mpclmul -mvpclmulqdq -msha"
-    MSVC_FLAGS
-    "/arch:AVX512"
+    westmere
+    goldmont
+    haswell
+    skylake
+    icelake
 )
-ucall_cpu_variant(
-    intel_alder
-    INTEL_ALDER
-    REQUIRES
-    stringzilla_target_haswell_compiles
-    stringzilla_target_westmere_compiles
-    stringzilla_target_goldmont_compiles
-    FLAGS
-    "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul -msha"
-    MSVC_FLAGS
-    "/arch:AVX2"
-)
-ucall_cpu_variant(
-    intel_sierra
-    INTEL_SIERRA
-    REQUIRES
-    stringzilla_target_haswell_compiles
-    stringzilla_target_westmere_compiles
-    stringzilla_target_goldmont_compiles
-    forkunion_target_x86_cmpccxadd_compiles
-    FLAGS
-    "-mavx2 -mfma -mbmi -mbmi2 -mpopcnt -mlzcnt -msse4.2 -maes -mpclmul -msha"
-    MSVC_FLAGS
-    "/arch:AVX2"
-)
-ucall_cpu_variant(
-    aws_g2
-    AWS_G2
-    REQUIRES
-    stringzilla_target_neon_compiles
-    stringzilla_target_neonaes_compiles
-    stringzilla_target_neonsha_compiles
-    forkunion_target_arm64_lse_compiles
-    FLAGS
-    "-march=armv8-a+simd+crypto+aes+sha2+lse"
-)
+ucall_cpu_variant(intel_alder INTEL_ALDER westmere goldmont haswell)
+ucall_cpu_variant(intel_sierra INTEL_SIERRA westmere goldmont haswell x86_cmpccxadd)
+ucall_cpu_variant(aws_g2 AWS_G2 neon neonaes neonsha arm64_lse)
 ucall_cpu_variant(
     apple_m2
     APPLE_M2
-    REQUIRES
-    stringzilla_target_neon_compiles
-    stringzilla_target_neonaes_compiles
-    stringzilla_target_neonsha_compiles
-    forkunion_target_arm64_lse_compiles
-    forkunion_target_arm64_rcpc_compiles
-    FLAGS
-    "-march=armv8-a+simd+crypto+aes+sha2+lse+rcpc"
+    neon
+    neonaes
+    neonsha
+    arm64_lse
+    arm64_rcpc
 )
 ucall_cpu_variant(
     aws_g5
     AWS_G5
-    REQUIRES
-    stringzilla_target_sve_compiles
-    stringzilla_target_sve2_compiles
-    stringzilla_target_sve2aes_compiles
-    stringzilla_target_neonsha_compiles
-    forkunion_target_arm64_lse_compiles
-    forkunion_target_arm64_rcpc_compiles
-    FLAGS
-    "-march=armv8.2-a+sve+sve2+sve2-aes+crypto+lse+rcpc"
+    neon
+    neonaes
+    neonsha
+    sve
+    sve2
+    sve2aes
+    arm64_lse
+    arm64_rcpc
 )
 
 if (UCALL_BUILD_TOOLS)
     ucall_sibling(
-        numkong NUMKONG numkong::static https://github.com/ashvardanian/NumKong
-        49b5140981945527e0ffca4d8037285022b98ad3
+        numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
+        3faee602cdbcc3ee1ca8880594e4c1b2d38c8f91
     )
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)

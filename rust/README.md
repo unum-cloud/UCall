@@ -38,7 +38,7 @@ The polling thread runs the handler, the client blocks in `get` until its respon
 
 ## Serving
 
-`Server::new` takes the interfaces to answer on, and `Server::with_options` also names the `Backend` and `CPUClass`, failing rather than substituting when either is unavailable.
+`Server::new` takes the interfaces to answer on, and `Server::with_options` also names the `Backend` and an optional `CPUClass` ceiling, failing rather than substituting when the backend is unavailable or the CPU does not run the class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
 Port zero binds a free port, which `Server::address` reports.
@@ -48,7 +48,7 @@ use ucall::*;
 
 let public = Interface::new("0.0.0.0:8545").event_loops(4).connections(16_384).pipelined_requests(16);
 let health = Interface::new("127.0.0.1:8546").connections(4);
-let mut server = Server::with_options(&[public, health], Backend::Automatic, CPUClass::Serial)?;
+let mut server = Server::with_options(&[public, health], Backend::Automatic, Some(CPUClass::Serial))?;
 println!("{} event loops on {} with {} kernels", server.event_loops(), server.backend(), server.cpu_class());
 
 server.get("/users/{user}/files/{*path}", |request: Request| {

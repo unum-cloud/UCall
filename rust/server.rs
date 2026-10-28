@@ -453,15 +453,16 @@ unsafe impl Sync for Server {}
 impl Server {
     /// Starts a server answering on `interfaces`, with the automatic backend and CPU class.
     pub fn new(interfaces: &[Interface]) -> Result<Server> {
-        Server::with_options(interfaces, Backend::Automatic, CPUClass::Automatic)
+        Server::with_options(interfaces, Backend::Automatic, None)
     }
 
-    /// Starts a server answering on `interfaces` with an explicit backend and CPU class, failing
-    /// rather than substituting when either is unavailable.
+    /// Starts a server answering on `interfaces` with an explicit backend and an optional CPU class
+    /// ceiling, failing rather than substituting when the backend is unavailable or the CPU does not
+    /// run the class.
     pub fn with_options(
         interfaces: &[Interface],
         backend: Backend,
-        cpu_class: CPUClass,
+        cpu_class: Option<CPUClass>,
     ) -> Result<Server> {
         // The contexts point into this vector, which the core keeps unchanged until the free.
         let authorizers: Vec<Option<Arc<PeerAuthorizer>>> = interfaces
@@ -505,7 +506,7 @@ impl Server {
             metrics_tags_count: 0,
             metrics_interval_microseconds: 0,
             backend: backend.to_raw(),
-            cpu_class: cpu_class.to_raw(),
+            cpu_class: CPUClass::to_raw(cpu_class),
         };
         let mut raw: ucall_server_t = ptr::null_mut();
         let mut resolved = config;
@@ -549,7 +550,7 @@ impl Server {
 
     /// The CPU class the server resolved to.
     pub fn cpu_class(&self) -> CPUClass {
-        CPUClass::from_raw(self.core.resolved.cpu_class)
+        CPUClass::from_raw(self.core.resolved.cpu_class).unwrap_or(CPUClass::Serial)
     }
 
     /// The numeric address interface `index` listens on, with the port it bound.

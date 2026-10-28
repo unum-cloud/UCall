@@ -7,8 +7,7 @@ Getters that cannot fail and handle release functions take their arguments direc
 Link `ucall::ucall` to use the single library containing every enabled backend.
 Select `automatic`, `posix`, `linux-epollaio`, `linux-uring612`, `linux-uring618`, `macos-kqueue`, or `windows-iocp` in the server or client configuration.
 Explicit unavailable selections fail.
-CPU classes select compiled string, cryptographic, and atomic kernels after checking the initialization thread's capabilities.
-Baseline entry points check cached calling-thread capabilities before entering CPU-specific code.
+CPU classes select compiled string, cryptographic, and atomic kernels once, at initialization, under the requested class or the initialization thread's capabilities.
 The application keeps those threads on CPUs supporting the selected class; `serial` is the conservative choice for differing capabilities.
 Server shutdown uses baseline atomics and native wakeups, so another thread can stop it without entering CPU-specific code.
 UCall creates no threads.

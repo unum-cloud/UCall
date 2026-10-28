@@ -66,11 +66,11 @@ jobs:
             preset: relwithdebinfo
             compilers: ""
             config: RelWithDebInfo
-          - name: Windows
-            os: windows-2025
-            preset: relwithdebinfo
+          - name: Windows with Visual Studio 2026
+            os: windows-2025-vs2026
+            preset: msvc2026_x64
             compilers: ""
-            config: RelWithDebInfo
+            config: Release
     defaults:
       run:
         shell: bash
@@ -96,6 +96,45 @@ jobs:
         run: cmake --build --preset ${{ matrix.preset }} --config ${{ matrix.config }} --parallel 4
       - name: Test C and C++
         run: ctest --preset ${{ matrix.preset }} --build-config ${{ matrix.config }}
+
+  # Each machine profile builds the library for one CPU; the Arm ones build natively on Arm runners. Clang 22 compiles
+  # it, as older compilers predate Olympus.
+  build_machine_profile:
+    name: Build Machine Profile ${{ matrix.preset }}
+    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [xeon4_hopper, xeon6_blackwell, grace_hopper, vera_rubin]
+    env:
+      CC: clang-22
+      CXX: clang++-22
+    steps:
+      - name: Checkout with sibling libraries
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Clang 22
+        run: sudo apt-get update && sudo apt-get install -y clang-22
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.preset }} -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
+          cmake --build --preset ${{ matrix.preset }} --parallel 4
+
+  # The NDK's own toolchain builds the library over the epoll backend; nothing runs it.
+  build_android:
+    name: Build Android ARM64
+    runs-on: ubuntu-26.04
+    steps:
+      - name: Checkout with sibling libraries
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Build
+        run: |
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
+          cmake --preset android_arm64
+          cmake --build --preset android_arm64 --parallel 4
 
   verify_models:
     name: Check Promela Models and GenMC Clients

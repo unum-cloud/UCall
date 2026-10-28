@@ -5,8 +5,23 @@
     {
       "name": "base",
       "hidden": true,
+      "description": "A build tree named after the preset, with the compiler launchers from the environment, so exporting CMAKE_CXX_COMPILER_LAUNCHER=ccache caches objects.",
       "binaryDir": "${sourceDir}/build_${presetName}",
-      "cacheVariables": {"UCALL_BUILD_TEST": "ON"}
+      "cacheVariables": {
+        "UCALL_BUILD_TEST": "ON",
+        "CMAKE_C_COMPILER_LAUNCHER": "$env{CMAKE_C_COMPILER_LAUNCHER}",
+        "CMAKE_CXX_COMPILER_LAUNCHER": "$env{CMAKE_CXX_COMPILER_LAUNCHER}"
+      }
+    },
+    {
+      "name": "linux",
+      "hidden": true,
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"}
+    },
+    {
+      "name": "windows",
+      "hidden": true,
+      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"}
     },
     {
       "name": "clang",
@@ -15,7 +30,7 @@
     },
     {
       "name": "debug",
-      "inherits": "base",
+      "inherits": ["base", "clang"],
       "displayName": "Host Debug",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
     },
@@ -34,13 +49,13 @@
     },
     {
       "name": "relwithdebinfo",
-      "inherits": "base",
+      "inherits": ["base", "clang"],
       "displayName": "Host RelWithDebInfo",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}
     },
     {
       "name": "release",
-      "inherits": "base",
+      "inherits": ["base", "clang"],
       "displayName": "Host Release",
       "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
     },
@@ -55,6 +70,60 @@
       "inherits": "debug",
       "displayName": "Host Debug with ThreadSanitizer",
       "cacheVariables": {"UCALL_BUILD_SANITIZERS": "thread"}
+    },
+    {
+      "name": "msvc2026_x64",
+      "inherits": ["base", "windows"],
+      "displayName": "Windows x64 - Visual Studio 2026",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "x64"
+    },
+    {
+      "name": "android_arm64",
+      "inherits": "base",
+      "displayName": "Android ARM64 - compile only",
+      "description": "The library over the epoll backend, through the NDK's own toolchain from ANDROID_NDK_ROOT.",
+      "toolchainFile": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "ANDROID_ABI": "arm64-v8a",
+        "ANDROID_PLATFORM": "android-28",
+        "UCALL_BUILD_TEST": "OFF",
+        "UCALL_WITH_LINUX_EPOLLAIO": "ON"
+      }
+    },
+    {
+      "name": "machine",
+      "hidden": true,
+      "inherits": ["base", "linux", "clang"],
+      "description": "The library for one machine: its CPU, and serial plus the one CPU class it runs in full; UCall has no GPU code.",
+      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "UCALL_BUILD_TEST": "OFF"}
+    },
+    {
+      "name": "xeon4_hopper",
+      "inherits": "machine",
+      "displayName": "Xeon 4 with Hopper - compile only",
+      "cacheVariables": {"UCALL_TARGET_ARCH": "sapphirerapids", "UCALL_TARGET_CLASSES": "intel_icelake"}
+    },
+    {
+      "name": "xeon6_blackwell",
+      "inherits": "machine",
+      "displayName": "Xeon 6 with Blackwell - compile only",
+      "cacheVariables": {"UCALL_TARGET_ARCH": "graniterapids", "UCALL_TARGET_CLASSES": "intel_icelake"}
+    },
+    {
+      "name": "grace_hopper",
+      "inherits": "machine",
+      "displayName": "Grace with Hopper - compile only",
+      "description": "UCall's Graviton5 class waits on no WFET, so Neoverse V2 runs it in full.",
+      "cacheVariables": {"UCALL_TARGET_ARCH": "neoverse-v2", "UCALL_TARGET_CLASSES": "aws_g5"}
+    },
+    {
+      "name": "vera_rubin",
+      "inherits": "machine",
+      "displayName": "Vera with Rubin - compile only",
+      "description": "Olympus cores need Clang 22 or GCC 15.",
+      "cacheVariables": {"UCALL_TARGET_ARCH": "olympus", "UCALL_TARGET_CLASSES": "aws_g5"}
     }
   ],
   "buildPresets": [
@@ -63,7 +132,13 @@
     {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
     {"name": "release", "configurePreset": "release"},
     {"name": "asan", "configurePreset": "asan"},
-    {"name": "tsan", "configurePreset": "tsan"}
+    {"name": "tsan", "configurePreset": "tsan"},
+    {"name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release"},
+    {"name": "android_arm64", "configurePreset": "android_arm64"},
+    {"name": "xeon4_hopper", "configurePreset": "xeon4_hopper"},
+    {"name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell"},
+    {"name": "grace_hopper", "configurePreset": "grace_hopper"},
+    {"name": "vera_rubin", "configurePreset": "vera_rubin"}
   ],
   "testPresets": [
     {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
@@ -80,6 +155,12 @@
       "configurePreset": "tsan",
       "output": {"outputOnFailure": true},
       "environment": {"TSAN_OPTIONS": "halt_on_error=1"}
+    },
+    {
+      "name": "msvc2026_x64",
+      "configurePreset": "msvc2026_x64",
+      "configuration": "Release",
+      "output": {"outputOnFailure": true}
     }
   ]
 }

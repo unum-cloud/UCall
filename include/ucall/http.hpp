@@ -489,11 +489,6 @@ struct http {
     using hash_kit_t = hash_kit_type_;
     using fold_kit_t = fold_kit_type_;
 
-    /** Every capability the kits call into, which a thread must report to use them. */
-    static constexpr sz_capability_t capabilities_k = compare_kit_t::capability_k | find_kit_t::capability_k |
-                                                      byteset_kit_t::capability_k | hash_kit_t::capability_k |
-                                                      fold_kit_t::capability_k;
-
     static bool valid_view(ucall_bytes_view_t bytes) noexcept { return bytes.data || !bytes.length; }
     static bool equal(std::string_view left, std::string_view right) noexcept {
         if (left.size() != right.size()) return false;

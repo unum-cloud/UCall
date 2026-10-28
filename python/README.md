@@ -6,7 +6,7 @@
 pip install ucall
 ```
 
-Wheels cover CPython 3.12 to 3.14 on Linux, macOS and Windows, and a source build needs CMake and a C++20 compiler.
+Wheels cover CPython 3.12 to 3.15 on Linux, macOS and Windows, and a source build needs CMake and a C++20 compiler.
 The package picks its I/O backend and CPU kernels when a server or client starts, so one wheel adapts to the kernel and CPU it runs on.
 
 ## Quickstart

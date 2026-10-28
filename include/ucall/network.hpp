@@ -33,8 +33,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     using http_t = http<compare_kit_type_, find_kit_type_, byteset_kit_type_, hash_kit_type_, fold_kit_type_>;
     using tunnel_t = secure_tunnel<sha256_kit_type_, aes256_gcm_kit_type_>;
     using crypto_t = secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_>;
-    static constexpr sz_capability_t capabilities_k = http_t::capabilities_k | sha256_kit_type_::capability_k |
-                                                      aes256_gcm_kit_type_::capability_k;
     using allocator_t = allocator_type_;
     using engine_t = typename engine_type_::template rebind_allocator<allocator_t>;
     template <typename value_type_>
@@ -3734,8 +3732,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (!server->config.metrics_sample_rate) server->config.metrics_sample_rate = 1.f;
         if (!server->config.metrics_interval_microseconds) server->config.metrics_interval_microseconds = 1'000'000;
         if (arguments->resolved) *arguments->resolved = server->config;
-        server->string_capabilities = capabilities_k;
-        server->atomic_capabilities = static_cast<std::uint64_t>(atomic_ref<std::uint32_t>::capabilities_k);
         server->api = &server_api_k;
         *arguments->server = server.release();
         publish(arguments->outcome, ucall_status_success_k);
@@ -5427,8 +5423,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             peer->connection.peer = peer.get();
         }
         if (arguments->resolved) *arguments->resolved = config;
-        client->string_capabilities = capabilities_k;
-        client->atomic_capabilities = static_cast<std::uint64_t>(atomic_ref<std::uint32_t>::capabilities_k);
         client->api = &client_api_k;
         *arguments->client = client.release();
         publish(arguments->outcome, ucall_status_success_k);

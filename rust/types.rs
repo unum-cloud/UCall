@@ -552,60 +552,61 @@ impl FromStr for Backend {
     }
 }
 
-/// The CPU kernels a server or client runs, from the portable `Serial` up.
+/// The CPU kernels a server or client runs, from the portable `Serial` up, where `None` takes what the
+/// constructing thread's CPU offers.
 ///
-/// Every thread that later polls, replies, or reads must run on a CPU supporting the class
-/// resolved at construction, and `Serial` is the conservative choice where they differ. Prints and
-/// parses its stable name, like "intel-icelake".
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+/// A class is a ceiling: the newest compiled class under it runs, failing with
+/// [`Status::Unsupported`] where the CPU does not run it. Every thread that later polls, replies, or
+/// reads must run on a CPU supporting the class resolved at construction, and `Serial` is the
+/// conservative choice where they differ. Prints and parses its stable name, like "intel-icelake".
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum CPUClass {
-    /// The best class the constructing thread's CPU supports.
-    #[default]
-    Automatic,
     /// Portable kernels that run on any CPU.
-    Serial,
+    Serial = 1,
     /// x86 cores from Intel Haswell on.
-    IntelHaswell,
+    IntelHaswell = 2,
     /// x86 server cores from Intel Skylake on.
-    IntelSkylake,
+    IntelSkylake = 3,
     /// x86 server cores from Intel Ice Lake on.
-    IntelIcelake,
+    IntelIcelake = 4,
     /// x86 hybrid cores from Intel Alder Lake on.
-    IntelAlder,
+    IntelAlder = 5,
     /// x86 efficiency cores from Intel Sierra Forest on.
-    IntelSierra,
+    IntelSierra = 6,
     /// Arm cores from AWS Graviton 2 on.
-    AWSG2,
+    AWSG2 = 7,
     /// Arm cores from Apple M2 on.
-    AppleM2,
+    AppleM2 = 8,
     /// Arm server cores from AWS Graviton 5 on.
-    AWSG5,
+    AWSG5 = 9,
 }
 
 impl CPUClass {
-    pub(crate) fn to_raw(self) -> ucall_cpu_class_t {
-        self as ucall_cpu_class_t
+    /// The `ucall_cpu_class_t` of `cpu_class`, zero for `None`.
+    pub(crate) fn to_raw(cpu_class: Option<CPUClass>) -> ucall_cpu_class_t {
+        cpu_class.map_or(0, |cpu_class| cpu_class as ucall_cpu_class_t)
     }
 
-    pub(crate) fn from_raw(value: ucall_cpu_class_t) -> Self {
+    pub(crate) fn from_raw(value: ucall_cpu_class_t) -> Option<Self> {
         match value {
-            1 => CPUClass::Serial,
-            2 => CPUClass::IntelHaswell,
-            3 => CPUClass::IntelSkylake,
-            4 => CPUClass::IntelIcelake,
-            5 => CPUClass::IntelAlder,
-            6 => CPUClass::IntelSierra,
-            7 => CPUClass::AWSG2,
-            8 => CPUClass::AppleM2,
-            9 => CPUClass::AWSG5,
-            _ => CPUClass::Automatic,
+            1 => Some(CPUClass::Serial),
+            2 => Some(CPUClass::IntelHaswell),
+            3 => Some(CPUClass::IntelSkylake),
+            4 => Some(CPUClass::IntelIcelake),
+            5 => Some(CPUClass::IntelAlder),
+            6 => Some(CPUClass::IntelSierra),
+            7 => Some(CPUClass::AWSG2),
+            8 => Some(CPUClass::AppleM2),
+            9 => Some(CPUClass::AWSG5),
+            _ => None,
         }
     }
 }
 
 impl fmt::Display for CPUClass {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter.write_str(unsafe { static_string(ucall_cpu_class_name(self.to_raw())) })
+        formatter
+            .write_str(unsafe { static_string(ucall_cpu_class_name(*self as ucall_cpu_class_t)) })
     }
 }
 
@@ -614,12 +615,8 @@ impl FromStr for CPUClass {
 
     /// Reads a stable name back, failing with [`Status::InvalidArgument`] on one no class has.
     fn from_str(name: &str) -> Result<Self> {
-        let cpu_class =
-            CPUClass::from_raw(unsafe { ucall_cpu_class_from_name(view(name.as_bytes())) });
-        match cpu_class != CPUClass::Automatic || name == CPUClass::Automatic.to_string() {
-            true => Ok(cpu_class),
-            false => Err(fail(Status::InvalidArgument, "no CPU class has that name")),
-        }
+        CPUClass::from_raw(unsafe { ucall_cpu_class_from_name(view(name.as_bytes())) })
+            .ok_or_else(|| fail(Status::InvalidArgument, "no CPU class has that name"))
     }
 }
 
@@ -688,7 +685,7 @@ mod tests {
     fn names_come_from_the_library() {
         assert_eq!(Status::OutOfMemory.to_string(), "out-of-memory");
         assert_eq!(Backend::LinuxURing618.to_string(), "linux-uring618");
-        assert_eq!(CPUClass::Automatic.to_string(), "automatic");
+        assert_eq!(CPUClass::AWSG5.to_string(), "aws-g5");
     }
 
     #[test]
@@ -702,6 +699,7 @@ mod tests {
         let unknown = "linux-epol".parse::<Backend>().unwrap_err();
         assert_eq!(unknown.status, Status::InvalidArgument);
         assert!("".parse::<CPUClass>().is_err());
+        assert!("automatic".parse::<CPUClass>().is_err());
     }
 
     #[test]

@@ -5,7 +5,6 @@
  *  @brief C entry points over each handle's initialization-selected operations, and the Noise key
  *      and received response verbs, which need no CPU-specific code.
  */
-#include <cassert>
 #include <cstdint>
 #include <cstring> // `std::memset`
 
@@ -28,49 +27,33 @@ template struct received_response<st::default_allocator<byte_t>>;
 using response_http_t =
     http<serial_compare_kit_t, serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t>;
 
-struct thread_capabilities_t {
-    std::uint64_t strings, atomics;
-};
-
-static thread_capabilities_t const& thread_capabilities() noexcept {
-    static thread_local thread_capabilities_t const capabilities {sz_capabilities_detected_cpu_(),
-                                                                  static_cast<std::uint64_t>(fu::cpu_capabilities())};
-    return capabilities;
-}
-
-template <typename handle_type_>
-static bool compatible(handle_type_ const* handle) noexcept {
-    auto const& capabilities = thread_capabilities();
-    return (capabilities.strings & handle->string_capabilities) == handle->string_capabilities &&
-           (capabilities.atomics & handle->atomic_capabilities) == handle->atomic_capabilities;
-}
-
 template <typename handle_type_>
 [[nodiscard]] static ucall_status_t admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept {
-    ucall_status_t const status = !handle               ? ucall_status_uninitialized_k
-                                  : !compatible(handle) ? ucall_status_unsupported_k
-                                                        : ucall_status_success_k;
-    if (status != ucall_status_success_k) publish(outcome, status);
-    return status;
+    if (handle) return ucall_status_success_k;
+    publish(outcome, ucall_status_uninitialized_k);
+    return ucall_status_uninitialized_k;
 }
 
 static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept { return spelling == text_view(name); }
 
 template <typename init_type_>
 static void init_network(init_type_* arguments) noexcept {
+    cpu_ceiling_t ceiling;
+    if (ucall_status_t const picked = pick_cpu_ceiling(arguments->config->cpu_class, ceiling);
+        picked != ucall_status_success_k) {
+        publish(arguments->outcome, picked);
+        return;
+    }
     auto config = *arguments->config;
     auto request = *arguments;
     request.config = &config;
-    auto const& capabilities = thread_capabilities();
-    auto strings = static_cast<sz_capability_t>(capabilities.strings);
-    auto atomics = static_cast<fu::capabilities_t>(capabilities.atomics);
     auto try_backend = [&](ucall_io_backend_t backend) {
         config.backend = backend;
-        make_network(&request, strings, atomics);
+        make_network(cpu_ladder_t {}, &request, ceiling);
         auto status = request.outcome->status;
         return status != ucall_status_unsupported_k && status != ucall_status_io_k;
     };
-    if (config.backend != ucall_io_backend_automatic_k) make_network(&request, strings, atomics);
+    if (config.backend != ucall_io_backend_automatic_k) make_network(cpu_ladder_t {}, &request, ceiling);
     else {
         bool finished = false;
 #if UCALL_WITH_LINUX_URING
@@ -91,6 +74,9 @@ static void init_network(init_type_* arguments) noexcept {
 #endif
         if (!finished) publish(arguments->outcome, ucall_status_unsupported_k);
     }
+    if (arguments->outcome->status != ucall_status_success_k) return;
+    if constexpr (std::is_same_v<init_type_, ucall_server_init_t>) (*arguments->server)->ceiling = ceiling;
+    else (*arguments->client)->ceiling = ceiling;
 }
 
 } // namespace unum::ucall
@@ -238,7 +224,6 @@ void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
 
 void ucall_server_free(ucall_server_t server) {
     if (!server) return;
-    assert(compatible(server));
     server->api->free(server);
 }
 void ucall_server_stop(ucall_server_t server) {
@@ -248,7 +233,6 @@ void ucall_server_stop(ucall_server_t server) {
 }
 void ucall_client_free(ucall_client_t client) {
     if (!client) return;
-    assert(compatible(client));
     client->api->free(client);
 }
 
@@ -336,10 +320,10 @@ void ucall_client_response_body(ucall_client_response_body_t* arguments) {
 }
 
 ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_http_request_t request) {
-    return server && compatible(server) ? server->api->request_verb(server, request) : ucall_verb_unknown_k;
+    return server ? server->api->request_verb(server, request) : ucall_verb_unknown_k;
 }
 size_t ucall_server_request_path_segments_count(ucall_server_t server, ucall_received_http_request_t request) {
-    return server && compatible(server) ? server->api->request_path_segments_count(server, request) : 0;
+    return server ? server->api->request_path_segments_count(server, request) : 0;
 }
 ucall_http_status_t ucall_client_response_status(ucall_received_http_response_t response) {
     return response ? static_cast<received_response_t*>(response)->status : 0;
@@ -392,7 +376,7 @@ void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* argument
 }
 
 size_t ucall_server_request_parts_count(ucall_server_t server, ucall_received_http_request_t request) {
-    return server && compatible(server) ? server->api->request_parts_count(server, request) : 0;
+    return server ? server->api->request_parts_count(server, request) : 0;
 }
 
 void ucall_server_request_part(ucall_server_request_part_t* arguments) {

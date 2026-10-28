@@ -145,8 +145,8 @@ pub struct ClientOptions {
     pub peer_authorizer: Option<Arc<PeerAuthorizer>>,
     /// The requested I/O backend.
     pub backend: Backend,
-    /// The requested CPU class.
-    pub cpu_class: CPUClass,
+    /// The CPU class the client confines itself to; `None` takes what the CPU offers.
+    pub cpu_class: Option<CPUClass>,
 }
 
 /// One HTTP call, owning everything the library reads until the call completes.
@@ -289,7 +289,7 @@ impl Client {
             log: silent_log(),
             max_concurrent_calls: options.calls,
             backend: options.backend.to_raw(),
-            cpu_class: options.cpu_class.to_raw(),
+            cpu_class: CPUClass::to_raw(options.cpu_class),
         };
         let mut resolved = config;
         let mut outcome = pending_outcome();

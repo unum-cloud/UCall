@@ -53,8 +53,9 @@ typedef struct ucall_client_config_t {
     /** Requested I/O backend; automatic chooses an available native backend. */
     ucall_io_backend_t backend;
 
-    /** Requested CPU class; unknown selects from the initialization thread's capabilities.
-     *  Callers must stay on compatible CPUs after first use. Serial is the conservative choice. */
+    /** Ceiling on the CPU class: the newest compiled class under it runs, and unknown takes the
+     *  initialization thread's capabilities. Callers must stay on compatible CPUs after first use.
+     *  Serial is the conservative choice. */
     ucall_cpu_class_t cpu_class;
 
 } ucall_client_config_t;
@@ -83,8 +84,8 @@ typedef struct ucall_client_init_t {
  *  @par Statuses:
  *  - @c ucall_status_invalid_argument_k An output or the configuration is missing, the connection
  *    budget is zero, or the default call budget overflows.
- *  - @c ucall_status_unsupported_k No compiled CPU class or I/O backend serves the configuration on
- *    this machine.
+ *  - @c ucall_status_unsupported_k This machine does not run the requested CPU class, or no I/O
+ *    backend serves the configuration on it.
  *  - @c ucall_status_overflow_k The connection, pipelining and call budgets overflow a counter.
  */
 UCALL_EXPORT void ucall_client_init(ucall_client_init_t* arguments);
@@ -168,8 +169,7 @@ typedef struct ucall_client_call_t {
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c client is @c NULL.
- *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the client's CPU
- *    class, or the @c url names a scheme other than @c http and @c http+noise.
+ *  - @c ucall_status_unsupported_k The @c url names a scheme other than @c http and @c http+noise.
  *  - @c ucall_status_invalid_argument_k A view, the @c verb or the security mode is invalid, the
  *    mode lacks the key or authorizer it needs, or the @c url has no scheme or a malformed
  *    authority.
@@ -222,8 +222,6 @@ typedef struct ucall_client_take_completed_t {
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c client is @c NULL.
- *  - @c ucall_status_unsupported_k The calling thread's CPU lacks a capability of the client's CPU
- *    class.
  *  - @c ucall_status_invalid_argument_k The @c count output is @c NULL, or @c calls is @c NULL
  *    with a nonzero @c capacity.
  */

@@ -258,22 +258,25 @@ static case_result_t test_timeout_and_cancel_unit() {
     return failures;
 }
 
-static case_result_t test_capability_admission_unit() {
+static case_result_t test_cpu_class_ceiling_unit() {
     std::size_t failures = 0;
-    ucall_client_handle_t client {};
-    client.string_capabilities = std::numeric_limits<std::uint64_t>::max();
-    ucall_outcome_t outcome {};
-    std::size_t count = 1;
-    ucall_client_take_completed_t take {&client, &outcome, nullptr, 0, &count, 0};
-    ucall_client_take_completed(&take);
-    failures += expect(outcome.status == ucall_status_unsupported_k && !count);
-    ucall_server_handle_t server {};
-    server.string_capabilities = client.string_capabilities;
-    ucall_server_take_call_t poll {&server, &outcome, 0, 0};
-    ucall_server_take_call(&poll);
-    failures += expect(outcome.status == ucall_status_unsupported_k);
-    ucall_server_stop(&server);
-    failures += expect(server.stopped);
+    bool refused = false;
+    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_aws_g5_k;
+         cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1)) {
+        ucall_client_t handle {};
+        ucall_outcome_t outcome {};
+        ucall_client_config_t config {};
+        config.cpu_class = cpu_class;
+        config.max_concurrent_connections = 1;
+        ucall_client_init_t init {&handle, &outcome, &config, nullptr};
+        ucall_client_init(&init);
+        // No CPU runs both the x86 and the Arm classes, so a pin past what this one runs must fail.
+        refused |= outcome.status == ucall_status_unsupported_k && !handle;
+        failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_unsupported_k);
+        failures += expect(cpu_class != ucall_cpu_class_serial_k || outcome.status == ucall_status_success_k);
+        ucall_client_free(handle);
+    }
+    failures += expect(refused);
     return failures;
 }
 
@@ -1285,7 +1288,7 @@ int main(int, char** argv) {
     run_test(totals, "test_allocation_failure_safety", test_allocation_failure_safety);
     run_test(totals, "test_origin_reuse_and_fairness_unit", test_origin_reuse_and_fairness_unit);
     run_test(totals, "test_client_batches_sends_unit", test_client_batches_sends_unit);
-    run_test(totals, "test_capability_admission_unit", test_capability_admission_unit);
+    run_test(totals, "test_cpu_class_ceiling_unit", test_cpu_class_ceiling_unit);
     run_test(totals, "test_progress_and_retention_unit", test_progress_and_retention_unit);
     run_test(totals, "test_completion_credits_unit", test_completion_credits_unit);
     run_test(totals, "test_timeout_and_cancel_unit", test_timeout_and_cancel_unit);
