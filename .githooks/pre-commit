@@ -1466,7 +1466,7 @@ run_tree_checks() {
         if [ -z "$pinned" ] || [ "$recorded" != "$pinned" ]; then
             fail "$sibling" "The CMake pin and the staged submodule must name the same commit."
         fi
-    done < <(git show :CMakeLists.txt | awk '
+    done < <(git show :cmake/ucall_siblings.cmake | awk '
         /^[[:space:]]*ucall_sibling\(/ { in_call = 1; name = ""; pin = "" }
         in_call {
             for (i = 1; i <= NF; ++i) {

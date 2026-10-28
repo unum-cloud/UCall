@@ -9,6 +9,7 @@ include = [
   "/src/**",
   "/c/**",
   "/CMakeLists.txt",
+  "/cmake/ucall_*.cmake",
   "/VERSION",
   "/build.rs",
 ]

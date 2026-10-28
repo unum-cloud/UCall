@@ -64,6 +64,7 @@ sdist.exclude = [
 sdist.include = [
   "/CMakeLists.txt",
   "/CMakePresets.json",
+  "/cmake/ucall_*.cmake",
   "/VERSION",
   "/c/ucall/**",
   "/include/ucall/**",

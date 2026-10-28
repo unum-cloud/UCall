@@ -63,24 +63,8 @@ if (UCALL_TARGET_CLASSES STREQUAL "native" AND NOT UCALL_TARGET_ARCH STREQUAL "n
     )
 endif ()
 
-# ThreadSanitizer sees no inline assembly, so ForkUnion leaves out the capabilities it cannot see when told.
-set(FORKUNION_BUILD_SANITIZERS ${UCALL_BUILD_SANITIZERS})
-
-if (UCALL_WITH_POSIX AND NOT UNIX)
-    message(FATAL_ERROR "The POSIX backend requires a POSIX platform")
-endif ()
-if (UCALL_WITH_LINUX_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "The io_uring backends require Linux")
-endif ()
-if (UCALL_WITH_LINUX_EPOLLAIO AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
-    message(FATAL_ERROR "The epoll-AIO backend requires Linux or Android")
-endif ()
-if (UCALL_WITH_KQUEUE AND NOT (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD"))
-    message(FATAL_ERROR "The kqueue backend requires macOS or FreeBSD")
-endif ()
-if (UCALL_WITH_IOCP AND NOT WIN32)
-    message(FATAL_ERROR "The IOCP backend requires Windows")
-endif ()
+include(cmake/ucall_flags.cmake)
+include(cmake/ucall_platform.cmake)
 
 # Make Release by default
 if (NOT CMAKE_BUILD_TYPE)
@@ -126,44 +110,7 @@ find_package(Threads REQUIRED)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
-# A sibling builds from its nested checkout, or else from the commit its submodule pins, fetched unless the override
-# variable the caller passes, `FETCHCONTENT_SOURCE_DIR_<NAME>`, names a local checkout.
-function (ucall_sibling name_ override_ repository_ tag_)
-    if (TARGET ${name_}::header)
-        return()
-    endif ()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED ${override_})
-        add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
-    else ()
-        FetchContent_Declare(
-            ${name_}
-            GIT_REPOSITORY ${repository_}
-            GIT_TAG ${tag_}
-            EXCLUDE_FROM_ALL SYSTEM
-        )
-        FetchContent_MakeAvailable(${name_})
-    endif ()
-endfunction ()
-
-# The siblings tune their own units for the same CPU, and probe what this host runs under `native`.
-if (UCALL_TARGET_ARCH)
-    set(FORKUNION_TARGET_ARCH ${UCALL_TARGET_ARCH})
-    set(STRINGZILLA_TARGET_ARCH ${UCALL_TARGET_ARCH})
-    set(NUMKONG_TARGET_ARCH ${UCALL_TARGET_ARCH})
-endif ()
-
-ucall_sibling(
-    stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
-    a4e9f5b0ac91481a5c30957e05d2310f3928c1d8
-)
-ucall_sibling(
-    forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
-    12a0a2706534452830868b7e33a4697549c898d5
-)
-ucall_sibling(
-    smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
-    e0db741da4e7b9cf6bc13aa493eff264aff3cfb8
-)
+include(cmake/ucall_siblings.cmake)
 
 # Prefer a current system liburing; source builds are isolated under the build directory.
 if (UCALL_WITH_LINUX_URING)
@@ -212,71 +159,6 @@ if (UCALL_BUILD_TEST)
         SYSTEM FIND_PACKAGE_ARGS 12.2.0
     )
     FetchContent_MakeAvailable(fmt)
-endif ()
-
-# Warnings apply to UCall's own targets only, so fetched dependencies build with their own flags. The C interface takes
-# named arguments as partially designated structs, leaving the rest zeroed.
-add_library(ucall_warnings INTERFACE)
-if (MSVC)
-    target_compile_options(ucall_warnings INTERFACE /W3)
-    if (UCALL_WERROR)
-        target_compile_options(ucall_warnings INTERFACE /WX)
-    endif ()
-else ()
-    target_compile_options(
-        ucall_warnings
-        INTERFACE
-            "$<$<COMPILE_LANGUAGE:C,CXX>:-Wall;-Wextra;-Wpedantic;-Wno-unknown-pragmas;-Wno-missing-field-initializers>"
-            "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-Wdocumentation>"
-    )
-    if (UCALL_WERROR)
-        target_compile_options(ucall_warnings INTERFACE -Werror)
-    endif ()
-    target_compile_options(ucall_warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
-endif ()
-
-# UCALL_TARGET_ARCH tunes UCall's own units, which all link `ucall_warnings`, for one CPU: `native` for this host, or a
-# CPU name like `graniterapids`, also when cross-compiling. Fetched dependencies keep their own flags.
-if (UCALL_TARGET_ARCH STREQUAL "native" AND CMAKE_CROSSCOMPILING)
-    message(FATAL_ERROR "UCALL_TARGET_ARCH=native needs the host as the target; name a CPU instead")
-elseif (
-    UCALL_TARGET_ARCH
-    AND MSVC
-    AND NOT UCALL_TARGET_ARCH STREQUAL "native"
-)
-    message(FATAL_ERROR "MSVC takes UCALL_TARGET_ARCH=native only; pass an /arch: value such as AVX2 or AVX512 "
-                        "through CMAKE_CXX_FLAGS instead of `${UCALL_TARGET_ARCH}`"
-    )
-elseif (UCALL_TARGET_ARCH AND MSVC)
-    # MSVC has no `/arch:native`; each class unit already takes its own `/arch:`, so the toolchain default stays.
-elseif (UCALL_TARGET_ARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
-    # AArch64 names CPUs through `-mcpu`, like `neoverse-v2`, as `-march` takes only architecture versions.
-    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${UCALL_TARGET_ARCH}>")
-elseif (UCALL_TARGET_ARCH)
-    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=${UCALL_TARGET_ARCH}>")
-endif ()
-
-# Sanitizers instrument UCall's library and tests, while fetched dependencies keep their own flags.
-add_library(ucall_sanitizers INTERFACE)
-if (UCALL_BUILD_SANITIZERS STREQUAL "address")
-    if (MSVC)
-        set(ucall_sanitizer_flags_ /fsanitize=address)
-    else ()
-        set(ucall_sanitizer_flags_ -fsanitize=address,undefined -fno-omit-frame-pointer)
-    endif ()
-elseif (UCALL_BUILD_SANITIZERS STREQUAL "thread")
-    if (MSVC)
-        message(FATAL_ERROR "MSVC has no ThreadSanitizer, so UCALL_BUILD_SANITIZERS=thread needs Clang or GCC")
-    endif ()
-    set(ucall_sanitizer_flags_ -fsanitize=thread)
-elseif (NOT UCALL_BUILD_SANITIZERS STREQUAL "off")
-    message(FATAL_ERROR "UCALL_BUILD_SANITIZERS is off, address or thread, not '${UCALL_BUILD_SANITIZERS}'")
-endif ()
-if (ucall_sanitizer_flags_)
-    target_compile_options(ucall_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
-    if (NOT MSVC)
-        target_link_options(ucall_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
-    endif ()
 endif ()
 
 add_library(ucall STATIC src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp src/variants_serial.cpp)
@@ -402,10 +284,6 @@ ucall_cpu_variant(
 )
 
 if (UCALL_BUILD_TOOLS)
-    ucall_sibling(
-        numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
-        3faee602cdbcc3ee1ca8880594e4c1b2d38c8f91
-    )
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
