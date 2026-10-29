@@ -40,6 +40,8 @@ option(UCALL_BUILD_PYTHON "Build the CPython extension; `pyproject.toml` switche
 option(UCALL_BUILD_TOOLS "Build the echo, ledger, key-value, and inference examples" OFF)
 option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
 option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" OFF)
+option(UCALL_BUILD_SHARED "Compile ucall_shared in the default build and install both libraries" OFF)
+option(UCALL_INSTALL "Install the C headers, libraries and CMake package" ${PROJECT_IS_TOP_LEVEL})
 option(UCALL_WERROR "Treat compiler warnings as errors" OFF)
 set(UCALL_BUILD_SANITIZERS
     "off"
@@ -96,6 +98,7 @@ endif ()
 
 include(FetchContent)
 include(ExternalProject)
+include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
@@ -151,52 +154,89 @@ if (UCALL_BUILD_TEST)
     FetchContent_MakeAvailable(fmt)
 endif ()
 
-add_library(ucall STATIC src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp)
-add_library(ucall::ucall ALIAS ucall)
-add_library(ucall::header ALIAS ucall)
+# Both flavors compile the same units, and their C interface lives in `c/ucall`, which `ucall::header` names alone.
+if (NOT UCALL_BUILD_SHARED)
+    set(ucall_library_exclusion_ EXCLUDE_FROM_ALL)
+endif ()
+set(ucall_sources_ src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp)
+add_library(ucall_static STATIC ${ucall_sources_})
+add_library(ucall_shared SHARED ${ucall_library_exclusion_} ${ucall_sources_})
+add_library(ucall::static ALIAS ucall_static)
+add_library(ucall::shared ALIAS ucall_shared)
+add_library(ucall_header INTERFACE)
+add_library(ucall::header ALIAS ucall_header)
+set_target_properties(ucall_static PROPERTIES EXPORT_NAME static)
+set_target_properties(ucall_shared PROPERTIES EXPORT_NAME shared)
+set_target_properties(ucall_header PROPERTIES EXPORT_NAME header)
 target_include_directories(
-    ucall
-    PUBLIC "${CMAKE_CURRENT_SOURCE_DIR}/c" "${CMAKE_CURRENT_SOURCE_DIR}/include"
-    PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}/src"
+    ucall_header INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c>
+                           $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
-target_compile_features(ucall PUBLIC cxx_std_20)
-target_compile_definitions(
-    ucall
-    PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${ucall_version_name_}"
-    PUBLIC UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}> UCALL_WITH_LINUX_EPOLLAIO=$<BOOL:${UCALL_WITH_LINUX_EPOLLAIO}>
-           UCALL_WITH_LINUX_URING=$<BOOL:${UCALL_WITH_LINUX_URING}> UCALL_WITH_KQUEUE=$<BOOL:${UCALL_WITH_KQUEUE}>
-           UCALL_WITH_IOCP=$<BOOL:${UCALL_WITH_IOCP}>
-)
-target_link_libraries(
-    ucall
-    PUBLIC forkunion::header smashtable::header stringzilla::header
-    PRIVATE Threads::Threads ucall_sanitizers ucall_warnings
-)
-target_link_libraries(
-    ucall
-    PUBLIC forkunion::cpu_capabilities_compiled
-    PRIVATE stringzilla::cpu_capabilities_compiled
-)
-# The C ABI is all a binary linking the archive may export; UCALL_EXPORT marks it.
-set_target_properties(
-    ucall
-    PROPERTIES C_VISIBILITY_PRESET hidden
-               CXX_VISIBILITY_PRESET hidden
-               VISIBILITY_INLINES_HIDDEN ON
-)
-if (NOT MSVC)
-    target_compile_options(ucall PUBLIC $<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>)
-endif ()
-if (WIN32)
-    target_compile_definitions(ucall PUBLIC UCALL_EXPORT=)
-    target_link_libraries(ucall PRIVATE bcrypt ws2_32 mswsock ntdll)
-endif ()
-if (UCALL_WITH_LINUX_URING)
-    target_link_libraries(ucall PUBLIC uring_internal)
-    if (TARGET liburing-ep)
-        add_dependencies(ucall liburing-ep)
+
+# The archive passes the native interface in `include/` and its siblings on to the tests, tools and bindings built here,
+# and an installed archive names only what it links. The shared library passes nothing but the C interface.
+function (ucall_setup_library target_ scope_)
+    target_include_directories(
+        ${target_} ${scope_} "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>" PRIVATE "${PROJECT_SOURCE_DIR}/src"
+    )
+    target_compile_features(${target_} ${scope_} cxx_std_20)
+    target_compile_definitions(${target_} PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${ucall_version_name_}")
+    target_compile_definitions(
+        ${target_}
+        ${scope_}
+        UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}>
+        UCALL_WITH_LINUX_EPOLLAIO=$<BOOL:${UCALL_WITH_LINUX_EPOLLAIO}>
+        UCALL_WITH_LINUX_URING=$<BOOL:${UCALL_WITH_LINUX_URING}>
+        UCALL_WITH_KQUEUE=$<BOOL:${UCALL_WITH_KQUEUE}>
+        UCALL_WITH_IOCP=$<BOOL:${UCALL_WITH_IOCP}>
+    )
+    target_link_libraries(
+        ${target_}
+        PUBLIC ucall_header
+        PRIVATE Threads::Threads $<BUILD_INTERFACE:ucall_sanitizers> $<BUILD_INTERFACE:ucall_warnings>
+                $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
+    )
+    target_link_libraries(
+        ${target_} ${scope_} $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
+        $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
+    )
+    # The C ABI is all a binary linking either flavor may export; UCALL_EXPORT marks it.
+    set_target_properties(
+        ${target_}
+        PROPERTIES C_VISIBILITY_PRESET hidden
+                   CXX_VISIBILITY_PRESET hidden
+                   VISIBILITY_INLINES_HIDDEN ON
+    )
+    if (NOT MSVC)
+        target_compile_options(${target_} ${scope_} $<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>)
     endif ()
+    if (WIN32)
+        target_link_libraries(${target_} PRIVATE bcrypt ws2_32 mswsock ntdll)
+    endif ()
+    # An installed archive links the system's liburing, which a source build of it does not install.
+    if (UCALL_WITH_LINUX_URING)
+        target_link_libraries(${target_} ${scope_} $<BUILD_INTERFACE:uring_internal> $<INSTALL_INTERFACE:uring>)
+        if (TARGET liburing-ep)
+            add_dependencies(${target_} liburing-ep)
+        endif ()
+    endif ()
+endfunction ()
+ucall_setup_library(ucall_static PUBLIC)
+ucall_setup_library(ucall_shared PRIVATE)
+# The archive's consumers call it directly, so on Windows only the shared library exports and its consumers import.
+if (WIN32)
+    target_compile_definitions(ucall_static PUBLIC UCALL_EXPORT=)
 endif ()
+# The linker hides what hidden visibility misses: liburing's archive and the standard library templates its headers
+# declare visible.
+if (APPLE)
+    target_link_options(ucall_shared PRIVATE "LINKER:-exported_symbol,_ucall_*")
+elseif (CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android|FreeBSD)$")
+    file(WRITE "${PROJECT_BINARY_DIR}/ucall_shared.map" "{\n  global: ucall_*;\n  local: *;\n};\n")
+    target_link_options(ucall_shared PRIVATE "LINKER:--version-script=${PROJECT_BINARY_DIR}/ucall_shared.map")
+endif ()
+# `SOVERSION` carries the major alone, the only break the C ABI admits.
+set_target_properties(ucall_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 
 # One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
 # kits and atomics use, oldest first, `serial` over none. A class exists when each of them is enabled. Its unit takes
@@ -222,11 +262,14 @@ function (ucall_cpu_variant class_ target_macro_)
         endif ()
     endforeach ()
     if (kept_)
-        target_compile_definitions(ucall PRIVATE UCALL_TARGET_${target_macro_}=1)
-        target_sources(ucall PRIVATE src/variants_${class_}.cpp)
+        target_compile_definitions(ucall_static PRIVATE UCALL_TARGET_${target_macro_}=1)
+        target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_${target_macro_}=1)
+        target_sources(ucall_static PRIVATE src/variants_${class_}.cpp)
+        target_sources(ucall_shared PRIVATE src/variants_${class_}.cpp)
         set_source_files_properties(src/variants_${class_}.cpp PROPERTIES COMPILE_OPTIONS "${flags_}")
     else ()
-        target_compile_definitions(ucall PRIVATE UCALL_TARGET_${target_macro_}=0)
+        target_compile_definitions(ucall_static PRIVATE UCALL_TARGET_${target_macro_}=0)
+        target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_${target_macro_}=0)
     endif ()
 endfunction ()
 
@@ -261,7 +304,8 @@ else ()
     set(ucall_floor_ "the portable floor")
 endif ()
 if (UCALL_MULTIVERSIONED)
-    target_compile_definitions(ucall PRIVATE UCALL_TARGET_MONOVERSIONED=0)
+    target_compile_definitions(ucall_static PRIVATE UCALL_TARGET_MONOVERSIONED=0)
+    target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_MONOVERSIONED=0)
     message(STATUS "UCall: multiversioned above ${ucall_floor_}")
 else ()
     get_property(ucall_capabilities_enabled_ GLOBAL PROPERTY stringzilla_capabilities_enabled)
@@ -287,7 +331,7 @@ if (UCALL_BUILD_TOOLS)
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
-        target_link_libraries(ucall_example_${example_} PRIVATE ucall::ucall forkunion::static ucall_warnings)
+        target_link_libraries(ucall_example_${example_} PRIVATE ucall_static forkunion::static ucall_warnings)
     endforeach ()
     target_link_libraries(ucall_example_inference PRIVATE numkong::static)
 endif ()
@@ -296,7 +340,7 @@ if (UCALL_BUILD_BENCH)
     add_executable(ucall_bench_server bench/ucall_server.cpp)
     foreach (bench_ ucall_bench_http ucall_bench_server)
         target_include_directories(${bench_} PRIVATE tools)
-        target_link_libraries(${bench_} PRIVATE ucall::ucall forkunion::static ucall_warnings)
+        target_link_libraries(${bench_} PRIVATE ucall_static forkunion::static ucall_warnings)
     endforeach ()
 endif ()
 if (UCALL_BUILD_PYTHON)
@@ -307,3 +351,5 @@ if (UCALL_BUILD_TEST)
     enable_testing()
     add_subdirectory(test)
 endif ()
+
+include(cmake/ucall_install.cmake)

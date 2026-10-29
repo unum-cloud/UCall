@@ -19,7 +19,7 @@ ctest --preset debug
 The `relwithdebinfo` and `release` presets build the same suites with optimization, `asan` and `tsan` build them under a sanitizer, and `check` builds every target with Clang and `UCALL_WERROR=ON`.
 Tests, tools and benchmarks are off unless a preset or a `-D` switch asks for them.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
-The build exposes one library as `ucall::ucall`.
+The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, and `ucall::header`, the C headers alone.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
 CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
 Each class unit compiles when StringZilla and ForkUnion enable every capability it uses, with StringZilla's flags for them.
@@ -34,6 +34,16 @@ The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python-builds) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust-builds) describe.
+
+`UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build and installs both libraries with a CMake package and a `ucall.pc`.
+The shared library exports the `ucall_*` C interface alone, and the `release` preset remaps the source directory out of every binary.
+The `sdk` install component holds the shared library, the C headers, both package files and the license, and CPack packs it alone, stripped, into `ucall-<version>-<platform>-sdk.tar.gz`:
+
+```bash
+cmake --preset release
+cmake --build --preset release
+cpack --config build_release/CPackConfig.cmake
+```
 
 ## Running Tests
 
@@ -69,7 +79,7 @@ cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-ll
     -D UCALL_FREEBSD_SYSROOT=/path/to/unpacked/base.txz
 cmake -B build_macos -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-macos-llvm.cmake \
     -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk
-cmake --build build_macos --target ucall
+cmake --build build_macos --target ucall_static
 ```
 
 Windows and FreeBSD link their test executables; macOS stops at the static library, since linking needs Apple's linker.
@@ -102,6 +112,7 @@ python -X faulthandler -m pytest
 ## Rust Builds
 
 The root `Cargo.toml` builds the crate from `rust/lib.rs`, and `build.rs` compiles the native library through CMake.
+`UCALL_LIBRARY_DIR`, naming the directory of a `libucall_static.a` CMake already built, links that archive and the system's liburing instead.
 `rust/types.rs`, `server.rs`, and `client.rs` mirror the Python sources, each module keeps its tests in `mod tests`, and `rust/testing.rs` holds their shared helpers.
 
 ```sh

@@ -28,8 +28,8 @@
 #include <tuple>       // `std::tuple`
 #include <vector>      // `std::vector`
 
-#include <forkunion.h>         // `fu_pool_t`, `fu_pool_for_threads`
-#include <forkunion/types.hpp> // `fu::split_mix`
+#include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_for_threads`
+#include <forkunion/types.hpp>   // `fu::split_mix`
 
 #include "ucall/types.hpp" // `bytes_view`
 

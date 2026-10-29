@@ -105,7 +105,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        preset: [xeon4_hopper, xeon6_blackwell, grace_hopper, vera_rubin]
+        preset: [xeon4_hopper, xeon6_blackwell, venice_mi450, grace_hopper, vera_rubin]
     env:
       CC: clang-22
       CXX: clang++-22

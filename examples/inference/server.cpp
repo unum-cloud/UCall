@@ -24,7 +24,7 @@
 #include <thread>      // `std::this_thread::sleep_for`
 #include <utility>     // `std::move`
 
-#include <forkunion.h>                 // `fu_pool_t`, `fu_pool_for_threads`
+#include <forkunion/forkunion.h>       // `fu_pool_t`, `fu_pool_for_threads`
 #include <forkunion/types.hpp>         // `fu::split_mix`
 #include <numkong/dots.hpp>            // `nk::dots_packed`
 #include <numkong/matrix.hpp>          // `nk::packed_matrix`, `nk::matrix_view`, `nk::matrix_span`

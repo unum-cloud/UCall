@@ -82,6 +82,8 @@ sdist.include = [
   "/stringzilla/c/**",
   "/stringzilla/probes/**",
   "/stringzilla/include/**",
+  "/stringzilla/cpp/**",
+  "/stringzilla/src/**",
   "/smashtable/CMakeLists.txt",
   "/smashtable/VERSION",
   "/smashtable/cmake/**",
@@ -92,6 +94,7 @@ sdist.include = [
   "/forkunion/c/**",
   "/forkunion/probes/**",
   "/forkunion/include/**",
+  "/forkunion/src/**",
 ]
 wheel.packages = ["python/ucall"]
 

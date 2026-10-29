@@ -4,7 +4,7 @@
 # ~~~
 #   cmake -B build_macos -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-macos-llvm.cmake \
 #       -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk
-#   cmake --build build_macos --target ucall
+#   cmake --build build_macos --target ucall_static
 # ~~~
 set(CMAKE_SYSTEM_NAME Darwin)
 set(CMAKE_SYSTEM_PROCESSOR x86_64)

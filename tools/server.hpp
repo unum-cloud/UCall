@@ -20,7 +20,7 @@
 #include <thread>           // `std::this_thread::sleep_for`
 #include <vector>           // `std::vector`
 
-#include <forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`
+#include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`
 
 #include "ucall/types.hpp" // `bytes_view`, `st::status_t`
 

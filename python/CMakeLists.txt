@@ -22,7 +22,7 @@ set_target_properties(
                C_VISIBILITY_PRESET hidden
                LINKER_LANGUAGE CXX
 )
-target_link_libraries(ucall_python PRIVATE ucall::ucall)
+target_link_libraries(ucall_python PRIVATE ucall_static)
 # The module's one export is its init function; the archives linked inside, UCall's own and its siblings', keep their
 # symbols to themselves.
 set_target_properties(ucall_python PROPERTIES VISIBILITY_INLINES_HIDDEN ON)

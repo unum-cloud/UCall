@@ -1,0 +1,7 @@
+@PACKAGE_INIT@
+
+include(CMakeFindDependencyMacro)
+find_dependency(Threads)
+include("${CMAKE_CURRENT_LIST_DIR}/ucallTargets.cmake")
+# The archive installs outside the SDK, so its targets load only where it was installed.
+include("${CMAKE_CURRENT_LIST_DIR}/ucallStaticTargets.cmake" OPTIONAL)

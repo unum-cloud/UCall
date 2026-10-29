@@ -38,6 +38,7 @@ jobs:
           update-version-in: |
             CITATION.cff:^version: (\d+\.\d+\.\d+(?:-rc\.\d+)?)
             CMakeLists.txt:VERSION (\d+\.\d+\.\d+(?:-rc\.\d+)?)
+            Cargo.toml:^version = "(\d+\.\d+\.\d+(?:-rc\.\d+)?)"
           update-major-version-in: |
             c/ucall/types.h:^#define UCALL_VERSION_MAJOR (\d+)
           update-minor-version-in: |

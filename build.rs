@@ -11,7 +11,7 @@
 use std::env;
 use std::error::Error;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The siblings CMake fetches by pinned revision unless `FETCHCONTENT_SOURCE_DIR_<NAME>` names a
 /// local checkout.
@@ -34,8 +34,57 @@ fn main() -> Result<(), Box<dyn Error>> {
     }
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
 
-    let mut library = cmake::Config::new(&manifest);
-    library.profile("Release").build_target("ucall");
+    // A directory holding `ucall_static` that CMake already built, like a parent project's build
+    // tree or a release, skips the build here and links the system's liburing. Pass the archive's
+    // exact directory.
+    println!("cargo:rerun-if-env-changed=UCALL_LIBRARY_DIR");
+    let target_os = env::var("CARGO_CFG_TARGET_OS")?;
+    match env::var_os("UCALL_LIBRARY_DIR") {
+        Some(directory) => {
+            let directory = PathBuf::from(directory);
+            let archive_name = if env::var("CARGO_CFG_TARGET_ENV")? == "msvc" {
+                "ucall_static.lib"
+            } else {
+                "libucall_static.a"
+            };
+            println!(
+                "cargo:rerun-if-changed={}",
+                directory.join(archive_name).display()
+            );
+            println!("cargo:rustc-link-search=native={}", directory.display());
+            println!("cargo:rustc-link-lib=static=ucall_static");
+            if target_os == "linux" {
+                println!("cargo:rustc-link-lib=dylib=uring");
+            }
+        }
+        None => build_library(&manifest)?,
+    }
+
+    // The archive is C++ over the platform's threads and sockets.
+    match target_os.as_str() {
+        "windows" => {
+            for system in ["bcrypt", "ws2_32", "mswsock"] {
+                println!("cargo:rustc-link-lib=dylib={system}");
+            }
+        }
+        "macos" | "ios" => println!("cargo:rustc-link-lib=dylib=c++"),
+        "freebsd" => {
+            println!("cargo:rustc-link-lib=dylib=c++");
+            println!("cargo:rustc-link-lib=dylib=pthread");
+        }
+        _ => {
+            println!("cargo:rustc-link-lib=dylib=stdc++");
+            println!("cargo:rustc-link-lib=dylib=pthread");
+        }
+    }
+
+    Ok(())
+}
+
+/// Builds `ucall_static` through CMake and links it with the liburing its io_uring backends need.
+fn build_library(manifest: &Path) -> Result<(), Box<dyn Error>> {
+    let mut library = cmake::Config::new(manifest);
+    library.profile("Release").build_target("ucall_static");
     for sibling in SIBLINGS {
         let variable = format!("FETCHCONTENT_SOURCE_DIR_{sibling}");
         println!("cargo:rerun-if-env-changed={variable}");
@@ -48,7 +97,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // of its build tree whatever the generator.
     let build = library.build().join("build");
     println!("cargo:rustc-link-search=native={}", build.display());
-    println!("cargo:rustc-link-lib=static=ucall");
+    println!("cargo:rustc-link-lib=static=ucall_static");
 
     // The io_uring backends link liburing publicly: the system's shared library when pkg-config
     // found a recent one, otherwise the archive CMake built from source.
@@ -66,24 +115,6 @@ fn main() -> Result<(), Box<dyn Error>> {
                 println!("cargo:rustc-link-search=native={}", source.display());
                 println!("cargo:rustc-link-lib=static=uring");
             }
-        }
-    }
-
-    // The archive is C++ over the platform's threads and sockets.
-    match env::var("CARGO_CFG_TARGET_OS")?.as_str() {
-        "windows" => {
-            for system in ["bcrypt", "ws2_32", "mswsock"] {
-                println!("cargo:rustc-link-lib=dylib={system}");
-            }
-        }
-        "macos" | "ios" => println!("cargo:rustc-link-lib=dylib=c++"),
-        "freebsd" => {
-            println!("cargo:rustc-link-lib=dylib=c++");
-            println!("cargo:rustc-link-lib=dylib=pthread");
-        }
-        _ => {
-            println!("cargo:rustc-link-lib=dylib=stdc++");
-            println!("cargo:rustc-link-lib=dylib=pthread");
         }
     }
 

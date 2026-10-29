@@ -57,7 +57,13 @@
       "name": "release",
       "inherits": ["base", "clang"],
       "displayName": "Host Release",
-      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release"}
+      "description": "The suites and the shared library, with build paths remapped so the binaries name none.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_FLAGS": "-ffile-prefix-map=${sourceDir}=.",
+        "CMAKE_CXX_FLAGS": "-ffile-prefix-map=${sourceDir}=.",
+        "UCALL_BUILD_SHARED": "ON"
+      }
     },
     {
       "name": "asan",

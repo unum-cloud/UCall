@@ -4,7 +4,8 @@ Include `ucall/ucall.h` for the whole interface, or include `types.h`, `client.h
 Every operation that can fail takes its named argument struct and writes a `ucall_outcome_t`.
 Getters that cannot fail and handle release functions take their arguments directly.
 
-Link `ucall::ucall` to use the single library containing every enabled backend.
+Link `ucall::static` or `ucall::shared`, each a single library containing every enabled backend.
+An installed tree or the SDK archive finds them through `find_package(ucall)`, and the shared library through `pkg-config --libs ucall` too.
 Select `automatic`, `posix`, `linux-epollaio`, `linux-uring612`, `linux-uring618`, `macos-kqueue`, or `windows-iocp` in the server or client configuration.
 Explicit unavailable selections fail.
 CPU classes select compiled string, cryptographic, and atomic kernels once, at initialization, under the requested class or the initialization thread's capabilities.
