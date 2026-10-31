@@ -5,7 +5,7 @@
 
 #include <turbob64.h>
 
-static const char int_to_hex_k[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
+static char const int_to_hex_k[16] = {'0', '1', '2', '3', '4', '5', '6', '7', '8', '9', 'A', 'B', 'C', 'D', 'E', 'F'};
 
 static void char_to_hex(uint8_t const c, uint8_t* hex) {
     hex[0] = int_to_hex_k[c >> 4];
@@ -32,7 +32,7 @@ static int to_string(PyObject* obj, char* data, size_t* len) {
         *len = begin - data;
     } else if (PyUnicode_Check(obj)) {
         Py_ssize_t size;
-        const char* char_ptr = PyUnicode_AsUTF8AndSize(obj, &size);
+        char const* char_ptr = PyUnicode_AsUTF8AndSize(obj, &size);
         char* begin = data;
         *(begin++) = '"';
         for (size_t i = 0; i != size; ++i) {

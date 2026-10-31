@@ -1,11 +1,11 @@
 /**
  *  @brief  Pure CPython bindings for UCall.
  *  @author Ash Vardanian
- *  @file   python.c
+ *  @file   lib.c
  *  @date   2023-01-30
- * 
+ *
  *  @copyright Copyright (c) 2023
- * 
+ *
  *  @see Reading Materials
  *  https://pythoncapi.readthedocs.io/type_object.html
  *  https://numpy.org/doc/stable/reference/c-api/types-and-structures.html
@@ -44,7 +44,7 @@ typedef enum {
 } py_param_kind_t;
 
 typedef struct {
-    const char* name;     // Name or NULL
+    char const* name;     // Name or NULL
     Py_ssize_t name_len;  // Name Length
     PyObject* value;      // Any or NULL
     PyTypeObject* type;   // Type or NULL
@@ -402,7 +402,6 @@ static PyMappingMethods server_mapping_methods = {
 
 static void server_dealloc(py_server_t* self) {
     free(self->wrappers);
-    free(self->config.ssl_certificates_paths);
     ucall_free(self->server);
     Py_TYPE(self)->tp_free((PyObject*)self);
 }
@@ -413,7 +412,7 @@ static PyObject* server_new(PyTypeObject* type, PyObject* args, PyObject* keywor
 }
 
 static int server_init(py_server_t* self, PyObject* args, PyObject* keywords) {
-    static const char const* keywords_list[] = {
+    static char const const* keywords_list[] = {
         "hostname",      "port",  "queue_depth", "max_callbacks", "max_threads",
         "count_threads", "quiet", "ssl_pk",      "ssl_certs",     NULL,
     };
@@ -429,19 +428,11 @@ static int server_init(py_server_t* self, PyObject* args, PyObject* keywords) {
 
     PyObject* certs_path = NULL;
 
-    if (!PyArg_ParseTupleAndKeywords(args, keywords, "|snnnnnpsO", (char**)keywords_list, //
+    if (!PyArg_ParseTupleAndKeywords(args, keywords, "|snnnnnp", (char**)keywords_list, //
                                      &self->config.hostname, &self->config.port, &self->config.queue_depth,
                                      &self->config.max_callbacks, &self->config.max_threads, &self->count_threads,
-                                     &self->quiet, &self->config.ssl_private_key_path, &certs_path))
+                                     &self->quiet))
         return -1;
-
-    if (self->config.ssl_private_key_path && certs_path && PySequence_Check(certs_path)) {
-        self->config.use_ssl = true;
-        self->config.ssl_certificates_count = PySequence_Length(certs_path);
-        self->config.ssl_certificates_paths = (char**)malloc(sizeof(char*) * self->config.ssl_certificates_count);
-        for (size_t i = 0; i < self->config.ssl_certificates_count; i++)
-            self->config.ssl_certificates_paths[i] = PyUnicode_AsUTF8AndSize(PySequence_GetItem(certs_path, i), NULL);
-    }
 
     self->wrapper_capacity = 16;
     self->wrappers = (py_wrapper_t*)malloc(self->wrapper_capacity * sizeof(py_wrapper_t));
@@ -512,22 +503,28 @@ int main(int argc, char* argv[]) {
         exit(1);
     }
 
-    /* Add a built-in module, before Py_Initialize */
+    // Add a built-in module, before Py_Initialize
     if (PyImport_AppendInittab("ucall." stringify_value_m(UCALL_PYTHON_MODULE_NAME), pyinit_f_m) == -1) {
         fprintf(stderr, "Error: could not extend in-built modules table\n");
         exit(1);
     }
 
-    /* Pass argv[0] to the Python interpreter */
-    Py_SetProgramName(program);
+    // Pass argv[0] to the Python interpreter
+    PyConfig config;
+    PyConfig_InitPythonConfig(&config);
+    config.program_name = program;
 
-    /* Initialize the Python interpreter.  Required.
-       If this step fails, it will be a fatal error. */
-    Py_Initialize();
+    // Initialize the Python interpreter.  Required.
+    // If this step fails, it will be a fatal error.
+    PyStatus status = Py_InitializeFromConfig(&config);
+    if (PyStatus_Exception(status)) {
+        fprintf(stderr, "Couldn't initialize from config\n");
+        exit(1);
+    }
+    PyConfig_Clear(&config);
 
-    /* Optionally import the module; alternatively,
-       import can be deferred until the embedded script
-       imports it. */
+    // Optionally import the module; alternatively, import can be deferred
+    // until the embedded script imports it.
     PyObject* pmodule = PyImport_ImportModule("ucall." stringify_value_m(UCALL_PYTHON_MODULE_NAME));
     if (!pmodule) {
         PyErr_Print();
@@ -537,8 +534,7 @@ int main(int argc, char* argv[]) {
     // Add version metadata
     {
         char version_str[50];
-        sprintf(version_str, "%d.%d.%d", UCALL_VERSION_MAJOR, UCALL_VERSION_MINOR,
-                UCALL_VERSION_PATCH);
+        sprintf(version_str, "%d.%d.%d", UCALL_VERSION_MAJOR, UCALL_VERSION_MINOR, UCALL_VERSION_PATCH);
         PyModule_AddStringConstant(pmodule, "__version__", version_str);
     }
 

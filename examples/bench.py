@@ -18,27 +18,27 @@ class Stats:
     requests_failure: int = 0
     mean_latency_secs: float = 0
     total_secs: float = 0
-    last_failure: str = ''
+    last_failure: str = ""
 
     @property
     def success_rate(self) -> float:
         return (self.requests_correct * 1.0 / self.requests) if self.requests else 1.0
 
     def __repr__(self) -> str:
-        bandwidth = self.requests / \
-            self.total_secs if self.total_secs > 0 else 0.0
-        result = f'''
+        bandwidth = self.requests / self.total_secs if self.total_secs > 0 else 0.0
+        result = f"""
         - Took: {self.total_secs:.1f} CPU seconds
         - Total exchanges: {self.requests:,}
         - Success rate: {self.success_rate:.3%}
         - Mean latency: {self.mean_latency_secs * 1e6:.1f} microseconds
         - Mean bandwidth: {bandwidth:.1f} requests/s
-        '''
+        """
         return I(result)
 
 
 def bench_serial(
-    callable, *,
+    callable,
+    *,
     requests_count: int = 100_000,
     seconds: float = 10,
     progress: bool = False,
@@ -90,19 +90,21 @@ def bench_parallel(
             callable=callable,
             seconds=seconds,
             requests_count=requests_count,
-            progress=progress)
+            progress=progress,
+        )
 
-    requests_correct = Value('i', 0)
-    requests_incorrect = Value('i', 0)
-    requests = Value('i', 0)
-    mean_latency_secs = Value('f', 0)
+    requests_correct = Value("i", 0)
+    requests_incorrect = Value("i", 0)
+    requests = Value("i", 0)
+    mean_latency_secs = Value("f", 0)
 
     def run():
         stats = bench_serial(
             callable=callable,
             seconds=seconds,
             requests_count=requests_count,
-            progress=False)
+            progress=False,
+        )
         requests_correct.value += stats.requests_correct
         requests_incorrect.value += stats.requests_incorrect
         requests.value += stats.requests
@@ -129,9 +131,19 @@ def bench_parallel(
     )
 
 
-def main(class_name: str, *, threads: int = 1, requests: int = 100_000, seconds: float = 10, progress: bool = False):
+def main(
+    class_name: str,
+    *,
+    threads: int = 1,
+    requests: int = 100_000,
+    seconds: float = 10,
+    progress: bool = False,
+):
     script_dir = os.path.dirname(os.path.abspath(__file__))
-    sys.path.append(f'{script_dir}/login')
+    project_dir = os.path.dirname(script_dir)
+    sys.path.append(f"{script_dir}/login")
+    sys.path.append(os.path.join(project_dir, "python"))
+
     class_ = locate(class_name)
     stats = bench_parallel(
         callable=class_(),
@@ -143,5 +155,5 @@ def main(class_name: str, *, threads: int = 1, requests: int = 100_000, seconds:
     print(stats)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     fire.Fire(main)

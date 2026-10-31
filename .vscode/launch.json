@@ -36,10 +36,10 @@
             "justMyCode": true
         },
         {
-            "name": "Python: Test Client",
+            "name": "Python: PyTest Current File",
             "type": "python",
             "request": "launch",
-            "program": "${workspaceFolder}/examples/test.py",
+            "program": "pytest ${file}",
             "console": "integratedTerminal",
             "justMyCode": false,
             "subProcess": true

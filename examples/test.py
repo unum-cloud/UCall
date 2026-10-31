@@ -10,8 +10,8 @@ from login.jsonrpc_client import CaseHTTP, CaseHTTPBatches, CaseTCP
 class ClientGeneric:
     """JSON-RPC Client that uses classic sync Python `requests` to pass JSON calls over HTTP"""
 
-    def __init__(self, uri: str = '127.0.0.1', port: int = 8545) -> None:
-        self.url = f'http://{uri}:{port}/'
+    def __init__(self, uri: str = "127.0.0.1", port: int = 8545) -> None:
+        self.url = f"http://{uri}:{port}/"
 
     def __call__(self, jsonrpc: object) -> object:
         return requests.post(self.url, json=jsonrpc).json()
@@ -19,10 +19,7 @@ class ClientGeneric:
 
 def shuffled_n_identities(class_, count_clients: int = 3, count_cycles: int = 1000):
 
-    clients = [
-        class_(identity=identity)
-        for identity in range(count_clients)
-    ]
+    clients = [class_(identity=identity) for identity in range(count_clients)]
 
     for _ in range(count_cycles):
         random.shuffle(clients)
@@ -96,60 +93,77 @@ def test_normal_positional_tls():
 
 def test_notification():
     client = ClientGeneric()
-    response = client({
-        'method': 'validate_session',
-        'params': {'user_id': 2, 'session_id': 2},
-        'jsonrpc': '2.0',
-    })
+    response = client(
+        {
+            "method": "validate_session",
+            "params": {"user_id": 2, "session_id": 2},
+            "jsonrpc": "2.0",
+        }
+    )
     assert len(response) == 0
 
 
 def test_method_missing():
     client = ClientGeneric()
-    response = client({
-        'method': 'sumsum',
-        'params': {'a': 2, 'b': 2},
-        'jsonrpc': '2.0',
-        'id': 0,
-    })
-    assert response['error']['code'] == -32601
+    response = client(
+        {
+            "method": "sumsum",
+            "params": {"a": 2, "b": 2},
+            "jsonrpc": "2.0",
+            "id": 0,
+        }
+    )
+    assert response["error"]["code"] == -32601
 
 
 def test_param_missing():
     client = ClientGeneric()
-    response = client({
-        'method': 'validate_session',
-        'params': {'user_id': 2},
-        'jsonrpc': '2.0',
-        'id': 0,
-    })
-    assert response['error']['code'] == -32602
+    response = client(
+        {
+            "method": "validate_session",
+            "params": {"user_id": 2},
+            "jsonrpc": "2.0",
+            "id": 0,
+        }
+    )
+    assert response["error"]["code"] == -32602
 
 
 def test_param_type():
     client = ClientGeneric()
-    response = client({
-        'method': 'validate_session',
-        'params': {'user_id': 2.0, 'session_id': 3.5},
-        'jsonrpc': '2.0',
-        'id': 0,
-    })
-    assert response['error']['code'] == -32602
+    response = client(
+        {
+            "method": "validate_session",
+            "params": {"user_id": 2.0, "session_id": 3.5},
+            "jsonrpc": "2.0",
+            "id": 0,
+        }
+    )
+    assert response["error"]["code"] == -32602
 
 
 def test_non_uniform_batch():
     a = 2
     b = 2
-    r_normal = {'method': 'validate_session', 'params': {
-        'user_id': a, 'session_id': b}, 'jsonrpc': '2.0', 'id': 0}
-    r_notification = {'method': 'validate_session', 'params': {
-        'user_id': a, 'session_id': b}, 'jsonrpc': '2.0'}
+    r_normal = {
+        "method": "validate_session",
+        "params": {"user_id": a, "session_id": b},
+        "jsonrpc": "2.0",
+        "id": 0,
+    }
+    r_notification = {
+        "method": "validate_session",
+        "params": {"user_id": a, "session_id": b},
+        "jsonrpc": "2.0",
+    }
 
     client = ClientGeneric()
-    response = client([
-        r_normal,
-        r_notification,
-    ])
+    response = client(
+        [
+            r_normal,
+            r_notification,
+        ]
+    )
 
 
 def test_numpy():
@@ -157,18 +171,20 @@ def test_numpy():
     b = np.random.randint(0, 101, size=(1, 3, 10))
     res = np.mod(np.logical_xor(a, b), 23)
     client = Client()
-    response = client({
-        'method': 'validate_all_sessions',
-        'params': {'user_ids': a, 'session_ids':  b},
-        'jsonrpc': '2.0',
-        'id': 100,
-    })
+    response = client(
+        {
+            "method": "validate_all_sessions",
+            "params": {"user_ids": a, "session_ids": b},
+            "jsonrpc": "2.0",
+            "id": 100,
+        }
+    )
     response.raise_for_status()
     assert np.array_equal(response.numpy, res)
 
 
 def test_pillow():
-    img = Image.open('examples/login/original.jpg')
+    img = Image.open("examples/login/original.jpg")
     res = img.rotate(45)
     client = Client()
     response = client.rotate_avatar(image=img)
@@ -183,18 +199,20 @@ def test_numpy_tls():
     b = np.random.randint(0, 101, size=(1, 3, 10))
     res = np.mod(np.logical_xor(a, b), 23)
     client = ClientTLS(allow_self_signed=True)
-    response = client({
-        'method': 'validate_all_sessions',
-        'params': {'user_ids': a, 'session_ids':  b},
-        'jsonrpc': '2.0',
-        'id': 100,
-    })
+    response = client(
+        {
+            "method": "validate_all_sessions",
+            "params": {"user_ids": a, "session_ids": b},
+            "jsonrpc": "2.0",
+            "id": 100,
+        }
+    )
     response.raise_for_status()
     assert np.array_equal(response.numpy, res)
 
 
 def test_pillow_tls():
-    img = Image.open('examples/login/original.jpg')
+    img = Image.open("examples/login/original.jpg")
     res = img.rotate(45)
     client = ClientTLS(allow_self_signed=True)
     response = client.rotate_avatar(image=img)
@@ -204,7 +222,7 @@ def test_pillow_tls():
     assert np.array_equal(ar1, ar2)
 
 
-if __name__ == '__main__':
+if __name__ == "__main__":
     test_normal()
     test_normal_positional()
     # test_normal_tls()

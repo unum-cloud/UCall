@@ -35,7 +35,7 @@
  * - `IORING_SETUP_COOP_TASKRUN` > 5.19.
  * - `IORING_SETUP_SINGLE_ISSUER` > 6.0.
  *
- * @author Ashot Vardanian
+ * @author Ash Vardanian
  *
  * @see Notable links:
  * https://man7.org/linux/man-pages/dir_by_project.html#liburing
@@ -487,7 +487,7 @@ void ucall_call_reply_content(ucall_call_t call, ucall_str_t body, size_t body_l
         return;
 
     body_len = string_length(body, body_len);
-    struct iovec iovecs[iovecs_for_content_k] {};
+    struct iovec iovecs[iovecs_for_content_k]{};
     fill_with_content(iovecs, scratch.dynamic_id, std::string_view(body, body_len), true);
     connection.pipes.append_outputs<iovecs_for_content_k>(iovecs);
 }
@@ -507,7 +507,7 @@ void ucall_call_reply_error(ucall_call_t call, int code_int, ucall_str_t note, s
     if (res.ec != std::error_code())
         return ucall_call_reply_error_unknown(call);
 
-    struct iovec iovecs[iovecs_for_error_k] {};
+    struct iovec iovecs[iovecs_for_error_k]{};
     fill_with_error(iovecs, scratch.dynamic_id, std::string_view(code, code_len), std::string_view(note, note_len),
                     true);
     if (!connection.pipes.append_outputs<iovecs_for_error_k>(iovecs))

@@ -9,7 +9,7 @@ import (
 	"os"
 	"time"
 	"bytes"
-  "flag"
+  	"flag"
 )
 
 var(
@@ -79,7 +79,6 @@ func main() {
 			    _, err = conn.Write([]byte(req))
       }
 			if err != nil {
-        //fmt.Printf("Write Error: %v\n", err)
 				break
 			}
 

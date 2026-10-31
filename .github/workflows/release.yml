@@ -1,66 +1,45 @@
 name: Release
 
 on:
-  push:
-    branches: ["main"]
+  release:
+    types: [published]
 
 env:
   BUILD_TYPE: Release
-  GH_TOKEN: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
   PYTHONUTF8: 1
 
-# Sets permissions of the GITHUB_TOKEN to allow deployment to GitHub Pages
 permissions:
-  contents: write
-  pages: write
-  id-token: write
+  contents: read
 
 jobs:
 
-  versioning:
-    name: Update Version
-    runs-on: ubuntu-latest
+  hooks:
+    name: Check Release Commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - name: Run TinySemVer
-        uses: ashvardanian/tinysemver@v2.0.7
-        with:
-          verbose: "true"
-          version-file: "VERSION"
-          update-version-in: |
-            CMakeLists.txt:VERSION (\d+\.\d+\.\d+)
-          update-major-version-in: |
-            include/ucall/ucall.h:^#define UCALL_VERSION_MAJOR (\d+)
-          update-minor-version-in: |
-            include/ucall/ucall.h:^#define UCALL_VERSION_MINOR (\d+)
-          update-patch-version-in: |
-            include/ucall/ucall.h:^#define UCALL_VERSION_PATCH (\d+)
-          dry-run: "false"
-          push: "true"
-          create-release: "true"
-          github-token: ${{ secrets.SEMANTIC_RELEASE_TOKEN }}
+        uses: actions/checkout@v7
+      - name: Check the Release Commit
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME"
 
   build_wheels:
     name: Build Python ${{ matrix.python-version }} for ${{ matrix.os }}
     runs-on: ${{ matrix.os }}
-    needs: versioning
+    needs: hooks
     strategy:
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: [ubuntu-26.04, macos-26, windows-2025]
         python-version: ["39", "310", "311", "312"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: 3.x
       - name: Setup QEMU
-        if: matrix.os == 'ubuntu-latest' # We only need QEMU for Linux builds
-        uses: docker/setup-qemu-action@v3
+        if: matrix.os == 'ubuntu-26.04' # We only need QEMU for Linux builds
+        uses: docker/setup-qemu-action@v4
       - name: Install cibuildwheel
         run: python -m pip install cibuildwheel
       - name: Build wheels
@@ -68,7 +47,7 @@ jobs:
         env:
           CIBW_BUILD: cp${{ matrix.python-version }}-*
       - name: Upload wheels
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: cibw-wheels-${{ matrix.os }}-${{ strategy.job-index }}
           path: ./wheelhouse/*.whl
@@ -77,7 +56,7 @@ jobs:
   publish_python:
     name: Publish Python
     needs: build_wheels
-    runs-on: ubuntu-20.04
+    runs-on: ubuntu-26.04
     environment:
       name: pypi
       url: https://pypi.org/p/stringzilla
@@ -86,7 +65,7 @@ jobs:
 
     steps:
       - name: Download artifacts
-        uses: actions/download-artifact@v4
+        uses: actions/download-artifact@v8
         with:
           # unpacks all CIBW artifacts into dist/
           pattern: cibw-*
@@ -105,16 +84,19 @@ jobs:
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}
-    runs-on: ubuntu-22.04
-    if: ${{ always() }}
-    needs: publish_python
+    runs-on: ubuntu-26.04
+    # Docs follow even a failed upload, but never a failed release check or a candidate.
+    if: ${{ always() && needs.hooks.result == 'success' && !github.event.release.prerelease }}
+    needs: [hooks, publish_python]
+    permissions:
+      contents: read
+      pages: write
+      id-token: write
     steps:
       - name: Checkout
-        uses: actions/checkout@v3
-        with:
-          ref: 'main'   
+        uses: actions/checkout@v7
       - name: Setup GitHub Pages
-        uses: actions/configure-pages@v2
+        uses: actions/configure-pages@v6
       - name: Install dependencies
         run: sudo apt update && sudo apt install -y doxygen graphviz dia git && pip install sphinx breathe furo m2r2 sphinxcontrib-googleanalytics==0.2.dev20220708 sphinxcontrib-jquery
       - name: Install UCall from PyPi
@@ -124,10 +106,10 @@ jobs:
       - name: Copy assets
         run: cp -r assets build/docs/html/
       - name: Upload artifacts
-        uses: actions/upload-pages-artifact@v1
+        uses: actions/upload-pages-artifact@v5
         with:
           # Upload entire repository
           path: "./build/docs/html/"
       - name: Deploy to GitHub Pages
         id: deployment
-        uses: actions/deploy-pages@v1
+        uses: actions/deploy-pages@v5
