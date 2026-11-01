@@ -1,0 +1,47 @@
+name: Test Python
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: 1
+  PYTHONFAULTHANDLER: 1
+
+jobs:
+  test_python:
+    name: Test Python ${{ matrix.python-version }} on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-26.04, macos-26, windows-2025]
+        python-version: ["3.12", "3.15"]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: ${{ matrix.python-version }}
+      - name: Install Test Dependencies
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install --group test
+      - name: Build Locally
+        run: python -m pip install .
+      - name: Test Python
+        run: python -X faulthandler -m pytest -x
+
+  # The native Python builds on every OS fail in minutes, before the cibuildwheel jobs start.
+  wheels:
+    name: Build Python Wheels
+    needs: test_python
+    uses: ./.github/workflows/build-wheels.yml
+    with:
+      smoke: true

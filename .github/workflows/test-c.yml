@@ -1,0 +1,193 @@
+name: Test C
+
+on:
+  workflow_call:
+
+permissions:
+  contents: read
+
+jobs:
+  test_ubuntu_debug:
+    name: Test Debug Build on Ubuntu with GCC 15
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Linux Compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-15 g++-15 clang-22
+      - name: Configure C and C++
+        run: cmake --preset debug -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+      - name: Build C and C++
+        run: cmake --build --preset debug --config Debug --parallel 4
+      - name: Test C and C++
+        run: ctest --preset debug --build-config Debug
+
+  test_ubuntu_clang:
+    name: Test on Ubuntu with Clang 22
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Linux Compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-15 g++-15 clang-22
+      - name: Configure C and C++
+        run: cmake --preset relwithdebinfo -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+      - name: Build C and C++
+        run: cmake --build --preset relwithdebinfo --config RelWithDebInfo --parallel 4
+      - name: Test C and C++
+        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo
+
+  test_macos:
+    name: Test on macOS
+    runs-on: macos-26
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Configure C and C++
+        run: cmake --preset relwithdebinfo -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+      - name: Build C and C++
+        run: cmake --build --preset relwithdebinfo --config RelWithDebInfo --parallel 4
+      - name: Test C and C++
+        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo
+
+  test_windows:
+    name: Test on Windows with Visual Studio 2026
+    runs-on: windows-2025-vs2026
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Configure C and C++
+        run: cmake --preset msvc2026_x64 -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+      - name: Build C and C++
+        run: cmake --build --preset msvc2026_x64 --config Release --parallel 4
+      - name: Test C and C++
+        run: ctest --preset msvc2026_x64 --build-config Release
+
+  # Each machine profile builds the library for one CPU; the Arm ones build natively on Arm runners. Clang 22 compiles
+  # it, as older compilers predate Olympus.
+  build_machine_profile:
+    name: Build Machine Profile ${{ matrix.preset }}
+    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [xeon4_hopper, xeon6_blackwell, venice_mi450, grace_hopper, vera_rubin]
+    env:
+      CC: clang-22
+      CXX: clang++-22
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Clang 22
+        run: sudo apt-get update && sudo apt-get install -y clang-22
+      - name: Build Library
+        run: |
+          cmake --preset ${{ matrix.preset }} -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
+          cmake --build --preset ${{ matrix.preset }} --parallel 4
+
+  # The NDK's own toolchain builds the library over the epoll backend; nothing runs it.
+  build_android:
+    name: Build for Android ARM64
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Build Library
+        run: |
+          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
+          cmake --preset android_arm64
+          cmake --build --preset android_arm64 --parallel 4
+
+  verify_models:
+    name: Check Promela Models and GenMC Clients
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Pull ForkUnion Submodule
+        run: git submodule update --init forkunion
+      - name: Install Spin, Clang and GenMC Build Dependencies
+        run: |
+          sudo apt update
+          sudo apt install -y spin cmake clang-20 llvm-20-dev libffi-dev zlib1g-dev libedit-dev
+      - name: Checkout GenMC
+        uses: actions/checkout@v7
+        with:
+          repository: MPI-SWS/genmc
+          ref: 9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7
+          path: genmc
+      - name: Restore GenMC Build
+        id: genmc
+        uses: actions/cache@v6
+        with:
+          path: genmc/build
+          key: genmc-9f6c4c0-clang-20
+      - name: Build GenMC
+        if: steps.genmc.outputs.cache-hit != 'true'
+        run: |
+          cmake -S genmc -B genmc/build -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-20 -D CMAKE_CXX_COMPILER=clang++-20 -D LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
+          cmake --build genmc/build --parallel
+      - name: Check Models and Clients
+        run: verification/check.sh
+        env:
+          GENMC: ${{ github.workspace }}/genmc/build/bin/genmc
+          GENMC_CLANG: clang++-20

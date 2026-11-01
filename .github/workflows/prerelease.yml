@@ -1,195 +1,40 @@
 name: Pre-Release
 
 on:
-  push:
-    branches: [main, main-dev]
   pull_request:
-  workflow_call:
+    branches: ["main", "main-dev"]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 permissions:
   contents: read
 
-env:
-  PYTHONUTF8: 1
-  PYTHONFAULTHANDLER: 1
-
 jobs:
-  lint:
-    name: Check source conventions
+  hooks:
+    name: Check Commits
     runs-on: ubuntu-26.04
+    timeout-minutes: 10
     steps:
-      - name: Checkout
+      - name: Checkout Repository
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Install formatters
-        run: python -m pip install --group lint
-      - name: Check Markdown formatting
-        uses: dprint/check@v2
-        with:
-          dprint-version: "0.59.0"
-      - name: Check the changed source
-        env:
-          CHANGE_BASE: ${{ github.event.pull_request.base.sha || github.event.before }}
-        run: |
-          base="$CHANGE_BASE"
-          if ! git rev-parse --verify "${base}^{commit}" >/dev/null 2>&1; then
-            base=$(git rev-parse HEAD^)
-          fi
-          UCALL_LINT_BASE="$base" .githooks/pre-commit
-      - name: Compile Python sources
-        run: python -m compileall -q python test bench examples
+      - name: Check Every Commit
+        run: .github/scripts/check-commits.sh "${{ github.event.pull_request.base.sha }}"
 
-  native:
-    name: Test ${{ matrix.name }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - name: Linux GCC Debug
-            os: ubuntu-26.04
-            preset: debug
-            compilers: -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
-            config: Debug
-          - name: Linux Clang
-            os: ubuntu-26.04
-            preset: relwithdebinfo
-            compilers: -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
-            config: RelWithDebInfo
-          - name: macOS
-            os: macos-15
-            preset: relwithdebinfo
-            compilers: ""
-            config: RelWithDebInfo
-          - name: Windows with Visual Studio 2026
-            os: windows-2025-vs2026
-            preset: msvc2026_x64
-            compilers: ""
-            config: Release
-    defaults:
-      run:
-        shell: bash
-    steps:
-      - name: Checkout with sibling libraries
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - name: Set up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.14"
-      - name: Install CMake
-        run: python -m pip install "cmake>=3.28"
-      - name: Install Linux compilers
-        if: runner.os == 'Linux'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y gcc-15 g++-15 clang-22
-      - name: Configure C and C++
-        run: cmake --preset ${{ matrix.preset }} ${{ matrix.compilers }} -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
-      - name: Build C and C++
-        run: cmake --build --preset ${{ matrix.preset }} --config ${{ matrix.config }} --parallel 4
-      - name: Test C and C++
-        run: ctest --preset ${{ matrix.preset }} --build-config ${{ matrix.config }}
+  test_c:
+    name: Test C
+    needs: hooks
+    uses: ./.github/workflows/test-c.yml
 
-  # Each machine profile builds the library for one CPU; the Arm ones build natively on Arm runners. Clang 22 compiles
-  # it, as older compilers predate Olympus.
-  build_machine_profile:
-    name: Build Machine Profile ${{ matrix.preset }}
-    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
-    strategy:
-      fail-fast: false
-      matrix:
-        preset: [xeon4_hopper, xeon6_blackwell, venice_mi450, grace_hopper, vera_rubin]
-    env:
-      CC: clang-22
-      CXX: clang++-22
-    steps:
-      - name: Checkout with sibling libraries
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - name: Install Clang 22
-        run: sudo apt-get update && sudo apt-get install -y clang-22
-      - name: Build
-        run: |
-          cmake --preset ${{ matrix.preset }} -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
-          cmake --build --preset ${{ matrix.preset }} --parallel 4
+  test_python:
+    name: Test Python
+    needs: hooks
+    uses: ./.github/workflows/test-python.yml
 
-  # The NDK's own toolchain builds the library over the epoll backend; nothing runs it.
-  build_android:
-    name: Build Android ARM64
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout with sibling libraries
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - name: Build
-        run: |
-          export ANDROID_NDK_ROOT="${ANDROID_NDK_LATEST_HOME}"
-          cmake --preset android_arm64
-          cmake --build --preset android_arm64 --parallel 4
-
-  verify_models:
-    name: Check Promela Models and GenMC Clients
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-      - name: Pull ForkUnion Submodule
-        run: git submodule update --init forkunion
-      - name: Install Spin, Clang and GenMC Build Dependencies
-        run: |
-          sudo apt update
-          sudo apt install -y spin cmake clang-20 llvm-20-dev libffi-dev zlib1g-dev libedit-dev
-      - name: Checkout GenMC
-        uses: actions/checkout@v7
-        with:
-          repository: MPI-SWS/genmc
-          ref: 9f6c4c0772d0c42b325681581acc6a0f3eb9b5f7
-          path: genmc
-      - name: Restore GenMC Build
-        id: genmc
-        uses: actions/cache@v6
-        with:
-          path: genmc/build
-          key: genmc-9f6c4c0-clang-20
-      - name: Build GenMC
-        if: steps.genmc.outputs.cache-hit != 'true'
-        run: |
-          cmake -S genmc -B genmc/build -D CMAKE_BUILD_TYPE=Release -D CMAKE_C_COMPILER=clang-20 -D CMAKE_CXX_COMPILER=clang++-20 -D LLVM_DIR=/usr/lib/llvm-20/lib/cmake/llvm
-          cmake --build genmc/build --parallel
-      - name: Check Models and Clients
-        run: verification/check.sh
-        env:
-          GENMC: ${{ github.workspace }}/genmc/build/bin/genmc
-          GENMC_CLANG: clang++-20
-
-  build_docs:
-    name: Build Docs
-    runs-on: ubuntu-26.04
-    steps:
-      - name: Checkout
-        uses: actions/checkout@v7
-        with:
-          submodules: recursive
-      - name: Set Up Python
-        uses: actions/setup-python@v7
-        with:
-          python-version: "3.13"
-      - name: Install Doxygen
-        run: |
-          curl -sSfL https://www.doxygen.nl/files/doxygen-1.18.0.linux.bin.tar.gz | tar -xz -C "$RUNNER_TEMP"
-          echo "$RUNNER_TEMP/doxygen-1.18.0/bin" >> "$GITHUB_PATH"
-      - name: Install Sphinx
-        run: pip install -r docs/requirements.txt
-      - name: Install UCall from the Checkout
-        run: pip install .
-      - name: Build Docs
-        run: cd docs && doxygen conf.dox && sphinx-build -M html . ../build/docs -W
+  test_docs:
+    name: Test Docs
+    needs: hooks
+    uses: ./.github/workflows/test-docs.yml

@@ -3,14 +3,13 @@ description: Something we haven't implemented yet?
 title: "Feature: "
 labels: ["enhancement"]
 assignees:
-  - octocat
+  - ashvardanian
 body:
   - type: markdown
     attributes:
       value: |
         Thanks for taking the time to fill out this feature request!
         We have already scheduled a few features for our [next milestone](https://github.com/unum-cloud/UCall/milestones).
-        Still, we will be happy to learn about your idea!
   - type: textarea
     id: what
     attributes:
@@ -30,8 +29,11 @@ body:
       label: Is your feature request specific to a certain interface?
       options:
         - It applies to everything
-        - Native C interface
-        - Official Python bindings
+        - C implementation
+        - C++ bindings
+        - Python bindings
+        - Rust bindings
+        - Other
     validations:
       required: true
   - type: input

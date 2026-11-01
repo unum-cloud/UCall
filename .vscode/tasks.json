@@ -1,17 +1,17 @@
 {
-    "version": "2.0.0",
-    "tasks": [
-        {
-            "label": "Build Debug",
-            "command": "cmake --preset debug && cmake --build --preset debug",
-            "args": [],
-            "type": "shell"
-        },
-        {
-            "label": "Build Release",
-            "command": "cmake --preset release && cmake --build --preset release",
-            "args": [],
-            "type": "shell"
-        },
-    ]
+  "version": "2.0.0",
+  "tasks": [
+    {
+      "label": "Build Debug",
+      "command": "cmake --preset debug && cmake --build --preset debug",
+      "args": [],
+      "type": "shell"
+    },
+    {
+      "label": "Build Release",
+      "command": "cmake --preset release && cmake --build --preset release",
+      "args": [],
+      "type": "shell"
+    },
+  ]
 }

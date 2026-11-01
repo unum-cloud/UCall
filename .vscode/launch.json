@@ -1,124 +1,124 @@
 {
-    // Use IntelliSense to learn about possible attributes.
-    // Hover to view descriptions of existing attributes.
-    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
-    "version": "0.2.0",
-    "configurations": [
-        {
-            "name": "(GDB) Attach Python",
-            "type": "cppdbg",
-            "request": "attach",
-            "program": "/usr/bin/python3",
-            "processId": "${command:pickProcess}",
-            "MIMode": "gdb",
-            "miDebuggerPath": "/usr/bin/gdb"
-        },
-        {
-            "name": "Python C++ Debug Current File",
-            "type": "pythoncpp",
-            "request": "launch",
-            "pythonConfig": "default",
-            "cppAttachName": "(GDB) Attach Python",
-        },
-        {
-            "name": "GoLang: Current File",
-            "type": "go",
-            "request": "launch",
-            "mode": "debug",
-            "program": "${file}"
-        },
-        {
-            "name": "Python: Current File",
-            "type": "python",
-            "request": "launch",
-            "program": "${file}",
-            "console": "integratedTerminal",
-            "justMyCode": false
-        },
-        {
-            "name": "Python: PyTest Current File",
-            "type": "python",
-            "request": "launch",
-            "program": "pytest ${file}",
-            "console": "integratedTerminal",
-            "justMyCode": false,
-            "subProcess": true
-        },
-        {
-            "name": "C++: Test io_uring Server",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_uring",
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "showDisplayString": true,
-            "stopAtEntry": false,
-            "externalConsole": false,
-            "preLaunchTask": "Build Debug",
-            "MIMode": "gdb",
-            "miDebuggerPath": "/usr/bin/gdb"
-        },
-        {
-            "name": "C++: Test epoll Server",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_epoll",
-            "cwd": "${workspaceFolder}",
-            "environment": [],
-            "showDisplayString": true,
-            "stopAtEntry": false,
-            "externalConsole": false,
-            "preLaunchTask": "Build Debug",
-            "MIMode": "gdb",
-            "miDebuggerPath": "/usr/bin/gdb"
-        },
-        {
-            "name": "C++: Test POSIX Server",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_posix",
-            "cwd": "${workspaceFolder}",
-            "showDisplayString": true,
-            "stopAtEntry": false,
-            "externalConsole": false,
-            "preLaunchTask": "Build Debug",
-            "linux": {
-                "MIMode": "gdb",
-                "miDebuggerPath": "/usr/bin/gdb"
-            },
-            "osx": {
-                "MIMode": "lldb",
-                "environment": [
-                    {
-                        "name": "CPATH",
-                        "value": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
-                    }
-                ],
-            },
-        },
-        {
-            "name": "C++: Test POSIX Rest Server",
-            "type": "cppdbg",
-            "request": "launch",
-            "program": "${workspaceFolder}/build_debug/bin/ucall_example_rest_posix",
-            "cwd": "${workspaceFolder}",
-            "showDisplayString": true,
-            "stopAtEntry": false,
-            "externalConsole": false,
-            "preLaunchTask": "Build Debug",
-            "linux": {
-                "MIMode": "gdb",
-                "miDebuggerPath": "/usr/bin/gdb"
-            },
-            "osx": {
-                "MIMode": "lldb",
-                "environment": [
-                    {
-                        "name": "CPATH",
-                        "value": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
-                    }
-                ],
-            },
-        },
-    ]
+  // Use IntelliSense to learn about possible attributes.
+  // Hover to view descriptions of existing attributes.
+  // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "(GDB) Attach Python",
+      "type": "cppdbg",
+      "request": "attach",
+      "program": "/usr/bin/python3",
+      "processId": "${command:pickProcess}",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb"
+    },
+    {
+      "name": "Python C++ Debug Current File",
+      "type": "pythoncpp",
+      "request": "launch",
+      "pythonConfig": "default",
+      "cppAttachName": "(GDB) Attach Python",
+    },
+    {
+      "name": "GoLang: Current File",
+      "type": "go",
+      "request": "launch",
+      "mode": "debug",
+      "program": "${file}"
+    },
+    {
+      "name": "Python: Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false
+    },
+    {
+      "name": "Python: PyTest Current File",
+      "type": "python",
+      "request": "launch",
+      "program": "pytest ${file}",
+      "console": "integratedTerminal",
+      "justMyCode": false,
+      "subProcess": true
+    },
+    {
+      "name": "C++: Test io_uring Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_uring",
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "showDisplayString": true,
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "preLaunchTask": "Build Debug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb"
+    },
+    {
+      "name": "C++: Test epoll Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_epoll",
+      "cwd": "${workspaceFolder}",
+      "environment": [],
+      "showDisplayString": true,
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "preLaunchTask": "Build Debug",
+      "MIMode": "gdb",
+      "miDebuggerPath": "/usr/bin/gdb"
+    },
+    {
+      "name": "C++: Test POSIX Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_posix",
+      "cwd": "${workspaceFolder}",
+      "showDisplayString": true,
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "preLaunchTask": "Build Debug",
+      "linux": {
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb"
+      },
+      "osx": {
+        "MIMode": "lldb",
+        "environment": [
+          {
+            "name": "CPATH",
+            "value": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
+          }
+        ],
+      },
+    },
+    {
+      "name": "C++: Test POSIX Rest Server",
+      "type": "cppdbg",
+      "request": "launch",
+      "program": "${workspaceFolder}/build_debug/bin/ucall_example_rest_posix",
+      "cwd": "${workspaceFolder}",
+      "showDisplayString": true,
+      "stopAtEntry": false,
+      "externalConsole": false,
+      "preLaunchTask": "Build Debug",
+      "linux": {
+        "MIMode": "gdb",
+        "miDebuggerPath": "/usr/bin/gdb"
+      },
+      "osx": {
+        "MIMode": "lldb",
+        "environment": [
+          {
+            "name": "CPATH",
+            "value": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
+          }
+        ],
+      },
+    },
+  ]
 }

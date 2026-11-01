@@ -1,12 +1,12 @@
-# https://editorconfig.org/
 root = true
-# Conservatively avoid changing defaults for other file types, e.g. raw json files for test cases,
-# Makefiles, etc.
-[*.{cpp,h,md}]
-charset                  = utf-8
-end_of_line              = lf
-indent_size              = 4
-indent_style             = space
-insert_final_newline     = true
-tab_width                = 4
+
+[*]
+indent_style = space
+indent_size = 4
+end_of_line = lf
+charset = utf-8
 trim_trailing_whitespace = true
+insert_final_newline = true
+
+[*.{js,mjs,cjs,ts,mts,json}]
+indent_size = 2

@@ -1,4 +1,4 @@
-# Builds
+# Build trees and CMake
 /build*/
 _deps/
 CMakeFiles/
@@ -6,10 +6,8 @@ CMakeCache.txt
 cmake_install.cmake
 Makefile
 CMakeUserPresets.json
-/compile_commands.json
-*.log
 
-# Objects and binaries
+# C and C++
 *.d
 *.o
 *.obj
@@ -28,10 +26,6 @@ CMakeUserPresets.json
 *.out
 *.app
 
-# Rust
-target/
-Cargo.lock
-
 # Python
 __pycache__/
 *.egg-info
@@ -42,11 +36,17 @@ wheelhouse/
 .ruff_cache/
 .mypy_cache/
 
-# JavaScript
-node_modules/
-package-lock.json
+# Rust
+target/
+Cargo.lock
 
-# Editors, assistants and language servers
-.DS_Store
+# Editors, assistants, language servers and tool caches
+/compile_commands.json
 .cache/
 .claude/
+
+# macOS
+.DS_Store
+
+# Local scratch
+*.log

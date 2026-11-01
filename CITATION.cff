@@ -1,11 +1,21 @@
 cff-version: 1.2.0
+title: "UCall: Simple Secure Web Client and Server Framework"
 message: "If you use this software, please cite it as below."
-authors:
-- family-names: "Vardanian"
-  given-names: "Ash"
-  orcid: "https://orcid.org/0000-0002-4882-1815"
-title: "UCall by Unum Cloud"
+type: software
+license: Apache-2.0
 version: 1.0.0-rc.1
-doi: 10.5281/zenodo.7951497
-date-released: 2023-01-03
-url: "https://github.com/unum-cloud/UCall"
+doi: 10.5281/zenodo.7951496
+repository-code: https://github.com/unum-cloud/UCall
+url: https://github.com/unum-cloud/UCall
+abstract: >-
+  UCall is a performance-oriented, portable, and compact HTTP and RPC framework built around Noise,
+  io_uring, and SIMD. Application handlers stay synchronous while caller-owned polling drives
+  connection state machines that overlap network I/O and retain request batches, with HTTP and Noise
+  clients and servers on capability-specialized I/O backends, exposed through a C ABI with C++,
+  Python, and Rust bindings.
+
+authors:
+  - family-names: Vardanian
+    given-names: Ash
+    alias: ashvardanian
+    orcid: https://orcid.org/0000-0002-4882-1815

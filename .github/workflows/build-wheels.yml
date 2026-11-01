@@ -1,0 +1,218 @@
+name: Build Python Wheels
+
+on:
+  workflow_call:
+    inputs:
+      smoke:
+        description: "Build the oldest and newest interpreter per platform"
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  PYTHONUTF8: 1
+  PYTHONFAULTHANDLER: 1
+
+jobs:
+  build_wheels_linux_x86:
+    name: Build Python Wheels for Linux x86 cp${{ matrix.python-version }}
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install cibuildwheel
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 180
+          command: python -m pip install 'cibuildwheel==4.3.5'
+      - name: Build Wheels
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 2
+          retry_wait_seconds: 30
+          timeout_minutes: 180
+          command: cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: cp${{ matrix.python-version }}-*
+          CIBW_PLATFORM: linux
+          CIBW_ARCHS: x86_64
+      - name: Upload Wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-linux-x86_64-cp${{ matrix.python-version }}
+          path: wheelhouse/*.whl
+          overwrite: true
+
+  build_wheels_linux_arm:
+    name: Build Python Wheels for Linux ARM cp${{ matrix.python-version }}
+    runs-on: ubuntu-26.04-arm
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install cibuildwheel
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 180
+          command: python -m pip install 'cibuildwheel==4.3.5'
+      - name: Build Wheels
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 2
+          retry_wait_seconds: 30
+          timeout_minutes: 180
+          command: cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: cp${{ matrix.python-version }}-*
+          CIBW_PLATFORM: linux
+          CIBW_ARCHS: aarch64
+      - name: Upload Wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-linux-aarch64-cp${{ matrix.python-version }}
+          path: wheelhouse/*.whl
+          overwrite: true
+
+  build_wheels_macos_arm:
+    name: Build Python Wheels for macOS ARM cp${{ matrix.python-version }}
+    runs-on: macos-26
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install cibuildwheel
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 180
+          command: python -m pip install 'cibuildwheel==4.3.5'
+      - name: Build Wheels
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 2
+          retry_wait_seconds: 30
+          timeout_minutes: 180
+          command: cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: cp${{ matrix.python-version }}-*
+          CIBW_PLATFORM: macos
+          CIBW_ARCHS: arm64
+      - name: Upload Wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-macos-arm64-cp${{ matrix.python-version }}
+          path: wheelhouse/*.whl
+          overwrite: true
+
+  build_wheels_windows:
+    name: Build Python Wheels for Windows ${{ matrix.architecture }} cp${{ matrix.python-version }}
+    runs-on: windows-2025
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+        architecture: [AMD64, ARM64]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Set Up MSVC
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: ${{ matrix.architecture == 'ARM64' && 'amd64_arm64' || 'amd64' }}
+      - name: Install cibuildwheel
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 180
+          command: python -m pip install 'cibuildwheel==4.3.5'
+      - name: Build Wheels
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 2
+          retry_wait_seconds: 30
+          timeout_minutes: 180
+          command: cibuildwheel --output-dir wheelhouse
+        env:
+          CIBW_BUILD: cp${{ matrix.python-version }}-win_${{ matrix.architecture }}
+          CIBW_PLATFORM: windows
+      - name: Upload Wheels
+        uses: actions/upload-artifact@v7
+        with:
+          name: cibw-wheels-windows-${{ matrix.architecture == 'ARM64' && 'arm64' || 'x86_64' }}-cp${{ matrix.python-version }}
+          path: wheelhouse/*.whl
+          overwrite: true
+
+  build_sdist:
+    name: Build Python Source Distribution
+    runs-on: ubuntu-26.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.13"
+      - name: Install Build Tools
+        uses: nick-fields/retry@v4
+        with:
+          max_attempts: 3
+          retry_wait_seconds: 10
+          timeout_minutes: 180
+          command: pip install build
+      - name: Build Source Distribution
+        run: python -m build --sdist
+      - name: Upload Source Distribution
+        uses: actions/upload-artifact@v7
+        with:
+          name: sdist
+          path: dist/*.tar.gz
+          retention-days: 1

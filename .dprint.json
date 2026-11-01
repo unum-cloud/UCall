@@ -1,8 +1,20 @@
 {
+  "indentWidth": 2,
   "lineWidth": 120,
   "newLineKind": "lf",
-  "includes": ["**/*.md"],
-  "excludes": ["**/.git/", "**/build*/", "**/node_modules/", "**/target/", "forkunion/", "smashtable/", "stringzilla/"],
+  "includes": ["**/*.{json,jsonc,yaml,yml,md}"],
+  "excludes": [
+    "**/.git/",
+    "**/build*/",
+    "**/dist/",
+    "**/node_modules/",
+    "**/package-lock.json",
+    "**/target/",
+    "forkunion/",
+    "numkong/",
+    "smashtable/",
+    "stringzilla/"
+  ],
   "markdown": {
     "textWrap": "maintain",
     "strongKind": "underscores",
@@ -10,5 +22,9 @@
     "codeBlock.skipFormat": true,
     "html.skipFormat": true
   },
-  "plugins": ["https://plugins.dprint.dev/markdown-0.26.0.wasm"]
+  "plugins": [
+    "https://plugins.dprint.dev/json-0.23.0.wasm",
+    "https://plugins.dprint.dev/g-plane/pretty_yaml-v0.6.0.wasm",
+    "https://plugins.dprint.dev/markdown-0.26.0.wasm"
+  ]
 }

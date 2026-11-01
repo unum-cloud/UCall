@@ -1,6 +1,6 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": {"major": 3, "minor": 28, "patch": 0},
+  "cmakeMinimumRequired": { "major": 3, "minor": 28, "patch": 0 },
   "configurePresets": [
     {
       "name": "base",
@@ -16,23 +16,23 @@
     {
       "name": "linux",
       "hidden": true,
-      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux"}
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
     },
     {
       "name": "windows",
       "hidden": true,
-      "condition": {"type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows"}
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Windows" }
     },
     {
       "name": "clang",
       "hidden": true,
-      "cacheVariables": {"CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++"}
+      "cacheVariables": { "CMAKE_C_COMPILER": "clang", "CMAKE_CXX_COMPILER": "clang++" }
     },
     {
       "name": "debug",
       "inherits": ["base", "clang"],
       "displayName": "Host Debug",
-      "cacheVariables": {"CMAKE_BUILD_TYPE": "Debug"}
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
     },
     {
       "name": "check",
@@ -51,7 +51,7 @@
       "name": "relwithdebinfo",
       "inherits": ["base", "clang"],
       "displayName": "Host RelWithDebInfo",
-      "cacheVariables": {"CMAKE_BUILD_TYPE": "RelWithDebInfo"}
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
     },
     {
       "name": "release",
@@ -69,13 +69,13 @@
       "name": "asan",
       "inherits": "debug",
       "displayName": "Host Debug with AddressSanitizer and UndefinedBehaviorSanitizer",
-      "cacheVariables": {"UCALL_BUILD_SANITIZERS": "address"}
+      "cacheVariables": { "UCALL_BUILD_SANITIZERS": "address" }
     },
     {
       "name": "tsan",
       "inherits": "debug",
       "displayName": "Host Debug with ThreadSanitizer",
-      "cacheVariables": {"UCALL_BUILD_SANITIZERS": "thread"}
+      "cacheVariables": { "UCALL_BUILD_SANITIZERS": "thread" }
     },
     {
       "name": "msvc2026_x64",
@@ -103,7 +103,7 @@
       "hidden": true,
       "inherits": ["base", "linux", "clang"],
       "description": "One machine: its CPU floor, every kernel-library capability spelled as 1 or 0, and its one GPU code.",
-      "cacheVariables": {"CMAKE_BUILD_TYPE": "Release", "UCALL_BUILD_TEST": "OFF", "UCALL_MULTIVERSIONED": "OFF"}
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "UCALL_BUILD_TEST": "OFF", "UCALL_MULTIVERSIONED": "OFF" }
     },
     {
       "name": "xeon4_hopper",
@@ -268,40 +268,40 @@
     }
   ],
   "buildPresets": [
-    {"name": "debug", "configurePreset": "debug"},
-    {"name": "check", "configurePreset": "check"},
-    {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo"},
-    {"name": "release", "configurePreset": "release"},
-    {"name": "asan", "configurePreset": "asan"},
-    {"name": "tsan", "configurePreset": "tsan"},
-    {"name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release"},
-    {"name": "android_arm64", "configurePreset": "android_arm64"},
-    {"name": "xeon4_hopper", "configurePreset": "xeon4_hopper"},
-    {"name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell"},
-    {"name": "grace_hopper", "configurePreset": "grace_hopper"},
-    {"name": "vera_rubin", "configurePreset": "vera_rubin"}
+    { "name": "debug", "configurePreset": "debug" },
+    { "name": "check", "configurePreset": "check" },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
+    { "name": "release", "configurePreset": "release" },
+    { "name": "asan", "configurePreset": "asan" },
+    { "name": "tsan", "configurePreset": "tsan" },
+    { "name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release" },
+    { "name": "android_arm64", "configurePreset": "android_arm64" },
+    { "name": "xeon4_hopper", "configurePreset": "xeon4_hopper" },
+    { "name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell" },
+    { "name": "grace_hopper", "configurePreset": "grace_hopper" },
+    { "name": "vera_rubin", "configurePreset": "vera_rubin" }
   ],
   "testPresets": [
-    {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
-    {"name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": {"outputOnFailure": true}},
-    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
+    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
+    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": { "outputOnFailure": true } },
+    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
     {
       "name": "asan",
       "configurePreset": "asan",
-      "output": {"outputOnFailure": true},
-      "environment": {"UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1"}
+      "output": { "outputOnFailure": true },
+      "environment": { "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1" }
     },
     {
       "name": "tsan",
       "configurePreset": "tsan",
-      "output": {"outputOnFailure": true},
-      "environment": {"TSAN_OPTIONS": "halt_on_error=1"}
+      "output": { "outputOnFailure": true },
+      "environment": { "TSAN_OPTIONS": "halt_on_error=1" }
     },
     {
       "name": "msvc2026_x64",
       "configurePreset": "msvc2026_x64",
       "configuration": "Release",
-      "output": {"outputOnFailure": true}
+      "output": { "outputOnFailure": true }
     }
   ]
 }

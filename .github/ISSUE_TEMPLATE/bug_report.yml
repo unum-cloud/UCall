@@ -1,9 +1,9 @@
 name: Report a bug
 description: Something doesn't work as expected?
 title: "Bug: "
-labels: ["bug", "invalid"]
+labels: ["bug"]
 assignees:
-  - octocat
+  - ashvardanian
 body:
   - type: markdown
     attributes:
@@ -35,14 +35,14 @@ body:
     id: version
     attributes:
       label: UCall version
-      placeholder: v0.0.X
+      placeholder: vX.Y.Z
     validations:
       required: true
   - type: input
     id: os
     attributes:
       label: Operating System
-      placeholder: Ubuntu 26.04
+      placeholder: Ubuntu 22.04
     validations:
       required: true
   - type: dropdown
@@ -59,8 +59,10 @@ body:
     attributes:
       label: Which interface are you using?
       options:
-        - Native C interface
-        - Official Python bindings
+        - C implementation
+        - C++ bindings
+        - Python bindings
+        - Rust bindings
     validations:
       required: true
   - type: dropdown
@@ -80,6 +82,14 @@ body:
       placeholder: email@example.com
     validations:
       required: false
+  - type: checkboxes
+    id: mentions
+    attributes:
+      label: Are you open to being tagged as a contributor?
+      description: Sometimes, a bug report is just as valuable as a patch 🤗
+      options:
+        - label: I am open to being mentioned in the project `.git` history as a contributor
+          required: false
   - type: checkboxes
     id: duplicate
     attributes:
