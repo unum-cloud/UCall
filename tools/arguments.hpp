@@ -14,7 +14,12 @@
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
 
-#include "ucall/ucall.h" // `ucall_noise_key_t`, `ucall_status_t`
+#include "ucall/types.hpp" // `UCALL_OS_WINDOWS_`
+#include "ucall/ucall.h"   // `ucall_noise_key_t`, `ucall_status_t`
+
+#if !UCALL_OS_WINDOWS_
+#include <sys/resource.h> // `getrusage`
+#endif
 
 namespace unum::ucall::tools {
 
@@ -56,6 +61,34 @@ inline bool parse_key(std::string_view text, ucall_noise_key_t& key) noexcept {
     }
     return true;
 }
+
+/** User plus system seconds this process spent so far, read through the platform's accounting. */
+inline double process_cpu_seconds() noexcept {
+#if UCALL_OS_WINDOWS_
+    FILETIME created, exited, kernel, user;
+    if (!GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) return 0;
+    auto ticks = [](FILETIME t) { return (std::uint64_t {t.dwHighDateTime} << 32 | t.dwLowDateTime) * 1e-7; };
+    return ticks(kernel) + ticks(user);
+#else
+    rusage usage {};
+    getrusage(RUSAGE_SELF, &usage);
+    auto seconds = [](timeval t) { return t.tv_sec + t.tv_usec * 1e-6; };
+    return seconds(usage.ru_utime) + seconds(usage.ru_stime);
+#endif
+}
+
+/** Wall and process CPU seconds read together, so one span reports both from one pair of
+ *  readings: the driver's measured phase, or a server's whole life. */
+struct process_clocks_t {
+    double wall_seconds {}, cpu_seconds {};
+    static process_clocks_t now() noexcept {
+        return {std::chrono::duration<double>(std::chrono::steady_clock::now().time_since_epoch()).count(),
+                process_cpu_seconds()};
+    }
+    process_clocks_t operator-(process_clocks_t const& since) const noexcept {
+        return {wall_seconds - since.wall_seconds, cpu_seconds - since.cpu_seconds};
+    }
+};
 
 /** XX learns the peer's key during the handshake, and these tools admit whichever it shows. */
 inline ucall_status_t admit_any_peer(ucall_noise_key_t const*, void*) noexcept { return ucall_status_success_k; }

@@ -291,8 +291,29 @@ typedef struct ucall_event_loop_statistics_t {
     /** Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does. */
     uint64_t zero_copy_fallbacks;
 
+    /** Sends that copied instead of pinning: the socket was demoted or refused zero-copy. */
+    uint64_t copying_sends;
+
+    /** File reads the kernel finishes later: io_uring, Linux or FreeBSD AIO, or overlapped I/O. */
+    uint64_t file_reads_asynchronous;
+
+    /** File reads the loop issued itself and blocked on, as the posix backend and macOS do. */
+    uint64_t file_reads_blocking;
+
+    /** Bytes the kernel reported read from files into the loop's file windows. */
+    uint64_t bytes_read;
+
     /** File reads submitted while an earlier window of the same stream waited to send or sent. */
     uint64_t file_window_overlaps;
+
+    /** Lingering closes reset at their deadline because the kernel still held what they sent. */
+    uint64_t linger_resets;
+
+    /** Passes the loop made over a ready connection, each advancing it as far as it goes. */
+    uint64_t ready_passes;
+
+    /** Replied exchanges the loop took from its queue to adopt their reply segments. */
+    uint64_t replied_dequeues;
 
     /** Requests the loop answered itself with 400, 404, 413, 501 or 503. */
     uint64_t refused_requests;
@@ -881,7 +902,8 @@ typedef struct ucall_server_request_body_chunk_t {
     ucall_server_t server;
 
     /** Final with the next bytes, or deferred until they arrive; a deferred pull finishes on the
-     *  request's polling thread, so a pull from that thread finishes on its next poll. */
+     *  request's polling thread, so a pull from that thread with nothing decoded yet answers
+     *  @c ucall_status_would_block_k instead and keeps no outcome. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -914,6 +936,8 @@ typedef struct ucall_server_request_body_chunk_t {
  *  - @c ucall_status_invalid_argument_k The @c request or the @c data output is @c NULL.
  *  - @c ucall_status_malformed_k The streamed body's framing is malformed.
  *  - @c ucall_status_connection_closed_k The connection closed before the streamed body ended.
+ *  - @c ucall_status_would_block_k Called on the request's polling thread with nothing decoded
+ *    yet; the next pull takes what arrives by then.
  */
 UCALL_EXPORT void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* arguments);
 

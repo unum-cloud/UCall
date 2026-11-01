@@ -223,17 +223,22 @@ inline descriptor_t accepted_socket(descriptor_t descriptor) noexcept {
 
 enum class io_wait_t { blocking_k, nonblocking_k };
 
-/** What a request asks of its socket or of a file. File operations keep @c descriptor as the socket
- *  they serve, so its close waits for them.
+/**
+ *  @brief What a request asks of its socket or of a file.
+ *      File operations keep @c descriptor as the socket they serve, so its close waits for them.
  *
  *  - @c send_zero_copy_k completes once the socket took bytes of @c data, and names the
  *    @c release_request whose @c zero_copy_release_k completes once the kernel let go of them; the
  *    submitter submits the release after the last send naming it completed.
+ *  - @c zero_copy_release_k completes with 0 while the socket still pins its sends, and with 1 once
+ *    the socket sends by copying for its lifetime: the kernel reported a send it counts copied, or
+ *    the engine never pins.
  *  - @c file_open_k opens the NUL-terminated path in @c data beneath @c file.directory_descriptor
  *    for unbuffered reads, completing with a descriptor the submitter owns even after a cancel.
  *  - @c file_read_k reads @c length bytes of @c file.file_descriptor at @c file.offset into
  *    @c data; @c file_read_vectors_k scatters them into the @c length vectors that @c data points
- *    at. Offsets, lengths and buffers meet the file's @c file_direct_alignment. */
+ *    at. Offsets, lengths and buffers meet the file's @c file_direct_alignment.
+ */
 enum class io_operation_t : std::uint8_t {
     accept_k,
     connect_k,
@@ -567,15 +572,19 @@ struct io_completion_t {
 static_assert(sizeof(io_completion_t) == 32);
 
 /** Counters an engine advances for its one polling owner, on lines no other thread writes.
- *  @c zero_copy_fallbacks counts sends the kernel copied anyway or refused to pin. */
+ *  @c zero_copy_fallbacks counts sends the kernel copied anyway or refused to pin, and
+ *  @c zero_copy_sends plus @c copying_sends is every send. */
 struct alignas(false_sharing_bytes_k) io_statistics_t {
     std::uint64_t submissions {}, completions {}, kernel_enters {}, cancellations {}, receive_rearms {},
-        bytes_copied {}, zero_copy_sends {}, zero_copy_fallbacks {}, file_reads_asynchronous {}, file_reads_blocking {};
+        bytes_copied {}, zero_copy_sends {}, zero_copy_fallbacks {}, copying_sends {}, file_reads_asynchronous {},
+        file_reads_blocking {};
 };
 
-/** Advances a counter only its owner writes, atomically so other threads may load it relaxed. */
+/** Advances a counter only its owner writes, through @p atomic_ref_template_, so other threads may
+ *  load it relaxed. */
+template <template <typename> class atomic_ref_template_>
 inline void tally(std::uint64_t& counter, std::uint64_t amount = 1) noexcept {
-    std::atomic_ref<std::uint64_t> word {counter};
+    atomic_ref_template_<std::uint64_t> word {counter};
     word.store(word.load(std::memory_order_relaxed) + amount, std::memory_order_relaxed);
 }
 
@@ -739,13 +748,14 @@ inline constexpr int socket_send_flags_k = MSG_NOSIGNAL;
 
 /** Performs the request's syscall, blocking for file work and copying for zero-copy sends, and
  *  probes a pending connect only once @p interest reports readiness. */
+template <template <typename> class atomic_ref_template_>
 inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, io_interest_t interest,
                                io_statistics_t& statistics) noexcept {
     if (stage == operation_stage_t::cancelled_k) return -ECANCELED;
     if (request.operation == io_operation_t::connect_k && stage != operation_stage_t::fresh_k &&
         interest != io_interest_t::ready_k)
         return -EAGAIN;
-    tally(statistics.kernel_enters);
+    tally<atomic_ref_template_>(statistics.kernel_enters);
     auto descriptor = static_cast<int>(request.descriptor);
     ssize_t result = -1;
     auto length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
@@ -773,12 +783,12 @@ inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, 
     case io_operation_t::file_open_k:
         return file_open_beneath(request.file.directory_descriptor, reinterpret_cast<char const*>(request.data));
     case io_operation_t::file_read_k:
-        tally(statistics.file_reads_blocking);
+        tally<atomic_ref_template_>(statistics.file_reads_blocking);
         return file_read(request.file.file_descriptor, {request.data, request.length}, request.file.offset);
     case io_operation_t::file_read_vectors_k:
-        tally(statistics.file_reads_blocking);
+        tally<atomic_ref_template_>(statistics.file_reads_blocking);
         return file_read_vectors(request.file.file_descriptor, io_vectors(request), request.file.offset);
-    case io_operation_t::zero_copy_release_k: return 0;
+    case io_operation_t::zero_copy_release_k: return 1;
     }
     return result >= 0 ? static_cast<descriptor_t>(result) : -errno;
 }
@@ -792,11 +802,12 @@ inline bool io_pending(descriptor_t result) noexcept {
 
 /** Nonblocking POSIX syscalls, completed through poll readiness; files are read blocking, and
  *  zero-copy sends copy, so their releases complete as submitted. */
-template <typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename allocator_type_ = st::default_allocator<byte_t>,
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
 struct posix_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_>
-    using rebind_allocator = posix_engine<other_allocator_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_>
+    using rebind = posix_engine<other_allocator_, other_atomic_ref_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
@@ -810,9 +821,9 @@ struct posix_engine {
         operation_place_t place {operation_place_t::free_k};
     };
     static_assert(sizeof(operation_t) == 16);
-    st::basic_vector<operation_t, rebound_allocator<operation_t>> operations {};
-    st::basic_vector<pollfd, rebound_allocator<pollfd>> polling {};
-    st::basic_vector<unsigned, rebound_allocator<unsigned>> polled {};
+    st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+    st::vector<pollfd, rebound_allocator<pollfd>> polling {};
+    st::vector<unsigned, rebound_allocator<unsigned>> polled {};
     operation_list_t free_operations, fresh_operations;
     unsigned waiting {};
     io_statistics_t statistics {};
@@ -827,7 +838,7 @@ struct posix_engine {
     ucall_status_t cancel(io_request_t& request) noexcept {
         for (unsigned i = 0; i != operations.size(); ++i)
             if (operations[i].request == &request) {
-                tally(statistics.cancellations);
+                tally<atomic_ref_template_>(statistics.cancellations);
                 operations[i].stage = operation_stage_t::cancelled_k;
                 if (operations[i].place == operation_place_t::polled_k) {
                     unpoll(operations[i]);
@@ -868,7 +879,7 @@ struct posix_engine {
         operations[index].request = &request;
         operations[index].place = operation_place_t::queued_k;
         fresh_operations.push(operations, index);
-        tally(statistics.submissions);
+        tally<atomic_ref_template_>(statistics.submissions);
         return ucall_status_success_k;
     }
     void unpoll(operation_t& operation) noexcept {
@@ -887,7 +898,7 @@ struct posix_engine {
         operation.request = nullptr;
         operation.place = operation_place_t::free_k;
         free_operations.push(operations, index);
-        tally(statistics.completions);
+        tally<atomic_ref_template_>(statistics.completions);
         return {&request, result};
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
@@ -904,7 +915,8 @@ struct posix_engine {
                 auto& request = *operation.request;
                 auto result = request.deadline && now >= request.deadline
                                   ? -ETIMEDOUT
-                                  : attempt_io(request, operation.stage, io_interest_t::unarmed_k, statistics);
+                                  : attempt_io<atomic_ref_template_>(request, operation.stage, io_interest_t::unarmed_k,
+                                                                     statistics);
                 if (!io_pending(result)) {
                     completions[count++] = finish(index, result);
                     continue;
@@ -920,7 +932,8 @@ struct posix_engine {
                 bool expired = request.deadline && now >= request.deadline;
                 if (expired || polling[i].revents) {
                     auto result = expired ? -ETIMEDOUT
-                                          : attempt_io(request, operation.stage, io_interest_t::ready_k, statistics);
+                                          : attempt_io<atomic_ref_template_>(request, operation.stage,
+                                                                             io_interest_t::ready_k, statistics);
                     polling[i].revents = 0;
                     if (!io_pending(result)) {
                         completions[count++] = finish(polled[i], result);
@@ -935,7 +948,7 @@ struct posix_engine {
                               ? -1
                               : static_cast<int>(std::min<std::uint64_t>(wait / 1000 + (wait % 1000 != 0),
                                                                          std::numeric_limits<int>::max()));
-            tally(statistics.kernel_enters);
+            tally<atomic_ref_template_>(statistics.kernel_enters);
             int result = ::poll(polling.data(), static_cast<nfds_t>(waiting), timeout);
             if (result < 0 && errno != EINTR) return -errno;
         }
@@ -953,12 +966,13 @@ using posix_engine_t = posix_engine<>;
  *  at its latest operation in each direction; file reads land through the readiness queue where
  *  the kernel offers asynchronous reads, and zero-copy sends copy, so their releases complete as
  *  submitted. */
-template <typename readiness_type_, typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename readiness_type_, typename allocator_type_ = st::default_allocator<byte_t>,
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
 struct readiness_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_>
-    using rebind_allocator =
-        readiness_engine<typename readiness_type_::template rebind_allocator<other_allocator_>, other_allocator_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_>
+    using rebind = readiness_engine<typename readiness_type_::template rebind<other_allocator_, other_atomic_ref_>,
+                                    other_allocator_, other_atomic_ref_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
@@ -983,7 +997,7 @@ struct readiness_engine {
     ucall_status_t cancel(io_request_t& request) noexcept {
         for (unsigned i = 0; i != operations.size(); ++i)
             if (operations[i].request == &request) {
-                tally(statistics.cancellations);
+                tally<atomic_ref_template_>(statistics.cancellations);
                 // A landing file read keeps its buffer until the kernel answers, then reports it.
                 operations[i].stage = operation_stage_t::cancelled_k;
                 if (operations[i].interest == io_interest_t::armed_k) wake(i);
@@ -998,8 +1012,8 @@ struct readiness_engine {
     readiness_engine& operator=(readiness_engine const&) = delete;
     readiness_engine(readiness_engine&&) = delete;
     readiness_engine& operator=(readiness_engine&&) = delete;
-    st::basic_vector<operation_t, rebound_allocator<operation_t>> operations {};
-    st::basic_vector<unsigned, rebound_allocator<unsigned>> timed {};
+    st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+    st::vector<unsigned, rebound_allocator<unsigned>> timed {};
     readiness_type_ readiness {};
     operation_list_t free_operations, fresh_operations, ready_operations, landed_operations;
     std::size_t active {};
@@ -1022,7 +1036,7 @@ struct readiness_engine {
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
         ++active;
-        tally(statistics.submissions);
+        tally<atomic_ref_template_>(statistics.submissions);
         return ucall_status_success_k;
     }
     void wake(unsigned index) noexcept {
@@ -1045,7 +1059,7 @@ struct readiness_engine {
         operation = {};
         free_operations.push(operations, index);
         --active;
-        tally(statistics.completions);
+        tally<atomic_ref_template_>(statistics.completions);
         return {&request, result};
     }
     std::size_t progress(operation_list_t& list, span<io_completion_t> completions, std::size_t count,
@@ -1106,7 +1120,7 @@ struct readiness_engine {
                               ? -1
                               : static_cast<int>(std::min<std::uint64_t>(wait / 1'000'000 + (wait % 1'000'000 != 0),
                                                                          std::numeric_limits<int>::max()));
-            tally(statistics.kernel_enters);
+            tally<atomic_ref_template_>(statistics.kernel_enters);
             int result = readiness.wait(
                 timeout,
                 [&](unsigned index, descriptor_t descriptor, short events) noexcept {
@@ -1136,11 +1150,12 @@ struct readiness_engine {
 
 /** kqueue readiness; FreeBSD reads files through @c aio_read completing as @c EVFILT_AIO events,
  *  while macOS, lacking kernel file AIO for this, reads them blocking and uncached. */
-template <typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename allocator_type_ = st::default_allocator<byte_t>,
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
 struct kqueue_readiness {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_>
-    using rebind_allocator = kqueue_readiness<other_allocator_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_>
+    using rebind = kqueue_readiness<other_allocator_, other_atomic_ref_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 #if UCALL_OS_FREEBSD_
@@ -1155,9 +1170,11 @@ struct kqueue_readiness {
     kqueue_readiness(kqueue_readiness&&) = delete;
     kqueue_readiness& operator=(kqueue_readiness&&) = delete;
     int descriptor {-1};
-    st::basic_vector<struct kevent, rebound_allocator<struct kevent>> events {};
+    st::vector<struct kevent, rebound_allocator<struct kevent>> events {};
 #if UCALL_OS_FREEBSD_
-    st::basic_vector<aiocb, rebound_allocator<aiocb>> file_reads {}; // One per operation, read by the kernel.
+
+    /** One per operation, read by the kernel. */
+    st::vector<aiocb, rebound_allocator<aiocb>> file_reads {};
     std::size_t file_reads_in_flight {};
 #endif
     ucall_status_t open(std::size_t capacity) noexcept {
@@ -1175,7 +1192,7 @@ struct kqueue_readiness {
         short filter = direction == io_direction_t::receive_k ? EVFILT_READ : EVFILT_WRITE;
         EV_SET(&change, static_cast<std::uintptr_t>(watched), filter, EV_ADD | EV_CLEAR, 0, 0,
                reinterpret_cast<void*>(static_cast<std::uintptr_t>(index)));
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         return kevent(descriptor, &change, 1, nullptr, 0, nullptr) == 0 ? 0 : -errno;
     }
     // Closing a descriptor drops its knotes.
@@ -1192,7 +1209,7 @@ struct kqueue_readiness {
                          io_statistics_t& statistics) noexcept {
         if (request.operation != io_operation_t::file_read_k &&
             request.operation != io_operation_t::file_read_vectors_k)
-            return attempt_io(request, stage, interest, statistics);
+            return attempt_io<atomic_ref_template_>(request, stage, interest, statistics);
         if (stage == operation_stage_t::cancelled_k) return -ECANCELED;
         aiocb& block = file_reads[index];
         block = {};
@@ -1202,7 +1219,7 @@ struct kqueue_readiness {
         block.aio_sigevent.sigev_notify_kqueue = descriptor;
         block.aio_sigevent.sigev_value.sival_ptr = reinterpret_cast<void*>(static_cast<std::uintptr_t>(index));
         int started;
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         if (request.operation == io_operation_t::file_read_k) {
             block.aio_buf = request.data;
             block.aio_nbytes = request.length;
@@ -1215,18 +1232,18 @@ struct kqueue_readiness {
         }
         if (started == 0) {
             ++file_reads_in_flight;
-            tally(statistics.file_reads_asynchronous);
+            tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
             interest = io_interest_t::landing_k;
             return 0;
         }
         if (errno != EAGAIN) return -errno;
-        return attempt_io(request, stage, interest, statistics);
+        return attempt_io<atomic_ref_template_>(request, stage, interest, statistics);
     }
 #else
     ucall_status_t reserve_file_reads(std::size_t) noexcept { return ucall_status_success_k; }
     descriptor_t attempt(unsigned, io_request_t& request, operation_stage_t& stage, io_interest_t& interest,
                          io_statistics_t& statistics) noexcept {
-        return attempt_io(request, stage, interest, statistics);
+        return attempt_io<atomic_ref_template_>(request, stage, interest, statistics);
     }
 #endif // UCALL_OS_FREEBSD_
 
@@ -1295,7 +1312,7 @@ struct release_table {
     using allocator_t = allocator_type_;
     using slots_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint32_t>;
     static constexpr std::uint32_t absent_k = operation_list_t::absent_k;
-    st::basic_vector<std::uint32_t, slots_allocator_t> slots;
+    st::vector<std::uint32_t, slots_allocator_t> slots;
     explicit release_table(allocator_t const& allocator = {}) noexcept : slots(slots_allocator_t {allocator}) {}
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(slots.resize(std::bit_ceil(capacity * 2)))) return ucall_status_out_of_memory_k;
@@ -1378,11 +1395,12 @@ static_assert(sizeof(zero_copy_run_t) == 16);
 
 /** Registers each descriptor once; a descriptor-addressed index finds its watch,
  *  at most half full. */
-template <typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename allocator_type_ = st::default_allocator<byte_t>,
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
 struct epoll_readiness {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_>
-    using rebind_allocator = epoll_readiness<other_allocator_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_>
+    using rebind = epoll_readiness<other_allocator_, other_atomic_ref_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr std::uint32_t absent_k = operation_list_t::absent_k;
@@ -1398,9 +1416,9 @@ struct epoll_readiness {
     epoll_readiness(epoll_readiness&&) = delete;
     epoll_readiness& operator=(epoll_readiness&&) = delete;
     int descriptor {-1};
-    st::basic_vector<epoll_event, rebound_allocator<epoll_event>> events {};
-    st::basic_vector<readiness_watch_t, rebound_allocator<readiness_watch_t>> watches {};
-    st::basic_vector<std::uint32_t, rebound_allocator<std::uint32_t>> watch_slots {}, free_watches {};
+    st::vector<epoll_event, rebound_allocator<epoll_event>> events {};
+    st::vector<readiness_watch_t, rebound_allocator<readiness_watch_t>> watches {};
+    st::vector<std::uint32_t, rebound_allocator<std::uint32_t>> watch_slots {}, free_watches {};
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(events.resize(capacity)) || st::failed(watches.resize(capacity)) ||
             st::failed(watch_slots.resize(std::bit_ceil(capacity * 2))) || st::failed(free_watches.reserve(capacity)))
@@ -1448,7 +1466,7 @@ struct epoll_readiness {
         epoll_event event {};
         event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
         event.data.u64 = std::uint64_t {chosen} << 32 | watches[chosen].generation;
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         if (epoll_ctl(descriptor, EPOLL_CTL_ADD, static_cast<int>(watched), &event) != 0) return -errno;
         free_watches.pop_back();
         watches[chosen].descriptor = static_cast<std::int32_t>(watched);
@@ -1612,15 +1630,16 @@ struct linux_aio_t {
  *    once.
  *  - A close with notifications still due keeps the descriptor until they all arrived, resetting
  *    first if the socket was set to reset on close. */
-template <typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename allocator_type_ = st::default_allocator<byte_t>,
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
 struct linux_epollaio_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_>
-    using rebind_allocator = linux_epollaio_engine<other_allocator_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_>
+    using rebind = linux_epollaio_engine<other_allocator_, other_atomic_ref_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
-    using vector = st::basic_vector<value_type_, rebound_allocator<value_type_>>;
+    using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
     struct operation_t {
         io_request_t* request {};
@@ -1635,7 +1654,7 @@ struct linux_epollaio_engine {
     vector<operation_t> operations;
     vector<unsigned> timed;
     vector<zero_copy_run_t> runs;
-    epoll_readiness<allocator_t> readiness;
+    epoll_readiness<allocator_t, atomic_ref_template_> readiness;
     release_table<allocator_t> releases;
     linux_aio_t files;
     operation_list_t free_operations, fresh_operations, ready_operations, landed_operations, waiting_files;
@@ -1697,7 +1716,7 @@ struct linux_epollaio_engine {
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
         ++active;
-        tally(statistics.submissions);
+        tally<atomic_ref_template_>(statistics.submissions);
         return ucall_status_success_k;
     }
 
@@ -1709,7 +1728,7 @@ struct linux_epollaio_engine {
             if (request.operation == io_operation_t::zero_copy_release_k ||
                 (request.operation == io_operation_t::close_k && operation.interest == io_interest_t::landing_k))
                 return ucall_status_success_k;
-            tally(statistics.cancellations);
+            tally<atomic_ref_template_>(statistics.cancellations);
             operation.stage = operation_stage_t::cancelled_k;
             if (operation.interest == io_interest_t::armed_k) wake(i);
             else if (operation.interest == io_interest_t::landing_k &&
@@ -1742,7 +1761,7 @@ struct linux_epollaio_engine {
         operation = {};
         free_operations.push(operations, index);
         --active;
-        tally(statistics.completions);
+        tally<atomic_ref_template_>(statistics.completions);
         return {&request, result};
     }
 
@@ -1750,11 +1769,11 @@ struct linux_epollaio_engine {
     descriptor_t read_file(unsigned index) noexcept {
         auto& operation = operations[index];
         if (operation.stage == operation_stage_t::cancelled_k) return -ECANCELED;
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         int const started = files.submit(index, *operation.request);
         if (started == -EAGAIN) waiting_files.push(operations, index);
         else if (started < 0) return started;
-        else tally(statistics.file_reads_asynchronous);
+        else tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
         operation.interest = io_interest_t::landing_k;
         return 0;
     }
@@ -1762,6 +1781,7 @@ struct linux_epollaio_engine {
     /** Sends copying, as a socket does once zero-copy is refused or reported copied. */
     descriptor_t send_copying(io_request_t const& request) noexcept {
         auto const length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
+        tally<atomic_ref_template_>(statistics.copying_sends);
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length, MSG_NOSIGNAL);
         return sent >= 0 ? static_cast<descriptor_t>(sent) : -errno;
     }
@@ -1772,7 +1792,7 @@ struct linux_epollaio_engine {
         auto& operation = operations[index];
         if (operation.stage == operation_stage_t::cancelled_k) return -ECANCELED;
         io_request_t const& request = *operation.request;
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         std::int64_t const chosen = readiness.watch(request.descriptor, statistics);
         if (chosen < 0) return send_copying(request);
         readiness_watch_t& watch = readiness.watches[static_cast<std::size_t>(chosen)];
@@ -1789,19 +1809,17 @@ struct linux_epollaio_engine {
                          extended->sends == std::numeric_limits<std::uint16_t>::max() ||
                          extended->first_id + extended->sends != watch.next_zero_copy_id))
             extended = nullptr;
-        if ((release == absent_k && free_operations.head == absent_k) || (!extended && free_runs == absent_k)) {
-            tally(statistics.zero_copy_fallbacks);
+        if ((release == absent_k && free_operations.head == absent_k) || (!extended && free_runs == absent_k))
             return send_copying(request);
-        }
         auto const length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length,
                                   MSG_NOSIGNAL | MSG_ZEROCOPY);
         if (sent < 0 && errno == ENOBUFS) {
-            tally(statistics.zero_copy_fallbacks);
+            tally<atomic_ref_template_>(statistics.zero_copy_fallbacks);
             return send_copying(request);
         }
         if (sent <= 0) return sent < 0 ? -errno : 0;
-        tally(statistics.zero_copy_sends);
+        tally<atomic_ref_template_>(statistics.zero_copy_sends);
         if (release == absent_k) {
             release = free_operations.pop(operations);
             operations[release] = {};
@@ -1825,8 +1843,17 @@ struct linux_epollaio_engine {
     /** Lands a release once no send it counts awaits a notification. */
     descriptor_t release_zero_copy(unsigned index) noexcept {
         auto& operation = operations[index];
-        if (operation.pending_notifications) operation.interest = io_interest_t::landing_k;
-        return 0;
+        if (operation.pending_notifications) {
+            operation.interest = io_interest_t::landing_k;
+            return 0;
+        }
+        return release_verdict(*operation.request);
+    }
+
+    /** What @p release completes with: 1 once its socket copies its sends for good, else 0. */
+    descriptor_t release_verdict(io_request_t const& release) const noexcept {
+        std::uint32_t const chosen = readiness.find(release.descriptor);
+        return chosen != absent_k && readiness.watches[chosen].zero_copy == zero_copy_stage_t::copying_k ? 1 : 0;
     }
 
     /** Closes a socket, or keeps it while notifications are due, resetting it first when it was set
@@ -1861,7 +1888,7 @@ struct linux_epollaio_engine {
         std::uint32_t const span = highest - lowest + 1;
         if (reported == zero_copy_stage_t::copying_k) {
             watch.zero_copy = zero_copy_stage_t::copying_k;
-            tally(statistics.zero_copy_fallbacks, span);
+            tally<atomic_ref_template_>(statistics.zero_copy_fallbacks, span);
         }
         for (unsigned previous = absent_k, current = watch.oldest_run; current != absent_k;) {
             zero_copy_run_t& run = runs[current];
@@ -1875,7 +1902,7 @@ struct linux_epollaio_engine {
                 auto& release = operations[run.release_operation];
                 release.pending_notifications -= overlap;
                 if (!release.pending_notifications && release.interest == io_interest_t::landing_k)
-                    land(run.release_operation, 0);
+                    land(run.release_operation, release_verdict(*release.request));
             }
             if (run.notified == run.sends) {
                 if (previous != absent_k) runs[previous].next = next;
@@ -1897,7 +1924,7 @@ struct linux_epollaio_engine {
             msghdr message {};
             message.msg_control = control;
             message.msg_controllen = sizeof(control);
-            tally(statistics.kernel_enters);
+            tally<atomic_ref_template_>(statistics.kernel_enters);
             if (recvmsg(descriptor, &message, MSG_ERRQUEUE) < 0) break;
             for (cmsghdr* header = CMSG_FIRSTHDR(&message); header; header = CMSG_NXTHDR(&message, header)) {
                 if (!((header->cmsg_level == SOL_IP && header->cmsg_type == IP_RECVERR) ||
@@ -1939,7 +1966,8 @@ struct linux_epollaio_engine {
         case io_operation_t::send_zero_copy_k: return send_zero_copy(index);
         case io_operation_t::zero_copy_release_k: return release_zero_copy(index);
         case io_operation_t::close_k: return close_watched(request.descriptor, index);
-        default: return attempt_io(request, operation.stage, operation.interest, statistics);
+        case io_operation_t::send_k: tally<atomic_ref_template_>(statistics.copying_sends); [[fallthrough]];
+        default: return attempt_io<atomic_ref_template_>(request, operation.stage, operation.interest, statistics);
         }
     }
     std::size_t progress(operation_list_t& list, span<io_completion_t> completions, std::size_t count,
@@ -1978,7 +2006,7 @@ struct linux_epollaio_engine {
         return count;
     }
     int wait(int timeout) noexcept {
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         return readiness.wait(
             timeout,
             [&](unsigned index, descriptor_t descriptor, short events) noexcept {
@@ -2068,11 +2096,12 @@ using linux_epollaio_engine_t = linux_epollaio_engine<>;
  *  A file read reopens its file unbuffered and overlapped on the port for its own lifetime; a path
  *  opens beneath its directory at once, vectored reads answer @c -ENOSYS, and zero-copy sends copy,
  *  so their releases complete as submitted. */
-template <typename allocator_type_ = st::default_allocator<byte_t>>
+template <typename allocator_type_ = st::default_allocator<byte_t>,
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
 struct windows_iocp_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_>
-    using rebind_allocator = windows_iocp_engine<other_allocator_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_>
+    using rebind = windows_iocp_engine<other_allocator_, other_atomic_ref_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     enum class operation_stage_t { pending_k, immediate_k, cancelling_k, timing_out_k };
@@ -2102,7 +2131,7 @@ struct windows_iocp_engine {
         for (auto& operation : operations)
             if (operation.request == &request) {
                 if (operation.stage == operation_stage_t::pending_k) {
-                    tally(statistics.cancellations);
+                    tally<atomic_ref_template_>(statistics.cancellations);
                     operation.stage = operation_stage_t::cancelling_k;
                     CancelIoEx(handle_of(operation), &operation.overlapped);
                 }
@@ -2118,9 +2147,9 @@ struct windows_iocp_engine {
     windows_iocp_engine(windows_iocp_engine&&) = delete;
     windows_iocp_engine& operator=(windows_iocp_engine&&) = delete;
     HANDLE port {};
-    st::basic_vector<operation_t, rebound_allocator<operation_t>> operations {};
-    st::basic_vector<unsigned, rebound_allocator<unsigned>> timed {};
-    st::basic_vector<OVERLAPPED_ENTRY, rebound_allocator<OVERLAPPED_ENTRY>> entries {};
+    st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+    st::vector<unsigned, rebound_allocator<unsigned>> timed {};
+    st::vector<OVERLAPPED_ENTRY, rebound_allocator<OVERLAPPED_ENTRY>> entries {};
     operation_list_t free_operations, immediate_operations;
     std::size_t active {};
     io_statistics_t statistics {};
@@ -2153,7 +2182,7 @@ struct windows_iocp_engine {
         auto* operation = &operations[index];
         *operation = {};
         operation->request = &request;
-        tally(statistics.submissions);
+        tally<atomic_ref_template_>(statistics.submissions);
         auto socket = static_cast<SOCKET>(request.descriptor);
         auto complete_immediately = [&](descriptor_t result) noexcept {
             operation->immediate = result;
@@ -2166,7 +2195,7 @@ struct windows_iocp_engine {
             return complete_immediately(socket_close(request.descriptor) == 0 ? 0 : -socket_last_error());
         if (request.operation == io_operation_t::shutdown_k)
             return complete_immediately(shutdown(socket, SD_SEND) == 0 ? 0 : -socket_last_error());
-        if (request.operation == io_operation_t::zero_copy_release_k) return complete_immediately(0);
+        if (request.operation == io_operation_t::zero_copy_release_k) return complete_immediately(1);
         // The open completes at once, as on POSIX; reads stay overlapped on the reopened handle.
         if (request.operation == io_operation_t::file_open_k)
             return complete_immediately(
@@ -2229,7 +2258,7 @@ struct windows_iocp_engine {
         case io_operation_t::file_read_vectors_k:
         case io_operation_t::zero_copy_release_k: break;
         }
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         if (result == SOCKET_ERROR && WSAGetLastError() != WSA_IO_PENDING) {
             auto error = socket_last_error();
             if (operation->accepted != INVALID_SOCKET) {
@@ -2255,7 +2284,7 @@ struct windows_iocp_engine {
             operation.timed = static_cast<unsigned>(timed.size());
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
-        tally(statistics.kernel_enters);
+        tally<atomic_ref_template_>(statistics.kernel_enters);
         HANDLE const file = ReOpenFile(reinterpret_cast<HANDLE>(_get_osfhandle(request.file.file_descriptor)),
                                        GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
                                        FILE_FLAG_NO_BUFFERING | FILE_FLAG_OVERLAPPED);
@@ -2269,7 +2298,7 @@ struct windows_iocp_engine {
             if (CreateIoCompletionPort(file, port, 0, 0) &&
                 (ReadFile(file, request.data, length, nullptr, &operation.overlapped) ||
                  GetLastError() == ERROR_IO_PENDING)) {
-                tally(statistics.file_reads_asynchronous);
+                tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
                 return ucall_status_success_k;
             }
             failure = GetLastError() == ERROR_HANDLE_EOF ? 0 : -EIO;
@@ -2305,7 +2334,7 @@ struct windows_iocp_engine {
         operation.request = nullptr;
         free_operations.push(operations, static_cast<unsigned>(&operation - operations.data()));
         --active;
-        tally(statistics.completions);
+        tally<atomic_ref_template_>(statistics.completions);
         return {&request, result};
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
@@ -2340,7 +2369,7 @@ struct windows_iocp_engine {
             }
             ULONG dequeued {};
             auto limit = static_cast<ULONG>(std::min(completions.size() - count, entries.size()));
-            tally(statistics.kernel_enters);
+            tally<atomic_ref_template_>(statistics.kernel_enters);
             if (!GetQueuedCompletionStatusEx(port, entries.data(), limit, &dequeued, wait, FALSE)) {
                 if (GetLastError() == WAIT_TIMEOUT) {
                     if (wait_policy == io_wait_t::blocking_k && !count && (!deadline || monotonic_ns() < deadline))
@@ -2393,8 +2422,3 @@ using windows_iocp_engine_t = windows_iocp_engine<>;
 #endif
 
 } // namespace unum::ucall
-
-#if UCALL_WITH_LINUX_URING
-#include "ucall/uring612.hpp"
-#include "ucall/uring618.hpp"
-#endif

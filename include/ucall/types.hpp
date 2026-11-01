@@ -102,6 +102,8 @@
 #endif
 #include <winsock2.h>
 #include <windows.h>
+#else
+#include <pthread.h>
 #endif // UCALL_OS_WINDOWS_
 
 #include <forkunion/atomics.hpp>
@@ -265,11 +267,18 @@ struct highest_kit<caps_, floor_, head_, tail_...> {
  */
 static constexpr std::size_t false_sharing_bytes_k = 128;
 
-/** A native socket descriptor; Winsock handles require pointer width. */
+/** A native socket descriptor; Winsock handles require pointer width. A polling thread names
+ *  itself by the identity its platform reads without entering the kernel; zero names no thread. */
 #if UCALL_OS_WINDOWS_
 using descriptor_t = std::intptr_t;
+using polling_thread_t = DWORD;
+inline polling_thread_t current_polling_thread() noexcept { return GetCurrentThreadId(); }
+inline bool is_current_thread(polling_thread_t thread) noexcept { return thread == GetCurrentThreadId(); }
 #else
 using descriptor_t = int;
+using polling_thread_t = pthread_t;
+inline polling_thread_t current_polling_thread() noexcept { return pthread_self(); }
+inline bool is_current_thread(polling_thread_t thread) noexcept { return pthread_equal(thread, pthread_self()); }
 #endif
 
 /**
@@ -290,8 +299,8 @@ using descriptor_t = int;
 template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class pool {
     using offsets_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::size_t>;
-    st::basic_vector<element_type_, allocator_type_> elements_;
-    st::basic_vector<std::size_t, offsets_allocator_t> free_offsets_;
+    st::vector<element_type_, allocator_type_> elements_;
+    st::vector<std::size_t, offsets_allocator_t> free_offsets_;
     std::size_t free_count_ {};
 
   public:

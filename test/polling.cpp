@@ -314,6 +314,7 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
         descriptors[i] = peer.connection.descriptor = client.engine.open_socket(AF_INET);
         failures += expect(descriptors[i] >= 0);
         peer.connection.stage = network_t::connection_stage_t::open_k;
+        network_t::mark_ready(client, peer);
     }
     auto& origin = *client.exchanges[0].origin;
     failures += expect(client.exchanges[1].origin == &origin && client.exchanges[3].origin == &origin &&
@@ -339,6 +340,7 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
     released.connection.transmitting = network_t::transmit_state_t::idle_k;
     released.connection.transmit_operation = network_t::operation_state_t::idle_k;
     client.exchanges[2].stage = network_t::client_exchange_t::stage_t::idle_k;
+    network_t::mark_ready(client, released);
     network_t::client_progress(client);
     // The waiting call closes an idle connection to another origin, and dials once it has closed.
     failures += expect(client.exchanges[3].stage == network_t::client_exchange_t::stage_t::queued_k &&
@@ -385,6 +387,7 @@ static case_result_t test_client_batches_sends_unit() {
     peer.connection.descriptor = client.engine.open_socket(AF_INET);
     failures += expect(peer.connection.descriptor >= 0);
     peer.connection.stage = network_t::connection_stage_t::open_k;
+    network_t::mark_ready(client, peer);
     network_t::client_progress(client);
     failures += expect(peer.exchanges_in_flight == 16 && !origin.waiting, "{} calls aboard, {} waiting",
                        peer.exchanges_in_flight, origin.waiting);

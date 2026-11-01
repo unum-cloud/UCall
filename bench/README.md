@@ -382,7 +382,8 @@ The report prints the mean, p50, p90, p99, p99.9, p99.99, and maximum in microse
 The driver timestamps each batch immediately after its polling call returns.
 Latency includes submission, queueing, transport progress, and completion observation by that worker; it is not a kernel completion timestamp.
 Throughput covers the measured ForkUnion dispatch through response verification, release, and completion of every worker.
-Neither the driver nor the servers time their own CPU use; measure either process from outside, like `/usr/bin/time -f '%U %S'` on Linux, which prints its user and system seconds when it exits.
+The total row's `driver_cpu_us_per_request` divides the driver's user and system time over the measured phase by its successful requests.
+Its `driver_busy_fraction` divides the same time by the elapsed time of every client, so a fraction near 1 means the driver, not the server, bounded the run.
 Rejected submissions, failed exchanges, and incorrect echo bytes are counted and produce a nonzero exit status.
 
 `--backend` and `--cpu-class` select the implementation and kernel bundle, and the report prints each active worker's resolved choices.
@@ -419,11 +420,13 @@ The driver reads no counters from the server, so it prints where they come from 
 The native server and every native example print their counters when stopped with `SIGINT` or `SIGTERM`: one line per event loop from `ucall_server_event_loop_statistics()` and one per batch endpoint from `ucall_server_batch_endpoint_statistics()`:
 
 ```text
-Event loop 0: 40000 requests, 79 accepts, 41068 polls, 0 empty polls, 41065 kernel enters, 40242 submissions, 80241 completions, 1 cancellations, 0 receive re-arms, 44440000 bytes received, 45640000 bytes sent, 85400000 bytes copied
+Event loop 0: 41068 polls, 0 empty polls, 41065 kernel enters, 40242 submissions, 80241 completions, 1 cancellations, 79 accepts, 40000 requests, 0 receive re-arms, 44440000 bytes received, 45640000 bytes sent, 85400000 bytes copied, 79 zero-copy sends, 79 zero-copy fallbacks, 39921 copying sends, 0 asynchronous file reads, 0 blocking file reads, 0 bytes read, 0 file window overlaps, 0 linger resets, 120000 ready passes, 40000 replied dequeues, 0 refused requests, 0 handshake failures, 0 authorizer refusals
 Batch endpoint 0: 525 batches, 16805 requests, 1 filled, 524 ready, 0 expired
+Process CPU: 1.284000 s
 ```
 
-`--stats json` prints the same counters as one JSON object instead, with `event_loops` and `batch_endpoints` arrays in loop and registration order.
+`--stats json` prints the same counters as one JSON object instead, with `event_loops` and `batch_endpoints` arrays in loop and registration order and the process's `cpu_seconds` last.
+At startup the server also prints whether ForkUnion pinned its serving loops to cores, as `Serving loops pinned` or `Serving loops floating`.
 A batch endpoint counts its callbacks and the requests they carried, and why each fired: __filled__ on reaching `--batch-max`, __ready__ on reaching `--batch-min` below it, and __expired__ below `--batch-min` once `--batch-latency-us` passed.
 
 The counters cover the server's whole life, warmup included, so divide them by its own `requests` rather than by the driver's measured count:
@@ -434,8 +437,12 @@ The counters cover the server's whole life, warmup included, so divide them by i
 - __Empty polls per poll__ shows how often a loop woke without work.
 - __Receive re-arms per request__ shows how often io_uring 7.0 had to restart a multishot receive.
 - __Bytes copied per request__, compared with the request and response body bytes, shows how many times UCall itself copied each payload byte: receive-buffer appends, reply bodies, Noise records, and parked receives, never the kernel's own copies.
+- __Zero-copy and copying sends__ add up to every send: a socket the kernel reported copying sends by copying for the rest of its life, and `zero_copy_fallbacks` counts only the kernel's own reports, so on loopback it stops at about one per connection.
+- __File reads per request__ splits a file reply's reads into `file_reads_asynchronous`, which the kernel finished later, and `file_reads_blocking`, which the loop waited on itself, while `bytes_read` counts what they read and `file_window_overlaps` the reads that ran while an earlier window of the stream still sent.
+- __Linger resets__ counts closes that reached their linger deadline with the kernel still holding sent bytes, and reset the peer so the kernel released them.
+- __Ready passes per request__ counts how often the loop advanced a ready connection for one exchange, and __replied dequeues per request__ how often it took an exchange from its replied queue.
 - __Requests per batch__ divides a batch endpoint's `requests` by its `batches`, and its three triggers split those batches by cause.
-- __Server CPU per request__ divides the server's user and system time, measured from outside as under [Driver Flags](#driver-flags), by the loops' summed `requests`.
+- __Server CPU per request__ divides the server's `cpu_seconds`, its user and system time since its loops started, by the loops' summed `requests`; `wall_seconds` beside it is the time they served.
 
 The native server and every native example share these flags:
 
@@ -446,6 +453,7 @@ The native server and every native example share these flags:
   XX admits every client key.
 - `--batch-min N`, `--batch-max N` and `--batch-latency-us N`: the budgets every batch endpoint of an example registers with.
 - `--stats human|json`: the format of the counters printed at exit.
+- `--reply-directory PATH`: the directory path parts of replies open files beneath, on a filesystem that takes `O_DIRECT` reads; the native server answers `GET /file/{name}` with the file `name` beneath it.
 
 ## Multiple Targets
 

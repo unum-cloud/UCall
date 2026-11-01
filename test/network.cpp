@@ -117,6 +117,9 @@ struct fixture_t {
     /** Requests that reached the echo or header-lookup routes. */
     std::atomic<std::size_t> dispatched {};
 
+    /** What @c /stream/pull answered. */
+    std::atomic<ucall_status_t> polling_pull_status {ucall_status_success_k};
+
     std::mutex held_mutex {};
     std::vector<ucall_received_http_request_t> held {};
     std::vector<std::thread> pollers {};
@@ -183,6 +186,19 @@ struct fixture_t {
     }
     static void gate(ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
+        std::lock_guard lock {fixture.held_mutex};
+        fixture.held.push_back(request);
+    }
+
+    /** Pulls once on the polling thread, keeping what the pull answered, then retains the request
+     *  like @c gate. */
+    static void pulling_gate(ucall_received_http_request_t request, void* context) {
+        auto& fixture = *static_cast<fixture_t*>(context);
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t data {};
+        ucall_server_request_body_chunk_t pull {fixture.server, &outcome, request, &data};
+        ucall_server_request_body_chunk(&pull);
+        fixture.polling_pull_status.store(outcome.status, std::memory_order_relaxed);
         std::lock_guard lock {fixture.held_mutex};
         fixture.held.push_back(request);
     }
@@ -326,6 +342,11 @@ struct fixture_t {
         ucall_server_add_http_endpoint_t stream {server, &outcome, uc::bytes_view("/stream"),     ucall_verb_any_k,
                                                  gate,   this,     ucall_body_delivery_streamed_k};
         ucall_server_add_http_endpoint(&stream);
+        if ((status = outcome.status) != ucall_status_success_k) return;
+        ucall_server_add_http_endpoint_t pulling {
+            server,       &outcome, uc::bytes_view("/stream/pull"), ucall_verb_any_k,
+            pulling_gate, this,     ucall_body_delivery_streamed_k};
+        ucall_server_add_http_endpoint(&pulling);
         if ((status = outcome.status) != ucall_status_success_k) return;
         ucall_client_config_t client_config {};
         client_config.max_concurrent_connections = settings.connections;
@@ -1712,6 +1733,40 @@ static case_result_t test_streamed_body_slow_puller(random_generator_t& generato
     failures += expect(written && received == body, "the held stream took {} of {} bytes", received.size(),
                        body.size());
     if (held) failures += reply_length(fixture, held, received.size());
+    return failures + fixture.stop();
+}
+
+/** A pull on the request's polling thread with nothing decoded yet answers @c would_block at once
+ *  and keeps no outcome, and the body still arrives through later pulls. */
+static case_result_t test_body_chunk_would_block_on_polling_thread(random_generator_t& generator) {
+    fixture_t fixture {{}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string const body = lettered_body();
+    std::string const head = fmt::format("POST /stream/pull HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+                                         body.size());
+    raw_client_t client;
+    require(failures + fixture.stop(), client.connect(fixture.address));
+    failures += expect(::send(client.descriptor, head.data(), head.size(), 0) == static_cast<ssize_t>(head.size()));
+    failures += await_held_in_background(fixture, 1);
+    auto* held = fixture.take_held();
+    if (!held) return failures + fixture.stop();
+    ucall_status_t const answered = fixture.polling_pull_status.load(std::memory_order_relaxed);
+    failures += expect(answered == ucall_status_would_block_k, "the polling-thread pull answered {}",
+                       ucall_status_name(answered));
+    bool written = false;
+    std::thread writer {
+        [&] { written = client.write(uc::byte_span(body), 65536, generator, steady_clock::now() + 5s); }};
+    std::size_t pulls = 0;
+    std::string const received = pull_body(fixture, held, failures, pulls);
+    writer.join();
+    failures += expect(written, "the body was not written");
+    failures += expect_bytes(uc::byte_span(received), uc::byte_span(body));
+    failures += reply_length(fixture, held, received.size());
+    auto const response = read_response(client, 0);
+    failures += expect(response.status == 200 && response.body == fmt::format("{}", body.size()), "answered {} {}",
+                       response.status, response.body);
     return failures + fixture.stop();
 }
 
@@ -3610,6 +3665,7 @@ int main(int argc, char** argv) {
     run_test(totals, "test_streamed_body_plain", test_streamed_body_plain);
     run_test(totals, "test_streamed_body_noise_xx", test_streamed_body_noise_xx);
     run_test(totals, "test_streamed_body_slow_puller", test_streamed_body_slow_puller);
+    run_test(totals, "test_body_chunk_would_block_on_polling_thread", test_body_chunk_would_block_on_polling_thread);
     run_test(totals, "test_streamed_body_barrier", test_streamed_body_barrier);
     run_test(totals, "test_streamed_body_malformed", test_streamed_body_malformed);
     run_test(totals, "test_oversized_request_refused", test_oversized_request_refused);

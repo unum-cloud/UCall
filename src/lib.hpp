@@ -111,6 +111,65 @@ struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
 };
 #endif
 
+/** The wait instruction one CPU class pairs: x86 spins on PAUSE and the WAITPKG Xeons arm TPAUSE,
+ *  the Arm classes spin on YIELD and the Graviton5 class sleeps in WFE, a monoversioned build takes
+ *  ForkUnion's pick for its target, and everything else yields, as does any class whose
+ *  @c FORKUNION_TARGET_<BIT> is off, such as under ThreadSanitizer. */
+template <cpu_class_t cpu_class_>
+struct waiter_for_cpu_class {
+    using type = fu::standard_yield_t;
+};
+#if FORKUNION_TARGET_X86_PAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_haswell_k> {
+    using type = fu::x86_pause_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_skylake_k> {
+    using type = fu::x86_pause_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_icelake_k> {
+    using type = fu::x86_pause_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_alder_k> {
+    using type = fu::x86_pause_t;
+};
+#endif
+#if FORKUNION_TARGET_X86_TPAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::intel_sierra_k> {
+    using type = fu::x86_tpause_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_YIELD
+template <>
+struct waiter_for_cpu_class<cpu_class_t::aws_g2_k> {
+    using type = fu::arm64_yield_t;
+};
+template <>
+struct waiter_for_cpu_class<cpu_class_t::apple_m2_k> {
+    using type = fu::arm64_yield_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_WFE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
+    using type = fu::arm64_wfe_t;
+};
+#endif
+#if UCALL_TARGET_MONOVERSIONED
+template <>
+struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
+    using type = fu::preferred_yield_t;
+};
+#endif
+
+/** The waiter a CPU class pairs, spelled short for the variants. */
+template <cpu_class_t cpu_class_>
+using waiter_of = typename waiter_for_cpu_class<cpu_class_>::type;
+
 /** The kits and atomic reference one CPU class builds its network from, each picked once here. */
 template <cpu_class_t cpu_class_>
 struct cpu_traits {

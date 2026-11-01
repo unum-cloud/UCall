@@ -37,12 +37,11 @@ using namespace unum::ucall::test;
 /** Checks the registered socket @p handle has `TCP_NODELAY`, through a descriptor it installs. */
 template <typename engine_type_>
 static std::size_t expect_nodelay(engine_type_& engine, descriptor_t handle) {
-    auto* submission = engine.entry();
+    auto* submission = engine.queue.entry();
     if (expect(submission)) return 1;
-    engine.control.result.reset();
-    io_uring_prep_fixed_fd_install(submission, static_cast<int>(engine_type_::registered_socket_t::index_of(handle)),
-                                   0);
-    io_uring_sqe_set_data64(submission, engine.tag(&engine.control, engine.control_tag_k));
+    engine.queue.control.result.reset();
+    io_uring_prep_fixed_fd_install(submission, static_cast<int>(registered_socket_t::index_of(handle)), 0);
+    io_uring_sqe_set_data64(submission, engine.queue.tag(&engine.queue.control, uring_control_tag_k));
     auto descriptor = engine.wait_control();
     if (expect(descriptor >= 0, "installing failed with {}", descriptor)) return 1;
     int enabled {};
@@ -75,10 +74,10 @@ static case_result_t failed_submission() {
                           .descriptor = owned,
                           .data = content,
                           .length = sizeof(content)};
-    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = owned, .length = engine.page};
+    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = owned, .length = engine.queue.page};
     require(failures, engine.submit(sending) == ucall_status_success_k);
     require(failures, engine.submit(receiving) == ucall_status_success_k);
-    require(failures, engine.enter(0, 0) >= 0);
+    require(failures, engine.queue.enter(0, 0) >= 0);
     byte_t received {};
     failures += expect(recv(sockets.peer, &received, sizeof(received), 0) == 1 && received == content[0]);
 
@@ -87,19 +86,20 @@ static case_result_t failed_submission() {
                               .data = content,
                               .length = sizeof(content)};
     failures += expect(engine.submit(unsubmitted) == ucall_status_success_k);
-    auto descriptor = engine.ring.ring_fd;
-    auto enter_descriptor = engine.ring.enter_ring_fd;
-    engine.ring.ring_fd = -1;
-    engine.ring.enter_ring_fd = -1;
-    auto failure = engine.enter(0, 0);
+    auto descriptor = engine.queue.ring.ring_fd;
+    auto enter_descriptor = engine.queue.ring.enter_ring_fd;
+    engine.queue.ring.ring_fd = -1;
+    engine.queue.ring.enter_ring_fd = -1;
+    auto failure = engine.queue.enter(0, 0);
     failures += expect(failure < 0);
-    engine.ring.ring_fd = descriptor;
-    engine.ring.enter_ring_fd = enter_descriptor;
-    engine.fault = failure;
+    engine.queue.ring.ring_fd = descriptor;
+    engine.queue.ring.enter_ring_fd = enter_descriptor;
+    engine.queue.fault = failure;
     engine.stop();
 
-    failures += expect(!engine.is_open() && engine.registrations == engine.registration_none_k);
-    failures += expect(!engine.receive_ring && engine.storage);
+    failures += expect(!engine.is_open() && engine.queue.file_registration == uring_registration_t::unregistered_k &&
+                       engine.queue.buffer_registration == uring_registration_t::unregistered_k);
+    failures += expect(!engine.queue.receive_ring && engine.queue.storage);
     failures += expect(!engine.has_kernel_work());
     failures += expect(recv(sockets.peer, &received, sizeof(received), 0) == 0);
     return failures;
@@ -169,10 +169,12 @@ static case_result_t test_uring618_paused_receive() {
         auto second = engine.import_socket(other.client);
         require(failures, first >= 0 && second >= 0);
         held.client = other.client = -1;
-        auto original = engine.page * (engine.buffer_count + 1);
-        std::vector<byte_t> payload(original + engine.page, byte_t {17});
+        auto original = engine.queue.page * (engine.queue.buffer_count + 1);
+        std::vector<byte_t> payload(original + engine.queue.page, byte_t {17});
         std::fill(payload.begin() + static_cast<std::ptrdiff_t>(original), payload.end(), byte_t {34});
-        io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = first, .length = engine.page};
+        io_request_t receiving {.operation = io_operation_t::receive_k,
+                                .descriptor = first,
+                                .length = engine.queue.page};
         require(failures, engine.submit(receiving) == ucall_status_success_k);
         require(failures, send_all(held.peer, span<byte_t const> {payload}.first(original)));
         io_completion_t completed[2] {};
@@ -182,7 +184,7 @@ static case_result_t test_uring618_paused_receive() {
         failures += expect(std::memcmp(completed[0].data, payload.data(), received) == 0);
 
         announce("a paused socket parks its backlog");
-        auto* owner = engine.socket_slot(first);
+        auto* owner = engine.socket_slots.find(first);
         auto deadline = deadline_after(1000000);
         while (owner->receive_head == engine.absent_k) {
             auto const spare = span<io_completion_t> {completed}.subspan(1);
@@ -194,7 +196,9 @@ static case_result_t test_uring618_paused_receive() {
         require(failures, send_all(held.peer, span<byte_t const> {payload}.subspan(original)));
 
         byte_t marker[1] {byte_t {51}};
-        io_request_t independent {.operation = io_operation_t::receive_k, .descriptor = second, .length = engine.page};
+        io_request_t independent {.operation = io_operation_t::receive_k,
+                                  .descriptor = second,
+                                  .length = engine.queue.page};
         require(failures, engine.submit(independent) == ucall_status_success_k);
         require(failures, send_all(other.peer, marker));
         require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline) == 1);
@@ -206,7 +210,7 @@ static case_result_t test_uring618_paused_receive() {
             require(failures, monotonic_ns() < deadline, "the paused receive never retired");
         }
         failures += expect(owner->receive_head == engine.absent_k && !owner->backlog.empty());
-        failures += expect(engine.available_buffers == engine.buffer_count);
+        failures += expect(engine.queue.available_buffers == engine.queue.buffer_count);
 
         announce("pausing with a receive in flight, then cancelling one");
         require(failures, engine.submit(independent) == ucall_status_success_k);

@@ -7,6 +7,10 @@
 #pragma once
 
 #include "ucall/network.hpp"
+#if UCALL_WITH_LINUX_URING
+#include "ucall/uring612.hpp"
+#include "ucall/uring618.hpp"
+#endif
 #include "lib.hpp"
 
 namespace unum::ucall {
@@ -15,7 +19,7 @@ template <typename engine_type_, cpu_class_t cpu_class_, typename init_type_>
 void make_network_for_engine(init_type_* arguments) noexcept {
     using traits_t = cpu_traits<cpu_class_>;
     using network_t =
-        network_variant<engine_type_, atomic_ref_for_cpu_class<cpu_class_>::template type,
+        network_variant<engine_type_, atomic_ref_for_cpu_class<cpu_class_>::template type, waiter_of<cpu_class_>,
                         typename traits_t::compare_kit_t, typename traits_t::find_kit_t,
                         typename traits_t::byteset_kit_t, typename traits_t::hash_kit_t, typename traits_t::fold_kit_t,
                         typename traits_t::sha256_kit_t, typename traits_t::aes256_gcm_kit_t>;

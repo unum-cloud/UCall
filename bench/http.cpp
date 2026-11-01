@@ -33,7 +33,7 @@
 
 #include "ucall/types.hpp" // `bytes_view`
 
-#include "arguments.hpp" // `tools::parse_count`, `tools::parse_duration`, `tools::parse_seed`, `tools::parse_key`
+#include "arguments.hpp" // `parse_count`, `parse_duration`, `parse_seed`, `parse_key`, `process_clocks_t`
 
 namespace unum::ucall::bench {
 
@@ -86,6 +86,7 @@ using tools::parse_count;
 using tools::parse_duration;
 using tools::parse_key;
 using tools::parse_seed;
+using tools::process_clocks_t;
 
 /** A switch: present, "1" or "true" select @p on, and "0" or "false" the zero enumerator. */
 template <typename mode_type_>
@@ -724,9 +725,10 @@ static int run(settings_t const& settings) {
                 return 1;
             }
     }
-    time_point_t const begin = clock_t::now();
+    process_clocks_t const started = process_clocks_t::now();
     if (!run.dispatch(phase_t::measured_k, settings.time_limit)) return 1;
-    double const seconds = std::chrono::duration<double>(clock_t::now() - begin).count();
+    process_clocks_t const spent = process_clocks_t::now() - started;
+    double const seconds = spent.wall_seconds;
     auto& workers = resources.workers;
     std::size_t successful = 0, failures = 0, rejected = 0, response_bytes = 0;
     bool valid = true;
@@ -775,6 +777,8 @@ static int run(settings_t const& settings) {
         return total.completed ? std::chrono::duration<double, std::milli>(at - run.schedule.begin).count() : 0.0;
     };
     auto gigabytes_per_second = response_bytes / seconds / bytes_per_gigabyte_k;
+    double const cpu_microseconds_per_request = successful ? spent.cpu_seconds * 1e6 / successful : 0.0;
+    double const busy_fraction = spent.cpu_seconds / (seconds * clients);
     double const fractions[] = {0.5, 0.9, 0.99, 0.999, 0.9999};
     char const* const percentiles[] = {"p50", "p90", "p99", "p99.9", "p99.99"};
     auto load = settings.rate ? "open-loop" : "closed-loop";
@@ -794,8 +798,10 @@ static int run(settings_t const& settings) {
                     static_cast<unsigned long long>(settings.seed), security);
         std::printf("{\"row\":\"total\",\"successful_requests\":%zu,\"failed_requests\":%zu,\"rejected_requests\":%zu,"
                     "\"elapsed_seconds\":%.6f,\"throughput_requests_per_second\":%.1f,"
-                    "\"response_body_gigabytes_per_second\":%.3f,\"latency_mean_us\":%.2f",
-                    successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second, mean);
+                    "\"response_body_gigabytes_per_second\":%.3f,\"driver_cpu_us_per_request\":%.3f," //
+                    "\"driver_busy_fraction\":%.3f,\"latency_mean_us\":%.2f",
+                    successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second,
+                    cpu_microseconds_per_request, busy_fraction, mean);
         for (std::size_t i = 0; i != std::size(fractions); ++i)
             std::printf(",\"latency_%s_us\":%.2f", percentiles[i], microseconds(latencies.percentile(fractions[i])));
         std::printf(",\"latency_max_us\":%.2f}\n", microseconds(latency_max));
@@ -849,9 +855,11 @@ static int run(settings_t const& settings) {
             if (!requests && !limit.count()) std::printf("none\n");
         }
         std::printf("Exchanges\n  Successful: %zu requests\n  Failures: %zu requests\n  Rejected: %zu requests\n"
-                    "  Elapsed: %.6f s\n  Throughput: %.1f requests/s\n  Response body throughput: %.3f GB/s\n"
-                    "  Latency: mean %.2f us",
-                    successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second, mean);
+                    "  Elapsed: %.6f s\n  Throughput: %.1f requests/s\n"              //
+                    "  Driver CPU: %.3f us/request, %.3f of its clients' time busy\n" //
+                    "  Response body throughput: %.3f GB/s\n  Latency: mean %.2f us",
+                    successful, failures, rejected, seconds, successful / seconds, cpu_microseconds_per_request,
+                    busy_fraction, gigabytes_per_second, mean);
         for (std::size_t i = 0; i != std::size(fractions); ++i)
             std::printf(", %s %.2f us", percentiles[i], microseconds(latencies.percentile(fractions[i])));
         std::printf(", max %.2f us\n", microseconds(latency_max));

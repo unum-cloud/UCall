@@ -18,13 +18,14 @@
 #include <limits>           // `std::numeric_limits`
 #include <string_view>      // `std::string_view`
 #include <thread>           // `std::this_thread::sleep_for`
+#include <tuple>            // `std::tuple`
 #include <vector>           // `std::vector`
 
-#include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`
+#include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`, `fu_pool_capabilities`
 
 #include "ucall/types.hpp" // `bytes_view`, `st::status_t`
 
-#include "arguments.hpp" // `parse_count`, `parse_key`, `admit_any_peer`
+#include "arguments.hpp" // `parse_count`, `parse_key`, `admit_any_peer`, `process_clocks_t`
 
 namespace unum::ucall::tools {
 
@@ -66,10 +67,15 @@ struct server_t {
     std::vector<ucall_outcome_t> outcomes;
     ucall_server_t server {};
     std::size_t event_loops {};
+    std::size_t connections {1024}, pipelined_requests {1};
     std::vector<ucall_http_batch_endpoint_t> batch_endpoints;                      // Each gets its own drain thread.
     std::size_t min_batch_size {}, max_batch_size {}, max_latency_microseconds {}; // Zeros take the defaults.
     statistics_format_t statistics_format {statistics_format_t::human_k};
+
+    /** Read when the loops start, so the report spans the server's life. */
+    process_clocks_t serving {};
     ucall_network_interface_t network_interface {};
+    ucall_bytes_view_t reply_directory {};
     ucall_noise_key_t private_key {};
     char address[sizeof("[ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255]:65535")] {};
 
@@ -94,8 +100,6 @@ struct server_t {
         ucall_server_config_t config {};
         config.cpu_class = ucall_cpu_class_serial_k;
         std::size_t threads = 1;
-        std::size_t connections = 1024;
-        std::size_t pipelined_requests = 1;
         std::size_t port = 8545;
         std::string_view host {"127.0.0.1"};
         std::string_view key {};
@@ -106,13 +110,15 @@ struct server_t {
                     "Usage: %s [--backend name] [--cpu-class name] [--threads N] [--host IP] [--port N]\n"
                     "       [--connections N] [--pipelined-requests N] [--security none|xx|ik] [--key HEX]\n"
                     "       [--batch-min N] [--batch-max N] [--batch-latency-us N] [--stats human|json]\n"
+                    "       [--reply-directory PATH]\n"
                     "Backend defaults to automatic, CPU class to serial, and threads to 1.\n"
                     "The host defaults to 127.0.0.1 and the port to 8545; pass 0.0.0.0 or :: to accept every NIC.\n"
                     "Admission defaults to 1024 connections of 1 request each.\n"
                     "Noise needs the 64-digit hex server private key; without --key one is generated.\n"
                     "Either way the public key is printed; XX admits every client key.\n"
                     "Batch budgets default to the library's 1, 32, and 10000 microseconds.\n"
-                    "--stats json prints every loop's and batch endpoint's counters as one JSON object.\n",
+                    "--stats json prints every loop's and batch endpoint's counters as a JSON object.\n" //
+                    "--reply-directory registers the directory path parts of replies open files beneath.\n",
                     argv[0]);
                 for (count_flag_t const& count : counts)
                     std::printf("%.*s N: %.*s (%zu)\n", static_cast<int>(count.name.size()), count.name.data(),
@@ -138,6 +144,10 @@ struct server_t {
             else if (flag == "--threads") valid = parse_count(value, threads, 1);
             else if (flag == "--connections") valid = parse_count(value, connections, 1);
             else if (flag == "--pipelined-requests") valid = parse_count(value, pipelined_requests, 1);
+            else if (flag == "--reply-directory") {
+                reply_directory = name;
+                valid = !value.empty();
+            }
             else if (flag == "--batch-min") valid = parse_count(value, min_batch_size, 1);
             else if (flag == "--batch-max") valid = parse_count(value, max_batch_size, 1);
             else if (flag == "--batch-latency-us") valid = parse_count(value, max_latency_microseconds, 1);
@@ -202,6 +212,10 @@ struct server_t {
         network_interface.max_concurrent_connections = connections;
         network_interface.max_pipelined_requests = pipelined_requests;
         network_interface.event_loops = std::min(threads, connections);
+        if (reply_directory.length) {
+            network_interface.reply_directories = &reply_directory;
+            network_interface.reply_directories_count = 1;
+        }
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
         ucall_outcome_t outcome {};
@@ -260,6 +274,7 @@ struct server_t {
         if (outcome.status != ucall_status_success_k) stop_requested.store(true, std::memory_order_relaxed);
     }
     int run() {
+        serving = process_clocks_t::now();
         std::size_t const threads = event_loops + batch_endpoints.size();
         outcomes.resize(threads);
         fu_topology_t topology {};
@@ -267,10 +282,15 @@ struct server_t {
         if (status == fu_success_k) status = fu_pool_new("ucall-server", fu_capabilities_all_k, &pool);
         if (status == fu_success_k) status = fu_pool_spawn(topology, pool, threads, fu_caller_exclusive_k);
         if (topology) fu_topology_delete(topology);
+        fu_capabilities_t effective {};
+        if (status == fu_success_k) status = fu_pool_capabilities(pool, &effective);
         if (status != fu_success_k) {
             std::fprintf(stderr, "ForkUnion initialization failed: %d\n", static_cast<int>(status));
             return 1;
         }
+        std::printf("Serving loops %s\n",
+                    effective & fu_capability_place_threads_by_affinity_k ? "pinned" : "floating");
+        std::fflush(stdout);
         if (fu_pool_unsafe_for_threads(pool, serve, this, &generation) != fu_success_k) return 1;
         while (!stop_requested.load(std::memory_order_relaxed))
             std::this_thread::sleep_for(std::chrono::milliseconds {100});
@@ -282,10 +302,38 @@ struct server_t {
         return report() ? result : 1;
     }
 
-    /** Prints the counters of every loop and batch endpoint. */
+    /** Prints the counters of every loop and batch endpoint, then the seconds served and spent. */
     bool report() const {
         bool const json = statistics_format == statistics_format_t::json_k;
         auto number = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
+        using counter_t = std::uint64_t ucall_event_loop_statistics_t::*;
+        static constexpr std::tuple<char const*, char const*, counter_t> counters_k[] {
+            {"polls", "polls", &ucall_event_loop_statistics_t::polls},
+            {"empty_polls", "empty polls", &ucall_event_loop_statistics_t::empty_polls},
+            {"kernel_enters", "kernel enters", &ucall_event_loop_statistics_t::kernel_enters},
+            {"submissions", "submissions", &ucall_event_loop_statistics_t::submissions},
+            {"completions", "completions", &ucall_event_loop_statistics_t::completions},
+            {"cancellations", "cancellations", &ucall_event_loop_statistics_t::cancellations},
+            {"accepts", "accepts", &ucall_event_loop_statistics_t::accepts},
+            {"requests", "requests", &ucall_event_loop_statistics_t::requests},
+            {"receive_rearms", "receive re-arms", &ucall_event_loop_statistics_t::receive_rearms},
+            {"bytes_received", "bytes received", &ucall_event_loop_statistics_t::bytes_received},
+            {"bytes_sent", "bytes sent", &ucall_event_loop_statistics_t::bytes_sent},
+            {"bytes_copied", "bytes copied", &ucall_event_loop_statistics_t::bytes_copied},
+            {"zero_copy_sends", "zero-copy sends", &ucall_event_loop_statistics_t::zero_copy_sends},
+            {"zero_copy_fallbacks", "zero-copy fallbacks", &ucall_event_loop_statistics_t::zero_copy_fallbacks},
+            {"copying_sends", "copying sends", &ucall_event_loop_statistics_t::copying_sends},
+            {"file_reads_asynchronous", "asynchronous file reads",
+             &ucall_event_loop_statistics_t::file_reads_asynchronous},
+            {"file_reads_blocking", "blocking file reads", &ucall_event_loop_statistics_t::file_reads_blocking},
+            {"bytes_read", "bytes read", &ucall_event_loop_statistics_t::bytes_read},
+            {"file_window_overlaps", "file window overlaps", &ucall_event_loop_statistics_t::file_window_overlaps},
+            {"linger_resets", "linger resets", &ucall_event_loop_statistics_t::linger_resets},
+            {"ready_passes", "ready passes", &ucall_event_loop_statistics_t::ready_passes},
+            {"replied_dequeues", "replied dequeues", &ucall_event_loop_statistics_t::replied_dequeues},
+            {"refused_requests", "refused requests", &ucall_event_loop_statistics_t::refused_requests},
+            {"handshake_failures", "handshake failures", &ucall_event_loop_statistics_t::handshake_failures},
+            {"authorizer_refusals", "authorizer refusals", &ucall_event_loop_statistics_t::authorizer_refusals}};
         ucall_outcome_t outcome {};
         if (json) std::printf("{\"event_loops\":[");
         for (std::size_t index = 0; index != event_loops; ++index) {
@@ -293,21 +341,15 @@ struct server_t {
             ucall_server_event_loop_statistics_t query {server, &outcome, index, &counters};
             ucall_server_event_loop_statistics(&query);
             if (!succeeded(outcome)) return false;
-            std::printf(json ? "%s{\"index\":%zu,\"requests\":%llu,\"accepts\":%llu,\"polls\":%llu,"
-                               "\"empty_polls\":%llu,\"kernel_enters\":%llu,\"submissions\":%llu,"
-                               "\"completions\":%llu,\"cancellations\":%llu,\"receive_rearms\":%llu,"
-                               "\"bytes_received\":%llu,\"bytes_sent\":%llu,\"bytes_copied\":%llu,"
-                               "\"zero_copy_sends\":%llu,\"zero_copy_fallbacks\":%llu,\"refused_requests\":%llu}"
-                             : "%sEvent loop %zu: %llu requests, %llu accepts, %llu polls, %llu empty polls, "
-                               "%llu kernel enters, %llu submissions, %llu completions, %llu cancellations, "
-                               "%llu receive re-arms, %llu bytes received, %llu bytes sent, %llu bytes copied, "
-                               "%llu zero-copy sends, %llu zero-copy fallbacks, %llu refused requests\n",
-                        json && index ? "," : "", index, number(counters.requests), number(counters.accepts),
-                        number(counters.polls), number(counters.empty_polls), number(counters.kernel_enters),
-                        number(counters.submissions), number(counters.completions), number(counters.cancellations),
-                        number(counters.receive_rearms), number(counters.bytes_received), number(counters.bytes_sent),
-                        number(counters.bytes_copied), number(counters.zero_copy_sends),
-                        number(counters.zero_copy_fallbacks), number(counters.refused_requests));
+            if (json) std::printf("%s{\"index\":%zu", index ? "," : "", index);
+            else std::printf("Event loop %zu:", index);
+            char const* separator = " ";
+            for (auto [json_name, human_name, counter] : counters_k) {
+                if (json) std::printf(",\"%s\":%llu", json_name, number(counters.*counter));
+                else std::printf("%s%llu %s", separator, number(counters.*counter), human_name);
+                separator = ", ";
+            }
+            std::printf(json ? "}" : "\n");
         }
         if (json) std::printf("],\"batch_endpoints\":[");
         for (std::size_t index = 0; index != batch_endpoints.size(); ++index) {
@@ -323,7 +365,9 @@ struct server_t {
                         number(counters.filled_batches), number(counters.ready_batches),
                         number(counters.expired_batches));
         }
-        if (json) std::printf("]}\n");
+        process_clocks_t const spent = process_clocks_t::now() - serving;
+        if (json) std::printf("],\"wall_seconds\":%.6f,\"cpu_seconds\":%.6f}\n", spent.wall_seconds, spent.cpu_seconds);
+        else std::printf("Served for %.6f s using %.6f s of CPU\n", spent.wall_seconds, spent.cpu_seconds);
         return true;
     }
     ~server_t() {
