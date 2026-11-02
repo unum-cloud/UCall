@@ -763,9 +763,8 @@ static PyObject* request_defer_reply(Request* self, Deferred* deferred) {
     ucall_status_t const status = ucall_outcome_status(&deferred->outcome);
     // A queued reply may already be final, even failed, so only these refusals
     // leave the request unanswered.
-    if (status == ucall_status_invalid_argument_k || status == ucall_status_uninitialized_k ||
-        status == ucall_status_already_exists_k || status == ucall_status_out_of_memory_k ||
-        status == ucall_status_overflow_k) {
+    if (status == ucall_status_uninitialized_k || status == ucall_status_invalid_argument_k ||
+        status == ucall_status_already_exists_k || status == ucall_status_out_of_memory_k) {
         ucall_py_raise_outcome(&deferred->outcome);
         return NULL;
     }

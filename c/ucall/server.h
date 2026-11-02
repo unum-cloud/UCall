@@ -1203,12 +1203,13 @@ typedef struct ucall_server_reply_vectored_t {
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a part or a view is invalid, a
- *    file descriptor reads buffered, a path leaves its directories, a status of 204 or 304 carries
- *    a body, the @c http_status is outside 200 to 599, or a header line is malformed or sets a
- *    length, a transfer encoding, a date or a server name.
- *  - @c ucall_status_overflow_k A range's end or the reply's length overflows its counter, or a
- *    range runs past the end of its file.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a part, a view or a range's end
+ *    is invalid, a descriptor reads buffered, a path leaves its directories, the status is outside
+ *    200 to 599, or a 204 or 304 carries a body.
+ *  - @c ucall_status_invalid_argument_k A header line is malformed or sets a length, a transfer
+ *    encoding, a date or a server name.
+ *  - @c ucall_status_overflow_k A range runs past the end of its file, published by the event loop
+ *    once it measured the file.
  *  - @c ucall_status_already_exists_k The request was already answered.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_not_found_k A file is missing, unreadable or irregular.
@@ -1297,11 +1298,12 @@ typedef struct ucall_server_reply_append_t {
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, its reply was not begun or
- *    already ended, a part or a view is invalid, a file descriptor reads buffered, a path leaves
- *    its directories, a file or path part of zero length comes on a stream with a declared length,
- *    as their size is unknown, a status of 204 or 304 gets a body, or one call brings more file and
- *    path parts than may wait.
- *  - @c ucall_status_overflow_k A range's end overflows its counter, or parts would run past a
+ *    already ended, a part, a view or a range's end is invalid, a descriptor reads buffered, or a
+ *    path leaves its directories.
+ *  - @c ucall_status_invalid_argument_k A zero-length file or path part comes on a stream with a
+ *    declared length, as its size is unknown, a 204 or 304 gets a body, or one call brings more
+ *    file and path parts than may wait.
+ *  - @c ucall_status_overflow_k The parts' length overflows its counter, or parts would run past a
  *    declared @c Content-Length.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_would_block_k Nothing was queued, as the bytes parts already queued for this
@@ -1344,8 +1346,8 @@ typedef struct ucall_server_reply_end_t {
  *    already ended.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_malformed_k The chunks fell short of a declared @c Content-Length.
- *  - @c ucall_status_overflow_k The last chunk's length overflows its counter, or a file part's
- *    range runs past the end of its file.
+ *  - @c ucall_status_overflow_k The last chunk's length overflows its counter, or a range runs past
+ *    the end of its file, published by the event loop once it measured the file.
  *  - @c ucall_status_not_found_k A file part's file is missing, unreadable or irregular.
  */
 UCALL_EXPORT void ucall_server_reply_end(ucall_server_reply_end_t* arguments);

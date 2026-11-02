@@ -42,6 +42,7 @@ struct linux_uring618_engine {
         uring_socket_stage_t stage {uring_socket_stage_t::vacant_k};
         zero_copy_stage_t zero_copy {zero_copy_stage_t::untried_k};
         uring_retirement_t retirement {uring_retirement_t::serving_k};
+        uring_close_t close {uring_close_t::orderly_k};
         receive_stage_t receive_stage {receive_stage_t::idle_k};
         receive_flow_t receive_flow {receive_flow_t::flowing_k};
         stream_start_t stream_start {stream_start_t::first_k};
@@ -80,6 +81,9 @@ struct linux_uring618_engine {
     operation_list_t timed_operations;
     unsigned rearming_socket_slots {absent_k};
 
+    /** Sockets whose stream is submitted or cancelling, which the kernel still holds. */
+    unsigned receiving_socket_slots {};
+
     /** At most every timed deadline while @c timed_operations is not empty. */
     std::uint64_t earliest_timed {};
 
@@ -94,12 +98,8 @@ struct linux_uring618_engine {
 
     bool is_open() const noexcept { return queue.is_open(); }
     bool has_kernel_work() const noexcept {
-        if (!queue.control.result || operations.in_flight_operations || zero_copy.pending_notifications ||
-            socket_slots.closing())
-            return true;
-        for (auto const& owner : socket_slots.records)
-            if (owner.receive_in_flight()) return true;
-        return false;
+        return !queue.control.result || operations.in_flight_operations || zero_copy.pending_notifications ||
+               socket_slots.closing() || receiving_socket_slots != 0;
     }
 
     ucall_status_t open(std::size_t depth, std::size_t capacity) noexcept {
@@ -231,6 +231,7 @@ struct linux_uring618_engine {
                 tally<atomic_ref_template_>(statistics.bytes_copied, length);
             }
             else {
+                if (owner.receive_in_flight()) --receiving_socket_slots;
                 owner.receive_stage = receive_stage_t::ended_k;
                 owner.terminal = buffer.length;
             }
@@ -302,6 +303,7 @@ struct linux_uring618_engine {
         submission->buf_group = 0;
         io_uring_sqe_set_data64(submission, queue.tag(&owner, uring_receive_tag_k));
         owner.receive_stage = receive_stage_t::submitted_k;
+        ++receiving_socket_slots;
         if (owner.stream_start == stream_start_t::rearm_k) tally<atomic_ref_template_>(statistics.receive_rearms);
         owner.stream_start = stream_start_t::rearm_k;
         return ucall_status_success_k;
@@ -372,17 +374,12 @@ struct linux_uring618_engine {
         return ucall_status_success_k;
     }
 
-    /** Makes the close of @p descriptor send a reset rather than a FIN, waiting on the ring. */
+    /** Marks the close of @p descriptor to send a reset rather than a FIN, without a round trip. */
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         auto* owner = socket_slots.find(descriptor);
-        if (!owner || queue.fault) return ucall_status_io_k;
-        auto* submission = queue.entry();
-        if (!submission) return ucall_status_io_k;
-        io_uring_prep_cmd_sock(submission, SOCKET_URING_OP_SETSOCKOPT, static_cast<int>(owner->index), SOL_SOCKET,
-                               SO_LINGER, &queue.storage->reset_linger, sizeof(queue.storage->reset_linger));
-        submission->flags |= IOSQE_FIXED_FILE;
-        queue.command(submission);
-        return wait_control() < 0 ? ucall_status_io_k : ucall_status_success_k;
+        if (!owner) return ucall_status_io_k;
+        owner->close = uring_close_t::reset_k;
+        return ucall_status_success_k;
     }
     ucall_status_t cancel(io_request_t& request) noexcept {
         // A release ends on its notifications, a close on its last socket operation, never sooner.
@@ -501,7 +498,10 @@ struct linux_uring618_engine {
         if (operation.socket_slot->retirement == uring_retirement_t::retiring_k) retire(*operation.socket_slot);
     }
     void settle_receive(socket_slot_t& owner, io_uring_cqe const& completion) noexcept {
-        if (!(completion.flags & IORING_CQE_F_MORE)) owner.receive_stage = receive_stage_t::idle_k;
+        if (!(completion.flags & IORING_CQE_F_MORE)) {
+            if (owner.receive_in_flight()) --receiving_socket_slots;
+            owner.receive_stage = receive_stage_t::idle_k;
+        }
         if (completion.flags & IORING_CQE_F_BUFFER) {
             --queue.available_buffers;
             unsigned index = completion.flags >> IORING_CQE_BUFFER_SHIFT;
@@ -522,6 +522,7 @@ struct linux_uring618_engine {
             }
         }
         else if (completion.res != -ENOBUFS && completion.res != -ECANCELED) {
+            if (owner.receive_in_flight()) --receiving_socket_slots;
             owner.receive_stage = receive_stage_t::ended_k;
             owner.terminal = completion.res;
             deliver_receive(owner);
@@ -610,7 +611,10 @@ struct linux_uring618_engine {
         if ((static_cast<std::uintptr_t>(user_data) & 7) != uring_receive_tag_k)
             return uring_discard(user_data, queue, operations, socket_slots, zero_copy);
         auto& owner = *reinterpret_cast<socket_slot_t*>(static_cast<std::uintptr_t>(user_data) & ~std::uintptr_t {7});
-        if (owner.receive_in_flight()) owner.receive_stage = receive_stage_t::idle_k;
+        if (owner.receive_in_flight()) {
+            owner.receive_stage = receive_stage_t::idle_k;
+            --receiving_socket_slots;
+        }
     }
     void discard_unsubmitted() noexcept {
         auto head = io_uring_smp_load_acquire(queue.ring.sq.khead);

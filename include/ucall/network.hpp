@@ -938,7 +938,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return release_requests[window].registered_memory;
         }
     };
-    enum class event_loop_stage_t { unopened_k, ready_k, quiesced_k };
+    enum class event_loop_stage_t { unopened_k, ready_k, stopping_k, quiesced_k };
 
     /** Whether an event loop runs, sleeps in its engine's poll, or was notified since it last did
      *  either; only a sleeping loop's notify writes its wake channel. */
@@ -993,6 +993,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         span<interface_acceptor_t> interface_acceptors {};
         connection_t* idle {};
         connection_t* ready {};
+
+        /** Connections off the idle list, so a stopping loop knows when it is done. */
+        std::size_t open_connections {};
         server_exchange_t* exchanges {};
         server_exchange_t* free_exchanges {};
         ucall_status_t setup_status {ucall_status_success_k};
@@ -1449,7 +1452,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::size_t length = 0;
         for (ucall_reply_part_t const& part : parts) {
             if (part.data.bytes.length > std::numeric_limits<std::size_t>::max() - length)
-                return ucall_status_overflow_k;
+                return ucall_status_invalid_argument_k;
             length += part.data.bytes.length;
         }
         bool const bodiless = status == 204 || status == 304;
@@ -1498,9 +1501,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return true;
     }
 
-    /** Refuses a range whose end overflows. */
+    /** Refuses a range whose end overflows its counter, which no file can satisfy. */
     static ucall_status_t check_range(std::uint64_t offset, std::uint64_t length) noexcept {
-        return length > std::numeric_limits<std::uint64_t>::max() - offset ? ucall_status_overflow_k
+        return length > std::numeric_limits<std::uint64_t>::max() - offset ? ucall_status_invalid_argument_k
                                                                            : ucall_status_success_k;
     }
 
@@ -2140,7 +2143,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     static std::string_view tag_text(char (&output)[capacity_], std::string_view key, std::string_view value) noexcept {
         std::size_t const length = std::min(value.size(), capacity_ - key.size());
         std::memcpy(output, key.data(), key.size());
-        std::memcpy(output + key.size(), value.data(), length);
+        if (length) std::memcpy(output + key.size(), value.data(), length);
         return {output, key.size() + length};
     }
 
@@ -2188,8 +2191,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         metrics.pending = metrics.reported;
         std::memcpy(metrics.interfaces_pending.data(), metrics.interfaces_reported.data(),
                     metrics.interfaces_reported.size() * sizeof(interface_statistics_t));
-        std::memcpy(metrics.batches_pending.data(), metrics.batches_reported.data(),
-                    metrics.batches_reported.size() * sizeof(ucall_batch_endpoint_statistics_t));
+        if (!metrics.batches_reported.empty())
+            std::memcpy(metrics.batches_pending.data(), metrics.batches_reported.data(),
+                        metrics.batches_reported.size() * sizeof(ucall_batch_endpoint_statistics_t));
     }
 
     /** Settles a sent datagram: delivered counters become the base of the next deltas, and a failed
@@ -2202,8 +2206,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         metrics.reported = metrics.pending;
         std::memcpy(metrics.interfaces_reported.data(), metrics.interfaces_pending.data(),
                     metrics.interfaces_pending.size() * sizeof(interface_statistics_t));
-        std::memcpy(metrics.batches_reported.data(), metrics.batches_pending.data(),
-                    metrics.batches_pending.size() * sizeof(ucall_batch_endpoint_statistics_t));
+        if (!metrics.batches_pending.empty())
+            std::memcpy(metrics.batches_reported.data(), metrics.batches_pending.data(),
+                        metrics.batches_pending.size() * sizeof(ucall_batch_endpoint_statistics_t));
     }
 
     /** Writes a latency line for one in every <tt>1 / metrics_sample_rate</tt> finished requests,
@@ -3361,8 +3366,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (connection.stage == connection_stage_t::idle_k) return;
         tally<atomic_ref>(event_loop.statistics.ready_passes);
         if (mode == server_mode_t::stopping_k && connection.stage != connection_stage_t::closing_k &&
-            connection.stage != connection_stage_t::releasing_k && connection.stage != connection_stage_t::closed_k)
+            connection.stage != connection_stage_t::closed_k) {
+            // A reply cut off at stop must not read as whole; a linger would only delay the peer.
+            if (connection.oldest_exchange || connection.stage == connection_stage_t::releasing_k)
+                connection.close_mode = close_mode_t::reset_close_k;
             connection.fail(ucall_status_connection_closed_k);
+        }
         if (connection.stage == connection_stage_t::closing_k &&
             connection.file_reading == file_read_state_t::waiting_window_k)
             leave_window_queue(event_loop, connection);
@@ -3417,6 +3426,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             connection.stage = connection_stage_t::idle_k;
             connection.next = event_loop.idle;
             event_loop.idle = &connection;
+            --event_loop.open_connections;
         }
     }
 
@@ -3460,25 +3470,24 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         expire_releases(event_loop);
         if (mode == server_mode_t::serving_k) emit_metrics(server, event_loop);
         else if (event_loop.metrics.stage == metrics_stage_t::sending_k) engine.cancel(event_loop.metrics.send_request);
-        if (mode == server_mode_t::stopping_k) {
-            for (; event_loop.ready; event_loop.ready = event_loop.ready->next)
-                event_loop.ready->readiness = readiness_t::unlisted_k;
-            for (auto& connection : event_loop.connections) advance_connection(server, event_loop, *connection, mode);
+        if (mode == server_mode_t::stopping_k && event_loop.stage == event_loop_stage_t::ready_k) {
+            // Every open connection fails once; later passes advance only what completions mark.
+            for (auto& connection : event_loop.connections)
+                if (connection->stage != connection_stage_t::idle_k) mark_ready(event_loop, *connection);
+            event_loop.stage = event_loop_stage_t::stopping_k;
         }
-        else do {
-                for (auto* connection = std::exchange(event_loop.ready, nullptr); connection;) {
-                    auto& current = *connection;
-                    connection = current.next;
-                    current.readiness = readiness_t::unlisted_k;
-                    advance_connection(server, event_loop, current, mode);
-                }
-            } while (collect_replies(event_loop) == ucall_status_success_k);
+        do {
+            for (auto* connection = std::exchange(event_loop.ready, nullptr); connection;) {
+                auto& current = *connection;
+                connection = current.next;
+                current.readiness = readiness_t::unlisted_k;
+                advance_connection(server, event_loop, current, mode);
+            }
+        } while (collect_replies(event_loop) == ucall_status_success_k);
         if (mode == server_mode_t::stopping_k) {
-            bool busy = false;
+            bool busy = event_loop.open_connections != 0 || event_loop.metrics.stage == metrics_stage_t::sending_k;
             for (auto& acceptor : event_loop.interface_acceptors)
                 busy |= acceptor.stage == interface_acceptor_t::stage_t::pending_k;
-            for (auto& connection : event_loop.connections) busy |= connection->stage != connection_stage_t::idle_k;
-            busy |= event_loop.metrics.stage == metrics_stage_t::sending_k;
             if (!busy) {
                 if (event_loop.metrics.stage != metrics_stage_t::closed_k) {
                     engine.close_socket(event_loop.metrics.send_request.descriptor);
@@ -3519,6 +3528,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
         tally<atomic_ref>(event_loop.statistics.accepts);
         event_loop.idle = chosen->next;
+        ++event_loop.open_connections;
         chosen->descriptor = completion.result;
         chosen->network_interface = &network_interface;
         chosen->send_buffer_bytes = network_interface.send_buffer_bytes;
@@ -4246,7 +4256,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         auto& server = *static_cast<server_t*>(handle);
         server_stop(handle);
         for (auto& event_loop : server.event_loops)
-            while (event_loop->stage == event_loop_stage_t::ready_k &&
+            while ((event_loop->stage == event_loop_stage_t::ready_k ||
+                    event_loop->stage == event_loop_stage_t::stopping_k) &&
                    event_loop->setup_status == ucall_status_success_k)
                 if (server_poll(server, *event_loop, io_wait_t::blocking_k) != ucall_status_success_k) break;
         allocator_delete<server_t, allocator_t> {server.allocator}(&server);

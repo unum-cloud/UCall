@@ -358,6 +358,28 @@ def test_reply_parts_path_and_bytes_on_worker(backend, loopback, serving, direct
     assert answers == [ucall.Deferred, type(None)]
 
 
+def test_reply_parts_overflow_keeps_request(backend, loopback, serving, direct_directory):
+    server = ucall.Server(loopback(reply_directories=[direct_directory]), backend=backend)
+    refusals = []
+
+    def send(detached: ucall.DetachedRequest):
+        try:
+            detached.reply_parts([ucall.Path(0, "clip.bin", 2**64 - 1, 1)])
+        except ucall.Error as error:
+            refusals.append(error.status)
+        detached.reply(b"still answerable")
+
+    @server.get("/clip")
+    def clip(request: ucall.Request):
+        workers.submit(send, request.detach())
+
+    with concurrent.futures.ThreadPoolExecutor(1) as workers, serving(server) as base:
+        response = ucall.Client(connections=1, backend=backend).get(f"{base}/clip")
+        workers.shutdown()
+    assert refusals == [ucall.Status.INVALID_ARGUMENT]
+    assert (response.status_code, bytes(response.body)) == (200, b"still answerable")
+
+
 def test_typed_handler_returning_path_raises(loopback, serving, monkeypatch):
     server = ucall.Server(loopback())
     unraisable = []

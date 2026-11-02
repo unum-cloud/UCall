@@ -3257,6 +3257,49 @@ static case_result_t test_stop_while_releasing() {
     });
 }
 
+/** Stopping the server while a peer that reads slowly holds a path reply cut off past its head
+ *  resets the peer at once, rather than closing in order behind the unsent body or lingering. */
+static case_result_t test_stop_resets_held_replies() {
+    return keeping_descriptors([]() -> case_result_t {
+        file_tree_t tree;
+        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        ucall_outcome_t outcome {};
+        std::size_t failures = 0;
+        raw_client_t client;
+        auto stopping = steady_clock::now();
+        {
+            fixture_t fixture {{.directory = tree.served}};
+            require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+            fixture.serve_in_background();
+            int const huge = ::open(tree.name("huge.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+            require(failures + fixture.stop(), huge >= 0 && ftruncate(huge, off_t {64} << 20) == 0);
+            ::close(huge);
+            require(failures + fixture.stop(), client.connect(fixture.address));
+            int const small = 4096;
+            failures += expect(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+            std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+            failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
+                               static_cast<ssize_t>(request.size()));
+            failures += await_held_in_background(fixture, 1);
+            failures += reply_parts(fixture, fixture.take_held(), outcome, {path_part("huge.bin")});
+            auto const deadline = steady_clock::now() + 5s;
+            while (client.received.find("\r\n\r\n") == std::string::npos &&
+                   client.read(client.received.size() + 1, deadline) == read_end_t::filled_k) {}
+            std::this_thread::sleep_for(50ms);
+            stopping = steady_clock::now();
+            ucall_server_stop(fixture.server);
+            failures += fixture.stop();
+        }
+        auto const end = client.read_until_close(stopping + 1s);
+        auto const ended = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - stopping);
+        failures += expect(end == read_end_t::failed_k || end == read_end_t::closed_k,
+                           "the read ended as {} after {} ms", static_cast<int>(end), ended.count());
+        failures += expect(ucall_outcome_status(&outcome) == ucall_status_connection_closed_k, "the outcome turned {}",
+                           ucall_status_name(ucall_outcome_status(&outcome)));
+        return failures;
+    });
+}
+
 /** A peer that stops reading after a `connection: close` reply holds its connection no longer
  *  than two linger periods: the close lingers for the peer's FIN and for the kernel to let go of
  *  what it sent without copying, resets once the deadline passes with the reply still unread,
@@ -3703,6 +3746,7 @@ int main(int argc, char** argv) {
     run_test(totals, "test_file_detach", test_file_detach);
     run_test(totals, "test_stop_while_opening", test_stop_while_opening);
     run_test(totals, "test_stop_while_releasing", test_stop_while_releasing);
+    run_test(totals, "test_stop_resets_held_replies", test_stop_resets_held_replies);
     run_test(totals, "test_linger_then_reset", test_linger_then_reset);
     run_test(totals, "test_file_window_overlap", test_file_window_overlap);
     run_test(totals, "test_file_fairness", test_file_fairness);

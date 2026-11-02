@@ -39,6 +39,9 @@ enum class uring_socket_stage_t : std::uint8_t { vacant_k, installing_k, open_k,
 /** Whether a socket still takes operations, or cancels them on its way to the close. */
 enum class uring_retirement_t : std::uint8_t { serving_k, retiring_k };
 
+/** Whether a socket's close sends a FIN, or a reset that purges what the kernel still holds. */
+enum class uring_close_t : std::uint8_t { orderly_k, reset_k };
+
 /** Whether an operation's deadline passed, so its cancellation completes as a timeout. */
 enum class uring_expiry_t : std::uint8_t { pending_k, expired_k };
 
@@ -301,7 +304,8 @@ struct uring_queue {
 };
 
 /** The registered socket slots, free-listed; @p socket_slot_type_ carries @c index, @c next,
- *  @c serial, @c owned_head, @c close_operation, @c stage, @c zero_copy and @c retirement. */
+ *  @c serial, @c owned_head, @c close_operation, @c stage, @c zero_copy, @c retirement and
+ *  @c close, as both engines' slot types do. */
 template <typename socket_slot_type_, typename allocator_type_>
 struct uring_socket_slots {
     using socket_slot_t = socket_slot_type_;
@@ -310,7 +314,7 @@ struct uring_socket_slots {
 
     st::vector<socket_slot_t, typename std::allocator_traits<allocator_t>::template rebind_alloc<socket_slot_t>>
         records;
-    unsigned free_socket_slots {absent_k}, vacant_socket_slots {};
+    unsigned free_socket_slots {absent_k}, vacant_socket_slots {}, closing_socket_slots {};
     std::uint64_t next_serial {};
 
     explicit uring_socket_slots(allocator_t const& allocator) noexcept : records(allocator) {}
@@ -345,6 +349,7 @@ struct uring_socket_slots {
         result.close_operation = absent_k;
         result.zero_copy = zero_copy_stage_t::untried_k;
         result.retirement = uring_retirement_t::serving_k;
+        result.close = uring_close_t::orderly_k;
         result.stage = uring_socket_stage_t::installing_k;
         result.serial = ++next_serial;
         return &result;
@@ -355,11 +360,7 @@ struct uring_socket_slots {
         free_socket_slots = owner.index;
         ++vacant_socket_slots;
     }
-    bool closing() const noexcept {
-        for (auto const& owner : records)
-            if (owner.stage == uring_socket_stage_t::closing_k) return true;
-        return false;
-    }
+    bool closing() const noexcept { return closing_socket_slots != 0; }
 
     template <typename queue_type_>
     descriptor_t import_socket(descriptor_t descriptor, queue_type_& queue) noexcept {
@@ -384,23 +385,34 @@ struct uring_socket_slots {
         return registered_socket_t {target->index}.handle();
     }
 
-    /** Submits the close of @p owner's registered descriptor. */
+    /** Submits the close of @p owner's registered descriptor, behind a linked @c SO_LINGER that
+     *  turns it into a reset where @p owner was marked so. */
     template <typename queue_type_>
     void submit_close(socket_slot_t& owner, queue_type_& queue) noexcept {
-        auto* submission = queue.entry();
+        auto* submission = queue.entry(owner.close == uring_close_t::reset_k ? 2 : 1);
         if (!submission) {
             queue.fault = -EIO;
             return;
         }
+        if (owner.close == uring_close_t::reset_k) {
+            // Hard-linked, so a refused option still closes, in order; its failure lands untracked.
+            io_uring_prep_cmd_sock(submission, SOCKET_URING_OP_SETSOCKOPT, static_cast<int>(owner.index), SOL_SOCKET,
+                                   SO_LINGER, &queue.storage->reset_linger, sizeof(queue.storage->reset_linger));
+            submission->flags |= IOSQE_FIXED_FILE | IOSQE_IO_HARDLINK | IOSQE_CQE_SKIP_SUCCESS;
+            io_uring_sqe_set_data64(submission, uring_cancel_tag_k);
+            submission = queue.entry();
+        }
         io_uring_prep_close_direct(submission, owner.index);
         io_uring_sqe_set_data64(submission, queue.tag(&owner, uring_close_tag_k));
         owner.stage = uring_socket_stage_t::closing_k;
+        ++closing_socket_slots;
     }
 
     /** Settles the close of @p owner's descriptor, answering the slot when it closed. */
     template <typename queue_type_>
     socket_slot_t* settle_close(socket_slot_t& owner, int result, queue_type_& queue) noexcept {
         owner.stage = uring_socket_stage_t::open_k;
+        --closing_socket_slots;
         if (result < 0) {
             queue.fault = result;
             return nullptr;
@@ -831,7 +843,10 @@ void uring_discard(std::uint64_t user_data, queue_type_& queue, operations_type_
     else if (kind == uring_control_tag_k) queue.control.result = -ECANCELED;
     else if (kind == uring_close_tag_k) {
         auto& owner = *static_cast<socket_slot_t*>(pointer);
-        if (owner.stage == uring_socket_stage_t::closing_k) owner.stage = uring_socket_stage_t::open_k;
+        if (owner.stage == uring_socket_stage_t::closing_k) {
+            owner.stage = uring_socket_stage_t::open_k;
+            --socket_slots.closing_socket_slots;
+        }
     }
 }
 
@@ -854,6 +869,7 @@ struct linux_uring612_engine {
         uring_socket_stage_t stage {uring_socket_stage_t::vacant_k};
         zero_copy_stage_t zero_copy {zero_copy_stage_t::untried_k};
         uring_retirement_t retirement {uring_retirement_t::serving_k};
+        uring_close_t close {uring_close_t::orderly_k};
     };
     static_assert(sizeof(socket_slot_t) == 32);
     struct buffer_t {
@@ -1015,17 +1031,12 @@ struct linux_uring612_engine {
         return ucall_status_success_k;
     }
 
-    /** Makes the close of @p descriptor send a reset rather than a FIN, waiting on the ring. */
+    /** Marks the close of @p descriptor to send a reset rather than a FIN, without a round trip. */
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         auto* owner = socket_slots.find(descriptor);
-        if (!owner || queue.fault) return ucall_status_io_k;
-        auto* submission = queue.entry();
-        if (!submission) return ucall_status_io_k;
-        io_uring_prep_cmd_sock(submission, SOCKET_URING_OP_SETSOCKOPT, static_cast<int>(owner->index), SOL_SOCKET,
-                               SO_LINGER, &queue.storage->reset_linger, sizeof(queue.storage->reset_linger));
-        submission->flags |= IOSQE_FIXED_FILE;
-        queue.command(submission);
-        return wait_control() < 0 ? ucall_status_io_k : ucall_status_success_k;
+        if (!owner) return ucall_status_io_k;
+        owner->close = uring_close_t::reset_k;
+        return ucall_status_success_k;
     }
     ucall_status_t cancel(io_request_t& request) noexcept {
         // A release ends on its notifications, a close on its last socket operation, never sooner.
