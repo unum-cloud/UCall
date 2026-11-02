@@ -68,6 +68,7 @@ struct alignas(8) uring_operation {
     io_request_t* request {};
     socket_slot_type_* socket_slot {};
     descriptor_t result {};
+    unsigned previous {absent_k};
     std::uint64_t zero_copy_serial {}; // The serial `zero_copy_socket` had when the send left.
     unsigned accepted {absent_k}, buffer {absent_k}, next {absent_k};
     unsigned owned_next {absent_k};         // The next operation of the same socket slot.
@@ -461,7 +462,7 @@ struct uring_operations {
         return index != absent_k ? &records[index] : nullptr;
     }
     void unlink(operation_list_t& list, operation_t& operation) noexcept {
-        [[maybe_unused]] ucall_status_t const removed = list.remove(records, index_of(operation));
+        [[maybe_unused]] st::status_t const removed = list.erase(records, index_of(operation));
     }
 
     /** Takes a free operation for @p request, owned by @p owner when it names a socket. */
@@ -631,24 +632,28 @@ struct uring_operations {
 
     /** Opens completed but never collected hand their descriptors to no one. */
     void close_uncollected_files() noexcept {
-        for (unsigned index = completed_operations.head; index != absent_k; index = records[index].next)
+        for (unsigned index = completed_operations.oldest; index != absent_k; index = records[index].next)
             if (records[index].request->operation == io_operation_t::file_open_k && records[index].result >= 0)
                 file_close(records[index].result);
     }
 };
 
-/** The zero-copy releases sends name, found through their table, and the notifications the kernel
+/** The zero-copy releases sends name, found through their index, and the notifications the kernel
  *  still owes them. */
-template <typename socket_slot_type_, typename allocator_type_, template <typename> class atomic_ref_template_>
+template <typename socket_slot_type_, typename allocator_type_, template <typename> class atomic_ref_template_,
+          typename row_kit_type_>
 struct uring_zero_copy {
     using socket_slot_t = socket_slot_type_;
     using allocator_t = allocator_type_;
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operation_t = typename operations_t::operation_t;
+    using release_index_t =
+        st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t,
+                             typename std::allocator_traits<allocator_t>::template rebind_alloc<byte_t>, row_kit_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
 
-    release_table<allocator_t> releases;
+    release_index_t releases;
 
     /** Summed over every release. */
     std::uint32_t pending_notifications {};
@@ -656,8 +661,15 @@ struct uring_zero_copy {
     /** The owning engine's counters. */
     io_statistics_t& statistics;
 
-    uring_zero_copy(allocator_t const& allocator, io_statistics_t& counters) noexcept
-        : releases(allocator), statistics(counters) {}
+    explicit uring_zero_copy(io_statistics_t& counters) noexcept : statistics(counters) {}
+
+    /** Builds the release index for up to @p capacity releases, dropping any it held. */
+    ucall_status_t open(std::size_t capacity, allocator_t const& allocator) noexcept {
+        st::expected<release_index_t> made = release_index_t::make(capacity, {}, allocator);
+        if (!made) return ucall_status_out_of_memory_k;
+        releases = std::move(*made);
+        return ucall_status_success_k;
+    }
 
     /** The release a zero-copy send counts against, taking an operation for it on the first send
      *  naming it; @c absent_k when the send copies instead: its socket was reported copying, or
@@ -665,13 +677,14 @@ struct uring_zero_copy {
     unsigned pair_release(operation_t& operation, operations_t& operations) noexcept {
         io_request_t* const named = operation.request->release_request;
         if (operation.socket_slot->zero_copy == zero_copy_stage_t::copying_k || !named) return absent_k;
-        unsigned release = releases.find(operations, named);
+        unsigned release = releases.find(release_key(named));
         if (release == absent_k) {
             auto* taken = operations.take(*named);
             if (!taken) return absent_k;
             taken->stage = uring_operation_stage_t::collecting_k;
             release = operations.index_of(*taken);
-            releases.insert(operations, release);
+            [[maybe_unused]] st::status_t const indexed = releases.insert(release_key(named), release,
+                                                                          st::assume_unique);
         }
         else if (operations[release].paired_operation != absent_k) return absent_k;
         return release;
@@ -703,8 +716,10 @@ struct uring_zero_copy {
      *  named completes at once. */
     ucall_status_t submit_release(io_request_t& request, operations_t& operations,
                                   socket_slots_t& socket_slots) noexcept {
-        unsigned index = releases.find(operations, &request);
-        if (index != absent_k) releases.erase(operations, index);
+        unsigned index = releases.find(release_key(&request));
+        if (index != absent_k) {
+            [[maybe_unused]] st::status_t const unindexed = releases.erase(release_key(&request), index);
+        }
         else {
             auto* taken = operations.take(request);
             if (!taken) return ucall_status_contended_k;
@@ -852,11 +867,12 @@ void uring_discard(std::uint64_t user_data, queue_type_& queue, operations_type_
 
 /** One-shot requests over registered sockets, submitted through the liburing SQ. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct linux_uring612_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_type_, template <typename> class other_atomic_ref_>
-    using rebind = linux_uring612_engine<other_allocator_type_, other_atomic_ref_>;
+    template <typename other_allocator_type_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = linux_uring612_engine<other_allocator_type_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
@@ -878,7 +894,7 @@ struct linux_uring612_engine {
     using queue_t = uring_queue<allocator_t, atomic_ref_template_>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
-    using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_>;
+    using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_, row_kit_type_>;
     using operation_t = typename operations_t::operation_t;
     static_assert(sizeof(operation_t) == 64);
     static constexpr io_uring_op opcodes_k[] {
@@ -894,7 +910,7 @@ struct linux_uring612_engine {
     vector<buffer_t> buffers;
 
     explicit linux_uring612_engine(allocator_t const& instance = {}) noexcept
-        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(instance, statistics),
+        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(statistics),
           buffers(rebound_allocator<buffer_t> {instance}) {}
     linux_uring612_engine(linux_uring612_engine const&) = delete;
     linux_uring612_engine& operator=(linux_uring612_engine const&) = delete;
@@ -918,7 +934,7 @@ struct linux_uring612_engine {
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
             socket_slots.open(sockets) != ucall_status_success_k ||
-            zero_copy.releases.open(capacity) != ucall_status_success_k ||
+            zero_copy.open(capacity, queue.allocator) != ucall_status_success_k ||
             st::failed(buffers.resize(queue.buffer_count)))
             return ucall_status_out_of_memory_k;
         ucall_status_t const opened = queue.open(depth, sockets, opcodes_k);

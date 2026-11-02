@@ -12,15 +12,16 @@ namespace unum::ucall {
 
 /** One-shot requests and multishot streams share the same registered socket slot lifetimes. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct linux_uring618_engine {
     using allocator_t = allocator_type_;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
-    template <typename other_allocator_type_, template <typename> class other_atomic_ref_>
-    using rebind = linux_uring618_engine<other_allocator_type_, other_atomic_ref_>;
+    template <typename other_allocator_type_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = linux_uring618_engine<other_allocator_type_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     enum class receive_stage_t : std::uint8_t { idle_k, submitted_k, cancelling_k, ended_k };
@@ -61,7 +62,7 @@ struct linux_uring618_engine {
     using queue_t = uring_queue<allocator_t, atomic_ref_template_>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
-    using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_>;
+    using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_, row_kit_type_>;
     using operation_t = typename operations_t::operation_t;
     static_assert(sizeof(operation_t) == 64);
     static constexpr io_uring_op opcodes_k[] {
@@ -88,7 +89,7 @@ struct linux_uring618_engine {
     std::uint64_t earliest_timed {};
 
     explicit linux_uring618_engine(allocator_t const& instance = {}) noexcept
-        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(instance, statistics),
+        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(statistics),
           buffers(rebound_allocator<buffer_t> {instance}) {}
     linux_uring618_engine(linux_uring618_engine const&) = delete;
     linux_uring618_engine& operator=(linux_uring618_engine const&) = delete;
@@ -112,7 +113,7 @@ struct linux_uring618_engine {
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
             socket_slots.open(sockets, queue.allocator) != ucall_status_success_k ||
-            zero_copy.releases.open(capacity) != ucall_status_success_k ||
+            zero_copy.open(capacity, queue.allocator) != ucall_status_success_k ||
             st::failed(buffers.resize(queue.buffer_count)))
             return ucall_status_out_of_memory_k;
         ucall_status_t const opened = queue.open(depth, sockets, opcodes_k);
@@ -343,8 +344,7 @@ struct linux_uring618_engine {
             }
             if (!owner->receive_in_flight()) rearm(*owner);
             if (request.deadline) {
-                if (timed_operations.head == absent_k || request.deadline < earliest_timed)
-                    earliest_timed = request.deadline;
+                if (timed_operations.empty() || request.deadline < earliest_timed) earliest_timed = request.deadline;
                 operation->timed_listing = uring_listing_t::listed_k;
                 operations.push(timed_operations, *operation);
             }
@@ -560,10 +560,10 @@ struct linux_uring618_engine {
     }
     void maintain() noexcept {
         if (queue.fault) return;
-        if (timed_operations.head != absent_k && monotonic_ns() >= earliest_timed) {
+        if (!timed_operations.empty() && monotonic_ns() >= earliest_timed) {
             auto now = monotonic_ns();
             earliest_timed = 0;
-            for (auto index = timed_operations.head; index != absent_k;) {
+            for (auto index = timed_operations.oldest; index != absent_k;) {
                 auto& operation = operations[index];
                 index = operation.next;
                 std::uint64_t const expiry = operation.request->deadline;
@@ -596,7 +596,7 @@ struct linux_uring618_engine {
             if (count) return count;
             auto now = monotonic_ns();
             auto wait_deadline = deadline;
-            if (timed_operations.head != absent_k)
+            if (!timed_operations.empty())
                 wait_deadline = !wait_deadline ? earliest_timed : std::min(wait_deadline, earliest_timed);
             unsigned wait = policy == io_wait_t::blocking_k && (!wait_deadline || now < wait_deadline) ? 1 : 0;
             int result = queue.enter(wait, wait_deadline);

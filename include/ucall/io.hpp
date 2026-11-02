@@ -15,6 +15,9 @@
 #include <chrono>
 #include <new>
 
+#include <smashtable/basic_hash_index.hpp>
+#include <smashtable/intrusive_list.hpp>
+
 #include "ucall/types.hpp"
 
 #if UCALL_OS_WINDOWS_
@@ -574,7 +577,7 @@ static_assert(sizeof(io_completion_t) == 32);
 /** Counters an engine advances for its one polling owner, on lines no other thread writes.
  *  @c zero_copy_fallbacks counts sends the kernel copied anyway or refused to pin, and
  *  @c zero_copy_sends plus @c copying_sends is every send. */
-struct alignas(false_sharing_bytes_k) io_statistics_t {
+struct alignas(fu::default_alignment_k) io_statistics_t {
     std::uint64_t submissions {}, completions {}, kernel_enters {}, cancellations {}, receive_rearms {},
         bytes_copied {}, zero_copy_sends {}, zero_copy_fallbacks {}, copying_sends {}, file_reads_asynchronous {},
         file_reads_blocking {};
@@ -687,39 +690,7 @@ struct wake_channel_t {
 };
 
 /** An intrusive FIFO of engine operations, linked through their @c next indices. */
-struct operation_list_t {
-    static constexpr unsigned absent_k = std::numeric_limits<unsigned>::max();
-    unsigned head {absent_k}, tail {absent_k};
-    template <typename operations_type_>
-    void push(operations_type_& operations, unsigned index) noexcept {
-        operations[index].next = absent_k;
-        if (tail != absent_k) operations[tail].next = index;
-        else head = index;
-        tail = index;
-    }
-    template <typename operations_type_>
-    unsigned pop(operations_type_& operations) noexcept {
-        auto index = head;
-        if (index == absent_k) return index;
-        head = operations[index].next;
-        if (head == absent_k) tail = absent_k;
-        return index;
-    }
-
-    /** Unlinks operation @p index, or answers @c ucall_status_not_found_k when it is not queued. */
-    template <typename operations_type_>
-    ucall_status_t remove(operations_type_& operations, unsigned index) noexcept {
-        for (unsigned previous = absent_k, current = head; current != absent_k;
-             previous = current, current = operations[current].next) {
-            if (current != index) continue;
-            if (previous != absent_k) operations[previous].next = operations[current].next;
-            else head = operations[current].next;
-            if (tail == index) tail = previous;
-            return ucall_status_success_k;
-        }
-        return ucall_status_not_found_k;
-    }
-};
+using operation_list_t = st::intrusive_list<unsigned>;
 
 /** The vectors a @c file_read_vectors_k request scatters into, which its @c data points at. */
 inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
@@ -803,11 +774,12 @@ inline bool io_pending(descriptor_t result) noexcept {
 /** Nonblocking POSIX syscalls, completed through poll readiness; files are read blocking, and
  *  zero-copy sends copy, so their releases complete as submitted. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct posix_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_, template <typename> class other_atomic_ref_>
-    using rebind = posix_engine<other_allocator_, other_atomic_ref_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = posix_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
@@ -967,12 +939,14 @@ using posix_engine_t = posix_engine<>;
  *  the kernel offers asynchronous reads, and zero-copy sends copy, so their releases complete as
  *  submitted. */
 template <typename readiness_type_, typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct readiness_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_, template <typename> class other_atomic_ref_>
-    using rebind = readiness_engine<typename readiness_type_::template rebind<other_allocator_, other_atomic_ref_>,
-                                    other_allocator_, other_atomic_ref_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind =
+        readiness_engine<typename readiness_type_::template rebind<other_allocator_, other_atomic_ref_, other_row_kit_>,
+                         other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
@@ -1151,11 +1125,12 @@ struct readiness_engine {
 /** kqueue readiness; FreeBSD reads files through @c aio_read completing as @c EVFILT_AIO events,
  *  while macOS, lacking kernel file AIO for this, reads them blocking and uncached. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct kqueue_readiness {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_, template <typename> class other_atomic_ref_>
-    using rebind = kqueue_readiness<other_allocator_, other_atomic_ref_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = kqueue_readiness<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 #if UCALL_OS_FREEBSD_
@@ -1305,54 +1280,10 @@ enum class zero_copy_stage_t : std::uint8_t { untried_k, enabled_k, copying_k };
 /** Slots in an io_uring registered-buffer table, the kernel's @c IORING_MAX_REG_BUFFERS. */
 inline constexpr unsigned uring_registered_buffers_limit_k = 16384;
 
-/** Finds an engine's zero-copy release operations by the request their sends name, open addressed
- *  and at most half full. */
-template <typename allocator_type_ = st::default_allocator<byte_t>>
-struct release_table {
-    using allocator_t = allocator_type_;
-    using slots_allocator_t = typename std::allocator_traits<allocator_t>::template rebind_alloc<std::uint32_t>;
-    static constexpr std::uint32_t absent_k = operation_list_t::absent_k;
-    st::vector<std::uint32_t, slots_allocator_t> slots;
-    explicit release_table(allocator_t const& allocator = {}) noexcept : slots(slots_allocator_t {allocator}) {}
-    ucall_status_t open(std::size_t capacity) noexcept {
-        if (st::failed(slots.resize(std::bit_ceil(capacity * 2)))) return ucall_status_out_of_memory_k;
-        for (auto& slot : slots) slot = absent_k;
-        return ucall_status_success_k;
-    }
-    std::size_t home(io_request_t const* request) const noexcept {
-        auto const key = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(request));
-        std::uint64_t mixed = (key >> 3) * 0x9E3779B97F4A7C15ull;
-        return static_cast<std::size_t>(mixed ^ mixed >> 32) & (slots.size() - 1);
-    }
-    template <typename operations_type_>
-    std::size_t slot_of(operations_type_ const& operations, io_request_t const* request) const noexcept {
-        std::size_t mask = slots.size() - 1, slot = home(request);
-        while (slots[slot] != absent_k && operations[slots[slot]].request != request) slot = (slot + 1) & mask;
-        return slot;
-    }
-    template <typename operations_type_>
-    unsigned find(operations_type_ const& operations, io_request_t const* request) const noexcept {
-        return slots.empty() ? absent_k : slots[slot_of(operations, request)];
-    }
-    template <typename operations_type_>
-    void insert(operations_type_ const& operations, unsigned index) noexcept {
-        slots[slot_of(operations, operations[index].request)] = index;
-    }
-    template <typename operations_type_>
-    void erase(operations_type_ const& operations, unsigned index) noexcept {
-        std::size_t mask = slots.size() - 1, slot = slot_of(operations, operations[index].request);
-        if (slots[slot] != index) return;
-        for (std::size_t next = (slot + 1) & mask; slots[next] != absent_k; next = (next + 1) & mask) {
-            std::size_t const next_home = home(operations[slots[next]].request);
-            // Linear probing finds an entry only while no vacancy lies between its home and slot.
-            if (((next - next_home) & mask) >= ((next - slot) & mask)) {
-                slots[slot] = slots[next];
-                slot = next;
-            }
-        }
-        slots[slot] = absent_k;
-    }
-};
+/** The key an engine indexes a zero-copy release by, the address of the request its sends name. */
+inline std::uint64_t release_key(io_request_t const* request) noexcept {
+    return static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(request));
+}
 
 /** Resets @p descriptor's connection now while keeping the descriptor, so its error queue stays
  *  readable; the kernel purges what it still meant to send. */
@@ -1396,40 +1327,39 @@ static_assert(sizeof(zero_copy_run_t) == 16);
 /** Registers each descriptor once; a descriptor-addressed index finds its watch,
  *  at most half full. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct epoll_readiness {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_, template <typename> class other_atomic_ref_>
-    using rebind = epoll_readiness<other_allocator_, other_atomic_ref_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = epoll_readiness<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     static constexpr std::uint32_t absent_k = operation_list_t::absent_k;
 
     /** The event data of the one descriptor that is no watch, the AIO completion counter. */
     static constexpr std::uint64_t signal_k = std::numeric_limits<std::uint64_t>::max();
+    using watches_t = st::basic_slot_pool<readiness_watch_t, std::uint32_t, rebound_allocator<byte_t>>;
+    using watch_index_t =
+        st::basic_hash_index<std::int32_t, std::uint32_t, st::default_hash_t, rebound_allocator<byte_t>, row_kit_type_>;
     explicit epoll_readiness(allocator_t const& allocator = {}) noexcept
-        : events(rebound_allocator<epoll_event> {allocator}), watches(rebound_allocator<readiness_watch_t> {allocator}),
-          watch_slots(rebound_allocator<std::uint32_t> {allocator}),
-          free_watches(rebound_allocator<std::uint32_t> {allocator}) {}
+        : events(rebound_allocator<epoll_event> {allocator}) {}
     epoll_readiness(epoll_readiness const&) = delete;
     epoll_readiness& operator=(epoll_readiness const&) = delete;
     epoll_readiness(epoll_readiness&&) = delete;
     epoll_readiness& operator=(epoll_readiness&&) = delete;
     int descriptor {-1};
     st::vector<epoll_event, rebound_allocator<epoll_event>> events {};
-    st::vector<readiness_watch_t, rebound_allocator<readiness_watch_t>> watches {};
-    st::vector<std::uint32_t, rebound_allocator<std::uint32_t>> watch_slots {}, free_watches {};
+    watches_t watches {};
+    watch_index_t watch_index {};
     ucall_status_t open(std::size_t capacity) noexcept {
-        if (st::failed(events.resize(capacity)) || st::failed(watches.resize(capacity)) ||
-            st::failed(watch_slots.resize(std::bit_ceil(capacity * 2))) || st::failed(free_watches.reserve(capacity)))
-            return ucall_status_out_of_memory_k;
-        free_watches.clear();
-        for (std::size_t index = 0; index != capacity; ++index) {
-            watches[index] = {};
-            [[maybe_unused]] st::status_t const freed = free_watches.push_back(st::assume_reserved,
-                                                                               static_cast<std::uint32_t>(index));
-        }
-        for (auto& slot : watch_slots) slot = absent_k;
+        if (st::failed(events.resize(capacity))) return ucall_status_out_of_memory_k;
+        rebound_allocator<byte_t> const allocator {events.get_allocator()};
+        st::expected<watches_t> made_watches = watches_t::make(capacity, allocator);
+        st::expected<watch_index_t> made_index = watch_index_t::make(capacity, {}, allocator);
+        if (!made_watches || !made_index) return ucall_status_out_of_memory_k;
+        watches = std::move(*made_watches);
+        watch_index = std::move(*made_index);
         if (descriptor < 0) descriptor = epoll_create1(EPOLL_CLOEXEC);
         return descriptor < 0 ? ucall_status_io_k : ucall_status_success_k;
     }
@@ -1443,34 +1373,28 @@ struct epoll_readiness {
                                                                             : ucall_status_io_k;
     }
 
-    /** The slot naming the watch of @p watched, or the vacant slot that ends its probe. */
-    std::size_t slot_of(descriptor_t watched) const noexcept {
-        std::size_t mask = watch_slots.size() - 1;
-        std::size_t slot = static_cast<std::size_t>(watched) & mask;
-        while (watch_slots[slot] != absent_k && watches[watch_slots[slot]].descriptor != watched)
-            slot = (slot + 1) & mask;
-        return slot;
-    }
-
     /** The watch of @p watched, or @c absent_k. */
     std::uint32_t find(descriptor_t watched) const noexcept {
-        return watch_slots.empty() ? absent_k : watch_slots[slot_of(watched)];
+        return watch_index.find(static_cast<std::int32_t>(watched));
     }
 
     /** The watch of @p watched, registering it on first use: its index, or a negated errno. */
     std::int64_t watch(descriptor_t watched, io_statistics_t& statistics) noexcept {
-        std::size_t slot = slot_of(watched);
-        if (watch_slots[slot] != absent_k) return watch_slots[slot];
-        if (free_watches.empty()) return -ENOBUFS;
-        std::uint32_t chosen = free_watches.back();
+        if (std::uint32_t const found = find(watched); found != absent_k) return found;
+        std::uint32_t const chosen = watches.take();
+        if (chosen == watches_t::absent_k) return -ENOBUFS;
         epoll_event event {};
         event.events = EPOLLIN | EPOLLOUT | EPOLLRDHUP | EPOLLET;
-        event.data.u64 = std::uint64_t {chosen} << 32 | watches[chosen].generation;
+        event.data.u64 = std::bit_cast<std::uint64_t>(watches.handle_of(chosen));
         tally<atomic_ref_template_>(statistics.kernel_enters);
-        if (epoll_ctl(descriptor, EPOLL_CTL_ADD, static_cast<int>(watched), &event) != 0) return -errno;
-        free_watches.pop_back();
+        if (epoll_ctl(descriptor, EPOLL_CTL_ADD, static_cast<int>(watched), &event) != 0) {
+            int const error = errno;
+            watches.vacate(chosen);
+            return -error;
+        }
         watches[chosen].descriptor = static_cast<std::int32_t>(watched);
-        watch_slots[slot] = chosen;
+        [[maybe_unused]] st::status_t const indexed = watch_index.insert(static_cast<std::int32_t>(watched), chosen,
+                                                                         st::assume_unique);
         return chosen;
     }
 
@@ -1479,30 +1403,19 @@ struct epoll_readiness {
     int arm(descriptor_t watched, io_direction_t direction, unsigned index, io_statistics_t& statistics) noexcept {
         std::int64_t const chosen = watch(watched, statistics);
         if (chosen < 0) return static_cast<int>(chosen);
-        readiness_watch_t& found = watches[static_cast<std::size_t>(chosen)];
+        readiness_watch_t& found = watches[static_cast<std::uint32_t>(chosen)];
         (direction == io_direction_t::receive_k ? found.receive_operation : found.transmit_operation) = index;
         return 0;
     }
 
-    /** Unregisters @p watched and frees its watch, shifting back the probe run behind it. */
+    /** Unregisters @p watched and frees its watch; events still queued for it find nothing. */
     void remove(descriptor_t watched) noexcept {
-        std::size_t slot = slot_of(watched);
-        std::uint32_t chosen = watch_slots[slot];
+        std::uint32_t const chosen = find(watched);
         if (chosen == absent_k) return;
         epoll_ctl(descriptor, EPOLL_CTL_DEL, static_cast<int>(watched), nullptr);
-        watches[chosen] = {-1, watches[chosen].generation + 1};
-        [[maybe_unused]] st::status_t const freed = free_watches.push_back(st::assume_reserved, std::uint32_t {chosen});
-        std::size_t mask = watch_slots.size() - 1;
-        for (std::size_t next = (slot + 1) & mask; watch_slots[next] != absent_k; next = (next + 1) & mask) {
-            std::size_t home = static_cast<std::size_t>(watches[watch_slots[next]].descriptor) & mask;
-            // Linear probing finds an entry only while no vacancy lies
-            // between its home and its slot.
-            if (((next - home) & mask) >= ((next - slot) & mask)) {
-                watch_slots[slot] = watch_slots[next];
-                slot = next;
-            }
-        }
-        watch_slots[slot] = absent_k;
+        [[maybe_unused]] st::status_t const unindexed = watch_index.erase(static_cast<std::int32_t>(watched), chosen);
+        watches[chosen] = {-1, watches[chosen].generation};
+        watches.vacate(chosen);
     }
 
     /** Waits up to @p timeout milliseconds, reporting readiness to @p fired, the error queues of
@@ -1519,20 +1432,18 @@ struct epoll_readiness {
                 signalled();
                 continue;
             }
-            auto const chosen = static_cast<std::uint32_t>(events[i].data.u64 >> 32);
-            if (watches[chosen].generation != static_cast<std::uint32_t>(events[i].data.u64)) continue;
-            if ((flags & EPOLLERR) &&
-                (watches[chosen].oldest_run != absent_k || watches[chosen].stage == watch_stage_t::closing_k))
-                errored(chosen);
+            auto const handle = std::bit_cast<typename watches_t::handle_t>(events[i].data.u64);
+            readiness_watch_t const* watch = watches.at(handle);
+            if (!watch) continue;
+            if ((flags & EPOLLERR) && (watch->oldest_run != absent_k || watch->stage == watch_stage_t::closing_k))
+                errored(handle.index);
             // The error queue may have closed and freed the watch.
-            readiness_watch_t const& watch = watches[chosen];
-            if (watch.generation != static_cast<std::uint32_t>(events[i].data.u64) ||
-                watch.stage == watch_stage_t::closing_k)
-                continue;
-            if ((flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) && watch.receive_operation != absent_k)
-                fired(watch.receive_operation, watch.descriptor, short {POLLIN});
-            if ((flags & (EPOLLOUT | EPOLLHUP | EPOLLERR)) && watch.transmit_operation != absent_k)
-                fired(watch.transmit_operation, watch.descriptor, short {POLLOUT});
+            watch = watches.at(handle);
+            if (!watch || watch->stage == watch_stage_t::closing_k) continue;
+            if ((flags & (EPOLLIN | EPOLLRDHUP | EPOLLHUP | EPOLLERR)) && watch->receive_operation != absent_k)
+                fired(watch->receive_operation, watch->descriptor, short {POLLIN});
+            if ((flags & (EPOLLOUT | EPOLLHUP | EPOLLERR)) && watch->transmit_operation != absent_k)
+                fired(watch->transmit_operation, watch->descriptor, short {POLLOUT});
         }
         return count;
     }
@@ -1631,11 +1542,12 @@ struct linux_aio_t {
  *  - A close with notifications still due keeps the descriptor until they all arrived, resetting
  *    first if the socket was set to reset on close. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct linux_epollaio_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_, template <typename> class other_atomic_ref_>
-    using rebind = linux_epollaio_engine<other_allocator_, other_atomic_ref_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = linux_epollaio_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
@@ -1650,12 +1562,14 @@ struct linux_epollaio_engine {
         io_interest_t interest {io_interest_t::unarmed_k};
     };
     static_assert(sizeof(operation_t) == 32);
+    using release_index_t = st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t,
+                                                 rebound_allocator<byte_t>, row_kit_type_>;
 
     vector<operation_t> operations;
     vector<unsigned> timed;
     vector<zero_copy_run_t> runs;
-    epoll_readiness<allocator_t, atomic_ref_template_> readiness;
-    release_table<allocator_t> releases;
+    epoll_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness;
+    release_index_t releases;
     linux_aio_t files;
     operation_list_t free_operations, fresh_operations, ready_operations, landed_operations, waiting_files;
     unsigned free_runs {absent_k};
@@ -1665,7 +1579,7 @@ struct linux_epollaio_engine {
 
     explicit linux_epollaio_engine(allocator_t const& allocator = {}) noexcept
         : operations(rebound_allocator<operation_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
-          runs(rebound_allocator<zero_copy_run_t> {allocator}), readiness(allocator), releases(allocator) {}
+          runs(rebound_allocator<zero_copy_run_t> {allocator}), readiness(allocator) {}
     linux_epollaio_engine(linux_epollaio_engine const&) = delete;
     linux_epollaio_engine& operator=(linux_epollaio_engine const&) = delete;
     linux_epollaio_engine(linux_epollaio_engine&&) = delete;
@@ -1686,7 +1600,10 @@ struct linux_epollaio_engine {
             return ucall_status_out_of_memory_k;
         stop();
         if (ucall_status_t const opened = readiness.open(capacity); opened != ucall_status_success_k) return opened;
-        if (ucall_status_t const opened = releases.open(capacity); opened != ucall_status_success_k) return opened;
+        st::expected<release_index_t> made = release_index_t::make(
+            capacity, {}, rebound_allocator<byte_t> {operations.get_allocator()});
+        if (!made) return ucall_status_out_of_memory_k;
+        releases = std::move(*made);
         if (ucall_status_t const opened = files.open(); opened != ucall_status_success_k) {
             if (opened == ucall_status_unsupported_k)
                 refusal = "Linux AIO refused a context: raise `fs.aio-max-nr`, as `sysctl -w fs.aio-max-nr=1048576`";
@@ -1697,9 +1614,11 @@ struct linux_epollaio_engine {
 
     ucall_status_t submit(io_request_t& request) noexcept {
         unsigned index = absent_k;
-        // A release some send already named exists since that send; it now leaves the table.
-        if (request.operation == io_operation_t::zero_copy_release_k) index = releases.find(operations, &request);
-        if (index != absent_k) releases.erase(operations, index);
+        // A release some send already named exists since that send; it now leaves the index.
+        if (request.operation == io_operation_t::zero_copy_release_k) index = releases.find(release_key(&request));
+        if (index != absent_k) {
+            [[maybe_unused]] st::status_t const unindexed = releases.erase(release_key(&request), index);
+        }
         else {
             index = free_operations.pop(operations);
             if (index == absent_k) return ucall_status_contended_k;
@@ -1732,7 +1651,7 @@ struct linux_epollaio_engine {
             operation.stage = operation_stage_t::cancelled_k;
             if (operation.interest == io_interest_t::armed_k) wake(i);
             else if (operation.interest == io_interest_t::landing_k &&
-                     waiting_files.remove(operations, i) == ucall_status_success_k) {
+                     waiting_files.erase(operations, i) == st::success_k) {
                 operation.interest = io_interest_t::unarmed_k;
                 fresh_operations.push(operations, i);
             }
@@ -1795,7 +1714,7 @@ struct linux_epollaio_engine {
         tally<atomic_ref_template_>(statistics.kernel_enters);
         std::int64_t const chosen = readiness.watch(request.descriptor, statistics);
         if (chosen < 0) return send_copying(request);
-        readiness_watch_t& watch = readiness.watches[static_cast<std::size_t>(chosen)];
+        readiness_watch_t& watch = readiness.watches[static_cast<std::uint32_t>(chosen)];
         if (watch.zero_copy == zero_copy_stage_t::untried_k) {
             int enabled = 1;
             watch.zero_copy = socket_option(request.descriptor, SOL_SOCKET, SO_ZEROCOPY, &enabled, sizeof(enabled)) == 0
@@ -1803,13 +1722,13 @@ struct linux_epollaio_engine {
                                   : zero_copy_stage_t::copying_k;
         }
         if (watch.zero_copy == zero_copy_stage_t::copying_k) return send_copying(request);
-        unsigned release = releases.find(operations, request.release_request);
+        unsigned release = releases.find(release_key(request.release_request));
         zero_copy_run_t* extended = watch.newest_run != absent_k ? &runs[watch.newest_run] : nullptr;
         if (extended && (extended->release_operation != release || release == absent_k ||
                          extended->sends == std::numeric_limits<std::uint16_t>::max() ||
                          extended->first_id + extended->sends != watch.next_zero_copy_id))
             extended = nullptr;
-        if ((release == absent_k && free_operations.head == absent_k) || (!extended && free_runs == absent_k))
+        if ((release == absent_k && free_operations.empty()) || (!extended && free_runs == absent_k))
             return send_copying(request);
         auto const length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length,
@@ -1824,7 +1743,8 @@ struct linux_epollaio_engine {
             release = free_operations.pop(operations);
             operations[release] = {};
             operations[release].request = request.release_request;
-            releases.insert(operations, release);
+            [[maybe_unused]] st::status_t const indexed = releases.insert(release_key(request.release_request), release,
+                                                                          st::assume_unique);
         }
         ++operations[release].pending_notifications;
         if (extended) ++extended->sends;
@@ -2048,13 +1968,13 @@ struct linux_epollaio_engine {
      *  from and waits for its notifications, so no buffer stays in the kernel's hands. */
     void stop() noexcept {
         files.close();
-        for (auto const& watch : readiness.watches)
+        for (auto const& watch : readiness.watches.records())
             if (watch.oldest_run != absent_k) {
                 [[maybe_unused]] ucall_status_t const reset = socket_disconnect_with_reset(watch.descriptor);
             }
         for (;;) {
             std::uint32_t due = absent_k;
-            for (std::uint32_t i = 0; i != readiness.watches.size() && due == absent_k; ++i)
+            for (std::uint32_t i = 0; i != readiness.watches.capacity() && due == absent_k; ++i)
                 if (readiness.watches[i].oldest_run != absent_k) due = i;
             if (due == absent_k) break;
             drain_error_queue(due);
@@ -2062,7 +1982,7 @@ struct linux_epollaio_engine {
             pollfd polled {readiness.watches[due].descriptor, 0, 0};
             ::poll(&polled, 1, -1);
         }
-        for (auto& watch : readiness.watches)
+        for (auto& watch : readiness.watches.records())
             if (watch.stage == watch_stage_t::closing_k) {
                 int const descriptor = watch.descriptor;
                 readiness.remove(descriptor);
@@ -2082,7 +2002,7 @@ struct linux_epollaio_engine {
             runs[i].next = free_runs;
             free_runs = i;
         }
-        for (auto& slot : releases.slots) slot = release_table<allocator_t>::absent_k;
+        releases.clear();
     }
 };
 using linux_epollaio_engine_t = linux_epollaio_engine<>;
@@ -2097,11 +2017,12 @@ using linux_epollaio_engine_t = linux_epollaio_engine<>;
  *  opens beneath its directory at once, vectored reads answer @c -ENOSYS, and zero-copy sends copy,
  *  so their releases complete as submitted. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
-          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref>
+          template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
+          typename row_kit_type_ = st::serial_row_kit_t>
 struct windows_iocp_engine {
     using allocator_t = allocator_type_;
-    template <typename other_allocator_, template <typename> class other_atomic_ref_>
-    using rebind = windows_iocp_engine<other_allocator_, other_atomic_ref_>;
+    template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
+    using rebind = windows_iocp_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     enum class operation_stage_t { pending_k, immediate_k, cancelling_k, timing_out_k };

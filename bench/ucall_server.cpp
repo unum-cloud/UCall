@@ -60,7 +60,7 @@ static void sum(ucall_received_http_request_t request, void* context) {
  *  again by the time the cursor returns to it. */
 struct deferred_outcomes_t {
     std::vector<ucall_outcome_t> slots;
-    alignas(uc::false_sharing_bytes_k) std::size_t cursor {};
+    alignas(uc::fu::default_alignment_k) std::size_t cursor {};
     ucall_outcome_t& claim() noexcept {
         for (;;) {
             std::size_t const index = uc::fu::preferred_atomic_ref<std::size_t> {cursor}.fetch_add(1) % slots.size();

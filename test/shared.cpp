@@ -19,8 +19,7 @@ using namespace unum::ucall::test;
 case_result_t test_pool_unit() {
     std::size_t failures = 0;
     announce("allocation_hands_out_distinct_slots");
-    pool<int> slots;
-    require(failures, slots.reserve(5) == ucall_status_success_k);
+    successive_pools<int> slots(5);
 
     int* const first = slots.alloc();
     int* const second = slots.alloc();
@@ -31,28 +30,26 @@ case_result_t test_pool_unit() {
     announce("a_released_slot_is_handed_out_again");
     *first = 42;
     slots.release(first);
-    int* const reused = slots.alloc();
-    failures += expect(reused != nullptr);
+    failures += expect(slots.alloc() == first);
 
     return failures;
 }
 
 case_result_t test_containers_safety() {
     std::size_t failures = 0;
-    announce("a_pool_refuses_rather_than_overruns");
-    pool<int> slots;
-    require(failures, slots.reserve(5) == ucall_status_success_k);
+    announce("a_full_pool_grows_without_moving_taken_slots");
+    successive_pools<int> slots(5);
     int* taken[5];
     for (std::size_t index = 0; index != 5; ++index) {
         taken[index] = slots.alloc();
         require(failures, taken[index] != nullptr);
+        *taken[index] = static_cast<int>(index);
     }
-    // The sixth request must say so rather than hand back a slot already in use.
-    failures += expect(slots.alloc() == nullptr);
-
-    slots.release(taken[2]);
-    failures += expect(slots.alloc() != nullptr);
-    failures += expect(slots.alloc() == nullptr);
+    // The sixth request must come from a new pool rather than hand back a slot already in use.
+    int* const grown = slots.alloc();
+    require(failures, grown != nullptr);
+    for (std::size_t index = 0; index != 5; ++index)
+        failures += expect(grown != taken[index] && *taken[index] == static_cast<int>(index));
     return failures;
 }
 

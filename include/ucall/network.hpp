@@ -13,6 +13,9 @@
 #include <chrono>   // `std::chrono::year_month_day`, `std::chrono::hh_mm_ss`, `std::chrono::weekday`
 #include <optional> // `std::optional`
 
+#include <smashtable/atomic_intrusive_stack.hpp>
+#include <smashtable/basic_ring.hpp>
+
 #include "ucall/http.hpp"
 #include "ucall/io.hpp"
 #include "ucall/routes.hpp"
@@ -27,14 +30,14 @@ namespace unum::ucall {
 
 template <typename engine_type_, template <typename> class atomic_ref_template_, typename waiter_type_,
           typename compare_kit_type_, typename find_kit_type_, typename byteset_kit_type_, typename hash_kit_type_,
-          typename fold_kit_type_, typename sha256_kit_type_, typename aes256_gcm_kit_type_,
+          typename fold_kit_type_, typename sha256_kit_type_, typename aes256_gcm_kit_type_, typename row_kit_type_,
           typename allocator_type_ = st::default_allocator<byte_t>>
 struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_type_, hash_kit_type_, fold_kit_type_> {
     using http_t = http<compare_kit_type_, find_kit_type_, byteset_kit_type_, hash_kit_type_, fold_kit_type_>;
     using tunnel_t = secure_tunnel<sha256_kit_type_, aes256_gcm_kit_type_>;
     using crypto_t = secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_>;
     using allocator_t = allocator_type_;
-    using engine_t = typename engine_type_::template rebind<allocator_t, atomic_ref_template_>;
+    using engine_t = typename engine_type_::template rebind<allocator_t, atomic_ref_template_, row_kit_type_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
@@ -247,7 +250,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     struct server_exchange_t;
 
     /** The event loop's own counters beside its engine's, on lines no other thread writes. */
-    struct alignas(false_sharing_bytes_k) event_loop_statistics_t {
+    struct alignas(fu::default_alignment_k) event_loop_statistics_t {
         std::uint64_t polls {}, empty_polls {}, accepts {}, requests {}, bytes_received {}, bytes_sent {},
             bytes_copied {}, bytes_read {}, file_window_overlaps {}, linger_resets {}, ready_passes {},
             replied_dequeues {};
@@ -613,10 +616,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         vector<server_exchange_t*> slots {}; // A power of two above the request budget plus one per event loop.
 
         /** Event loops @c fetch_add it. */
-        alignas(false_sharing_bytes_k) std::uint64_t tail {};
+        alignas(fu::default_alignment_k) std::uint64_t tail {};
 
         /** Written by the drain only. */
-        alignas(false_sharing_bytes_k) std::uint64_t head {};
+        alignas(fu::default_alignment_k) std::uint64_t head {};
         drain_state_t drain {};
         wake_channel_t wake {};
         ucall_received_http_batch_callback_t callback {};
@@ -683,7 +686,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         server_exchange_t(server_exchange_t&&) = delete;
         server_exchange_t& operator=(server_exchange_t&&) = delete;
         ~server_exchange_t() noexcept {
-            for (reply_segment_t* segment : {free_segments, shared.returned_segments, queued_segments(),
+            for (reply_segment_t* segment : {free_segments, shared.returned_segments.take_all(), queued_segments(),
                                              releases[0].sent_segments, releases[1].sent_segments})
                 while (segment) {
                     reply_segment_t* next = segment->next;
@@ -692,7 +695,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                     segment = next;
                 }
             for (file_segment_t* file_segment :
-                 {free_file_segments, shared.returned_file_segments, queued_file_segments(),
+                 {free_file_segments, shared.returned_file_segments.take_all(), queued_file_segments(),
                   releases[0].sent_file_segments, releases[1].sent_file_segments})
                 while (file_segment) {
                     file_segment_t* next = file_segment->next;
@@ -819,7 +822,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
         /** Words a replier or puller writes while the loop reads the cursors above, on lines of
          *  their own: the reply's state bits, its hold on the socket, and the stacks both link. */
-        struct alignas(false_sharing_bytes_k) shared_t {
+        struct alignas(fu::default_alignment_k) shared_t {
             std::uint32_t state {};
 
             /** Raised by a pull from any thread, lowered by the loop. */
@@ -835,18 +838,18 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             reply_segment_t* pushed_segments {};
 
             /** Released chunks the loop pushes back; taken whole by the replier. */
-            reply_segment_t* returned_segments {};
+            st::atomic_intrusive_stack<reply_segment_t, atomic_ref_template_> returned_segments {};
 
             /** The reply's first file segment, linked once. */
             file_segment_t* pushed_file_segments {};
 
             /** Released ones the loop pushes back for the replier. */
-            file_segment_t* returned_file_segments {};
+            st::atomic_intrusive_stack<file_segment_t, atomic_ref_template_> returned_file_segments {};
 
             /** Queues it for its event loop while listed. */
             replied_link_t replied_link {};
         } shared;
-        static_assert(sizeof(shared_t) == false_sharing_bytes_k);
+        static_assert(sizeof(shared_t) == fu::default_alignment_k);
     };
     struct network_interface_t {
         explicit network_interface_t(allocator_t const& allocator = {}) noexcept
@@ -883,7 +886,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         }
 
         /** Admitted connections across every loop, apart from the words each request reads. */
-        alignas(false_sharing_bytes_k) std::size_t active {};
+        alignas(fu::default_alignment_k) std::size_t active {};
     };
     using wake_t = wake_channel_t;
     struct interface_acceptor_t {
@@ -1004,8 +1007,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
          *  and the loop alone walks from the head, which starts at the stub. */
         replied_link_t replied_stub {};
         replied_link_t* replied_head {&replied_stub};
-        alignas(false_sharing_bytes_k) replied_link_t* replied_tail {&replied_stub};
-        alignas(false_sharing_bytes_k) wake_state_t wake_state {wake_state_t::awake_k};
+        alignas(fu::default_alignment_k) replied_link_t* replied_tail {&replied_stub};
+        alignas(fu::default_alignment_k) wake_state_t wake_state {wake_state_t::awake_k};
         event_loop_statistics_t statistics {};
         std::uint32_t index {};
         vector<interface_statistics_t> interface_statistics {}; // One per interface, by its index.
@@ -1080,8 +1083,9 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         endpoint_t* endpoints {};
         vector<batch_endpoint_t*> batch_endpoints; // Every drain that `server_stop` must wake.
         std::size_t requests_budget {};
-        alignas(
-            false_sharing_bytes_k) std::uint32_t serving {}; // Read by registrations, apart from what dispatch reads.
+
+        /** Read by registrations, apart from what dispatch reads. */
+        alignas(fu::default_alignment_k) std::uint32_t serving {};
 
         /** The metric prefix then every tag, back to back, as the resolved configuration views. */
         vector<char> metrics_text {};
@@ -1106,7 +1110,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             }
         }
     };
-    using response_t = received_response<allocator_t>;
 
     static secure_tunnel_mode_t tunnel_mode(ucall_security_mode_t mode) noexcept {
         return static_cast<secure_tunnel_mode_t>(mode);
@@ -1556,8 +1559,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
      *  one it allocates. */
     static file_segment_t* take_file_segment(server_exchange_t& exchange) noexcept {
         if (!exchange.free_file_segments)
-            exchange.free_file_segments = atomic_ref<file_segment_t*> {exchange.shared.returned_file_segments}.exchange(
-                nullptr, std::memory_order_acquire);
+            exchange.free_file_segments = exchange.shared.returned_file_segments.take_all();
         if (file_segment_t* file_segment = exchange.free_file_segments) {
             exchange.free_file_segments = file_segment->next;
             return file_segment;
@@ -1793,9 +1795,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     /** A free chunk segment for @p exchange's replier: its own, then those the loop released, else
      *  one it allocates. */
     static reply_segment_t* take_segment(server_exchange_t& exchange) noexcept {
-        if (!exchange.free_segments)
-            exchange.free_segments = atomic_ref<reply_segment_t*> {exchange.shared.returned_segments}.exchange(
-                nullptr, std::memory_order_acquire);
+        if (!exchange.free_segments) exchange.free_segments = exchange.shared.returned_segments.take_all();
         if (reply_segment_t* segment = exchange.free_segments) {
             exchange.free_segments = segment->next;
             return segment;
@@ -1977,17 +1977,6 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         return true;
     }
 
-    /** Pushes the chain from @p newest down to @p oldest onto the stack at @p head, which a
-     *  replier takes whole. */
-    template <typename record_type_>
-    static void push_returned(record_type_*& head, record_type_& newest, record_type_& oldest) noexcept {
-        auto stack = atomic_ref<record_type_*> {head};
-        auto* next = stack.load(std::memory_order_relaxed);
-        do {
-            oldest.next = next;
-        } while (!stack.compare_exchange_weak(next, &newest, std::memory_order_release, std::memory_order_relaxed));
-    }
-
     /** Hands a sent or abandoned chunk back to its replier, or keeps it while sends of the exchange
      *  named a release the kernel has not completed. */
     static void retire_segment(server_exchange_t& exchange, reply_segment_t& segment) noexcept {
@@ -2008,7 +1997,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             segment.next = release.sent_segments;
             release.sent_segments = &segment;
         }
-        else push_returned(exchange.shared.returned_segments, segment, segment);
+        else exchange.shared.returned_segments.push(segment);
     }
 
     /** The file segment whose own segment leads @p exchange's queue, or null when a memory segment
@@ -2043,7 +2032,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             return;
         }
         file_segment.segment.bytes.clear();
-        push_returned(exchange.shared.returned_file_segments, file_segment, file_segment);
+        exchange.shared.returned_file_segments.push(file_segment);
     }
 
     /** Retires the front of @p exchange's queue, a file or memory segment, sent or not. */
@@ -2086,7 +2075,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         if (reply_segment_t* newest = std::exchange(release.sent_segments, nullptr)) {
             reply_segment_t* oldest = newest;
             while (oldest->next) oldest = oldest->next;
-            push_returned(exchange.shared.returned_segments, *newest, *oldest);
+            exchange.shared.returned_segments.push_chain(*newest, *oldest);
         }
         if (file_segment_t* newest = std::exchange(release.sent_file_segments, nullptr)) {
             file_segment_t* oldest = newest;
@@ -2094,7 +2083,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 oldest->segment.bytes.clear();
                 if (!oldest->next) break;
             }
-            push_returned(exchange.shared.returned_file_segments, *newest, *oldest);
+            exchange.shared.returned_file_segments.push_chain(*newest, *oldest);
         }
         release.state = release_state_t::idle_k;
         release.held_bytes = 0;
@@ -4719,6 +4708,49 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                                                 arguments->outcome);
         if (status != ucall_status_deferred_k) publish(arguments->outcome, status);
     }
+    struct response_pool_t;
+
+    /** A received response, homed in its client's pool, which a free returns it to. */
+    struct response_t : received_response_t {
+        explicit response_t(response_pool_t& home) noexcept
+            : storage(rebound_allocator<byte_t> {home.allocator}), pool(&home) {
+            destroy = &release;
+        }
+        vector<byte_t> storage;
+        response_t* next {};
+        response_pool_t* pool {};
+
+        static void release(received_response_t* response) noexcept {
+            auto* owned = static_cast<response_t*>(response);
+            response_pool_t& home = *owned->pool;
+            // Home first, so the count never names a response nobody holds.
+            home.returned.push(*owned);
+            if (atomic_ref<std::size_t> {home.outside}.fetch_sub(1, std::memory_order_acq_rel) == 1) delete_pool(home);
+        }
+    };
+
+    /** The home of a client's responses, outliving the client so a response freed late still has
+     *  one; @c outside counts responses in callers' hands plus the client's own reference. */
+    struct response_pool_t {
+        explicit response_pool_t(allocator_t const& allocator) noexcept : allocator(allocator) {}
+
+        st::atomic_intrusive_stack<response_t, atomic_ref_template_> returned {};
+        std::size_t outside {1};
+        allocator_t allocator;
+    };
+
+    /** Frees the responses linked from @p newest through @c next. */
+    static void delete_responses(allocator_t const& allocator, response_t* newest) noexcept {
+        while (newest) allocator_delete<response_t, allocator_t> {allocator}(std::exchange(newest, newest->next));
+    }
+
+    /** Frees every response returned to @p pool, then the pool, once nothing counts on it. */
+    static void delete_pool(response_pool_t& pool) noexcept {
+        allocator_t const allocator = pool.allocator;
+        delete_responses(allocator, pool.returned.take_all());
+        allocator_delete<response_pool_t, allocator_t> {allocator}(&pool);
+    }
+
     struct client_exchange_t {
         explicit client_exchange_t(allocator_t const& allocator = {}) noexcept
             : authority(rebound_allocator<char> {allocator}), target(rebound_allocator<char> {allocator}),
@@ -4801,13 +4833,15 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         /** Its origin's peers a queued call steps. */
         client_peer_t *previous_accepting {}, *next_accepting {};
     };
+    using completed_ring_t = st::basic_ring<ucall_completed_call_t, rebound_allocator<ucall_completed_call_t>>;
+    using origin_index_t = st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t,
+                                                rebound_allocator<byte_t>, row_kit_type_>;
     struct client_t : ucall_client_handle_t {
         allocator_t allocator;
         explicit client_t(allocator_t const& allocator = {}) noexcept
             : allocator(allocator), engine(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
               completed(rebound_allocator<ucall_completed_call_t> {allocator}),
-              peers(rebound_allocator<owner<client_peer_t>> {allocator}),
-              origin_slots(rebound_allocator<std::uint32_t> {allocator}) {}
+              peers(rebound_allocator<owner<client_peer_t>> {allocator}) {}
         client_t(client_t const&) = delete;
         client_t& operator=(client_t const&) = delete;
         client_t(client_t&&) = delete;
@@ -4815,7 +4849,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
         engine_t engine {};
         vector<io_completion_t> completions {};
-        vector<ucall_completed_call_t> completed {};
+        completed_ring_t completed {};
         ucall_status_t failure {ucall_status_success_k};
         ucall_client_config_t config {};
         ucall_noise_key_t private_key {};
@@ -4838,9 +4872,13 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         std::uint64_t earliest_peer_deadline {};
         client_origin_t *live {}, *free_origins {};
 
-        /** Live origins by @c authority_hash, probed linearly. */
-        vector<std::uint32_t> origin_slots {};
-        std::size_t admitted {}, completed_head {}, completed_count {};
+        /** Live origins by @c authority_hash, confirmed against the origin itself. */
+        origin_index_t origin_index {};
+        std::size_t admitted {};
+
+        /** Where freed responses return, and those taken back from it for the next answers. */
+        response_pool_t* responses {};
+        response_t* free_responses {};
         ~client_t() noexcept {
             engine.stop();
             crypto_t::secure_zero(private_key);
@@ -4853,8 +4891,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                           connection.receive_request.descriptor < 0))
                         engine.close_socket(connection.descriptor);
                 }
-            for (std::size_t i = 0; i != completed_count; ++i)
-                ucall_client_response_free(completed[(completed_head + i) % completed.size()].response);
+            for (std::size_t i = 0; i != completed.size(); ++i) ucall_client_response_free(completed[i].response);
+            delete_responses(allocator, free_responses);
+            if (responses && atomic_ref<std::size_t> {responses->outside}.fetch_sub(1, std::memory_order_acq_rel) == 1)
+                delete_pool(*responses);
             peers.clear();
             for (auto& exchange : exchanges) std::destroy_at(&exchange);
             if (!exchanges.empty())
@@ -5006,11 +5046,12 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
     }
     static void finish_exchange(client_t& client, client_exchange_t& exchange, ucall_status_t status,
                                 response_t* response = nullptr) noexcept {
-        auto& completed = client.completed[(client.completed_head + client.completed_count) % client.completed.size()];
-        completed.context = exchange.arguments.context;
-        completed.response = response;
-        completed.outcome = {status, status == ucall_status_success_k ? nullptr : ucall_status_name(status)};
-        ++client.completed_count;
+        // Every completed call was admitted, and admission stops at the ring's capacity.
+        [[maybe_unused]] st::status_t const pushed = client.completed.push(
+            st::assume_reserved,
+            ucall_completed_call_t {exchange.arguments.context,
+                                    {status, status == ucall_status_success_k ? nullptr : ucall_status_name(status)},
+                                    response});
         exchange.addresses.reset();
         exchange.address = nullptr;
         exchange.redirect.clear();
@@ -5022,19 +5063,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
 
     /** Frees @p origin once no call waits on it and no peer serves it. */
     static void retire_origin(client_t& client, client_origin_t& origin) noexcept {
-        std::size_t const mask = client.origin_slots.size() - 1;
         std::uint32_t const index = static_cast<std::uint32_t>(&origin - client.origins.data());
-        std::size_t slot = origin.authority_hash & mask;
-        while (client.origin_slots[slot] != index) slot = (slot + 1) & mask;
-        for (std::size_t next = (slot + 1) & mask; client.origin_slots[next] != absent_k; next = (next + 1) & mask) {
-            std::size_t const next_home = client.origins[client.origin_slots[next]].authority_hash & mask;
-            // Linear probing finds an entry only while no vacancy lies between its home and slot.
-            if (((next - next_home) & mask) >= ((next - slot) & mask)) {
-                client.origin_slots[slot] = client.origin_slots[next];
-                slot = next;
-            }
-        }
-        client.origin_slots[slot] = absent_k;
+        [[maybe_unused]] st::status_t const erased = client.origin_index.erase(origin.authority_hash, index);
         (origin.previous ? origin.previous->next : client.live) = origin.next;
         if (origin.next) origin.next->previous = origin.previous;
         crypto_t::secure_zero(origin.private_key);
@@ -5052,20 +5082,15 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                         sizeof(private_key));
             if (options.server_key) std::memcpy(remote_key, *options.server_key, sizeof(remote_key));
         }
-        std::size_t const mask = client.origin_slots.size() - 1;
-        std::size_t slot = exchange.authority_hash & mask;
-        client_origin_t* found = nullptr;
-        for (; client.origin_slots[slot] != absent_k; slot = (slot + 1) & mask) {
-            client_origin_t& origin = client.origins[client.origin_slots[slot]];
-            if (origin.authority_hash == exchange.authority_hash && origin.security == options.security &&
-                origin.authority.size() == exchange.authority.size() &&
-                equal(text_view(origin.authority), text_view(exchange.authority)) &&
-                std::memcmp(origin.private_key, private_key, sizeof(private_key)) == 0 &&
-                std::memcmp(origin.remote_key, remote_key, sizeof(remote_key)) == 0) {
-                found = &origin;
-                break;
-            }
-        }
+        std::uint32_t const found_index = client.origin_index.find(
+            exchange.authority_hash, [&](std::uint32_t index) noexcept {
+                client_origin_t const& origin = client.origins[index];
+                return origin.security == options.security && origin.authority.size() == exchange.authority.size() &&
+                       equal(text_view(origin.authority), text_view(exchange.authority)) &&
+                       std::memcmp(origin.private_key, private_key, sizeof(private_key)) == 0 &&
+                       std::memcmp(origin.remote_key, remote_key, sizeof(remote_key)) == 0;
+            });
+        client_origin_t* found = found_index == origin_index_t::absent_k ? nullptr : &client.origins[found_index];
         client_origin_t* origin = found ? found : client.free_origins;
         if (!found && copy_text(origin->authority, {exchange.authority.data(), exchange.authority.size() - 1}) ==
                           ucall_status_success_k) {
@@ -5076,7 +5101,8 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             std::memcpy(origin->remote_key, remote_key, sizeof(remote_key));
             origin->next = std::exchange(client.live, origin);
             if (origin->next) origin->next->previous = origin;
-            client.origin_slots[slot] = static_cast<std::uint32_t>(origin - client.origins.data());
+            [[maybe_unused]] st::status_t const indexed = client.origin_index.insert(
+                exchange.authority_hash, static_cast<std::uint32_t>(origin - client.origins.data()), st::assume_unique);
             found = origin;
         }
         crypto_t::secure_zero(private_key);
@@ -5374,6 +5400,19 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         credit_room(client, peer);
     }
 
+    /** A response for the next answer: one freed back to the pool, else a new one homed there. */
+    static response_t* take_response(client_t& client) noexcept {
+        if (!client.free_responses) client.free_responses = client.responses->returned.take_all();
+        response_t* response = client.free_responses;
+        if (response) {
+            client.free_responses = response->next;
+            response->storage.clear();
+        }
+        else response = allocate_unique<response_t>(client.allocator, *client.responses).release();
+        if (response) atomic_ref<std::size_t> {client.responses->outside}.add(1, std::memory_order_relaxed);
+        return response;
+    }
+
     /** Answers @p peer's oldest call with the whole response at @p offset of @c input:
      *  a redirect queues the call again as a fresh one, and any other response completes it. */
     static void answer_call(client_t& client, client_peer_t& peer, std::size_t offset) noexcept {
@@ -5386,11 +5425,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             status = redirect_exchange(exchange, message, connection.text().substr(offset));
         response_t* response = nullptr;
         if (status == ucall_status_not_found_k) {
-            response = allocate_unique<response_t>(client.allocator, client.allocator).release();
+            response = take_response(client);
             if (!response) return connection.fail(ucall_status_out_of_memory_k);
             if (!offset && message.wire_length == connection.input.size()) {
-                response->storage = std::move(connection.input);
-                connection.input.clear();
+                std::swap(response->storage, connection.input);
             }
             else if (ucall_status_t const appended = append_text(
                          response->storage, {text_view(connection.input).substr(offset, message.wire_length)});
@@ -5663,6 +5701,11 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
+        client->responses = allocate_unique<response_pool_t>(allocator, allocator).release();
+        if (!client->responses) {
+            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            return;
+        }
         client->config = *arguments->config;
         auto& config = client->config;
         if (!config.connect_timeout_microseconds) config.connect_timeout_microseconds = 5'000'000;
@@ -5690,12 +5733,14 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
             std::memcpy(client->private_key, *config.noise_private_key, sizeof(client->private_key));
             config.noise_private_key = &client->private_key;
         }
-        if (st::failed(client->completed.resize(config.max_concurrent_calls)) ||
-            st::failed(client->completions.resize(slots)) ||
+        st::expected<completed_ring_t> completed = completed_ring_t::make(
+            std::bit_ceil(config.max_concurrent_calls), rebound_allocator<ucall_completed_call_t> {allocator});
+        if (!completed || st::failed(client->completions.resize(slots)) ||
             st::failed(client->peers.resize(config.max_concurrent_connections))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
+        client->completed = std::move(*completed);
         rebound_allocator<client_exchange_t> exchange_allocator {allocator};
         auto* exchanges = exchange_allocator.allocate(config.max_concurrent_calls);
         if (!exchanges) {
@@ -5714,11 +5759,13 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
         for (std::size_t i = origins_count; i != 0; --i)
             std::construct_at(origins + i - 1, allocator)->next = std::exchange(client->free_origins, origins + i - 1);
         client->origins = {origins, origins_count};
-        if (st::failed(client->origin_slots.resize(std::bit_ceil(origins_count * 2)))) {
+        st::expected<origin_index_t> origin_index = origin_index_t::make(origins_count, {},
+                                                                         rebound_allocator<byte_t> {allocator});
+        if (!origin_index) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
-        for (std::uint32_t& slot : client->origin_slots) slot = absent_k;
+        client->origin_index = std::move(*origin_index);
         auto status = client->engine.open(slots, slots);
         if (status != ucall_status_success_k) {
             publish(arguments->outcome, status);
@@ -5809,7 +5856,7 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                 auto round_deadline = deadline && next_deadline ? std::min(next_deadline, deadline)
                                       : deadline                ? deadline
                                                                 : next_deadline;
-                auto wait = arguments->timeout_microseconds && client.admitted && !client.completed_count
+                auto wait = arguments->timeout_microseconds && client.admitted && client.completed.empty()
                                 ? io_wait_t::blocking_k
                                 : io_wait_t::nonblocking_k;
                 int count = client.engine.poll(span<io_completion_t> {client.completions}, wait, round_deadline);
@@ -5836,15 +5883,10 @@ struct network_variant : http<compare_kit_type_, find_kit_type_, byteset_kit_typ
                     mark_ready(client, peer);
                 }
                 next_deadline = client_progress(client);
-            } while (!client.completed_count && client.admitted && arguments->timeout_microseconds &&
+            } while (client.completed.empty() && client.admitted && arguments->timeout_microseconds &&
                      monotonic_ns() < deadline);
         }
-        auto count = std::min(arguments->capacity, client.completed_count);
-        for (std::size_t i = 0; i != count; ++i) {
-            arguments->calls[i] = client.completed[client.completed_head];
-            client.completed_head = (client.completed_head + 1) % client.completed.size();
-        }
-        client.completed_count -= count;
+        std::size_t const count = client.completed.pop_many({arguments->calls, arguments->capacity});
         client.admitted -= count;
         *arguments->count = count;
         publish(arguments->outcome, count ? ucall_status_success_k : client.failure);
@@ -5885,6 +5927,6 @@ template <typename engine_type_, typename allocator_type_ = st::default_allocato
 using serial_network =
     network_variant<engine_type_, fu::standard_atomic_ref, fu::standard_yield_t, serial_compare_kit_t,
                     serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t, serial_sha256_kit_t,
-                    serial_aes256_gcm_kit_t, allocator_type_>;
+                    serial_aes256_gcm_kit_t, st::serial_row_kit_t, allocator_type_>;
 
 } // namespace unum::ucall

@@ -3523,6 +3523,97 @@ static case_result_t test_warm_file_reply_allocates_nothing() {
 #endif
 }
 
+#if UCALL_WITH_POSIX
+
+/** A plain POSIX client drawing every allocation from @p counts, or null when it fails to start. */
+static ucall_client_t counted_client(allocation_counts_t& counts) {
+    ucall_client_t client {};
+    ucall_outcome_t outcome {};
+    ucall_client_config_t config {};
+    config.max_concurrent_connections = 1;
+    config.backend = ucall_io_backend_posix_k;
+    ucall_client_init_t init {&client, &outcome, &config, nullptr};
+    counted_network_t::client_init(&init, counting_allocator<uc::byte_t> {counts});
+    return outcome.status == ucall_status_success_k ? client : nullptr;
+}
+
+/** Calls @p url on @p client and waits up to five seconds for the call to complete. */
+static ucall_completed_call_t counted_call(ucall_client_t client, std::string const& url) {
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(url);
+    call.verb = ucall_verb_get_k;
+    ucall_client_call(&call);
+    ucall_completed_call_t completed {};
+    completed.outcome.status = outcome.status;
+    if (outcome.status != ucall_status_success_k) return completed;
+    std::size_t count {};
+    ucall_client_take_completed_t take {client, &outcome, &completed, 1, &count, 5'000'000};
+    ucall_client_take_completed(&take);
+    if (!count) completed.outcome.status = ucall_status_timeout_k;
+    return completed;
+}
+#endif
+
+/** A response freed after its client returns, with the client's pool, every byte the client
+ *  allocated. */
+static case_result_t test_client_responses_outlive_free_unit() {
+#if UCALL_WITH_POSIX
+    fixture_t fixture {{.backend = ucall_io_backend_posix_k}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    allocation_counts_t counts;
+    ucall_client_t client = counted_client(counts);
+    require(failures + fixture.stop(), client, "the counted client failed to start");
+    auto const url = fmt::format("{}/echo/1", fixture.url);
+    ucall_completed_call_t const freed = counted_call(client, url);
+    ucall_completed_call_t const late = counted_call(client, url);
+    failures += expect(freed.response && late.response, "{} then {}", ucall_status_name(freed.outcome.status),
+                       ucall_status_name(late.outcome.status));
+    if (freed.response) failures += check_response(freed.response, {});
+    ucall_client_free(client);
+    failures += expect(counts.live() != 0, "the late response lost its pool with the client");
+    if (late.response) failures += check_response(late.response, {});
+    failures += expect(!counts.live() && !counts.bytes, "{} allocations of {} bytes outlived the last response",
+                       counts.live(), counts.bytes);
+    return failures + fixture.stop();
+#else
+    return case_result_t::skipped("the POSIX backend is not compiled");
+#endif
+}
+
+/** Once 64 responses warmed the client, 1,000 more allocate nothing: each takes a freed response
+ *  back and swaps its capacity with the connection's input. */
+static case_result_t test_warm_client_allocates_nothing() {
+#if UCALL_WITH_POSIX
+    fixture_t fixture {{.backend = ucall_io_backend_posix_k}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    allocation_counts_t counts;
+    ucall_client_t client = counted_client(counts);
+    require(failures + fixture.stop(), client, "the counted client failed to start");
+    auto const url = fmt::format("{}/echo/1", fixture.url);
+    std::size_t warm_allocations = 0;
+    for (std::size_t call = 0; call != 64 + 1000 && !failures; ++call) {
+        if (call == 64) warm_allocations = counts.allocations;
+        ucall_completed_call_t const completed = counted_call(client, url);
+        failures += expect(completed.response, "call {}: {}", call, ucall_status_name(completed.outcome.status));
+        if (completed.response) failures += check_response(completed.response, {});
+    }
+    failures += expect(counts.allocations == warm_allocations, "1,000 warm calls allocated {} times",
+                       counts.allocations - warm_allocations);
+    ucall_client_free(client);
+    failures += expect(!counts.live(), "{} allocations outlived the client", counts.live());
+    return failures + fixture.stop();
+#else
+    return case_result_t::skipped("the POSIX backend is not compiled");
+#endif
+}
+
 #endif // UCALL_OS_POSIX_
 #pragma endregion File Parts
 
@@ -3751,6 +3842,8 @@ int main(int argc, char** argv) {
     run_test(totals, "test_file_window_overlap", test_file_window_overlap);
     run_test(totals, "test_file_fairness", test_file_fairness);
     run_test(totals, "test_warm_file_reply_allocates_nothing", test_warm_file_reply_allocates_nothing);
+    run_test(totals, "test_client_responses_outlive_free_unit", test_client_responses_outlive_free_unit);
+    run_test(totals, "test_warm_client_allocates_nothing", test_warm_client_allocates_nothing);
     if (backend_under_test == ucall_io_backend_automatic_k)
         run_test(totals, "test_backend_parity", test_backend_parity);
 #endif

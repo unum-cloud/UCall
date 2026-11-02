@@ -21,8 +21,6 @@ static_assert(sizeof(void*) != 8 || sizeof(ucall_reply_part_t) == 48, "a reply p
 
 namespace unum::ucall {
 
-template struct received_response<st::default_allocator<byte_t>>;
-
 /** Responses outlive their client and its CPU class, so reading one takes the serial kits. */
 using response_http_t =
     http<serial_compare_kit_t, serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t>;

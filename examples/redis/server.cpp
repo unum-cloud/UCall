@@ -20,7 +20,7 @@
 namespace st = ashvardanian::smashtable;
 using uc::tools::reply_error;
 
-using bytes_t = st::basic_vector<uc::byte_t>;
+using bytes_t = st::vector<uc::byte_t>;
 
 struct key_hash_t {
     std::size_t operator()(bytes_t const& key) const noexcept {

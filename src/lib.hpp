@@ -9,6 +9,8 @@
 
 #include <type_traits>
 
+#include <smashtable/row_search.hpp>
+
 #include "ucall/ucall.h"
 #include "ucall/types.hpp"
 #include "ucall/http.hpp"
@@ -111,6 +113,59 @@ struct atomic_ref_for_cpu_class<cpu_class_t::monoversioned_k> {
 };
 #endif
 
+/** The row kit one CPU class compares index keys with, serial wherever its
+ *  @c SMASHTABLE_TARGET_<KIT> is off. */
+template <cpu_class_t cpu_class_>
+struct row_kit_for_cpu_class {
+    using type = st::serial_row_kit_t;
+};
+#if SMASHTABLE_TARGET_HASWELL
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::intel_haswell_k> {
+    using type = st::haswell_row_kit_t;
+};
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::intel_alder_k> {
+    using type = st::haswell_row_kit_t;
+};
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::intel_sierra_k> {
+    using type = st::haswell_row_kit_t;
+};
+#endif
+#if SMASHTABLE_TARGET_SKYLAKE
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::intel_skylake_k> {
+    using type = st::skylake_row_kit_t;
+};
+#endif
+#if SMASHTABLE_TARGET_ICELAKE
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::intel_icelake_k> {
+    using type = st::icelake_row_kit_t;
+};
+#endif
+#if SMASHTABLE_TARGET_NEON
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::aws_g2_k> {
+    using type = st::neon_row_kit_t;
+};
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::apple_m2_k> {
+    using type = st::neon_row_kit_t;
+};
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::aws_g5_k> {
+    using type = st::neon_row_kit_t;
+};
+#endif
+#if UCALL_TARGET_MONOVERSIONED
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::monoversioned_k> {
+    using type = st::native_row_kit_t;
+};
+#endif
+
 /** The wait instruction one CPU class pairs: x86 spins on PAUSE and the WAITPKG Xeons arm TPAUSE,
  *  the Arm classes spin on YIELD and the Graviton5 class sleeps in WFE, a monoversioned build takes
  *  ForkUnion's pick for its target, and everything else yields, as does any class whose
@@ -182,6 +237,7 @@ struct cpu_traits {
     using fold_kit_t = fold_kit<stringzilla_capabilities_k>;
     using sha256_kit_t = sha256_kit<stringzilla_capabilities_k>;
     using aes256_gcm_kit_t = aes256_gcm_kit<stringzilla_capabilities_k>;
+    using row_search_kit_t = typename row_kit_for_cpu_class<cpu_class_>::type;
 
     template <typename value_type_>
     using atomic_ref = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
@@ -244,6 +300,7 @@ constexpr bool rung_advances() noexcept {
            !std::is_same_v<typename own_t::fold_kit_t, typename parent_t::fold_kit_t> ||
            !std::is_same_v<typename own_t::sha256_kit_t, typename parent_t::sha256_kit_t> ||
            !std::is_same_v<typename own_t::aes256_gcm_kit_t, typename parent_t::aes256_gcm_kit_t> ||
+           !std::is_same_v<typename own_t::row_search_kit_t, typename parent_t::row_search_kit_t> ||
            !std::is_same_v<typename own_t::template atomic_ref<std::uint32_t>,
                            typename parent_t::template atomic_ref<std::uint32_t>>;
 }

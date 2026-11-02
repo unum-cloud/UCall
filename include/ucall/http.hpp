@@ -454,28 +454,9 @@ struct received_response_t : ucall_received_http_response_handle_t {
     span<byte_t const> bytes() const noexcept { return content; }
 };
 
-template <typename allocator_type_ = st::default_allocator<byte_t>>
-struct received_response : received_response_t {
-    st::basic_vector<byte_t, allocator_type_> storage;
-
-    explicit received_response(allocator_type_ const& allocator) noexcept : storage(allocator) { destroy = &release; }
-    received_response(received_response const&) = delete;
-    received_response& operator=(received_response const&) = delete;
-    received_response(received_response&&) = delete;
-    received_response& operator=(received_response&&) = delete;
-
-    static void release(received_response_t* response) noexcept {
-        auto* owned = static_cast<received_response*>(response);
-        using deleter_t = allocator_delete<received_response, allocator_type_>;
-        deleter_t {typename deleter_t::allocator_t {owned->storage.get_allocator()}}(owned);
-    }
-};
-
-extern template struct received_response<st::default_allocator<byte_t>>;
-
 /** The text a byte vector holds, borrowing it. */
 template <typename element_type_, typename allocator_type_>
-std::string_view text_view(st::basic_vector<element_type_, allocator_type_> const& bytes) noexcept {
+std::string_view text_view(st::vector<element_type_, allocator_type_> const& bytes) noexcept {
     static_assert(sizeof(element_type_) == 1);
     return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
 }
@@ -868,7 +849,7 @@ struct http {
 
     /** Appends every one of @p texts to @p bytes in one resize, or nothing at all. */
     template <typename element_type_, typename allocator_type_>
-    [[nodiscard]] static ucall_status_t append_text(st::basic_vector<element_type_, allocator_type_>& bytes,
+    [[nodiscard]] static ucall_status_t append_text(st::vector<element_type_, allocator_type_>& bytes,
                                                     std::initializer_list<std::string_view> texts) noexcept {
         static_assert(sizeof(element_type_) == 1);
         std::size_t offset = bytes.size(), length = offset;
@@ -884,7 +865,7 @@ struct http {
         return ucall_status_success_k;
     }
     template <typename allocator_type_>
-    static void drop_bytes(st::basic_vector<byte_t, allocator_type_>& bytes, std::size_t count) noexcept {
+    static void drop_bytes(st::vector<byte_t, allocator_type_>& bytes, std::size_t count) noexcept {
         bytes.erase(0, count);
     }
 };

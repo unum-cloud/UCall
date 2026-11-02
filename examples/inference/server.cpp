@@ -87,10 +87,10 @@ static void offer_scores(top_rows_t& top, std::size_t first_row, std::span<score
 struct pool_thread_scratch_t {
 
     /** A `queries × slice_rows_k` matrix for the slice being scored. */
-    st::basic_vector<score_t> scores;
+    st::vector<score_t> scores;
 
     /** The best rows of each query across this thread's slices. */
-    st::basic_vector<top_rows_t> tops;
+    st::vector<top_rows_t> tops;
 
     /** The latest packing's or batch's outcome on this thread. */
     nk::status_t status {};
@@ -148,21 +148,21 @@ static void score_slices(void* context, std::size_t thread, std::size_t) {
 struct batch_scratch_t {
 
     /** The requests whose bodies were valid queries, in batch order. */
-    st::basic_vector<ucall_received_http_request_t> requests;
+    st::vector<ucall_received_http_request_t> requests;
 
     /** Their queries, one dense `requests × dimensions` matrix for the packed GEMM. */
-    st::basic_vector<query_t> queries;
+    st::vector<query_t> queries;
 
     /** The best rows of each query. */
-    st::basic_vector<top_rows_t> tops;
+    st::vector<top_rows_t> tops;
 };
 
 struct service_t {
     ucall_server_t server {};
     std::size_t rows = 100'000, dimensions = 1024, seed = 42, slow_batch_microseconds = 5000;
     fu_pool_t pool {}; // Only the `/infer/batch` drain dispatches it, so no call ever finds it busy.
-    st::basic_vector<model_slice_t> slices;
-    st::basic_vector<pool_thread_scratch_t> pool_scratch;
+    st::vector<model_slice_t> slices;
+    st::vector<pool_thread_scratch_t> pool_scratch;
     batch_scratch_t scratch; // Only the `/infer/batch` drain touches it.
 
     ~service_t() { fu_pool_delete(pool); }
@@ -186,7 +186,7 @@ struct service_t {
             std::fprintf(stderr, "ForkUnion initialization failed: %d\n", static_cast<int>(status));
             return false;
         }
-        st::basic_vector<query_t> model;
+        st::vector<query_t> model;
         if (st::failed(model.resize(rows * dimensions)) || st::failed(slices.resize(slices_count)) ||
             st::failed(pool_scratch.resize(threads))) {
             std::fputs("The matrix does not fit in memory\n", stderr);

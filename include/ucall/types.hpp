@@ -15,7 +15,6 @@
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <span>        // `std::span`, `std::as_bytes`
-#include <numeric>     // `std::iota`
 #include <string_view> // `std::string_view`
 #include <type_traits> // `std::is_convertible_v`
 #include <utility>     // `std::move`
@@ -108,6 +107,7 @@
 
 #include <forkunion/atomics.hpp>
 #include <forkunion/capabilities.hpp>
+#include <smashtable/basic_slot_pool.hpp>
 #include <smashtable/basic_vector.hpp>
 #include <stringzilla/capabilities.h>
 
@@ -253,19 +253,8 @@ struct highest_kit<caps_, floor_, head_, tail_...> {
                                     typename highest_kit<caps_, floor_, tail_...>::type>;
 };
 
-/**
- *  @brief Bytes to keep between things two threads write, so neither steals the other's line.
- *
- *  Not 64. Apple's arm64 cores use 128-byte lines, and x86 pulls adjacent lines in pairs for the
- *  prefetcher, so 64 leaves two hot fields sharing a fetch on both of the architectures we target.
- *  @c alignas needs a constant expression, so this is the conservative upper bound rather than
- *  whatever the machine in front of you reports.
- *
- *  Deliberately not @c std::hardware_destructive_interference_size: libstdc++ reports 64 for
- *  x86-64, which is the number this exists to correct, and GCC warns on its use in any layout that
- *  crosses a translation unit.
- */
-static constexpr std::size_t false_sharing_bytes_k = 128;
+static_assert(st::cache_line_bytes_k == fu::default_alignment_k,
+              "SMASHTABLE_DEFAULT_ALIGNMENT and FORKUNION_DEFAULT_ALIGNMENT disagree");
 
 /** A native socket descriptor; Winsock handles require pointer width. A polling thread names
  *  itself by the identity its platform reads without entering the kernel; zero names no thread. */
@@ -282,66 +271,11 @@ inline bool is_current_thread(polling_thread_t thread) noexcept { return pthread
 #endif
 
 /**
- *  @brief Object pool for efficient allocation/deallocation of fixed-size elements.
- *
- *  Maintains a free list for O(1) operations. All elements remain constructed for the pool's
- *  lifetime, enabling fast reuse without construction overhead.
- *
- *  @tparam element_type_ Type of pooled elements. Must be nothrow default-constructible.
- *
- *  @code{.cpp}
- * pool<connection_t> conn_pool;
- * conn_pool.reserve(100);
- * connection_t* conn = conn_pool.alloc();
- * if (conn) { conn->reset(); conn_pool.release(conn); }
- *  @endcode
- */
-template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
-class pool {
-    using offsets_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<std::size_t>;
-    st::vector<element_type_, allocator_type_> elements_;
-    st::vector<std::size_t, offsets_allocator_t> free_offsets_;
-    std::size_t free_count_ {};
-
-  public:
-    using element_t = element_type_;
-    using value_type = element_t;
-    using allocator_t = allocator_type_;
-
-    explicit pool(allocator_t const& allocator = {}) noexcept
-        : elements_(allocator), free_offsets_(offsets_allocator_t {allocator}) {}
-    pool(pool const&) = delete;
-    pool& operator=(pool const&) = delete;
-    ~pool() noexcept = default;
-
-    [[nodiscard]] ucall_status_t reserve(std::size_t count) noexcept {
-        assert(elements_.empty());
-        decltype(elements_) elements {elements_.get_allocator()};
-        decltype(free_offsets_) offsets {free_offsets_.get_allocator()};
-        if (st::failed(elements.resize(count)) || st::failed(offsets.resize(count)))
-            return ucall_status_out_of_memory_k;
-        std::iota(offsets.begin(), offsets.end(), std::size_t {0});
-        elements_ = std::move(elements);
-        free_offsets_ = std::move(offsets);
-        free_count_ = count;
-        return ucall_status_success_k;
-    }
-    element_t* alloc() noexcept { return free_count_ ? elements_.data() + free_offsets_[--free_count_] : nullptr; }
-    void release(element_t* released) noexcept {
-        assert(contains(released) && free_count_ < elements_.size());
-        free_offsets_[free_count_++] = static_cast<std::size_t>(released - elements_.data());
-    }
-    bool contains(element_t const* pointer) const noexcept {
-        return !elements_.empty() && pointer >= elements_.data() && pointer < elements_.data() + elements_.size();
-    }
-};
-
-/**
  *  @brief Growable pool allocator with pointer stability guarantee.
  *
- *  Manages a linked list of fixed-size pools. When a pool is exhausted, allocates a new pool at 2x
- *  the previous capacity. Pointers remain valid for the lifetime of the successive_pools instance
- *  since individual pools are never reallocated.
+ *  Manages a linked list of fixed-size slot pools. When a pool is exhausted, allocates a new pool
+ *  at 2x the previous capacity. Pointers remain valid for the lifetime of the successive_pools
+ *  instance since individual pools are never reallocated.
  *
  *  Allocation strategy:
  *  - Tries to allocate from newest (largest) pool first for better cache locality
@@ -368,15 +302,16 @@ class pool {
  */
 template <typename element_type_, typename allocator_type_ = st::default_allocator<element_type_>>
 class successive_pools {
+    using bytes_allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<byte_t>;
+    using slot_pool_t = st::basic_slot_pool<element_type_, std::uint32_t, bytes_allocator_t>;
+
     struct pool_node_t {
-        pool<element_type_, allocator_type_> pool_;
-        std::size_t capacity_ {};
+        slot_pool_t pool_;
 
         /** Singly linked list, newer pools first. */
         pool_node_t* next_ {};
 
-        pool_node_t(std::size_t capacity, allocator_type_ const& allocator) noexcept
-            : pool_(allocator), capacity_(capacity) {}
+        explicit pool_node_t(slot_pool_t&& pool) noexcept : pool_(std::move(pool)) {}
     };
 
     allocator_type_ allocator_ {};
@@ -411,17 +346,17 @@ class successive_pools {
      */
     [[nodiscard]] element_t* alloc() noexcept {
         // Try existing pools (newest to oldest)
-        for (pool_node_t* node = head_; node != nullptr; node = node->next_) {
-            element_t* elem = node->pool_.alloc();
-            if (elem) return elem;
-        }
+        for (pool_node_t* node = head_; node != nullptr; node = node->next_)
+            if (std::uint32_t const index = node->pool_.take(); index != slot_pool_t::absent_k)
+                return &node->pool_[index];
 
         // All pools exhausted - grow
-        std::size_t new_capacity = head_ ? head_->capacity_ * 2 : initial_capacity_;
+        std::size_t new_capacity = head_ ? head_->pool_.capacity() * 2 : initial_capacity_;
         if (grow(new_capacity) != ucall_status_success_k) return nullptr;
 
         // Try allocation from newly created pool
-        return head_->pool_.alloc();
+        std::uint32_t const index = head_->pool_.take();
+        return index != slot_pool_t::absent_k ? &head_->pool_[index] : nullptr;
     }
 
     /**
@@ -435,8 +370,9 @@ class successive_pools {
 
         // Find which pool owns this pointer
         for (pool_node_t* node = head_; node != nullptr; node = node->next_) {
-            if (node->pool_.contains(released)) {
-                node->pool_.release(released);
+            std::span<element_t const> const records = node->pool_.records();
+            if (released >= records.data() && released < records.data() + records.size()) {
+                node->pool_.vacate(node->pool_.index_of(*released));
                 return;
             }
         }
@@ -463,13 +399,11 @@ class successive_pools {
      *  @return @c ucall_status_out_of_memory_k when the pool or its storage cannot be allocated.
      */
     [[nodiscard]] ucall_status_t grow(std::size_t capacity) noexcept {
-        auto owned = allocate_unique<pool_node_t>(allocator_, capacity, allocator_);
+        st::expected<slot_pool_t> made = slot_pool_t::make(capacity, bytes_allocator_t {allocator_});
+        if (!made) return ucall_status_out_of_memory_k;
+        auto owned = allocate_unique<pool_node_t>(allocator_, std::move(*made));
         auto* new_node = owned.get();
         if (!new_node) return ucall_status_out_of_memory_k;
-
-        // Reserve the pool capacity
-        if (ucall_status_t const reserved = new_node->pool_.reserve(capacity); reserved != ucall_status_success_k)
-            return reserved;
 
         // Prepend to linked list (newest first)
         new_node->next_ = head_;

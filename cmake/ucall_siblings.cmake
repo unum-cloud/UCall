@@ -42,7 +42,7 @@ ucall_sibling(
 )
 ucall_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
-    7bc9e00713929c4273099dce3d1e4e6d61bea4af
+    b4cf836d790049afe0ea9d9c226f7933b5660dc1
 )
 
 if (UCALL_BUILD_TOOLS)

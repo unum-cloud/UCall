@@ -84,7 +84,7 @@ struct routing_case_t {
  */
 struct path_arena_t {
     static constexpr std::size_t slot_width_k = 32;
-    st::basic_vector<char> characters {};
+    st::vector<char> characters {};
 
     [[nodiscard]] bool reserve(std::size_t routes) noexcept {
         return !st::failed(characters.resize(routes * slot_width_k));
