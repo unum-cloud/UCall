@@ -23,6 +23,16 @@ static char const* spell_verb(int value) {
     return names[value];
 }
 
+static char const* spell_body_delivery(int value) {
+    static char const* const names[] = {"buffered", "streamed"};
+    return names[value];
+}
+
+static char const* spell_log_level(int value) {
+    static char const* const names[] = {"debug", "info", "warning", "error", "fatal"};
+    return names[value];
+}
+
 static char const doc_Status[] =                                                  //
     "Status(value)\n"                                                             //
     "\n"                                                                          //
@@ -68,6 +78,26 @@ static char const doc_Verb[] =                                                  
     "  >>> ucall.Verb.POST == 2\n"                                                             //
     "  True";
 
+static char const doc_BodyDelivery[] =                                                          //
+    "BodyDelivery(value)\n"                                                                     //
+    "\n"                                                                                        //
+    "When an endpoint's handler runs: once the body is buffered, or at headers time with the\n" //
+    "body pulled through `DetachedRequest.body_chunks`.\n"                                      //
+    "\n"                                                                                        //
+    "Example:\n"                                                                                //
+    "  >>> @server.post(\"/upload\", body=ucall.BodyDelivery.STREAMED)\n"                       //
+    "  ... def upload(request: ucall.Request):\n"                                               //
+    "  ...     workers.submit(store, request.detach())";
+
+static char const doc_LogLevel[] =                                                           //
+    "LogLevel(value)\n"                                                                      //
+    "\n"                                                                                     //
+    "The severity of a line the `Server` log callback receives, from the most verbose up.\n" //
+    "\n"                                                                                     //
+    "Example:\n"                                                                             //
+    "  >>> ucall.LogLevel.WARNING > ucall.LogLevel.INFO\n"                                   //
+    "  True";
+
 ucall_py_enum_mirror_t ucall_py_status_enum = {
     "Status", doc_Status, ucall_status_success_k, ucall_status_would_block_k, spell_status, NULL,
 };
@@ -82,6 +112,17 @@ ucall_py_enum_mirror_t ucall_py_security_enum = {
 };
 ucall_py_enum_mirror_t ucall_py_verb_enum = {
     "Verb", doc_Verb, ucall_verb_unknown_k, ucall_verb_any_k, spell_verb, NULL,
+};
+ucall_py_enum_mirror_t ucall_py_body_delivery_enum = {
+    "BodyDelivery",
+    doc_BodyDelivery,
+    ucall_body_delivery_buffered_k,
+    ucall_body_delivery_streamed_k,
+    spell_body_delivery,
+    NULL,
+};
+ucall_py_enum_mirror_t ucall_py_log_level_enum = {
+    "LogLevel", doc_LogLevel, ucall_log_level_debug_k, ucall_log_level_fatal_k, spell_log_level, NULL,
 };
 
 #pragma endregion Enums

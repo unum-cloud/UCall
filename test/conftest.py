@@ -1,7 +1,17 @@
-"""Fixtures the Python suites share: the backends a server runs on, loopback interfaces, and polling threads."""
+"""Fixtures the Python suites share: the backends a server runs on, loopback interfaces, and
+polling threads.
+
+File: test/conftest.py
+Author: Ash Vardanian
+Date: October 19, 2026
+"""
 
 import contextlib
+import os
+import pathlib
+import shutil
 import sys
+import tempfile
 import threading
 from collections.abc import Callable, Iterator
 from enum import IntEnum
@@ -64,3 +74,21 @@ def serving() -> Callable[[ucall.Server], contextlib.AbstractContextManager[str]
                 thread.join()
 
     return serve
+
+
+@pytest.fixture
+def direct_directory(tmp_path: pathlib.Path) -> Iterator[pathlib.Path]:
+    """A directory whose files open with `os.O_DIRECT`, under `UCALL_TEST_DIRECT_DIRECTORY` when set, else `tmp_path`."""
+    base = os.environ.get("UCALL_TEST_DIRECT_DIRECTORY")
+    directory = pathlib.Path(tempfile.mkdtemp(prefix="ucall-direct-", dir=base)) if base else tmp_path
+    probe = directory / "probe.bin"
+    probe.write_bytes(bytes(1 << 16))
+    try:
+        os.close(os.open(probe, os.O_RDONLY | os.O_DIRECT))
+    except OSError as error:
+        pytest.skip(f"{directory} refuses O_DIRECT ({error.strerror}); set UCALL_TEST_DIRECT_DIRECTORY to a disk")
+    finally:
+        probe.unlink()
+    yield directory
+    if base:
+        shutil.rmtree(directory)

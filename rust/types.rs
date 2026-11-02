@@ -1,5 +1,6 @@
-//! Vocabulary shared by servers and clients: statuses and errors, verbs, backends, CPU classes,
-//! security modes, Noise keys, and the byte views header lines are lent as.
+//! Vocabulary shared by servers and clients: statuses and errors, deferred outcomes, verbs,
+//! backends, CPU classes, security modes, Noise keys, log sinks, and the byte views header lines
+//! are lent as.
 //!
 //! File: rust/types.rs
 //! Author: Ash Vardanian
@@ -10,10 +11,14 @@
 
 use core::ffi::{c_char, c_int, c_void, CStr};
 use core::fmt;
+use core::future::{Future, IntoFuture};
 use core::marker::PhantomData;
-use core::ptr;
+use core::pin::Pin;
+use core::ptr::{self, NonNull};
 use core::str::FromStr;
+use core::task::{Context, Poll};
 use core::time::Duration;
+use std::os::fd::BorrowedFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -29,8 +34,10 @@ pub(crate) type ucall_security_mode_t = c_int;
 pub(crate) type ucall_verb_t = c_int;
 pub(crate) type ucall_log_level_t = c_int;
 pub(crate) type ucall_log_format_t = c_int;
+pub(crate) type ucall_body_delivery_t = c_int;
 
 pub(crate) const ucall_status_success_k: ucall_status_t = 0;
+pub(crate) const ucall_status_deferred_k: ucall_status_t = 1;
 pub(crate) const ucall_status_connection_closed_k: ucall_status_t = 21;
 pub(crate) const ucall_status_peer_rejected_k: ucall_status_t = 24;
 
@@ -122,6 +129,8 @@ extern "C" {
     fn ucall_version_name() -> *const c_char;
     fn ucall_noise_key_generate(arguments: *mut ucall_noise_key_generate_t);
     fn ucall_noise_key_derive(arguments: *mut ucall_noise_key_derive_t);
+    pub(crate) fn ucall_outcome_wait(outcome: *mut ucall_outcome_t) -> ucall_status_t;
+    pub(crate) fn ucall_outcome_status(outcome: *mut ucall_outcome_t) -> ucall_status_t;
 }
 
 // endregion: Raw Declarations
@@ -131,7 +140,7 @@ extern "C" {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[non_exhaustive]
 pub enum Status {
-    /// A submitted call has not finished; no verb of this crate returns before it is final.
+    /// A reply is still sending a file or path part, as [`Deferred::status`] reports it.
     Deferred = 1,
     /// An allocation or reservation could not be satisfied.
     OutOfMemory = 2,
@@ -165,7 +174,8 @@ pub enum Status {
     HandshakeFailed = 23,
     /// The peer authorizer declined the authenticated static key.
     PeerRejected = 24,
-    /// A nonblocking poll had no progress to report.
+    /// Nothing was ready: a nonblocking poll had no progress to report, a pull on the polling
+    /// thread found no body bytes yet, or a stream's peer lags behind its appended parts.
     WouldBlock = 25,
 }
 
@@ -259,13 +269,99 @@ pub(crate) fn pending_outcome() -> ucall_outcome_t {
     }
 }
 
-/// The log sink that drops every line, as neither servers nor clients here take one.
-pub(crate) fn silent_log() -> ucall_log_t {
-    ucall_log_t {
-        callback: None,
-        context: ptr::null_mut(),
-        format: 0,
-        level: 0,
+/// A reply still sending a file or path part: it owns the outcome the event loop makes final,
+/// and the descriptors its parts borrow stay open for `'f`, until it is final.
+///
+/// [`Deferred::status`] polls without blocking, [`Deferred::wait`] blocks until the reply is
+/// final, and `.await` polls it from async code. Dropping one that is not final waits for it, so
+/// it belongs off the polling thread, which is the one finishing it.
+#[must_use = "dropping a deferred reply waits for it"]
+pub struct Deferred<'f> {
+    // A raw heap address rather than a `Box`, as the event loop writes it while this moves.
+    outcome: NonNull<ucall_outcome_t>,
+    files: PhantomData<BorrowedFd<'f>>,
+}
+
+// The outcome moves with the `Deferred`, and until it is final only the library writes it.
+unsafe impl Send for Deferred<'_> {}
+
+impl Deferred<'_> {
+    /// An outcome at a stable heap address, for a verb that may finish after it returns.
+    pub(crate) fn pending() -> Self {
+        Deferred {
+            outcome: NonNull::from(Box::leak(Box::new(pending_outcome()))),
+            files: PhantomData,
+        }
+    }
+
+    /// The outcome to hand the verb.
+    pub(crate) fn raw(&self) -> *mut ucall_outcome_t {
+        self.outcome.as_ptr()
+    }
+
+    /// `Err(Status::Deferred)` until the reply is final, then its final status, read without
+    /// blocking through `ucall_outcome_status`.
+    pub fn status(&self) -> core::result::Result<(), Status> {
+        Status::from_raw(unsafe { ucall_outcome_status(self.raw()) })
+    }
+
+    /// Blocks until the reply is final, through `ucall_outcome_wait`, and reports how it ended.
+    pub fn wait(self) -> Result<()> {
+        unsafe { ucall_outcome_wait(self.raw()) };
+        check(unsafe { *self.raw() })
+    }
+}
+
+impl Drop for Deferred<'_> {
+    fn drop(&mut self) {
+        // Once final, the library touches the outcome no more, so it is freed here.
+        unsafe {
+            ucall_outcome_wait(self.raw());
+            drop(Box::from_raw(self.raw()));
+        }
+    }
+}
+
+impl fmt::Debug for Deferred<'_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(formatter, "Deferred({:?})", self.status())
+    }
+}
+
+impl<'f> IntoFuture for Deferred<'f> {
+    type Output = Result<()>;
+    type IntoFuture = Wait<'f>;
+
+    fn into_future(self) -> Wait<'f> {
+        Wait(Some(self))
+    }
+}
+
+/// A [`Deferred`] being awaited: every poll reads its status, and one not yet final asks to be
+/// polled again.
+///
+/// The library has no wake-up, so an executor re-polls it while other tasks run, spinning only
+/// when nothing else is ready; [`Deferred::wait`] blocks without spinning.
+#[must_use = "an awaited reply does nothing unless polled"]
+pub struct Wait<'f>(Option<Deferred<'f>>);
+
+impl Future for Wait<'_> {
+    type Output = Result<()>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let awaited = &mut self.get_mut().0;
+        match awaited.take() {
+            None => Poll::Ready(Err(fail(
+                Status::InvalidArgument,
+                "the reply was already awaited",
+            ))),
+            Some(deferred) if deferred.status() == Err(Status::Deferred) => {
+                *awaited = Some(deferred);
+                context.waker().wake_by_ref();
+                Poll::Pending
+            }
+            Some(deferred) => Poll::Ready(deferred.wait()),
+        }
     }
 }
 
@@ -676,6 +772,108 @@ unsafe extern "C" fn authorize_trampoline(
         Ok(true) => ucall_status_success_k,
         _ => ucall_status_peer_rejected_k,
     }
+}
+
+/// When an endpoint's handler runs: once the body is buffered, or at headers time, with the body
+/// pulled through [`DetachedRequest::body_chunk`](crate::DetachedRequest::body_chunk).
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum BodyDelivery {
+    /// The handler runs once the whole body arrived, read through `body`.
+    #[default]
+    Buffered,
+    /// The handler runs once the headers arrived, and the body is pulled chunk by chunk.
+    Streamed,
+}
+
+impl BodyDelivery {
+    pub(crate) fn to_raw(self) -> ucall_body_delivery_t {
+        self as ucall_body_delivery_t
+    }
+}
+
+/// The severity of a log line, from the most verbose up.
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug, Hash, Default)]
+pub enum LogLevel {
+    /// Detail for debugging UCall itself.
+    #[default]
+    Debug,
+    /// Routine events.
+    Info,
+    /// Something recoverable went wrong.
+    Warning,
+    /// An operation failed.
+    Error,
+    /// The handle cannot go on.
+    Fatal,
+}
+
+impl LogLevel {
+    fn from_raw(value: ucall_log_level_t) -> Self {
+        match value {
+            0 => LogLevel::Debug,
+            1 => LogLevel::Info,
+            2 => LogLevel::Warning,
+            3 => LogLevel::Error,
+            _ => LogLevel::Fatal,
+        }
+    }
+}
+
+/// The shape of each log line.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum LogFormat {
+    /// Human-readable lines with normalized units.
+    #[default]
+    Human,
+    /// One JSON document per line.
+    JSON,
+}
+
+/// Receives one formatted log line, without a trailing newline, on whichever thread produced it,
+/// polling threads included; it should return quickly, and a panic drops the line.
+pub type LogCallback = dyn Fn(LogLevel, &[u8]) + Send + Sync;
+
+/// The one log sink of a server or a client; without one, the library writes nothing anywhere.
+#[derive(Clone)]
+pub struct Log {
+    /// Receives every line at or above `level`.
+    pub callback: Arc<LogCallback>,
+    /// The line format.
+    pub format: LogFormat,
+    /// Lines below this severity are never formatted.
+    pub level: LogLevel,
+}
+
+/// Lends an optional sink as the C log, whose context points at the callback inside `log`, which
+/// must stay in place until the handle is freed.
+pub(crate) fn lend_log(log: &Option<Box<Log>>) -> ucall_log_t {
+    match log {
+        Some(log) => ucall_log_t {
+            callback: Some(log_trampoline),
+            context: ptr::from_ref(&log.callback).cast_mut().cast(),
+            format: log.format as ucall_log_format_t,
+            level: log.level as ucall_log_level_t,
+        },
+        None => ucall_log_t {
+            callback: None,
+            context: ptr::null_mut(),
+            format: 0,
+            level: 0,
+        },
+    }
+}
+
+/// # Safety
+/// `context` must address a live `Arc<LogCallback>`, and `line` a valid view.
+unsafe extern "C" fn log_trampoline(
+    level: ucall_log_level_t,
+    line: ucall_bytes_view_t,
+    context: *mut c_void,
+) {
+    let callback = &*context.cast::<Arc<LogCallback>>();
+    let _ = catch_unwind(AssertUnwindSafe(|| {
+        callback(LogLevel::from_raw(level), viewed(line))
+    }));
 }
 
 // region: Tests

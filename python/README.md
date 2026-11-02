@@ -40,6 +40,8 @@ assert bytes(response.body) == b"Hello, world!"
 ## Serving
 
 `ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
+Its `log=` callable receives each line the server writes as a `ucall.LogLevel` and a `str`, on whichever thread wrote it and holding the interpreter lock, and `metrics=ucall.Metrics(address, sample_rate, prefix, tags, interval_us)` sends StatsD datagrams from every event loop.
+An `Interface` also takes `max_request_bytes=`, past which a request is answered 413, and `reply_directories=`, the directories a `ucall.Path` part names by position.
 Without interfaces it answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545".
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
@@ -127,6 +129,79 @@ Either consumes the request, so a second reply raises `ucall.Error` with `Status
 A request may be kept past its handler and answered later, from any thread, once, while responses still leave each connection in request order.
 A request released without a reply answers 500.
 A reply to a closed connection still consumes the request silently; any other failed reply raises `ucall.Error` and keeps it.
+
+`request.path_segments` is a tuple of the path's components as `bytes`, and `request.parts` a tuple of `ucall.RequestPart(name, content_type, data)` for a `multipart/form-data` body.
+Each part's `data` views the received bytes like `body` does, and keeps the request alive and unanswered until every such view is gone.
+
+## Files & Streams
+
+Handlers run on the polling thread, so a reply or a pull that finishes later runs on a worker: `request.detach()` hands the request over as a `ucall.DetachedRequest`, which reads and replies like a `Request` and alone has the three verbs below.
+
+| Verb                                  | Returns                                             | Final when                             |
+| :------------------------------------ | :-------------------------------------------------- | :------------------------------------- |
+| `reply_parts(parts, status, headers)` | `None` for bytes alone, else a `ucall.Deferred`     | every part is sent                     |
+| `reply_stream(status, headers)`       | a `ucall.ReplyStream` with `append(parts)`, `end()` | `end()` returns `None` or a `Deferred` |
+| `body_chunks()`                       | an iterator of `memoryview` chunks                  | the body ended                         |
+
+### Serving a File
+
+```python
+import concurrent.futures
+
+import ucall
+
+workers = concurrent.futures.ThreadPoolExecutor()
+server = ucall.Server(ucall.Interface("0.0.0.0:8080", reply_directories=["/srv/videos"]))
+
+
+def send_video(detached: ucall.DetachedRequest, name: str):
+    deferred = detached.reply_parts([ucall.Path(0, name)])
+    deferred.wait()  # or: await deferred
+
+
+@server.get("/videos/{name}")
+def video(request: ucall.Request):
+    workers.submit(send_video, request.detach(), request.path_parameter("name"))
+```
+
+`reply_parts` concatenates bytes-like objects, `ucall.Path(directory, path, offset=0, length=0)` and `ucall.File(descriptor, offset=0, length=0)` into one body whose Content-Length is measured from the files.
+A `Path` resolves beneath the named `reply_directories` entry, and the event loop opens, reads and closes it unbuffered.
+A `File` is the caller's regular file opened with `os.O_DIRECT`, or an object whose `fileno()` answers one; UCall never closes it, and the `Deferred` keeps it open until the reply is final.
+`deferred.status()` reads the outcome without waiting, `deferred.wait()` blocks without the interpreter lock and raises the failure, such as `Status.NOT_FOUND` after a 404, and `await deferred` runs that wait on the running loop's default executor.
+Releasing an unfinished `Deferred` waits for it, which is why only a detached request makes one.
+
+### Streaming a Reply
+
+```python
+def send_rows(detached: ucall.DetachedRequest, rows):
+    stream = detached.reply_stream(headers=("content-type: text/csv",))
+    for row in rows:
+        stream.append([row.encode()])
+    stream.end()
+```
+
+`append` queues more parts and raises `ucall.Error` with `Status.WOULD_BLOCK` while the peer lags behind what is queued; `end()` answers `None` or a `Deferred` as `reply_parts` does, and a stream released without `end()` ends itself.
+
+### Streaming an Upload
+
+```python
+import hashlib
+
+
+def store(detached: ucall.DetachedRequest):
+    digest = hashlib.sha256()
+    for chunk in detached.body_chunks():
+        digest.update(chunk)
+    detached.reply(digest.hexdigest().encode())
+
+
+@server.post("/uploads", body=ucall.BodyDelivery.STREAMED)
+def upload(request: ucall.Request):
+    workers.submit(store, request.detach())
+```
+
+An endpoint registered with `body=ucall.BodyDelivery.STREAMED`, on `add_endpoint`, `route` and every verb decorator, runs its handler once the headers arrived.
+`body_chunks()` yields each chunk as a `memoryview` valid until the next pull, which releases it, and waits for bytes without the interpreter lock.
 
 ## Batches
 
@@ -218,6 +293,7 @@ A `Completed` carries the `context`, the final `status`, a `message` on failure,
 
 `request`, `get`, `post`, `put`, `delete` and `patch` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
 They take `json=` to send a value as JSON with its content type, and raise `ucall.Error` when the exchange fails.
+Every calling method also takes this call's `timeout_us=`, `max_retries=` and `max_redirects=` in place of the client's, and a `client_key=` private key in place of its own.
 
 Every received response is a `Response`, whatever its HTTP status, and only a failed exchange is an error.
 A `Response` owns its received bytes, so it stays readable after its `Client` is gone, and supports the buffer protocol as a request does: `bytes(response)` copies its body and `response.body` views it.
@@ -267,6 +343,7 @@ assert bytes(response.body) == client_public_key
 `generate_noise_keypair` draws from the operating system's entropy and raises `ucall.Error` with `Status.IO` when it is refused.
 `derive_noise_public_key` recovers the public half of a stored private key, which peers compare in their authorizers.
 Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `server_key=`.
+Noise KK has both sides name each other in advance: the interface admits one caller through `noise_peer_key=`, and the call names its own private key with `client_key=` and the server's with `server_key=`.
 An `http+noise://` URL implies Noise XX, and a handler reads the client's authenticated key through `request.peer`.
 
 ## Errors
@@ -287,7 +364,7 @@ except ucall.Error as error:
     print("nobody listens:", error)
 ```
 
-`ucall.Status`, `Backend`, `CPUClass`, `Security` and `Verb` are `enum.IntEnum` classes, and every argument taking one also takes its name in any case, with "-" or "_" between words.
+`ucall.Status`, `Backend`, `CPUClass`, `Security`, `Verb`, `BodyDelivery` and `LogLevel` are `enum.IntEnum` classes, and every argument taking one also takes its name in any case, with "-" or "_" between words.
 A submitted call that fails completes with that status in `Completed.status`, such as `CONNECTION_FAILED`, `CONNECTION_CLOSED`, `TIMEOUT`, `HANDSHAKE_FAILED` or `PEER_REJECTED`, and HTTP error statuses are ordinary responses.
 On the serving side, failures become replies rather than exceptions: 400 for parameters that do not bind, 500 for a handler that raised or a request released unanswered.
 
@@ -336,12 +413,6 @@ Every thread that polls, replies or reads must run on a CPU supporting the CPU c
 The binding leaves these out:
 
 - WebSocket endpoints, connections and messages, on either side.
-- Streamed request bodies, multipart parts and path segments by index; a handler reads the whole body and the template's named captures.
-- Streamed, vectored and file replies; a reply sends one body from memory.
-- The log sink and StatsD metrics of a server or client, which run silent and report through `event_loop_statistics` and `statistics` instead.
-- The initiator key a server interface admits under Noise KK, so a KK interface is refused at startup.
-- Per-call timeouts, retries, redirect limits and client keys; a call takes its client's.
-- Polling an unfinished outcome, as every method here returns once its result is final.
 
 ## Design
 
@@ -356,7 +427,14 @@ The binding is a thin native layer, and every rule below follows from that.
   A reply consumes its `Request`, a released request answers 500, views over a body pin it until released, and a `Response` frees itself.
 - __Handlers never stop a loop.__
   An exception inside a handler or an authorizer reaches `sys.unraisablehook` and answers 500 or rejects the peer, and Ctrl+C raised inside one is re-armed for the main thread.
+- __Blocking stays simple.__
+  Every method looks as it would without asynchrony, and only a reply with file or path parts answers a `Deferred`.
+- __Deferred replies are symmetric through language idioms.__
+  A `Deferred` owns its outcome: `wait()` blocks, `await` borrows the running loop's executor, and releasing it waits, as releasing any owner does.
+  The verbs that may defer exist only on a `DetachedRequest`, so by type no polling thread waits on its own loop.
+- __No extra cost until used.__
+  Bytes-only replies keep their outcome on the stack, up to sixteen reply parts lay out on the stack, and a `Deferred` is the one allocation a file reply adds.
 - __No life of its own.__
   The binding starts no threads, keeps no global state beyond imported helpers, and needs no async runtime, so it drops into any threading model.
 - __Statuses and modes are enums.__
-  `ucall.Status`, `Backend`, `CPUClass`, `Security` and `Verb` are `enum.IntEnum` classes, so nothing is ever compared as a string.
+  `ucall.Status`, `Backend`, `CPUClass`, `Security`, `Verb`, `BodyDelivery` and `LogLevel` are `enum.IntEnum` classes, so nothing is ever compared as a string.

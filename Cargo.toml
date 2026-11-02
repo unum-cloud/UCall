@@ -28,3 +28,7 @@ path = "rust/lib.rs"
 [build-dependencies]
 # The library is CMake's to build, so `build.rs` drives it rather than restating its per-class flags.
 cmake = "0.1"
+
+[dev-dependencies]
+# The file-part tests open descriptors with `O_DIRECT`, whose value differs between architectures.
+libc = "0.2"

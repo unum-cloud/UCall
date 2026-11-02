@@ -54,12 +54,13 @@ mod types;
 #[cfg(test)]
 mod testing;
 
-pub use client::{CallRequest, Client, ClientOptions, Completed, Response};
+pub use client::{CallRequest, Client, ClientOptions, Completed, RequestOptions, Response};
 pub use server::{
-    Batch, BatchEndpoint, BatchEndpointStatistics, Batching, EventLoopStatistics, Interface, Peer,
-    Request, Server,
+    Batch, BatchEndpoint, BatchEndpointStatistics, Batching, DetachedRequest, EventLoopStatistics,
+    Interface, Metrics, Peer, ReplyPart, ReplyStream, Request, RequestPart, Server, ServerOptions,
 };
 pub use types::{
-    derive_noise_public_key, generate_noise_keypair, version, Backend, BytesView, CPUClass, Error,
-    HTTPStatus, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb,
+    derive_noise_public_key, generate_noise_keypair, version, Backend, BodyDelivery, BytesView,
+    CPUClass, Deferred, Error, HTTPStatus, Log, LogCallback, LogFormat, LogLevel, NoiseKey,
+    PeerAuthorizer, Result, Security, Status, Verb, Wait,
 };

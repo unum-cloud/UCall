@@ -19,10 +19,15 @@ Example:
   b'3'
   >>> server.stop()
   >>> thread.join()
+
+File: python/ucall/lib.pyi
+Author: Ash Vardanian
+Date: October 25, 2026
 """
 
 import enum
-from collections.abc import Buffer, Callable, Sequence
+import os
+from collections.abc import Awaitable, Buffer, Callable, Generator, Iterator, Sequence
 from typing import Any, Final, TypeVar
 
 F = TypeVar("F", bound=Callable[..., object])
@@ -160,6 +165,33 @@ class Verb(enum.IntEnum):
     OPTIONS = 7
     ANY = 8
 
+class BodyDelivery(enum.IntEnum):
+    """When an endpoint's handler runs: once the body is buffered, or at headers time with the
+    body pulled through `DetachedRequest.body_chunks`.
+
+    Example:
+      >>> @server.post("/upload", body=ucall.BodyDelivery.STREAMED)
+      ... def upload(request: ucall.Request):
+      ...     workers.submit(store, request.detach())
+    """
+
+    BUFFERED = 0
+    STREAMED = 1
+
+class LogLevel(enum.IntEnum):
+    """The severity of a line the `Server` log callback receives, from the most verbose up.
+
+    Example:
+      >>> ucall.LogLevel.WARNING > ucall.LogLevel.INFO
+      True
+    """
+
+    DEBUG = 0
+    INFO = 1
+    WARNING = 2
+    ERROR = 3
+    FATAL = 4
+
 class Error(RuntimeError):
     """A failed verb, raised with the `Status` it reported and a static detail.
 
@@ -190,19 +222,25 @@ class Interface:
       device_name (str, optional): A network device to pin the socket to, such as "eth0";
         None binds by address alone.
       security (Security, optional): Encryption of accepted connections. Defaults to
-        `Security.NONE`; `Security.NOISE_KK` is refused, as a server cannot name its callers.
+        `Security.NONE`.
       private_key (bytes, optional): The 32-byte Noise identity, required under Noise.
       peer_authorizer (Callable[[bytes], bool], optional): Admits a Noise peer by its 32-byte
         static key, required under `Security.NOISE_XX`; None admits every peer.
+      noise_peer_key (bytes, optional): The one caller's 32-byte static public key, required
+        under `Security.NOISE_KK`.
       event_loops (int, optional): Loops accepting here; 0 takes one for an address and one per
         receive queue for a device.
       connections (int, optional): Connections open at once. Defaults to 1024.
       pipelined_requests (int, optional): Requests one connection carries before the server
         stops reading from it; 0 means one.
+      max_request_bytes (int, optional): The largest request head and buffered body, past which
+        the reply is 413; 0 takes the largest receive buffer the kernel grants a socket.
+      reply_directories (Sequence[str | bytes | os.PathLike], optional): The directories a
+        `Path` part names by position, each opened once by the server.
 
     Raises:
       TypeError: An argument of the wrong type.
-      ValueError: A `private_key` other than 32 bytes long, or an unknown `security`.
+      ValueError: A key other than 32 bytes long, or an unknown `security`.
 
     Example:
       >>> interface = ucall.Interface("127.0.0.1:0", connections=64, pipelined_requests=16)
@@ -219,9 +257,12 @@ class Interface:
         security: Security | str = Security.NONE,
         private_key: bytes | None = None,
         peer_authorizer: Callable[[bytes], bool] | None = None,
+        noise_peer_key: bytes | None = None,
         event_loops: int = 0,
         connections: int = 1024,
         pipelined_requests: int = 0,
+        max_request_bytes: int = 0,
+        reply_directories: Sequence[str | bytes | os.PathLike[str] | os.PathLike[bytes]] = (),
     ) -> Interface: ...
     @property
     def address(self) -> str:
@@ -247,14 +288,64 @@ class Interface:
     @property
     def pipelined_requests(self) -> int:
         """Requests one connection carries at once; 0 means one."""
+    @property
+    def noise_peer_key(self) -> bytes | None:
+        """The 32-byte static key KK expects, or None."""
+    @property
+    def max_request_bytes(self) -> int:
+        """The largest request head and buffered body; 0 takes the kernel's receive buffer."""
+    @property
+    def reply_directories(self) -> tuple[str | bytes, ...]:
+        """The directories `Path` parts name by position."""
+
+class Metrics:
+    """Where a `Server` sends StatsD datagrams, each event loop on its own schedule.
+
+    Args:
+      address (str | bytes): The StatsD UDP endpoint, "host:port".
+      sample_rate (float, optional): The fraction of finished requests whose latency is
+        reported, in (0, 1]; 0 takes 1.
+      prefix (str | bytes, optional): The metric name prefix; empty takes "ucall".
+      tags (Sequence[str | bytes], optional): Global "key:value" tags.
+      interval_us (int, optional): Microseconds between datagrams; 0 takes one second.
+
+    Example:
+      >>> metrics = ucall.Metrics("127.0.0.1:8125", tags=("service:inference",))
+      >>> server = ucall.Server(ucall.Interface("127.0.0.1:0"), metrics=metrics)
+    """
+
+    def __new__(
+        cls,
+        address: str | bytes,
+        sample_rate: float = 0.0,
+        prefix: str | bytes | None = None,
+        tags: Sequence[str | bytes] = (),
+        interval_us: int = 0,
+    ) -> Metrics: ...
+    @property
+    def address(self) -> str | bytes:
+        """The StatsD "host:port"."""
+    @property
+    def sample_rate(self) -> float:
+        """Latencies reported; 0 takes 1."""
+    @property
+    def prefix(self) -> str | bytes | None:
+        """The metric name prefix, or None for "ucall"."""
+    @property
+    def tags(self) -> tuple[str | bytes, ...]:
+        """Global "key:value" tags."""
+    @property
+    def interval_us(self) -> int:
+        """Microseconds between datagrams."""
 
 class Request(Buffer):
     """One received HTTP request, retained until a reply consumes it.
 
     A handler taking one parameter annotated `Request` receives it on the polling thread, and may
-    keep it to answer later from any thread, once. `body` and the buffer protocol view the received
-    bytes without a copy until the reply, which is refused while such a view is alive, except the
-    `body` passed as the reply body itself. A request released without a reply answers 500.
+    keep it to answer later from any thread, once, or `detach` it to a worker for the replies that
+    may defer. `body`, `parts` and the buffer protocol view the received bytes without a copy
+    until the reply, which is refused while such a view is alive, except the `body` passed as the
+    reply body itself. A request released without a reply answers 500.
 
     Example:
       >>> @server.put("/echo/{name}")
@@ -276,6 +367,12 @@ class Request(Buffer):
     @property
     def peer(self) -> tuple[int, bytes]:
         """The index of the interface it arrived on and the peer's 32-byte Noise key, zeros on plaintext."""
+    @property
+    def parts(self) -> tuple[RequestPart, ...]:
+        """The `RequestPart`s of a multipart/form-data body, else empty."""
+    @property
+    def path_segments(self) -> tuple[bytes, ...]:
+        """The path's components between slashes, as sent."""
     def header(self, name: str | bytes, /) -> str | None:
         """Looks up a header of the request by its case-insensitive name.
 
@@ -355,7 +452,322 @@ class Request(Buffer):
           ... def teapot(request: ucall.Request):
           ...     request.reply_error(418, "short and stout\n")
         """
+    def detach(self) -> DetachedRequest:
+        """Hands the request to another thread, the one way to the verbs whose replies may defer.
+
+        The `DetachedRequest` owns the request from then on, and this object answers nothing. A
+        `Deferred` waits when released, and a wait on the polling thread would wait for the loop
+        running it, so pass the detached request to a worker rather than replying here.
+
+        Raises:
+          BufferError: A view over `body` or a part is still alive.
+          Error: The request was already answered or detached, with `Status.ALREADY_EXISTS`.
+
+        Example:
+          >>> @server.get("/videos/{name}")
+          ... def video(request: ucall.Request):
+          ...     name = request.path_parameter("name")
+          ...     workers.submit(send_video, request.detach(), name)
+        """
     def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class RequestPart:
+    """One part of a `multipart/form-data` request body, from `Request.parts`.
+
+    `data` views the received bytes without a copy and keeps the request alive, so the request
+    refuses its reply until every such view is gone, as it does for views over `body`.
+
+    Example:
+      >>> @server.post("/upload")
+      ... def upload(request: ucall.Request):
+      ...     return {part.name: len(part.data) for part in request.parts}
+    """
+
+    @property
+    def name(self) -> str:
+        """The name from Content-Disposition."""
+    @property
+    def content_type(self) -> str:
+        """The part's Content-Type, empty if absent."""
+    @property
+    def data(self) -> memoryview:
+        """A read-only memoryview of the payload, which refuses the request's reply while alive."""
+
+class File:
+    """A byte range of a file the caller opened, as one part of `DetachedRequest.reply_parts`.
+
+    The event loop reads it unbuffered after the call returns, so the reply defers, and the
+    `Deferred` keeps this part, and through it a file object, alive until it is final. UCall
+    never closes the descriptor.
+
+    Args:
+      descriptor (int | HasFileno): A regular file opened with `os.O_DIRECT`, or an object
+        whose `fileno()` answers one.
+      offset (int, optional): The range's first byte. Defaults to 0.
+      length (int, optional): The range's byte count; 0 sends through the end of the file.
+
+    Example:
+      >>> part = ucall.File(os.open("/srv/videos/intro.mp4", os.O_RDONLY | os.O_DIRECT))
+    """
+
+    def __new__(cls, descriptor: Any, offset: int = 0, length: int = 0) -> File: ...
+    @property
+    def descriptor(self) -> Any:
+        """The descriptor or its file object."""
+    @property
+    def offset(self) -> int:
+        """The range's first byte."""
+    @property
+    def length(self) -> int:
+        """The range's bytes; 0 runs to the end."""
+
+class Path:
+    """A byte range of a file beneath a reply directory, as one part of `reply_parts`.
+
+    The event loop opens it unbuffered beneath the directory and closes it once sent, so the
+    reply defers. Absolute paths, ".." and any resolution leaving the directory are refused.
+
+    Args:
+      directory (int): A position in the `reply_directories` of the interface the request
+        arrived on.
+      path (str | bytes | os.PathLike): The file beneath that directory.
+      offset (int, optional): The range's first byte. Defaults to 0.
+      length (int, optional): The range's byte count; 0 sends through the end of the file.
+
+    Example:
+      >>> part = ucall.Path(0, "intro.mp4", offset=1 << 20)
+    """
+
+    def __new__(
+        cls,
+        directory: int,
+        path: str | bytes | os.PathLike[str] | os.PathLike[bytes],
+        offset: int = 0,
+        length: int = 0,
+    ) -> Path: ...
+    @property
+    def directory(self) -> int:
+        """The position of the reply directory."""
+    @property
+    def path(self) -> str | bytes:
+        """The file beneath the directory."""
+    @property
+    def offset(self) -> int:
+        """The range's first byte."""
+    @property
+    def length(self) -> int:
+        """The range's bytes; 0 runs to the end."""
+
+class Deferred(Awaitable[None]):
+    r"""A reply still sending file or path parts, from `reply_parts` or `ReplyStream.end`.
+
+        It owns the reply's outcome and keeps the `File` parts it borrows alive until the outcome is
+        final. `await` it in a coroutine, or call `wait()`; released unfinished, it waits, so keep it
+        off the polling thread, as `Request.detach` does.
+
+        Example:
+          >>> deferred = detached.reply_parts([b"--frame
+    ", ucall.Path(0, "intro.mp4")])
+          >>> deferred.wait()  # or: await deferred
+    """
+
+    def status(self) -> Status:
+        """Reads the reply's outcome without waiting.
+
+        Returns:
+          Status: `Status.DEFERRED` while parts still send, then the final one.
+
+        Example:
+          >>> deferred.status() in (ucall.Status.DEFERRED, ucall.Status.SUCCESS)
+          True
+        """
+    def wait(self) -> None:
+        """Blocks until every part is sent, without the interpreter lock.
+
+        Raises:
+          Error: The reply failed, such as `Status.NOT_FOUND` for a missing file, which answered
+            404, or `Status.CONNECTION_CLOSED` for a peer that left.
+
+        Example:
+          >>> deferred.wait()
+        """
+    def __await__(self) -> Generator[Any]: ...
+
+class DetachedRequest(Buffer):
+    r"""A request taken off its polling thread by `Request.detach`, owning the replies that may defer.
+
+        It reads and answers as `Request` does, and alone offers `reply_parts`, `reply_stream` and
+        `body_chunks`, whose `Deferred` replies and waiting pulls belong on a worker thread. Released
+        without a reply, it answers 500.
+
+        Example:
+          >>> def send_video(detached: ucall.DetachedRequest, name: str):
+          ...     deferred = detached.reply_parts([b"--frame
+    ", ucall.Path(0, name)])
+          ...     deferred.wait()  # or: await deferred
+    """
+
+    @property
+    def verb(self) -> Verb:
+        """The `Verb` it arrived with, never `Verb.ANY`."""
+    @property
+    def path(self) -> str:
+        """The path as sent, still percent-encoded, without the query."""
+    @property
+    def body(self) -> memoryview:
+        """A read-only memoryview of the body, valid until the reply."""
+    @property
+    def peer(self) -> tuple[int, bytes]:
+        """The index of the interface it arrived on and the peer's 32-byte Noise key, zeros on plaintext."""
+    @property
+    def parts(self) -> tuple[RequestPart, ...]:
+        """The `RequestPart`s of a multipart/form-data body, else empty."""
+    @property
+    def path_segments(self) -> tuple[bytes, ...]:
+        """The path's components between slashes, as sent."""
+    def header(self, name: str | bytes, /) -> str | None:
+        """Looks up a header of the request by its case-insensitive name, as `Request.header` does."""
+    def query(self, name: str | bytes, /) -> str | None:
+        """Looks up a query parameter of the request, as `Request.query` does."""
+    def path_parameter(self, name: str | bytes, /) -> str | None:
+        """Looks up a placeholder the endpoint's URI template captured, as `Request.path_parameter` does."""
+    def reply(self, body: Buffer = b"", status: int = 200, headers: Sequence[str | bytes] = ()) -> None:
+        """Answers the request, once, as `Request.reply` does."""
+    def reply_error(self, status: int, message: str | bytes) -> None:
+        """Answers the request with an error status and a plain-text message, as `Request.reply_error` does."""
+    def reply_parts(
+        self,
+        parts: Sequence[Buffer | File | Path],
+        status: int = 200,
+        headers: Sequence[str | bytes] = (),
+    ) -> Deferred | None:
+        r"""Answers the request, once, with `parts` concatenated into the body.
+
+                Bytes-like parts are copied before the call returns, and the reply is then final. A `File` or
+                `Path` part is read by the event loop afterwards, sized first so Content-Length is measured,
+                and its reply defers: one failing before the head replaces the reply with 404 or 416, and one
+                failing after it resets the connection.
+
+                Args:
+                  parts (Sequence[Buffer | File | Path]): The body, in order.
+                  status (int, optional): The HTTP status. Defaults to 200.
+                  headers (Sequence[str | bytes], optional): "name: value" lines; the server adds
+                    Content-Length, Date and Server itself.
+
+                Returns:
+                  Deferred | None: The `Deferred` of a reply with file or path parts, which may already be
+                    final, or None for bytes alone, final on return.
+
+                Raises:
+                  BufferError: A view over the request's bytes is still alive.
+                  Error: A refused part, such as a descriptor without O_DIRECT, or a request already
+                    answered, with `Status.ALREADY_EXISTS`.
+
+                Example:
+                  >>> deferred = detached.reply_parts([b"--frame
+        ", ucall.Path(0, "intro.mp4")])
+                  >>> deferred.wait()  # or: await deferred
+        """
+    def reply_stream(self, status: int = 200, headers: Sequence[str | bytes] = ()) -> ReplyStream:
+        r"""Answers the request with a body sent in parts, emitting the status line and headers now.
+
+                The body is chunked for HTTP/1.1 peers, unless `headers` declare Content-Length, which the
+                parts must then sum to. A peer that left already still opens the stream, whose parts drop.
+
+                Args:
+                  status (int, optional): The HTTP status. Defaults to 200.
+                  headers (Sequence[str | bytes], optional): "name: value" lines.
+
+                Returns:
+                  ReplyStream: The open reply, which owns the request from then on.
+
+                Raises:
+                  BufferError: A view over the request's bytes is still alive.
+                  Error: A malformed header, or a request already answered, with `Status.ALREADY_EXISTS`.
+
+                Example:
+                  >>> stream = detached.reply_stream(headers=("content-type: text/event-stream",))
+                  >>> stream.append([b"data: 1
+
+        "])
+                  >>> stream.end()
+        """
+    def body_chunks(self) -> BodyChunks:
+        """Iterates the request body as it arrives, each chunk the bytes decoded since the last pull.
+
+        Each chunk is a read-only memoryview valid until the next pull, which releases it, and a
+        pull waits for bytes without the interpreter lock. On a buffered endpoint the first chunk
+        is the whole body.
+
+        Returns:
+          BodyChunks: The iterator, ending once the body did.
+
+        Raises:
+          BufferError: From a pull, while a view derived from the last chunk is still alive.
+          Error: From a pull, `Status.CONNECTION_CLOSED` or `Status.MALFORMED` for a body cut short
+            or badly framed, or `Status.WOULD_BLOCK` on the polling thread with nothing decoded.
+
+        Example:
+          >>> for chunk in detached.body_chunks():
+          ...     digest.update(chunk)
+        """
+    def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class ReplyStream:
+    r"""A reply sent in parts, from `DetachedRequest.reply_stream`, ended once.
+
+        Released without `end()`, it ends the reply itself and waits for any file parts to send.
+
+        Example:
+          >>> stream = detached.reply_stream(headers=("content-type: application/x-ndjson",))
+          >>> for row in rows:
+          ...     stream.append([json.dumps(row).encode(), b"
+    "])
+          >>> stream.end()
+    """
+
+    def append(self, parts: Sequence[Buffer | File | Path], /) -> None:
+        r"""Queues `parts` after the ones before, all of them or none.
+
+                Bytes-like parts are copied before the call returns; `File` parts stay alive with the
+                stream until its end is final.
+
+                Args:
+                  parts (Sequence[Buffer | File | Path]): The next parts of the body.
+
+                Raises:
+                  Error: `Status.WOULD_BLOCK` while the peer lags, to retry once it caught up, or
+                    `Status.CONNECTION_CLOSED` once it left; nothing was queued either way.
+
+                Example:
+                  >>> stream.append([b"data: ", payload, b"
+
+        "])
+        """
+    def end(self) -> Deferred | None:
+        """Completes the reply, consuming the request whatever happens.
+
+        Returns:
+          Deferred | None: The `Deferred` of a stream that appended file or path parts, which
+            may already be final, or None for bytes alone.
+
+        Raises:
+          Error: The parts fell short of a declared Content-Length, with `Status.MALFORMED`, or
+            the stream already ended, with `Status.ALREADY_EXISTS`.
+
+        Example:
+          >>> deferred = stream.end()
+        """
+
+class BodyChunks(Iterator[memoryview]):
+    """The iterator `DetachedRequest.body_chunks` returns, yielding memoryviews of the body.
+
+    Example:
+      >>> received = sum(len(chunk) for chunk in detached.body_chunks())
+    """
+
+    def __iter__(self) -> BodyChunks: ...
+    def __next__(self) -> memoryview: ...
 
 class BatchEndpoint:
     """One batching route of a server, drained by one application thread.
@@ -430,9 +842,13 @@ class Server:
       *interfaces (Interface): Where to answer; none answers on `DEFAULT_ADDRESS`.
       backend (Backend, optional): The I/O implementation. Defaults to `Backend.AUTOMATIC`.
       cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.AUTOMATIC`.
+      log (Callable[[LogLevel, str], object], optional): Receives every line the server writes,
+        on whichever thread wrote it, holding the interpreter lock; None writes nothing.
+      metrics (Metrics, optional): Where to send StatsD datagrams; None sends none.
 
     Raises:
-      Error: An interface that cannot be bound, such as an address in use.
+      Error: An interface that cannot be bound, such as an address in use, or a reply directory
+        that cannot be opened.
 
     Example:
       >>> server = ucall.Server(ucall.Interface("127.0.0.1:0"), backend="posix")
@@ -445,6 +861,8 @@ class Server:
         *interfaces: Interface,
         backend: Backend | str = Backend.AUTOMATIC,
         cpu_class: CPUClass | str = CPUClass.AUTOMATIC,
+        log: Callable[[LogLevel, str], object] | None = None,
+        metrics: Metrics | None = None,
     ) -> Server: ...
     @property
     def event_loops(self) -> int:
@@ -461,7 +879,14 @@ class Server:
     @property
     def batch_endpoints(self) -> tuple[BatchEndpoint, ...]:
         """Batch endpoints, each needing a drainer."""
-    def add_endpoint(self, path: str | bytes, verb: Verb | str, handler: F, /) -> F:
+    def add_endpoint(
+        self,
+        path: str | bytes,
+        verb: Verb | str,
+        handler: F,
+        /,
+        body: BodyDelivery | str = BodyDelivery.BUFFERED,
+    ) -> F:
         """Routes `verb` requests matching the URI template `path` to `handler`, on the polling thread.
 
         A handler taking one parameter annotated `Request` receives the request, which it may answer
@@ -475,6 +900,8 @@ class Server:
           path (str): A URI template such as `/users/{name}` or `/files/{*path}`.
           verb (Verb): The method to answer; `Verb.ANY` answers every one.
           handler (Callable): The function to route to.
+          body (BodyDelivery, optional): `BodyDelivery.STREAMED` runs the handler once the headers
+            arrived, its body pulled through `DetachedRequest.body_chunks`. Defaults to buffered.
 
         Returns:
           Callable: `handler` itself.
@@ -525,12 +952,19 @@ class Server:
           >>> endpoint in server.batch_endpoints
           True
         """
-    def route(self, path: str | bytes, verb: Verb | str = Verb.GET) -> Callable[[F], F]:
+    def route(
+        self,
+        path: str | bytes,
+        verb: Verb | str = Verb.GET,
+        *,
+        body: BodyDelivery | str = BodyDelivery.BUFFERED,
+    ) -> Callable[[F], F]:
         """Registers the decorated function for `verb` requests matching the URI template `path`.
 
         Args:
           path (str): A URI template such as "/users/{name}".
           verb (Verb, optional): The method to answer. Defaults to `Verb.GET`.
+          body (BodyDelivery, optional): When the handler runs, as `add_endpoint` takes it.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -540,11 +974,12 @@ class Server:
           ... def anything(request: ucall.Request):
           ...     return request.verb.name
         """
-    def get(self, path: str | bytes, /) -> Callable[[F], F]:
+    def get(self, path: str | bytes, /, *, body: BodyDelivery | str = BodyDelivery.BUFFERED) -> Callable[[F], F]:
         """Registers the decorated function for GET requests matching the URI template `path`.
 
         Args:
           path (str): A URI template such as "/users/{name}".
+          body (BodyDelivery, optional): When the handler runs, as `add_endpoint` takes it.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -554,11 +989,12 @@ class Server:
           ... def user(name: str, verbose: bool = False):
           ...     return {"name": name, "verbose": verbose}
         """
-    def post(self, path: str | bytes, /) -> Callable[[F], F]:
+    def post(self, path: str | bytes, /, *, body: BodyDelivery | str = BodyDelivery.BUFFERED) -> Callable[[F], F]:
         """Registers the decorated function for POST requests matching the URI template `path`.
 
         Args:
           path (str): A URI template such as "/sum".
+          body (BodyDelivery, optional): When the handler runs, as `add_endpoint` takes it.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -568,11 +1004,12 @@ class Server:
           ... def sum(a: int, b: float = 0.5):
           ...     return a + b
         """
-    def put(self, path: str | bytes, /) -> Callable[[F], F]:
+    def put(self, path: str | bytes, /, *, body: BodyDelivery | str = BodyDelivery.BUFFERED) -> Callable[[F], F]:
         """Registers the decorated function for PUT requests matching the URI template `path`.
 
         Args:
           path (str): A URI template such as `/files/{*path}`.
+          body (BodyDelivery, optional): When the handler runs, as `add_endpoint` takes it.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -582,11 +1019,12 @@ class Server:
           ... def store(request: ucall.Request):
           ...     return len(request.body)
         """
-    def delete(self, path: str | bytes, /) -> Callable[[F], F]:
+    def delete(self, path: str | bytes, /, *, body: BodyDelivery | str = BodyDelivery.BUFFERED) -> Callable[[F], F]:
         """Registers the decorated function for DELETE requests matching the URI template `path`.
 
         Args:
           path (str): A URI template such as `/files/{*path}`.
+          body (BodyDelivery, optional): When the handler runs, as `add_endpoint` takes it.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -596,11 +1034,12 @@ class Server:
           ... def remove(path: str):
           ...     return None
         """
-    def patch(self, path: str | bytes, /) -> Callable[[F], F]:
+    def patch(self, path: str | bytes, /, *, body: BodyDelivery | str = BodyDelivery.BUFFERED) -> Callable[[F], F]:
         """Registers the decorated function for PATCH requests matching the URI template `path`.
 
         Args:
           path (str): A URI template such as "/users/{name}".
+          body (BodyDelivery, optional): When the handler runs, as `add_endpoint` takes it.
 
         Returns:
           Callable[[F], F]: A decorator calling `add_endpoint` and returning the function as is.
@@ -710,8 +1149,10 @@ class Server:
         Returns:
           dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,
             `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,
-            `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks` and
-            `file_window_overlaps`, each read on its own.
+            `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,
+            `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,
+            `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,
+            `refused_requests`, `handshake_failures` and `authorizer_refusals`, each read on its own.
 
         Raises:
           Error: An `event_loop` past the last one.
@@ -830,6 +1271,10 @@ class Client:
         headers: Sequence[str | bytes] = (),
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
     ) -> Response:
         """Sends one exchange and waits for its response on this thread.
 
@@ -846,6 +1291,12 @@ class Client:
           security (Security, optional): The handshake for this call. Defaults to `Security.NONE`.
           server_key (bytes, optional): The server's 32-byte static key, for `Security.NOISE_IK`
             and `Security.NOISE_KK`.
+          client_key (bytes, optional): This call's 32-byte Noise private key in place of the
+            client's own, as `Security.NOISE_KK` names the caller to the server.
+          timeout_us (int, optional): The budget of this call, queueing and redirects included;
+            0 takes the client's `request_timeout_us`.
+          max_retries (int, optional): Connection attempts before sending; 0 takes 3.
+          max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -869,12 +1320,16 @@ class Client:
         headers: Sequence[str | bytes] = (),
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
     ) -> Response:
         """Sends a GET and waits for its response, as `request` does.
 
         Args:
           url (str | bytes): The full URL.
-          **options: `body`, `json`, `headers`, `security` and `server_key`, as `request` takes them.
+          **options: `body`, `json`, `headers`, `security`, the keys and limits, as `request` takes them.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -896,13 +1351,17 @@ class Client:
         headers: Sequence[str | bytes] = (),
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
     ) -> Response:
         """Sends a POST and waits for its response, as `request` does.
 
         Args:
           url (str | bytes): The full URL.
           body (Buffer, optional): Any bytes-like object to send.
-          **options: `json`, `headers`, `security` and `server_key`, as `request` takes them.
+          **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -924,13 +1383,17 @@ class Client:
         headers: Sequence[str | bytes] = (),
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
     ) -> Response:
         """Sends a PUT and waits for its response, as `request` does.
 
         Args:
           url (str | bytes): The full URL.
           body (Buffer, optional): Any bytes-like object to send.
-          **options: `json`, `headers`, `security` and `server_key`, as `request` takes them.
+          **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -952,12 +1415,16 @@ class Client:
         headers: Sequence[str | bytes] = (),
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
     ) -> Response:
         """Sends a DELETE and waits for its response, as `request` does.
 
         Args:
           url (str | bytes): The full URL.
-          **options: `body`, `json`, `headers`, `security` and `server_key`, as `request` takes them.
+          **options: `body`, `json`, `headers`, `security`, the keys and limits, as `request` takes them.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -979,13 +1446,17 @@ class Client:
         headers: Sequence[str | bytes] = (),
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
     ) -> Response:
         """Sends a PATCH and waits for its response, as `request` does.
 
         Args:
           url (str | bytes): The full URL.
           body (Buffer, optional): Any bytes-like object to send.
-          **options: `json`, `headers`, `security` and `server_key`, as `request` takes them.
+          **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -1007,6 +1478,10 @@ class Client:
         *,
         security: Security | str = Security.NONE,
         server_key: bytes | None = None,
+        client_key: bytes | None = None,
+        timeout_us: int = 0,
+        max_retries: int = 0,
+        max_redirects: int = 0,
         context: object = None,
     ) -> None:
         """Queues one exchange without driving I/O.
@@ -1023,6 +1498,12 @@ class Client:
             and an "http+noise://" URL calls over Noise XX.
           server_key (bytes, optional): The server's 32-byte static key, required for
             `Security.NOISE_IK` and `Security.NOISE_KK`.
+          client_key (bytes, optional): This call's 32-byte Noise private key in place of the
+            client's own, as `Security.NOISE_KK` names the caller to the server.
+          timeout_us (int, optional): The budget of this call, queueing and redirects included;
+            0 takes the client's `request_timeout_us`.
+          max_retries (int, optional): Connection attempts before sending; 0 takes 3.
+          max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.
           context (object, optional): Anything, handed back as `Completed.context`.
 
         Raises:

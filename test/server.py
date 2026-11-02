@@ -1,6 +1,16 @@
-"""Exercises `ucall.Server` against in-process clients on loopback, polled by threads the tests start."""
+"""Exercises `ucall.Server` against in-process clients on loopback, polled by threads the tests
+start.
 
+File: test/server.py
+Author: Ash Vardanian
+Date: October 25, 2026
+"""
+
+import asyncio
+import concurrent.futures
+import hashlib
 import json
+import os
 import threading
 
 import pytest
@@ -174,6 +184,7 @@ def test_raw_request_echo(backend, loopback, serving):
                 f"x-name: {request.path_parameter('name')}",
                 f"x-query: {request.query('q')}",
                 f"x-header: {request.header('X-Custom')}",
+                f"x-segments: {b'|'.join(request.path_segments).decode()}",
             ),
         )
         try:
@@ -186,8 +197,16 @@ def test_raw_request_echo(backend, loopback, serving):
         response = client.put(f"{base}/echo/alpha?q=1", b"\x00binary\xff", headers=("x-custom: yes",))
         del client
         assert bytes(response.body) == b"\x00binary\xff"
-        headers = {name: response.header(f"x-{name}") for name in ("verb", "path", "name", "query", "header")}
-        assert headers == {"verb": "PUT", "path": "/echo/alpha", "name": "alpha", "query": "1", "header": "yes"}
+        names = ("verb", "path", "name", "query", "header", "segments")
+        headers = {name: response.header(f"x-{name}") for name in names}
+        assert headers == {
+            "verb": "PUT",
+            "path": "/echo/alpha",
+            "name": "alpha",
+            "query": "1",
+            "header": "yes",
+            "segments": "echo|alpha",
+        }
         assert response.header("x-missing") is None
     assert [type(refusal) for refusal in refusals] == [BufferError, ucall.Status]
     assert refusals[1] == ucall.Status.ALREADY_EXISTS
@@ -305,3 +324,217 @@ def test_run_refuses_more_than_one_loop_or_any_batch(loopback):
         "endpoints, so poll each loop with take_calls and drain each batch endpoint with take_batches on threads of "
         "your own."
     )
+
+
+def test_reply_parts_path_and_bytes_on_worker(backend, loopback, serving, direct_directory):
+    content = bytes(range(256)) * 32
+    (direct_directory / "frame.bin").write_bytes(content)
+    descriptor = os.open(direct_directory / "frame.bin", os.O_RDONLY | os.O_DIRECT)
+    server = ucall.Server(loopback(reply_directories=[direct_directory]), backend=backend)
+    answers = []
+
+    def send(detached: ucall.DetachedRequest, parts: list):
+        answer = detached.reply_parts(parts, headers=("content-type: application/octet-stream",))
+        answers.append(type(answer))
+        if answer is not None:
+            answer.wait()
+
+    @server.get("/frame")
+    def frame(request: ucall.Request):
+        parts = [b"<", ucall.Path(0, "frame.bin", 256, 512), b"|", ucall.File(descriptor, length=256), b">"]
+        workers.submit(send, request.detach(), parts)
+
+    @server.get("/bytes")
+    def memory(request: ucall.Request):
+        workers.submit(send, request.detach(), [b"in ", memoryview(b"memory")])
+
+    with concurrent.futures.ThreadPoolExecutor(1) as workers, serving(server) as base:
+        client = ucall.Client(connections=1, backend=backend)
+        framed = bytes(client.get(f"{base}/frame").body)
+        memory_only = bytes(client.get(f"{base}/bytes").body)
+    os.close(descriptor)
+    assert framed == b"<" + content[256:768] + b"|" + content[:256] + b">"
+    assert memory_only == b"in memory"
+    assert answers == [ucall.Deferred, type(None)]
+
+
+def test_typed_handler_returning_path_raises(loopback, serving, monkeypatch):
+    server = ucall.Server(loopback())
+    unraisable = []
+    monkeypatch.setattr("sys.unraisablehook", unraisable.append)
+
+    @server.get("/video")
+    def video():
+        return ucall.Path(0, "intro.mp4")
+
+    with serving(server) as base:
+        assert ucall.Client(connections=1).get(f"{base}/video").status_code == 500
+    assert [(type(report.exc_value), str(report.exc_value)) for report in unraisable] == [
+        (
+            TypeError,
+            "a handler returned a ucall.Path, which may defer, so send it with DetachedRequest.reply_parts on "
+            "another thread",
+        )
+    ]
+
+
+def test_deferred_await_and_wait(backend, loopback, serving, direct_directory):
+    (direct_directory / "note.txt").write_bytes(b"deferred note")
+    server = ucall.Server(loopback(reply_directories=[direct_directory]), backend=backend)
+    finished = {}
+
+    def send(detached: ucall.DetachedRequest, name: str, waiting: str):
+        deferred = detached.reply_parts([ucall.Path(0, name)])
+        try:
+            if waiting == "await":
+
+                async def finish():
+                    await deferred
+
+                asyncio.run(finish())
+            else:
+                deferred.wait()
+        except ucall.Error as error:
+            finished[name, waiting] = error.status
+        else:
+            finished[name, waiting] = deferred.status()
+
+    @server.get("/{name}/{waiting}")
+    def note(request: ucall.Request):
+        name, waiting = request.path_parameter("name"), request.path_parameter("waiting")
+        workers.submit(send, request.detach(), name, waiting)
+
+    with concurrent.futures.ThreadPoolExecutor(1) as workers, serving(server) as base:
+        client = ucall.Client(connections=1, backend=backend)
+        replies = [
+            client.get(f"{base}/{name}/{waiting}")
+            for name in ("note.txt", "missing.txt")
+            for waiting in ("await", "wait")
+        ]
+        workers.shutdown()
+    assert [(reply.status_code, bytes(reply.body)) for reply in replies[:2]] == [(200, b"deferred note")] * 2
+    assert [reply.status_code for reply in replies[2:]] == [404, 404]
+    assert finished == {
+        ("note.txt", "await"): ucall.Status.SUCCESS,
+        ("note.txt", "wait"): ucall.Status.SUCCESS,
+        ("missing.txt", "await"): ucall.Status.NOT_FOUND,
+        ("missing.txt", "wait"): ucall.Status.NOT_FOUND,
+    }
+
+
+def test_body_chunks_on_worker(backend, loopback, serving):
+    server = ucall.Server(loopback(), backend=backend)
+    payload = os.urandom(1 << 22)
+    observed = []
+
+    def receive(detached: ucall.DetachedRequest):
+        digest = hashlib.sha256()
+        chunks = detached.body_chunks()
+        first = next(chunks)
+        digest.update(first)
+        for chunk in chunks:
+            digest.update(chunk)
+        try:
+            first.tobytes()
+        except ValueError:
+            observed.append("released")
+        detached.reply(digest.digest())
+
+    @server.post("/upload", body=ucall.BodyDelivery.STREAMED)
+    def upload(request: ucall.Request):
+        workers.submit(receive, request.detach())
+
+    with concurrent.futures.ThreadPoolExecutor(1) as workers, serving(server) as base:
+        client = ucall.Client(connections=1, backend=backend)
+        response = client.post(f"{base}/upload", payload)
+        workers.shutdown()
+    assert bytes(response.body) == hashlib.sha256(payload).digest()
+    assert observed == ["released"]
+
+
+def test_parts_pin_the_request(backend, loopback, serving):
+    server = ucall.Server(loopback(), backend=backend)
+    body = (
+        b"--frontier\r\n"
+        b'Content-Disposition: form-data; name="caption"\r\n\r\n'
+        b"sunset\r\n"
+        b"--frontier\r\n"
+        b'Content-Disposition: form-data; name="image"; filename="a.png"\r\n'
+        b"Content-Type: image/png\r\n\r\n"
+        b"\x89PNG\r\n"
+        b"--frontier--\r\n"
+    )
+    held = []
+    arrived = threading.Event()
+
+    @server.post("/upload")
+    def upload(request: ucall.Request):
+        held.append(request.parts)
+        arrived.set()
+
+    with serving(server) as base:
+        replies = []
+
+        def call():
+            client = ucall.Client(connections=1, backend=backend)
+            headers = ("content-type: multipart/form-data; boundary=frontier",)
+            replies.append(client.post(f"{base}/upload", body, headers=headers).status_code)
+
+        caller = threading.Thread(target=call)
+        caller.start()
+        assert arrived.wait(timeout=10)
+        observed = [(part.name, part.content_type, bytes(part.data)) for part in held[0]]
+        # The handler returned and dropped the request, which its parts keep unanswered.
+        caller.join(timeout=0.2)
+        assert caller.is_alive()
+        held.clear()
+        caller.join()
+    assert observed == [("caption", "", b"sunset"), ("image", "image/png", b"\x89PNG")]
+    assert replies == [500]
+
+
+def test_body_keyword_on_decorators(loopback, serving):
+    server = ucall.Server(loopback())
+    seen = {}
+
+    def record(request: ucall.Request):
+        try:
+            seen[request.path] = bytes(request.body)
+        except ucall.Error as error:
+            seen[request.path] = error.status
+        return b""
+
+    server.post("/buffered")(record)
+    server.post("/post", body=ucall.BodyDelivery.STREAMED)(record)
+    server.put("/put", body="streamed")(record)
+    server.route("/route", ucall.Verb.POST, body=ucall.BodyDelivery.STREAMED)(record)
+    server.add_endpoint("/add", "POST", record, body=ucall.BodyDelivery.STREAMED)
+    with serving(server) as base:
+        client = ucall.Client(connections=1)
+        for path in ("/buffered", "/post", "/route", "/add"):
+            client.post(f"{base}{path}")
+        client.put(f"{base}/put")
+    streamed = ucall.Status.INVALID_ARGUMENT
+    assert seen == {"/buffered": b"", "/post": streamed, "/put": streamed, "/route": streamed, "/add": streamed}
+
+
+def test_kk_interface(backend, loopback, serving):
+    server_private, server_public = ucall.generate_noise_keypair()
+    client_private, client_public = ucall.generate_noise_keypair()
+    stranger_private, _ = ucall.generate_noise_keypair()
+    secure = loopback(security=ucall.Security.NOISE_KK, private_key=server_private, noise_peer_key=client_public)
+    assert secure.noise_peer_key == client_public
+    server = ucall.Server(secure, backend=backend)
+
+    @server.get("/peer")
+    def peer(request: ucall.Request):
+        return request.peer[1]
+
+    with serving(server):
+        client = ucall.Client(connections=1, backend=backend)
+        url = f"http+noise://{server.addresses[0]}/peer"
+        known = {"security": ucall.Security.NOISE_KK, "server_key": server_public}
+        admitted = bytes(client.get(url, client_key=client_private, **known).body)
+        with pytest.raises(ucall.Error):
+            client.get(url, client_key=stranger_private, max_retries=1, **known)
+    assert admitted == client_public

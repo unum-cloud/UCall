@@ -1,7 +1,17 @@
-//! Loopback servers polled by scoped threads, and the clients that call them, for the suites.
+//! Loopback servers polled by scoped threads, the clients that call them, and the unbuffered
+//! files replies send, for the suites.
+//!
+//! File: rust/testing.rs
+//! Author: Ash Vardanian
+//! Date: October 25, 2026
+
+use std::fs::{File, OpenOptions};
+use std::os::unix::fs::OpenOptionsExt;
+use std::path::{Path, PathBuf};
+use std::sync::mpsc::{self, Receiver};
 
 use crate::client::{Client, ClientOptions};
-use crate::server::{Interface, Server};
+use crate::server::{DetachedRequest, Interface, Request, Server};
 
 /// Stops the server when dropped, so a failed assertion still releases the polling threads.
 pub struct Stopping<'server>(pub &'server Server);
@@ -42,4 +52,37 @@ pub fn client(connections: usize) -> Client {
         ..Default::default()
     })
     .unwrap()
+}
+
+/// A handler detaching every request into the returned receiver, for a worker to answer.
+pub fn detaching() -> (
+    impl Fn(Request) + Send + Sync + 'static,
+    Receiver<DetachedRequest>,
+) {
+    let (handed, received) = mpsc::channel();
+    let handler = move |request: Request| handed.send(request.detach()).unwrap();
+    (handler, received)
+}
+
+/// An empty directory beside the test binary, inside the build tree, since file parts read
+/// unbuffered and tmpfs refuses that.
+pub fn direct_directory(name: &str) -> PathBuf {
+    let directory = std::env::current_exe().unwrap().with_file_name(name);
+    let _ = std::fs::remove_dir_all(&directory);
+    std::fs::create_dir_all(&directory).unwrap();
+    directory
+}
+
+/// Opens `path` for the unbuffered reads a file part requires.
+pub fn open_direct(path: &Path) -> File {
+    OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(path)
+        .unwrap()
+}
+
+/// `length` bytes cycling through a prime period, so a misplaced range shows.
+pub fn pattern(length: usize) -> Vec<u8> {
+    (0..length).map(|index| (index % 251) as u8).collect()
 }

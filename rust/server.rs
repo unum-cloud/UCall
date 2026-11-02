@@ -12,23 +12,28 @@
 //! Date: October 25, 2026
 
 // The C mirror keeps the C spelling of every name.
-#![allow(non_camel_case_types)]
+#![allow(non_camel_case_types, non_upper_case_globals)]
 
 use core::ffi::{c_int, c_void};
+use core::marker::PhantomData;
 use core::mem::ManuallyDrop;
+use core::ops::Deref;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use std::os::fd::{AsRawFd, BorrowedFd};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::types::{
-    check, fail, lend_authorizer, microseconds, pending_outcome, silent_log, ucall_bytes_view_t,
-    ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t, ucall_io_backend_t,
-    ucall_log_t, ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t,
-    ucall_received_http_request_t, ucall_security_mode_t, ucall_server_t,
-    ucall_status_connection_closed_k, ucall_status_success_k, ucall_verb_t, view, viewed, Backend,
-    BytesView, CPUClass, HTTPStatus, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb,
+    check, fail, lend_authorizer, lend_log, microseconds, pending_outcome, ucall_body_delivery_t,
+    ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t,
+    ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t,
+    ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t,
+    ucall_security_mode_t, ucall_server_t, ucall_status_connection_closed_k,
+    ucall_status_deferred_k, ucall_status_success_k, ucall_status_t, ucall_verb_t, view, viewed,
+    Backend, BodyDelivery, BytesView, CPUClass, Deferred, HTTPStatus, Log, NoiseKey,
+    PeerAuthorizer, Result, Security, Status, Verb,
 };
 
 // region: Raw Declarations
@@ -144,7 +149,7 @@ struct ucall_server_add_http_endpoint_t {
     verb: ucall_verb_t,
     callback: ucall_received_http_request_callback_t,
     context: *mut c_void,
-    body_delivery: c_int,
+    body_delivery: ucall_body_delivery_t,
 }
 
 #[repr(C)]
@@ -219,6 +224,110 @@ struct ucall_server_reply_error_t {
     message: ucall_bytes_view_t,
 }
 
+#[repr(C)]
+struct ucall_server_request_path_segment_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    index: usize,
+    segment: *mut ucall_bytes_view_t,
+}
+
+#[repr(C)]
+struct ucall_server_request_body_chunk_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    data: *mut ucall_bytes_view_t,
+}
+
+#[repr(C)]
+struct ucall_server_request_part_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    index: usize,
+    name: *mut ucall_bytes_view_t,
+    content_type: *mut ucall_bytes_view_t,
+    data: *mut ucall_bytes_view_t,
+}
+
+type ucall_reply_part_kind_t = c_int;
+
+const ucall_reply_part_bytes_k: ucall_reply_part_kind_t = 0;
+const ucall_reply_part_file_k: ucall_reply_part_kind_t = 1;
+const ucall_reply_part_path_k: ucall_reply_part_kind_t = 2;
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ucall_file_range_t {
+    file_descriptor: c_int,
+    offset: u64,
+    length: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ucall_path_range_t {
+    directory_index: usize,
+    relative_path: ucall_bytes_view_t,
+    offset: u64,
+    length: u64,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+union ucall_reply_part_data_t {
+    bytes: ucall_bytes_view_t,
+    file: ucall_file_range_t,
+    path: ucall_path_range_t,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct ucall_reply_part_t {
+    kind: ucall_reply_part_kind_t,
+    data: ucall_reply_part_data_t,
+}
+
+#[repr(C)]
+struct ucall_server_reply_vectored_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    http_status: ucall_http_status_t,
+    headers: *const ucall_bytes_view_t,
+    headers_count: usize,
+    parts: *const ucall_reply_part_t,
+    parts_count: usize,
+}
+
+#[repr(C)]
+struct ucall_server_reply_begin_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    http_status: ucall_http_status_t,
+    headers: *const ucall_bytes_view_t,
+    headers_count: usize,
+}
+
+#[repr(C)]
+struct ucall_server_reply_append_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    parts: *const ucall_reply_part_t,
+    parts_count: usize,
+}
+
+#[repr(C)]
+struct ucall_server_reply_end_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+}
+
 extern "C" {
     fn ucall_server_init(arguments: *mut ucall_server_init_t);
     fn ucall_server_free(server: ucall_server_t);
@@ -238,13 +347,28 @@ extern "C" {
         request: ucall_received_http_request_t,
     ) -> ucall_verb_t;
     fn ucall_server_request_path(arguments: *mut ucall_server_request_path_t);
+    fn ucall_server_request_path_segments_count(
+        server: ucall_server_t,
+        request: ucall_received_http_request_t,
+    ) -> usize;
+    fn ucall_server_request_path_segment(arguments: *mut ucall_server_request_path_segment_t);
     fn ucall_server_request_path_parameter(arguments: *mut ucall_server_request_path_parameter_t);
     fn ucall_server_request_query_parameter(arguments: *mut ucall_server_request_query_parameter_t);
     fn ucall_server_request_header(arguments: *mut ucall_server_request_header_t);
     fn ucall_server_request_peer(arguments: *mut ucall_server_request_peer_t);
     fn ucall_server_request_body(arguments: *mut ucall_server_request_body_t);
+    fn ucall_server_request_body_chunk(arguments: *mut ucall_server_request_body_chunk_t);
+    fn ucall_server_request_parts_count(
+        server: ucall_server_t,
+        request: ucall_received_http_request_t,
+    ) -> usize;
+    fn ucall_server_request_part(arguments: *mut ucall_server_request_part_t);
     fn ucall_server_reply_content(arguments: *mut ucall_server_reply_content_t);
     fn ucall_server_reply_error(arguments: *mut ucall_server_reply_error_t);
+    fn ucall_server_reply_vectored(arguments: *mut ucall_server_reply_vectored_t);
+    fn ucall_server_reply_begin(arguments: *mut ucall_server_reply_begin_t);
+    fn ucall_server_reply_append(arguments: *mut ucall_server_reply_append_t);
+    fn ucall_server_reply_end(arguments: *mut ucall_server_reply_end_t);
 }
 
 // endregion: Raw Declarations
@@ -273,10 +397,13 @@ pub struct Interface {
     device_name: Option<String>,
     security: Security,
     private_key: Option<NoiseKey>,
+    noise_peer_key: Option<NoiseKey>,
     peer_authorizer: Option<Arc<PeerAuthorizer>>,
     event_loops: usize,
     connections: usize,
     pipelined_requests: usize,
+    max_request_bytes: usize,
+    reply_directories: Vec<String>,
 }
 
 impl Interface {
@@ -288,10 +415,13 @@ impl Interface {
             device_name: None,
             security: Security::None,
             private_key: None,
+            noise_peer_key: None,
             peer_authorizer: None,
             event_loops: 0,
             connections: 1024,
             pipelined_requests: 0,
+            max_request_bytes: 0,
+            reply_directories: Vec::new(),
         }
     }
 
@@ -302,10 +432,16 @@ impl Interface {
     }
 
     /// Requires a Noise handshake under this server identity; `NoiseXX` also needs an authorizer,
-    /// and `NoiseKK` is for clients only.
+    /// and `NoiseKK` the initiator's key.
     pub fn security(mut self, security: Security, private_key: NoiseKey) -> Self {
         self.security = security;
         self.private_key = Some(private_key);
+        self
+    }
+
+    /// The one initiator's static public key a `NoiseKK` interface admits, known in advance.
+    pub fn noise_peer_key(mut self, public_key: NoiseKey) -> Self {
+        self.noise_peer_key = Some(public_key);
         self
     }
 
@@ -338,6 +474,54 @@ impl Interface {
         self.pipelined_requests = count;
         self
     }
+
+    /// The largest request head and buffered body; past it the reply is 413 and the connection
+    /// closes. Zero takes the largest receive buffer the kernel grants a socket, and streamed
+    /// bodies are bounded by the handler's pulls instead.
+    pub fn max_request_bytes(mut self, bytes: usize) -> Self {
+        self.max_request_bytes = bytes;
+        self
+    }
+
+    /// Directories the [`ReplyPart::Path`] parts of replies to this interface's requests resolve
+    /// beneath, by position; each is opened when the server starts, failing it if one cannot be.
+    pub fn reply_directories(
+        mut self,
+        directories: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        self.reply_directories = directories.into_iter().map(Into::into).collect();
+        self
+    }
+}
+
+/// What a server runs on and reports through, beside its interfaces.
+#[derive(Clone, Default)]
+pub struct ServerOptions {
+    /// The requested I/O backend, failing rather than substituting when it is unavailable.
+    pub backend: Backend,
+    /// A ceiling on the CPU class, failing where the CPU does not run it; `None` takes what the
+    /// constructing thread's CPU offers.
+    pub cpu_class: Option<CPUClass>,
+    /// Where log lines go; `None` keeps the server silent.
+    pub log: Option<Log>,
+    /// Where StatsD datagrams go; `None` sends none.
+    pub metrics: Option<Metrics>,
+}
+
+/// The StatsD endpoint a server sends each event loop's counters and sampled request latencies
+/// to, as UDP datagrams.
+#[derive(Clone, Debug, Default)]
+pub struct Metrics {
+    /// The endpoint in "host:port" form.
+    pub address: String,
+    /// The fraction of finished requests whose latency is reported, in (0, 1]; zero means 1.
+    pub sample_rate: f32,
+    /// The metric name prefix; empty means "ucall".
+    pub prefix: String,
+    /// Tags on every metric, each "key:value".
+    pub tags: Vec<String>,
+    /// The time between one event loop's datagrams; zero means one second.
+    pub interval: Duration,
 }
 
 /// The library's server handle and what its configuration points at, shared by the [`Server`],
@@ -345,8 +529,10 @@ impl Interface {
 struct ServerCore {
     raw: ucall_server_t,
     resolved: ucall_server_config_t,
-    // Interface callback contexts must outlive the handle, which `Drop` frees before its fields.
+    // Interface and log callback contexts must outlive the handle, which `Drop` frees before its
+    // fields.
     _authorizers: Vec<Option<Arc<PeerAuthorizer>>>,
+    _log: Option<Box<Log>>,
 }
 
 // The handle's stop, statistics, request, and reply entry points are thread-safe; polling ones
@@ -453,26 +639,34 @@ unsafe impl Sync for Server {}
 impl Server {
     /// Starts a server answering on `interfaces`, with the automatic backend and CPU class.
     pub fn new(interfaces: &[Interface]) -> Result<Server> {
-        Server::with_options(interfaces, Backend::Automatic, None)
+        Server::with_options(interfaces, ServerOptions::default())
     }
 
-    /// Starts a server answering on `interfaces` with an explicit backend and an optional CPU class
-    /// ceiling, failing rather than substituting when the backend is unavailable or the CPU does not
-    /// run the class.
-    pub fn with_options(
-        interfaces: &[Interface],
-        backend: Backend,
-        cpu_class: Option<CPUClass>,
-    ) -> Result<Server> {
-        // The contexts point into this vector, which the core keeps unchanged until the free.
+    /// Starts a server answering on `interfaces` with the backend, CPU class, log sink and StatsD
+    /// endpoint `options` name.
+    pub fn with_options(interfaces: &[Interface], options: ServerOptions) -> Result<Server> {
+        // The contexts point into this vector and box, which the core keeps until the free.
         let authorizers: Vec<Option<Arc<PeerAuthorizer>>> = interfaces
             .iter()
             .map(|interface| interface.peer_authorizer.clone())
             .collect();
+        let log = options.log.map(Box::new);
+        // The library copies the directories, keys and metric names during initialization.
+        let directories: Vec<Vec<ucall_bytes_view_t>> = interfaces
+            .iter()
+            .map(|interface| {
+                let directories = &interface.reply_directories;
+                directories
+                    .iter()
+                    .map(|path| view(path.as_bytes()))
+                    .collect()
+            })
+            .collect();
         let raw_interfaces: Vec<ucall_network_interface_t> = interfaces
             .iter()
             .zip(&authorizers)
-            .map(|(interface, authorizer)| {
+            .zip(&directories)
+            .map(|((interface, authorizer), directories)| {
                 let (peer_authorizer, peer_authorizer_context) = lend_authorizer(authorizer);
                 ucall_network_interface_t {
                     address: view(interface.address.as_bytes()),
@@ -482,31 +676,40 @@ impl Server {
                         .private_key
                         .as_ref()
                         .map_or(ptr::null(), ptr::from_ref),
-                    noise_peer_key: ptr::null(),
+                    noise_peer_key: interface
+                        .noise_peer_key
+                        .as_ref()
+                        .map_or(ptr::null(), ptr::from_ref),
                     peer_authorizer,
                     peer_authorizer_context,
                     event_loops: interface.event_loops,
                     max_concurrent_connections: interface.connections,
                     max_pipelined_requests: interface.pipelined_requests,
-                    max_request_bytes: 0,
-                    reply_directories: ptr::null(),
-                    reply_directories_count: 0,
+                    max_request_bytes: interface.max_request_bytes,
+                    reply_directories: directories.as_ptr(),
+                    reply_directories_count: directories.len(),
                 }
             })
             .collect();
 
+        let metrics = options.metrics.unwrap_or_default();
+        let tags: Vec<ucall_bytes_view_t> = metrics
+            .tags
+            .iter()
+            .map(|tag| view(tag.as_bytes()))
+            .collect();
         let config = ucall_server_config_t {
             interfaces: raw_interfaces.as_ptr(),
             interfaces_count: raw_interfaces.len(),
-            log: silent_log(),
-            metrics_address: view(&[]),
-            metrics_sample_rate: 0.0,
-            metrics_prefix: view(&[]),
-            metrics_tags: ptr::null(),
-            metrics_tags_count: 0,
-            metrics_interval_microseconds: 0,
-            backend: backend.to_raw(),
-            cpu_class: CPUClass::to_raw(cpu_class),
+            log: lend_log(&log),
+            metrics_address: view(metrics.address.as_bytes()),
+            metrics_sample_rate: metrics.sample_rate,
+            metrics_prefix: view(metrics.prefix.as_bytes()),
+            metrics_tags: tags.as_ptr(),
+            metrics_tags_count: tags.len(),
+            metrics_interval_microseconds: microseconds(metrics.interval),
+            backend: options.backend.to_raw(),
+            cpu_class: CPUClass::to_raw(options.cpu_class),
         };
         let mut raw: ucall_server_t = ptr::null_mut();
         let mut resolved = config;
@@ -522,6 +725,7 @@ impl Server {
             raw,
             resolved,
             _authorizers: authorizers,
+            _log: log,
         };
         check(outcome)?;
 
@@ -572,6 +776,19 @@ impl Server {
         verb: Verb,
         handler: impl Fn(Request) + Send + Sync + 'static,
     ) -> Result<()> {
+        self.route_with(path, verb, BodyDelivery::Buffered, handler)
+    }
+
+    /// Routes like [`Server::route`], running `handler` once the body is buffered, or with
+    /// [`BodyDelivery::Streamed`] as soon as the headers arrived, the body still to be pulled
+    /// through [`DetachedRequest::body_chunk`].
+    pub fn route_with(
+        &mut self,
+        path: &str,
+        verb: Verb,
+        delivery: BodyDelivery,
+        handler: impl Fn(Request) + Send + Sync + 'static,
+    ) -> Result<()> {
         let route = Box::into_raw(Box::new(Route {
             server: Arc::clone(&self.core),
             handler: Box::new(handler),
@@ -584,7 +801,7 @@ impl Server {
             verb: verb.to_raw(),
             callback: Some(route_trampoline),
             context: route.cast(),
-            body_delivery: 0,
+            body_delivery: delivery.to_raw(),
         };
         unsafe { ucall_server_add_http_endpoint(&mut arguments) };
         let registered = check(outcome);
@@ -792,8 +1009,24 @@ pub struct EventLoopStatistics {
     pub zero_copy_sends: u64,
     /// Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does.
     pub zero_copy_fallbacks: u64,
+    /// Sends that copied instead of pinning: the socket was demoted, refused zero-copy, or had no
+    /// room to track one.
+    pub copying_sends: u64,
+    /// File reads handed to the kernel to finish later: io_uring, Linux or FreeBSD AIO, or
+    /// overlapped reads.
+    pub file_reads_asynchronous: u64,
+    /// File reads the loop issued itself and blocked on, as the posix backend and macOS do.
+    pub file_reads_blocking: u64,
+    /// Bytes the kernel reported read from files into the loop's file windows.
+    pub bytes_read: u64,
     /// File reads submitted while an earlier window of the same stream waited to send or sent.
     pub file_window_overlaps: u64,
+    /// Lingering closes reset at their deadline because the kernel still held what they sent.
+    pub linger_resets: u64,
+    /// Passes the loop made over a ready connection, each advancing it as far as it goes.
+    pub ready_passes: u64,
+    /// Replied exchanges the loop took from its queue to adopt their reply segments.
+    pub replied_dequeues: u64,
     /// Requests the loop answered itself with 400, 404, 413, 501 or 503.
     pub refused_requests: u64,
     /// Connections whose Noise handshake failed.
@@ -1160,21 +1393,100 @@ impl Request {
         peer
     }
 
-    /// Hands the handle to one reply call, which consumes it on success and on a closed
-    /// connection; any other failure leaves it retained, so dropping it answers 500 instead.
-    fn finish(
+    /// Path components in order, as sent and still percent-encoded.
+    pub fn path_segments_count(&self) -> usize {
+        unsafe { ucall_server_request_path_segments_count(self.server.raw, self.raw) }
+    }
+
+    /// Path component `index`, counting from zero, or `None` past the last one.
+    pub fn path_segment(&self, index: usize) -> Option<&[u8]> {
+        let mut segment = view(&[]);
+        let mut outcome = pending_outcome();
+        let mut arguments = ucall_server_request_path_segment_t {
+            server: self.server.raw,
+            outcome: &mut outcome,
+            request: self.raw,
+            index,
+            segment: &mut segment,
+        };
+        unsafe { ucall_server_request_path_segment(&mut arguments) };
+        check(outcome).ok().map(|()| unsafe { viewed(segment) })
+    }
+
+    /// Parts in a `multipart/form-data` body, zero for any other body.
+    pub fn parts_count(&self) -> usize {
+        unsafe { ucall_server_request_parts_count(self.server.raw, self.raw) }
+    }
+
+    /// Part `index` of a `multipart/form-data` body, its payload undecoded.
+    ///
+    /// Fails with [`Status::InvalidArgument`] past the last part, and with [`Status::Malformed`]
+    /// when the body is no well-formed multipart body.
+    pub fn part(&self, index: usize) -> Result<RequestPart<'_>> {
+        let (mut name, mut content_type, mut data) = (view(&[]), view(&[]), view(&[]));
+        let mut outcome = pending_outcome();
+        let mut arguments = ucall_server_request_part_t {
+            server: self.server.raw,
+            outcome: &mut outcome,
+            request: self.raw,
+            index,
+            name: &mut name,
+            content_type: &mut content_type,
+            data: &mut data,
+        };
+        unsafe { ucall_server_request_part(&mut arguments) };
+        check(outcome).map(|()| unsafe {
+            RequestPart {
+                name: viewed(name),
+                content_type: viewed(content_type),
+                data: viewed(data),
+            }
+        })
+    }
+
+    /// Hands the request to a thread that may wait, where it gains the replies that may finish
+    /// later; the polling thread itself must never wait on them.
+    pub fn detach(self) -> DetachedRequest {
+        DetachedRequest(self)
+    }
+
+    /// Gives the handle up once a reply call answered `status`: success, deferred and a closed
+    /// connection consume it; any other failure leaves it retained, so dropping it answers 500.
+    fn settle(self, status: ucall_status_t) {
+        if status == ucall_status_success_k
+            || status == ucall_status_deferred_k
+            || status == ucall_status_connection_closed_k
+        {
+            let consumed = ManuallyDrop::new(self);
+            drop(unsafe { ptr::read(&consumed.server) });
+        }
+    }
+
+    /// Hands the handle to one reply call that is final on return.
+    fn finish_final(
         self,
         reply: impl FnOnce(ucall_server_t, ucall_received_http_request_t, *mut ucall_outcome_t),
     ) -> Result<()> {
         let mut outcome = pending_outcome();
         reply(self.server.raw, self.raw, &mut outcome);
-        if outcome.status == ucall_status_success_k
-            || outcome.status == ucall_status_connection_closed_k
-        {
-            let consumed = ManuallyDrop::new(self);
-            drop(unsafe { ptr::read(&consumed.server) });
-        }
+        self.settle(unsafe { ucall_outcome_status(&mut outcome) });
         check(outcome)
+    }
+
+    /// Hands the handle to one reply call that may finish later, answering the outcome while it
+    /// is deferred.
+    fn finish<'f>(
+        self,
+        reply: impl FnOnce(ucall_server_t, ucall_received_http_request_t, *mut ucall_outcome_t),
+    ) -> Result<Option<Deferred<'f>>> {
+        let deferred = Deferred::pending();
+        reply(self.server.raw, self.raw, deferred.raw());
+        let status = unsafe { ucall_outcome_status(deferred.raw()) };
+        self.settle(status);
+        match status {
+            ucall_status_deferred_k => Ok(Some(deferred)),
+            _ => deferred.wait().map(|()| None),
+        }
     }
 
     /// Replies with `status`, full header lines like "content-type: text/plain", and `body`.
@@ -1183,7 +1495,7 @@ impl Request {
     /// request and reports [`Status::ConnectionClosed`]; any other failure keeps it, and dropping
     /// it then answers 500.
     pub fn reply(self, status: HTTPStatus, headers: &[BytesView<'_>], body: &[u8]) -> Result<()> {
-        self.finish(|server, request, outcome| {
+        self.finish_final(|server, request, outcome| {
             let mut arguments = ucall_server_reply_content_t {
                 server,
                 outcome,
@@ -1199,7 +1511,7 @@ impl Request {
 
     /// Replies with an error `status`, 400 or above, and a plain-text `message`.
     pub fn reply_error(self, status: HTTPStatus, message: &str) -> Result<()> {
-        self.finish(|server, request, outcome| {
+        self.finish_final(|server, request, outcome| {
             let mut arguments = ucall_server_reply_error_t {
                 server,
                 outcome,
@@ -1226,15 +1538,310 @@ impl Drop for Request {
     }
 }
 
+/// One part of a `multipart/form-data` request body, borrowing the received bytes.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RequestPart<'request> {
+    /// The name its `Content-Disposition` gives.
+    pub name: &'request [u8],
+    /// Its `Content-Type`, empty when absent.
+    pub content_type: &'request [u8],
+    /// Its payload, undecoded.
+    pub data: &'request [u8],
+}
+
+/// One part of a reply body, as `ucall_reply_part_t` tags it.
+#[derive(Clone, Copy, Debug)]
+pub enum ReplyPart<'f> {
+    /// Bytes in memory, copied before the call returns.
+    Bytes(&'f [u8]),
+    /// A range of a regular file opened with `O_DIRECT`, which the event loop reads unbuffered
+    /// after the call returns, so it stays open until the reply is final.
+    File {
+        /// The open file, borrowed and never closed by UCall.
+        file: BorrowedFd<'f>,
+        /// The range's first byte.
+        offset: u64,
+        /// The range's byte count; zero sends through the end of the file.
+        length: u64,
+    },
+    /// A range of a file the event loop opens beneath one of the interface's
+    /// [`Interface::reply_directories`], and closes once it is sent.
+    Path {
+        /// The position of the directory among the interface's reply directories.
+        directory: usize,
+        /// The file beneath it, relative, copied before the call returns.
+        path: &'f [u8],
+        /// The range's first byte.
+        offset: u64,
+        /// The range's byte count; zero sends through the end of the file.
+        length: u64,
+    },
+}
+
+impl ReplyPart<'_> {
+    /// Lays the parts out as the tagged array the library reads.
+    fn raw_array(parts: &[ReplyPart<'_>]) -> Vec<ucall_reply_part_t> {
+        parts
+            .iter()
+            .map(|part| match *part {
+                ReplyPart::Bytes(bytes) => ucall_reply_part_t {
+                    kind: ucall_reply_part_bytes_k,
+                    data: ucall_reply_part_data_t { bytes: view(bytes) },
+                },
+                ReplyPart::File {
+                    file,
+                    offset,
+                    length,
+                } => ucall_reply_part_t {
+                    kind: ucall_reply_part_file_k,
+                    data: ucall_reply_part_data_t {
+                        file: ucall_file_range_t {
+                            file_descriptor: file.as_raw_fd(),
+                            offset,
+                            length,
+                        },
+                    },
+                },
+                ReplyPart::Path {
+                    directory,
+                    path,
+                    offset,
+                    length,
+                } => ucall_reply_part_t {
+                    kind: ucall_reply_part_path_k,
+                    data: ucall_reply_part_data_t {
+                        path: ucall_path_range_t {
+                            directory_index: directory,
+                            relative_path: view(path),
+                            offset,
+                            length,
+                        },
+                    },
+                },
+            })
+            .collect()
+    }
+}
+
+/// A request taken off its polling thread, and the only owner of the verbs that may finish
+/// later: [`DetachedRequest::reply_parts`], [`DetachedRequest::reply_stream`] and
+/// [`DetachedRequest::body_chunk`].
+///
+/// It reads like the [`Request`] it came from, moves to any thread, and answers 500 when dropped
+/// unreplied. Its replies hand back a [`Deferred`] while a file or path part still sends, and
+/// waiting on one belongs off the polling thread, as that thread is the one sending it.
+///
+/// ```
+/// use std::sync::mpsc;
+/// use ucall::*;
+///
+/// let (handed, received) = mpsc::channel::<DetachedRequest>();
+/// let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
+/// server.get("/clip", move |request: Request| handed.send(request.detach()).unwrap())?;
+/// let address = server.address(0).unwrap().to_owned();
+///
+/// let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
+/// std::thread::scope(|scope| {
+///     scope.spawn(|| server.take_calls(0));
+///     scope.spawn(move || {
+///         let detached = received.recv().unwrap();
+///         let parts = [ReplyPart::Bytes(b"frame")];
+///         if let Ok(Some(deferred)) = detached.reply_parts(HTTPStatus::OK, &[], &parts) {
+///             let _ = deferred.wait(); // or: deferred.await
+///         }
+///     });
+///     let response = client.get(format!("http://{address}/clip"));
+///     server.stop();
+///     assert_eq!(response?.body(), b"frame");
+///     Ok::<(), Error>(())
+/// })?;
+/// # Ok::<(), ucall::Error>(())
+/// ```
+pub struct DetachedRequest(Request);
+
+impl Deref for DetachedRequest {
+    type Target = Request;
+
+    /// Reads the request through the verbs [`Request`] has.
+    fn deref(&self) -> &Request {
+        &self.0
+    }
+}
+
+impl DetachedRequest {
+    /// Replies with `status`, full header lines, and `parts` concatenated into the body, its
+    /// Content-Length measured; `None` once final, and a [`Deferred`] while a file or path part
+    /// still sends.
+    ///
+    /// A part failing before the head left replaces the reply with 404 for a missing, unreadable
+    /// or irregular file, 416 for a range past its end, or 500, and the [`Deferred`] reports the
+    /// cause. A refusal on return keeps the request, and dropping it then answers 500.
+    pub fn reply_parts<'f>(
+        self,
+        status: HTTPStatus,
+        headers: &[BytesView<'_>],
+        parts: &[ReplyPart<'f>],
+    ) -> Result<Option<Deferred<'f>>> {
+        let raw_parts = ReplyPart::raw_array(parts);
+        self.0.finish(|server, request, outcome| {
+            let mut arguments = ucall_server_reply_vectored_t {
+                server,
+                outcome,
+                request,
+                http_status: status.0,
+                headers: BytesView::raw_array(headers),
+                headers_count: headers.len(),
+                parts: raw_parts.as_ptr(),
+                parts_count: raw_parts.len(),
+            };
+            unsafe { ucall_server_reply_vectored(&mut arguments) }
+        })
+    }
+
+    /// Sends the status line and header lines, and opens a body appended part by part: chunked,
+    /// or of the length a Content-Length header declares.
+    ///
+    /// A closed connection still consumes the request and reports [`Status::ConnectionClosed`];
+    /// any other failure keeps it, and dropping it then answers 500.
+    pub fn reply_stream<'f>(
+        self,
+        status: HTTPStatus,
+        headers: &[BytesView<'_>],
+    ) -> Result<ReplyStream<'f>> {
+        let mut outcome = pending_outcome();
+        let mut arguments = ucall_server_reply_begin_t {
+            server: self.0.server.raw,
+            outcome: &mut outcome,
+            request: self.0.raw,
+            http_status: status.0,
+            headers: BytesView::raw_array(headers),
+            headers_count: headers.len(),
+        };
+        unsafe { ucall_server_reply_begin(&mut arguments) };
+        let begun = unsafe { ucall_outcome_status(&mut outcome) };
+        if begun != ucall_status_success_k && begun != ucall_status_connection_closed_k {
+            check(outcome)?;
+        }
+        let request = ManuallyDrop::new(self.0);
+        // A closed connection still takes its end, which dropping the stream sends.
+        let stream = ReplyStream {
+            server: unsafe { ptr::read(&request.server) },
+            raw: request.raw,
+            files: PhantomData,
+        };
+        check(outcome).map(|()| stream)
+    }
+
+    /// Pulls the body bytes decoded since the last pull, waiting for them to arrive; empty once
+    /// the body ended. On a [`BodyDelivery::Buffered`] endpoint the first pull is the whole body.
+    ///
+    /// On the polling thread, where nothing can arrive while it runs, a pull finding nothing
+    /// fails with [`Status::WouldBlock`] instead. A body cut short fails with
+    /// [`Status::ConnectionClosed`], and a malformed one with [`Status::Malformed`].
+    pub fn body_chunk(&mut self) -> Result<&[u8]> {
+        let mut data = view(&[]);
+        let mut outcome = pending_outcome();
+        // One pointer each, as the event loop writes them after the call returns.
+        let (data_pointer, outcome_pointer) = (ptr::addr_of_mut!(data), ptr::addr_of_mut!(outcome));
+        let mut arguments = ucall_server_request_body_chunk_t {
+            server: self.0.server.raw,
+            outcome: outcome_pointer,
+            request: self.0.raw,
+            data: data_pointer,
+        };
+        unsafe {
+            ucall_server_request_body_chunk(&mut arguments);
+            ucall_outcome_wait(outcome_pointer);
+        }
+        check(outcome).map(|()| unsafe { viewed(data) })
+    }
+}
+
+/// A reply whose head left and whose body is appended part by part, from any one thread at a
+/// time, until [`ReplyStream::end`]; dropping it ends it, waiting for its file parts to send.
+///
+/// The descriptors its file parts borrow stay open for `'f`, through the [`Deferred`] its end may
+/// hand back.
+pub struct ReplyStream<'f> {
+    server: Arc<ServerCore>,
+    raw: ucall_received_http_request_t,
+    files: PhantomData<BorrowedFd<'f>>,
+}
+
+// The stream's handle is used by one thread at a time, and its replies may come from any of them.
+unsafe impl Send for ReplyStream<'_> {}
+
+impl<'f> ReplyStream<'f> {
+    /// Queues `parts` on the body together, or none of them.
+    ///
+    /// Fails with [`Status::WouldBlock`], queueing nothing, while the peer lags behind the parts
+    /// already queued; retry once it catches up.
+    pub fn append(&mut self, parts: &[ReplyPart<'f>]) -> Result<()> {
+        let raw_parts = ReplyPart::raw_array(parts);
+        let mut outcome = pending_outcome();
+        let mut arguments = ucall_server_reply_append_t {
+            server: self.server.raw,
+            outcome: &mut outcome,
+            request: self.raw,
+            parts: raw_parts.as_ptr(),
+            parts_count: raw_parts.len(),
+        };
+        unsafe { ucall_server_reply_append(&mut arguments) };
+        check(outcome)
+    }
+
+    /// Ends the body, consuming the request whatever the outcome; `None` once final, and a
+    /// [`Deferred`] while file or path parts still send.
+    ///
+    /// A body short of its declared Content-Length fails with [`Status::Malformed`] and closes
+    /// the connection after the bytes already sent.
+    pub fn end(self) -> Result<Option<Deferred<'f>>> {
+        let stream = ManuallyDrop::new(self);
+        let ended = stream.end_raw();
+        drop(unsafe { ptr::read(&stream.server) });
+        ended
+    }
+
+    fn end_raw(&self) -> Result<Option<Deferred<'f>>> {
+        let deferred = Deferred::pending();
+        let mut arguments = ucall_server_reply_end_t {
+            server: self.server.raw,
+            outcome: deferred.raw(),
+            request: self.raw,
+        };
+        unsafe { ucall_server_reply_end(&mut arguments) };
+        match unsafe { ucall_outcome_status(deferred.raw()) } {
+            ucall_status_deferred_k => Ok(Some(deferred)),
+            _ => deferred.wait().map(|()| None),
+        }
+    }
+}
+
+impl Drop for ReplyStream<'_> {
+    fn drop(&mut self) {
+        drop(self.end_raw());
+    }
+}
+
 // region: Tests
 
 #[cfg(test)]
 mod tests {
+    use core::future::{Future, IntoFuture};
+    use core::pin::pin;
+    use core::task::{Context, Poll, Waker};
+    use std::borrow::Cow;
+    use std::io::{Read, Write};
+    use std::net::{TcpStream, UdpSocket};
+    use std::os::fd::AsFd;
     use std::sync::Mutex;
+    use std::time::Instant;
 
     use super::*;
-    use crate::client::{CallRequest, Client, ClientOptions, Completed};
-    use crate::testing::{client, loopback, serving, Stopping};
+    use crate::client::{CallRequest, Client, ClientOptions, Completed, RequestOptions};
+    use crate::testing::{
+        client, detaching, direct_directory, loopback, open_direct, pattern, serving, Stopping,
+    };
     use crate::types::{derive_noise_public_key, generate_noise_keypair};
 
     #[test]
@@ -1438,6 +2045,401 @@ mod tests {
             assert_eq!(contended.status, Status::Contended);
             scope.spawn(|| server.stop());
             assert_eq!(polling.join().unwrap(), Ok(()));
+        });
+    }
+
+    #[test]
+    fn reply_parts_concatenates_bytes_and_paths() {
+        let directory = direct_directory("reply-parts");
+        let clip = pattern(10_000);
+        std::fs::write(directory.join("clip.bin"), &clip).unwrap();
+        let interface = loopback(1).reply_directories([directory.to_str().unwrap()]);
+        let mut server = Server::new(&[interface]).unwrap();
+        let (handler, received) = detaching();
+        server.get("/clip", handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let parts = [
+                        ReplyPart::Bytes(b"<"),
+                        ReplyPart::Path {
+                            directory: 0,
+                            path: b"clip.bin",
+                            offset: 1000,
+                            length: 5000,
+                        },
+                        ReplyPart::Bytes(b">"),
+                    ];
+                    let detached = received.recv().unwrap();
+                    let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
+                    deferred.expect("a path part defers").wait().unwrap();
+                });
+                let response = client(1).get(format!("http://{address}/clip")).unwrap();
+                let expected = [b"<".as_slice(), &clip[1000..6000], b">"].concat();
+                assert_eq!(response.body(), expected.as_slice());
+            });
+        });
+    }
+
+    #[test]
+    fn path_part_defers_until_sent() {
+        let directory = direct_directory("deferred-paths");
+        let interface = loopback(1).reply_directories([directory.to_str().unwrap()]);
+        let mut server = Server::new(&[interface]).unwrap();
+        let (handler, received) = detaching();
+        server.get("/{name}", handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let missing = ReplyPart::Path {
+                        directory: 0,
+                        path: b"missing.bin",
+                        offset: 0,
+                        length: 0,
+                    };
+                    let detached = received.recv().unwrap();
+                    let deferred = detached
+                        .reply_parts(HTTPStatus::OK, &[], &[missing])
+                        .unwrap();
+                    let mut awaited = pin!(deferred.expect("a path part defers").into_future());
+                    let mut context = Context::from_waker(Waker::noop());
+                    let ended = loop {
+                        match awaited.as_mut().poll(&mut context) {
+                            Poll::Ready(ended) => break ended,
+                            Poll::Pending => std::thread::yield_now(),
+                        }
+                    };
+                    assert_eq!(ended.unwrap_err().status, Status::NotFound);
+                    let detached = received.recv().unwrap();
+                    let parts = [ReplyPart::Bytes(b"final")];
+                    let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
+                    assert!(deferred.is_none());
+                });
+                let mut client = client(1);
+                let missing = client.get(format!("http://{address}/missing")).unwrap();
+                assert_eq!(missing.status_code(), HTTPStatus::NOT_FOUND);
+                let bytes = client.get(format!("http://{address}/bytes")).unwrap();
+                assert_eq!(bytes.body(), b"final");
+            });
+        });
+    }
+
+    #[test]
+    fn detached_request_replies_from_a_worker() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        let (handler, received) = detaching();
+        server.get("/users/{name}", handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let detached = received.recv().unwrap();
+                    let greeting = [b"Hello, ", detached.path_parameter("name").unwrap()].concat();
+                    let parts = [ReplyPart::Bytes(&greeting)];
+                    let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
+                    assert!(deferred.is_none());
+                    drop(received.recv().unwrap());
+                });
+                let mut client = client(1);
+                let replied = client.get(format!("http://{address}/users/ada")).unwrap();
+                assert_eq!(replied.body(), b"Hello, ada");
+                let dropped = client.get(format!("http://{address}/users/bob")).unwrap();
+                assert_eq!(dropped.status_code(), HTTPStatus::INTERNAL_ERROR);
+            });
+        });
+    }
+
+    #[test]
+    fn reply_stream_appends_then_ends() {
+        let directory = direct_directory("reply-stream");
+        let clip = pattern(8192);
+        let path = directory.join("clip.bin");
+        std::fs::write(&path, &clip).unwrap();
+        let file = open_direct(&path);
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        let (handler, received) = detaching();
+        server.get("/stream", handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                let file = &file;
+                scope.spawn(move || {
+                    let detached = received.recv().unwrap();
+                    let mut stream = detached.reply_stream(HTTPStatus::OK, &[]).unwrap();
+                    stream.append(&[ReplyPart::Bytes(b"<")]).unwrap();
+                    let range = ReplyPart::File {
+                        file: file.as_fd(),
+                        offset: 4096,
+                        length: 4096,
+                    };
+                    stream.append(&[range, ReplyPart::Bytes(b">")]).unwrap();
+                    if let Some(deferred) = stream.end().unwrap() {
+                        deferred.wait().unwrap();
+                    }
+                });
+                let response = client(1).get(format!("http://{address}/stream")).unwrap();
+                let expected = [b"<".as_slice(), &clip[4096..], b">"].concat();
+                assert_eq!(response.body(), expected.as_slice());
+            });
+        });
+    }
+
+    #[test]
+    fn streamed_body_pulls_chunks_on_a_worker() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        let (handler, received) = detaching();
+        server
+            .route_with("/upload", Verb::Post, BodyDelivery::Streamed, handler)
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        let body = pattern(4 << 20);
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let mut detached = received.recv().unwrap();
+                    let mut pulled = Vec::new();
+                    loop {
+                        let chunk = detached.body_chunk().unwrap();
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        pulled.extend_from_slice(chunk);
+                    }
+                    let parts = [ReplyPart::Bytes(&pulled)];
+                    let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
+                    assert!(deferred.is_none());
+                });
+                let url = format!("http://{address}/upload");
+                let response = client(1).post(url, body.clone()).unwrap();
+                assert_eq!(response.body(), body.as_slice());
+            });
+        });
+    }
+
+    #[test]
+    fn body_chunk_would_block_on_polling_thread() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        let streamed = BodyDelivery::Streamed;
+        server
+            .route_with("/upload", Verb::Post, streamed, |request: Request| {
+                let mut detached = request.detach();
+                let pulled = detached.body_chunk().map(<[u8]>::len);
+                let answer = format!("{:?}", pulled.map_err(|error| error.status));
+                let parts = [ReplyPart::Bytes(answer.as_bytes())];
+                // Bytes alone are final on return, so nothing waits on this thread.
+                let _ = detached.reply_parts(HTTPStatus::OK, &[], &parts);
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            // Only the head is sent, so the body has no byte decoded when the handler pulls.
+            let mut connection = TcpStream::connect(&address).unwrap();
+            let head = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n";
+            connection.write_all(head).unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut response = Vec::new();
+            let mut buffer = [0; 4096];
+            while !response.ends_with(b"Err(WouldBlock)") {
+                match connection.read(&mut buffer) {
+                    Ok(read) if read != 0 => response.extend_from_slice(&buffer[..read]),
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                    other => panic!(
+                        "answered {:?} then {other:?}",
+                        String::from_utf8_lossy(&response)
+                    ),
+                }
+            }
+            assert!(response.starts_with(b"HTTP/1.1 200"));
+        });
+    }
+
+    #[test]
+    fn multipart_parts_by_index() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        server
+            .post("/form", |request: Request| {
+                let count = request.parts_count();
+                let mut summary = format!("{count};");
+                for index in 0..count {
+                    let part = request.part(index).unwrap();
+                    for field in [part.name, part.content_type, part.data] {
+                        summary.push_str(&String::from_utf8_lossy(field));
+                        summary.push('=');
+                    }
+                    summary.push(';');
+                }
+                let past = request
+                    .part(count)
+                    .map(|_| ())
+                    .map_err(|error| error.status);
+                summary.push_str(&format!("{past:?}"));
+                let _ = request.reply(HTTPStatus::OK, &[], summary.as_bytes());
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        let body = concat!(
+            "--zz\r\nContent-Disposition: form-data; name=\"a\"\r\nContent-Type: text/plain\r\n\r\n",
+            "one\r\n--zz\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n--zz--\r\n",
+        );
+        serving(&server, || {
+            let form: Cow<'static, [u8]> =
+                b"content-type: multipart/form-data; boundary=zz"[..].into();
+            let call = CallRequest {
+                headers: vec![form],
+                ..CallRequest::post(format!("http://{address}/form"), body.as_bytes())
+            };
+            let response = client(1).call(call).unwrap();
+            let summary = String::from_utf8_lossy(response.body()).into_owned();
+            assert_eq!(summary, "2;a=text/plain=one=;b==two=;Err(InvalidArgument)");
+        });
+    }
+
+    #[test]
+    fn path_segments_by_index() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        server
+            .get("/files/{*path}", |request: Request| {
+                let count = request.path_segments_count();
+                let mut body = count.to_string().into_bytes();
+                for index in 0..count {
+                    body.push(b'|');
+                    body.extend_from_slice(request.path_segment(index).unwrap());
+                }
+                if request.path_segment(count).is_none() {
+                    body.extend_from_slice(b"|end");
+                }
+                let _ = request.reply(HTTPStatus::OK, &[], &body);
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            let url = format!("http://{address}/files/a%20b/c?d=e");
+            let response = client(1).get(url).unwrap();
+            assert_eq!(response.body(), b"3|files|a%20b|c|end");
+        });
+    }
+
+    #[test]
+    fn kk_interface_admits_its_peer_key() {
+        let (server_key, server_public_key) = generate_noise_keypair().unwrap();
+        let (client_key, client_public_key) = generate_noise_keypair().unwrap();
+        let (stranger_key, _) = generate_noise_keypair().unwrap();
+        let sealed = loopback(2)
+            .security(Security::NoiseKK, server_key)
+            .noise_peer_key(client_public_key);
+        let mut server = Server::new(&[sealed]).unwrap();
+        server
+            .get("/peer", |request: Request| {
+                let key = request.peer().static_key;
+                let _ = request.reply(HTTPStatus::OK, &[], &key);
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        let call = |key| CallRequest {
+            options: RequestOptions {
+                security: Security::NoiseKK,
+                client_key: Some(key),
+                server_key: Some(server_public_key),
+                ..Default::default()
+            },
+            ..CallRequest::get(format!("http://{address}/peer"))
+        };
+        serving(&server, || {
+            let admitted = client(1).call(call(client_key)).unwrap();
+            assert_eq!(admitted.body(), client_public_key.as_slice());
+            assert!(client(1).call(call(stranger_key)).is_err());
+        });
+    }
+
+    #[test]
+    fn max_request_bytes_answers_413() {
+        let mut server = Server::new(&[loopback(2).max_request_bytes(1024)]).unwrap();
+        server
+            .post("/echo", |request: Request| {
+                let body = request.body().to_vec();
+                let _ = request.reply(HTTPStatus::OK, &[], &body);
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            let url = format!("http://{address}/echo");
+            let fitting = client(1).post(url.clone(), vec![b'x'; 64]).unwrap();
+            assert_eq!(fitting.status_code(), HTTPStatus::OK);
+            let oversized = client(1).post(url, vec![b'x'; 4096]).unwrap();
+            assert_eq!(oversized.status_code(), HTTPStatus::PAYLOAD_TOO_LARGE);
+        });
+    }
+
+    #[test]
+    fn metrics_datagram_reaches_a_socket() {
+        let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
+        socket
+            .set_read_timeout(Some(Duration::from_millis(100)))
+            .unwrap();
+        let metrics = Metrics {
+            address: socket.local_addr().unwrap().to_string(),
+            prefix: "rusty".into(),
+            interval: Duration::from_millis(10),
+            ..Default::default()
+        };
+        let options = ServerOptions {
+            metrics: Some(metrics),
+            ..Default::default()
+        };
+        let mut server = Server::with_options(&[loopback(1)], options).unwrap();
+        server
+            .get("/ping", |request: Request| {
+                let _ = request.reply(HTTPStatus::NO_CONTENT, &[], &[]);
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            let mut client = client(1);
+            let mut datagram = [0; 65536];
+            // Each call polls the loop, which sends once the interval passed, and a datagram
+            // carries only the counters that moved since the last one.
+            let counted = (0..100).any(|_| {
+                client.get(format!("http://{address}/ping")).unwrap();
+                let length = socket.recv(&mut datagram).unwrap_or(0);
+                let text = String::from_utf8_lossy(&datagram[..length]);
+                text.contains("rusty.requests:")
+            });
+            assert!(counted, "no datagram counted the requests");
+        });
+    }
+
+    #[test]
+    fn request_options_timeout_overrides_client() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        // The worker never comes, so held requests stay unanswered until the receiver drops.
+        let (handler, held) = detaching();
+        server.get("/slow", handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            let mut client = Client::new(ClientOptions {
+                connections: 1,
+                request_timeout: Duration::from_secs(30),
+                ..Default::default()
+            })
+            .unwrap();
+            let call = CallRequest {
+                options: RequestOptions {
+                    timeout: Duration::from_millis(200),
+                    ..Default::default()
+                },
+                ..CallRequest::get(format!("http://{address}/slow"))
+            };
+            let started = Instant::now();
+            let Err(timed_out) = client.call(call) else {
+                panic!("the call was answered past its own timeout");
+            };
+            assert_eq!(timed_out.status, Status::Timeout);
+            assert!(started.elapsed() < Duration::from_secs(10));
+            drop(held);
         });
     }
 }

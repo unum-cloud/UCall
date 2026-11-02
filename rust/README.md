@@ -38,17 +38,23 @@ The polling thread runs the handler, the client blocks in `get` until its respon
 
 ## Serving
 
-`Server::new` takes the interfaces to answer on, and `Server::with_options` also names the `Backend` and an optional `CPUClass` ceiling, failing rather than substituting when the backend is unavailable or the CPU does not run the class.
+`Server::new` takes the interfaces to answer on, and `Server::with_options` also takes `ServerOptions`: the `Backend`, an optional `CPUClass` ceiling, a `Log` sink and a StatsD endpoint in `Metrics`.
+It fails rather than substituting when the backend is unavailable or the CPU does not run the class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
+`max_request_bytes` caps a request's head and buffered body, answering 413 past it, and `reply_directories` names the directories path replies resolve beneath.
 Port zero binds a free port, which `Server::address` reports.
 
 ```rust
+use std::sync::Arc;
 use ucall::*;
 
 let public = Interface::new("0.0.0.0:8545").event_loops(4).connections(16_384).pipelined_requests(16);
 let health = Interface::new("127.0.0.1:8546").connections(4);
-let mut server = Server::with_options(&[public, health], Backend::Automatic, Some(CPUClass::Serial))?;
+let log = Log { callback: Arc::new(|level: LogLevel, line: &[u8]| eprintln!("{level:?} {}", String::from_utf8_lossy(line))), format: LogFormat::Human, level: LogLevel::Warning };
+let metrics = Metrics { address: "127.0.0.1:8125".into(), prefix: "rpc".into(), ..Default::default() };
+let options = ServerOptions { cpu_class: Some(CPUClass::Serial), log: Some(log), metrics: Some(metrics), ..Default::default() };
+let mut server = Server::with_options(&[public, health], options)?;
 println!("{} event loops on {} with {} kernels", server.event_loops(), server.backend(), server.cpu_class());
 
 server.get("/users/{user}/files/{*path}", |request: Request| {
@@ -67,6 +73,7 @@ Endpoints register through `&mut Server` before any loop is polled, with `route`
 Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice fails with `Status::AlreadyExists`.
 A path no endpoint matches answers 404, and a request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
 
+Log lines reach the callback on whichever thread produced them, and StatsD datagrams carry each loop's counters and sampled request latencies, every second unless `Metrics::interval` says otherwise.
 `Server::event_loop_statistics` copies one loop's counters, from any thread while the loop runs: polls, system calls, submissions and completions, accepted connections, requests, and the bytes received, sent and copied.
 Divided by `requests`, they price one call.
 
@@ -75,6 +82,7 @@ Divided by `requests`, they price one call.
 A handler receives each `Request` by value.
 Its reads borrow the received bytes: `verb`, `path`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on and the client's authenticated Noise key.
 The path and query values stay percent-encoded as sent, header names match case-insensitively, and the body arrives whole, decoded from chunked framing if it was sent that way.
+`path_segments_count` and `path_segment` read the path component by component, and `parts_count` and `part` read a `multipart/form-data` body as `RequestPart`s, each borrowing its name, content type and payload.
 
 ```rust
 use ucall::*;
@@ -96,6 +104,80 @@ A reply copies what it sends, and since it consumes the request, a body made of 
 A request owns its received bytes and is `Send`, so a handler may hand it to a worker thread and return, and the worker replies whenever it is done.
 A request dropped without a reply answers 500, as does one held by a handler that panics.
 A reply to a closed connection still consumes the request and reports `Status::ConnectionClosed`; any other failed reply keeps it, and dropping it then answers 500.
+
+## Files & Streams
+
+Handlers run on the polling thread, so a reply or a pull that finishes later runs on a worker: `Request::detach` hands the request over as a `DetachedRequest`, which reads and replies like a `Request` and alone has the three verbs below.
+
+| Verb                                   | Returns                                            | Final when                              |
+| :------------------------------------- | :------------------------------------------------- | :-------------------------------------- |
+| `reply_parts(status, headers, parts)`  | `None` for bytes alone, else a `Deferred`          | every part is sent                      |
+| `reply_stream(status, headers)`        | a `ReplyStream` with `append(parts)` and `end()`   | `end()` returns `None` or a `Deferred`  |
+| `body_chunk()`                         | the bytes decoded since the last pull              | an empty chunk once the body ended      |
+
+### Serving a File
+
+```rust
+use std::sync::mpsc;
+use ucall::*;
+
+let (handed, received) = mpsc::channel::<DetachedRequest>();
+let interface = Interface::new("0.0.0.0:8080").reply_directories(["/srv/videos"]);
+let mut server = Server::new(&[interface])?;
+server.get("/videos/{name}", move |request: Request| handed.send(request.detach()).unwrap())?;
+
+std::thread::scope(|scope| {
+    scope.spawn(|| server.take_calls(0));
+    for detached in received {
+        let name = detached.path_parameter("name").unwrap_or_default().to_vec();
+        let parts = [ReplyPart::Path { directory: 0, path: &name, offset: 0, length: 0 }];
+        let replied = detached.reply_parts(HTTPStatus::OK, &[], &parts);
+        if let Ok(Some(deferred)) = replied {
+            let _ = deferred.wait(); // or: deferred.await
+        }
+    }
+});
+```
+
+`reply_parts` concatenates `ReplyPart::Bytes`, `ReplyPart::Path` and `ReplyPart::File` parts into one body whose Content-Length is measured from the files.
+A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and the event loop opens, reads and closes it unbuffered.
+A `File` borrows the caller's descriptor, opened with `O_DIRECT`, for the `Deferred`'s lifetime.
+A file that is missing, unreadable or too short replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
+`Deferred::status` polls without blocking, `Deferred::wait` blocks until the reply is final, `.await` polls the status between other tasks, since the library has no wake-up, and dropping a `Deferred` waits for it, which is why only a detached request makes one.
+
+### Streaming a Reply
+
+```rust
+fn send_rows(detached: DetachedRequest, rows: &[String]) -> Result<()> {
+    let mut stream = detached.reply_stream(HTTPStatus::OK, &["content-type: text/csv".into()])?;
+    for row in rows {
+        stream.append(&[ReplyPart::Bytes(row.as_bytes())])?;
+    }
+    stream.end().map(|_| ())
+}
+```
+
+The stream is chunked unless a Content-Length header declares the length; `append` refuses with `Status::WouldBlock`, queueing nothing, while the peer lags behind what is queued; `end` answers `None` or a `Deferred` like `reply_parts`, and dropping an unended stream ends it.
+
+### Streaming an Upload
+
+```rust
+fn store(mut detached: DetachedRequest) -> Result<()> {
+    let mut received_bytes = 0usize;
+    loop {
+        let chunk = detached.body_chunk()?;
+        if chunk.is_empty() {
+            break;
+        }
+        received_bytes += chunk.len();
+    }
+    let total = received_bytes.to_string();
+    detached.reply_parts(HTTPStatus::OK, &[], &[ReplyPart::Bytes(total.as_bytes())]).map(|_| ())
+}
+```
+
+An endpoint registered through `Server::route_with` with `BodyDelivery::Streamed` runs its handler once the headers arrive; the handler hands `request.detach()` to a worker as above, and `body_chunk` blocks for the bytes decoded since the last pull, empty once the body ended.
+On the polling thread, where nothing arrives while the handler runs, a pull with nothing decoded refuses with `Status::WouldBlock` instead of waiting.
 
 ## Batches
 
@@ -171,6 +253,7 @@ println!("{:?} {:?}", response.body(), keep);
 A call admitted once completes exactly once, and a client already holding `calls` unretrieved calls refuses more with `Status::Contended`.
 `take_completed` drives every admitted call and fills a caller-provided buffer with finished ones, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
 `get`, `post` and `call` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
+`CallRequest::options` carries the call's own `RequestOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
 
 Every received response is a `Response`, whatever its HTTP status, and only a failed exchange is an `Error`.
 A `Response` owns its received bytes and is `Send`, so it stays readable after its `Client` is dropped and may move to another thread.
@@ -203,7 +286,8 @@ let client = Client::new(ClientOptions {
 
 `generate_noise_keypair` draws from the operating system's entropy and fails with `Status::IO` when it is refused.
 `derive_noise_public_key` recovers the public half of a stored private key, which peers compare in their authorizers.
-Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `CallRequest::server_key`.
+Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `RequestOptions::server_key`.
+Noise KK has both sides know each other in advance: the interface admits the one key `Interface::noise_peer_key` names, and the call presents `RequestOptions::client_key` or the client's own key.
 An `http+noise://` URL implies Noise XX, and a handler reads the client's authenticated key through `Request::peer`.
 
 ## Errors
@@ -246,15 +330,7 @@ Every thread that polls, replies or reads must run on a CPU supporting the CPU c
 
 ## What This Crate Does Not Expose
 
-The crate leaves these out:
-
-- WebSocket endpoints, connections and messages, on either side.
-- Streamed request bodies, multipart parts and path segments by index; a handler reads the whole body and the template's named captures.
-- Streamed, vectored and file replies; a reply sends one body from memory.
-- The log sink and StatsD metrics of a server or client, which run silent and report through `event_loop_statistics` and `statistics` instead.
-- The initiator key a server interface admits under Noise KK, so a KK interface is refused at startup.
-- Per-call timeouts, retries, redirect limits and client keys; a call takes its client's.
-- Polling an unfinished outcome, as every method here returns once its result is final.
+The crate leaves out WebSocket endpoints, connections and messages, on either side.
 
 ## Design
 
@@ -262,8 +338,10 @@ The crate is a thin layer over UCall's native library, and every rule below foll
 
 - __Verbs share one name across languages.__
   `take_call`, `take_calls`, `take_batch`, `take_batches`, `submit` and `take_completed` name the same calls in Python and Rust.
+- __Blocking stays simple, deferring stays symmetric.__
+  A reply that is final on return looks as it did before files and streams existed, a deferred one is a `Deferred` that `wait`s, `.await`s or waits as it drops, and nothing costs more until a `DetachedRequest` is used.
 - __Ownership is a type, not a flag.__
-  A reply consumes its `Request`, a dropped request answers 500, a `Response` frees itself, and a `Client` is neither `Send` nor `Sync`, so misuse does not compile.
+  A reply consumes its `Request`, a dropped request answers 500, only a `DetachedRequest` hands back a `Deferred`, a `Response` frees itself, and a `Client` is neither `Send` nor `Sync`, so misuse does not compile.
 - __Single owners are claimed, never assumed.__
   Event loops and batch endpoints take `&self`, and an atomic claim answers `Status::Contended` to a second poller instead of racing it.
 - __Handlers are plain closures.__

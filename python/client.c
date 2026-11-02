@@ -57,6 +57,10 @@ struct Completed {
     /** The server's static key the client borrows while the call is in flight. */
     ucall_noise_key_t server_key;
 
+    /** The client's private key for this call, which the client borrows while the call is in
+     *  flight. */
+    ucall_noise_key_t client_key;
+
     /** The neighbors in the client's in-flight list. */
     Completed* previous;
     Completed* next;
@@ -87,6 +91,7 @@ static void Completed_dealloc(Completed* self) {
     Py_CLEAR(self->url);
     Py_CLEAR(self->context);
     Py_CLEAR(self->response);
+    memset(self->client_key, 0, sizeof(self->client_key));
     PyObject_Free(self);
 }
 
@@ -357,25 +362,46 @@ static int client_owned(Client* self) {
     return -1;
 }
 
+/** The per-call options every calling verb takes, mirroring @c ucall_request_options_t; NULL skips
+ *  one. */
+typedef struct call_options_t {
+    PyObject* security;
+    PyObject* server_key;
+    PyObject* client_key;
+    PyObject* timeout;
+    PyObject* retries;
+    PyObject* redirects;
+} call_options_t;
+
 /**
  *  @brief Submits one exchange, whose @c Completed the client owns until it is retrieved.
  *  @return The borrowed @c Completed, or NULL with an exception set.
  */
 static Completed* client_submit(Client* self, ucall_verb_t verb, PyObject* url, PyObject* body, PyObject* headers,
-                                ucall_security_mode_t security, PyObject* server_key, PyObject* context) {
+                                call_options_t const* options, PyObject* context) {
+    int security = ucall_security_mode_none_k;
+    ucall_client_call_t submission = {0};
+    if (ucall_py_enum_from_object(options->security, "security", &ucall_py_security_enum, &security) != 0 ||
+        ucall_py_size_from_object(options->timeout, "timeout_us", &submission.options.timeout_microseconds) != 0 ||
+        ucall_py_size_from_object(options->retries, "max_retries", &submission.options.max_retries) != 0 ||
+        ucall_py_size_from_object(options->redirects, "max_redirects", &submission.options.max_redirects) != 0)
+        return NULL;
     Completed* const call = PyObject_New(Completed, &CompletedType);
     if (!call) return NULL;
     memset((char*)call + sizeof(PyObject), 0, sizeof(Completed) - sizeof(PyObject));
     call->status = ucall_status_deferred_k;
     call->context = Py_NewRef(context ? context : Py_None);
     ucall_outcome_t outcome = {0};
-    ucall_client_call_t submission = {0};
     submission.client = self->handle;
     submission.verb = verb;
-    submission.options.security = security;
-    if (server_key && server_key != Py_None) {
-        if (ucall_py_key_from_object(server_key, "server_key", call->server_key) != 0) goto refused;
+    submission.options.security = (ucall_security_mode_t)security;
+    if (options->server_key && options->server_key != Py_None) {
+        if (ucall_py_key_from_object(options->server_key, "server_key", call->server_key) != 0) goto refused;
         submission.options.server_key = (ucall_noise_key_t const*)&call->server_key;
+    }
+    if (options->client_key && options->client_key != Py_None) {
+        if (ucall_py_key_from_object(options->client_key, "client_key", call->client_key) != 0) goto refused;
+        submission.options.client_key = (ucall_noise_key_t const*)&call->client_key;
     }
     call->url = PyUnicode_Check(url) ? PyUnicode_AsUTF8String(url) : Py_NewRef(url);
     if (!call->url || ucall_py_text_from_object(call->url, "url", &submission.url) != 0) goto refused;
@@ -436,50 +462,63 @@ static PyObject* client_take(Client* self, size_t timeout_microseconds, size_t c
     return list;
 }
 
-static char const doc_Client_submit[] =                                                            //
-    "submit(verb, url, /, body=b\"\", headers=(), *, security=Security.NONE, server_key=None,\n"   //
-    "    context=None) -> None\n"                                                                  //
-    "\n"                                                                                           //
-    "Queues one exchange without driving I/O.\n"                                                   //
-    "\n"                                                                                           //
-    "`take_completed` later returns exactly one `Completed` carrying `context`.\n"                 //
-    "\n"                                                                                           //
-    "Args:\n"                                                                                      //
-    "  verb (Verb): The method, such as `Verb.POST` or \"post\".\n"                                //
-    "  url (str | bytes): The full URL, \"http://\" or \"http+noise://\" and the server.\n"        //
-    "  body (Buffer, optional): Any bytes-like object, borrowed until the call completes.\n"       //
-    "  headers (Sequence[str | bytes], optional): \"name: value\" lines; the client adds Host,\n"  //
-    "    Content-Length and User-Agent itself.\n"                                                  //
-    "  security (Security, optional): The handshake for this call. Defaults to `Security.NONE`,\n" //
-    "    and an \"http+noise://\" URL calls over Noise XX.\n"                                      //
-    "  server_key (bytes, optional): The server's 32-byte static key, required for\n"              //
-    "    `Security.NOISE_IK` and `Security.NOISE_KK`.\n"                                           //
-    "  context (object, optional): Anything, handed back as `Completed.context`.\n"                //
-    "\n"                                                                                           //
-    "Raises:\n"                                                                                    //
-    "  Error: The call was refused and will not complete, such as `Status.CONTENDED` once\n"       //
-    "    `calls` are in flight, or `Status.INVALID_ARGUMENT` from another thread.\n"               //
-    "\n"                                                                                           //
-    "Example:\n"                                                                                   //
-    "  >>> for index in range(4):\n"                                                               //
+static char const doc_Client_submit[] =                                                             //
+    "submit(verb, url, /, body=b\"\", headers=(), *, context=None, security=Security.NONE,\n"       //
+    "    server_key=None, client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> None\n" //
+    "\n"                                                                                            //
+    "Queues one exchange without driving I/O.\n"                                                    //
+    "\n"                                                                                            //
+    "`take_completed` later returns exactly one `Completed` carrying `context`.\n"                  //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  verb (Verb): The method, such as `Verb.POST` or \"post\".\n"                                 //
+    "  url (str | bytes): The full URL, \"http://\" or \"http+noise://\" and the server.\n"         //
+    "  body (Buffer, optional): Any bytes-like object, borrowed until the call completes.\n"        //
+    "  headers (Sequence[str | bytes], optional): \"name: value\" lines; the client adds Host,\n"   //
+    "    Content-Length and User-Agent itself.\n"                                                   //
+    "  security (Security, optional): The handshake for this call. Defaults to `Security.NONE`,\n"  //
+    "    and an \"http+noise://\" URL calls over Noise XX.\n"                                       //
+    "  server_key (bytes, optional): The server's 32-byte static key, required for\n"               //
+    "    `Security.NOISE_IK` and `Security.NOISE_KK`.\n"                                            //
+    "  client_key (bytes, optional): This call's 32-byte Noise private key in place of the\n"       //
+    "    client's own, as `Security.NOISE_KK` names the caller to the server.\n"                    //
+    "  timeout_us (int, optional): The budget of this call, queueing and redirects included;\n"     //
+    "    0 takes the client's `request_timeout_us`.\n"                                              //
+    "  max_retries (int, optional): Connection attempts before sending; 0 takes 3.\n"               //
+    "  max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.\n"          //
+    "  context (object, optional): Anything, handed back as `Completed.context`.\n"                 //
+    "\n"                                                                                            //
+    "Raises:\n"                                                                                     //
+    "  Error: The call was refused and will not complete, such as `Status.CONTENDED` once\n"        //
+    "    `calls` are in flight, or `Status.INVALID_ARGUMENT` from another thread.\n"                //
+    "\n"                                                                                            //
+    "Example:\n"                                                                                    //
+    "  >>> for index in range(4):\n"                                                                //
     "  ...     client.submit(\"POST\", \"http://127.0.0.1:8545/echo\", b\"payload\", context=index)";
 
 static PyObject* Client_submit(Client* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
-    PyObject *verb = NULL, *url = NULL, *body = NULL, *headers = NULL, *security = NULL, *server_key = NULL,
-             *context = NULL;
-    ucall_py_argument_t const arguments[] = {{"verb", &verb},         {"url", &url},
-                                             {"body", &body},         {"headers", &headers},
-                                             {"security", &security}, {"server_key", &server_key},
-                                             {"context", &context}};
-    if (ucall_py_parse_fast("submit", values, count, names, 2, 4, arguments, 7) != 0 || client_owned(self) != 0)
+    PyObject *verb = NULL, *url = NULL, *body = NULL, *headers = NULL, *context = NULL;
+    call_options_t options;
+    ucall_py_argument_t const arguments[] = {
+        {"verb", &verb},
+        {"url", &url},
+        {"body", &body},
+        {"headers", &headers},
+        {"context", &context},
+        {"security", &options.security},
+        {"server_key", &options.server_key},
+        {"client_key", &options.client_key},
+        {"timeout_us", &options.timeout},
+        {"max_retries", &options.retries},
+        {"max_redirects", &options.redirects},
+    };
+    if (ucall_py_parse_fast("submit", values, count, names, 2, 4, arguments,
+                            sizeof(arguments) / sizeof(arguments[0])) != 0 ||
+        client_owned(self) != 0)
         return NULL;
-    int verb_value = 0, security_value = ucall_security_mode_none_k;
-    if (ucall_py_enum_from_object(verb, "verb", &ucall_py_verb_enum, &verb_value) != 0 ||
-        ucall_py_enum_from_object(security, "security", &ucall_py_security_enum, &security_value) != 0)
-        return NULL;
-    if (!client_submit(self, (ucall_verb_t)verb_value, url, body, headers, (ucall_security_mode_t)security_value,
-                       server_key, context))
-        return NULL;
+    int verb_value = 0;
+    if (ucall_py_enum_from_object(verb, "verb", &ucall_py_verb_enum, &verb_value) != 0) return NULL;
+    if (!client_submit(self, (ucall_verb_t)verb_value, url, body, headers, &options, context)) return NULL;
     Py_RETURN_NONE;
 }
 
@@ -530,11 +569,8 @@ static PyObject* Client_take_completed(Client* self, PyObject* const* values, Py
  *  @return The @c Response, or NULL with an exception set, a @c ucall.Error for a failed exchange.
  */
 static PyObject* client_request(Client* self, ucall_verb_t verb, PyObject* url, PyObject* body, PyObject* json,
-                                PyObject* headers, PyObject* security, PyObject* server_key) {
-    int security_value = ucall_security_mode_none_k;
-    if (client_owned(self) != 0 ||
-        ucall_py_enum_from_object(security, "security", &ucall_py_security_enum, &security_value) != 0)
-        return NULL;
+                                PyObject* headers, call_options_t const* options) {
+    if (client_owned(self) != 0) return NULL;
     PyObject *encoded = NULL, *lines = NULL;
     if (json && json != Py_None) {
         PyObject* const text = PyObject_CallOneArg(ucall_py_json_dumps, json);
@@ -553,8 +589,7 @@ static PyObject* client_request(Client* self, ucall_verb_t verb, PyObject* url, 
         headers = lines;
     }
     // The call keeps its own references to the body and header lines it borrows.
-    Completed* const own = client_submit(self, verb, url, body, headers, (ucall_security_mode_t)security_value,
-                                         server_key, NULL);
+    Completed* const own = client_submit(self, verb, url, body, headers, options, NULL);
     Py_XDECREF(lines);
     Py_XDECREF(encoded);
     if (!own) return NULL;
@@ -580,7 +615,7 @@ static PyObject* client_request(Client* self, ucall_verb_t verb, PyObject* url, 
 
 static char const doc_Client_request[] =                                                                    //
     "request(verb, url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE,\n"                 //
-    "    server_key=None) -> Response\n"                                                                    //
+    "    server_key=None, client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> Response\n"     //
     "\n"                                                                                                    //
     "Sends one exchange and waits for its response on this thread.\n"                                       //
     "\n"                                                                                                    //
@@ -597,6 +632,12 @@ static char const doc_Client_request[] =                                        
     "  security (Security, optional): The handshake for this call. Defaults to `Security.NONE`.\n"          //
     "  server_key (bytes, optional): The server's 32-byte static key, for `Security.NOISE_IK`\n"            //
     "    and `Security.NOISE_KK`.\n"                                                                        //
+    "  client_key (bytes, optional): This call's 32-byte Noise private key in place of the\n"               //
+    "    client's own, as `Security.NOISE_KK` names the caller to the server.\n"                            //
+    "  timeout_us (int, optional): The budget of this call, queueing and redirects included;\n"             //
+    "    0 takes the client's `request_timeout_us`.\n"                                                      //
+    "  max_retries (int, optional): Connection attempts before sending; 0 takes 3.\n"                       //
+    "  max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.\n"                  //
     "\n"                                                                                                    //
     "Returns:\n"                                                                                            //
     "  Response: The response, whatever its HTTP status.\n"                                                 //
@@ -611,50 +652,70 @@ static char const doc_Client_request[] =                                        
     "  200";
 
 static PyObject* Client_request(Client* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
-    PyObject *verb = NULL, *url = NULL, *body = NULL, *json = NULL, *headers = NULL, *security = NULL,
-             *server_key = NULL;
-    ucall_py_argument_t const arguments[] = {{"verb", &verb},
-                                             {"url", &url},
-                                             {"body", &body},
-                                             {"json", &json},
-                                             {"headers", &headers},
-                                             {"security", &security},
-                                             {"server_key", &server_key}};
-    if (ucall_py_parse_fast("request", values, count, names, 2, 3, arguments, 7) != 0) return NULL;
+    PyObject *verb = NULL, *url = NULL, *body = NULL, *json = NULL, *headers = NULL;
+    call_options_t options;
+    ucall_py_argument_t const arguments[] = {
+        {"verb", &verb},
+        {"url", &url},
+        {"body", &body},
+        {"json", &json},
+        {"headers", &headers},
+        {"security", &options.security},
+        {"server_key", &options.server_key},
+        {"client_key", &options.client_key},
+        {"timeout_us", &options.timeout},
+        {"max_retries", &options.retries},
+        {"max_redirects", &options.redirects},
+    };
+    if (ucall_py_parse_fast("request", values, count, names, 2, 3, arguments,
+                            sizeof(arguments) / sizeof(arguments[0])) != 0)
+        return NULL;
     int verb_value = 0;
     if (ucall_py_enum_from_object(verb, "verb", &ucall_py_verb_enum, &verb_value) != 0) return NULL;
-    return client_request(self, (ucall_verb_t)verb_value, url, body, json, headers, security, server_key);
+    return client_request(self, (ucall_verb_t)verb_value, url, body, json, headers, &options);
 }
 
 /** Parses the arguments of `get` and its siblings, differing in @p verb and where `body` binds. */
 static PyObject* client_verb(Client* self, char const* name, ucall_verb_t verb, Py_ssize_t positional_max,
                              PyObject* const* values, Py_ssize_t count, PyObject* names) {
-    PyObject *url = NULL, *body = NULL, *json = NULL, *headers = NULL, *security = NULL, *server_key = NULL;
-    ucall_py_argument_t const arguments[] = {{"url", &url},           {"body", &body},
-                                             {"json", &json},         {"headers", &headers},
-                                             {"security", &security}, {"server_key", &server_key}};
-    if (ucall_py_parse_fast(name, values, count, names, 1, positional_max, arguments, 6) != 0) return NULL;
-    return client_request(self, verb, url, body, json, headers, security, server_key);
+    PyObject *url = NULL, *body = NULL, *json = NULL, *headers = NULL;
+    call_options_t options;
+    ucall_py_argument_t const arguments[] = {
+        {"url", &url},
+        {"body", &body},
+        {"json", &json},
+        {"headers", &headers},
+        {"security", &options.security},
+        {"server_key", &options.server_key},
+        {"client_key", &options.client_key},
+        {"timeout_us", &options.timeout},
+        {"max_retries", &options.retries},
+        {"max_redirects", &options.redirects},
+    };
+    if (ucall_py_parse_fast(name, values, count, names, 1, positional_max, arguments,
+                            sizeof(arguments) / sizeof(arguments[0])) != 0)
+        return NULL;
+    return client_request(self, verb, url, body, json, headers, &options);
 }
 
-static char const doc_Client_get[] =                                                                  //
-    "get(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, server_key=None)\n"    //
-    "    -> Response\n"                                                                               //
-    "\n"                                                                                              //
-    "Sends a GET and waits for its response, as `request` does.\n"                                    //
-    "\n"                                                                                              //
-    "Args:\n"                                                                                         //
-    "  url (str | bytes): The full URL.\n"                                                            //
-    "  **options: `body`, `json`, `headers`, `security` and `server_key`, as `request` takes them.\n" //
-    "\n"                                                                                              //
-    "Returns:\n"                                                                                      //
-    "  Response: The response, whatever its HTTP status.\n"                                           //
-    "\n"                                                                                              //
-    "Raises:\n"                                                                                       //
-    "  Error: The exchange failed.\n"                                                                 //
-    "\n"                                                                                              //
-    "Example:\n"                                                                                      //
-    "  >>> bytes(client.get(\"http://127.0.0.1:8545/sum?a=1&b=2\").body)\n"                           //
+static char const doc_Client_get[] =                                                                      //
+    "get(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, server_key=None,\n"        //
+    "    client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> Response\n"                    //
+    "\n"                                                                                                  //
+    "Sends a GET and waits for its response, as `request` does.\n"                                        //
+    "\n"                                                                                                  //
+    "Args:\n"                                                                                             //
+    "  url (str | bytes): The full URL.\n"                                                                //
+    "  **options: `body`, `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n" //
+    "\n"                                                                                                  //
+    "Returns:\n"                                                                                          //
+    "  Response: The response, whatever its HTTP status.\n"                                               //
+    "\n"                                                                                                  //
+    "Raises:\n"                                                                                           //
+    "  Error: The exchange failed.\n"                                                                     //
+    "\n"                                                                                                  //
+    "Example:\n"                                                                                          //
+    "  >>> bytes(client.get(\"http://127.0.0.1:8545/sum?a=1&b=2\").body)\n"                               //
     "  b'3'";
 
 static PyObject* Client_get(Client* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
@@ -662,15 +723,15 @@ static PyObject* Client_get(Client* self, PyObject* const* values, Py_ssize_t co
 }
 
 static char const doc_Client_post[] =                                                               //
-    "post(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, server_key=None)\n" //
-    "    -> Response\n"                                                                             //
+    "post(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, server_key=None,\n" //
+    "    client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> Response\n"              //
     "\n"                                                                                            //
     "Sends a POST and waits for its response, as `request` does.\n"                                 //
     "\n"                                                                                            //
     "Args:\n"                                                                                       //
     "  url (str | bytes): The full URL.\n"                                                          //
     "  body (Buffer, optional): Any bytes-like object to send.\n"                                   //
-    "  **options: `json`, `headers`, `security` and `server_key`, as `request` takes them.\n"       //
+    "  **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n"   //
     "\n"                                                                                            //
     "Returns:\n"                                                                                    //
     "  Response: The response, whatever its HTTP status.\n"                                         //
@@ -687,15 +748,15 @@ static PyObject* Client_post(Client* self, PyObject* const* values, Py_ssize_t c
 }
 
 static char const doc_Client_put[] =                                                               //
-    "put(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, server_key=None)\n" //
-    "    -> Response\n"                                                                            //
+    "put(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, server_key=None,\n" //
+    "    client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> Response\n"             //
     "\n"                                                                                           //
     "Sends a PUT and waits for its response, as `request` does.\n"                                 //
     "\n"                                                                                           //
     "Args:\n"                                                                                      //
     "  url (str | bytes): The full URL.\n"                                                         //
     "  body (Buffer, optional): Any bytes-like object to send.\n"                                  //
-    "  **options: `json`, `headers`, `security` and `server_key`, as `request` takes them.\n"      //
+    "  **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n"  //
     "\n"                                                                                           //
     "Returns:\n"                                                                                   //
     "  Response: The response, whatever its HTTP status.\n"                                        //
@@ -711,24 +772,24 @@ static PyObject* Client_put(Client* self, PyObject* const* values, Py_ssize_t co
     return client_verb(self, "put", ucall_verb_put_k, 2, values, count, names);
 }
 
-static char const doc_Client_delete[] =                                                               //
-    "delete(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, server_key=None)\n" //
-    "    -> Response\n"                                                                               //
-    "\n"                                                                                              //
-    "Sends a DELETE and waits for its response, as `request` does.\n"                                 //
-    "\n"                                                                                              //
-    "Args:\n"                                                                                         //
-    "  url (str | bytes): The full URL.\n"                                                            //
-    "  **options: `body`, `json`, `headers`, `security` and `server_key`, as `request` takes them.\n" //
-    "\n"                                                                                              //
-    "Returns:\n"                                                                                      //
-    "  Response: The response, whatever its HTTP status.\n"                                           //
-    "\n"                                                                                              //
-    "Raises:\n"                                                                                       //
-    "  Error: The exchange failed.\n"                                                                 //
-    "\n"                                                                                              //
-    "Example:\n"                                                                                      //
-    "  >>> client.delete(\"http://127.0.0.1:8545/files/notes.txt\").status_code\n"                    //
+static char const doc_Client_delete[] =                                                                   //
+    "delete(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, server_key=None,\n"     //
+    "    client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> Response\n"                    //
+    "\n"                                                                                                  //
+    "Sends a DELETE and waits for its response, as `request` does.\n"                                     //
+    "\n"                                                                                                  //
+    "Args:\n"                                                                                             //
+    "  url (str | bytes): The full URL.\n"                                                                //
+    "  **options: `body`, `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n" //
+    "\n"                                                                                                  //
+    "Returns:\n"                                                                                          //
+    "  Response: The response, whatever its HTTP status.\n"                                               //
+    "\n"                                                                                                  //
+    "Raises:\n"                                                                                           //
+    "  Error: The exchange failed.\n"                                                                     //
+    "\n"                                                                                                  //
+    "Example:\n"                                                                                          //
+    "  >>> client.delete(\"http://127.0.0.1:8545/files/notes.txt\").status_code\n"                        //
     "  204";
 
 static PyObject* Client_delete(Client* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
@@ -736,15 +797,15 @@ static PyObject* Client_delete(Client* self, PyObject* const* values, Py_ssize_t
 }
 
 static char const doc_Client_patch[] =                                                                      //
-    "patch(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, server_key=None)\n"        //
-    "    -> Response\n"                                                                                     //
+    "patch(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, server_key=None,\n"        //
+    "    client_key=None, timeout_us=0, max_retries=0, max_redirects=0) -> Response\n"                      //
     "\n"                                                                                                    //
     "Sends a PATCH and waits for its response, as `request` does.\n"                                        //
     "\n"                                                                                                    //
     "Args:\n"                                                                                               //
     "  url (str | bytes): The full URL.\n"                                                                  //
     "  body (Buffer, optional): Any bytes-like object to send.\n"                                           //
-    "  **options: `json`, `headers`, `security` and `server_key`, as `request` takes them.\n"               //
+    "  **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n"           //
     "\n"                                                                                                    //
     "Returns:\n"                                                                                            //
     "  Response: The response, whatever its HTTP status.\n"                                                 //

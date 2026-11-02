@@ -446,6 +446,7 @@ __Security__ (Server → Client):
 __Roadmap:__ The declared WebSocket operations currently return unsupported.
 Streamed replies are implemented: `ucall_server_reply_begin()`, `ucall_server_reply_append()` and `ucall_server_reply_end()` send a chunked body from any thread, long after the callback returned.
 Streamed request bodies are implemented too: an endpoint registered with `ucall_body_delivery_streamed_k` runs once the head parsed, and each `ucall_server_request_body_chunk()` takes every byte decoded since the last one, finishing later through its outcome when none arrived yet.
+The Python and Rust bindings expose both through a detached request a worker finishes, described in their Files & Streams sections.
 The connection reads on only as the handler pulls, so a slow handler slows its own peer and nobody else, and no request pipelined behind the body parses before the body ended.
 Buffered requests are capped by `max_request_bytes`, which defaults to the largest receive buffer the kernel grants a socket; past it the reply is 413.
 

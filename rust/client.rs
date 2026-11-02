@@ -19,11 +19,11 @@ use std::collections::VecDeque;
 use std::sync::Arc;
 
 use crate::types::{
-    check, fail, lend_authorizer, microseconds, pending_outcome, silent_log, ucall_bytes_view_t,
+    check, fail, lend_authorizer, lend_log, microseconds, pending_outcome, ucall_bytes_view_t,
     ucall_client_t, ucall_cpu_class_t, ucall_http_status_t, ucall_io_backend_t, ucall_log_t,
     ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t, ucall_received_http_response_t,
-    ucall_security_mode_t, ucall_verb_t, view, viewed, Backend, CPUClass, HTTPStatus, NoiseKey,
-    PeerAuthorizer, Result, Security, Status, Verb,
+    ucall_security_mode_t, ucall_verb_t, view, viewed, Backend, CPUClass, HTTPStatus, Log,
+    NoiseKey, PeerAuthorizer, Result, Security, Status, Verb,
 };
 
 // region: Raw Declarations
@@ -147,6 +147,25 @@ pub struct ClientOptions {
     pub backend: Backend,
     /// The CPU class the client confines itself to; `None` takes what the CPU offers.
     pub cpu_class: Option<CPUClass>,
+    /// Where log lines go; `None` keeps the client silent.
+    pub log: Option<Log>,
+}
+
+/// One call's time budget, retries, redirects and security, each zero field taking its default.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub struct RequestOptions {
+    /// Time budget including queueing and redirects; zero takes the client's `request_timeout`.
+    pub timeout: Duration,
+    /// Connection attempts made again before sending the request; zero means 3.
+    pub max_retries: usize,
+    /// Redirect hops followed before failing; zero means 5.
+    pub max_redirects: usize,
+    /// The transport security; an `http+noise://` URL implies Noise XX.
+    pub security: Security,
+    /// The private key this call authenticates with in place of the client's own.
+    pub client_key: Option<NoiseKey>,
+    /// The server's static key, which Noise IK and KK need in advance.
+    pub server_key: Option<NoiseKey>,
 }
 
 /// One HTTP call, owning everything the library reads until the call completes.
@@ -161,10 +180,8 @@ pub struct CallRequest {
     pub headers: Vec<Cow<'static, [u8]>>,
     /// The request body; empty sends no payload.
     pub body: Cow<'static, [u8]>,
-    /// The transport security; an `http+noise://` URL implies Noise XX.
-    pub security: Security,
-    /// The server's static key, which Noise IK and KK need in advance.
-    pub server_key: Option<NoiseKey>,
+    /// The call's own time budget, retries, redirects and security.
+    pub options: RequestOptions,
 }
 
 impl CallRequest {
@@ -175,8 +192,7 @@ impl CallRequest {
             url: url.into(),
             headers: Vec::new(),
             body: Cow::Borrowed(&[]),
-            security: Security::None,
-            server_key: None,
+            options: RequestOptions::default(),
         }
     }
 
@@ -190,11 +206,12 @@ impl CallRequest {
     }
 }
 
-/// The library's client handle and the authorizer it calls back into.
+/// The library's client handle and the authorizer and log it calls back into.
 struct ClientCore {
     raw: ucall_client_t,
-    // The callback context must outlive the handle, which `Drop` frees before its fields.
+    // The callback contexts must outlive the handle, which `Drop` frees before its fields.
     authorizer: Option<Arc<PeerAuthorizer>>,
+    log: Option<Box<Log>>,
 }
 
 impl Drop for ClientCore {
@@ -273,6 +290,7 @@ impl Client {
         let mut core = Box::new(ClientCore {
             raw: ptr::null_mut(),
             authorizer: options.peer_authorizer,
+            log: options.log.map(Box::new),
         });
         let (peer_authorizer, peer_authorizer_context) = lend_authorizer(&core.authorizer);
         let config = ucall_client_config_t {
@@ -286,7 +304,7 @@ impl Client {
                 .map_or(ptr::null(), ptr::from_ref),
             peer_authorizer,
             peer_authorizer_context,
-            log: silent_log(),
+            log: lend_log(&core.log),
             max_concurrent_calls: options.calls,
             backend: options.backend.to_raw(),
             cpu_class: CPUClass::to_raw(options.cpu_class),
@@ -340,12 +358,17 @@ impl Client {
             headers_count: call.headers.len(),
             body: view(&request.body),
             options: ucall_request_options_t {
-                timeout_microseconds: 0,
-                max_retries: 0,
-                max_redirects: 0,
-                security: request.security.to_raw(),
-                client_key: ptr::null(),
+                timeout_microseconds: microseconds(request.options.timeout),
+                max_retries: request.options.max_retries,
+                max_redirects: request.options.max_redirects,
+                security: request.options.security.to_raw(),
+                client_key: request
+                    .options
+                    .client_key
+                    .as_ref()
+                    .map_or(ptr::null(), ptr::from_ref),
                 server_key: request
+                    .options
                     .server_key
                     .as_ref()
                     .map_or(ptr::null(), ptr::from_ref),

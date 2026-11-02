@@ -44,6 +44,11 @@
  *  body passed as the reply body, which the reply releases before answering. A request dropped
  *  without a reply answers 500 itself.
  *
+ *  @c Request.detach moves the handle into a @c DetachedRequest, the only owner of the verbs whose
+ *  replies may defer, so by type a @c Deferred, which waits when released, never comes to be on a
+ *  polling thread. A @c Deferred keeps its outcome on the heap with the @c File parts it borrows,
+ *  and the memoryview of a part or a body chunk counts among its request's exports as @c body does.
+ *
  *  @section python_clients Client Calls
  *
  *  Every accepted call is a @c Completed object whose address is the C cookie. It holds the URL,
@@ -182,6 +187,12 @@ extern ucall_py_enum_mirror_t ucall_py_security_enum;
 /** The HTTP methods, as `ucall.Verb`. */
 extern ucall_py_enum_mirror_t ucall_py_verb_enum;
 
+/** When an endpoint's callback runs, as @c ucall.BodyDelivery. */
+extern ucall_py_enum_mirror_t ucall_py_body_delivery_enum;
+
+/** The severities of log lines, as @c ucall.LogLevel. */
+extern ucall_py_enum_mirror_t ucall_py_log_level_enum;
+
 /**
  *  @brief Builds every enum mirror as an `enum.IntEnum` and adds it to @p module.
  *  @return 0 on success, or -1 with an exception set.
@@ -229,6 +240,34 @@ extern PyTypeObject ServerType;
 
 /** `ucall.Request`, one received request until a reply consumes it. */
 extern PyTypeObject RequestType;
+
+/** @c ucall.DetachedRequest, a request taken off its polling thread, with the verbs that may
+ *  defer. */
+extern PyTypeObject DetachedRequestType;
+
+/** @c ucall.RequestPart, one part of a multipart request body. */
+extern PyTypeObject RequestPartType;
+
+/** A view over bytes a request owns, counted among the request's exports. */
+extern PyTypeObject RequestBytesType;
+
+/** @c ucall.BodyChunks, the iterator pulling a detached request's body. */
+extern PyTypeObject BodyChunksType;
+
+/** @c ucall.File, a byte range of a descriptor the caller opened, as a reply part. */
+extern PyTypeObject FileType;
+
+/** @c ucall.Path, a byte range of a file beneath a reply directory, as a reply part. */
+extern PyTypeObject PathType;
+
+/** @c ucall.Deferred, a reply still sending file or path parts. */
+extern PyTypeObject DeferredType;
+
+/** @c ucall.ReplyStream, a reply sent in appended parts. */
+extern PyTypeObject ReplyStreamType;
+
+/** @c ucall.Metrics, where a server sends StatsD datagrams. */
+extern PyTypeObject MetricsType;
 
 /** `ucall.BatchEndpoint`, one batching route and its draining verbs. */
 extern PyTypeObject BatchEndpointType;
