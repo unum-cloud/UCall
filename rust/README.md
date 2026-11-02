@@ -130,7 +130,8 @@ std::thread::scope(|scope| {
     scope.spawn(|| server.take_calls(0));
     for detached in received {
         let name = detached.path_parameter("name").unwrap_or_default().to_vec();
-        let parts = [ReplyPart::Path { directory: 0, path: &name, offset: 0, length: 0 }];
+        let path = PathRange { directory: 0, path: name.as_slice().into(), offset: 0, length: 0 };
+        let parts = [ReplyPart::Path(path)];
         let replied = detached.reply_parts(HTTPStatus::OK, &[], &parts);
         if let Ok(Some(deferred)) = replied {
             let _ = deferred.wait(); // or: deferred.await
@@ -141,7 +142,7 @@ std::thread::scope(|scope| {
 
 `reply_parts` concatenates `ReplyPart::Bytes`, `ReplyPart::Path` and `ReplyPart::File` parts into one body whose Content-Length is measured from the files.
 A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and the event loop opens, reads and closes it unbuffered.
-A `File` borrows the caller's descriptor, opened with `O_DIRECT`, for the `Deferred`'s lifetime.
+A `File` borrows the caller's descriptor, opened with `O_DIRECT`, for the `Deferred`'s lifetime, while bytes and paths are copied before the call returns, so they may be dropped right after it.
 A file that is missing, unreadable or too short replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
 `Deferred::status` polls without blocking, `Deferred::wait` blocks until the reply is final, `.await` polls the status between other tasks, since the library has no wake-up, and dropping a `Deferred` waits for it, which is why only a detached request makes one.
 
@@ -151,7 +152,7 @@ A file that is missing, unreadable or too short replaces the reply with 404, 416
 fn send_rows(detached: DetachedRequest, rows: &[String]) -> Result<()> {
     let mut stream = detached.reply_stream(HTTPStatus::OK, &["content-type: text/csv".into()])?;
     for row in rows {
-        stream.append(&[ReplyPart::Bytes(row.as_bytes())])?;
+        stream.append(&[ReplyPart::Bytes(row.as_bytes().into())])?;
     }
     stream.end().map(|_| ())
 }
@@ -172,7 +173,7 @@ fn store(mut detached: DetachedRequest) -> Result<()> {
         received_bytes += chunk.len();
     }
     let total = received_bytes.to_string();
-    detached.reply_parts(HTTPStatus::OK, &[], &[ReplyPart::Bytes(total.as_bytes())]).map(|_| ())
+    detached.reply_parts(HTTPStatus::OK, &[], &[ReplyPart::Bytes(total.as_bytes().into())]).map(|_| ())
 }
 ```
 

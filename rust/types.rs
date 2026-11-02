@@ -18,7 +18,6 @@ use core::ptr::{self, NonNull};
 use core::str::FromStr;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::os::fd::BorrowedFd;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
@@ -38,6 +37,10 @@ pub(crate) type ucall_body_delivery_t = c_int;
 
 pub(crate) const ucall_status_success_k: ucall_status_t = 0;
 pub(crate) const ucall_status_deferred_k: ucall_status_t = 1;
+pub(crate) const ucall_status_out_of_memory_k: ucall_status_t = 2;
+pub(crate) const ucall_status_uninitialized_k: ucall_status_t = 12;
+pub(crate) const ucall_status_invalid_argument_k: ucall_status_t = 17;
+pub(crate) const ucall_status_already_exists_k: ucall_status_t = 19;
 pub(crate) const ucall_status_connection_closed_k: ucall_status_t = 21;
 pub(crate) const ucall_status_peer_rejected_k: ucall_status_t = 24;
 
@@ -279,7 +282,7 @@ pub(crate) fn pending_outcome() -> ucall_outcome_t {
 pub struct Deferred<'f> {
     // A raw heap address rather than a `Box`, as the event loop writes it while this moves.
     outcome: NonNull<ucall_outcome_t>,
-    files: PhantomData<BorrowedFd<'f>>,
+    files: PhantomData<Descriptor<'f>>,
 }
 
 // The outcome moves with the `Deferred`, and until it is final only the library writes it.
@@ -443,6 +446,37 @@ pub fn derive_noise_public_key(private_key: &NoiseKey) -> NoiseKey {
     // Derivation fails only on the null pointers references rule out.
     unsafe { ucall_noise_key_derive(&mut arguments) };
     public_key
+}
+
+/// A file descriptor borrowed for `'f`, laid out as the C `int` the library reads.
+#[cfg(unix)]
+pub type Descriptor<'f> = std::os::fd::BorrowedFd<'f>;
+/// A file descriptor borrowed for `'f`, laid out as the C `int` the library reads.
+#[cfg(windows)]
+pub type Descriptor<'f> = CrtDescriptor<'f>;
+
+/// A C runtime descriptor, as `_open_osfhandle` makes one, borrowed for `'f` and never closed.
+#[cfg(windows)]
+#[repr(transparent)]
+#[derive(Clone, Copy, Debug)]
+pub struct CrtDescriptor<'f> {
+    descriptor: c_int,
+    file: PhantomData<&'f ()>,
+}
+
+#[cfg(windows)]
+impl CrtDescriptor<'_> {
+    /// Borrows `descriptor`.
+    ///
+    /// # Safety
+    ///
+    /// The descriptor stays open for the returned lifetime.
+    pub unsafe fn borrow_raw(descriptor: c_int) -> Self {
+        CrtDescriptor {
+            descriptor,
+            file: PhantomData,
+        }
+    }
 }
 
 /// A borrowed header line, laid out so a slice of them is lent to the library without copying.

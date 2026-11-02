@@ -57,10 +57,13 @@ mod testing;
 pub use client::{CallRequest, Client, ClientOptions, Completed, RequestOptions, Response};
 pub use server::{
     Batch, BatchEndpoint, BatchEndpointStatistics, Batching, DetachedRequest, EventLoopStatistics,
-    Interface, Metrics, Peer, ReplyPart, ReplyStream, Request, RequestPart, Server, ServerOptions,
+    FileRange, Interface, Metrics, PathRange, Peer, ReplyPart, ReplyStream, Request, RequestPart,
+    Server, ServerOptions,
 };
+#[cfg(windows)]
+pub use types::CrtDescriptor;
 pub use types::{
     derive_noise_public_key, generate_noise_keypair, version, Backend, BodyDelivery, BytesView,
-    CPUClass, Deferred, Error, HTTPStatus, Log, LogCallback, LogFormat, LogLevel, NoiseKey,
-    PeerAuthorizer, Result, Security, Status, Verb, Wait,
+    CPUClass, Deferred, Descriptor, Error, HTTPStatus, Log, LogCallback, LogFormat, LogLevel,
+    NoiseKey, PeerAuthorizer, Result, Security, Status, Verb, Wait,
 };
