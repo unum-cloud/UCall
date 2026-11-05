@@ -2,9 +2,9 @@
  *  @file verification/segment_links.pml
  *  @author Ash Vardanian
  *  @date October 27, 2026
- *  @brief Spin model of an exchange's reply segments in `include/ucall/network.hpp`: the replier's
- *      @c link_chain and @c list_replied against the loop's @c collect_replies, @c adopt_chain and
- *      the parking in @c retire_segment.
+ *  @brief Spin model of an exchange's reply segments in @c include/ucall/network/replies.hpp: the
+ *      replier's @c link_chain and @c list_replied against @c collect_replies of
+ *      @c include/ucall/network/serving.hpp, @c adopt_chain and the parking in @c retire_segment.
  *
  *  The replier writes each segment's payload, links it with a release store into the @c next of
  *  its previous segment, and lists the exchange by setting the listed bit with an acquire-release

@@ -23,7 +23,7 @@
 
 #include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`, `fu_pool_capabilities`
 
-#include "ucall/types.hpp" // `bytes_view`, `st::status_t`
+#include "ucall/utilities/types.hpp" // `bytes_view`, `st::status_t`
 
 #include "arguments.hpp" // `parse_count`, `parse_key`, `admit_any_peer`, `process_clocks_t`
 
@@ -68,7 +68,9 @@ struct server_t {
     ucall_server_t server {};
     std::size_t event_loops {};
     std::size_t connections {1024}, pipelined_requests {1};
-    std::vector<ucall_http_batch_endpoint_t> batch_endpoints;                      // Each gets its own drain thread.
+
+    /** Each gets its own polling thread. */
+    std::vector<ucall_http_batch_endpoint_t> batch_endpoints;
     std::size_t min_batch_size {}, max_batch_size {}, max_latency_microseconds {}; // Zeros take the defaults.
     statistics_format_t statistics_format {statistics_format_t::human_k};
 
@@ -90,14 +92,14 @@ struct server_t {
         ucall_server_reply_content_t reply {*static_cast<ucall_server_t*>(context),
                                             &outcome,
                                             request,
+                                            ucall_http_status_ok_k,
                                             nullptr,
                                             0,
-                                            bytes_view("ready\n"),
-                                            ucall_http_status_ok_k};
+                                            bytes_view("ready\n")};
         ucall_server_reply_content(&reply);
     }
     int init(int argc, char** argv, std::initializer_list<count_flag_t> counts = {}) {
-        ucall_server_config_t config {};
+        ucall_server_options_t config {};
         config.cpu_class = ucall_cpu_class_serial_k;
         std::size_t threads = 1;
         std::size_t port = 8545;
@@ -157,9 +159,9 @@ struct server_t {
             }
             else if (flag == "--security") {
                 valid = value == "none" || value == "xx" || value == "ik";
-                network_interface.security_mode = value == "xx"   ? ucall_security_mode_noise_xx_k
-                                                  : value == "ik" ? ucall_security_mode_noise_ik_k
-                                                                  : ucall_security_mode_none_k;
+                network_interface.security = value == "xx"   ? ucall_security_noise_xx_k
+                                             : value == "ik" ? ucall_security_noise_ik_k
+                                                             : ucall_security_none_k;
             }
             else if (flag == "--stats") {
                 valid = value == "human" || value == "json";
@@ -180,7 +182,7 @@ struct server_t {
                 return -1;
             }
         }
-        if (network_interface.security_mode != ucall_security_mode_none_k) {
+        if (network_interface.security != ucall_security_none_k) {
             ucall_noise_key_t public_key {};
             ucall_outcome_t outcome {};
             if (!key.empty()) {
@@ -199,7 +201,7 @@ struct server_t {
             for (ucall_byte_t byte : public_key) std::printf("%02x", byte);
             std::printf("\n");
             network_interface.noise_private_key = &private_key;
-            if (network_interface.security_mode == ucall_security_mode_noise_xx_k)
+            if (network_interface.security == ucall_security_noise_xx_k)
                 network_interface.peer_authorizer = admit_any_peer;
         }
         std::signal(SIGINT, request_stop);
@@ -219,7 +221,7 @@ struct server_t {
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
         ucall_outcome_t outcome {};
-        ucall_server_config_t resolved {};
+        ucall_server_options_t resolved {};
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
         if (!succeeded(outcome)) return -1;

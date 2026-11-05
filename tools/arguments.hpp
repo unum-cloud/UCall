@@ -14,8 +14,8 @@
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
 
-#include "ucall/types.hpp" // `UCALL_OS_WINDOWS_`
-#include "ucall/ucall.h"   // `ucall_noise_key_t`, `ucall_status_t`
+#include "ucall/utilities/types.hpp" // `UCALL_OS_WINDOWS_`
+#include "ucall/ucall.h"             // `ucall_noise_key_t`, `ucall_status_t`
 
 #if !UCALL_OS_WINDOWS_
 #include <sys/resource.h> // `getrusage`

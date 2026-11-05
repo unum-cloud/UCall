@@ -25,7 +25,7 @@ static void echo(ucall_received_http_request_t request, void* context) {
     ucall_bytes_view_t body {};
     ucall_server_request_body_t extract {server, &outcome, request, &body};
     ucall_server_request_body(&extract);
-    ucall_server_reply_content_t reply {server, &outcome, request, nullptr, 0, body, ucall_http_status_ok_k};
+    ucall_server_reply_content_t reply {server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, body};
     ucall_server_reply_content(&reply);
 }
 
@@ -100,7 +100,7 @@ static void reordered(ucall_received_http_request_t request, void* context) {
             static_cast<unsigned long long>(key[1]), static_cast<unsigned long long>(key[2]));
         ucall_bytes_view_t headers[] = {uc::bytes_view({pair_header, static_cast<std::size_t>(length)}),
                                         uc::bytes_view(member ? "x-ucall-member: 1" : "x-ucall-member: 0")};
-        ucall_server_reply_content_t reply {service.server, &outcome, held, headers, 2, body, ucall_http_status_ok_k};
+        ucall_server_reply_content_t reply {service.server, &outcome, held, ucall_http_status_ok_k, headers, 2, body};
         ucall_server_reply_content(&reply);
     }
 }

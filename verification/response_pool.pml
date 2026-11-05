@@ -2,8 +2,8 @@
  *  @file verification/response_pool.pml
  *  @author Ash Vardanian
  *  @date November 2, 2026
- *  @brief Spin model of a client's responses in @c include/ucall/network.hpp: @c take_response,
- *      @c response_t::release, @c delete_pool and the teardown in @c ~client_t.
+ *  @brief Spin model of a client's responses in @c include/ucall/network/client.hpp:
+ *      @c take_response, @c response_t::release, @c delete_pool and the teardown in @c ~client.
  *
  *  The pool holds a take-all stack @c returned and a count @c outside of one for the client plus
  *  one per response handed out. A free pushes its response with a releasing compare-exchange, then

@@ -5,7 +5,7 @@ Requests queue on the event loop; one batcher task flushes them to the shared Nu
 maximum, on reaching the minimum, or once the oldest request waited the latency budget.
 The kernel runs on a worker thread, so the event loop keeps accepting while a batch scores.
 
-File: examples/inference/server_fastapi.py
+File: bench/fastapi_inference.py
 Author: Ash Vardanian
 Date: October 25, 2026
 """

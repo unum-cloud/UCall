@@ -10,9 +10,11 @@
 
 #include "harness.hpp" // `expect`, `require`, `run_test`, `scale_iterations`
 
-#include "ucall/tunnel.hpp"
+#include "ucall/tunnel/crypto.hpp"        // `secure_tunnel_crypto`, the serial kits
+#include "ucall/tunnel/secure_tunnel.hpp" // `secure_tunnel_t`
 
 using namespace unum::ucall;
+using namespace unum::ucall::tunnel;
 using namespace unum::ucall::test;
 
 using crypto_t = secure_tunnel_crypto<serial_sha256_kit_t, serial_aes256_gcm_kit_t>;
@@ -195,7 +197,7 @@ struct connected_pair_t {
         client_config.max_payload = max_payload;
         // `IK` and `KK` give the initiator the responder's key ahead of the first message.
         if (mode == secure_tunnel_mode_t::noise_ik_k || mode == secure_tunnel_mode_t::noise_kk_k)
-            client_config.remote_public = server_keys.public_half();
+            client_config.peer_public = server_keys.public_half();
 
         secure_tunnel_config_t server_config;
         server_config.mode = mode;
@@ -204,7 +206,7 @@ struct connected_pair_t {
         server_config.local_public = server_keys.public_half();
         server_config.max_payload = max_payload;
         // Only `KK` pre-shares the initiator's key with the responder.
-        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.remote_public = client_keys.public_half();
+        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.peer_public = client_keys.public_half();
 
         if (client.make(client_config) != secure_tunnel_fault_t::none_k) return handshake_outcome_t::misconfigured_k;
         if (server.make(server_config) != secure_tunnel_fault_t::none_k) return handshake_outcome_t::misconfigured_k;
@@ -522,8 +524,8 @@ case_result_t test_geometry_safety() {
         client_config.local_public = client_identity.public_half();
         server_config.local_private = server_identity.private_half();
         server_config.local_public = server_identity.public_half();
-        if (mode != secure_tunnel_mode_t::noise_xx_k) client_config.remote_public = server_identity.public_half();
-        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.remote_public = client_identity.public_half();
+        if (mode != secure_tunnel_mode_t::noise_xx_k) client_config.peer_public = server_identity.public_half();
+        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.peer_public = client_identity.public_half();
         client_config.max_payload = secure_tunnel_payload_ceiling_k;
         server_config.max_payload = 1024;
 
@@ -596,7 +598,7 @@ case_result_t test_handshake_unit() {
     unproven_config.mode = secure_tunnel_mode_t::noise_ik_k;
     unproven_config.role = secure_tunnel_role_t::initiator_k;
     unproven_config.local_private = client_keys.private_half();
-    unproven_config.remote_public = server_keys.public_half();
+    unproven_config.peer_public = server_keys.public_half();
     failures += expect(unproven.make(unproven_config) == secure_tunnel_fault_t::none_k);
 
     byte_t seen[secure_tunnel_key_size_k];
@@ -661,14 +663,14 @@ case_result_t test_handshake_safety() {
         client_config.role = secure_tunnel_role_t::initiator_k;
         client_config.local_private = client_keys.private_half();
         client_config.local_public = client_keys.public_half();
-        if (mode != secure_tunnel_mode_t::noise_xx_k) client_config.remote_public = server_keys.public_half();
+        if (mode != secure_tunnel_mode_t::noise_xx_k) client_config.peer_public = server_keys.public_half();
 
         secure_tunnel_config_t server_config;
         server_config.mode = mode;
         server_config.role = secure_tunnel_role_t::responder_k;
         server_config.local_private = server_keys.private_half();
         server_config.local_public = server_keys.public_half();
-        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.remote_public = client_keys.public_half();
+        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.peer_public = client_keys.public_half();
 
         // A peer forcing a shared secret it already knows is an attack, not the operating system
         // refusing entropy, and the two must not collapse into one fault.
@@ -728,8 +730,8 @@ case_result_t test_handshake_delivery() {
         client_config.local_public = client_identity.public_half();
         server_config.local_private = server_identity.private_half();
         server_config.local_public = server_identity.public_half();
-        if (mode != secure_tunnel_mode_t::noise_xx_k) client_config.remote_public = server_identity.public_half();
-        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.remote_public = client_identity.public_half();
+        if (mode != secure_tunnel_mode_t::noise_xx_k) client_config.peer_public = server_identity.public_half();
+        if (mode == secure_tunnel_mode_t::noise_kk_k) server_config.peer_public = client_identity.public_half();
 
         secure_tunnel_t initiator, responder;
         failures += expect(initiator.make(client_config) == secure_tunnel_fault_t::none_k);

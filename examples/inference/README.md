@@ -12,43 +12,33 @@ A query is exactly `--dimensions` request bytes read as i8, and each reply holds
 
 - `POST /infer` runs NumKong's packed i8 dots for one query over every slice in turn, on the polling thread that received it, with its scores and running top 10 on the stack.
 - `POST /infer/batch` is a batch endpoint that copies a batch's queries into one dense matrix, then spreads the slices over a ForkUnion pool of one thread per logical core, each taking every N-th slice, and merges the threads' best rows.
-  Its drain thread is the pool's only user, owns the threads' score scratch, and parks the pool between batches.
+  Its polling thread is the pool's only user, owns the threads' score scratch, and parks the pool between batches.
 - `POST /slow/batch` sleeps `--slow-batch-us` microseconds in its callback, 5,000 by default, then answers every request with an empty body.
 - `GET /health` answers `ready`.
 
 Besides `--rows`, `--dimensions`, `--seed` and `--slow-batch-us`, it takes the server flags every example shares: `--host`, `--port`, `--threads`, `--connections`, `--pipelined-requests`, `--security`, `--key`, `--batch-min`, `--batch-max`, `--batch-latency-us` and `--stats`.
 
 ```sh
-cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DUCALL_BUILD_BENCH=ON -DUCALL_BUILD_TOOLS=ON
+cmake -S . -B build_release -DCMAKE_BUILD_TYPE=Release -DUCALL_BUILD_BENCH=ON -DUCALL_BUILD_EXAMPLES=ON
 cmake --build build_release --target ucall_bench_http ucall_example_inference
 build_release/ucall_example_inference --rows 100000 --dimensions 1024 --threads 1 --connections 2048 \
     --batch-min 8 --batch-max 64 --batch-latency-us 1000 --stats json
 ```
 
-## Python Twins
+## Python Server
 
-Three Python services serve the inference routes over one NumKong kernel, [model.py](model.py), whose matrix and replies are byte-identical to the native example's for the same seed.
-They compare Python frameworks on the same application, not against the native server.
-
-- [server.py](server.py) runs on UCall's Python bindings: `/infer` scores on the polling thread, and `/infer/batch` is a batch endpoint drained by its own thread.
-- [server_fastapi.py](server_fastapi.py) runs on FastAPI: `/infer` scores on the event loop, and `/infer/batch` queues requests in an asyncio micro-batcher under the same three budgets, scoring each batch on a worker thread.
-- [server_litserve.py](server_litserve.py) runs on LitServe, which serves `/infer/batch` alone and batches by `max_batch_size` and `batch_timeout` without a minimum.
-  LitServe decodes bodies as JSON, so its middleware first wraps each raw query in a hexadecimal string.
-
-All three take `--rows`, `--dimensions`, `--seed`, `--port`, `--batch-min`, `--batch-max` and `--batch-latency-us`; LitServe ignores `--batch-min`.
+[server.py](server.py) serves the same routes on UCall's Python bindings over one NumKong kernel, [model.py](model.py), whose matrix and replies are byte-identical to the native example's for the same seed.
+`/infer` scores on the polling thread, and `/infer/batch` is a batch endpoint polled by its own thread.
+It takes `--rows`, `--dimensions`, `--seed`, `--port`, `--batch-min`, `--batch-max` and `--batch-latency-us`, and its FastAPI and LitServe baselines live with the benchmarks.
 
 ```sh
 uv venv .venv && source .venv/bin/activate
-uv pip install . numpy numkong fastapi 'uvicorn[standard]' litserve
+uv pip install . numpy numkong
 python examples/inference/server.py --port 8547 \
     --batch-min 8 --batch-max 64 --batch-latency-us 1000
-python examples/inference/server_fastapi.py --port 8548 \
-    --batch-min 8 --batch-max 64 --batch-latency-us 1000
-python examples/inference/server_litserve.py --port 8549 \
-    --batch-max 64 --batch-latency-us 1000
 ```
 
-Point the driver commands below at ports 8547 through 8549.
+Point the driver commands below at port 8547.
 
 ## Batch Amortization
 
@@ -119,7 +109,7 @@ Parked ForkUnion workers take up to 1 ms to wake for each batch, which the examp
 ## Endpoint Isolation
 
 Does a slow batch endpoint still stall the others?
-Each batch endpoint has its own drain thread, so `/infer/batch` should keep its latency while `/slow/batch` sleeps 5 ms in every callback.
+Each batch endpoint has its own polling thread, so `/infer/batch` should keep its latency while `/slow/batch` sleeps 5 ms in every callback.
 The fast route takes a fixed 1,000 requests/s while a second driver offers the slow route 0 to 800 requests/s:
 
 ```sh
@@ -140,5 +130,5 @@ wait
 |                      800 |                     999 |       14,680 |       41,943 |                     9.5 |        2,442 |        10,400 |
 
 The slow and fast counts come from the server's batch counters, warmup included.
-A slow batch endpoint does not drag a fast one: the fast route's p99 stays between 38 and 48 ms with no trend as the slow load grows, even when the slow drain is saturated and packs about 4 requests into each batch.
+A slow batch endpoint does not drag a fast one: the fast route's p99 stays between 38 and 48 ms with no trend as the slow load grows, even when the slow endpoint's polling thread is saturated and packs about 4 requests into each batch.
 These runs shared the machine at a load average of 23 to 28.

@@ -2,7 +2,7 @@
  *  @file verification/claims.cpp
  *  @author Ash Vardanian
  *  @date October 27, 2026
- *  @brief GenMC client for the reply claim in `include/ucall/network.hpp`: @c reply and
+ *  @brief GenMC client for the reply claim in @c include/ucall/network/replies.hpp: @c reply and
  *      @c begin_reply against the loop's @c detach of a closed connection.
  *
  *  Two repliers claim one exchange with @c fetch_test_and_set_bit on its claimed bit, acquiring

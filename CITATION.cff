@@ -8,7 +8,7 @@ doi: 10.5281/zenodo.7951496
 repository-code: https://github.com/unum-cloud/UCall
 url: https://github.com/unum-cloud/UCall
 abstract: >-
-  UCall is a performance-oriented, portable, and compact HTTP and RPC framework built around Noise,
+  UCall is a performance-oriented, portable, and compact HTTP framework built around Noise,
   io_uring, and SIMD. Application handlers stay synchronous while caller-owned polling drives
   connection state machines that overlap network I/O and retain request batches, with HTTP and Noise
   clients and servers on capability-specialized I/O backends, exposed through a C ABI with C++,

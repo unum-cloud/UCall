@@ -1,8 +1,12 @@
 cmake_minimum_required(VERSION 3.28)
 file(STRINGS "${CMAKE_CURRENT_SOURCE_DIR}/VERSION" ucall_version_name_ LIMIT_COUNT 1)
+# `project()` takes the numeric core alone, so a candidate's suffix stays in the name.
+if (NOT ucall_version_name_ MATCHES "^([0-9]+\\.[0-9]+\\.[0-9]+)")
+    message(FATAL_ERROR "VERSION must start with MAJOR.MINOR.PATCH, not '${ucall_version_name_}'")
+endif ()
 project(
     ucall
-    VERSION 1.0.0
+    VERSION ${CMAKE_MATCH_1}
     LANGUAGES C CXX
     DESCRIPTION "HTTP and Noise clients and servers with capability-specialized I/O backends"
     HOMEPAGE_URL "https://github.com/unum-cloud/UCall"
@@ -37,9 +41,10 @@ option(UCALL_WITH_LINUX_EPOLLAIO "Include the Linux epoll and AIO backend" ${uca
 option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${ucall_default_kqueue_})
 option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${ucall_default_iocp_})
 option(UCALL_BUILD_PYTHON "Build the CPython extension; `pyproject.toml` switches it on" OFF)
-option(UCALL_BUILD_TOOLS "Build the echo, ledger, key-value, and inference examples" OFF)
+option(UCALL_BUILD_EXAMPLES "Build the hello, echo, ledger, key-value, and inference examples" OFF)
 option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
 option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" OFF)
+option(UCALL_BUILD_FUZZ "Build libFuzzer harnesses for the parsers; needs Clang" OFF)
 option(UCALL_BUILD_SHARED "Compile ucall_shared in the default build and install both libraries" OFF)
 option(UCALL_INSTALL "Install the C headers, libraries and CMake package" ${PROJECT_IS_TOP_LEVEL})
 option(UCALL_WERROR "Treat compiler warnings as errors" OFF)
@@ -97,7 +102,6 @@ if (PROJECT_IS_TOP_LEVEL AND EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/.git")
 endif ()
 
 include(FetchContent)
-include(ExternalProject)
 include(GNUInstallDirs)
 find_package(Threads REQUIRED)
 
@@ -105,43 +109,8 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(cmake/ucall_siblings.cmake)
 
-# Prefer a current system liburing; source builds are isolated under the build directory.
 if (UCALL_WITH_LINUX_URING)
-    find_package(PkgConfig QUIET)
-    if (PkgConfig_FOUND)
-        pkg_check_modules(UCALL_URING QUIET IMPORTED_TARGET liburing>=2.15)
-    endif ()
-    if (TARGET PkgConfig::UCALL_URING)
-        add_library(uring_internal ALIAS PkgConfig::UCALL_URING)
-    else ()
-        set(ucall_uring_dir_ ${CMAKE_BINARY_DIR}/_deps/liburing-ep)
-        # liburing's own `configure` knows no target, so a cross build names it with the compilers.
-        set(ucall_uring_cc_ ${CMAKE_C_COMPILER})
-        set(ucall_uring_cxx_ ${CMAKE_CXX_COMPILER})
-        if (CMAKE_C_COMPILER_TARGET)
-            string(APPEND ucall_uring_cc_ " --target=${CMAKE_C_COMPILER_TARGET}")
-            string(APPEND ucall_uring_cxx_ " --target=${CMAKE_CXX_COMPILER_TARGET}")
-        endif ()
-        ExternalProject_Add(
-            liburing-ep
-            GIT_REPOSITORY https://github.com/axboe/liburing.git
-            GIT_TAG liburing-2.15
-            GIT_SHALLOW 1
-            PREFIX ${CMAKE_BINARY_DIR}/_deps/
-            SOURCE_DIR ${ucall_uring_dir_}
-            CONFIGURE_COMMAND <SOURCE_DIR>/configure --cc=${ucall_uring_cc_} --cxx=${ucall_uring_cxx_}
-            BUILD_COMMAND make -C <SOURCE_DIR>/src -s
-            BUILD_BYPRODUCTS ${ucall_uring_dir_}/src/liburing.a
-            BUILD_IN_SOURCE 1
-            INSTALL_COMMAND ""
-            UPDATE_COMMAND ""
-        )
-        add_library(uring_internal STATIC IMPORTED GLOBAL)
-        add_dependencies(uring_internal liburing-ep)
-        set_property(TARGET uring_internal PROPERTY IMPORTED_LOCATION ${ucall_uring_dir_}/src/liburing.a)
-        file(MAKE_DIRECTORY ${ucall_uring_dir_}/src/include)
-        set_property(TARGET uring_internal PROPERTY INTERFACE_INCLUDE_DIRECTORIES ${ucall_uring_dir_}/src/include)
-    endif ()
+    include(cmake/liburing.cmake)
 endif ()
 
 if (UCALL_BUILD_TEST)
@@ -213,22 +182,19 @@ function (ucall_setup_library target_ scope_)
     if (WIN32)
         target_link_libraries(${target_} PRIVATE bcrypt ws2_32 mswsock ntdll)
     endif ()
-    # An installed archive links the system's liburing, which a source build of it does not install.
     if (UCALL_WITH_LINUX_URING)
-        target_link_libraries(${target_} ${scope_} $<BUILD_INTERFACE:uring_internal> $<INSTALL_INTERFACE:uring>)
-        if (TARGET liburing-ep)
-            add_dependencies(${target_} liburing-ep)
-        endif ()
+        target_link_libraries(${target_} ${scope_} uring::uring)
     endif ()
 endfunction ()
 ucall_setup_library(ucall_static PUBLIC)
 ucall_setup_library(ucall_shared PRIVATE)
+# A C program links the archive with the C driver, which leaves out the C++ runtime the library needs.
+target_link_libraries(ucall_static INTERFACE $<$<LINK_LANGUAGE:C>:${CMAKE_CXX_IMPLICIT_LINK_LIBRARIES}>)
 # The archive's consumers call it directly, so on Windows only the shared library exports and its consumers import.
 if (WIN32)
     target_compile_definitions(ucall_static PUBLIC UCALL_EXPORT=)
 endif ()
-# The linker hides what hidden visibility misses: liburing's archive and the standard library templates its headers
-# declare visible.
+# The linker hides what hidden visibility misses: the standard library templates its headers declare visible.
 if (APPLE)
     target_link_options(ucall_shared PRIVATE "LINKER:-exported_symbol,_ucall_*")
 elseif (CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android|FreeBSD)$")
@@ -286,17 +252,7 @@ ucall_cpu_variant(
     icelake
 )
 ucall_cpu_variant(intel_alder INTEL_ALDER westmere goldmont haswell)
-ucall_cpu_variant(intel_sierra INTEL_SIERRA westmere goldmont haswell x86_cmpccxadd)
 ucall_cpu_variant(aws_g2 AWS_G2 neon neonaes neonsha arm64_lse)
-ucall_cpu_variant(
-    apple_m2
-    APPLE_M2
-    neon
-    neonaes
-    neonsha
-    arm64_lse
-    arm64_rcpc
-)
 
 if (UCALL_MARCH)
     set(ucall_floor_ "${UCALL_MARCH}")
@@ -327,13 +283,22 @@ else ()
     ucall_cpu_variant(monoversioned MONOVERSIONED ${ucall_capabilities_vouched_})
 endif ()
 
-if (UCALL_BUILD_TOOLS)
+if (UCALL_BUILD_EXAMPLES)
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
         target_link_libraries(ucall_example_${example_} PRIVATE ucall_static forkunion::static ucall_warnings)
     endforeach ()
     target_link_libraries(ucall_example_inference PRIVATE numkong::static)
+    add_executable(ucall_example_hello examples/hello.c)
+    target_link_libraries(ucall_example_hello PRIVATE ucall_static ucall_warnings)
+endif ()
+# The command-line client builds with the examples and with anything installed, where it joins the SDK.
+if (UCALL_BUILD_EXAMPLES OR UCALL_INSTALL)
+    add_executable(ucall_cli cli/ucall.cpp)
+    set_target_properties(ucall_cli PROPERTIES OUTPUT_NAME ucall)
+    target_include_directories(ucall_cli PRIVATE tools)
+    target_link_libraries(ucall_cli PRIVATE ucall_static ucall_warnings)
 endif ()
 if (UCALL_BUILD_BENCH)
     add_executable(ucall_bench_http bench/http.cpp)

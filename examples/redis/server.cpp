@@ -134,7 +134,8 @@ static void key_value(ucall_received_http_request_t request, void* context) {
     ucall_bytes_view_t const response = verb == ucall_verb_get_k && !not_modified
                                             ? uc::bytes_view(uc::text_view(result.bytes))
                                             : ucall_bytes_view_t {};
-    ucall_server_reply_content_t reply {service.server, &outcome, request, headers, 2, response};
+    ucall_server_reply_content_t reply {service.server, &outcome, request, ucall_http_status_ok_k,
+                                        headers,        2,        response};
     if (not_modified) reply.http_status = ucall_http_status_not_modified_k;
     ucall_server_reply_content(&reply);
 }

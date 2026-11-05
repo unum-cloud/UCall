@@ -83,7 +83,7 @@ static void offer_scores(top_rows_t& top, std::size_t first_row, std::span<score
         top.offer({static_cast<std::uint32_t>(first_row + row), scores[row]});
 }
 
-/** One pool thread's scratch, grown before each batch by the drain, its single owner. */
+/** One pool thread's scratch, grown before each batch by the polling owner. */
 struct pool_thread_scratch_t {
 
     /** A `queries × slice_rows_k` matrix for the slice being scored. */
@@ -119,7 +119,7 @@ static void pack_slices(void* context, std::size_t thread, std::size_t) {
     }
 }
 
-/** One batch's pass over the pool, on the stack of the drain thread that dispatched it. */
+/** One batch's pass over the pool, on the stack of the polling thread that dispatched it. */
 struct batch_call_t {
     std::span<model_slice_t const> slices;
     std::span<pool_thread_scratch_t> threads;
@@ -174,7 +174,7 @@ struct service_t {
         std::size_t cores {};
         fu_status_t status = fu_topology_new(&topology);
         if (status == fu_success_k) status = fu_logical_cores_count(topology, &cores);
-        // The pool floats, so the drain thread that dispatches it runs a share unpinned.
+        // The pool floats, so the polling thread that dispatches it runs a share unpinned.
         fu_capabilities_t const floating = static_cast<fu_capabilities_t>(
             fu_capabilities_all_k &
             ~(fu_capability_place_threads_by_affinity_k | fu_capability_place_memory_on_domain_k));
@@ -273,7 +273,7 @@ struct service_t {
                     *output++ = static_cast<ucall_byte_t>(word >> (8 * byte));
         ucall_outcome_t outcome {};
         ucall_server_reply_content_t content {
-            server, &outcome, request, nullptr, 0, {bytes, sizeof(bytes)}, ucall_http_status_ok_k};
+            server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, {bytes, sizeof(bytes)}};
         ucall_server_reply_content(&content);
     }
 };
@@ -327,7 +327,7 @@ static void slow_batch(ucall_received_http_request_t const* requests, std::size_
     std::this_thread::sleep_for(std::chrono::microseconds(service.slow_batch_microseconds));
     for (ucall_received_http_request_t const request : batch) {
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {service.server, &outcome, request, nullptr, 0, {}, ucall_http_status_ok_k};
+        ucall_server_reply_content_t reply {service.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, {}};
         ucall_server_reply_content(&reply);
     }
 }

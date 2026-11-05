@@ -1,0 +1,53 @@
+name: Release Rust
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    name: Check Release Commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Check the Release Commit
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME"
+
+  # `cargo publish` builds the packaged crate, which drives CMake over the library's sources.
+  publish_rust:
+    name: Publish Rust Crate
+    needs: hooks
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    environment:
+      name: crates
+      url: https://crates.io/crates/ucall
+    permissions:
+      contents: read
+      id-token: write
+    env:
+      CC: clang-22
+      CXX: clang++-22
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Clang 22
+        run: sudo apt-get update && sudo apt-get install -y clang-22
+      - name: Authenticate with crates.io
+        id: crates_io
+        uses: rust-lang/crates-io-auth-action@v1
+      - name: Publish Rust Crate to Registry
+        run: cargo publish --token ${{ steps.crates_io.outputs.token }}

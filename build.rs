@@ -35,8 +35,8 @@ fn main() -> Result<(), Box<dyn Error>> {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR")?);
 
     // A directory holding `ucall_static` that CMake already built, like a parent project's build
-    // tree or a release, skips the build here and links the system's liburing. Pass the archive's
-    // exact directory.
+    // tree or an installed prefix, skips the build here and links the liburing archive beside it.
+    // Pass the archive's exact directory.
     println!("cargo:rerun-if-env-changed=UCALL_LIBRARY_DIR");
     let target_os = env::var("CARGO_CFG_TARGET_OS")?;
     match env::var_os("UCALL_LIBRARY_DIR") {
@@ -54,7 +54,7 @@ fn main() -> Result<(), Box<dyn Error>> {
             println!("cargo:rustc-link-search=native={}", directory.display());
             println!("cargo:rustc-link-lib=static=ucall_static");
             if target_os == "linux" {
-                println!("cargo:rustc-link-lib=dylib=uring");
+                println!("cargo:rustc-link-lib=static=uring");
             }
         }
         None => build_library(&manifest)?,
@@ -63,7 +63,7 @@ fn main() -> Result<(), Box<dyn Error>> {
     // The archive is C++ over the platform's threads and sockets.
     match target_os.as_str() {
         "windows" => {
-            for system in ["bcrypt", "ws2_32", "mswsock"] {
+            for system in ["bcrypt", "ws2_32", "mswsock", "ntdll"] {
                 println!("cargo:rustc-link-lib=dylib={system}");
             }
         }
@@ -84,7 +84,10 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// Builds `ucall_static` through CMake and links it with the liburing its io_uring backends need.
 fn build_library(manifest: &Path) -> Result<(), Box<dyn Error>> {
     let mut library = cmake::Config::new(manifest);
-    library.profile("Release").build_target("ucall_static");
+    library
+        .profile("Release")
+        .build_target("ucall_static")
+        .define("UCALL_INSTALL", "OFF");
     for sibling in SIBLINGS {
         let variable = format!("FETCHCONTENT_SOURCE_DIR_{sibling}");
         println!("cargo:rerun-if-env-changed={variable}");
@@ -99,23 +102,10 @@ fn build_library(manifest: &Path) -> Result<(), Box<dyn Error>> {
     println!("cargo:rustc-link-search=native={}", build.display());
     println!("cargo:rustc-link-lib=static=ucall_static");
 
-    // The io_uring backends link liburing publicly: the system's shared library when pkg-config
-    // found a recent one, otherwise the archive CMake built from source.
+    // The io_uring backends link the liburing archive CMake built beside `ucall_static`.
     let cache = fs::read_to_string(build.join("CMakeCache.txt"))?;
     if cached(&cache, "UCALL_WITH_LINUX_URING") == Some("ON") {
-        match cached(&cache, "UCALL_URING_FOUND") {
-            Some("1") => {
-                if let Some(directory) = cached(&cache, "UCALL_URING_LIBDIR") {
-                    println!("cargo:rustc-link-search=native={directory}");
-                }
-                println!("cargo:rustc-link-lib=dylib=uring");
-            }
-            _ => {
-                let source = build.join("_deps").join("liburing-ep").join("src");
-                println!("cargo:rustc-link-search=native={}", source.display());
-                println!("cargo:rustc-link-lib=static=uring");
-            }
-        }
+        println!("cargo:rustc-link-lib=static=uring");
     }
 
     // Cargo scans a watched directory recursively.

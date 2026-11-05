@@ -1,4 +1,4 @@
-"""Shared NumKong model for the Python twins of the native inference example.
+"""Shared NumKong model for the Python inference services: the UCall example and its benchmark baselines.
 
 The matrix holds the same values as `ucall_example_inference` with the same seed: ForkUnion's counter-based
 SplitMix64 keyed by the seed's own SplitMix64 output, eight little-endian i8 values per word.

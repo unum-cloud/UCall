@@ -7,7 +7,7 @@
 #   ctest --test-dir build_aarch64_llvm
 # ~~~
 #
-# QEMU's `-cpu max` carries LSE, RCPC and SVE2, so every Arm CPU class the library compiles runs, the AWS and Apple ones
+# QEMU's `-cpu max` carries LSE, RCPC and SVE2, so every Arm CPU class the library compiles runs, `aws_g2` and `aws_g5`
 # included.
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR aarch64)
@@ -25,9 +25,6 @@ find_program(ucall_qemu_aarch64_ qemu-aarch64)
 if (ucall_qemu_aarch64_)
     set(CMAKE_CROSSCOMPILING_EMULATOR "${ucall_qemu_aarch64_};-L;/usr/aarch64-linux-gnu;-cpu;max")
 endif ()
-
-# The host's `.pc` files describe x86 libraries; an AArch64 liburing comes from the sysroot or is built.
-set(ENV{PKG_CONFIG_LIBDIR} "/usr/lib/aarch64-linux-gnu/pkgconfig:/usr/share/pkgconfig")
 
 set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
 set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)

@@ -10,7 +10,7 @@ curl -X POST http://127.0.0.1:8545/echo/batch --data-binary 'hello'
 ```
 
 `POST /echo` answers on the polling thread that parsed the request, with the body unchanged, embedded zero bytes included.
-`POST /echo/batch` routes the same work through a batch endpoint, drained by a pool thread of its own.
+`POST /echo/batch` routes the same work through a batch endpoint, polled by a pool thread of its own.
 
 `POST /echo/reordered` exercises retained replies.
 It holds a tagged request until its partner arrives, then answers the second before the first without blocking the polling caller.

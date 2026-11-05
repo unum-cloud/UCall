@@ -13,14 +13,15 @@ The backend defaults to automatic, the CPU class to serial, and the application 
 
 Every example also answers `GET /health` with `ready`.
 Each one is a single `server.cpp` over the flag parsing, polling loops, error replies and shutdown of `tools/server.hpp`, which the native benchmark server shares.
+[`hello.c`](hello.c), the C quickstart, is smaller than all of them: one `POST /echo` route on loopback port 8080 over the C ABI, taking no flags.
 
 Each batch callback receives a borrowed array of request handles and its count, and views them once as a `std::span`; the echo, key-value, and ledger callbacks reuse the individual handler for each request.
 These routes coalesce requests from every polling loop under the `--batch-min`, `--batch-max`, and `--batch-latency-us` budgets.
-Every batch endpoint gets a pool thread of its own that drains it through the handle its registration returned, so batch callbacks never run on a polling loop and a slow endpoint never holds another's batches.
+Every batch endpoint gets a pool thread of its own that polls it through the handle its registration returned, so batch callbacks never run on a polling loop and a slow endpoint never holds another's batches.
 The inference example's `/infer/batch` scores a whole batch with one NumKong packed GEMM across a ForkUnion pool, and `/slow/batch` sleeps in its callback to test that isolation.
 Each request keeps its own response; ledger transfers and key-value operations keep their individual transaction boundaries.
 
-Build with `UCALL_BUILD_TOOLS=ON` and select `ucall_example_echo`, `ucall_example_redis`, `ucall_example_ledger`, or `ucall_example_inference`.
+Build with `UCALL_BUILD_EXAMPLES=ON` and select `ucall_example_echo`, `ucall_example_redis`, `ucall_example_ledger`, or `ucall_example_inference`.
 Each executable selects among the backends compiled into the single UCall library.
 `--connections` supplies the admission budget, and `--threads` selects the application-owned polling loops.
 The application dispatches those loops through its ForkUnion pool; UCall creates no threads.

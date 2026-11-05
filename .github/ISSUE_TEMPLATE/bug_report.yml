@@ -59,8 +59,7 @@ body:
     attributes:
       label: Which interface are you using?
       options:
-        - C implementation
-        - C++ bindings
+        - C interface
         - Python bindings
         - Rust bindings
     validations:
@@ -68,10 +67,14 @@ body:
   - type: dropdown
     id: implementation
     attributes:
-      label: Which implementation are you using?
+      label: Which I/O backend are you using?
       options:
         - posix
-        - io_uring
+        - linux-epollaio
+        - linux-uring612
+        - linux-uring618
+        - bsd-kqueue
+        - windows-iocp
     validations:
       required: true
   - type: input

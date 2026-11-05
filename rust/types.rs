@@ -29,11 +29,12 @@ pub(crate) type ucall_status_t = u32;
 pub(crate) type ucall_http_status_t = u32;
 pub(crate) type ucall_io_backend_t = c_int;
 pub(crate) type ucall_cpu_class_t = c_int;
-pub(crate) type ucall_security_mode_t = c_int;
+pub(crate) type ucall_security_t = c_int;
 pub(crate) type ucall_verb_t = c_int;
 pub(crate) type ucall_log_level_t = c_int;
 pub(crate) type ucall_log_format_t = c_int;
 pub(crate) type ucall_body_delivery_t = c_int;
+pub(crate) type ucall_percent_mode_t = c_int;
 
 pub(crate) const ucall_status_success_k: ucall_status_t = 0;
 pub(crate) const ucall_status_deferred_k: ucall_status_t = 1;
@@ -129,7 +130,14 @@ extern "C" {
     fn ucall_io_backend_from_name(name: ucall_bytes_view_t) -> ucall_io_backend_t;
     fn ucall_cpu_class_from_name(name: ucall_bytes_view_t) -> ucall_cpu_class_t;
     fn ucall_status_name(status: ucall_status_t) -> *const c_char;
+    fn ucall_status_from_name(name: ucall_bytes_view_t) -> ucall_status_t;
     fn ucall_version_name() -> *const c_char;
+    fn ucall_decode_percent(
+        encoded: ucall_bytes_view_t,
+        decoded: *mut ucall_byte_t,
+        length: *mut usize,
+        mode: ucall_percent_mode_t,
+    ) -> ucall_status_t;
     fn ucall_noise_key_generate(arguments: *mut ucall_noise_key_generate_t);
     fn ucall_noise_key_derive(arguments: *mut ucall_noise_key_derive_t);
     pub(crate) fn ucall_outcome_wait(outcome: *mut ucall_outcome_t) -> ucall_status_t;
@@ -210,6 +218,15 @@ impl Status {
         };
         Err(status)
     }
+
+    /// Reads a status back from its stable spelling, like "out-of-memory", or `None` for a name
+    /// no failure has, "success" among them.
+    pub fn from_name(name: &str) -> Option<Self> {
+        let raw = unsafe { ucall_status_from_name(view(name.as_bytes())) };
+        Status::from_raw(raw)
+            .err()
+            .filter(|status| status.to_string() == name)
+    }
 }
 
 impl fmt::Display for Status {
@@ -265,10 +282,12 @@ pub(crate) fn fail(status: Status, message: &'static str) -> Error {
 }
 
 /// An outcome for the library to overwrite, starting as success.
-pub(crate) fn pending_outcome() -> ucall_outcome_t {
-    ucall_outcome_t {
-        status: ucall_status_success_k,
-        message: ptr::null(),
+impl Default for ucall_outcome_t {
+    fn default() -> Self {
+        ucall_outcome_t {
+            status: ucall_status_success_k,
+            message: ptr::null(),
+        }
     }
 }
 
@@ -292,7 +311,7 @@ impl Deferred<'_> {
     /// An outcome at a stable heap address, for a verb that may finish after it returns.
     pub(crate) fn pending() -> Self {
         Deferred {
-            outcome: NonNull::from(Box::leak(Box::new(pending_outcome()))),
+            outcome: NonNull::from(Box::leak(Box::new(ucall_outcome_t::default()))),
             files: PhantomData,
         }
     }
@@ -402,9 +421,46 @@ pub(crate) fn microseconds(duration: Duration) -> usize {
     usize::try_from(duration.as_micros()).unwrap_or(usize::MAX)
 }
 
-/// The version of the linked library, like "1.0.0" or "1.0.0-rc.1".
+/// Calls `ucall_version_name`.
 pub fn version() -> &'static str {
     unsafe { static_string(ucall_version_name()) }
+}
+
+/// Which part of a URL [`decode_percent`] reads, as only a query spells a space `+`.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub enum PercentMode {
+    /// A path, where `+` stays itself.
+    Path,
+    /// A query, where `+` is a space.
+    Query,
+}
+
+/// Decodes the `%XX` escapes of `encoded`, like a [`Request::query`](crate::Request::query) value,
+/// and `+` as a space in [`PercentMode::Query`].
+///
+/// Fails with [`Status::InvalidArgument`] on a `%` without two hexadecimal digits.
+///
+/// ```
+/// use ucall::{decode_percent, PercentMode};
+///
+/// assert_eq!(decode_percent(b"caf%C3%A9+au+lait", PercentMode::Query)?, "café au lait".as_bytes());
+/// assert!(decode_percent(b"100%", PercentMode::Path).is_err());
+/// # Ok::<(), ucall::Error>(())
+/// ```
+pub fn decode_percent(encoded: &[u8], mode: PercentMode) -> Result<Vec<u8>> {
+    let mut decoded = vec![0; encoded.len()];
+    let mut length = 0;
+    let raw = unsafe {
+        ucall_decode_percent(
+            view(encoded),
+            decoded.as_mut_ptr(),
+            &mut length,
+            mode as ucall_percent_mode_t,
+        )
+    };
+    Status::from_raw(raw).map_err(|status| fail(status, "a '%' lacks two hexadecimal digits"))?;
+    decoded.truncate(length);
+    Ok(decoded)
 }
 
 /// A 32-byte Curve25519 key, private or public, as every Noise handshake takes it.
@@ -424,7 +480,7 @@ pub type NoiseKey = [u8; 32];
 pub fn generate_noise_keypair() -> Result<(NoiseKey, NoiseKey)> {
     let mut private_key: NoiseKey = [0; 32];
     let mut public_key: NoiseKey = [0; 32];
-    let mut outcome = pending_outcome();
+    let mut outcome = ucall_outcome_t::default();
     let mut arguments = ucall_noise_key_generate_t {
         outcome: &mut outcome,
         private_key: &mut private_key,
@@ -437,7 +493,7 @@ pub fn generate_noise_keypair() -> Result<(NoiseKey, NoiseKey)> {
 /// The public key of `private_key`, as a [`PeerAuthorizer`] on the other side sees it.
 pub fn derive_noise_public_key(private_key: &NoiseKey) -> NoiseKey {
     let mut public_key: NoiseKey = [0; 32];
-    let mut outcome = pending_outcome();
+    let mut outcome = ucall_outcome_t::default();
     let mut arguments = ucall_noise_key_derive_t {
         outcome: &mut outcome,
         private_key,
@@ -570,10 +626,14 @@ impl HTTPStatus {
     pub const INTERNAL_ERROR: HTTPStatus = HTTPStatus(500);
     /// 501, the verb or feature is not supported.
     pub const NOT_IMPLEMENTED: HTTPStatus = HTTPStatus(501);
+    /// 502, an upstream answered with something no HTTP peer would send.
+    pub const BAD_GATEWAY: HTTPStatus = HTTPStatus(502);
     /// 503, the server is overloaded, like a batch endpoint whose queue is full.
     pub const SERVICE_UNAVAILABLE: HTTPStatus = HTTPStatus(503);
     /// 504, an upstream dependency timed out.
     pub const GATEWAY_TIMEOUT: HTTPStatus = HTTPStatus(504);
+    /// 505, the request names an HTTP version the server does not speak.
+    pub const VERSION_NOT_SUPPORTED: HTTPStatus = HTTPStatus(505);
 }
 
 /// An HTTP method, for routing on the server and for calls on the client.
@@ -636,7 +696,7 @@ pub enum Backend {
     /// Linux io_uring as kernel 6.18 offers it.
     LinuxURing618,
     /// macOS and FreeBSD readiness polling over `kqueue`.
-    MacOSKqueue,
+    BSDKqueue,
     /// Windows I/O completion ports.
     WindowsIOCP,
 }
@@ -652,7 +712,7 @@ impl Backend {
             2 => Backend::LinuxEpollAIO,
             3 => Backend::LinuxURing612,
             4 => Backend::LinuxURing618,
-            5 => Backend::MacOSKqueue,
+            5 => Backend::BSDKqueue,
             6 => Backend::WindowsIOCP,
             _ => Backend::Automatic,
         }
@@ -701,16 +761,12 @@ pub enum CPUClass {
     IntelIcelake = 4,
     /// x86 hybrid cores from Intel Alder Lake on.
     IntelAlder = 5,
-    /// x86 efficiency cores from Intel Sierra Forest on.
-    IntelSierra = 6,
     /// Arm cores from AWS Graviton 2 on.
-    AWSG2 = 7,
-    /// Arm cores from Apple M2 on.
-    AppleM2 = 8,
+    AWSG2 = 6,
     /// Arm server cores from AWS Graviton 5 on.
-    AWSG5 = 9,
+    AWSG5 = 7,
     /// The one class of a monoversioned build, with every capability it compiled.
-    Monoversioned = 10,
+    Monoversioned = 8,
 }
 
 impl CPUClass {
@@ -726,11 +782,9 @@ impl CPUClass {
             3 => Some(CPUClass::IntelSkylake),
             4 => Some(CPUClass::IntelIcelake),
             5 => Some(CPUClass::IntelAlder),
-            6 => Some(CPUClass::IntelSierra),
-            7 => Some(CPUClass::AWSG2),
-            8 => Some(CPUClass::AppleM2),
-            9 => Some(CPUClass::AWSG5),
-            10 => Some(CPUClass::Monoversioned),
+            6 => Some(CPUClass::AWSG2),
+            7 => Some(CPUClass::AWSG5),
+            8 => Some(CPUClass::Monoversioned),
             _ => None,
         }
     }
@@ -768,8 +822,8 @@ pub enum Security {
 }
 
 impl Security {
-    pub(crate) fn to_raw(self) -> ucall_security_mode_t {
-        self as ucall_security_mode_t
+    pub(crate) fn to_raw(self) -> ucall_security_t {
+        self as ucall_security_t
     }
 }
 
@@ -921,6 +975,7 @@ mod tests {
         assert_eq!(Status::OutOfMemory.to_string(), "out-of-memory");
         assert_eq!(Backend::LinuxURing618.to_string(), "linux-uring618");
         assert_eq!(CPUClass::AWSG5.to_string(), "aws-g5");
+        assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 
     #[test]
@@ -935,6 +990,13 @@ mod tests {
         assert_eq!(unknown.status, Status::InvalidArgument);
         assert!("".parse::<CPUClass>().is_err());
         assert!("automatic".parse::<CPUClass>().is_err());
+        assert_eq!(Status::from_name("would-block"), Some(Status::WouldBlock));
+        assert_eq!(
+            Status::from_name("invalid-argument"),
+            Some(Status::InvalidArgument)
+        );
+        assert_eq!(Status::from_name("success"), None);
+        assert_eq!(Status::from_name("would-bloc"), None);
     }
 
     #[test]

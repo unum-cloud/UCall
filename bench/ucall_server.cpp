@@ -18,7 +18,7 @@ static void reply(ucall_server_t server, ucall_received_http_request_t request, 
                   ucall_bytes_view_t body) {
     ucall_outcome_t outcome {};
     ucall_bytes_view_t const header = uc::bytes_view(content_type);
-    ucall_server_reply_content_t content {server, &outcome, request, &header, 1, body, ucall_http_status_ok_k};
+    ucall_server_reply_content_t content {server, &outcome, request, ucall_http_status_ok_k, &header, 1, body};
     ucall_server_reply_content(&content);
 }
 

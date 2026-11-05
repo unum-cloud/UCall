@@ -6,12 +6,17 @@ Author: Ash Vardanian
 Date: October 25, 2026
 """
 
+import _thread
 import asyncio
 import concurrent.futures
 import hashlib
 import json
 import os
+import socket
+import sys
+import sysconfig
 import threading
+import time
 
 import pytest
 
@@ -90,6 +95,7 @@ def test_typed_parameters_bind_from_path_query_and_json(backend, loopback, servi
             (client.post(f"{base}/describe/hi", b"[1]"), "expected a JSON object body\n"),
             (client.post(f"{base}/describe/hi", b"{"), f"{malformed.value}\n"),
             (client.get(f"{base}/need"), "missing parameter 'value'\n"),
+            (client.get(f"{base}/describe/hi?note=100%"), "a '%' in the query lacks two hexadecimal digits\n"),
         ]
         assert [answer(response) for response, _ in refusals] == [(400, message) for _, message in refusals]
 
@@ -185,6 +191,8 @@ def test_raw_request_echo(backend, loopback, serving):
                 f"x-query: {request.query('q')}",
                 f"x-header: {request.header('X-Custom')}",
                 f"x-segments: {b'|'.join(request.path_segments).decode()}",
+                f"x-field: {dict(request.fields())[b'x-custom'].decode()}",
+                f"x-query-string: {request.query_string}",
             ),
         )
         try:
@@ -197,7 +205,7 @@ def test_raw_request_echo(backend, loopback, serving):
         response = client.put(f"{base}/echo/alpha?q=1", b"\x00binary\xff", headers=("x-custom: yes",))
         del client
         assert bytes(response.body) == b"\x00binary\xff"
-        names = ("verb", "path", "name", "query", "header", "segments")
+        names = ("verb", "path", "name", "query", "header", "segments", "field", "query-string")
         headers = {name: response.header(f"x-{name}") for name in names}
         assert headers == {
             "verb": "PUT",
@@ -206,7 +214,10 @@ def test_raw_request_echo(backend, loopback, serving):
             "query": "1",
             "header": "yes",
             "segments": "echo|alpha",
+            "field": "yes",
+            "query-string": "q=1",
         }
+        assert [name for name, _ in response.fields() if name.startswith(b"x-")] == [f"x-{n}".encode() for n in names]
         assert response.header("x-missing") is None
     assert [type(refusal) for refusal in refusals] == [BufferError, ucall.Status]
     assert refusals[1] == ucall.Status.ALREADY_EXISTS
@@ -216,7 +227,7 @@ def test_batch_replies_in_reverse_arrive_in_order(backend, loopback, serving):
     server = ucall.Server(loopback(connections=1, pipelined_requests=4), backend=backend)
     batches = []
 
-    @server.batch("/batch", "PUT", min_size=4, max_size=4, max_latency_us=5_000_000)
+    @server.batch("/batch", "PUT", min_size=4, max_size=4, max_latency_microseconds=5_000_000)
     def reverse(requests: list[ucall.Request]):
         batches.append(len(requests))
         for request in reversed(requests):
@@ -232,7 +243,7 @@ def test_batch_replies_in_reverse_arrive_in_order(backend, loopback, serving):
             client.submit("PUT", f"{base}/batch", str(index).encode(), context=index)
         finished = []
         while len(finished) != 4:
-            finished += client.take_completed(timeout_us=1_000_000)
+            finished += client.take_completed(timeout_microseconds=1_000_000)
     assert batches == [4]
     assert [completed.context for completed in finished] == [0, 1, 2, 3]
     assert all(completed.status == ucall.Status.SUCCESS for completed in finished)
@@ -256,18 +267,21 @@ def test_peer_under_noise_xx(backend, loopback, serving):
         vetted.append(key)
         return key == client_public
 
-    secure = loopback(security=ucall.Security.NOISE_XX, private_key=server_private, peer_authorizer=admit_client)
+    secure = loopback(security=ucall.Security.NOISE_XX, noise_private_key=server_private, peer_authorizer=admit_client)
     server = ucall.Server(loopback(), secure, backend=backend)
+
+    addresses = []
 
     @server.get("/peer")
     def peer(request: ucall.Request):
-        interface_index, static_key = request.peer
+        interface_index, static_key, address = request.peer
+        addresses.append(address)
         return bytes([interface_index]) + static_key
 
     with serving(server):
         client = ucall.Client(
             connections=1,
-            private_key=client_private,
+            noise_private_key=client_private,
             peer_authorizer=lambda key: key == server_public,
             backend=backend,
         )
@@ -276,6 +290,7 @@ def test_peer_under_noise_xx(backend, loopback, serving):
     assert secure_body == b"\x01" + client_public
     assert plain_body == b"\x00" + bytes(32)
     assert vetted == [client_public]
+    assert [(str(ip), port != 0) for ip, port in addresses] == [("127.0.0.1", True)] * 2
 
 
 def test_handler_failures_answer_500(backend, loopback, serving, monkeypatch):
@@ -324,6 +339,71 @@ def test_run_refuses_more_than_one_loop_or_any_batch(loopback):
         "endpoints, so poll each loop with take_calls and drain each batch endpoint with take_batches on threads of "
         "your own."
     )
+
+
+def test_run_second_interrupt_cuts(backend, loopback):
+    server = ucall.Server(loopback(), backend=backend)
+    held = []
+    arrived, ended = threading.Event(), threading.Event()
+    interrupted = {}
+
+    @server.get("/hold")
+    def hold(request: ucall.Request):
+        held.append(request.detach())
+        arrived.set()
+
+    def peer():
+        host, _, port = server.addresses[0].rpartition(":")
+        with socket.create_connection((host, int(port))) as connection:
+            connection.sendall(b"GET /hold HTTP/1.1\r\nHost: a\r\n\r\n")
+            if not arrived.wait(5):
+                return
+            _thread.interrupt_main()
+            time.sleep(0.2)
+            interrupted["second"] = time.monotonic()
+            _thread.interrupt_main()
+            # A drain deaf to the second interrupt ends only on this reply, so the case cannot hang.
+            if not ended.wait(3):
+                held[0].reply(b"late")
+
+    peering = threading.Thread(target=peer)
+    peering.start()
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            server.run()
+    finally:
+        returned = time.monotonic()
+        ended.set()
+        peering.join()
+    assert returned - interrupted["second"] < 1.0
+
+
+@pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets are missing here")
+def test_unix_listener_echo(backend, serving, tmp_path):
+    listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    listener.bind(str(tmp_path / "echo.sock"))
+    listener.listen()
+    server = ucall.Server(ucall.Interface(descriptor=listener, connections=8), backend=backend)
+    peers = []
+
+    @server.post("/echo")
+    def echo(request: ucall.Request):
+        peers.append(request.peer[2])
+        return bytes(request.body)
+
+    body = bytes(range(256)) * 64
+    with serving(server), socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as connection:
+        connection.connect(str(tmp_path / "echo.sock"))
+        connection.sendall(b"POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: %d\r\n\r\n" % len(body) + body)
+        response = b""
+        while not response.endswith(body):
+            chunk = connection.recv(65536)
+            assert chunk, f"the server closed after {len(response)} bytes"
+            response += chunk
+    listener.close()
+    assert response.startswith(b"HTTP/1.1 200 OK\r\n")
+    assert server.addresses == (str(tmp_path / "echo.sock"),)
+    assert peers == [""]
 
 
 def test_reply_parts_path_and_bytes_on_worker(backend, loopback, serving, direct_directory):
@@ -540,11 +620,41 @@ def test_body_keyword_on_decorators(loopback, serving):
     assert seen == {"/buffered": b"", "/post": streamed, "/put": streamed, "/route": streamed, "/add": streamed}
 
 
+def test_verb_decorators_route_each_verb(loopback, serving):
+    server = ucall.Server(loopback())
+
+    @server.get("/verb")
+    def get(request: ucall.Request):
+        return b"get"
+
+    @server.post("/verb")
+    def post(request: ucall.Request):
+        return b"post"
+
+    @server.put("/verb")
+    def put(request: ucall.Request):
+        return b"put"
+
+    @server.delete("/verb")
+    def delete(request: ucall.Request):
+        return b"delete"
+
+    @server.patch("/verb")
+    def patch(request: ucall.Request):
+        return b"patch"
+
+    with serving(server) as base:
+        client = ucall.Client(connections=1)
+        for verb in ("get", "post", "put", "delete", "patch"):
+            response = getattr(client, verb)(f"{base}/verb")
+            assert (response.status_code, bytes(response.body)) == (200, verb.encode())
+
+
 def test_kk_interface(backend, loopback, serving):
     server_private, server_public = ucall.generate_noise_keypair()
     client_private, client_public = ucall.generate_noise_keypair()
     stranger_private, _ = ucall.generate_noise_keypair()
-    secure = loopback(security=ucall.Security.NOISE_KK, private_key=server_private, noise_peer_key=client_public)
+    secure = loopback(security=ucall.Security.NOISE_KK, noise_private_key=server_private, noise_peer_key=client_public)
     assert secure.noise_peer_key == client_public
     server = ucall.Server(secure, backend=backend)
 
@@ -555,8 +665,29 @@ def test_kk_interface(backend, loopback, serving):
     with serving(server):
         client = ucall.Client(connections=1, backend=backend)
         url = f"http+noise://{server.addresses[0]}/peer"
-        known = {"security": ucall.Security.NOISE_KK, "server_key": server_public}
-        admitted = bytes(client.get(url, client_key=client_private, **known).body)
+        known = {"security": ucall.Security.NOISE_KK, "noise_peer_key": server_public}
+        admitted = bytes(client.get(url, noise_private_key=client_private, **known).body)
         with pytest.raises(ucall.Error):
-            client.get(url, client_key=stranger_private, max_retries=1, **known)
+            client.get(url, noise_private_key=stranger_private, max_retries=1, **known)
     assert admitted == client_public
+
+
+def test_handlers_on_four_loops_from_four_threads(backend, loopback, serving):
+    server = ucall.Server(loopback(event_loops=4), backend=backend)
+    loop_threads = set()
+
+    @server.post("/echo")
+    def echo(request: ucall.Request):
+        loop_threads.add(threading.get_ident())
+        return bytes(request.body)
+
+    def post(sender: int) -> list[bytes]:
+        client = ucall.Client(connections=1, backend=backend)
+        return [bytes(client.post(f"{base}/echo", f"{sender}:{index}".encode()).body) for index in range(64)]
+
+    with serving(server) as base, concurrent.futures.ThreadPoolExecutor(4) as pool:
+        answers = list(pool.map(post, range(4)))
+    assert answers == [[f"{sender}:{index}".encode() for index in range(64)] for sender in range(4)]
+    assert len(loop_threads) >= 2
+    if sysconfig.get_config_var("Py_GIL_DISABLED"):
+        assert not sys._is_gil_enabled()

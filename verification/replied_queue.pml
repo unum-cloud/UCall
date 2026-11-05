@@ -2,7 +2,7 @@
  *  @file verification/replied_queue.pml
  *  @author Ash Vardanian
  *  @date October 27, 2026
- *  @brief Spin model of an event loop's replied queue in `include/ucall/network.hpp`:
+ *  @brief Spin model of an event loop's replied queue in @c include/ucall/network/replies.hpp:
  *      @c enqueue_replied and @c dequeue_replied, Vyukov's intrusive queue with a stub, the
  *      adoption in @c serve_open beside the one in @c collect_replies, and the wake-up between
  *      @c event_loop_t::notify and @c server_poll.

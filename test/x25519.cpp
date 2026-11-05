@@ -13,10 +13,11 @@
 #include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
-#include "ucall/curve25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
-#include "harness.hpp"          // `expect`, `run_test`, `from_hex`
+#include "ucall/tunnel/curve25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
+#include "harness.hpp"                 // `expect`, `run_test`, `from_hex`
 
 using namespace unum::ucall;
+using namespace unum::ucall::tunnel;
 using namespace unum::ucall::test;
 
 #pragma region Fixtures
@@ -117,10 +118,10 @@ struct x25519_backend_t {
 static x25519_backend_t const x25519_backends_k[] = {
     {"dispatched", x25519_tiers_t::none_k, &x25519_scalar_multiply},
     {"serial", x25519_tiers_t::serial_k, &x25519_scalar_multiply_serial},
-#if UCALL_HAS_INT128_
+#if UCALL_COMPILER_INT128_
     {"radix51", x25519_tiers_t::radix51_k, &x25519_scalar_multiply_radix51},
 #endif
-#if UCALL_TARGET_X86_ADX
+#if UCALL_ARCH_X8664_ADX_
     {"adx", x25519_tiers_t::adx_k, &x25519_scalar_multiply_adx},
 #endif
 };

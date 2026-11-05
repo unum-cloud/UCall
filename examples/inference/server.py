@@ -1,4 +1,4 @@
-"""UCall Python inference service, the twin of the FastAPI and LitServe baselines for `/infer`.
+"""UCall Python inference service, which the FastAPI and LitServe baselines in `bench/` mirror for `/infer`.
 
 `/infer` scores one query on the polling thread that received it, and `/infer/batch` is a batch
 endpoint whose drain thread scores each batch in one pass with the shared NumKong kernel in

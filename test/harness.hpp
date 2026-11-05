@@ -58,7 +58,7 @@
 
 #include <forkunion/types.hpp> // `fu::split_mix`
 
-#include "ucall/types.hpp" // `byte_t`, `span`
+#include "ucall/utilities/types.hpp" // `byte_t`, `span`
 
 #if UCALL_OS_LINUX_ || UCALL_OS_APPLE_
 #include <unistd.h> // `isatty`, `STDERR_FILENO`

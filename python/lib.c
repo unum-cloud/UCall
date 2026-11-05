@@ -197,7 +197,7 @@ static int enum_register(PyObject* module, PyObject* int_enum, PyObject* keyword
 int ucall_py_enums_register(PyObject* module) {
     ucall_py_enum_mirror_t* const mirrors[] = {
         &ucall_py_status_enum, &ucall_py_backend_enum,       &ucall_py_cpu_class_enum, &ucall_py_security_enum,
-        &ucall_py_verb_enum,   &ucall_py_body_delivery_enum, &ucall_py_log_level_enum};
+        &ucall_py_verb_enum,   &ucall_py_body_delivery_enum, &ucall_py_log_level_enum, &ucall_py_log_format_enum};
     PyObject* const enum_module = PyImport_ImportModule("enum");
     PyObject* const int_enum = enum_module ? PyObject_GetAttrString(enum_module, "IntEnum") : NULL;
     PyObject* const keywords = int_enum ? Py_BuildValue("{ss}", "module", "ucall") : NULL;
@@ -281,9 +281,95 @@ void ucall_py_report_handler_failure(PyObject* handler) {
     PyErr_WriteUnraisable(handler);
 }
 
+void ucall_py_log(ucall_log_level_t level, ucall_bytes_view_t line, void* context) {
+    PyGILState_STATE const state = PyGILState_Ensure();
+    // A line may come from a reply inside a deallocation while an exception unwinds,
+    // which must survive it.
+    PyObject* const pending = PyErr_GetRaisedException();
+    PyObject* const callback = (PyObject*)context;
+    PyObject* const severity = ucall_py_enum_to_object(&ucall_py_log_level_enum, (long)level);
+    PyObject* const text = severity ? ucall_py_text_to_object(line) : NULL;
+    PyObject* const result = text ? PyObject_CallFunctionObjArgs(callback, severity, text, NULL) : NULL;
+    if (!result) ucall_py_report_handler_failure(callback);
+    Py_XDECREF(result);
+    Py_XDECREF(text);
+    Py_XDECREF(severity);
+    PyErr_SetRaisedException(pending);
+    PyGILState_Release(state);
+}
+
+int ucall_py_log_from_objects(PyObject* callback, PyObject* level, PyObject* format, ucall_log_t* log) {
+    int level_value = ucall_log_level_debug_k, format_value = ucall_log_format_human_k;
+    if (ucall_py_enum_from_object(level, "log_level", &ucall_py_log_level_enum, &level_value) != 0 ||
+        ucall_py_enum_from_object(format, "log_format", &ucall_py_log_format_enum, &format_value) != 0)
+        return -1;
+    if (callback == Py_None) callback = NULL;
+    if (callback && !PyCallable_Check(callback)) {
+        PyErr_Format(PyExc_TypeError, "'log' must be callable, got %s", Py_TYPE(callback)->tp_name);
+        return -1;
+    }
+    if (callback)
+        *log = (ucall_log_t) {ucall_py_log, callback, (ucall_log_format_t)format_value, (ucall_log_level_t)level_value};
+    return 0;
+}
+
+static char const doc_status_from_name[] =                             //
+    "from_name(name, /)\n"                                             //
+    "\n"                                                               //
+    "The `Status` spelled `name`, as `ucall_status_name` spells it.\n" //
+    "\n"                                                               //
+    "Raises:\n"                                                        //
+    "  ValueError: No status is spelled `name`.\n"                     //
+    "\n"                                                               //
+    "Example:\n"                                                       //
+    "  >>> ucall.Status.from_name(\"out-of-memory\")\n"                //
+    "  <Status.OUT_OF_MEMORY: 2>";
+
+static PyObject* api_status_from_name([[maybe_unused]] PyObject* type, PyObject* name) {
+    Py_ssize_t length = 0;
+    char const* const spelled = PyUnicode_AsUTF8AndSize(name, &length);
+    if (!spelled) return NULL;
+    ucall_status_t const status = ucall_status_from_name(
+        (ucall_bytes_view_t) {(ucall_byte_t const*)spelled, (size_t)length});
+    // An unrecognized name reads as invalid-argument, so only its own spelling may answer it.
+    char const* const canonical = ucall_status_name(status);
+    if (strlen(canonical) != (size_t)length || memcmp(canonical, spelled, (size_t)length) != 0)
+        return PyErr_Format(PyExc_ValueError, "no ucall.Status is spelled %R", name);
+    return ucall_py_enum_to_object(&ucall_py_status_enum, (long)status);
+}
+
+static PyMethodDef status_from_name_method = {"from_name", api_status_from_name, METH_O | METH_CLASS,
+                                              doc_status_from_name};
+
+/** Gives the @c Status mirror its @c from_name class method. */
+static int status_methods_register(void) {
+    PyObject* const method = PyDescr_NewClassMethod((PyTypeObject*)ucall_py_status_enum.type, &status_from_name_method);
+    int const added = method ? PyObject_SetAttrString(ucall_py_status_enum.type, "from_name", method) : -1;
+    Py_XDECREF(method);
+    return added;
+}
+
 #pragma endregion Enums and Errors
 
 #pragma region Module
+
+static char const doc_version[] =                                                            //
+    "version()\n"                                                                            //
+    "\n"                                                                                     //
+    "Calls `ucall_version_name`, the linked library's version, candidate suffix included.\n" //
+    "\n"                                                                                     //
+    "Example:\n"                                                                             //
+    "  >>> ucall.version()\n"                                                                //
+    "  '1.0.0-rc.1'";
+
+static PyObject* api_version([[maybe_unused]] PyObject* module, [[maybe_unused]] PyObject* unused) {
+    return PyUnicode_FromString(ucall_version_name());
+}
+
+static PyMethodDef module_methods[] = {
+    {"version", api_version, METH_NOARGS, doc_version},
+    {NULL, NULL, 0, NULL},
+};
 
 PyObject* ucall_py_json_dumps = NULL;
 PyObject* ucall_py_json_loads = NULL;
@@ -367,7 +453,11 @@ PyMODINIT_FUNC PyInit_lib(void) {
 
     PyObject* const module = PyModule_Create(&module_definition);
     if (!module) return NULL;
-    if (ucall_py_enums_register(module) < 0 || PyModule_AddFunctions(module, ucall_py_noise_methods) < 0 ||
+    // Module-level objects are written here, before anyone imports the module, and only read after.
+    if (ucall_py_module_without_lock(module) < 0) goto failed;
+    if (ucall_py_enums_register(module) < 0 || status_methods_register() < 0 ||
+        PyModule_AddFunctions(module, ucall_py_noise_methods) < 0 ||
+        PyModule_AddFunctions(module, module_methods) < 0 ||
         PyModule_AddStringConstant(module, "__version__", ucall_version_name()) < 0 ||
         PyModule_AddStringConstant(module, "DEFAULT_ADDRESS", ucall_py_default_address_k) < 0)
         goto failed;

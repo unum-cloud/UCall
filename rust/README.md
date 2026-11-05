@@ -43,6 +43,8 @@ It fails rather than substituting when the backend is unavailable or the CPU doe
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
 `max_request_bytes` caps a request's head and buffered body, answering 413 past it, and `reply_directories` names the directories path replies resolve beneath.
+`Interface::listening` accepts on a listener another owner opened, a `TcpListener`, a `UnixListener` or one systemd passed in, instead of binding an address, and never closes it.
+At its connection budget an interface evicts the idle keep-alive connection that progressed least recently for a new peer.
 Port zero binds a free port, which `Server::address` reports.
 
 ```rust
@@ -71,7 +73,9 @@ server.route("/anything", Verb::Any, |request: Request| {
 
 Endpoints register through `&mut Server` before any loop is polled, with `route` taking any `Verb` and `get`, `post`, `put`, `delete` and `patch` naming one.
 Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice fails with `Status::AlreadyExists`.
-A path no endpoint matches answers 404, and a request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
+Routing is exact: an empty segment is a segment, so `/users` and `/users/` are different paths.
+A path no endpoint matches answers 404, one whose endpoints take other verbs answers 405 with an `allow` header, a GET endpoint also serves HEAD, and `OPTIONS` answers 204 with the same `allow` list.
+A request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
 
 Log lines reach the callback on whichever thread produced them, and StatsD datagrams carry each loop's counters and sampled request latencies, every second unless `Metrics::interval` says otherwise.
 `Server::event_loop_statistics` copies one loop's counters, from any thread while the loop runs: polls, system calls, submissions and completions, accepted connections, requests, and the bytes received, sent and copied.
@@ -80,8 +84,9 @@ Divided by `requests`, they price one call.
 ## Requests
 
 A handler receives each `Request` by value.
-Its reads borrow the received bytes: `verb`, `path`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on and the client's authenticated Noise key.
-The path and query values stay percent-encoded as sent, header names match case-insensitively, and the body arrives whole, decoded from chunked framing if it was sent that way.
+Its reads borrow the received bytes: `verb`, `path`, `query_string`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on, the client's authenticated Noise key and its `PeerAddress`: `Ip` with the port and IPv6 scope, `Unix`, or `Unknown`.
+The path and query values stay percent-encoded as sent, which `ucall::decode_percent` decodes, header names match case-insensitively, and the body arrives whole, decoded from chunked framing if it was sent that way.
+`fields` iterates every header field in arrival order as `(name, value)`, names lowercased and values trimmed, as a proxy forwards a head.
 `path_segments_count` and `path_segment` read the path component by component, and `parts_count` and `part` read a `multipart/form-data` body as `RequestPart`s, each borrowing its name, content type and payload.
 
 ```rust
@@ -210,14 +215,14 @@ std::thread::scope(|scope| {
 ```
 
 `Batching` dispatches as soon as `min_size` requests wait, never more than `max_size` at once, and a smaller batch once its oldest request waited `max_latency`; zero fields mean 1, 32 and 10 milliseconds.
-The handler runs on the thread draining the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
+The handler runs on the thread polling the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
 A `Batch` lends its requests in arrival order: `get` and `iter` borrow them, `take` moves one out, and iterating it by value takes them all, forwards or reversed.
 Requests the handler neither replies to nor keeps answer 500 once it returns, and all of them do when it panics.
 Taken requests may be replied to later, from any thread, while their responses still leave each connection in request order.
 
 The queue holds as many requests as the interfaces admit at once, connections times pipelined requests, and refuses more with 503.
 `Server::stop` releases the requests still queued without a reply, and a dropped `BatchEndpoint` leaves its queue unanswered until the server is freed.
-`BatchEndpoint::statistics` counts batches and requests, and whether each batch was dispatched on reaching `max_size`, on reaching `min_size`, or once `max_latency` passed, from any thread while the endpoint drains.
+`BatchEndpoint::statistics` counts batches and requests, and whether each batch was dispatched on reaching `max_size`, on reaching `min_size`, or once `max_latency` passed, from any thread while the endpoint is polled.
 
 ## Calling
 
@@ -230,7 +235,7 @@ use ucall::*;
 
 let mut client = Client::new(ClientOptions { connections: 4, pipelined_calls: 16, ..Default::default() })?;
 for index in 0..64u64 {
-    client.submit(CallRequest::post("http://127.0.0.1:8545/infer", vec![index as u8]), index)?;
+    client.submit(ClientCall::post("http://127.0.0.1:8545/infer", vec![index as u8]), index)?;
 }
 let mut completed: [Completed; 16] = Default::default();
 let mut remaining = 64;
@@ -250,13 +255,16 @@ drop(client);
 println!("{:?} {:?}", response.body(), keep);
 ```
 
-`submit` takes a `CallRequest`, which owns its URL, header lines, body and security until the call completes, and tags it with a `u64` context.
+`submit` takes a `ClientCall`, which owns its URL, header lines, body and security until the call completes, and tags it with a `u64` context.
 A call admitted once completes exactly once, and a client already holding `calls` unretrieved calls refuses more with `Status::Contended`.
 `take_completed` drives every admitted call and fills a caller-provided buffer with finished ones, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
-`get`, `post` and `call` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
-`CallRequest::options` carries the call's own `RequestOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
+`get`, `post`, `put`, `delete`, `patch` and `call` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
+`ClientCall::options` carries the call's own `ClientCallOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
 
-Every received response is a `Response`, whatever its HTTP status, and only a failed exchange is an `Error`.
+`ClientOptions::max_response_bytes` caps what a call buffers, failing it with `Status::Overflow` past the cap, and `ClientOptions::log` reports dials that fail every address, refused handshakes and refused redirects.
+Host names resolve through the library's own stub resolver, driven by the client's polling, and connections race the answered addresses as Happy Eyeballs does.
+
+Every received response is a `Response`, whatever its HTTP status, and only a failed exchange is an `Error`; `Response::fields` iterates its header fields as a request's does.
 A `Response` owns its received bytes and is `Send`, so it stays readable after its `Client` is dropped and may move to another thread.
 Dropping the client cancels the calls still in flight and discards completions not yet retrieved.
 
@@ -279,7 +287,7 @@ let server = Server::new(&[sealed])?;
 
 let client = Client::new(ClientOptions {
     connections: 1,
-    private_key: Some(client_private_key),
+    noise_private_key: Some(client_private_key),
     peer_authorizer: Some(Arc::new(move |key: &NoiseKey| *key == server_public_key)),
     ..Default::default()
 })?;
@@ -287,8 +295,8 @@ let client = Client::new(ClientOptions {
 
 `generate_noise_keypair` draws from the operating system's entropy and fails with `Status::IO` when it is refused.
 `derive_noise_public_key` recovers the public half of a stored private key, which peers compare in their authorizers.
-Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `RequestOptions::server_key`.
-Noise KK has both sides know each other in advance: the interface admits the one key `Interface::noise_peer_key` names, and the call presents `RequestOptions::client_key` or the client's own key.
+Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `ClientCallOptions::noise_peer_key`.
+Noise KK has both sides know each other in advance: the interface admits the one key `Interface::noise_peer_key` names, and the call presents `ClientCallOptions::noise_private_key` or the client's own key.
 An `http+noise://` URL implies Noise XX, and a handler reads the client's authenticated key through `Request::peer`.
 
 ## Errors
@@ -310,7 +318,9 @@ match client.get("http://127.0.0.1:1/") {
 
 A submitted call that fails completes with `Err` in `Completed::response`: `Status::ConnectionFailed`, `Status::ConnectionClosed`, `Status::Timeout`, `Status::HandshakeFailed` or `Status::PeerRejected`.
 A request lookup that finds nothing answers `None`, and HTTP error statuses are ordinary responses.
-`Backend` and `CPUClass` print and parse their stable names, like "linux-uring618" and "intel-icelake", failing with `Status::InvalidArgument` on a name no value has, and `ucall::version()` names the linked library.
+`Backend` and `CPUClass` print and parse their stable names, like "linux-uring618" and "intel-icelake", failing with `Status::InvalidArgument` on a name no value has, and `Status::from_name` reads a status back from its spelling.
+`ucall::version()` spells the linked library's version, candidate suffix included.
+`ucall::decode_percent` decodes a path or a query value, which requests lend still percent-encoded.
 
 ## Threads & Polling
 
@@ -322,7 +332,8 @@ The crate starts no threads and needs no async runtime: every callback runs on a
 
 Each event loop and each batch endpoint has one polling owner at a time, and a second thread polling it concurrently gets `Status::Contended`.
 `take_calls` and `take_batches` run until `Server::stop`, while `take_call` and `take_batch` return after one round, waiting up to their timeout, so a loop of them interleaves polling with other work on the same thread.
-`Server::stop` works from any thread, handlers included, wakes every polling and draining thread, and dropping the `Server` stops it too.
+`Server::stop` works from any thread, handlers included, wakes every polling thread, and dropping the `Server` stops it too.
+The first stop drains, answering every request already held before its connection closes, and a second one cuts the replies still in flight.
 An interface accepts on its own number of event loops, one by default, and the server runs the largest of those counts.
 
 Registration takes `&mut Server`, and polling, stopping and statistics take `&Server`, so the borrow checker orders setup before serving.

@@ -30,11 +30,17 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-15 g++-15 clang-22
       - name: Configure C and C++
-        run: cmake --preset debug -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+        run: cmake --preset debug -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15 -DUCALL_BUILD_EXAMPLES=ON -DUCALL_BUILD_BENCH=ON
       - name: Build C and C++
         run: cmake --build --preset debug --config Debug --parallel 4
       - name: Test C and C++
-        run: ctest --preset debug --build-config Debug
+        run: ctest --preset debug --build-config Debug --no-tests=error | tee ctest.log
+      - name: Require Every Linux Backend
+        run: |
+          if grep -E '^[[:space:]]+[0-9]+ - (epollaio|uring612|uring618) \(Skipped\)' ctest.log; then
+            echo "A Linux backend suite skipped, so its engine went untested"
+            exit 1
+          fi
 
   test_ubuntu_clang:
     name: Test on Ubuntu with Clang 22
@@ -59,11 +65,59 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y gcc-15 g++-15 clang-22
       - name: Configure C and C++
-        run: cmake --preset relwithdebinfo -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+        run: cmake --preset relwithdebinfo -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DUCALL_BUILD_EXAMPLES=ON -DUCALL_BUILD_BENCH=ON
       - name: Build C and C++
         run: cmake --build --preset relwithdebinfo --config RelWithDebInfo --parallel 4
       - name: Test C and C++
-        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo
+        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo --no-tests=error | tee ctest.log
+      - name: Require Every Linux Backend
+        run: |
+          if grep -E '^[[:space:]]+[0-9]+ - (epollaio|uring612|uring618) \(Skipped\)' ctest.log; then
+            echo "A Linux backend suite skipped, so its engine went untested"
+            exit 1
+          fi
+
+  test_ubuntu_sanitizers:
+    name: Test ${{ matrix.preset }} Preset on Ubuntu with Clang 22
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [asan, tsan]
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Linux Compilers
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang-22
+      # ThreadSanitizer's fixed shadow ranges collide with the runner kernel's wider mmap randomization.
+      - name: Narrow Address Randomization
+        run: sudo sysctl vm.mmap_rnd_bits=28
+      - name: Configure C and C++
+        run: cmake --preset ${{ matrix.preset }} -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
+      - name: Build C and C++
+        run: cmake --build --preset ${{ matrix.preset }} --parallel 4
+      - name: Test C and C++
+        run: ctest --preset ${{ matrix.preset }} --no-tests=error | tee ctest.log
+      - name: Require Every Linux Backend
+        run: |
+          if grep -E '^[[:space:]]+[0-9]+ - (epollaio|uring612|uring618) \(Skipped\)' ctest.log; then
+            echo "A Linux backend suite skipped, so its engine went untested"
+            exit 1
+          fi
 
   test_macos:
     name: Test on macOS
@@ -84,11 +138,17 @@ jobs:
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Configure C and C++
-        run: cmake --preset relwithdebinfo -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+        run: cmake --preset relwithdebinfo -DUCALL_BUILD_EXAMPLES=ON -DUCALL_BUILD_BENCH=ON
       - name: Build C and C++
         run: cmake --build --preset relwithdebinfo --config RelWithDebInfo --parallel 4
       - name: Test C and C++
-        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo
+        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo --no-tests=error | tee ctest.log
+      - name: Require the Kqueue Backend
+        run: |
+          if grep -E '^[[:space:]]+[0-9]+ - kqueue \(Skipped\)' ctest.log; then
+            echo "The kqueue suite skipped, so its engine went untested"
+            exit 1
+          fi
 
   test_windows:
     name: Test on Windows with Visual Studio 2026
@@ -109,11 +169,130 @@ jobs:
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Configure C and C++
-        run: cmake --preset msvc2026_x64 -DUCALL_BUILD_TOOLS=ON -DUCALL_BUILD_BENCH=ON
+        run: cmake --preset msvc2026_x64 -DUCALL_BUILD_EXAMPLES=ON -DUCALL_BUILD_BENCH=ON
       - name: Build C and C++
         run: cmake --build --preset msvc2026_x64 --config Release --parallel 4
       - name: Test C and C++
-        run: ctest --preset msvc2026_x64 --build-config Release
+        run: ctest --preset msvc2026_x64 --build-config Release --no-tests=error | tee ctest.log
+      - name: Require the IOCP Backend
+        run: |
+          if grep -E '^[[:space:]]+[0-9]+ - iocp \(Skipped\)' ctest.log; then
+            echo "The IOCP suite skipped, so its engine went untested"
+            exit 1
+          fi
+
+  # Every target at -O0 with warnings as errors, so a warning any example or benchmark raises fails here.
+  check_ubuntu:
+    name: Check Every Target on Ubuntu with Clang 22
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Clang 22
+        run: sudo apt-get update && sudo apt-get install -y clang-22
+      - name: Build Every Target
+        run: |
+          cmake --preset check -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
+          cmake --build --preset check --parallel 4
+
+  # Each parser's libFuzzer harness runs five minutes, seeded by the run number, and a failure keeps what it found.
+  fuzz_ubuntu:
+    name: Fuzz ${{ matrix.target }} Parser on Ubuntu with Clang 22
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        target: [dns, http, multipart, routes, tunnel, url]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Clang 22 and libFuzzer
+        run: sudo apt-get update && sudo apt-get install -y clang-22 libclang-rt-22-dev
+      - name: Build the ${{ matrix.target }} Harness
+        run: |
+          cmake --preset fuzz -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22
+          cmake --build --preset fuzz --target ucall_fuzz_${{ matrix.target }} --parallel 4
+      - name: Fuzz the ${{ matrix.target }} Parser
+        working-directory: build_fuzz
+        env:
+          UBSAN_OPTIONS: halt_on_error=1 print_stacktrace=1
+        run: |
+          mkdir -p corpus findings
+          ./ucall_fuzz_${{ matrix.target }} -max_total_time=300 -seed=${{ github.run_number }} -artifact_prefix=findings/ corpus
+      - name: Upload ${{ matrix.target }} Findings
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-${{ matrix.target }}-findings
+          path: build_fuzz/findings/
+
+  # The archive and the shared library as a C program sees them once installed: through CMake's package and through
+  # pkg-config. The installed archive links the system's liburing, so the runner needs its development package.
+  install_ubuntu:
+    name: Install And Consume On Ubuntu
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    defaults:
+      run:
+        shell: bash
+    env:
+      CC: clang-22
+      CXX: clang++-22
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.14"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Clang 22, liburing and pkg-config
+        run: sudo apt-get update && sudo apt-get install -y clang-22 liburing-dev pkg-config
+      - name: Build and Install
+        run: |
+          cmake -B build_install -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
+          cmake --build build_install --parallel 4
+          cmake --install build_install --prefix "$RUNNER_TEMP/ucall"
+      - name: Consume Through find_package
+        run: |
+          mkdir -p "$RUNNER_TEMP/consumer"
+          cat > "$RUNNER_TEMP/consumer/CMakeLists.txt" <<EOF
+          cmake_minimum_required(VERSION 3.28)
+          project(consumer LANGUAGES C)
+          find_package(ucall 1 REQUIRED)
+          add_executable(hello_static "$GITHUB_WORKSPACE/examples/hello.c")
+          target_link_libraries(hello_static PRIVATE ucall::static)
+          add_executable(hello_shared "$GITHUB_WORKSPACE/examples/hello.c")
+          target_link_libraries(hello_shared PRIVATE ucall::shared)
+          EOF
+          cmake -S "$RUNNER_TEMP/consumer" -B "$RUNNER_TEMP/consumer/build" -D CMAKE_PREFIX_PATH="$RUNNER_TEMP/ucall"
+          cmake --build "$RUNNER_TEMP/consumer/build"
+      - name: Consume Through pkg-config
+        run: |
+          export PKG_CONFIG_PATH="$RUNNER_TEMP/ucall/lib/pkgconfig"
+          "$CC" examples/hello.c $(pkg-config --cflags --libs ucall) -o "$RUNNER_TEMP/hello_pkg_config"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" ldd "$RUNNER_TEMP/hello_pkg_config" | grep -q libucall_shared
 
   # Each machine profile builds the library for one CPU; the Arm ones build natively on Arm runners. Clang 22 compiles
   # it, as older compilers predate Olympus.

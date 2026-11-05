@@ -9,6 +9,7 @@ use std::fs::{File, OpenOptions};
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
+use std::time::Duration;
 
 use crate::client::{Client, ClientOptions};
 use crate::server::{DetachedRequest, Interface, Request, Server};
@@ -62,6 +63,14 @@ pub fn detaching() -> (
     let (handed, received) = mpsc::channel();
     let handler = move |request: Request| handed.send(request.detach()).unwrap();
     (handler, received)
+}
+
+/// The next request [`detaching`] handed over, failing the test instead of waiting forever when
+/// no call reached the server, since the server's handler keeps the sender alive.
+pub fn next_detached(received: &Receiver<DetachedRequest>) -> DetachedRequest {
+    received
+        .recv_timeout(Duration::from_secs(30))
+        .expect("no request reached the handler")
 }
 
 /// An empty directory beside the test binary, inside the build tree, since file parts read

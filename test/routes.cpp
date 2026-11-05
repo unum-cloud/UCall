@@ -11,10 +11,11 @@
 
 #include <string_view> // `std::string_view`
 
-#include "ucall/routes.hpp" // `route_trie_t`, `extract_path_component`
-#include "harness.hpp"      // `expect`, `require`, `run_test`, `scale_iterations`
+#include "ucall/http/routes.hpp" // `route_trie_t`, `extract_path_component`
+#include "harness.hpp"           // `expect`, `require`, `run_test`, `scale_iterations`
 
 using namespace unum::ucall;
+using namespace unum::ucall::http;
 using namespace unum::ucall::test;
 
 #pragma region Fixtures
@@ -203,6 +204,19 @@ case_result_t test_routes_unit() {
         for (ucall_verb_t const verb : routed_verbs_k) routes.must_match("/test", verb, endpoint_numbered(number++));
     }
     {
+        routing_case_t routes(failures, "head_falls_back_to_get");
+        routes.must_add("/page", ucall_verb_get_k, first);
+        routes.must_add("/both", ucall_verb_get_k, second);
+        routes.must_add("/both", ucall_verb_head_k, third);
+        routes.must_match("/page", ucall_verb_head_k, first);
+        routes.must_match("/both", ucall_verb_head_k, third);
+        routes.must_not_match("/page", ucall_verb_post_k);
+        verb_set_t allowed {};
+        failures += expect(!routes.trie.match("/page", ucall_verb_post_k, nullptr, &allowed) &&
+                               allowed == verb_set_t(1u << ucall_verb_get_k),
+                           "a miss reported verbs {:#x}", allowed);
+    }
+    {
         routing_case_t routes(failures, "unregistered_verb_does_not_match");
         routes.must_add("/users", ucall_verb_get_k, first);
         routes.must_match("/users", ucall_verb_get_k, first);
@@ -355,13 +369,43 @@ case_result_t test_routes_safety() {
         routes.must_match("/users", ucall_verb_get_k, first);
     }
     {
-        // Empty segments are skipped rather than matched, so all three spellings reach one route.
-        routing_case_t routes(failures, "empty_segments_are_skipped");
+        // Collapsing slashes would let `//admin//secret` past a rule guarding `/admin/secret`.
+        routing_case_t routes(failures, "empty_segments_are_segments");
         routes.must_add("/users", ucall_verb_get_k, first);
+        routes.must_add("/a//b", ucall_verb_get_k, second);
         routes.must_match("/users", ucall_verb_get_k, first);
-        routes.must_match("/users/", ucall_verb_get_k, first);
-        routes.must_match("//users", ucall_verb_get_k, first);
-        routes.must_match("/users//", ucall_verb_get_k, first);
+        routes.must_not_match("//users", ucall_verb_get_k);
+        routes.must_not_match("/users//", ucall_verb_get_k);
+        routes.must_match("/a//b", ucall_verb_get_k, second);
+        routes.must_not_match("/a/b", ucall_verb_get_k);
+        failures += expect(
+            count_path_segments("/") == 0 && count_path_segments("/a/") == 2 && count_path_segments("//a//") == 4,
+            "segment counts");
+    }
+    {
+        routing_case_t routes(failures, "trailing_slash_is_significant");
+        routes.must_add("/users", ucall_verb_get_k, first);
+        routes.must_add("/users/", ucall_verb_get_k, second);
+        routes.must_match("/users", ucall_verb_get_k, first);
+        routes.must_match("/users/", ucall_verb_get_k, second);
+        routes.must_not_match("/users//", ucall_verb_get_k);
+    }
+    {
+        routing_case_t routes(failures, "a_parameter_takes_no_empty_segment");
+        routes.must_add("/users/{id}", ucall_verb_get_k, first);
+        routes.must_add("/users/{id}/posts", ucall_verb_get_k, second);
+        routes.must_match("/users/7", ucall_verb_get_k, first);
+        routes.must_not_match("/users/", ucall_verb_get_k);
+        routes.must_not_match("/users//posts", ucall_verb_get_k);
+    }
+    {
+        routing_case_t routes(failures, "a_wildcard_keeps_inner_empty_segments");
+        routes.must_add("/files/{*path}", ucall_verb_get_k, first);
+        routes.must_add("/files/new", ucall_verb_get_k, second);
+        routes.must_match("/files//a", ucall_verb_get_k, first);
+        routes.must_match("/files/a//b", ucall_verb_get_k, first);
+        routes.must_match("/files/new/", ucall_verb_get_k, first);
+        routes.must_not_match("/files/", ucall_verb_get_k);
     }
     return failures;
 }
@@ -396,6 +440,49 @@ case_result_t test_routes_stress() {
 
 #pragma endregion Hostile Input And Sweeps
 
+#pragma region Percent Codec
+
+/** Path and query decoding through the C verb, in place and into a separate buffer. */
+case_result_t test_percent_codec() {
+    std::size_t failures = 0;
+    struct decoding_t {
+        ucall_status_t status;
+        std::string_view text;
+    };
+    char buffer[64] {};
+    auto decode = [&](std::string_view encoded, ucall_percent_mode_t mode) noexcept {
+        std::size_t length = 0;
+        ucall_status_t const status = ucall_decode_percent(bytes_view(encoded), reinterpret_cast<ucall_byte_t*>(buffer),
+                                                           &length, mode);
+        return decoding_t {status, {buffer, status == ucall_status_success_k ? length : 0}};
+    };
+    auto decodes = [&](std::string_view encoded, ucall_percent_mode_t mode, std::string_view expected) noexcept {
+        decoding_t const decoded = decode(encoded, mode);
+        return expect(decoded.status == ucall_status_success_k && decoded.text == expected,
+                      "'{}' decoded to '{}' with status {}, not '{}'", encoded, decoded.text, decoded.status, expected);
+    };
+    failures += decodes("a+b%20c", ucall_percent_path_k, "a+b c");
+    failures += decodes("a+b%20c", ucall_percent_query_k, "a b c");
+    failures += decodes("%2B+%2b", ucall_percent_query_k, "+ +");
+    failures += decodes("%E2%9c%93", ucall_percent_path_k, "\xE2\x9C\x93");
+    failures += decodes("", ucall_percent_query_k, "");
+    for (std::string_view malformed : {"100%", "%4", "%zz", "a%+20"})
+        for (ucall_percent_mode_t mode : {ucall_percent_path_k, ucall_percent_query_k})
+            failures += expect(decode(malformed, mode).status == ucall_status_invalid_argument_k,
+                               "'{}' decoded although its escape is malformed", malformed);
+
+    char in_place[] = "name=caf%C3%A9+au+lait&x=%2541";
+    std::size_t length = 0;
+    ucall_byte_t* const bytes = reinterpret_cast<ucall_byte_t*>(in_place);
+    failures += expect(ucall_decode_percent({bytes, sizeof(in_place) - 1}, bytes, &length, ucall_percent_query_k) ==
+                               ucall_status_success_k &&
+                           std::string_view(in_place, length) == "name=caf\xC3\xA9 au lait&x=%41",
+                       "decoding in place gave '{}'", std::string_view(in_place, length));
+    return failures;
+}
+
+#pragma endregion Percent Codec
+
 int main(int, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
@@ -405,5 +492,6 @@ int main(int, char** argv) {
     run_test(totals, "test_routes_unit", test_routes_unit);
     run_test(totals, "test_routes_safety", test_routes_safety);
     run_test(totals, "test_routes_stress", test_routes_stress);
+    run_test(totals, "test_percent_codec", test_percent_codec);
     return suite_exit_code(totals);
 }

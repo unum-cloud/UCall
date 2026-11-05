@@ -6,7 +6,7 @@ the stack with the shared NumKong kernel in `examples/inference/model.py`. It ha
 LitServe decodes request bodies as JSON, so a small ASGI middleware wraps each raw i8 body as a
 hexadecimal JSON string before routing; the report should name that cost beside the results.
 
-File: examples/inference/server_litserve.py
+File: bench/litserve_inference.py
 Author: Ash Vardanian
 Date: October 25, 2026
 """

@@ -13,7 +13,7 @@ license-files = ["LICENSE"]
 requires-python = ">=3.12"
 authors = [{ name = "Ash Vardanian", email = "info@unum.cloud" }]
 classifiers = [
-  "Development Status :: 5 - Production/Stable",
+  "Development Status :: 4 - Beta",
   "Natural Language :: English",
   "Intended Audience :: Developers",
   "Intended Audience :: Information Technology",
@@ -100,6 +100,7 @@ wheel.packages = ["python/ucall"]
 
 [tool.scikit-build.cmake.define]
 UCALL_BUILD_PYTHON = "ON"
+UCALL_INSTALL = "OFF"
 
 # Groups rather than extras, so none of this reaches the published wheel's metadata.
 [dependency-groups]
@@ -129,7 +130,6 @@ quote-style = "double"
 [tool.ruff.lint.per-file-ignores]
 "python/ucall/__init__.py" = ["F401", "F403"]
 ".cmake-format.py" = ["F821"]
-"cmake-format.py" = ["F821"]
 "!python/**" = ["D"]
 "*.pyi" = ["D"]
 
@@ -147,7 +147,7 @@ combine-as-imports = true
 extend-immutable-calls = ["fastapi.Body", "Body"]
 
 [tool.cibuildwheel]
-build = ["cp312-*", "cp313-*", "cp314-*", "cp315-*"]
+build = ["cp312-*", "cp313-*", "cp314-*", "cp314t-*", "cp315-*"]
 build-verbosity = 0
 skip = ["*musllinux*"]
 test-command = "python -X faulthandler -m pytest -x {project}/test"

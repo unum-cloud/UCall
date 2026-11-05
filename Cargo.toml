@@ -1,8 +1,11 @@
 [package]
 authors = ["Ash Vardanian <info@unum.cloud>"]
 description = "HTTP and Noise clients and servers with capability-specialized I/O backends"
-keywords = ["http", "rpc", "server", "io-uring", "noise"]
+keywords = ["http", "server", "io-uring", "noise"]
+categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
 edition = "2021"
+# `Waker::noop` in the tests; the library itself builds on 1.82.
+rust-version = "1.85"
 include = [
   "/rust/**",
   "/include/**",
@@ -10,13 +13,16 @@ include = [
   "/c/**",
   "/CMakeLists.txt",
   "/cmake/ucall_*.cmake",
+  "/cmake/liburing.cmake",
   "/VERSION",
   "/build.rs",
+  "/LICENSE",
 ]
 license = "Apache-2.0"
 links = "ucall"
 name = "ucall"
 publish = true
+readme = "rust/README.md"
 repository = "https://github.com/unum-cloud/UCall"
 documentation = "https://docs.rs/ucall"
 version = "1.0.0-rc.1"

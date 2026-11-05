@@ -344,7 +344,7 @@ check_member_comments_above() {
             gsub(/"([^"\\]|\\.)*"/, "\"\"", code)
             depth += gsub(/\{/, "{", code) - gsub(/\}/, "}", code)
             if (depth <= 0) { depth = 0; next }
-            if (code ~ /\\[[:space:]]*$/ || code ~ /^[[:space:]]*(\/\/|\/\*|\*|using[[:space:]])/) next
+            if (code ~ /\\[[:space:]]*$/ || code ~ /^[[:space:]]*(\/\/|\/\*|\*|#|using[[:space:]])/) next
             if ((FNR in added) && code ~ /[]A-Za-z0-9_);,][[:space:]]*(\/\/([^\/!]|$)|\/\*[^*])/) print "+" $0
         }' || true)
     [ -z "$trailing" ] || reject_with_reason "$trailing" \
@@ -2040,7 +2040,7 @@ check_abbreviations_spelled_out() {
                 if ((prose && token !~ /_/) || !(token in existing)) { print "    " token ": " original[FNR]; break }
             }
         }' <(printf '%s\n' "$previous_text") \
-        "$staged_code_path" \
+        "${staged_code_path:-/dev/null}" \
         <(printf '%s\n' "$staged_added_text") "$staged_added_unquoted_path" || true)
     [ -z "$abbreviated" ] || reject_with_reason "$abbreviated" \
         "$staged_path abbreviates a word this project spells out; write \`high\`, \`low\`, \`accumulator\`, and so on:"
@@ -3576,7 +3576,7 @@ check_platform_macros_through_vocabulary() {
         grep -oE '__linux__|__APPLE__|__FreeBSD__|\b_WIN(32|64)\b|__GNUC__|__clang__|_MSC_VER|\b__x86_64__\b|_M_X64|\b__aarch64__\b|_M_ARM64' |
         sort -u || true)
     [ -z "$raw" ] || reject_with_reason "$raw" \
-        "$staged_path asks a raw platform macro - include ucall/types.hpp and use its vocabulary," \
+        "$staged_path asks a raw platform macro - include ucall/utilities/types.hpp and use its vocabulary," \
         "            UCALL_OS_*, UCALL_ARCH_* or UCALL_COMPILER_*:"
 }
 
@@ -3652,7 +3652,7 @@ run_project_checks() {
         check_trailing_returns
         check_iterator_laundering
         check_path_hops
-        case "$staged_path" in include/ucall/types.hpp | c/*.h | python/*.c) ;; *) check_platform_macros_through_vocabulary ;; esac
+        case "$staged_path" in include/ucall/utilities/types.hpp | c/*.h | python/*.c) ;; *) check_platform_macros_through_vocabulary ;; esac
         ;;
     esac
     case "$staged_path" in

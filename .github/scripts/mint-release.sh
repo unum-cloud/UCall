@@ -6,13 +6,13 @@
 set -euo pipefail
 version=$1 core=${1%%-*}
 branch=$(git branch --show-current)
-previous=$(git describe --tags --abbrev=0)
+# The first release has no tag before it, so its notes start at the root commit.
+previous=$(git describe --tags --abbrev=0 2>/dev/null || git rev-list --max-parents=0 HEAD)
 git diff --quiet HEAD || { echo "mint-release: commit or stash your changes first"; exit 1; }
 
 IFS=. read -r major minor patch <<< "$core"
-export version core major minor patch
+export version major minor patch
 echo "$version" > VERSION
-perl -pi -e 's/^([[:space:]]+VERSION )[0-9.]+$/$1$ENV{core}/' CMakeLists.txt
 perl -pi -e 's/^(#define UCALL_VERSION_MAJOR )[0-9]+$/$1$ENV{major}/; s/^(#define UCALL_VERSION_MINOR )[0-9]+$/$1$ENV{minor}/; s/^(#define UCALL_VERSION_PATCH )[0-9]+$/$1$ENV{patch}/' c/ucall/types.h
 perl -pi -e 's/^version: .+$/version: $ENV{version}/' CITATION.cff
 perl -pi -e 's/^(version = ")[^"]+/$1$ENV{version}/' Cargo.toml

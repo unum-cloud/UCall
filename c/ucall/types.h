@@ -8,9 +8,8 @@
 #ifndef UNUM_UCALL_TYPES_H
 #define UNUM_UCALL_TYPES_H
 
-#include <stdbool.h> // bool
-#include <stddef.h>  // size_t
-#include <stdint.h>  // uint32_t, int32_t
+#include <stddef.h> // size_t
+#include <stdint.h> // uint32_t, int32_t
 
 #define UCALL_VERSION_MAJOR 1
 #define UCALL_VERSION_MINOR 0
@@ -55,7 +54,7 @@ typedef enum ucall_io_backend_t {
     ucall_io_backend_linux_epollaio_k,
     ucall_io_backend_linux_uring612_k,
     ucall_io_backend_linux_uring618_k,
-    ucall_io_backend_macos_kqueue_k,
+    ucall_io_backend_bsd_kqueue_k,
     ucall_io_backend_windows_iocp_k
 } ucall_io_backend_t;
 
@@ -67,9 +66,7 @@ typedef enum ucall_cpu_class_t {
     ucall_cpu_class_intel_skylake_k,
     ucall_cpu_class_intel_icelake_k,
     ucall_cpu_class_intel_alder_k,
-    ucall_cpu_class_intel_sierra_k,
     ucall_cpu_class_aws_g2_k,
-    ucall_cpu_class_apple_m2_k,
     ucall_cpu_class_aws_g5_k,
     ucall_cpu_class_monoversioned_k
 } ucall_cpu_class_t;
@@ -93,8 +90,7 @@ UCALL_EXPORT ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t na
 /**
  *  @brief Reads a CPU kernel class back from its stable name.
  *  @param[in] name The counted spelling @c ucall_cpu_class_name() returns.
- *  @return The named class, or @c ucall_cpu_class_unknown_k for an unrecognized name, which
- *      callers tell from "automatic" by naming the result back.
+ *  @return The named class, or @c ucall_cpu_class_unknown_k for an unrecognized name.
  *
  *  @note @b Thread-safe.
  */
@@ -150,27 +146,25 @@ typedef enum ucall_body_delivery_t {
  *  @note Use @c http+noise:// or @c ws+noise:// URL schemes to enable Noise transport.
  *  @see https://noiseprotocol.org/noise.html for pattern specifications.
  */
-typedef enum ucall_security_mode_t {
+typedef enum ucall_security_t {
 
     /** No encryption, plain TCP/IP. */
-    ucall_security_mode_none_k,
+    ucall_security_none_k,
 
     /** Trust on first use - no pre-shared keys needed. */
-    ucall_security_mode_noise_xx_k,
+    ucall_security_noise_xx_k,
 
     /** Client knows server's public key in advance. */
-    ucall_security_mode_noise_ik_k,
+    ucall_security_noise_ik_k,
 
     /** Both know each other's public keys in advance. */
-    ucall_security_mode_noise_kk_k
-} ucall_security_mode_t;
+    ucall_security_noise_kk_k
+} ucall_security_t;
 
 /** Noise protocol key (32 bytes for Curve25519). */
 typedef ucall_byte_t ucall_noise_key_t[32];
 
-/** HTTP request methods/verbs for endpoint routing.
- *
- *  For JSON-RPC all requests are typically sent via HTTP @c POST. */
+/** HTTP request methods/verbs for endpoint routing. */
 typedef enum ucall_verb_t {
 
     /** Unrecognized or not yet parsed. The zero-initialized default. */
@@ -284,7 +278,7 @@ enum {
  *  @param[in] peer_static_key The remote party's 32-byte Curve25519 static public key.
  *  @param[in] context User-supplied context from the server or client configuration.
  *
- *  Required for @c ucall_security_mode_noise_xx_k, where keys are learned during the handshake
+ *  Required for @c ucall_security_noise_xx_k, where keys are learned during the handshake
  *  rather than known in advance. Called after the key is authenticated, before any payload.
  *  Returning @c ucall_status_success_k admits the peer.
  *
@@ -387,6 +381,26 @@ typedef struct ucall_noise_key_derive_t {
  */
 UCALL_EXPORT void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments);
 
+/** The family of a peer's socket address. */
+typedef enum ucall_address_family_t {
+    ucall_address_family_unknown_k = 0,
+    ucall_address_family_ipv4_k = 1,
+    ucall_address_family_ipv6_k = 2,
+    ucall_address_family_unix_k = 3,
+} ucall_address_family_t;
+
+/** A peer's socket address: IPv4 in the first 4 @c bytes, IPv6 in all 16, both in network order,
+ *  the port in host order and the IPv6 scope; AF_UNIX peers carry only the family. */
+typedef struct ucall_peer_address_t {
+    ucall_byte_t bytes[16];
+    uint32_t scope;
+    uint16_t port;
+
+    /** A @c ucall_address_family_t, one byte wide. */
+    uint8_t family;
+    uint8_t reserved;
+} ucall_peer_address_t;
+
 /** HTTP status codes for server responses and client results.
  *
  *  Numeric codes also represent responses absent from the named constants below.
@@ -454,11 +468,17 @@ enum {
     /** Verb or feature not supported. */
     ucall_http_status_not_implemented_k = 501,
 
+    /** An upstream answered with something no HTTP peer would send. */
+    ucall_http_status_bad_gateway_k = 502,
+
     /** Server is overloaded or shutting down. */
     ucall_http_status_service_unavailable_k = 503,
 
     /** Upstream dependency timed out. */
     ucall_http_status_gateway_timeout_k = 504,
+
+    /** Request names an HTTP version the server does not speak. */
+    ucall_http_status_version_not_supported_k = 505,
 };
 
 /** Severity of a log line, from the most verbose up. */
@@ -575,6 +595,33 @@ UCALL_EXPORT char const* ucall_status_name(ucall_status_t status);
  *  - @c ucall_status_invalid_argument_k An unrecognized name.
  */
 UCALL_EXPORT ucall_status_t ucall_status_from_name(ucall_bytes_view_t name);
+
+/** Which part of a URL @c ucall_decode_percent() reads, as only a query spells a space '+'. */
+typedef enum ucall_percent_mode_t {
+
+    /** A path, where '+' stays itself. */
+    ucall_percent_path_k = 0,
+
+    /** A query, where '+' is a space. */
+    ucall_percent_query_k = 1
+} ucall_percent_mode_t;
+
+/**
+ *  @brief Decodes the %XX escapes of @p encoded, and '+' as a space in query mode.
+ *  @param[in] encoded A path or a query value, as a request lends it.
+ *  @param[out] decoded At least @c encoded.length bytes; may alias @c encoded.data.
+ *  @param[out] length The decoded length.
+ *  @param[in] mode Whether a '+' is itself or a space.
+ *  @return The decoding's status.
+ *
+ *  @note @b Thread-safe.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k A '%' without two hexadecimal digits, an unknown @p mode,
+ *    or a missing @p length, @p decoded or @c encoded.data while @c encoded.length is not zero.
+ */
+UCALL_EXPORT ucall_status_t ucall_decode_percent(ucall_bytes_view_t encoded, ucall_byte_t* decoded, size_t* length,
+                                                 ucall_percent_mode_t mode);
 
 /**
  *  @brief Reports the version of the linked library, which may differ from @c UCALL_VERSION_* in

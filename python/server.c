@@ -20,7 +20,7 @@ typedef struct Interface {
     PyObject* device_name;
 
     /** The 32-byte Noise identity, a @c bytes, or NULL. */
-    PyObject* private_key;
+    PyObject* noise_private_key;
 
     /** The callable vetting Noise peers, or NULL. */
     PyObject* peer_authorizer;
@@ -32,7 +32,7 @@ typedef struct Interface {
     PyObject* reply_directories;
 
     /** The encryption of accepted connections. */
-    ucall_security_mode_t security;
+    ucall_security_t security;
 
     /** The requested loops; zero lets the library choose. */
     Py_ssize_t event_loops;
@@ -45,23 +45,28 @@ typedef struct Interface {
 
     /** The largest request head and buffered body; zero takes the kernel's receive buffer. */
     Py_ssize_t max_request_bytes;
+
+    /** A listening socket to accept on instead of binding @c address, or -1 to bind. */
+    intptr_t descriptor;
 } Interface;
 
 static char const doc_Interface[] =                                                                 //
-    "Interface(address, *, device_name=None, security=Security.NONE, private_key=None,\n"           //
-    "    peer_authorizer=None, noise_peer_key=None, event_loops=0, connections=1024,\n"             //
-    "    pipelined_requests=0, max_request_bytes=0, reply_directories=())\n"                        //
+    "Interface(address=\"\", *, descriptor=None, device_name=None, security=Security.NONE,\n"       //
+    "    noise_private_key=None, peer_authorizer=None, noise_peer_key=None, event_loops=0,\n"       //
+    "    connections=1024, pipelined_requests=0, max_request_bytes=0, reply_directories=())\n"      //
     "\n"                                                                                            //
     "One address a server answers on, with the security and admission of what arrives there.\n"     //
     "\n"                                                                                            //
     "Args:\n"                                                                                       //
     "  address (str): The \"host:port\" to listen on; port 0 takes a free one, which\n"             //
-    "    `Server.addresses` reports.\n"                                                             //
+    "    `Server.addresses` reports. Required unless `descriptor` is given.\n"                      //
+    "  descriptor (int | socket.socket, optional): A listening stream socket to accept on\n"        //
+    "    instead, such as an AF_UNIX one; the server accepts on duplicates and never closes it.\n"  //
     "  device_name (str, optional): A network device to pin the socket to, such as \"eth0\";\n"     //
     "    None binds by address alone.\n"                                                            //
     "  security (Security, optional): Encryption of accepted connections. Defaults to\n"            //
     "    `Security.NONE`.\n"                                                                        //
-    "  private_key (bytes, optional): The 32-byte Noise identity, required under Noise.\n"          //
+    "  noise_private_key (bytes, optional): The 32-byte Noise identity, required under Noise.\n"    //
     "  peer_authorizer (Callable[[bytes], bool], optional): Admits a Noise peer by its 32-byte\n"   //
     "    static key, required under `Security.NOISE_XX`; None admits every peer.\n"                 //
     "  noise_peer_key (bytes, optional): The one caller's 32-byte static public key, required\n"    //
@@ -105,14 +110,15 @@ static PyObject* interface_directories(PyObject* object) {
 }
 
 static PyObject* Interface_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
-    PyObject *address = NULL, *device_name = NULL, *security = NULL, *private_key = NULL, *peer_authorizer = NULL,
-             *noise_peer_key = NULL, *event_loops = NULL, *connections = NULL, *pipelined_requests = NULL,
-             *max_request_bytes = NULL, *reply_directories = NULL;
+    PyObject *address = NULL, *descriptor = NULL, *device_name = NULL, *security = NULL, *noise_private_key = NULL,
+             *peer_authorizer = NULL, *noise_peer_key = NULL, *event_loops = NULL, *connections = NULL,
+             *pipelined_requests = NULL, *max_request_bytes = NULL, *reply_directories = NULL;
     ucall_py_argument_t const arguments[] = {
         {"address", &address},
+        {"descriptor", &descriptor},
         {"device_name", &device_name},
         {"security", &security},
-        {"private_key", &private_key},
+        {"noise_private_key", &noise_private_key},
         {"peer_authorizer", &peer_authorizer},
         {"noise_peer_key", &noise_peer_key},
         {"event_loops", &event_loops},
@@ -121,47 +127,76 @@ static PyObject* Interface_new(PyTypeObject* type, PyObject* positional, PyObjec
         {"max_request_bytes", &max_request_bytes},
         {"reply_directories", &reply_directories},
     };
-    if (ucall_py_parse_tuple("Interface", positional, keywords, 1, 1, arguments,
+    if (ucall_py_parse_tuple("Interface", positional, keywords, 0, 1, arguments,
                              sizeof(arguments) / sizeof(arguments[0])) != 0)
         return NULL;
-    if (!PyUnicode_Check(address))
+    PyObject* const empty = PyUnicode_FromString("");
+    if (!empty) return NULL;
+    if (!address) address = empty;
+    if (!PyUnicode_Check(address)) {
+        Py_DECREF(empty);
         return PyErr_Format(PyExc_TypeError, "'address' must be str, got %s", Py_TYPE(address)->tp_name);
+    }
+    long long listening = -1;
+    if (descriptor && descriptor != Py_None) {
+        // A `socket.socket` hands its descriptor over through `fileno()`, as `select` takes it.
+        PyObject* const number = PyLong_Check(descriptor) ? Py_NewRef(descriptor)
+                                                          : PyObject_CallMethod(descriptor, "fileno", NULL);
+        listening = number ? PyLong_AsLongLong(number) : -1;
+        Py_XDECREF(number);
+        if (PyErr_Occurred() || listening < 0) {
+            Py_DECREF(empty);
+            if (!PyErr_Occurred()) PyErr_SetString(PyExc_ValueError, "'descriptor' must name an open socket");
+            return NULL;
+        }
+    }
+    else if (PyUnicode_GetLength(address) == 0) {
+        Py_DECREF(empty);
+        return PyErr_Format(PyExc_TypeError, "Interface() needs an 'address' or a 'descriptor'");
+    }
     if (device_name == Py_None) device_name = NULL;
     if (device_name && !PyUnicode_Check(device_name))
         return PyErr_Format(PyExc_TypeError, "'device_name' must be str or None, got %s",
                             Py_TYPE(device_name)->tp_name);
-    if (private_key == Py_None) private_key = NULL;
+    if (noise_private_key == Py_None) noise_private_key = NULL;
     ucall_noise_key_t key_check;
-    if (private_key && ucall_py_key_from_object(private_key, "private_key", key_check) != 0) return NULL;
+    if (noise_private_key && ucall_py_key_from_object(noise_private_key, "noise_private_key", key_check) != 0)
+        return NULL;
     if (noise_peer_key == Py_None) noise_peer_key = NULL;
     if (noise_peer_key && ucall_py_key_from_object(noise_peer_key, "noise_peer_key", key_check) != 0) return NULL;
     if (peer_authorizer == Py_None) peer_authorizer = NULL;
     if (peer_authorizer && !PyCallable_Check(peer_authorizer))
         return PyErr_Format(PyExc_TypeError, "'peer_authorizer' must be callable, got %s",
                             Py_TYPE(peer_authorizer)->tp_name);
-    int security_mode = ucall_security_mode_none_k;
+    int security_value = ucall_security_none_k;
     size_t loops = 0, budget = 1024, pipelined = 0, request_bytes = 0;
-    if (ucall_py_enum_from_object(security, "security", &ucall_py_security_enum, &security_mode) != 0 ||
+    if (ucall_py_enum_from_object(security, "security", &ucall_py_security_enum, &security_value) != 0 ||
         ucall_py_size_from_object(event_loops, "event_loops", &loops) != 0 ||
         ucall_py_size_from_object(connections, "connections", &budget) != 0 ||
         ucall_py_size_from_object(pipelined_requests, "pipelined_requests", &pipelined) != 0 ||
         ucall_py_size_from_object(max_request_bytes, "max_request_bytes", &request_bytes) != 0)
         return NULL;
     PyObject* const directories = interface_directories(reply_directories);
-    if (!directories) return NULL;
+    if (!directories) {
+        Py_DECREF(empty);
+        return NULL;
+    }
 
     Interface* const self = (Interface*)type->tp_alloc(type, 0);
     if (!self) {
         Py_DECREF(directories);
+        Py_DECREF(empty);
         return NULL;
     }
     self->address = Py_NewRef(address);
+    Py_DECREF(empty);
+    self->descriptor = (intptr_t)listening;
     self->device_name = Py_XNewRef(device_name);
-    self->private_key = Py_XNewRef(private_key);
+    self->noise_private_key = Py_XNewRef(noise_private_key);
     self->peer_authorizer = Py_XNewRef(peer_authorizer);
     self->noise_peer_key = Py_XNewRef(noise_peer_key);
     self->reply_directories = directories;
-    self->security = (ucall_security_mode_t)security_mode;
+    self->security = (ucall_security_t)security_value;
     self->event_loops = (Py_ssize_t)loops;
     self->connections = (Py_ssize_t)budget;
     self->pipelined_requests = (Py_ssize_t)pipelined;
@@ -184,7 +219,7 @@ static void Interface_dealloc(Interface* self) {
     Interface_clear(self);
     Py_CLEAR(self->address);
     Py_CLEAR(self->device_name);
-    Py_CLEAR(self->private_key);
+    Py_CLEAR(self->noise_private_key);
     Py_CLEAR(self->noise_peer_key);
     Py_CLEAR(self->reply_directories);
     Py_TYPE(self)->tp_free((PyObject*)self);
@@ -211,8 +246,8 @@ static PyGetSetDef Interface_getset[] = {
     {"security", (getter)Interface_get_security, NULL, "Encryption of accepted connections.", NULL},
     {"device_name", ucall_py_get_optional, NULL, "The pinned device, or None.",
      (void*)offsetof(Interface, device_name)},
-    {"private_key", ucall_py_get_optional, NULL, "The 32-byte Noise identity, or None.",
-     (void*)offsetof(Interface, private_key)},
+    {"noise_private_key", ucall_py_get_optional, NULL, "The 32-byte Noise identity, or None.",
+     (void*)offsetof(Interface, noise_private_key)},
     {"peer_authorizer", ucall_py_get_optional, NULL, "The Noise peer vetting, or None.",
      (void*)offsetof(Interface, peer_authorizer)},
     {"noise_peer_key", ucall_py_get_optional, NULL, "The 32-byte static key KK expects, or None.",
@@ -253,31 +288,34 @@ typedef struct Metrics {
     double sample_rate;
 
     /** Microseconds between one event loop's datagrams; zero takes one second. */
-    Py_ssize_t interval_us;
+    Py_ssize_t interval_microseconds;
 } Metrics;
 
-static char const doc_Metrics[] =                                                           //
-    "Metrics(address, sample_rate=0.0, prefix=\"\", tags=(), interval_us=0)\n"              //
-    "\n"                                                                                    //
-    "Where a `Server` sends StatsD datagrams, each event loop on its own schedule.\n"       //
-    "\n"                                                                                    //
-    "Args:\n"                                                                               //
-    "  address (str | bytes): The StatsD UDP endpoint, \"host:port\".\n"                    //
-    "  sample_rate (float, optional): The fraction of finished requests whose latency is\n" //
-    "    reported, in (0, 1]; 0 takes 1.\n"                                                 //
-    "  prefix (str | bytes, optional): The metric name prefix; empty takes \"ucall\".\n"    //
-    "  tags (Sequence[str | bytes], optional): Global \"key:value\" tags.\n"                //
-    "  interval_us (int, optional): Microseconds between datagrams; 0 takes one second.\n"  //
-    "\n"                                                                                    //
-    "Example:\n"                                                                            //
-    "  >>> metrics = ucall.Metrics(\"127.0.0.1:8125\", tags=(\"service:inference\",))\n"    //
+static char const doc_Metrics[] =                                                                    //
+    "Metrics(address, sample_rate=0.0, prefix=\"\", tags=(), interval_microseconds=0)\n"             //
+    "\n"                                                                                             //
+    "Where a `Server` sends StatsD datagrams, each event loop on its own schedule.\n"                //
+    "\n"                                                                                             //
+    "Args:\n"                                                                                        //
+    "  address (str | bytes): The StatsD UDP endpoint, \"host:port\".\n"                             //
+    "  sample_rate (float, optional): The fraction of finished requests whose latency is\n"          //
+    "    reported, in (0, 1]; 0 takes 1.\n"                                                          //
+    "  prefix (str | bytes, optional): The metric name prefix; empty takes \"ucall\".\n"             //
+    "  tags (Sequence[str | bytes], optional): Global \"key:value\" tags.\n"                         //
+    "  interval_microseconds (int, optional): Microseconds between datagrams; 0 takes one second.\n" //
+    "\n"                                                                                             //
+    "Example:\n"                                                                                     //
+    "  >>> metrics = ucall.Metrics(\"127.0.0.1:8125\", tags=(\"service:inference\",))\n"             //
     "  >>> server = ucall.Server(ucall.Interface(\"127.0.0.1:0\"), metrics=metrics)";
 
 static PyObject* Metrics_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
-    PyObject *address = NULL, *sample_rate = NULL, *prefix = NULL, *tags = NULL, *interval_us = NULL;
+    PyObject *address = NULL, *sample_rate = NULL, *prefix = NULL, *tags = NULL, *interval_microseconds = NULL;
     ucall_py_argument_t const arguments[] = {
-        {"address", &address}, {"sample_rate", &sample_rate}, {"prefix", &prefix},
-        {"tags", &tags},       {"interval_us", &interval_us},
+        {"address", &address},
+        {"sample_rate", &sample_rate},
+        {"prefix", &prefix},
+        {"tags", &tags},
+        {"interval_microseconds", &interval_microseconds},
     };
     if (ucall_py_parse_tuple("Metrics", positional, keywords, 1, 5, arguments, 5) != 0) return NULL;
     ucall_bytes_view_t view;
@@ -286,7 +324,7 @@ static PyObject* Metrics_new(PyTypeObject* type, PyObject* positional, PyObject*
     if (ucall_py_text_from_object(address, "address", &view) != 0 ||
         (prefix && ucall_py_text_from_object(prefix, "prefix", &view) != 0) ||
         (sample_rate && (rate = PyFloat_AsDouble(sample_rate)) == -1.0 && PyErr_Occurred()) ||
-        ucall_py_size_from_object(interval_us, "interval_us", &interval) != 0)
+        ucall_py_size_from_object(interval_microseconds, "interval_microseconds", &interval) != 0)
         return NULL;
     PyObject* const tagged = tags ? PySequence_Tuple(tags) : PyTuple_New(0);
     for (Py_ssize_t index = 0; tagged && index != PyTuple_GET_SIZE(tagged); ++index)
@@ -303,7 +341,7 @@ static PyObject* Metrics_new(PyTypeObject* type, PyObject* positional, PyObject*
     self->prefix = Py_XNewRef(prefix);
     self->tags = tagged;
     self->sample_rate = rate;
-    self->interval_us = (Py_ssize_t)interval;
+    self->interval_microseconds = (Py_ssize_t)interval;
     return (PyObject*)self;
 }
 
@@ -318,7 +356,8 @@ static PyMemberDef Metrics_members[] = {
     {"address", Py_T_OBJECT_EX, offsetof(Metrics, address), Py_READONLY, "The StatsD \"host:port\"."},
     {"sample_rate", Py_T_DOUBLE, offsetof(Metrics, sample_rate), Py_READONLY, "Latencies reported; 0 takes 1."},
     {"tags", Py_T_OBJECT_EX, offsetof(Metrics, tags), Py_READONLY, "Global \"key:value\" tags."},
-    {"interval_us", Py_T_PYSSIZET, offsetof(Metrics, interval_us), Py_READONLY, "Microseconds between datagrams."},
+    {"interval_microseconds", Py_T_PYSSIZET, offsetof(Metrics, interval_microseconds), Py_READONLY,
+     "Microseconds between datagrams."},
     {NULL, 0, 0, 0, NULL},
 };
 
@@ -354,7 +393,7 @@ typedef struct Server {
     ucall_server_t handle;
 
     /** Every default filled in; the arrays it points at belong to @c handle. */
-    ucall_server_config_t resolved;
+    ucall_server_options_t resolved;
 
     /** The largest resolved @c event_loops among the interfaces: the server's parallelism. */
     size_t event_loops;
@@ -368,7 +407,7 @@ typedef struct Server {
     /** The callable receiving log lines, which the C interface borrows, or NULL. */
     PyObject* log;
 
-    /** Advanced by `stop()`, under the interpreter lock like every read of it. */
+    /** Advanced by @c stop() from any thread, so every access takes the server's section. */
     server_stage_t stage;
 } Server;
 
@@ -496,7 +535,7 @@ static ucall_status_t reply_failure(ucall_server_t server, ucall_received_http_r
 static int reply_content(ucall_server_t server, ucall_received_http_request_t request, ucall_http_status_t status,
                          ucall_bytes_view_t const* headers, size_t headers_count, ucall_bytes_view_t body) {
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_content_t reply = {server, &outcome, request, headers, headers_count, body, status};
+    ucall_server_reply_content_t reply = {server, &outcome, request, status, headers, headers_count, body};
     ucall_server_reply_content(&reply);
     return outcome.status == ucall_status_connection_closed_k ? 0 : ucall_py_raise_outcome(&outcome);
 }
@@ -537,12 +576,37 @@ static PyObject* request_new(Server* server, ucall_received_http_request_t handl
     return (PyObject*)request;
 }
 
+/** Takes @p self's handle for one reply under its section, so of two racing replies one finds
+ *  it gone. */
+static ucall_received_http_request_t request_take(Request* self) {
+    ucall_py_section_t section;
+    ucall_py_section_begin(&section, (PyObject*)self);
+    ucall_received_http_request_t const handle = self->handle;
+    self->handle = NULL;
+    ucall_py_section_end(&section);
+    return handle;
+}
+
+/** Gives back the handle of a reply that queued nothing, so the request still answers. */
+static void request_restore(Request* self, ucall_received_http_request_t handle) {
+    ucall_py_section_t section;
+    ucall_py_section_begin(&section, (PyObject*)self);
+    self->handle = handle;
+    ucall_py_section_end(&section);
+}
+
+static PyObject* request_raise_replied(void) {
+    return ucall_py_raise_status(ucall_status_already_exists_k, "the request was already replied to");
+}
+
 /** Answers @p request with an error unless it was replied to or views over its body are alive. */
 static void request_fail(Request* request, ucall_http_status_t status, char const* message) {
-    if (!request->handle || request->exports) return;
-    ucall_status_t const replied = reply_failure(request->server->handle, request->handle, status, message,
-                                                 strlen(message));
-    if (replied == ucall_status_success_k || replied == ucall_status_connection_closed_k) request->handle = NULL;
+    if (request->exports) return;
+    ucall_received_http_request_t const handle = request_take(request);
+    if (!handle) return;
+    ucall_status_t const replied = reply_failure(request->server->handle, handle, status, message, strlen(message));
+    if (replied != ucall_status_success_k && replied != ucall_status_connection_closed_k)
+        request_restore(request, handle);
 }
 
 static int request_live(Request* self) {
@@ -661,6 +725,54 @@ static char const doc_Request_header[] =                                        
 
 static PyObject* Request_header(Request* self, PyObject* name) { return request_lookup(self, name, lookup_header); }
 
+static char const doc_Request_fields[] =                                                            //
+    "fields() -> list[tuple[bytes, bytes]]\n"                                                       //
+    "\n"                                                                                            //
+    "Every header field line in arrival order, repeated names apart, as a proxy forwards a head.\n" //
+    "\n"                                                                                            //
+    "Returns:\n"                                                                                    //
+    "  list[tuple[bytes, bytes]]: Each name, lowercased as the parser keeps it, with its value\n"   //
+    "    trimmed.\n"                                                                                //
+    "\n"                                                                                            //
+    "Example:\n"                                                                                    //
+    "  >>> [name for name, _ in request.fields()]\n"                                                //
+    "  [b'host', b'accept']";
+
+static PyObject* Request_fields(Request* self, [[maybe_unused]] PyObject* unused) {
+    if (request_live(self) != 0) return NULL;
+    ucall_outcome_t outcome = {0};
+    size_t count = 0;
+    ucall_server_request_fields_count_t counting = {self->server->handle, &outcome, self->handle, &count};
+    ucall_server_request_fields_count(&counting);
+    if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
+    PyObject* const fields = PyList_New((Py_ssize_t)count);
+    for (size_t index = 0; fields && index != count; ++index) {
+        ucall_bytes_view_t name = {0}, value = {0};
+        ucall_server_request_field_t extract = {self->server->handle, &outcome, self->handle, index, &name, &value};
+        ucall_server_request_field(&extract);
+        PyObject* const field = ucall_py_raise_outcome(&outcome) == 0
+                                    ? Py_BuildValue("(y#y#)", (char const*)name.data, (Py_ssize_t)name.length,
+                                                    (char const*)value.data, (Py_ssize_t)value.length)
+                                    : NULL;
+        if (!field) {
+            Py_DECREF(fields);
+            return NULL;
+        }
+        PyList_SET_ITEM(fields, (Py_ssize_t)index, field);
+    }
+    return fields;
+}
+
+static PyObject* Request_get_query_string(Request* self, [[maybe_unused]] void* closure) {
+    if (request_live(self) != 0) return NULL;
+    ucall_outcome_t outcome = {0};
+    ucall_bytes_view_t query = {0};
+    ucall_server_request_query_t extract = {self->server->handle, &outcome, self->handle, &query};
+    ucall_server_request_query(&extract);
+    if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
+    return ucall_py_text_to_object(query);
+}
+
 static char const doc_Request_query[] =                                                  //
     "query(name, /) -> str | None\n"                                                     //
     "\n"                                                                                 //
@@ -701,16 +813,35 @@ static PyObject* Request_path_parameter(Request* self, PyObject* name) {
     return request_lookup(self, name, lookup_path_parameter);
 }
 
+/** A peer's socket address as Python's @c socket spells one: an address and port pair, an empty
+ *  string for AF_UNIX as @c getpeername answers, or None when unknown. */
+static PyObject* peer_address_object(ucall_peer_address_t const* address) {
+    if (address->family == ucall_address_family_unix_k) return PyUnicode_FromString("");
+    if (address->family != ucall_address_family_ipv4_k && address->family != ucall_address_family_ipv6_k)
+        Py_RETURN_NONE;
+    PyObject* const module = PyImport_ImportModule("ipaddress");
+    if (!module) return NULL;
+    Py_ssize_t const length = address->family == ucall_address_family_ipv4_k ? 4 : 16;
+    PyObject* const ip = PyObject_CallMethod(module, "ip_address", "y#", (char const*)address->bytes, length);
+    Py_DECREF(module);
+    if (!ip) return NULL;
+    return Py_BuildValue("(Ni)", ip, (int)address->port);
+}
+
 static PyObject* Request_get_peer(Request* self, [[maybe_unused]] void* closure) {
     if (request_live(self) != 0) return NULL;
     ucall_outcome_t outcome = {0};
     size_t interface_index = 0;
     ucall_noise_key_t static_key = {0};
-    ucall_server_request_peer_t query = {self->server->handle, &outcome, self->handle, &interface_index, &static_key};
+    ucall_peer_address_t address = {0};
+    ucall_server_request_peer_t query = {self->server->handle, &outcome,    self->handle,
+                                         &interface_index,     &static_key, &address};
     ucall_server_request_peer(&query);
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
-    return Py_BuildValue("(nN)", (Py_ssize_t)interface_index,
-                         PyBytes_FromStringAndSize((char const*)static_key, sizeof(ucall_noise_key_t)));
+    PyObject* const peer = peer_address_object(&address);
+    if (!peer) return NULL;
+    return Py_BuildValue("(nNN)", (Py_ssize_t)interface_index,
+                         PyBytes_FromStringAndSize((char const*)static_key, sizeof(ucall_noise_key_t)), peer);
 }
 
 /**
@@ -722,7 +853,7 @@ static int request_claim_reply(Request* self, PyObject* body, ucall_bytes_view_t
     own->data = NULL;
     own->length = 0;
     if (!self->handle) {
-        ucall_py_raise_status(ucall_status_already_exists_k, "the request was already replied to");
+        request_raise_replied();
         return -1;
     }
     if (body && PyMemoryView_Check(body) && PyMemoryView_GET_BASE(body) == (PyObject*)self) {
@@ -747,28 +878,28 @@ static int request_claim_reply(Request* self, PyObject* body, ucall_bytes_view_t
     return 0;
 }
 
-/** Marks the request consumed after a reply that delivered it or found its connection closed. */
-static PyObject* request_finish_reply(Request* self, ucall_outcome_t* outcome) {
+/** Keeps the request consumed after a reply that delivered it or found its connection closed, and
+ *  gives @p handle back otherwise. */
+static PyObject* request_finish_reply(Request* self, ucall_received_http_request_t handle, ucall_outcome_t* outcome) {
     ucall_status_t const status = ucall_outcome_status(outcome);
-    if (status == ucall_status_success_k || status == ucall_status_connection_closed_k) {
-        self->handle = NULL;
-        Py_RETURN_NONE;
-    }
+    if (status == ucall_status_success_k || status == ucall_status_connection_closed_k) Py_RETURN_NONE;
+    request_restore(self, handle);
     ucall_py_raise_outcome(outcome);
     return NULL;
 }
 
-/** Hands @p deferred back once its reply was queued, or raises the refusal that queued nothing. */
-static PyObject* request_defer_reply(Request* self, Deferred* deferred) {
+/** Hands @p deferred back once its reply was queued, or gives @p handle back and raises the refusal
+ *  that queued nothing. */
+static PyObject* request_defer_reply(Request* self, ucall_received_http_request_t handle, Deferred* deferred) {
     ucall_status_t const status = ucall_outcome_status(&deferred->outcome);
     // A queued reply may already be final, even failed, so only these refusals
     // leave the request unanswered.
     if (status == ucall_status_uninitialized_k || status == ucall_status_invalid_argument_k ||
         status == ucall_status_already_exists_k || status == ucall_status_out_of_memory_k) {
+        request_restore(self, handle);
         ucall_py_raise_outcome(&deferred->outcome);
         return NULL;
     }
-    self->handle = NULL;
     return Py_NewRef((PyObject*)deferred);
 }
 
@@ -780,12 +911,13 @@ static PyObject* request_send(Request* self, PyObject* body, ucall_http_status_t
     Py_buffer buffer = {0};
     if (body && !own.data && PyObject_GetBuffer(body, &buffer, PyBUF_SIMPLE) != 0) return NULL;
     ucall_bytes_view_t const content = own.data ? own : (ucall_bytes_view_t) {buffer.buf, (size_t)buffer.len};
+    ucall_received_http_request_t const handle = request_take(self);
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_content_t reply = {self->server->handle, &outcome, self->handle, headers,
-                                          headers_count,        content,  status};
-    ucall_server_reply_content(&reply);
+    ucall_server_reply_content_t reply = {self->server->handle, &outcome, handle, status, headers,
+                                          headers_count,        content};
+    if (handle) ucall_server_reply_content(&reply);
     if (buffer.obj) PyBuffer_Release(&buffer);
-    return request_finish_reply(self, &outcome);
+    return handle ? request_finish_reply(self, handle, &outcome) : request_raise_replied();
 }
 
 /** Answers @p self with what a handler returned, serialized by @c serialize_result. */
@@ -862,11 +994,12 @@ static PyObject* Request_reply_error(Request* self, PyObject* const* values, Py_
         return NULL;
     ucall_bytes_view_t own;
     if (request_claim_reply(self, NULL, &own) != 0) return NULL;
+    ucall_received_http_request_t const handle = request_take(self);
+    if (!handle) return request_raise_replied();
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_error_t reply = {self->server->handle, &outcome, self->handle, (ucall_http_status_t)http_status,
-                                        text};
+    ucall_server_reply_error_t reply = {self->server->handle, &outcome, handle, (ucall_http_status_t)http_status, text};
     ucall_server_reply_error(&reply);
-    return request_finish_reply(self, &outcome);
+    return request_finish_reply(self, handle, &outcome);
 }
 
 static int RequestBytes_getbuffer(RequestBytes* self, Py_buffer* view, int flags) {
@@ -1020,8 +1153,10 @@ static char const doc_Request_detach[] =                                        
 static PyObject* Request_detach(Request* self, [[maybe_unused]] PyObject* unused) {
     ucall_bytes_view_t own;
     if (request_claim_reply(self, NULL, &own) != 0) return NULL;
-    PyObject* const detached = request_new(self->server, self->handle, &DetachedRequestType);
-    if (detached) self->handle = NULL;
+    ucall_received_http_request_t const handle = request_take(self);
+    if (!handle) return request_raise_replied();
+    PyObject* const detached = request_new(self->server, handle, &DetachedRequestType);
+    if (!detached) request_restore(self, handle);
     return detached;
 }
 
@@ -1413,16 +1548,18 @@ static PyObject* DetachedRequest_reply_parts(Request* self, PyObject* const* val
     Deferred* const deferred = files && reply_parts_keep_files(&source, files) == 0 ? deferred_new(files) : NULL;
     Py_XDECREF(files);
     PyObject* answer = NULL;
-    if (deferred || !source.deferring_count) {
+    ucall_received_http_request_t const handle = deferred || !source.deferring_count ? request_take(self) : NULL;
+    if (handle) {
         ucall_outcome_t final = {0};
         ucall_outcome_t* const outcome = deferred ? &deferred->outcome : &final;
         ucall_server_reply_vectored_t reply = {
-            self->server->handle, outcome,     self->handle, (ucall_http_status_t)http_status,
+            self->server->handle, outcome,     handle,       (ucall_http_status_t)http_status,
             lines.views,          lines.count, source.parts, source.count,
         };
         ucall_server_reply_vectored(&reply);
-        answer = deferred ? request_defer_reply(self, deferred) : request_finish_reply(self, &final);
+        answer = deferred ? request_defer_reply(self, handle, deferred) : request_finish_reply(self, handle, &final);
     }
+    else if (deferred || !source.deferring_count) request_raise_replied();
     reply_parts_release(&source);
     ucall_py_header_lines_release(&lines);
     Py_XDECREF(deferred);
@@ -1472,20 +1609,24 @@ static PyObject* DetachedRequest_reply_stream(Request* self, PyObject* const* va
         stream->deferring_count = 0;
     }
     PyObject* opened = NULL;
-    if (stream && stream->files) {
+    ucall_received_http_request_t const handle = stream && stream->files ? request_take(self) : NULL;
+    if (handle) {
         ucall_outcome_t outcome = {0};
         ucall_server_reply_begin_t begin = {
-            self->server->handle, &outcome, self->handle, (ucall_http_status_t)http_status, lines.views, lines.count,
+            self->server->handle, &outcome, handle, (ucall_http_status_t)http_status, lines.views, lines.count,
         };
         ucall_server_reply_begin(&begin);
         ucall_status_t const begun = ucall_outcome_status(&outcome);
         if (begun == ucall_status_success_k || begun == ucall_status_connection_closed_k) {
-            stream->handle = self->handle;
-            self->handle = NULL;
+            stream->handle = handle;
             opened = Py_NewRef((PyObject*)stream);
         }
-        else ucall_py_raise_outcome(&outcome);
+        else {
+            request_restore(self, handle);
+            ucall_py_raise_outcome(&outcome);
+        }
     }
+    else if (stream && stream->files) request_raise_replied();
     ucall_py_header_lines_release(&lines);
     Py_XDECREF(stream);
     return opened;
@@ -1602,9 +1743,17 @@ static PyObject* ReplyStream_end(ReplyStream* self, [[maybe_unused]] PyObject* u
     if (reply_stream_live(self) != 0) return NULL;
     Deferred* const deferred = self->deferring_count ? deferred_new(self->files) : NULL;
     if (self->deferring_count && !deferred) return NULL;
-    ucall_outcome_t final = {0};
-    ucall_server_reply_end_t end = {self->server->handle, deferred ? &deferred->outcome : &final, self->handle};
+    ucall_py_section_t section;
+    ucall_py_section_begin(&section, (PyObject*)self);
+    ucall_received_http_request_t const handle = self->handle;
     self->handle = NULL;
+    ucall_py_section_end(&section);
+    if (!handle) {
+        Py_XDECREF(deferred);
+        return ucall_py_raise_status(ucall_status_already_exists_k, "the stream already ended");
+    }
+    ucall_outcome_t final = {0};
+    ucall_server_reply_end_t end = {self->server->handle, deferred ? &deferred->outcome : &final, handle};
     ucall_server_reply_end(&end);
     if (deferred) return (PyObject*)deferred;
     ucall_status_t const status = ucall_outcome_status(&final);
@@ -1707,6 +1856,7 @@ PyTypeObject BodyChunksType = {
 
 static PyMethodDef Request_methods[] = {
     {"header", (PyCFunction)Request_header, METH_O, doc_Request_header},
+    {"fields", (PyCFunction)Request_fields, METH_NOARGS, doc_Request_fields},
     {"query", (PyCFunction)Request_query, METH_O, doc_Request_query},
     {"path_parameter", (PyCFunction)Request_path_parameter, METH_O, doc_Request_path_parameter},
     {"reply", (PyCFunction)(void (*)(void))Request_reply, ucall_py_method_flags_k, doc_Request_reply},
@@ -1717,6 +1867,7 @@ static PyMethodDef Request_methods[] = {
 
 static PyMethodDef DetachedRequest_methods[] = {
     {"header", (PyCFunction)Request_header, METH_O, doc_Request_header},
+    {"fields", (PyCFunction)Request_fields, METH_NOARGS, doc_Request_fields},
     {"query", (PyCFunction)Request_query, METH_O, doc_Request_query},
     {"path_parameter", (PyCFunction)Request_path_parameter, METH_O, doc_Request_path_parameter},
     {"reply", (PyCFunction)(void (*)(void))Request_reply, ucall_py_method_flags_k, doc_Request_reply},
@@ -1732,9 +1883,13 @@ static PyMethodDef DetachedRequest_methods[] = {
 static PyGetSetDef Request_getset[] = {
     {"verb", (getter)Request_get_verb, NULL, "The `Verb` it arrived with, never `Verb.ANY`.", NULL},
     {"path", (getter)Request_get_path, NULL, "The path as sent, still percent-encoded, without the query.", NULL},
+    {"query_string", (getter)Request_get_query_string, NULL,
+     "The query after the first `?`, still percent-encoded, or \"\" without one.", NULL},
     {"body", (getter)Request_get_body, NULL, "A read-only memoryview of the body, valid until the reply.", NULL},
     {"peer", (getter)Request_get_peer, NULL,
-     "The index of the interface it arrived on and the peer's 32-byte Noise key, zeros on plaintext.", NULL},
+     "The index of the interface it arrived on, the peer's 32-byte Noise key, zeros on plaintext, " //
+     "and its address: (ipaddress, port), \"\" for AF_UNIX, or None.",
+     NULL},
     {"parts", (getter)Request_get_parts, NULL, "The `RequestPart`s of a multipart/form-data body, else empty.", NULL},
     {"path_segments", (getter)Request_get_path_segments, NULL, "The path's components between slashes, as sent.", NULL},
     {NULL, NULL, NULL, NULL, NULL},
@@ -1896,27 +2051,16 @@ static PyObject* scalar_from_text(char const* data, size_t length, scalar_kind_t
     return value;
 }
 
-static int hex_digit(ucall_byte_t character) {
-    if (character >= '0' && character <= '9') return character - '0';
-    if (character >= 'a' && character <= 'f') return character - 'a' + 10;
-    if (character >= 'A' && character <= 'F') return character - 'A' + 10;
-    return -1;
-}
-
 /** Converts a query value to @p kind, percent-decoded with "+" as a space as by `unquote_plus`. */
 static PyObject* scalar_from_query(ucall_bytes_view_t text, scalar_kind_t kind) {
     char inline_buffer[256];
     char* const decoded = text.length <= sizeof(inline_buffer) ? inline_buffer : PyMem_Malloc(text.length);
     if (!decoded) return PyErr_NoMemory();
     size_t length = 0;
-    for (size_t index = 0; index != text.length; ++index) {
-        ucall_byte_t const character = text.data[index];
-        int const high = character == '%' && index + 2 < text.length ? hex_digit(text.data[index + 1]) : -1;
-        int const low = high >= 0 ? hex_digit(text.data[index + 2]) : -1;
-        if (low >= 0) decoded[length++] = (char)(high * 16 + low), index += 2;
-        else decoded[length++] = character == '+' ? ' ' : (char)character;
-    }
-    PyObject* const value = scalar_from_text(decoded, length, kind, "replace");
+    ucall_status_t const status = ucall_decode_percent(text, (ucall_byte_t*)decoded, &length, ucall_percent_query_k);
+    PyObject* const value = status == ucall_status_success_k
+                                ? scalar_from_text(decoded, length, kind, "replace")
+                                : PyErr_Format(PyExc_ValueError, "a '%%' in the query lacks two hexadecimal digits");
     if (decoded != inline_buffer) PyMem_Free(decoded);
     return value;
 }
@@ -2236,7 +2380,7 @@ PyTypeObject EndpointType = {
 typedef struct BatchEndpoint {
     PyObject ob_base;
 
-    /** The endpoint the draining verbs address. */
+    /** The endpoint the polling verbs address. */
     ucall_http_batch_endpoint_t handle;
 
     /** The server that registered it, NULL once a collection cleared it. */
@@ -2246,7 +2390,8 @@ typedef struct BatchEndpoint {
     PyObject* handler;
 } BatchEndpoint;
 
-/** Runs a batch endpoint's Python handler on the draining thread with a list of its requests. */
+/** Runs a batch endpoint's Python handler on its polling owner's thread with a list of its
+ *  requests. */
 static void call_batch_endpoint(ucall_received_http_request_t const* handles, size_t count, void* context) {
     PyGILState_STATE const state = PyGILState_Ensure();
     BatchEndpoint* const endpoint = (BatchEndpoint*)context;
@@ -2298,29 +2443,30 @@ static int batch_endpoint_live(BatchEndpoint* self) {
     return -1;
 }
 
-static char const doc_BatchEndpoint_take_batch[] =                                               //
-    "take_batch(timeout_us=0) -> None\n"                                                         //
-    "\n"                                                                                         //
-    "Runs the handler on this thread if a batch is due, waiting for one at most `timeout_us`.\n" //
-    "\n"                                                                                         //
-    "Each batch endpoint has one draining owner, and the wait polls no event loop.\n"            //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  timeout_us (int, optional): The longest wait in microseconds; 0 checks once.\n"           //
-    "\n"                                                                                         //
-    "Raises:\n"                                                                                  //
-    "  Error: The server failed, or was released.\n"                                             //
-    "\n"                                                                                         //
-    "Example:\n"                                                                                 //
-    "  >>> endpoint.take_batch(timeout_us=1_000)";
+static char const doc_BatchEndpoint_take_batch[] =                                                         //
+    "take_batch(timeout_microseconds=0) -> None\n"                                                         //
+    "\n"                                                                                                   //
+    "Runs the handler on this thread if a batch is due, waiting for one at most `timeout_microseconds`.\n" //
+    "\n"                                                                                                   //
+    "Each batch endpoint has one polling owner, and the wait polls no event loop.\n"                       //
+    "\n"                                                                                                   //
+    "Args:\n"                                                                                              //
+    "  timeout_microseconds (int, optional): The longest wait in microseconds; 0 checks once.\n"           //
+    "\n"                                                                                                   //
+    "Raises:\n"                                                                                            //
+    "  Error: The server failed, or was released.\n"                                                       //
+    "\n"                                                                                                   //
+    "Example:\n"                                                                                           //
+    "  >>> endpoint.take_batch(timeout_microseconds=1_000)";
 
 static PyObject* BatchEndpoint_take_batch(BatchEndpoint* self, PyObject* const* values, Py_ssize_t count,
                                           PyObject* names) {
     PyObject* timeout = NULL;
-    ucall_py_argument_t const arguments[] = {{"timeout_us", &timeout}};
+    ucall_py_argument_t const arguments[] = {{"timeout_microseconds", &timeout}};
     if (ucall_py_parse_fast("take_batch", values, count, names, 0, 1, arguments, 1) != 0) return NULL;
     size_t microseconds = 0;
-    if (ucall_py_size_from_object(timeout, "timeout_us", &microseconds) != 0 || batch_endpoint_live(self) != 0)
+    if (ucall_py_size_from_object(timeout, "timeout_microseconds", &microseconds) != 0 ||
+        batch_endpoint_live(self) != 0)
         return NULL;
     ucall_outcome_t outcome = {0};
     ucall_server_take_batch_t take = {self->server->handle, &outcome, self->handle, microseconds};
@@ -2342,8 +2488,8 @@ static char const doc_BatchEndpoint_take_batches[] =                            
     "  Error: The server failed, or was released.\n"                                     //
     "\n"                                                                                 //
     "Example:\n"                                                                         //
-    "  >>> drainer = threading.Thread(target=endpoint.take_batches)\n"                   //
-    "  >>> drainer.start()";
+    "  >>> poller = threading.Thread(target=endpoint.take_batches)\n"                    //
+    "  >>> poller.start()";
 
 static PyObject* BatchEndpoint_take_batches(BatchEndpoint* self, [[maybe_unused]] PyObject* unused) {
     if (batch_endpoint_live(self) != 0) return NULL;
@@ -2361,13 +2507,13 @@ static char const doc_BatchEndpoint_statistics[] =                              
     "\n"                                                                                           //
     "Counts the batches the endpoint handed out since registration, and why each fired.\n"         //
     "\n"                                                                                           //
-    "Each counter is read on its own, so a snapshot of an endpoint being drained is not one\n"     //
+    "Each counter is read on its own, so a snapshot of an endpoint being polled is not one\n"      //
     "instant, and batches a stop released count nowhere.\n"                                        //
     "\n"                                                                                           //
     "Returns:\n"                                                                                   //
     "  dict[str, int]: `batches` handed to the handler and the `requests` in them, then the\n"     //
     "    `filled_batches` that reached `max_size`, the `ready_batches` that reached `min_size`,\n" //
-    "    and the `expired_batches` that waited out `max_latency_us`.\n"                            //
+    "    and the `expired_batches` that waited out `max_latency_microseconds`.\n"                  //
     "\n"                                                                                           //
     "Example:\n"                                                                                   //
     "  >>> counters = endpoint.statistics()\n"                                                     //
@@ -2403,19 +2549,19 @@ static PyGetSetDef BatchEndpoint_getset[] = {
     {NULL, NULL, NULL, NULL, NULL},
 };
 
-static char const doc_BatchEndpoint[] =                                                            //
-    "One batching route of a server, drained by one application thread.\n"                         //
-    "\n"                                                                                           //
-    "Requests matching it from every event loop share one queue, which `take_batch` and\n"         //
-    "`take_batches` hand to the handler as a list once enough arrived or the oldest waited long\n" //
-    "enough. The handler runs on the draining thread and replies to each request, in any order.\n" //
-    "\n"                                                                                           //
-    "Example:\n"                                                                                   //
-    "  >>> @server.batch(\"/infer\", min_size=8, max_size=64, max_latency_us=500)\n"               //
-    "  ... def infer(requests: list[ucall.Request]):\n"                                            //
-    "  ...     for request in requests:\n"                                                         //
-    "  ...         request.reply(bytes(request.body))\n"                                           //
-    "  >>> infer in server.batch_endpoints\n"                                                      //
+static char const doc_BatchEndpoint[] =                                                                   //
+    "One batching route of a server, polled by one application thread.\n"                                 //
+    "\n"                                                                                                  //
+    "Requests matching it from every event loop share one queue, which `take_batch` and `take_batches`\n" //
+    "hand to the handler as a list once enough arrived or the oldest waited long enough. The handler\n"   //
+    "runs on its polling owner's thread and replies to each request, in any order.\n"                     //
+    "\n"                                                                                                  //
+    "Example:\n"                                                                                          //
+    "  >>> @server.batch(\"/infer\", min_size=8, max_size=64, max_latency_microseconds=500)\n"            //
+    "  ... def infer(requests: list[ucall.Request]):\n"                                                   //
+    "  ...     for request in requests:\n"                                                                //
+    "  ...         request.reply(bytes(request.body))\n"                                                  //
+    "  >>> infer in server.batch_endpoints\n"                                                             //
     "  True";
 
 PyTypeObject BatchEndpointType = {
@@ -2435,8 +2581,8 @@ PyTypeObject BatchEndpointType = {
 #pragma region Server
 
 static char const doc_Server[] =                                                                     //
-    "Server(*interfaces, backend=Backend.AUTOMATIC, cpu_class=CPUClass.AUTOMATIC, log=None,\n"       //
-    "    metrics=None)\n"                                                                            //
+    "Server(*interfaces, backend=Backend.AUTOMATIC, cpu_class=CPUClass.UNKNOWN, log=None,\n"         //
+    "    log_level=LogLevel.DEBUG, log_format=LogFormat.HUMAN, metrics=None)\n"                      //
     "\n"                                                                                             //
     "An HTTP server over one or more interfaces, polled by threads the application starts.\n"        //
     "\n"                                                                                             //
@@ -2447,9 +2593,11 @@ static char const doc_Server[] =                                                
     "Args:\n"                                                                                        //
     "  *interfaces (Interface): Where to answer; none answers on `DEFAULT_ADDRESS`.\n"               //
     "  backend (Backend, optional): The I/O implementation. Defaults to `Backend.AUTOMATIC`.\n"      //
-    "  cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.AUTOMATIC`.\n"         //
+    "  cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.UNKNOWN`.\n"           //
     "  log (Callable[[LogLevel, str], object], optional): Receives every line the server writes,\n"  //
     "    on whichever thread wrote it, holding the interpreter lock; None writes nothing.\n"         //
+    "  log_level (LogLevel, optional): The least severe line `log` receives. Defaults to DEBUG.\n"   //
+    "  log_format (LogFormat, optional): How lines are spelled. Defaults to `LogFormat.HUMAN`.\n"    //
     "  metrics (Metrics, optional): Where to send StatsD datagrams; None sends none.\n"              //
     "\n"                                                                                             //
     "Raises:\n"                                                                                      //
@@ -2477,27 +2625,9 @@ static PyObject* server_interfaces(PyObject* positional) {
     return interfaces;
 }
 
-/** Hands one log line to the Python callable, from whichever thread wrote it. */
-static void server_log(ucall_log_level_t level, ucall_bytes_view_t line, void* context) {
-    PyGILState_STATE const state = PyGILState_Ensure();
-    // A line may come from a reply inside a deallocation while an exception unwinds,
-    // which must survive it.
-    PyObject* const pending = PyErr_GetRaisedException();
-    PyObject* const callback = (PyObject*)context;
-    PyObject* const severity = ucall_py_enum_to_object(&ucall_py_log_level_enum, (long)level);
-    PyObject* const text = severity ? ucall_py_text_to_object(line) : NULL;
-    PyObject* const result = text ? PyObject_CallFunctionObjArgs(callback, severity, text, NULL) : NULL;
-    if (!result) ucall_py_report_handler_failure(callback);
-    Py_XDECREF(result);
-    Py_XDECREF(text);
-    Py_XDECREF(severity);
-    PyErr_SetRaisedException(pending);
-    PyGILState_Release(state);
-}
-
 /** Views the StatsD settings of @p metrics, a @c Metrics, in @p config; @p tags keeps the tag
  *  views. */
-static int server_metrics(PyObject* metrics, ucall_server_config_t* config, ucall_py_header_lines_t* tags) {
+static int server_metrics(PyObject* metrics, ucall_server_options_t* config, ucall_py_header_lines_t* tags) {
     if (!metrics) return ucall_py_header_lines_from_object(NULL, tags);
     Metrics const* const source = (Metrics const*)metrics;
     if (ucall_py_text_from_object(source->address, "address", &config->metrics_address) != 0 ||
@@ -2507,34 +2637,31 @@ static int server_metrics(PyObject* metrics, ucall_server_config_t* config, ucal
     config->metrics_sample_rate = (float)source->sample_rate;
     config->metrics_tags = tags->views;
     config->metrics_tags_count = tags->count;
-    config->metrics_interval_microseconds = (size_t)source->interval_us;
+    config->metrics_interval_microseconds = (size_t)source->interval_microseconds;
     return 0;
 }
 
 static PyObject* Server_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
-    PyObject *backend = NULL, *cpu_class = NULL, *log = NULL, *metrics = NULL;
-    ucall_py_argument_t const arguments[] = {{"backend", &backend},
-                                             {"cpu_class", &cpu_class},
-                                             {"log", &log},
-                                             {"metrics", &metrics}};
+    PyObject *backend = NULL, *cpu_class = NULL, *log = NULL, *log_level = NULL, *log_format = NULL, *metrics = NULL;
+    ucall_py_argument_t const arguments[] = {
+        {"backend", &backend},     {"cpu_class", &cpu_class},   {"log", &log},
+        {"log_level", &log_level}, {"log_format", &log_format}, {"metrics", &metrics}};
     if (ucall_py_parse_tuple("Server", NULL, keywords, 0, 0, arguments, sizeof(arguments) / sizeof(arguments[0])) != 0)
         return NULL;
-    ucall_server_config_t config = {0};
+    ucall_server_options_t config = {0};
     int backend_value = ucall_io_backend_automatic_k, cpu_class_value = ucall_cpu_class_unknown_k;
     if (ucall_py_enum_from_object(backend, "backend", &ucall_py_backend_enum, &backend_value) != 0 ||
         ucall_py_enum_from_object(cpu_class, "cpu_class", &ucall_py_cpu_class_enum, &cpu_class_value) != 0)
         return NULL;
     config.backend = (ucall_io_backend_t)backend_value;
     config.cpu_class = (ucall_cpu_class_t)cpu_class_value;
+    if (ucall_py_log_from_objects(log, log_level, log_format, &config.log) != 0) return NULL;
     if (log == Py_None) log = NULL;
-    if (log && !PyCallable_Check(log))
-        return PyErr_Format(PyExc_TypeError, "'log' must be callable, got %s", Py_TYPE(log)->tp_name);
     if (metrics == Py_None) metrics = NULL;
     if (metrics && !Py_IS_TYPE(metrics, &MetricsType))
         return PyErr_Format(PyExc_TypeError, "'metrics' must be a ucall.Metrics, got %s", Py_TYPE(metrics)->tp_name);
     ucall_py_header_lines_t tags;
     if (server_metrics(metrics, &config, &tags) != 0) return NULL;
-    if (log) config.log = (ucall_log_t) {server_log, log, ucall_log_format_human_k, ucall_log_level_debug_k};
 
     PyObject* const interfaces = server_interfaces(positional);
     if (!interfaces) {
@@ -2575,10 +2702,11 @@ static PyObject* Server_new(PyTypeObject* type, PyObject* positional, PyObject* 
                                                        : NULL;
         if (!address || (source->device_name && !device)) filled = -1;
         target->address = (ucall_bytes_view_t) {(ucall_byte_t const*)address, (size_t)address_length};
+        if (source->descriptor >= 0) target->listen_descriptor = &source->descriptor;
         target->device_name = (ucall_bytes_view_t) {(ucall_byte_t const*)device, (size_t)device_length};
-        target->security_mode = source->security;
-        if (source->private_key) {
-            memcpy(keys[index], PyBytes_AS_STRING(source->private_key), sizeof(ucall_noise_key_t));
+        target->security = source->security;
+        if (source->noise_private_key) {
+            memcpy(keys[index], PyBytes_AS_STRING(source->noise_private_key), sizeof(ucall_noise_key_t));
             target->noise_private_key = (ucall_noise_key_t const*)&keys[index];
         }
         if (source->peer_authorizer) {
@@ -2718,41 +2846,41 @@ static PyObject* Server_add_endpoint(Server* self, PyObject* const* values, Py_s
     return added ? Py_NewRef(handler) : NULL;
 }
 
-static char const doc_Server_add_batch_endpoint[] =                                                  //
-    "add_batch_endpoint(path, verb, handler, /, min_size=0, max_size=0, max_latency_us=0)\n"         //
-    "    -> BatchEndpoint\n"                                                                         //
-    "\n"                                                                                             //
-    "Queues matching requests from every event loop for `handler(requests)`, called in batches.\n"   //
-    "\n"                                                                                             //
-    "A batch is due once `min_size` requests arrived, `max_size` are queued, or the oldest waited\n" //
-    "`max_latency_us`. The handler runs on the thread draining the returned endpoint and replies\n"  //
-    "to each request.\n"                                                                             //
-    "\n"                                                                                             //
-    "Args:\n"                                                                                        //
-    "  path (str): A URI template such as \"/infer\".\n"                                             //
-    "  verb (Verb): The method to answer; `Verb.ANY` answers every one.\n"                           //
-    "  handler (Callable[[list[Request]], object]): The function handed each batch.\n"               //
-    "  min_size (int, optional): Requests that make a batch due at once; 0 means 1.\n"               //
-    "  max_size (int, optional): Requests one batch holds at most; 0 means 32.\n"                    //
-    "  max_latency_us (int, optional): The longest the oldest request waits for a batch to\n"        //
-    "    fill, in microseconds; 0 means 10 ms.\n"                                                    //
-    "\n"                                                                                             //
-    "Returns:\n"                                                                                     //
-    "  BatchEndpoint: The endpoint to drain.\n"                                                      //
-    "\n"                                                                                             //
-    "Raises:\n"                                                                                      //
-    "  Error: A duplicate route or an invalid template.\n"                                           //
-    "\n"                                                                                             //
-    "Example:\n"                                                                                     //
-    "  >>> endpoint = server.add_batch_endpoint(\"/sizes\", \"POST\", lambda requests: None, 4)\n"   //
-    "  >>> endpoint in server.batch_endpoints\n"                                                     //
+static char const doc_Server_add_batch_endpoint[] =                                                     //
+    "add_batch_endpoint(path, verb, handler, /, min_size=0, max_size=0, max_latency_microseconds=0)\n"  //
+    "    -> BatchEndpoint\n"                                                                            //
+    "\n"                                                                                                //
+    "Queues matching requests from every event loop for `handler(requests)`, called in batches.\n"      //
+    "\n"                                                                                                //
+    "A batch is due once `min_size` requests arrived, `max_size` are queued, or the oldest waited\n"    //
+    "`max_latency_microseconds`. The handler runs on the thread polling the returned endpoint and\n"    //
+    "replies to each request.\n"                                                                        //
+    "\n"                                                                                                //
+    "Args:\n"                                                                                           //
+    "  path (str): A URI template such as \"/infer\".\n"                                                //
+    "  verb (Verb): The method to answer; `Verb.ANY` answers every one.\n"                              //
+    "  handler (Callable[[list[Request]], object]): The function handed each batch.\n"                  //
+    "  min_size (int, optional): Requests that make a batch due at once; 0 means 1.\n"                  //
+    "  max_size (int, optional): Requests one batch holds at most; 0 means 32.\n"                       //
+    "  max_latency_microseconds (int, optional): The longest the oldest request waits for a batch to\n" //
+    "    fill, in microseconds; 0 means 10 ms.\n"                                                       //
+    "\n"                                                                                                //
+    "Returns:\n"                                                                                        //
+    "  BatchEndpoint: The endpoint to drain.\n"                                                         //
+    "\n"                                                                                                //
+    "Raises:\n"                                                                                         //
+    "  Error: A duplicate route or an invalid template.\n"                                              //
+    "\n"                                                                                                //
+    "Example:\n"                                                                                        //
+    "  >>> endpoint = server.add_batch_endpoint(\"/sizes\", \"POST\", lambda requests: None, 4)\n"      //
+    "  >>> endpoint in server.batch_endpoints\n"                                                        //
     "  True";
 
 static PyObject* Server_add_batch_endpoint(Server* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
     PyObject *path = NULL, *verb = NULL, *handler = NULL, *min_size = NULL, *max_size = NULL, *max_latency = NULL;
     ucall_py_argument_t const arguments[] = {{"path", &path},         {"verb", &verb},
                                              {"handler", &handler},   {"min_size", &min_size},
-                                             {"max_size", &max_size}, {"max_latency_us", &max_latency}};
+                                             {"max_size", &max_size}, {"max_latency_microseconds", &max_latency}};
     if (ucall_py_parse_fast("add_batch_endpoint", values, count, names, 3, 6, arguments, 6) != 0) return NULL;
     ucall_bytes_view_t template_view;
     int verb_value = 0;
@@ -2761,7 +2889,7 @@ static PyObject* Server_add_batch_endpoint(Server* self, PyObject* const* values
         ucall_py_enum_from_object(verb, "verb", &ucall_py_verb_enum, &verb_value) != 0 ||
         ucall_py_size_from_object(min_size, "min_size", &minimum) != 0 ||
         ucall_py_size_from_object(max_size, "max_size", &maximum) != 0 ||
-        ucall_py_size_from_object(max_latency, "max_latency_us", &latency) != 0)
+        ucall_py_size_from_object(max_latency, "max_latency_microseconds", &latency) != 0)
         return NULL;
     if (!PyCallable_Check(handler))
         return PyErr_Format(PyExc_TypeError, "'handler' must be callable, got %s", Py_TYPE(handler)->tp_name);
@@ -2953,29 +3081,29 @@ static PyObject* Server_patch(Server* self, PyObject* const* values, Py_ssize_t 
     return server_route_verb(self, "patch", ucall_verb_patch_k, values, count, names);
 }
 
-static char const doc_Server_batch[] =                                                           //
-    "batch(path, verb=Verb.POST, *, min_size=0, max_size=0, max_latency_us=0)\n"                 //
-    "    -> Callable[[Callable[[list[Request]], object]], BatchEndpoint]\n"                      //
-    "\n"                                                                                         //
-    "Registers the decorated `handler(requests)` as a batch endpoint, replacing it with that.\n" //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  path (str): A URI template such as \"/infer\".\n"                                         //
-    "  verb (Verb, optional): The method to answer. Defaults to `Verb.POST`.\n"                  //
-    "  min_size (int, optional): Requests that make a batch due at once; 0 means 1.\n"           //
-    "  max_size (int, optional): Requests one batch holds at most; 0 means 32.\n"                //
-    "  max_latency_us (int, optional): The longest the oldest request waits, in microseconds;\n" //
-    "    0 means 10 ms.\n"                                                                       //
-    "\n"                                                                                         //
-    "Returns:\n"                                                                                 //
-    "  Callable: A decorator calling `add_batch_endpoint` and returning its `BatchEndpoint`.\n"  //
-    "\n"                                                                                         //
-    "Example:\n"                                                                                 //
-    "  >>> @server.batch(\"/reverse\", min_size=4, max_size=4)\n"                                //
-    "  ... def reverse(requests: list[ucall.Request]):\n"                                        //
-    "  ...     for request in reversed(requests):\n"                                             //
-    "  ...         request.reply(request.body)\n"                                                //
-    "  >>> type(reverse).__name__\n"                                                             //
+static char const doc_Server_batch[] =                                                                     //
+    "batch(path, verb=Verb.POST, *, min_size=0, max_size=0, max_latency_microseconds=0)\n"                 //
+    "    -> Callable[[Callable[[list[Request]], object]], BatchEndpoint]\n"                                //
+    "\n"                                                                                                   //
+    "Registers the decorated `handler(requests)` as a batch endpoint, replacing it with that.\n"           //
+    "\n"                                                                                                   //
+    "Args:\n"                                                                                              //
+    "  path (str): A URI template such as \"/infer\".\n"                                                   //
+    "  verb (Verb, optional): The method to answer. Defaults to `Verb.POST`.\n"                            //
+    "  min_size (int, optional): Requests that make a batch due at once; 0 means 1.\n"                     //
+    "  max_size (int, optional): Requests one batch holds at most; 0 means 32.\n"                          //
+    "  max_latency_microseconds (int, optional): The longest the oldest request waits, in microseconds;\n" //
+    "    0 means 10 ms.\n"                                                                                 //
+    "\n"                                                                                                   //
+    "Returns:\n"                                                                                           //
+    "  Callable: A decorator calling `add_batch_endpoint` and returning its `BatchEndpoint`.\n"            //
+    "\n"                                                                                                   //
+    "Example:\n"                                                                                           //
+    "  >>> @server.batch(\"/reverse\", min_size=4, max_size=4)\n"                                          //
+    "  ... def reverse(requests: list[ucall.Request]):\n"                                                  //
+    "  ...     for request in reversed(requests):\n"                                                       //
+    "  ...         request.reply(request.body)\n"                                                          //
+    "  >>> type(reverse).__name__\n"                                                                       //
     "  'BatchEndpoint'";
 
 static PyObject* Server_batch(Server* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
@@ -2984,7 +3112,7 @@ static PyObject* Server_batch(Server* self, PyObject* const* values, Py_ssize_t 
                                              {"verb", &verb},
                                              {"min_size", &min_size},
                                              {"max_size", &max_size},
-                                             {"max_latency_us", &max_latency}};
+                                             {"max_latency_microseconds", &max_latency}};
     if (ucall_py_parse_fast("batch", values, count, names, 1, 2, arguments, 5) != 0) return NULL;
     ucall_bytes_view_t template_view;
     int verb_value = ucall_verb_post_k;
@@ -3010,39 +3138,43 @@ static size_t event_loop_index(PyObject* object, int* failed) {
     return index;
 }
 
-static char const doc_Server_take_call[] =                                                      //
-    "take_call(event_loop=0, timeout_us=0) -> None\n"                                           //
-    "\n"                                                                                        //
-    "Advances one event loop and runs its ready handlers on this thread.\n"                     //
-    "\n"                                                                                        //
-    "Each loop has one polling owner, and handlers run inside the call, so a slow one delays\n" //
-    "its return past `timeout_us`.\n"                                                           //
-    "\n"                                                                                        //
-    "Args:\n"                                                                                   //
-    "  event_loop (int, optional): The loop to advance, below `event_loops`. Defaults to 0.\n"  //
-    "  timeout_us (int, optional): The longest wait for I/O in microseconds; 0 polls once.\n"   //
-    "\n"                                                                                        //
-    "Raises:\n"                                                                                 //
-    "  Error: An `event_loop` past the last one, or an I/O failure.\n"                          //
-    "\n"                                                                                        //
-    "Example:\n"                                                                                //
-    "  >>> server.take_call(0, timeout_us=1_000)";
+static char const doc_Server_take_call[] =                                                              //
+    "take_call(event_loop=0, timeout_microseconds=0) -> bool\n"                                         //
+    "\n"                                                                                                //
+    "Advances one event loop and runs its ready handlers on this thread.\n"                             //
+    "\n"                                                                                                //
+    "Each loop has one polling owner, and handlers run inside the call, so a slow one delays\n"         //
+    "its return past `timeout_microseconds`.\n"                                                         //
+    "\n"                                                                                                //
+    "Args:\n"                                                                                           //
+    "  event_loop (int, optional): The loop to advance, below `event_loops`. Defaults to 0.\n"          //
+    "  timeout_microseconds (int, optional): The longest wait for I/O in microseconds; 0 polls once.\n" //
+    "\n"                                                                                                //
+    "Returns:\n"                                                                                        //
+    "  bool: False once the loop retired after `stop()`, with nothing left to take.\n"                  //
+    "\n"                                                                                                //
+    "Raises:\n"                                                                                         //
+    "  Error: An `event_loop` past the last one, or an I/O failure.\n"                                  //
+    "\n"                                                                                                //
+    "Example:\n"                                                                                        //
+    "  >>> while server.take_call(0, timeout_microseconds=1_000): pass";
 
 static PyObject* Server_take_call(Server* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
     PyObject *loop = NULL, *timeout = NULL;
-    ucall_py_argument_t const arguments[] = {{"event_loop", &loop}, {"timeout_us", &timeout}};
+    ucall_py_argument_t const arguments[] = {{"event_loop", &loop}, {"timeout_microseconds", &timeout}};
     if (ucall_py_parse_fast("take_call", values, count, names, 0, 2, arguments, 2) != 0) return NULL;
     int failed = 0;
     size_t microseconds = 0;
     size_t const index = event_loop_index(loop, &failed);
-    if (failed || ucall_py_size_from_object(timeout, "timeout_us", &microseconds) != 0) return NULL;
+    if (failed || ucall_py_size_from_object(timeout, "timeout_microseconds", &microseconds) != 0) return NULL;
     ucall_outcome_t outcome = {0};
     ucall_server_take_call_t take = {self->handle, &outcome, index, microseconds};
     Py_BEGIN_ALLOW_THREADS;
     ucall_server_take_call(&take);
     Py_END_ALLOW_THREADS;
+    if (outcome.status == ucall_status_connection_closed_k) Py_RETURN_FALSE;
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
-    Py_RETURN_NONE;
+    Py_RETURN_TRUE;
 }
 
 static char const doc_Server_take_calls[] =                                                    //
@@ -3094,7 +3226,8 @@ static char const doc_Server_run[] =                                            
     "Serves a server of one event loop and no batch endpoints on the calling thread.\n"            //
     "\n"                                                                                           //
     "It returns after `stop()` or `KeyboardInterrupt`, polling in slices of 100 ms and checking\n" //
-    "for signals between them, and once stopped it lets the loop finish the requests in flight.\n" //
+    "for signals between them, and once stopped it lets the loop finish the requests in flight;\n" //
+    "a second `KeyboardInterrupt` cuts them.\n"                                                    //
     "\n"                                                                                           //
     "Raises:\n"                                                                                    //
     "  RuntimeError: The server has more than one event loop or any batch endpoint.\n"             //
@@ -3107,6 +3240,22 @@ static char const doc_Server_run[] =                                            
     "  >>> server.stop()\n"                                                                        //
     "  >>> runner.join()";
 
+/** Whether @p self still serves, read under its section since @c stop may run on any thread. */
+static int server_serving(Server* self) {
+    ucall_py_section_t section;
+    ucall_py_section_begin(&section, (PyObject*)self);
+    int const serving = self->stage == server_serving_k;
+    ucall_py_section_end(&section);
+    return serving;
+}
+
+static void server_stop_serving(Server* self) {
+    ucall_py_section_t section;
+    ucall_py_section_begin(&section, (PyObject*)self);
+    self->stage = server_stopping_k;
+    ucall_py_section_end(&section);
+}
+
 static PyObject* Server_run(Server* self, [[maybe_unused]] PyObject* unused) {
     Py_ssize_t const batches = server_batch_endpoints_count(self);
     if (self->event_loops != 1 || batches)
@@ -3117,22 +3266,32 @@ static PyObject* Server_run(Server* self, [[maybe_unused]] PyObject* unused) {
                             self->event_loops, batches);
     ucall_outcome_t outcome = {0};
     int failed = 0;
-    while (!failed && self->stage == server_serving_k) {
-        ucall_server_take_call_t take = {self->handle, &outcome, 0, ucall_py_interrupt_period_us_k};
+    while (!failed && server_serving(self) && outcome.status == ucall_status_success_k) {
+        ucall_server_take_call_t take = {self->handle, &outcome, 0, ucall_py_interrupt_period_microseconds_k};
         Py_BEGIN_ALLOW_THREADS;
         ucall_server_take_call(&take);
         Py_END_ALLOW_THREADS;
-        failed = ucall_py_raise_outcome(&outcome) != 0 || PyErr_CheckSignals() != 0;
+        failed = (outcome.status != ucall_status_connection_closed_k && ucall_py_raise_outcome(&outcome) != 0) ||
+                 PyErr_CheckSignals() != 0;
     }
     // Handlers draining below run on this thread, so the exception that ended serving waits aside.
-    PyObject* const interrupted = PyErr_GetRaisedException();
-    self->stage = server_stopping_k;
+    PyObject* interrupted = PyErr_GetRaisedException();
+    server_stop_serving(self);
     ucall_server_stop(self->handle);
     ucall_outcome_t drained = {0};
-    ucall_server_take_calls_t take = {self->handle, &drained, 0};
-    Py_BEGIN_ALLOW_THREADS;
-    ucall_server_take_calls(&take);
-    Py_END_ALLOW_THREADS;
+    // Slices keep Ctrl+C live through the drain, and a second one cuts what it still waits for.
+    while (drained.status == ucall_status_success_k) {
+        ucall_server_take_call_t take = {self->handle, &drained, 0, ucall_py_interrupt_period_microseconds_k};
+        Py_BEGIN_ALLOW_THREADS;
+        ucall_server_take_call(&take);
+        Py_END_ALLOW_THREADS;
+        if (PyErr_CheckSignals() == 0) continue;
+        PyObject* const again = PyErr_GetRaisedException();
+        if (interrupted) Py_DECREF(again);
+        else interrupted = again;
+        ucall_server_stop(self->handle);
+    }
+    if (drained.status == ucall_status_connection_closed_k) drained.status = ucall_status_success_k;
     if (interrupted) {
         PyErr_SetRaisedException(interrupted);
         return NULL;
@@ -3141,19 +3300,23 @@ static PyObject* Server_run(Server* self, [[maybe_unused]] PyObject* unused) {
     Py_RETURN_NONE;
 }
 
-static char const doc_Server_stop[] =                                                      //
-    "stop() -> None\n"                                                                     //
-    "\n"                                                                                   //
-    "Asks the server to stop, waking every polling and draining caller to return.\n"       //
-    "\n"                                                                                   //
-    "Safe from any thread and from a handler. Join the polling threads before releasing\n" //
-    "the server.\n"                                                                        //
-    "\n"                                                                                   //
-    "Example:\n"                                                                           //
+static char const doc_Server_stop[] =                                                                  //
+    "stop() -> None\n"                                                                                 //
+    "\n"                                                                                               //
+    "Asks the server to stop, waking every polling caller, of loops and batch endpoints, to return.\n" //
+    "\n"                                                                                               //
+    "The first call drains: no new connections, idle ones close, and the requests\n"                   //
+    "already held are answered before their connections close. A second call cuts the\n"               //
+    "replies still in flight.\n"                                                                       //
+    "\n"                                                                                               //
+    "Safe from any thread and from a handler. Join the polling threads before releasing\n"             //
+    "the server.\n"                                                                                    //
+    "\n"                                                                                               //
+    "Example:\n"                                                                                       //
     "  >>> server.stop()";
 
 static PyObject* Server_stop(Server* self, [[maybe_unused]] PyObject* unused) {
-    self->stage = server_stopping_k;
+    server_stop_serving(self);
     ucall_server_stop(self->handle);
     Py_RETURN_NONE;
 }
@@ -3287,9 +3450,12 @@ static PyGetSetDef Server_getset[] = {
     {"backend", (getter)Server_get_backend, NULL, "The I/O implementation initialization chose.", NULL},
     {"cpu_class", (getter)Server_get_cpu_class, NULL, "The CPU kernels initialization chose.", NULL},
     {"addresses", (getter)Server_get_addresses, NULL, "The resolved \"host:port\" of each interface.", NULL},
-    {"batch_endpoints", (getter)Server_get_batch_endpoints, NULL, "Batch endpoints, each needing a drainer.", NULL},
+    {"batch_endpoints", (getter)Server_get_batch_endpoints, NULL, "Batch endpoints, each needing a polling owner.",
+     NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
+
+ucall_server_t ucall_py_server_handle(PyObject* server) { return ((Server*)server)->handle; }
 
 PyTypeObject ServerType = {
     PyVarObject_HEAD_INIT(NULL, 0).tp_name = "ucall.Server",

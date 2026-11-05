@@ -29,6 +29,11 @@ jobs:
     needs: hooks
     uses: ./.github/workflows/test-c.yml
 
+  test_rust:
+    name: Test Rust
+    needs: hooks
+    uses: ./.github/workflows/test-rust.yml
+
   test_python:
     name: Test Python
     needs: hooks

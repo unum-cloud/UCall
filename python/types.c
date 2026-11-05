@@ -33,6 +33,11 @@ static char const* spell_log_level(int value) {
     return names[value];
 }
 
+static char const* spell_log_format(int value) {
+    static char const* const names[] = {"human", "json"};
+    return names[value];
+}
+
 static char const doc_Status[] =                                                  //
     "Status(value)\n"                                                             //
     "\n"                                                                          //
@@ -51,13 +56,13 @@ static char const doc_Backend[] =                                               
     "  >>> ucall.Server(ucall.Interface(\"127.0.0.1:0\"), backend=ucall.Backend.POSIX).backend\n"  //
     "  <Backend.POSIX: 1>";
 
-static char const doc_CPUClass[] =                                                                      //
-    "CPUClass(value)\n"                                                                                 //
-    "\n"                                                                                                //
-    "A bundle of CPU kernels for `Server` and `Client`; `AUTOMATIC` picks the initializing thread's.\n" //
-    "\n"                                                                                                //
-    "Example:\n"                                                                                        //
-    "  >>> ucall.Server(ucall.Interface(\"127.0.0.1:0\"), cpu_class=\"serial\").cpu_class\n"            //
+static char const doc_CPUClass[] =                                                                    //
+    "CPUClass(value)\n"                                                                               //
+    "\n"                                                                                              //
+    "A bundle of CPU kernels for `Server` and `Client`; `UNKNOWN` picks the initializing thread's.\n" //
+    "\n"                                                                                              //
+    "Example:\n"                                                                                      //
+    "  >>> ucall.Server(ucall.Interface(\"127.0.0.1:0\"), cpu_class=\"serial\").cpu_class\n"          //
     "  <CPUClass.SERIAL: 1>";
 
 static char const doc_Security[] =                                                             //
@@ -89,6 +94,15 @@ static char const doc_BodyDelivery[] =                                          
     "  ... def upload(request: ucall.Request):\n"                                               //
     "  ...     workers.submit(store, request.detach())";
 
+static char const doc_LogFormat[] =                                                         //
+    "LogFormat(value)\n"                                                                    //
+    "\n"                                                                                    //
+    "How the library spells a log line: as human-readable fields, or as one JSON object.\n" //
+    "\n"                                                                                    //
+    "Example:\n"                                                                            //
+    "  >>> ucall.LogFormat.JSON\n"                                                          //
+    "  <LogFormat.JSON: 1>";
+
 static char const doc_LogLevel[] =                                                           //
     "LogLevel(value)\n"                                                                      //
     "\n"                                                                                     //
@@ -108,7 +122,7 @@ ucall_py_enum_mirror_t ucall_py_cpu_class_enum = {
     "CPUClass", doc_CPUClass, ucall_cpu_class_unknown_k, ucall_cpu_class_monoversioned_k, spell_cpu_class, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_security_enum = {
-    "Security", doc_Security, ucall_security_mode_none_k, ucall_security_mode_noise_kk_k, spell_security, NULL,
+    "Security", doc_Security, ucall_security_none_k, ucall_security_noise_kk_k, spell_security, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_verb_enum = {
     "Verb", doc_Verb, ucall_verb_unknown_k, ucall_verb_any_k, spell_verb, NULL,
@@ -123,6 +137,9 @@ ucall_py_enum_mirror_t ucall_py_body_delivery_enum = {
 };
 ucall_py_enum_mirror_t ucall_py_log_level_enum = {
     "LogLevel", doc_LogLevel, ucall_log_level_debug_k, ucall_log_level_fatal_k, spell_log_level, NULL,
+};
+ucall_py_enum_mirror_t ucall_py_log_format_enum = {
+    "LogFormat", doc_LogFormat, ucall_log_format_human_k, ucall_log_format_json_k, spell_log_format, NULL,
 };
 
 #pragma endregion Enums

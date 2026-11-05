@@ -2,12 +2,14 @@
  *  @file c/test.c
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief A C caller of the linked library's name, status, outcome, and Noise key functions.
+ *  @brief A C caller of the linked library's name, version, status, outcome, and Noise key calls.
  */
+#include <stdio.h>
+#include <string.h>
+
 #undef NDEBUG
 #include <assert.h>
 #include <stdint.h>
-#include <string.h>
 
 #include "ucall/ucall.h"
 
@@ -27,11 +29,18 @@ int main(void) {
     assert(ucall_io_backend_from_name(backend) == ucall_io_backend_linux_epollaio_k);
     backend.length = 5;
     assert(ucall_io_backend_from_name(backend) == ucall_io_backend_automatic_k);
-    ucall_bytes_view_t cpu_class = {(ucall_byte_t const*)"apple-m2", 8};
-    assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_apple_m2_k);
+    ucall_bytes_view_t cpu_class = {(ucall_byte_t const*)"aws-g2", 6};
+    assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_aws_g2_k);
     cpu_class.data = NULL;
     cpu_class.length = 0;
     assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_unknown_k);
+
+    int major = -1, minor = -1, patch = -1;
+    ucall_version(&major, &minor, &patch);
+    assert(major == UCALL_VERSION_MAJOR && minor == UCALL_VERSION_MINOR && patch == UCALL_VERSION_PATCH);
+    char expected[32];
+    snprintf(expected, sizeof(expected), "%d.%d.%d", major, minor, patch);
+    assert(strncmp(ucall_version_name(), expected, strlen(expected)) == 0);
 
     ucall_outcome_t outcome = {ucall_status_success_k, NULL};
     assert(ucall_outcome_status(&outcome) == ucall_status_success_k);

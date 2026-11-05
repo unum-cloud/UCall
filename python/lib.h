@@ -22,7 +22,7 @@
  *  polling. An exception escaping a handler goes to @c sys.unraisablehook, and every request it
  *  left unanswered gets a 500, so one faulty handler never stops a loop. A call that blocks for
  *  the application, @c run and the blocking client calls, waits in slices of
- *  @c ucall_py_interrupt_period_us_k and checks for signals between them, so Ctrl+C works.
+ *  @c ucall_py_interrupt_period_microseconds_k, checking for signals between them for Ctrl+C.
  *
  *  @section python_handlers Typed Handlers
  *
@@ -74,6 +74,41 @@
 
 #include "ucall/ucall.h"
 
+#pragma region Free Threading
+
+/** Serializes threads on one object where no interpreter lock does; the lock does it otherwise. */
+typedef struct ucall_py_section_t {
+#ifdef Py_GIL_DISABLED
+    PyCriticalSection section;
+#else
+    char unused;
+#endif
+} ucall_py_section_t;
+
+static inline void ucall_py_section_begin([[maybe_unused]] ucall_py_section_t* section,
+                                          [[maybe_unused]] PyObject* object) {
+#ifdef Py_GIL_DISABLED
+    PyCriticalSection_Begin(&section->section, object);
+#endif
+}
+
+static inline void ucall_py_section_end([[maybe_unused]] ucall_py_section_t* section) {
+#ifdef Py_GIL_DISABLED
+    PyCriticalSection_End(&section->section);
+#endif
+}
+
+/** Tells a free-threaded interpreter that @p module runs without its lock; a no-op otherwise. */
+static inline int ucall_py_module_without_lock([[maybe_unused]] PyObject* module) {
+#ifdef Py_GIL_DISABLED
+    return PyUnstable_Module_SetGIL(module, Py_MOD_GIL_NOT_USED);
+#else
+    return 0;
+#endif
+}
+
+#pragma endregion Free Threading
+
 #pragma region Arguments
 
 /** Compile-time constants of the binding layer. */
@@ -83,7 +118,7 @@ enum {
     ucall_py_method_flags_k = METH_FASTCALL | METH_KEYWORDS,
 
     /** The longest a blocking call stays in C, where Python cannot raise @c KeyboardInterrupt. */
-    ucall_py_interrupt_period_us_k = 100000,
+    ucall_py_interrupt_period_microseconds_k = 100000,
 };
 
 /** One argument a verb takes and the slot its borrowed value lands in; a skipped one stays NULL. */
@@ -193,6 +228,9 @@ extern ucall_py_enum_mirror_t ucall_py_body_delivery_enum;
 /** The severities of log lines, as @c ucall.LogLevel. */
 extern ucall_py_enum_mirror_t ucall_py_log_level_enum;
 
+/** The spellings of log lines, as @c ucall.LogFormat. */
+extern ucall_py_enum_mirror_t ucall_py_log_format_enum;
+
 /**
  *  @brief Builds every enum mirror as an `enum.IntEnum` and adds it to @p module.
  *  @return 0 on success, or -1 with an exception set.
@@ -213,6 +251,16 @@ int ucall_py_raise_outcome(ucall_outcome_t const* outcome);
 
 /** Reports a handler's exception without stopping the poller, re-arming Ctrl+C for Python. */
 void ucall_py_report_handler_failure(PyObject* handler);
+
+/** Hands one log line to the Python callable @p context, as a @c ucall_log_t callback, from
+ *  whichever thread wrote it. */
+void ucall_py_log(ucall_log_level_t level, ucall_bytes_view_t line, void* context);
+
+/**
+ *  @brief Reads the @c log, @c log_level and @c log_format arguments into @p log.
+ *  @return 0 on success, or -1 with an exception set.
+ */
+int ucall_py_log_from_objects(PyObject* callback, PyObject* level, PyObject* format, ucall_log_t* log);
 
 /** Calls a Python `peer_authorizer(static_key)`, truthy to admit, from the handshaking thread. */
 ucall_status_t ucall_py_authorize_peer(ucall_noise_key_t const* peer_static_key, void* context);
@@ -237,6 +285,9 @@ extern PyTypeObject InterfaceType;
 
 /** `ucall.Server`, polled by application threads. */
 extern PyTypeObject ServerType;
+
+/** The C handle of @p server, a @c ucall.Server. */
+ucall_server_t ucall_py_server_handle(PyObject* server);
 
 /** `ucall.Request`, one received request until a reply consumes it. */
 extern PyTypeObject RequestType;
@@ -269,7 +320,7 @@ extern PyTypeObject ReplyStreamType;
 /** @c ucall.Metrics, where a server sends StatsD datagrams. */
 extern PyTypeObject MetricsType;
 
-/** `ucall.BatchEndpoint`, one batching route and its draining verbs. */
+/** @c ucall.BatchEndpoint, one batching route and its polling verbs. */
 extern PyTypeObject BatchEndpointType;
 
 /** The context of one plain route: its handler and the parameter table resolved at registration. */

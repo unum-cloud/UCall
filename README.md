@@ -22,11 +22,12 @@
 
 ---
 
-UCall is a ¹ performance-oriented, ² portable, and ³ compact HTTP/RPC framework, with a ⁴ twist!
+UCall is a ¹ performance-oriented, ² portable, and ³ compact HTTP framework, with a ⁴ twist!
 How ¹ fast?
 About 291,000 1 KiB echoes per second from one server thread natively, about 278,000 through its Rust bindings and about 268,000 through its Python bindings, against about 83,000 for gRPC on tonic, 21,000 for FastAPI and 15,000 for Python gRPC, in the [framework comparison](bench/README.md#framework-comparison).
 How ² portable?
-A C ABI fronts a C++20 core with POSIX, Linux epoll with AIO and io_uring, macOS/FreeBSD kqueue, and Windows IOCP backends.
+A C ABI fronts a C++20 core with POSIX, Linux epoll with AIO and io_uring, macOS and FreeBSD kqueue, and Windows IOCP backends.
+IOCP runs one event loop per interface.
 Python and Rust bindings wrap that ABI directly, with the same caller-owned polling threads.
 How ³ compact?
 HTTP framing, routing, and transport state live in templated headers, with one native library exporting the C interface.
@@ -96,6 +97,119 @@ server.run()
 </tr>
 </table>
 
+## Build From Source
+
+A source build needs CMake 3.28 and a C++20 compiler, and pulls StringZilla, ForkUnion and SmashTable as submodules:
+
+```sh
+git clone --recursive https://github.com/unum-cloud/UCall.git && cd UCall
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
+cmake --build build_release --parallel
+cmake --install build_release --prefix ~/.local
+```
+
+The install holds the C headers, `libucall_static`, `libucall_shared`, a `ucall.pc`, and a CMake package naming `ucall::static` and `ucall::shared`, which a C program links like any C library.
+It also holds `ucall`, a command-line client for one HTTP or Noise call, as in `ucall -d @body.json http://127.0.0.1:8080/echo`.
+`-H` adds a header line, `-d @-` reads the body from standard input, `-i` prints the status line and every response field before the body, and `--server-key` pins the server for an `http+noise://` URL.
+`ucall keygen FILE` writes a fresh Noise private key and prints its public half, and the exit code is 0 for a 2xx answer and the status's hundreds digit otherwise.
+Leaving `UCALL_BUILD_SHARED` off installs the archive without the shared library and its `ucall.pc`.
+`pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](CONTRIBUTING.md) lists the presets, tests and cross builds.
+
+## C Quickstart
+
+One callback reads a request's body and replies with it, and `main` initializes the server, registers the route, and polls its one loop on the calling thread.
+The listing is [`examples/hello.c`](examples/hello.c), which CI links against both installed libraries:
+
+```c
+#include <stdio.h>
+
+#include <ucall/ucall.h>
+
+static void echo(ucall_received_http_request_t request, void* context) {
+    ucall_server_t server = *(ucall_server_t*)context;
+    ucall_outcome_t outcome = {0};
+    ucall_bytes_view_t body = {0};
+    ucall_server_request_body_t read = {.server = server, .outcome = &outcome, .request = request, .body = &body};
+    ucall_server_request_body(&read);
+    ucall_server_reply_content_t reply = {.server = server, .outcome = &outcome, .request = request, .body = body};
+    ucall_server_reply_content(&reply);
+}
+
+int main(void) {
+    ucall_network_interface_t listener = {
+        .address = {(ucall_byte_t const*)"127.0.0.1:8080", 14},
+        .max_concurrent_connections = 1024,
+    };
+    ucall_server_options_t options = {.interfaces = &listener, .interfaces_count = 1};
+    ucall_server_t server = NULL;
+    ucall_outcome_t outcome = {0};
+    ucall_server_init_t init = {.server = &server, .outcome = &outcome, .options = &options};
+    ucall_server_init(&init);
+    if (outcome.status != ucall_status_success_k) {
+        fprintf(stderr, "%s\n", outcome.message);
+        return 1;
+    }
+
+    ucall_server_add_http_endpoint_t route = {.server = server,
+                                              .outcome = &outcome,
+                                              .uri_template = {(ucall_byte_t const*)"/echo", 5},
+                                              .verb = ucall_verb_post_k,
+                                              .callback = echo,
+                                              .context = &server};
+    ucall_server_add_http_endpoint(&route);
+    ucall_server_take_calls_t poll = {.server = server, .outcome = &outcome};
+    ucall_server_take_calls(&poll);
+    ucall_server_free(server);
+    return outcome.status == ucall_status_success_k ? 0 : 1;
+}
+```
+
+```sh
+export PKG_CONFIG_PATH=~/.local/lib/pkgconfig LD_LIBRARY_PATH=~/.local/lib
+cc examples/hello.c $(pkg-config --cflags --libs ucall) -o hello && ./hello &
+curl -X POST --data 'Hello, UCall!' http://127.0.0.1:8080/echo
+```
+
+## Rust Quickstart
+
+The crate wraps the same ABI, with closures for handlers and threads the application owns for polling:
+
+```rust
+use std::time::Duration;
+use ucall::*;
+
+let interface = Interface::new("127.0.0.1:0").pipelined_requests(16);
+let mut server = Server::new(&[interface])?;
+server.post("/sum", |request: Request| {
+    let sum: u64 = request.body().iter().map(|&byte| u64::from(byte)).sum();
+    let _ = request.reply(HTTPStatus::OK, &[], sum.to_string().as_bytes());
+})?;
+let batching = Batching { min_size: 8, max_size: 64, max_latency: Duration::from_micros(500) };
+let infer = server.batch("/infer", Verb::Post, batching, |batch: Batch| {
+    for request in batch {
+        let _ = request.reply(HTTPStatus::OK, &[], b"scored");
+    }
+})?;
+let address = server.address(0).unwrap().to_owned();
+
+let mut client = Client::new(ClientOptions { connections: 4, ..Default::default() })?;
+std::thread::scope(|scope| {
+    for event_loop in 0..server.event_loops() {
+        let server = &server;
+        scope.spawn(move || server.take_calls(event_loop));
+    }
+    scope.spawn(|| infer.take_batches());
+    let sum = client.post(format!("http://{address}/sum"), vec![1, 2, 3]);
+    let scored = client.post(format!("http://{address}/infer"), b"pixels".as_slice());
+    server.stop();
+    assert_eq!(sum?.body(), b"6");
+    assert_eq!(scored?.body(), b"scored");
+    Ok::<(), Error>(())
+})?;
+```
+
+The [Rust guide](rust/README.md) covers streaming, files, Noise and metrics.
+
 ## 📈 Performance Metrics
 
 The native [benchmark driver](bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
@@ -123,7 +237,7 @@ For heavy operations, there is no secret pill, but there is a common "latency hi
 Batch endpoints group independent requests by their configured size and latency budgets.
 Endpoint callbacks run synchronously on the application polling caller; a deadline cannot preempt a callback.
 Registering a batch endpoint returns its `ucall_http_batch_endpoint_t` handle.
-Each batch endpoint has one queue fed by every event loop and one application thread draining that handle through `ucall_server_take_batches()`, so its callback never runs on an event loop.
+Each batch endpoint has one queue fed by every event loop and one application thread polling that handle through `ucall_server_take_batches()`, so its callback never runs on an event loop.
 With `max_pipelined_requests` on an interface and `max_pipelined_calls` on a client, one connection carries several requests at once, so a single client can fill a batch; replies still leave in request order.
 
 ### Caller-Owned Polling
@@ -136,13 +250,24 @@ Register server routes before polling.
 `ucall_server_take_call()` advances one loop with a bounded wait; a zero timeout performs one nonblocking progress round.
 `ucall_server_take_calls()` drives that loop continuously until shutdown.
 Each loop has one application owner, and `ucall_server_stop()` can wake it from another thread.
+The first stop drains: listeners close, idle connections close, and every request already held gets its reply, announced as its connection's last.
+A second stop cuts the replies still in flight; there is no drain timeout.
+An interface takes a `listen_descriptor` in place of an address, accepting on a socket systemd or a supervisor passed in, TCP or AF_UNIX, and never closing it.
+Once an interface holds its whole connection budget, a new peer evicts the idle keep-alive connection that progressed least recently, and slow peers holding requests are never cut by a deadline.
 
 `ucall_client_call()` submits an exchange and returns its acceptance result.
 Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
 Initialize, submit, poll, and free a client on the same owner thread.
 Keep borrowed request inputs alive until their completion is retrieved.
 After retrieval, the caller owns each response until `ucall_client_response_free()`, even past client teardown.
+A response is capped by the client's `max_response_bytes`, which takes the kernel's largest receive buffer by default, as `max_request_bytes` caps a server's requests.
 Stop and join server polling threads before freeing the server.
+
+The client resolves host names itself, through a stub resolver its own event loop drives, so a lookup never blocks the polling thread.
+It reads `/etc/resolv.conf` with its `search` and `ndots` options and `/etc/hosts` on POSIX, and the adapters' settings on Windows.
+Queries for AAAA and A go over UDP and retry over TCP when truncated, follow CNAME chains, and cache answers and refusals for their TTL.
+Connections race the answered addresses Happy Eyeballs style, alternating IPv6 and IPv4 from IPv6, waiting 50 ms for an AAAA answer behind an A one, and starting the next address 250 ms after the previous one.
+The client's `log` sink reports dials that fail every address, refused handshakes and refused redirects, in the same human or JSON lines the server writes.
 
 ### Encryption: From TLS to Noise
 
@@ -301,27 +426,27 @@ There is no OpenSSL, no libsodium, and no third-party Noise implementation.
 The Curve25519 implementation lives separately from StringZilla's symmetric cipher and hash kernels.
 
 [stringzilla]: https://github.com/ashvardanian/StringZilla
-[simdjson]: https://github.com/simdjson/simdjson
-[simdutf]: https://github.com/simdutf/simdutf
-[turbobase64]: https://github.com/powturbo/Turbo-Base64
-[ada]: https://github.com/ada-url/ada
 
-### Protocol Flexibility: REST and JSON-RPC
+### REST Interface
 
-The current C ABI exposes path, query, header, and body views for REST-style APIs.
-JSON-RPC conversion and higher-level parameter decoding are planned:
+The C ABI exposes path, query, header, and body views for REST-style APIs:
 
-- __Path Parameters__: Extract from URL pattern, e.g., `/users/{user_id}/posts/{post_id}`
-- __Query Parameters__: Extract from query string, e.g., `/search?q=rust&limit=10`
-- __JSON Body__: Applications can parse raw body bytes, e.g., `{"temperature": 0.7, "max_tokens": 100}`; automatic decoding is planned
-- __Multipart Body__: Planned support for files + metadata in one request
+- __Path Parameters__: Captured by URI templates, e.g., `/users/{user_id}/posts/{post_id}`, through `ucall_server_request_path_parameter()`
+- __Query Parameters__: Looked up by name, e.g., `/search?q=rust&limit=10`, through `ucall_server_request_query_parameter()`
+- __JSON Body__: Applications parse raw body bytes, e.g., `{"temperature": 0.7, "max_tokens": 100}`, and the Python bindings bind typed handler parameters from it
+- __Multipart Body__: Files and metadata in one request, read part by part through `ucall_server_request_part()`
+- __Header Fields__: Looked up by case-insensitive name through `ucall_server_request_header()`, or walked in arrival order through `ucall_server_request_fields_count()` and `ucall_server_request_field()`, as a proxy forwards a head whole
+- __Raw Query__: The whole query after the first `?` through `ucall_server_request_query()`
+- __Peer Address__: The IPv4, IPv6 or AF_UNIX address a connection came from, beside its interface and authenticated Noise key, through `ucall_server_request_peer()`
 
-The routing and raw-body interface already lets an application implement either shape; the framework does not yet supply the JSON-RPC adapter.
-Why support JSON-RPC?
+Paths and query values arrive as sent, and `ucall_decode_percent()` decodes their `%XX` escapes, reading `+` as a space in a query and refusing a `%` without two hexadecimal digits.
+Field names arrive lowercased, as the parser keeps them, and values trimmed; a client response's fields read the same way through `ucall_client_response_fields_count()` and `ucall_client_response_field()`.
 
-- Broadly supported, especially in decentralized software.
-- Human, machine, and LLM-friendly format with no vendor lock-in.
-- Enables batch requests, allowing multiple calls in a single HTTP request.
+Routing is exact, as in axum and Envoy: an empty segment is a segment, so `/users`, `/users/` and `//users` are three different paths.
+Literal segments match before parameters, which never take an empty segment, and both before a trailing wildcard.
+A path no route takes answers 404, and a path whose routes take other verbs answers 405 with an `allow` header listing them.
+A GET route serves HEAD as well, an `OPTIONS` request answers 204 with the same `allow` list, and `OPTIONS *` lists every verb.
+A request sending `Expect: 100-continue` gets its interim `100 Continue` once the requests before it on its connection were answered, or on a streamed endpoint once its handler first pulls the body.
 
 ### Multipart Data and Rich Types
 
@@ -366,18 +491,8 @@ curl -X POST http://localhost:8545/vectorize \
 ### Client-Side Batching ≠ Server-Side Batching
 
 When building high-throughput applications, it's common to batch multiple requests together on the client side to reduce network overhead.
-For JSON-RPC, that's trivial - pack a JSON array of individual procedure calls:
-
-```json
-[
-  { "id": 1, "method": "some-method", "params": "...", "jsonrpc": "2.0" },
-  { "id": 2, "method": "another-method", "params": "...", "jsonrpc": "2.0" },
-  { "id": 3, "method": "some-method", "params": "...", "jsonrpc": "2.0" }
-]
-```
-
-A JSON-RPC adapter could regroup procedures by endpoint before assembling its response array; that adapter is planned.
-The implemented server batching instead collects independent HTTP requests from every polling loop into each batch endpoint's queue and passes their retained handles as a counted array.
+That batch is one request from one client, which the server must split, dispatch and reassemble itself.
+Server-side batching instead collects independent HTTP requests from different clients and every polling loop into each batch endpoint's queue, and passes their retained handles as a counted array.
 Each request keeps its own response and transaction boundary, as the [key-value and ledger examples](examples/README.md) demonstrate.
 
 ### Resumable Uploads & Downloads
@@ -401,6 +516,7 @@ Replies can carry byte ranges of files, as descriptors or as paths beneath direc
 The event loop reads them with `O_DIRECT`, past the page cache, into windows borrowed from its pool, reading the next window while the previous one sends.
 Every reply leaves through zero-copy sends wherever the kernel offers them, and a window returns to the pool once the kernel let go of it.
 Under Noise each read leaves a gap behind every record's payload for its tag and the next record's header, so records seal in place inside the window.
+IOCP does not yet send file parts over Noise connections.
 
 ### Other Functional HTTP Headers
 
@@ -477,7 +593,7 @@ myapp.batch.queue:8|g|#env:prod,region:us-east,endpoint:/infer
 
 ```c
 ucall_bytes_view_t const tags[] = {{(ucall_byte_t const*)"env:prod", 8}, {(ucall_byte_t const*)"region:us-east", 14}};
-ucall_server_config_t config = {
+ucall_server_options_t config = {
     .metrics_address = {(ucall_byte_t const*)"127.0.0.1:8125", 14},
     .metrics_sample_rate = 0.1,                          // A latency line for one request in ten
     .metrics_prefix = {(ucall_byte_t const*)"myapp", 5}, // Metric names become "myapp.requests"
@@ -525,7 +641,7 @@ So for now, UCall focuses on TCP-based communication and HTTP/1.1 interoperabili
 
 FastAPI comes with a rich ecosystem of plugins and extensions for authentication, database integration, OpenAPI schema generation, and more.
 
-UCall supports routes like `/users/{id}` natively, including named parameters and greedy suffixes.
+UCall supports routes like `/users/{id}` natively, including named parameters and greedy suffixes, matched exactly as the [REST Interface](#rest-interface) section describes.
 The current gaps are higher-level SDK ergonomics, automatic schema generation, rich-type conversion, and the authentication integrations discussed above.
 
 ### What If You Love TLS?!

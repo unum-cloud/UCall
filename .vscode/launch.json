@@ -45,10 +45,10 @@
       "subProcess": true
     },
     {
-      "name": "C++: Test io_uring Server",
+      "name": "C++: Echo Example",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_uring",
+      "program": "${workspaceFolder}/build_debug_siblings/ucall_example_echo",
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
@@ -59,10 +59,10 @@
       "miDebuggerPath": "/usr/bin/gdb"
     },
     {
-      "name": "C++: Test epoll Server",
+      "name": "C++: Network Suite",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_epoll",
+      "program": "${workspaceFolder}/build_debug_siblings/ucall_test_network",
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
@@ -71,54 +71,6 @@
       "preLaunchTask": "Build Debug",
       "MIMode": "gdb",
       "miDebuggerPath": "/usr/bin/gdb"
-    },
-    {
-      "name": "C++: Test POSIX Server",
-      "type": "cppdbg",
-      "request": "launch",
-      "program": "${workspaceFolder}/build_debug/bin/ucall_example_login_posix",
-      "cwd": "${workspaceFolder}",
-      "showDisplayString": true,
-      "stopAtEntry": false,
-      "externalConsole": false,
-      "preLaunchTask": "Build Debug",
-      "linux": {
-        "MIMode": "gdb",
-        "miDebuggerPath": "/usr/bin/gdb"
-      },
-      "osx": {
-        "MIMode": "lldb",
-        "environment": [
-          {
-            "name": "CPATH",
-            "value": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
-          }
-        ],
-      },
-    },
-    {
-      "name": "C++: Test POSIX Rest Server",
-      "type": "cppdbg",
-      "request": "launch",
-      "program": "${workspaceFolder}/build_debug/bin/ucall_example_rest_posix",
-      "cwd": "${workspaceFolder}",
-      "showDisplayString": true,
-      "stopAtEntry": false,
-      "externalConsole": false,
-      "preLaunchTask": "Build Debug",
-      "linux": {
-        "MIMode": "gdb",
-        "miDebuggerPath": "/usr/bin/gdb"
-      },
-      "osx": {
-        "MIMode": "lldb",
-        "environment": [
-          {
-            "name": "CPATH",
-            "value": "/Library/Developer/CommandLineTools/SDKs/MacOSX.sdk/usr/include/"
-          }
-        ],
-      },
     },
   ]
 }

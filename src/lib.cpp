@@ -2,8 +2,9 @@
  *  @file src/lib.cpp
  *  @author Ash Vardanian
  *  @date August 15, 2023
- *  @brief C entry points over each handle's initialization-selected operations, and the Noise key
- *      and received response verbs, which need no CPU-specific code.
+ *  @brief C entry points over each handle's initialization-selected operations, the outcome
+ *      word and the percent codec through the host class's rows, and the Noise key and
+ *      received response verbs.
  */
 #include <cstdint>
 #include <cstring> // `std::memset`
@@ -11,8 +12,8 @@
 #include <span>        // `std::as_bytes`, `std::as_writable_bytes`
 #include <string_view> // `std::string_view`
 
-#include "ucall/http.hpp"
-#include "ucall/io.hpp"
+#include "ucall/http/messages.hpp" // `messages`, `received_response_t`, the serial kits
+#include "ucall/network/types.hpp" // `ucall_server_handle_t`, `ucall_client_handle_t`
 #include "lib.hpp"
 
 using namespace unum::ucall;
@@ -21,9 +22,19 @@ static_assert(sizeof(void*) != 8 || sizeof(ucall_reply_part_t) == 48, "a reply p
 
 namespace unum::ucall {
 
+using http::received_response_t;
+using http::serial_byteset_kit_t;
+using http::serial_compare_kit_t;
+using http::serial_find_kit_t;
+using http::serial_fold_kit_t;
+using http::serial_hash_kit_t;
+using tunnel::secure_tunnel_fault_t;
+using tunnel::secure_tunnel_generate_keypair;
+using tunnel::x25519_derive_public;
+
 /** Responses outlive their client and its CPU class, so reading one takes the serial kits. */
 using response_http_t =
-    http<serial_compare_kit_t, serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t>;
+    http::messages<serial_compare_kit_t, serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t>;
 
 template <typename handle_type_>
 [[nodiscard]] static ucall_status_t admit(handle_type_ const* handle, ucall_outcome_t* outcome) noexcept {
@@ -32,26 +43,24 @@ template <typename handle_type_>
     return ucall_status_uninitialized_k;
 }
 
-static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept { return spelling == text_view(name); }
-
 template <typename init_type_>
 static void init_network(init_type_* arguments) noexcept {
     cpu_ceiling_t ceiling;
-    if (ucall_status_t const picked = pick_cpu_ceiling(arguments->config->cpu_class, ceiling);
+    if (ucall_status_t const picked = pick_cpu_ceiling(arguments->options->cpu_class, ceiling);
         picked != ucall_status_success_k) {
         publish(arguments->outcome, picked);
         return;
     }
-    auto config = *arguments->config;
+    auto options = *arguments->options;
     auto request = *arguments;
-    request.config = &config;
+    request.options = &options;
     auto try_backend = [&](ucall_io_backend_t backend) {
-        config.backend = backend;
+        options.backend = backend;
         make_network(cpu_ladder_t {}, &request, ceiling);
         auto status = request.outcome->status;
         return status != ucall_status_unsupported_k && status != ucall_status_io_k;
     };
-    if (config.backend != ucall_io_backend_automatic_k) make_network(cpu_ladder_t {}, &request, ceiling);
+    if (options.backend != ucall_io_backend_automatic_k) make_network(cpu_ladder_t {}, &request, ceiling);
     else {
         bool finished = false;
 #if UCALL_WITH_LINUX_URING
@@ -62,7 +71,7 @@ static void init_network(init_type_* arguments) noexcept {
         if (!finished) finished = try_backend(ucall_io_backend_linux_epollaio_k);
 #endif
 #if UCALL_WITH_KQUEUE
-        if (!finished) finished = try_backend(ucall_io_backend_macos_kqueue_k);
+        if (!finished) finished = try_backend(ucall_io_backend_bsd_kqueue_k);
 #endif
 #if UCALL_WITH_IOCP
         if (!finished) finished = try_backend(ucall_io_backend_windows_iocp_k);
@@ -72,57 +81,21 @@ static void init_network(init_type_* arguments) noexcept {
 #endif
         if (!finished) publish(arguments->outcome, ucall_status_unsupported_k);
     }
-    if (arguments->outcome->status != ucall_status_success_k) return;
-    if constexpr (std::is_same_v<init_type_, ucall_server_init_t>) (*arguments->server)->ceiling = ceiling;
-    else (*arguments->client)->ceiling = ceiling;
 }
 
 } // namespace unum::ucall
 
 extern "C" {
 
-char const* ucall_io_backend_name(ucall_io_backend_t backend) {
-    switch (backend) {
-    case ucall_io_backend_automatic_k: return "automatic";
-    case ucall_io_backend_posix_k: return "posix";
-    case ucall_io_backend_linux_epollaio_k: return "linux-epollaio";
-    case ucall_io_backend_linux_uring612_k: return "linux-uring612";
-    case ucall_io_backend_linux_uring618_k: return "linux-uring618";
-    case ucall_io_backend_macos_kqueue_k: return "macos-kqueue";
-    case ucall_io_backend_windows_iocp_k: return "windows-iocp";
-    }
-    return "unknown";
-}
+ucall_status_t ucall_outcome_status(ucall_outcome_t* outcome) { return host_verbs().load(outcome); }
 
-char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
-    switch (cpu_class) {
-    case ucall_cpu_class_unknown_k: return "automatic";
-    case ucall_cpu_class_serial_k: return "serial";
-    case ucall_cpu_class_intel_haswell_k: return "intel-haswell";
-    case ucall_cpu_class_intel_skylake_k: return "intel-skylake";
-    case ucall_cpu_class_intel_icelake_k: return "intel-icelake";
-    case ucall_cpu_class_intel_alder_k: return "intel-alder";
-    case ucall_cpu_class_intel_sierra_k: return "intel-sierra";
-    case ucall_cpu_class_aws_g2_k: return "aws-g2";
-    case ucall_cpu_class_apple_m2_k: return "apple-m2";
-    case ucall_cpu_class_aws_g5_k: return "aws-g5";
-    case ucall_cpu_class_monoversioned_k: return "monoversioned";
-    }
-    return "unknown";
-}
+ucall_status_t ucall_outcome_wait(ucall_outcome_t* outcome) { return host_verbs().wait(outcome); }
 
-ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name) {
-    for (auto backend = ucall_io_backend_posix_k; backend <= ucall_io_backend_windows_iocp_k;
-         backend = static_cast<ucall_io_backend_t>(backend + 1))
-        if (named(ucall_io_backend_name(backend), name)) return backend;
-    return ucall_io_backend_automatic_k;
-}
-
-ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name) {
-    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_monoversioned_k;
-         cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1))
-        if (named(ucall_cpu_class_name(cpu_class), name)) return cpu_class;
-    return ucall_cpu_class_unknown_k;
+ucall_status_t ucall_decode_percent(ucall_bytes_view_t encoded, ucall_byte_t* decoded, size_t* length,
+                                    ucall_percent_mode_t mode) {
+    if (!length || mode > ucall_percent_query_k || (encoded.length && (!encoded.data || !decoded)))
+        return ucall_status_invalid_argument_k;
+    return host_verbs().decode_percent(encoded, decoded, length, mode);
 }
 
 void ucall_noise_key_generate(ucall_noise_key_generate_t* arguments) {
@@ -159,7 +132,7 @@ void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments) {
 void ucall_server_init(ucall_server_init_t* arguments) {
     if (!arguments) return;
     if (arguments->server) *arguments->server = nullptr;
-    if (!arguments->server || !arguments->outcome || !arguments->config) {
+    if (!arguments->server || !arguments->outcome || !arguments->options) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
@@ -169,10 +142,12 @@ void ucall_server_init(ucall_server_init_t* arguments) {
 void ucall_client_init(ucall_client_init_t* arguments) {
     if (!arguments) return;
     if (arguments->client) *arguments->client = nullptr;
-    if (!arguments->client || !arguments->outcome || !arguments->config) {
+    if (!arguments->client || !arguments->outcome || !arguments->options) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
+    // A bound client takes its server's network, whose engine it shares.
+    if (arguments->options->server) return arguments->options->server->api->bind_client(arguments);
     init_network(arguments);
 }
 
@@ -227,8 +202,7 @@ void ucall_server_free(ucall_server_t server) {
 }
 void ucall_server_stop(ucall_server_t server) {
     if (!server) return;
-    std::atomic_ref<std::uint32_t> {server->stopped}.store(1, std::memory_order_release);
-    for (auto* wake : server->wakeups) wake->notify();
+    server->api->stop(server);
 }
 void ucall_client_free(ucall_client_t client) {
     if (!client) return;
@@ -264,6 +238,21 @@ void ucall_server_request_header(ucall_server_request_header_t* arguments) {
     if (!arguments) return;
     if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_header(arguments);
+}
+void ucall_server_request_fields_count(ucall_server_request_fields_count_t* arguments) {
+    if (!arguments) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->request_fields_count(arguments);
+}
+void ucall_server_request_field(ucall_server_request_field_t* arguments) {
+    if (!arguments) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->request_field(arguments);
+}
+void ucall_server_request_query(ucall_server_request_query_t* arguments) {
+    if (!arguments) return;
+    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
+    arguments->server->api->request_query(arguments);
 }
 void ucall_server_request_peer(ucall_server_request_peer_t* arguments) {
     if (!arguments) return;
@@ -304,6 +293,39 @@ void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     auto value = message.header(text_view(response.bytes()), text_view(arguments->name));
     *arguments->value = bytes_view(value);
     publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
+}
+void ucall_client_response_fields_count(ucall_client_response_fields_count_t* arguments) {
+    if (!arguments) return;
+    if (arguments->count) *arguments->count = 0;
+    if (!arguments->response || !arguments->count) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    auto& response = *static_cast<received_response_t*>(arguments->response);
+    response_http_t::http_message_t message {};
+    message.headers_length = response.headers_length;
+    *arguments->count = message.fields_count(text_view(response.bytes()));
+    publish(arguments->outcome, ucall_status_success_k);
+}
+void ucall_client_response_field(ucall_client_response_field_t* arguments) {
+    if (!arguments) return;
+    if (arguments->name) *arguments->name = {};
+    if (arguments->value) *arguments->value = {};
+    if (!arguments->response || !arguments->name || !arguments->value) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    auto& response = *static_cast<received_response_t*>(arguments->response);
+    response_http_t::http_message_t message {};
+    message.headers_length = response.headers_length;
+    std::string_view name, value;
+    if (!message.field(text_view(response.bytes()), arguments->index, name, value)) {
+        publish(arguments->outcome, ucall_status_not_found_k);
+        return;
+    }
+    *arguments->name = bytes_view(name);
+    *arguments->value = bytes_view(value);
+    publish(arguments->outcome, ucall_status_success_k);
 }
 void ucall_client_response_body(ucall_client_response_body_t* arguments) {
     if (!arguments) return;

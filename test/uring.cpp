@@ -16,12 +16,14 @@
 #include <string>    // `std::string`
 #include <vector>    // `std::vector`
 
-#include "ucall/uring612.hpp"
-#include "ucall/uring618.hpp"
+#include "ucall/io/linux_uring612_engine.hpp" // `linux_uring612_engine`
+#include "ucall/io/linux_uring618_engine.hpp" // `linux_uring618_engine`
 
 #include "harness.hpp" // `expect`, `require`, `run_test`, `counting_allocator`, `loopback_pair`, `direct_directory_t`
 
 using namespace unum::ucall;
+using namespace unum::ucall::io;
+using namespace unum::ucall::utilities;
 using namespace unum::ucall::test;
 
 /** Sends all of @p bytes through @p descriptor, blocking. */

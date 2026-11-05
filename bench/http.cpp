@@ -31,7 +31,7 @@
 #include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_for_threads`
 #include <forkunion/types.hpp>   // `fu::split_mix`
 
-#include "ucall/types.hpp" // `bytes_view`
+#include "ucall/utilities/types.hpp" // `bytes_view`
 
 #include "arguments.hpp" // `parse_count`, `parse_duration`, `parse_seed`, `parse_key`, `process_clocks_t`
 
@@ -361,7 +361,7 @@ struct schedule_t {
 
 struct worker_t {
     ucall_client_t client {};
-    ucall_client_config_t resolved {};
+    ucall_client_options_t resolved {};
     std::vector<group_t> groups;
     std::vector<std::size_t> idle; // Indices of `groups` waiting for their next arrival.
     std::vector<ucall_completed_call_t> completed;
@@ -409,8 +409,8 @@ struct worker_t {
                 call.body = bytes_view(payload);
                 call.context = &slot;
                 if (server_key && settings.urls[group.origin].starts_with("http+noise://")) {
-                    call.options.security = ucall_security_mode_noise_ik_k;
-                    call.options.server_key = server_key;
+                    call.options.security = ucall_security_noise_ik_k;
+                    call.options.noise_peer_key = server_key;
                 }
                 std::size_t headers = 0;
                 if (settings.reply_order == reply_order_t::reordered_k) {
@@ -481,7 +481,7 @@ struct worker_t {
             ucall_outcome_t outcome {};
             std::size_t count {};
             ucall_client_take_completed_t take {client,           &outcome, completed.data(),
-                                                completed.size(), &count,   resolved.request_timeout_microseconds};
+                                                completed.size(), &count,   resolved.call_timeout_microseconds};
             if (waiting)
                 take.timeout_microseconds = static_cast<std::size_t>(
                     std::chrono::duration_cast<std::chrono::microseconds>(until_wake).count());
@@ -595,7 +595,7 @@ struct run_t {
         if (index >= run.resources.workers.size()) return;
         auto& worker = run.resources.workers[index];
         auto count = run.resources.workers.size();
-        ucall_client_config_t config {};
+        ucall_client_options_t config {};
         auto width = run.settings.reply_order == reply_order_t::reordered_k ? 2u : 1u;
         auto connection_groups = run.settings.connections / width;
         config.max_concurrent_connections = (connection_groups / count + (index < connection_groups % count)) * width +

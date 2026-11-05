@@ -3,7 +3,6 @@ OUTPUT_DIRECTORY       = ../build/
 INPUT                  = ../c/ucall
 RECURSIVE              = YES
 FILE_PATTERNS          = *.h
-EXTENSION_MAPPING      = cuh=C++
 EXCLUDE_SYMBOLS        = *_
 ENABLE_PREPROCESSING   = YES
 MACRO_EXPANSION        = YES

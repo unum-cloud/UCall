@@ -61,7 +61,8 @@ static void account(ucall_received_http_request_t request, void* context) {
     char* end = std::to_chars(result, result + sizeof(result), balance).ptr;
     *end++ = '\n';
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {service.server, &outcome, request, nullptr, 0, uc::bytes_view({result, end})};
+    ucall_server_reply_content_t reply {
+        service.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view({result, end})};
     ucall_server_reply_content(&reply);
 }
 static void transfer(ucall_received_http_request_t request, void* context) {
@@ -102,7 +103,8 @@ static void transfer(ucall_received_http_request_t request, void* context) {
         reply_error(service.server, request, transaction->stage()) ||
         reply_error(service.server, request, transaction->commit()))
         return;
-    ucall_server_reply_content_t reply {service.server, &outcome, request, nullptr, 0, uc::bytes_view("committed\n")};
+    ucall_server_reply_content_t reply {
+        service.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("committed\n")};
     ucall_server_reply_content(&reply);
 }
 

@@ -30,14 +30,17 @@ A pinned class or ceiling below that class then fails as unsupported rather than
 The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set both, and CI compiles each of them, beside `android_arm64` over the epoll backend and `msvc2026_x64` with Visual Studio.
 `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 
-`UCALL_BUILD_TOOLS=ON` enables `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
+`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_hello`, `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
+`ucall_cli`, the `ucall` command-line client in `cli/`, builds with the examples and with any install, and `ucall_test_cli` drives it against an in-process server.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python-builds) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust-builds) describe.
 
-`UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build and installs both libraries with a CMake package and a `ucall.pc`.
+`cmake --install` installs `ucall::static`, the C headers, a CMake package and the license.
+`UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build, and installs it beside the archive with a `ucall.pc`.
 The shared library exports the `ucall_*` C interface alone, and the `release` preset remaps the source directory out of every binary.
-The `sdk` install component holds the shared library, the C headers, both package files and the license, and CPack packs it alone, stripped, into `ucall-<version>-<platform>-sdk.tar.gz`:
+A C program links either library, as CI's install job does with `examples/hello.c` through `find_package(ucall)` and through `pkg-config`.
+CPack packs the `sdk` install component, which holds all of it, stripped, into `ucall-<version>-<platform>-sdk.tar.gz`:
 
 ```bash
 cmake --preset release
@@ -56,6 +59,26 @@ UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset debug
 
 Python suites sit beside them as `test/server.py` and `test/client.py`, and Rust tests sit in each module of `rust/`.
 
+### Fuzzing
+
+`test/properties.hpp` holds one oracle per parser that reads untrusted bytes, each copying its input into a heap block of exactly its size so AddressSanitizer catches a read past it.
+`ucall_test_properties` drives them from seeded mutations of valid inputs, and the `fuzz` preset builds a libFuzzer harness over each with Clang, AddressSanitizer and UndefinedBehaviorSanitizer:
+
+- `ucall_fuzz_http`: request and response framing, whole against cut into pieces and streamed.
+- `ucall_fuzz_multipart`: `multipart/form-data` splitting against a linear reference.
+- `ucall_fuzz_routes`: the route trie against a linear matcher with literal, parameter and wildcard precedence.
+- `ucall_fuzz_url`: URL parsing round trips, and relative redirects that never leave their origin.
+- `ucall_fuzz_dns`: the stub resolver's answer decoder.
+- `ucall_fuzz_tunnel`: Noise responders fed hostile first messages, and records whose flipped bytes must never open.
+
+```bash
+cmake --preset fuzz -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --build --preset fuzz
+mkdir -p corpus && build_fuzz/ucall_fuzz_routes -max_total_time=60 corpus
+```
+
+CI runs each harness for five minutes with the run number as its seed and keeps what a failing one found.
+
 ### Arm on an x86 Host
 
 `cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
@@ -66,7 +89,7 @@ QEMU's user mode has neither io_uring nor Linux AIO, so those suites skip.
 cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
 cmake --build build_aarch64
 ctest --test-dir build_aarch64
-qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class apple-m2
+qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class aws-g2
 ```
 
 ### Windows, FreeBSD and macOS on a Linux Host
@@ -134,7 +157,7 @@ No template in `include/` names a CPU class or a capability mask; classes, masks
 Every mutable object has one owner and one authoritative state.
 Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
 That owner holds its connections, protocol transitions, deadlines, and backend operation records.
-Endpoint callbacks execute synchronously on the polling caller, and batch callbacks on the batch endpoint's draining caller.
+Endpoint callbacks execute synchronously on the polling caller, and batch callbacks on the batch endpoint's polling owner.
 Cross-thread retained replies and server shutdown publish state atomically rather than changing the loop's I/O records directly.
 Public contracts say when inputs may be reused, when an outcome becomes final, and which owner must outlive which handle.
 Cancellation requests work to stop; only retirement permits its storage to be reused.

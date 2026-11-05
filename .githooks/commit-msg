@@ -36,8 +36,7 @@ Release:*)
         [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
         git show :CITATION.cff 2>/dev/null | grep -qxF "version: $version" || stale="$stale CITATION.cff"
         git show :Cargo.toml 2>/dev/null | grep -qxF "version = \"$version\"" || stale="$stale Cargo.toml"
-        # CMake's `project(VERSION)` and the C macros take numbers only, so a candidate keeps its core there.
-        git show :CMakeLists.txt 2>/dev/null | grep -qE "^[[:space:]]+VERSION ${core//./\\.}$" || stale="$stale CMakeLists.txt"
+        # The C macros take numbers only, so a candidate keeps its core there.
         for field in "MAJOR $major" "MINOR $minor" "PATCH $patch"; do
             git show :c/ucall/types.h 2>/dev/null | grep -qxF "#define UCALL_VERSION_$field" || stale="$stale c/ucall/types.h:${field% *}"
         done

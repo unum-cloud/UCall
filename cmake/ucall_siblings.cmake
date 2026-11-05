@@ -42,10 +42,10 @@ ucall_sibling(
 )
 ucall_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
-    b4cf836d790049afe0ea9d9c226f7933b5660dc1
+    a65d5b81763f683c3a2a167c3a4e3426942a76cd
 )
 
-if (UCALL_BUILD_TOOLS)
+if (UCALL_BUILD_EXAMPLES)
     ucall_sibling(
         numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
         8b3df749915fdcc01e563df8ff119c3e09c04789

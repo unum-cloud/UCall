@@ -25,8 +25,15 @@ extern "C" {
  *  standing up a second server to do it. */
 typedef struct ucall_network_interface_t {
 
-    /** Listening address in "host:port" form. Required. */
+    /** Listening address in "host:port" form, required unless @c listen_descriptor is set; the
+     *  resolved options report the bound address, or an AF_UNIX socket's path. */
     ucall_bytes_view_t address;
+
+    /** A listening stream socket to accept on instead of binding @c address, such as one systemd
+     *  or a supervisor passed in, or NULL to bind. Read during @c ucall_server_init(), which
+     *  accepts on duplicates of it: UCall never closes it, though the duplicates share its
+     *  @c O_NONBLOCK. Default: NULL. */
+    intptr_t const* listen_descriptor;
 
     /** Physical device to pin this interface to with @c SO_BINDTODEVICE, such as "eth0", or empty
      *  to bind by address alone.
@@ -35,10 +42,10 @@ typedef struct ucall_network_interface_t {
      *  device the machine has - which is why the two are separate fields rather than one. */
     ucall_bytes_view_t device_name;
 
-    /** Encryption for connections accepted here. Default: ucall_security_mode_none_k. */
-    ucall_security_mode_t security_mode;
+    /** Encryption for connections accepted here. Default: ucall_security_none_k. */
+    ucall_security_t security;
 
-    /** Server identity for handshakes. Required when @c security_mode is not none. */
+    /** Server identity for handshakes. Required when @c security is not none. */
     ucall_noise_key_t const* noise_private_key;
 
     /** The initiator's static public key, which KK hashes before the first message. Required for
@@ -93,7 +100,7 @@ typedef struct ucall_network_interface_t {
  *  @brief Configuration parameters for the UCall server.
  *  @sa Initialize with @c ucall_server_init().
  */
-typedef struct ucall_server_config_t {
+typedef struct ucall_server_options_t {
 
     /** Interfaces to answer on. At least one is required.
      *
@@ -135,7 +142,7 @@ typedef struct ucall_server_config_t {
      *  Serial is the conservative choice. */
     ucall_cpu_class_t cpu_class;
 
-} ucall_server_config_t;
+} ucall_server_options_t;
 
 /** Arguments of @c ucall_server_init(). */
 typedef struct ucall_server_init_t {
@@ -147,12 +154,12 @@ typedef struct ucall_server_init_t {
     ucall_outcome_t* outcome;
 
     /** Requested configuration. Zeroed fields take their documented defaults. */
-    ucall_server_config_t const* config;
+    ucall_server_options_t const* options;
 
-    /** Optional output for @c config with every default filled in, including each interface's @c
+    /** Optional output for @c options with every default filled in, including each interface's @c
      *  event_loops. The arrays and strings it points at belong to the server until @c
      *  ucall_server_free(). */
-    ucall_server_config_t* resolved;
+    ucall_server_options_t* resolved;
 
 } ucall_server_init_t;
 
@@ -180,11 +187,22 @@ UCALL_EXPORT void ucall_server_init(ucall_server_init_t* arguments);
  *
  *  @note Stop and join polling threads, and finish application use of retained requests before
  *      teardown. Remaining request handles become invalid. Native I/O retirement can block.
+ *      Returns without freeing while a client bound to it lives; free those first.
  */
 UCALL_EXPORT void ucall_server_free(ucall_server_t server);
 
-/** Requests shutdown and wakes blocked polling and draining callers.
- *  Safe from an endpoint callback or a separate thread. */
+/**
+ *  @brief Requests shutdown and wakes blocked polling callers and batch polling owners.
+ *  @param[in] server Server from @c ucall_server_init(), or @c NULL.
+ *
+ *  The first call drains: the server stops accepting, closes idle connections, and answers the
+ *  requests it already holds with @c connection: close, closing each connection after its last
+ *  reply. Polling callers return once their loop has no connection left, and batch polling owners
+ *  once every loop has returned. Any later call, or @c ucall_server_free(), cuts instead: replies
+ *  still in flight are abandoned and their peers reset.
+ *
+ *  Safe from an endpoint callback or a separate thread.
+ */
 UCALL_EXPORT void ucall_server_stop(ucall_server_t server);
 
 /** Arguments of @c ucall_server_take_call(). */
@@ -205,12 +223,14 @@ typedef struct ucall_server_take_call_t {
 } ucall_server_take_call_t;
 
 /**
- *  Advances one server loop and invokes ready callbacks on the calling thread.
+ *  @brief Advances one server loop and invokes ready callbacks on the calling thread.
+ *
  *  Callbacks run synchronously; the timeout cannot preempt them.
  *
  *  @par Statuses:
+ *  - @c ucall_status_connection_closed_k The loop retired after a stop: its drain or cut ended,
+ *    so a caller polling in slices stops here.
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_unsupported_k The kernel refuses the loop's I/O ring on its first poll.
  *  - @c ucall_status_invalid_argument_k The @c event_loop_index is past the last loop.
  *  - @c ucall_status_overflow_k The loop's connections, acceptors or pipelined requests overflow
  *    the counters its first poll sizes.
@@ -232,11 +252,10 @@ typedef struct ucall_server_take_calls_t {
 } ucall_server_take_calls_t;
 
 /**
- *  Drives one server loop until @c ucall_server_stop() or an I/O failure.
+ *  @brief Drives one server loop until @c ucall_server_stop() or an I/O failure.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_unsupported_k The kernel refuses the loop's I/O ring on its first poll.
  *  - @c ucall_status_invalid_argument_k The @c event_loop_index is past the last loop.
  *  - @c ucall_status_overflow_k The loop's connections, acceptors or pipelined requests overflow
  *    the counters its first poll sizes.
@@ -315,7 +334,7 @@ typedef struct ucall_event_loop_statistics_t {
     /** Replied exchanges the loop took from its queue to adopt their reply segments. */
     uint64_t replied_dequeues;
 
-    /** Requests the loop answered itself with 400, 404, 413, 501 or 503. */
+    /** Requests the loop answered itself with 400, 404, 405, 413, 501, 503 or 505. */
     uint64_t refused_requests;
 
     /** Connections whose Noise handshake failed. */
@@ -360,10 +379,10 @@ typedef struct ucall_server_take_batch_t {
     /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Outcome of this draining round. */
+    /** Outcome of this round. */
     ucall_outcome_t* outcome;
 
-    /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one draining owner. */
+    /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one polling owner. */
     ucall_http_batch_endpoint_t endpoint;
 
     /** Maximum wait for a due batch; zero performs one nonblocking round. */
@@ -388,10 +407,10 @@ typedef struct ucall_server_take_batches_t {
     /** Initialized server that registered @c endpoint. */
     ucall_server_t server;
 
-    /** Final outcome after draining stops. */
+    /** Final outcome after polling stops. */
     ucall_outcome_t* outcome;
 
-    /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one draining owner. */
+    /** Endpoint from @c ucall_server_add_http_batch_endpoint(); each has one polling owner. */
     ucall_http_batch_endpoint_t endpoint;
 
 } ucall_server_take_batches_t;
@@ -406,11 +425,13 @@ typedef struct ucall_server_take_batches_t {
  */
 UCALL_EXPORT void ucall_server_take_batches(ucall_server_take_batches_t* arguments);
 
-/** Counters of one batch endpoint since registration; they say how large its batches were and
- *  why each fired.
+/**
+ *  @brief Counters of one batch endpoint since registration; they say how large its batches were
+ *      and why each fired.
  *
- *  Only the endpoint's draining owner advances them. Batches released by a stop fire no callback
- *  and count nowhere. */
+ *  Only the endpoint's polling owner advances them. Batches released by a stop fire no callback
+ *  and count nowhere.
+ */
 typedef struct ucall_batch_endpoint_statistics_t {
 
     /** Callbacks invoked. */
@@ -448,8 +469,9 @@ typedef struct ucall_server_batch_endpoint_statistics_t {
 } ucall_server_batch_endpoint_statistics_t;
 
 /**
- *  Copies one batch endpoint's counters, from any thread whose CPU runs the server's CPU class.
- *  Each counter is read on its own, so a snapshot of a draining endpoint is not one instant.
+ *  @brief Copies one batch endpoint's counters from any thread on a CPU of the server's class.
+ *
+ *  Each counter is read on its own, so a snapshot of a polled endpoint is not one instant.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -561,7 +583,7 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
     size_t max_latency_microseconds;
 
     /** Receives the endpoint that @c ucall_server_take_batch() and @c ucall_server_take_batches()
-     *  drain; required. */
+     *  poll; required. */
     ucall_http_batch_endpoint_t* endpoint;
 
 } ucall_server_add_http_batch_endpoint_t;
@@ -570,8 +592,8 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
  *  @brief Registers a batching callback to collect multiple requests and process them together.
  *      Very handy for batch-processing and high-latency operations (e.g., GPU inference).
  *
- *  This differs from JSON-RPC batching: here the server aggregates requests from different sources
- *  and dispatches them together, rather than the client batching into a JSON array.
+ *  Unlike client-side batching, which packs several calls into one request, the server aggregates
+ *  independent requests from different sources and dispatches them together.
  *
  *  Batching behavior:
  *  - Batch size < @c min_batch_size: Wait for more requests (up to @c max_latency_microseconds).
@@ -579,9 +601,9 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
  *  - Batch size >= @c max_batch_size: Force dispatch (prevent unbounded growth).
  *
  *  Requests from every event loop share one queue per batch endpoint. The callback receives a
- *  counted array of request handles on the thread draining that endpoint through
+ *  counted array of request handles on the thread polling that endpoint through
  *  @c ucall_server_take_batch() or @c ucall_server_take_batches(), never on an event loop.
- *  Registration returns the endpoint's handle, so each endpoint can have its own draining thread.
+ *  Registration returns the endpoint's handle, so each endpoint can have its own polling thread.
  *  Copy the request handles into application-owned storage to process them later; received bytes
  *  need no copy.
  *
@@ -626,6 +648,7 @@ typedef struct ucall_server_add_websocket_endpoint_t {
  *  events (open, message, error, close) on the application polling caller.
  *
  *  @note Call during setup only, before any loop is polled.
+ *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
  */
 UCALL_EXPORT void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* arguments);
 
@@ -661,17 +684,46 @@ typedef struct ucall_server_request_path_t {
 /**
  *  @brief Extracts the path of the received request: its target without the query.
  *
- *  The path stays as the peer sent it, percent-encoded and with repeated slashes, which the
- *  segment and parameter accessors skip.
+ *  The path stays as the peer sent it, percent-encoded. Routing and the segment accessors take it
+ *  exactly: @c / holds no segments, every @c / after the first starts one, so @c //a holds an
+ *  empty segment before @c a and a trailing slash adds an empty last one.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c request or the @c path output is @c NULL.
  */
 UCALL_EXPORT void ucall_server_request_path(ucall_server_request_path_t* arguments);
+
+/** Arguments of @c ucall_server_request_query(). */
+typedef struct ucall_server_request_query_t {
+
+    /** The server this call operates on. */
+    ucall_server_t server;
+
+    /** The verb's status, listed on the verb. */
+    ucall_outcome_t* outcome;
+
+    /** The received request inside the @c ucall_received_http_request_callback_t. */
+    ucall_received_http_request_t request;
+
+    /** Output for a borrowed view of the query. */
+    ucall_bytes_view_t* query;
+
+} ucall_server_request_query_t;
+
+/**
+ *  @brief Extracts the query of the received request: its target after the first @c ?, as sent and
+ *      percent-encoded, or empty when it has none.
+ *
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c query output is @c NULL.
+ */
+UCALL_EXPORT void ucall_server_request_query(ucall_server_request_query_t* arguments);
 
 /**
  *  @brief Returns the number of path components of the received request.
@@ -709,8 +761,7 @@ typedef struct ucall_server_request_path_segment_t {
  *
  *  Useful for RESTful APIs with path parameters, e.g., "/users/{id}/posts/{postId}".
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -746,8 +797,7 @@ typedef struct ucall_server_request_path_parameter_t {
  *  a @c name of @c "id" yields @c "7". A greedy wildcard @c {*path} captures the remaining segments
  *  including separators.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -783,8 +833,7 @@ typedef struct ucall_server_request_query_parameter_t {
  *  Unlike HTTP headers, query parameters are case-sensitive by specification, but server-dependent
  *  in practice. An example would be ASP.NET / IIS, which treats "?id" and "?ID" as same parameters.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -817,8 +866,7 @@ typedef struct ucall_server_request_header_t {
 /**
  *  @brief Extracts the named string header from the received request.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -827,6 +875,71 @@ typedef struct ucall_server_request_header_t {
  *  - @c ucall_status_not_found_k The request has no such header.
  */
 UCALL_EXPORT void ucall_server_request_header(ucall_server_request_header_t* arguments);
+
+/** Arguments of @c ucall_server_request_fields_count(). */
+typedef struct ucall_server_request_fields_count_t {
+
+    /** The server this call operates on. */
+    ucall_server_t server;
+
+    /** The verb's status, listed on the verb. */
+    ucall_outcome_t* outcome;
+
+    /** The received request inside the @c ucall_received_http_request_callback_t. */
+    ucall_received_http_request_t request;
+
+    /** Output for the number of header field lines, in arrival order. */
+    size_t* count;
+
+} ucall_server_request_fields_count_t;
+
+/**
+ *  @brief Counts the header field lines of the received request, repeated names included.
+ *
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_invalid_argument_k The @c request or the @c count output is @c NULL.
+ */
+UCALL_EXPORT void ucall_server_request_fields_count(ucall_server_request_fields_count_t* arguments);
+
+/** Arguments of @c ucall_server_request_field(). */
+typedef struct ucall_server_request_field_t {
+
+    /** The server this call operates on. */
+    ucall_server_t server;
+
+    /** The verb's status, listed on the verb. */
+    ucall_outcome_t* outcome;
+
+    /** The received request inside the @c ucall_received_http_request_callback_t. */
+    ucall_received_http_request_t request;
+
+    /** Which field line, below @c ucall_server_request_fields_count(). */
+    size_t index;
+
+    /** Output for a borrowed view of its name, lowercased as the parser keeps every field name. */
+    ucall_bytes_view_t* name;
+
+    /** Output for a borrowed view of its value, without surrounding whitespace. */
+    ucall_bytes_view_t* value;
+
+} ucall_server_request_field_t;
+
+/**
+ *  @brief Extracts one header field line of the received request by its arrival order, as a proxy
+ *      forwards a head whole.
+ *
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
+ *  - @c ucall_status_invalid_argument_k The @c request, the @c name or the @c value output
+ *    is @c NULL.
+ *  - @c ucall_status_not_found_k The @c index is past the last field line.
+ */
+UCALL_EXPORT void ucall_server_request_field(ucall_server_request_field_t* arguments);
 
 /** Arguments of @c ucall_server_request_peer(). */
 typedef struct ucall_server_request_peer_t {
@@ -840,22 +953,25 @@ typedef struct ucall_server_request_peer_t {
     /** A request from any endpoint, plain or batch, until its reply. */
     ucall_received_http_request_t request;
 
-    /** Output for the position of its interface in @c ucall_server_config_t::interfaces. */
+    /** Output for the position of its interface in @c ucall_server_options_t::interfaces. */
     size_t* network_interface_index;
 
     /** Output for the peer's authenticated Noise static key; zeroed on plaintext interfaces. */
     ucall_noise_key_t* static_key;
 
+    /** Output for the peer's socket address as accepted. */
+    ucall_peer_address_t* address;
+
 } ucall_server_request_peer_t;
 
 /**
- *  @brief Reports which interface a request arrived on and which authenticated key sent it.
+ *  @brief Reports which interface a request arrived on, which authenticated key sent it, and from
+ *      which socket address.
  *
- *  Both facts are copied when the request is received, so they remain readable after its
+ *  All three are copied when the request is received, so they remain readable after its
  *  connection closes, as batched requests often outlive theirs.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -869,7 +985,7 @@ typedef struct ucall_server_request_body_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -885,8 +1001,7 @@ typedef struct ucall_server_request_body_t {
  *
  *  A streamed endpoint's body is pulled through @c ucall_server_request_body_chunk() instead.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -928,8 +1043,7 @@ typedef struct ucall_server_request_body_chunk_t {
  *  @warning The returned @c data is valid only until the next call on this @c request.
  *  @sa Use @c ucall_server_request_body() for endpoints that are not registered as streaming.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -958,7 +1072,7 @@ typedef struct ucall_server_request_part_t {
     /** The server this call operates on. */
     ucall_server_t server;
 
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
+    /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
     /** The received request inside the @c ucall_received_http_request_callback_t. */
@@ -984,8 +1098,7 @@ typedef struct ucall_server_request_part_t {
  *  The payload is handed over without decoding. Media formats are the application's concern - pass
  *  @c data straight to an image or video decoder to keep the path copy-free.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -1008,33 +1121,32 @@ typedef struct ucall_server_reply_content_t {
     /** The received request to reply to. */
     ucall_received_http_request_t request;
 
+    /** Response status. Zero sends @c ucall_http_status_ok_k. */
+    ucall_http_status_t http_status;
+
     /** Every HTTP header line, each as a counted byte view. */
     ucall_bytes_view_t const* headers;
 
     /** Number of counted header lines. */
     size_t headers_count;
 
-    /** Response body content. Can be NULL for empty body. */
+    /** Response body content. Empty for an empty body. */
     ucall_bytes_view_t body;
-
-    /** Response status. Zero sends @c ucall_http_status_ok_k. */
-    ucall_http_status_t http_status;
 
 } ucall_server_reply_content_t;
 
 /**
  *  @brief Sends an HTTP response with custom headers and body.
  *
- *  Automatically sets standard headers: @c Content-Length, @c Date, @c Server.
+ *  Automatically sets standard headers: @c Content-Length, @c Date, @c Server, @c Connection.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a view is invalid, a status of
- *    204 or 304 carries a body, the @c http_status is outside 200 to 599, or a header line is
- *    malformed or sets @c Content-Length, @c Transfer-Encoding, @c Date or @c Server.
+ *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a view is invalid, a 204 or 304
+ *    carries a body, the @c http_status is outside 200 to 599, or a header line is malformed or
+ *    sets a length, a transfer encoding, a date, a server name or a connection.
  *  - @c ucall_status_already_exists_k The request was already answered.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_overflow_k The reply's length overflows its counter.
@@ -1067,8 +1179,7 @@ typedef struct ucall_server_reply_error_t {
  *  Automatically sets @c Content-Type: @c text/plain. For errors requiring custom headers, use @c
  *  ucall_server_reply_content() instead.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -1198,21 +1309,20 @@ typedef struct ucall_server_reply_vectored_t {
  *  missing, unreadable or irregular file, @c 416 for a range past its end, @c 500 otherwise. A part
  *  failing after the head resets the connection.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a part, a view or a range's end
- *    is invalid, a descriptor reads buffered, a path leaves its directories, the status is outside
- *    200 to 599, or a 204 or 304 carries a body.
- *  - @c ucall_status_invalid_argument_k A header line is malformed or sets a length, a transfer
- *    encoding, a date or a server name.
  *  - @c ucall_status_overflow_k A range runs past the end of its file, published by the event loop
  *    once it measured the file.
  *  - @c ucall_status_already_exists_k The request was already answered.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_not_found_k A file is missing, unreadable or irregular.
+ *
+ *  @c ucall_status_invalid_argument_k answers a @c NULL @c request, an invalid part, view or range
+ *  end, a descriptor that reads buffered, a path leaving its directories, a status outside 200 to
+ *  599, a 204 or 304 with a body, and a header line that is malformed or sets a length, a transfer
+ *  encoding, a date or a server name.
  */
 UCALL_EXPORT void ucall_server_reply_vectored(ucall_server_reply_vectored_t* arguments);
 
@@ -1250,14 +1360,14 @@ typedef struct ucall_server_reply_begin_t {
  *  it gets a body delimited by closing the connection. A @c HEAD request, @c 204 and @c 304 carry
  *  no body: chunks for a @c HEAD request are accepted and dropped.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, the @c http_status is outside
- *    200 to 599, a header line is malformed or sets @c Transfer-Encoding, @c Date or @c Server, the
- *    declared @c Content-Length is no decimal number, or a status of 204 or 304 declares one.
+ *    200 to 599, a header line is malformed or sets @c Transfer-Encoding, @c Date, @c Server or
+ *    @c Connection, the declared @c Content-Length is no decimal number, or a status of 204 or 304
+ *    declares one.
  *  - @c ucall_status_already_exists_k The request was already answered.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_overflow_k The head's length overflows its counter.
@@ -1292,23 +1402,22 @@ typedef struct ucall_server_reply_append_t {
  *
  *  A file or path part that fails once the head left resets the connection.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, its reply was not begun or
- *    already ended, a part, a view or a range's end is invalid, a descriptor reads buffered, or a
- *    path leaves its directories.
- *  - @c ucall_status_invalid_argument_k A zero-length file or path part comes on a stream with a
- *    declared length, as its size is unknown, a 204 or 304 gets a body, or one call brings more
- *    file and path parts than may wait.
  *  - @c ucall_status_overflow_k The parts' length overflows its counter, or parts would run past a
  *    declared @c Content-Length.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_would_block_k Nothing was queued, as the bytes parts already queued for this
  *    request and not yet taken by the socket exceed the bytes a reading peer takes per round trip,
  *    or too many file and path parts wait; retry once the peer catches up.
+ *
+ *  @c ucall_status_invalid_argument_k answers a @c NULL @c request, a reply not begun or already
+ *  ended, an invalid part, view or range end, a descriptor that reads buffered, a path leaving
+ *  its directories, a zero-length file or path part on a stream with a declared length, as its
+ *  size is unknown, a 204 or 304 that gets a body, and one call bringing more file and path parts
+ *  than may wait.
  */
 UCALL_EXPORT void ucall_server_reply_append(ucall_server_reply_append_t* arguments);
 
@@ -1337,8 +1446,7 @@ typedef struct ucall_server_reply_end_t {
  *  While file or path parts are still unsent, the outcome reads @c ucall_status_deferred_k on
  *  return, and the event loop publishes success once they are sent, or the cause of a failure.
  *
- *  @note @b Thread-safe across requests. Two threads must not operate on the @b same @c request
- *      concurrently.
+ *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
@@ -1378,6 +1486,7 @@ typedef struct ucall_server_websocket_send_t {
  *  Thread-safe, can be called from any thread including from within the callback itself.
  *
  *  @note @b Thread-safe.
+ *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
  */
 UCALL_EXPORT void ucall_server_websocket_send(ucall_server_websocket_send_t* arguments);
 
@@ -1401,6 +1510,7 @@ typedef struct ucall_server_websocket_close_t {
  *  Thread-safe, can be called from any thread including from within the callback itself.
  *
  *  @note @b Thread-safe.
+ *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
  */
 UCALL_EXPORT void ucall_server_websocket_close(ucall_server_websocket_close_t* arguments);
 

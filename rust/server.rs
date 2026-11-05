@@ -4,8 +4,8 @@
 //! UCall starts no threads. Each event loop is driven by one application thread at a time
 //! through [`Server::take_call`] or [`Server::take_calls`], and each batch endpoint by one thread
 //! at a time through [`BatchEndpoint::take_batch`] or [`BatchEndpoint::take_batches`]. Plain
-//! handlers run on the polling thread, batch handlers on the draining thread, and either may hand
-//! its [`Request`] to any other thread to reply.
+//! handlers run on the polling thread, batch handlers on their endpoint's polling owner, and
+//! either may hand its [`Request`] to any other thread to reply.
 //!
 //! File: rust/server.rs
 //! Author: Ash Vardanian
@@ -21,19 +21,20 @@ use core::ops::Deref;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
 use core::time::Duration;
+use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::types::{
-    check, fail, lend_authorizer, lend_log, microseconds, pending_outcome, ucall_body_delivery_t,
+    check, fail, lend_authorizer, lend_log, microseconds, ucall_body_delivery_t,
     ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t,
     ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t,
-    ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t,
-    ucall_security_mode_t, ucall_server_t, ucall_status_already_exists_k,
-    ucall_status_connection_closed_k, ucall_status_deferred_k, ucall_status_invalid_argument_k,
-    ucall_status_out_of_memory_k, ucall_status_success_k, ucall_status_uninitialized_k,
-    ucall_verb_t, view, viewed, Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor,
-    HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb,
+    ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t, ucall_security_t,
+    ucall_server_t, ucall_status_already_exists_k, ucall_status_connection_closed_k,
+    ucall_status_deferred_k, ucall_status_invalid_argument_k, ucall_status_out_of_memory_k,
+    ucall_status_success_k, ucall_status_uninitialized_k, ucall_verb_t, view, viewed, Backend,
+    BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, HTTPStatus, Log, NoiseKey,
+    PeerAuthorizer, Result, Security, Status, Verb,
 };
 
 // region: Raw Declarations
@@ -42,8 +43,9 @@ use crate::types::{
 #[derive(Clone, Copy)]
 struct ucall_network_interface_t {
     address: ucall_bytes_view_t,
+    listen_descriptor: *const isize,
     device_name: ucall_bytes_view_t,
-    security_mode: ucall_security_mode_t,
+    security: ucall_security_t,
     noise_private_key: *const ucall_noise_key_t,
     noise_peer_key: *const ucall_noise_key_t,
     peer_authorizer: ucall_peer_authorizer_t,
@@ -58,7 +60,7 @@ struct ucall_network_interface_t {
 
 #[repr(C)]
 #[derive(Clone, Copy)]
-struct ucall_server_config_t {
+struct ucall_server_options_t {
     interfaces: *const ucall_network_interface_t,
     interfaces_count: usize,
     log: ucall_log_t,
@@ -76,8 +78,8 @@ struct ucall_server_config_t {
 struct ucall_server_init_t {
     server: *mut ucall_server_t,
     outcome: *mut ucall_outcome_t,
-    config: *const ucall_server_config_t,
-    resolved: *mut ucall_server_config_t,
+    options: *const ucall_server_options_t,
+    resolved: *mut ucall_server_options_t,
 }
 
 #[repr(C)]
@@ -188,12 +190,49 @@ type ucall_server_request_query_parameter_t = ucall_server_request_path_paramete
 type ucall_server_request_header_t = ucall_server_request_path_parameter_t;
 
 #[repr(C)]
+struct ucall_server_request_query_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    query: *mut ucall_bytes_view_t,
+}
+
+#[repr(C)]
+struct ucall_server_request_fields_count_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    count: *mut usize,
+}
+
+#[repr(C)]
+struct ucall_server_request_field_t {
+    server: ucall_server_t,
+    outcome: *mut ucall_outcome_t,
+    request: ucall_received_http_request_t,
+    index: usize,
+    name: *mut ucall_bytes_view_t,
+    value: *mut ucall_bytes_view_t,
+}
+
+#[repr(C)]
 struct ucall_server_request_peer_t {
     server: ucall_server_t,
     outcome: *mut ucall_outcome_t,
     request: ucall_received_http_request_t,
     network_interface_index: *mut usize,
     static_key: *mut ucall_noise_key_t,
+    address: *mut ucall_peer_address_t,
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, Default)]
+struct ucall_peer_address_t {
+    bytes: [u8; 16],
+    scope: u32,
+    port: u16,
+    family: u8,
+    reserved: u8,
 }
 
 #[repr(C)]
@@ -209,10 +248,10 @@ struct ucall_server_reply_content_t {
     server: ucall_server_t,
     outcome: *mut ucall_outcome_t,
     request: ucall_received_http_request_t,
+    http_status: ucall_http_status_t,
     headers: *const ucall_bytes_view_t,
     headers_count: usize,
     body: ucall_bytes_view_t,
-    http_status: ucall_http_status_t,
 }
 
 #[repr(C)]
@@ -355,6 +394,9 @@ extern "C" {
     fn ucall_server_request_path_parameter(arguments: *mut ucall_server_request_path_parameter_t);
     fn ucall_server_request_query_parameter(arguments: *mut ucall_server_request_query_parameter_t);
     fn ucall_server_request_header(arguments: *mut ucall_server_request_header_t);
+    fn ucall_server_request_fields_count(arguments: *mut ucall_server_request_fields_count_t);
+    fn ucall_server_request_field(arguments: *mut ucall_server_request_field_t);
+    fn ucall_server_request_query(arguments: *mut ucall_server_request_query_t);
     fn ucall_server_request_peer(arguments: *mut ucall_server_request_peer_t);
     fn ucall_server_request_body(arguments: *mut ucall_server_request_body_t);
     fn ucall_server_request_body_chunk(arguments: *mut ucall_server_request_body_chunk_t);
@@ -386,7 +428,7 @@ extern "C" {
 /// let plain = Interface::new("127.0.0.1:0");
 /// let sealed = Interface::new("127.0.0.1:0")
 ///     .security(Security::NoiseXX, private_key)
-///     .peer_authorizer(|client_key: &NoiseKey| client_key != &[0; 32]);
+///     .peer_authorizer(|noise_private_key: &NoiseKey| noise_private_key != &[0; 32]);
 /// let server = Server::new(&[plain, sealed])?;
 /// assert!(server.address(1).is_some());
 /// # Ok::<(), ucall::Error>(())
@@ -394,9 +436,10 @@ extern "C" {
 #[derive(Clone)]
 pub struct Interface {
     address: String,
+    listen_descriptor: Option<isize>,
     device_name: Option<String>,
     security: Security,
-    private_key: Option<NoiseKey>,
+    noise_private_key: Option<NoiseKey>,
     noise_peer_key: Option<NoiseKey>,
     peer_authorizer: Option<Arc<PeerAuthorizer>>,
     event_loops: usize,
@@ -412,9 +455,10 @@ impl Interface {
     pub fn new(address: impl Into<String>) -> Self {
         Interface {
             address: address.into(),
+            listen_descriptor: None,
             device_name: None,
             security: Security::None,
-            private_key: None,
+            noise_private_key: None,
             noise_peer_key: None,
             peer_authorizer: None,
             event_loops: 0,
@@ -422,6 +466,27 @@ impl Interface {
             pipelined_requests: 0,
             max_request_bytes: 0,
             reply_directories: Vec::new(),
+        }
+    }
+
+    /// An interface accepting on a listening stream socket another owner opened, such as a
+    /// `TcpListener`, a `UnixListener` or one systemd passed in; the server accepts on duplicates
+    /// and never closes `listener`, which must outlive [`Server::new`].
+    #[cfg(unix)]
+    pub fn listening(listener: &impl std::os::fd::AsRawFd) -> Self {
+        Interface {
+            listen_descriptor: Some(listener.as_raw_fd() as isize),
+            ..Interface::new("")
+        }
+    }
+
+    /// An interface accepting on a listening stream socket another owner opened; the server
+    /// accepts on duplicates and never closes `listener`, which must outlive [`Server::new`].
+    #[cfg(windows)]
+    pub fn listening(listener: &impl std::os::windows::io::AsRawSocket) -> Self {
+        Interface {
+            listen_descriptor: Some(listener.as_raw_socket() as isize),
+            ..Interface::new("")
         }
     }
 
@@ -435,7 +500,7 @@ impl Interface {
     /// and `NoiseKK` the initiator's key.
     pub fn security(mut self, security: Security, private_key: NoiseKey) -> Self {
         self.security = security;
-        self.private_key = Some(private_key);
+        self.noise_private_key = Some(private_key);
         self
     }
 
@@ -526,9 +591,9 @@ pub struct Metrics {
 
 /// The library's server handle and what its configuration points at, shared by the [`Server`],
 /// its routes and batch endpoints, and every retained [`Request`], so the last of them frees it.
-struct ServerCore {
-    raw: ucall_server_t,
-    resolved: ucall_server_config_t,
+pub(crate) struct ServerCore {
+    pub(crate) raw: ucall_server_t,
+    resolved: ucall_server_options_t,
     // Interface and log callback contexts must outlive the handle, which `Drop` frees before its
     // fields.
     _authorizers: Vec<Option<Arc<PeerAuthorizer>>>,
@@ -555,7 +620,7 @@ impl Drop for ServerCore {
     }
 }
 
-/// One thread's exclusive turn at polling an event loop or draining a batch endpoint, released
+/// One thread's exclusive turn at polling an event loop or a batch endpoint, released
 /// when the polling call returns.
 struct Claim<'owner>(&'owner AtomicBool);
 
@@ -595,6 +660,16 @@ unsafe extern "C" fn route_trampoline(
     };
     // Unwinding drops the request, which answers 500.
     let _ = catch_unwind(AssertUnwindSafe(|| (route.handler)(request)));
+}
+
+/// What [`Server::take_call`] found of its event loop.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Polling {
+    /// The loop serves, or drains what it holds after a stop.
+    Serving,
+    /// The loop drained or cut everything after [`Server::stop`], so a caller polling in slices
+    /// stops.
+    Retired,
 }
 
 /// An HTTP server over one or more interfaces, polled by application threads.
@@ -637,6 +712,10 @@ unsafe impl Send for Server {}
 unsafe impl Sync for Server {}
 
 impl Server {
+    /// The shared handle a bound client keeps alive.
+    pub(crate) fn core(&self) -> Arc<ServerCore> {
+        Arc::clone(&self.core)
+    }
     /// Starts a server answering on `interfaces`, with the automatic backend and CPU class.
     pub fn new(interfaces: &[Interface]) -> Result<Server> {
         Server::with_options(interfaces, ServerOptions::default())
@@ -670,10 +749,14 @@ impl Server {
                 let (peer_authorizer, peer_authorizer_context) = lend_authorizer(authorizer);
                 ucall_network_interface_t {
                     address: view(interface.address.as_bytes()),
+                    listen_descriptor: interface
+                        .listen_descriptor
+                        .as_ref()
+                        .map_or(ptr::null(), ptr::from_ref),
                     device_name: view(interface.device_name.as_deref().unwrap_or("").as_bytes()),
-                    security_mode: interface.security.to_raw(),
+                    security: interface.security.to_raw(),
                     noise_private_key: interface
-                        .private_key
+                        .noise_private_key
                         .as_ref()
                         .map_or(ptr::null(), ptr::from_ref),
                     noise_peer_key: interface
@@ -698,7 +781,7 @@ impl Server {
             .iter()
             .map(|tag| view(tag.as_bytes()))
             .collect();
-        let config = ucall_server_config_t {
+        let config = ucall_server_options_t {
             interfaces: raw_interfaces.as_ptr(),
             interfaces_count: raw_interfaces.len(),
             log: lend_log(&log),
@@ -713,11 +796,11 @@ impl Server {
         };
         let mut raw: ucall_server_t = ptr::null_mut();
         let mut resolved = config;
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_init_t {
             server: &mut raw,
             outcome: &mut outcome,
-            config: &config,
+            options: &config,
             resolved: &mut resolved,
         };
         unsafe { ucall_server_init(&mut arguments) };
@@ -793,7 +876,7 @@ impl Server {
             server: Arc::clone(&self.core),
             handler: Box::new(handler),
         }));
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_add_http_endpoint_t {
             server: self.core.raw,
             outcome: &mut outcome,
@@ -875,7 +958,7 @@ impl Server {
             requests: Vec::new(),
         }));
         let mut raw: ucall_http_batch_endpoint_t = ptr::null_mut();
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_add_http_batch_endpoint_t {
             server: self.core.raw,
             outcome: &mut outcome,
@@ -893,7 +976,7 @@ impl Server {
             server: self.core.raw,
             raw,
             state,
-            drained: AtomicBool::new(false),
+            polled: AtomicBool::new(false),
         };
         check(outcome)?;
         Ok(endpoint)
@@ -909,12 +992,13 @@ impl Server {
     }
 
     /// Advances one event loop, running the handlers of the requests it completes on this thread,
-    /// and waits up to `timeout` for progress; zero performs one nonblocking round.
+    /// and waits up to `timeout` for progress; zero performs one nonblocking round. Answers
+    /// [`Polling::Retired`] once the loop has nothing left to take after [`Server::stop`].
     ///
     /// Fails with [`Status::Contended`] while another thread polls the same loop.
-    pub fn take_call(&self, event_loop: usize, timeout: Duration) -> Result<()> {
+    pub fn take_call(&self, event_loop: usize, timeout: Duration) -> Result<Polling> {
         let _claim = self.claim(event_loop)?;
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_take_call_t {
             server: self.core.raw,
             outcome: &mut outcome,
@@ -922,7 +1006,10 @@ impl Server {
             timeout_microseconds: microseconds(timeout),
         };
         unsafe { ucall_server_take_call(&mut arguments) };
-        check(outcome)
+        match check(outcome) {
+            Err(error) if error.status == Status::ConnectionClosed => Ok(Polling::Retired),
+            result => result.map(|()| Polling::Serving),
+        }
     }
 
     /// Drives one event loop on this thread until [`Server::stop`] or an I/O failure.
@@ -930,7 +1017,7 @@ impl Server {
     /// Fails with [`Status::Contended`] while another thread polls the same loop.
     pub fn take_calls(&self, event_loop: usize) -> Result<()> {
         let _claim = self.claim(event_loop)?;
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_take_calls_t {
             server: self.core.raw,
             outcome: &mut outcome,
@@ -940,8 +1027,11 @@ impl Server {
         check(outcome)
     }
 
-    /// Requests shutdown and wakes every polling and draining thread; callable from any thread,
+    /// Requests shutdown and wakes every polling thread; callable from any thread,
     /// including from inside a handler.
+    ///
+    /// The first call drains: no new connections, idle ones close, and the requests already held
+    /// are answered before their connections close. A second call cuts the replies still in flight.
     pub fn stop(&self) {
         unsafe { ucall_server_stop(self.core.raw) }
     }
@@ -951,7 +1041,7 @@ impl Server {
     /// Fails with [`Status::InvalidArgument`] for an index past the last loop.
     pub fn event_loop_statistics(&self, event_loop: usize) -> Result<EventLoopStatistics> {
         let mut statistics = EventLoopStatistics::default();
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_event_loop_statistics_t {
             server: self.core.raw,
             outcome: &mut outcome,
@@ -1027,7 +1117,7 @@ pub struct EventLoopStatistics {
     pub ready_passes: u64,
     /// Replied exchanges the loop took from its queue to adopt their reply segments.
     pub replied_dequeues: u64,
-    /// Requests the loop answered itself with 400, 404, 413, 501 or 503.
+    /// Requests the loop answered itself with 400, 404, 405, 413, 501, 503 or 505.
     pub refused_requests: u64,
     /// Connections whose Noise handshake failed.
     pub handshake_failures: u64,
@@ -1050,7 +1140,7 @@ pub struct Batching {
 /// Counters of one batch endpoint since registration: how large its batches were, and why each
 /// was dispatched.
 ///
-/// Each counter is read on its own, so a snapshot of an endpoint being drained is not one
+/// Each counter is read on its own, so a snapshot of an endpoint being polled is not one
 /// instant. Requests released by [`Server::stop`] count nowhere.
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
@@ -1076,7 +1166,7 @@ struct BatchState {
 }
 
 /// # Safety
-/// `context` must address the [`BatchState`] of the endpoint being drained, which its draining
+/// `context` must address the [`BatchState`] of the endpoint being polled, which its polling
 /// claim borrows exclusively, and `requests` a counted array of its server's retained handles.
 unsafe extern "C" fn batch_trampoline(
     requests: *const ucall_received_http_request_t,
@@ -1099,7 +1189,7 @@ unsafe extern "C" fn batch_trampoline(
     state.requests.clear();
 }
 
-/// One batch endpoint, drained by one thread at a time and observable from any.
+/// One batch endpoint, polled by one thread at a time and observable from any.
 ///
 /// Requests from every event loop share its queue, so one thread drains what all of them
 /// received. Dropping it leaves its queued requests unanswered until the server is freed, and the
@@ -1120,8 +1210,8 @@ unsafe extern "C" fn batch_trampoline(
 /// let address = server.address(0).unwrap().to_owned();
 ///
 /// let mut client = Client::new(ClientOptions { connections: 2, ..Default::default() })?;
-/// client.submit(CallRequest::post(format!("http://{address}/score"), b"four".as_slice()), 0)?;
-/// client.submit(CallRequest::post(format!("http://{address}/score"), b"seven..".as_slice()), 1)?;
+/// client.submit(ClientCall::post(format!("http://{address}/score"), b"four".as_slice()), 0)?;
+/// client.submit(ClientCall::post(format!("http://{address}/score"), b"seven..".as_slice()), 1)?;
 /// std::thread::scope(|scope| {
 ///     scope.spawn(|| server.take_calls(0));
 ///     scope.spawn(|| scores.take_batches());
@@ -1144,10 +1234,10 @@ pub struct BatchEndpoint {
     server: ucall_server_t,
     raw: ucall_http_batch_endpoint_t,
     state: *mut BatchState,
-    drained: AtomicBool,
+    polled: AtomicBool,
 }
 
-// The handler is `Send + Sync`, and the draining claim keeps the state to one thread at a time.
+// The handler is `Send + Sync`, and the polling claim keeps the state to one thread at a time.
 unsafe impl Send for BatchEndpoint {}
 unsafe impl Sync for BatchEndpoint {}
 
@@ -1158,10 +1248,10 @@ impl BatchEndpoint {
     /// Fails with [`Status::Contended`] while another thread drains the same endpoint.
     pub fn take_batch(&self, timeout: Duration) -> Result<()> {
         let _claim = Claim::take(
-            &self.drained,
-            "another thread is draining this batch endpoint",
+            &self.polled,
+            "another thread is polling this batch endpoint",
         )?;
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_take_batch_t {
             server: self.server,
             outcome: &mut outcome,
@@ -1178,10 +1268,10 @@ impl BatchEndpoint {
     /// Fails with [`Status::Contended`] while another thread drains the same endpoint.
     pub fn take_batches(&self) -> Result<()> {
         let _claim = Claim::take(
-            &self.drained,
-            "another thread is draining this batch endpoint",
+            &self.polled,
+            "another thread is polling this batch endpoint",
         )?;
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_take_batches_t {
             server: self.server,
             outcome: &mut outcome,
@@ -1191,10 +1281,10 @@ impl BatchEndpoint {
         check(outcome)
     }
 
-    /// A snapshot of the endpoint's counters, readable from any thread while it is drained.
+    /// A snapshot of the endpoint's counters, readable from any thread while it is polled.
     pub fn statistics(&self) -> Result<BatchEndpointStatistics> {
         let mut statistics = BatchEndpointStatistics::default();
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_batch_endpoint_statistics_t {
             server: self.server,
             outcome: &mut outcome,
@@ -1208,7 +1298,7 @@ impl BatchEndpoint {
 
 impl Drop for BatchEndpoint {
     fn drop(&mut self) {
-        // Only this endpoint's draining calls run its handler, and none can be in progress.
+        // Only this endpoint's polling calls run its handler, and none can be in progress.
         drop(unsafe { Box::from_raw(self.state) });
     }
 }
@@ -1265,6 +1355,41 @@ pub struct Peer {
     pub network_interface_index: usize,
     /// The client's authenticated Noise static key, zeroed on plaintext interfaces.
     pub static_key: NoiseKey,
+    /// The socket address the connection was accepted from.
+    pub address: PeerAddress,
+}
+
+/// The socket address a peer connected from, as its connection was accepted.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PeerAddress {
+    /// The engine reported no address the library knows.
+    Unknown,
+    /// An IPv4 or IPv6 address and port, with the IPv6 scope.
+    Ip(SocketAddr),
+    /// An AF_UNIX peer, which binds no path.
+    Unix,
+}
+
+impl PeerAddress {
+    fn from_raw(raw: &ucall_peer_address_t) -> PeerAddress {
+        match raw.family {
+            1 => {
+                let octets = [raw.bytes[0], raw.bytes[1], raw.bytes[2], raw.bytes[3]];
+                PeerAddress::Ip(SocketAddr::V4(SocketAddrV4::new(
+                    Ipv4Addr::from(octets),
+                    raw.port,
+                )))
+            }
+            2 => PeerAddress::Ip(SocketAddr::V6(SocketAddrV6::new(
+                Ipv6Addr::from(raw.bytes),
+                raw.port,
+                0,
+                raw.scope,
+            ))),
+            3 => PeerAddress::Unix,
+            _ => PeerAddress::Unknown,
+        }
+    }
 }
 
 /// One received HTTP request, retained until a reply consumes it.
@@ -1282,17 +1407,20 @@ pub struct Peer {
 /// server.get("/users/{name}", move |request: Request| handed.send(request).unwrap())?;
 /// let address = server.address(0).unwrap().to_owned();
 ///
-/// let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
-/// std::thread::scope(|scope| {
-///     scope.spawn(|| server.take_calls(0));
-///     scope.spawn(move || {
-///         let request = received.recv().unwrap();
+/// // The worker outlives the scope, as the sender it waits on lives in the server's handler.
+/// std::thread::spawn(move || {
+///     for request in received {
 ///         let name = request.path_parameter("name").unwrap_or_default();
 ///         let greeting = [b"Hello, ", name].concat();
 ///         let _ = request.reply(HTTPStatus::OK, &[], &greeting);
-///     });
+///     }
+/// });
+/// let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
+/// std::thread::scope(|scope| {
+///     let polling = scope.spawn(|| server.take_calls(0));
 ///     let response = client.get(format!("http://{address}/users/ada?verbose=1"));
 ///     server.stop();
+///     polling.join().unwrap()?;
 ///     assert_eq!(response?.body(), b"Hello, ada");
 ///     Ok::<(), Error>(())
 /// })?;
@@ -1315,7 +1443,7 @@ impl Request {
     /// The request path as sent, still percent-encoded, without the query.
     pub fn path(&self) -> &[u8] {
         let mut path = view(&[]);
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_request_path_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1333,7 +1461,7 @@ impl Request {
         name: &str,
     ) -> Option<&[u8]> {
         let mut value = view(&[]);
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_request_path_parameter_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1360,10 +1488,54 @@ impl Request {
         self.named(ucall_server_request_header, name)
     }
 
+    /// Every header field line in arrival order, repeated names apart: each name lowercased as
+    /// the parser keeps it, and its value trimmed.
+    pub fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
+        let mut count = 0;
+        let mut outcome = ucall_outcome_t::default();
+        let mut arguments = ucall_server_request_fields_count_t {
+            server: self.server.raw,
+            outcome: &mut outcome,
+            request: self.raw,
+            count: &mut count,
+        };
+        unsafe { ucall_server_request_fields_count(&mut arguments) };
+        (0..count).map_while(move |index| {
+            let (mut name, mut value) = (view(&[]), view(&[]));
+            let mut outcome = ucall_outcome_t::default();
+            let mut arguments = ucall_server_request_field_t {
+                server: self.server.raw,
+                outcome: &mut outcome,
+                request: self.raw,
+                index,
+                name: &mut name,
+                value: &mut value,
+            };
+            unsafe { ucall_server_request_field(&mut arguments) };
+            check(outcome)
+                .ok()
+                .map(|()| unsafe { (viewed(name), viewed(value)) })
+        })
+    }
+
+    /// The query after the first `?`, still percent-encoded, or empty without one.
+    pub fn query_string(&self) -> &[u8] {
+        let mut query = view(&[]);
+        let mut outcome = ucall_outcome_t::default();
+        let mut arguments = ucall_server_request_query_t {
+            server: self.server.raw,
+            outcome: &mut outcome,
+            request: self.raw,
+            query: &mut query,
+        };
+        unsafe { ucall_server_request_query(&mut arguments) };
+        unsafe { viewed(query) }
+    }
+
     /// The request body, decoded from chunked framing if it arrived that way.
     pub fn body(&self) -> &[u8] {
         let mut body = view(&[]);
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_request_body_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1377,20 +1549,24 @@ impl Request {
     /// The interface the request arrived on and the sender's authenticated static key, readable
     /// after its connection closed.
     pub fn peer(&self) -> Peer {
-        let mut peer = Peer {
-            network_interface_index: 0,
-            static_key: [0; 32],
-        };
-        let mut outcome = pending_outcome();
+        let mut network_interface_index = 0;
+        let mut static_key = [0; 32];
+        let mut address = ucall_peer_address_t::default();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_request_peer_t {
             server: self.server.raw,
             outcome: &mut outcome,
             request: self.raw,
-            network_interface_index: &mut peer.network_interface_index,
-            static_key: &mut peer.static_key,
+            network_interface_index: &mut network_interface_index,
+            static_key: &mut static_key,
+            address: &mut address,
         };
         unsafe { ucall_server_request_peer(&mut arguments) };
-        peer
+        Peer {
+            network_interface_index,
+            static_key,
+            address: PeerAddress::from_raw(&address),
+        }
     }
 
     /// Path components in order, as sent and still percent-encoded.
@@ -1401,7 +1577,7 @@ impl Request {
     /// Path component `index`, counting from zero, or `None` past the last one.
     pub fn path_segment(&self, index: usize) -> Option<&[u8]> {
         let mut segment = view(&[]);
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_request_path_segment_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1424,7 +1600,7 @@ impl Request {
     /// when the body is no well-formed multipart body.
     pub fn part(&self, index: usize) -> Result<RequestPart<'_>> {
         let (mut name, mut content_type, mut data) = (view(&[]), view(&[]), view(&[]));
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_request_part_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1462,7 +1638,7 @@ impl Request {
         self,
         reply: impl FnOnce(ucall_server_t, ucall_received_http_request_t, *mut ucall_outcome_t),
     ) -> Result<()> {
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         reply(self.server.raw, self.raw, &mut outcome);
         match unsafe { ucall_outcome_status(&mut outcome) } {
             ucall_status_success_k | ucall_status_connection_closed_k => self.release(),
@@ -1531,7 +1707,7 @@ impl Request {
 
 impl Drop for Request {
     fn drop(&mut self) {
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_reply_error_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1618,18 +1794,21 @@ const _: () = assert!(
 /// server.get("/clip", move |request: Request| handed.send(request.detach()).unwrap())?;
 /// let address = server.address(0).unwrap().to_owned();
 ///
-/// let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
-/// std::thread::scope(|scope| {
-///     scope.spawn(|| server.take_calls(0));
-///     scope.spawn(move || {
-///         let detached = received.recv().unwrap();
+/// // The worker outlives the scope, as the sender it waits on lives in the server's handler.
+/// std::thread::spawn(move || {
+///     for detached in received {
 ///         let parts = [ReplyPart::Bytes(b"frame".into())];
 ///         if let Ok(Some(deferred)) = detached.reply_parts(HTTPStatus::OK, &[], &parts) {
 ///             let _ = deferred.wait(); // or: deferred.await
 ///         }
-///     });
+///     }
+/// });
+/// let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
+/// std::thread::scope(|scope| {
+///     let polling = scope.spawn(|| server.take_calls(0));
 ///     let response = client.get(format!("http://{address}/clip"));
 ///     server.stop();
+///     polling.join().unwrap()?;
 ///     assert_eq!(response?.body(), b"frame");
 ///     Ok::<(), Error>(())
 /// })?;
@@ -1697,7 +1876,7 @@ impl DetachedRequest {
         status: HTTPStatus,
         headers: &[BytesView<'_>],
     ) -> Result<ReplyStream<'f>> {
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_reply_begin_t {
             server: self.0.server.raw,
             outcome: &mut outcome,
@@ -1729,7 +1908,7 @@ impl DetachedRequest {
     /// [`Status::ConnectionClosed`], and a malformed one with [`Status::Malformed`].
     pub fn body_chunk(&mut self) -> Result<&[u8]> {
         let mut data = view(&[]);
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         // One pointer each, as the event loop writes them after the call returns.
         let (data_pointer, outcome_pointer) = (ptr::addr_of_mut!(data), ptr::addr_of_mut!(outcome));
         let mut arguments = ucall_server_request_body_chunk_t {
@@ -1766,7 +1945,7 @@ impl<'f> ReplyStream<'f> {
     /// Fails with [`Status::WouldBlock`], queueing nothing, while the peer lags behind the parts
     /// already queued; retry once it catches up.
     pub fn append(&mut self, parts: &[ReplyPart<'_, 'f>]) -> Result<()> {
-        let mut outcome = pending_outcome();
+        let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_reply_append_t {
             server: self.server.raw,
             outcome: &mut outcome,
@@ -1826,9 +2005,10 @@ mod tests {
     use std::time::Instant;
 
     use super::*;
-    use crate::client::{CallRequest, Client, ClientOptions, Completed, RequestOptions};
+    use crate::client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed};
     use crate::testing::{
-        client, detaching, direct_directory, loopback, open_direct, pattern, serving, Stopping,
+        client, detaching, direct_directory, loopback, next_detached, open_direct, pattern,
+        serving, Stopping,
     };
     use crate::types::{derive_noise_public_key, generate_noise_keypair};
 
@@ -1849,6 +2029,13 @@ mod tests {
                         body.extend_from_slice(&unit);
                         body.push(b' ');
                         body.extend_from_slice(request.path());
+                        body.push(b' ');
+                        body.extend_from_slice(request.query_string());
+                        let hosts = request
+                            .fields()
+                            .filter(|(name, _)| *name == b"host")
+                            .count();
+                        body.extend_from_slice(format!(" {hosts}").as_bytes());
                         let _ = request.reply(
                             HTTPStatus::OK,
                             &["content-type: text/plain".into()],
@@ -1870,7 +2057,10 @@ mod tests {
                 .unwrap();
             assert_eq!(response.status_code(), HTTPStatus::OK);
             assert_eq!(response.header("Content-Type"), Some(&b"text/plain"[..]));
-            assert_eq!(response.body(), b"42 apples /sum/apples");
+            assert_eq!(response.body(), b"42 apples /sum/apples a=2&b=40 1");
+            assert!(response
+                .fields()
+                .any(|field| field == (&b"content-type"[..], &b"text/plain"[..])));
             let refused = client
                 .get(format!("http://{address}/sum/apples?a=2"))
                 .unwrap();
@@ -1879,6 +2069,37 @@ mod tests {
         assert_eq!(server.event_loop_statistics(0).unwrap().requests, 2);
         let past = server.event_loop_statistics(1).unwrap_err();
         assert_eq!(past.status, Status::InvalidArgument);
+    }
+
+    #[test]
+    fn verb_sugar_routes_each_verb() {
+        let answering = |body: &'static [u8]| {
+            move |request: Request| {
+                let _ = request.reply(HTTPStatus::OK, &[], body);
+            }
+        };
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        server.get("/verb", answering(b"get")).unwrap();
+        server.post("/verb", answering(b"post")).unwrap();
+        server.put("/verb", answering(b"put")).unwrap();
+        server.delete("/verb", answering(b"delete")).unwrap();
+        server.patch("/verb", answering(b"patch")).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            let mut client = client(1);
+            let url = format!("http://{address}/verb");
+            for (response, body) in [
+                (client.get(url.clone()), "get"),
+                (client.post(url.clone(), b"".as_slice()), "post"),
+                (client.put(url.clone(), b"".as_slice()), "put"),
+                (client.delete(url.clone()), "delete"),
+                (client.patch(url.clone(), b"".as_slice()), "patch"),
+            ] {
+                let response = response.unwrap();
+                assert_eq!(response.status_code(), HTTPStatus::OK);
+                assert_eq!(response.body(), body.as_bytes());
+            }
+        });
     }
 
     #[test]
@@ -1902,7 +2123,7 @@ mod tests {
             .unwrap();
         let address = server.address(0).unwrap().to_owned();
         std::thread::scope(|scope| {
-            let draining = scope.spawn(|| endpoint.take_batches());
+            let polling = scope.spawn(|| endpoint.take_batches());
             serving(&server, || {
                 let mut client = Client::new(ClientOptions {
                     connections: 1,
@@ -1913,9 +2134,9 @@ mod tests {
                 .unwrap();
                 for context in 0..4u64 {
                     // PUT, because a POST never pipelines behind another one.
-                    let call = CallRequest {
+                    let call = ClientCall {
                         verb: Verb::Put,
-                        ..CallRequest::post(
+                        ..ClientCall::post(
                             format!("http://{address}/score"),
                             vec![b'0' + context as u8],
                         )
@@ -1935,11 +2156,11 @@ mod tests {
                     }
                 }
                 assert_eq!(order, [0, 1, 2, 3]);
-                // The batch was answered, so the draining thread holds the endpoint.
+                // The batch was answered, so the polling thread holds the endpoint.
                 let contended = endpoint.take_batch(Duration::ZERO).unwrap_err();
                 assert_eq!(contended.status, Status::Contended);
             });
-            assert_eq!(draining.join().unwrap(), Ok(()));
+            assert_eq!(polling.join().unwrap(), Ok(()));
         });
         assert_eq!(*sizes.lock().unwrap(), [4]);
         let statistics = endpoint.statistics().unwrap();
@@ -1953,15 +2174,62 @@ mod tests {
         assert_eq!(statistics, expected);
     }
 
+    #[cfg(unix)]
+    #[test]
+    fn unix_listener_echoes() {
+        use std::os::unix::net::{UnixListener, UnixStream};
+
+        let path = std::env::temp_dir().join(format!("ucall-echo-{}.sock", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let listener = UnixListener::bind(&path).unwrap();
+        let mut server = Server::new(&[Interface::listening(&listener)
+            .connections(4)
+            .event_loops(1)])
+        .unwrap();
+        server
+            .post("/echo", |request: Request| {
+                let body = if request.peer().address == PeerAddress::Unix {
+                    request.body().to_vec()
+                } else {
+                    b"not unix".to_vec()
+                };
+                let _ = request.reply(HTTPStatus::OK, &[], &body);
+            })
+            .unwrap();
+        assert_eq!(server.address(0), path.to_str());
+        let body = pattern(64 << 10);
+        serving(&server, || {
+            let mut connection = UnixStream::connect(&path).unwrap();
+            let head = format!(
+                "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+                body.len()
+            );
+            connection.write_all(head.as_bytes()).unwrap();
+            connection.write_all(&body).unwrap();
+            connection
+                .set_read_timeout(Some(Duration::from_secs(5)))
+                .unwrap();
+            let mut response = Vec::new();
+            let mut buffer = [0; 65536];
+            while !response.ends_with(&body) {
+                let read = connection.read(&mut buffer).unwrap();
+                assert_ne!(read, 0, "the server closed after {} bytes", response.len());
+                response.extend_from_slice(&buffer[..read]);
+            }
+            assert!(response.starts_with(b"HTTP/1.1 200 OK\r\n"));
+        });
+        let _ = std::fs::remove_file(&path);
+    }
+
     #[test]
     fn peers_report_their_interface_and_noise_key() {
-        let (server_key, _) = generate_noise_keypair().unwrap();
-        let (client_key, _) = generate_noise_keypair().unwrap();
-        let client_public_key = derive_noise_public_key(&client_key);
+        let (noise_peer_key, _) = generate_noise_keypair().unwrap();
+        let (noise_private_key, _) = generate_noise_keypair().unwrap();
+        let client_public_key = derive_noise_public_key(&noise_private_key);
         let authorized = Arc::new(Mutex::new(None));
         let recorded = Arc::clone(&authorized);
         let noise = loopback(1)
-            .security(Security::NoiseXX, server_key)
+            .security(Security::NoiseXX, noise_peer_key)
             .peer_authorizer(move |key: &NoiseKey| {
                 recorded.lock().unwrap().replace(*key).is_none()
             });
@@ -1969,6 +2237,10 @@ mod tests {
         server
             .get("/peer", |request: Request| {
                 let peer = request.peer();
+                let PeerAddress::Ip(address) = peer.address else {
+                    panic!("a loopback peer reported {:?}", peer.address);
+                };
+                assert!(address.ip().is_loopback() && address.port() != 0);
                 let mut body = peer.static_key.to_vec();
                 body.push(peer.network_interface_index as u8);
                 let _ = request.reply(HTTPStatus::OK, &[], &body);
@@ -1979,7 +2251,7 @@ mod tests {
         serving(&server, || {
             let mut client = Client::new(ClientOptions {
                 connections: 2,
-                private_key: Some(client_key),
+                noise_private_key: Some(noise_private_key),
                 peer_authorizer: Some(Arc::new(|_: &NoiseKey| true)),
                 ..Default::default()
             })
@@ -2034,6 +2306,7 @@ mod tests {
             scope.spawn(|| server.stop());
             assert_eq!(polling.join().unwrap(), Ok(()));
         });
+        assert_eq!(server.take_call(0, Duration::ZERO), Ok(Polling::Retired));
     }
 
     #[test]
@@ -2059,7 +2332,7 @@ mod tests {
                         }),
                         ReplyPart::Bytes(b">".into()),
                     ];
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
                     deferred.expect("a path part defers").wait().unwrap();
                 });
@@ -2087,7 +2360,7 @@ mod tests {
                         offset: 0,
                         length: 0,
                     });
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let deferred = detached
                         .reply_parts(HTTPStatus::OK, &[], &[missing])
                         .unwrap();
@@ -2100,7 +2373,7 @@ mod tests {
                         }
                     };
                     assert_eq!(ended.unwrap_err().status, Status::NotFound);
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let parts = [ReplyPart::Bytes(b"final".into())];
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
                     assert!(deferred.is_none());
@@ -2123,12 +2396,12 @@ mod tests {
         serving(&server, || {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let greeting = [b"Hello, ", detached.path_parameter("name").unwrap()].concat();
                     let parts = [ReplyPart::Bytes(greeting.as_slice().into())];
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
                     assert!(deferred.is_none());
-                    drop(received.recv().unwrap());
+                    drop(next_detached(&received));
                 });
                 let mut client = client(1);
                 let replied = client.get(format!("http://{address}/users/ada")).unwrap();
@@ -2154,7 +2427,7 @@ mod tests {
             std::thread::scope(|scope| {
                 let file = &file;
                 scope.spawn(move || {
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let mut stream = detached.reply_stream(HTTPStatus::OK, &[]).unwrap();
                     stream.append(&[ReplyPart::Bytes(b"<".into())]).unwrap();
                     let range = ReplyPart::File(FileRange {
@@ -2193,7 +2466,7 @@ mod tests {
                         offset: u64::MAX,
                         length: 1,
                     });
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let refused = detached.reply_parts(HTTPStatus::OK, &[], &[overflowing]);
                     assert_eq!(refused.unwrap_err().status, Status::InvalidArgument);
                 });
@@ -2214,7 +2487,7 @@ mod tests {
         serving(&server, || {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
-                    let detached = received.recv().unwrap();
+                    let detached = next_detached(&received);
                     let mut stream = detached.reply_stream(HTTPStatus::OK, &[]).unwrap();
                     for row in 0..3 {
                         let text = format!("row {row}\n");
@@ -2242,7 +2515,7 @@ mod tests {
         serving(&server, || {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
-                    let mut detached = received.recv().unwrap();
+                    let mut detached = next_detached(&received);
                     let mut pulled = Vec::new();
                     loop {
                         let chunk = detached.body_chunk().unwrap();
@@ -2332,9 +2605,9 @@ mod tests {
         serving(&server, || {
             let form: Cow<'static, [u8]> =
                 b"content-type: multipart/form-data; boundary=zz"[..].into();
-            let call = CallRequest {
+            let call = ClientCall {
                 headers: vec![form],
-                ..CallRequest::post(format!("http://{address}/form"), body.as_bytes())
+                ..ClientCall::post(format!("http://{address}/form"), body.as_bytes())
             };
             let response = client(1).call(call).unwrap();
             let summary = String::from_utf8_lossy(response.body()).into_owned();
@@ -2369,11 +2642,11 @@ mod tests {
 
     #[test]
     fn kk_interface_admits_its_peer_key() {
-        let (server_key, server_public_key) = generate_noise_keypair().unwrap();
-        let (client_key, client_public_key) = generate_noise_keypair().unwrap();
+        let (noise_peer_key, server_public_key) = generate_noise_keypair().unwrap();
+        let (noise_private_key, client_public_key) = generate_noise_keypair().unwrap();
         let (stranger_key, _) = generate_noise_keypair().unwrap();
         let sealed = loopback(2)
-            .security(Security::NoiseKK, server_key)
+            .security(Security::NoiseKK, noise_peer_key)
             .noise_peer_key(client_public_key);
         let mut server = Server::new(&[sealed]).unwrap();
         server
@@ -2383,17 +2656,17 @@ mod tests {
             })
             .unwrap();
         let address = server.address(0).unwrap().to_owned();
-        let call = |key| CallRequest {
-            options: RequestOptions {
+        let call = |key| ClientCall {
+            options: ClientCallOptions {
                 security: Security::NoiseKK,
-                client_key: Some(key),
-                server_key: Some(server_public_key),
+                noise_private_key: Some(key),
+                noise_peer_key: Some(server_public_key),
                 ..Default::default()
             },
-            ..CallRequest::get(format!("http://{address}/peer"))
+            ..ClientCall::get(format!("http://{address}/peer"))
         };
         serving(&server, || {
-            let admitted = client(1).call(call(client_key)).unwrap();
+            let admitted = client(1).call(call(noise_private_key)).unwrap();
             assert_eq!(admitted.body(), client_public_key.as_slice());
             assert!(client(1).call(call(stranger_key)).is_err());
         });
@@ -2466,16 +2739,16 @@ mod tests {
         serving(&server, || {
             let mut client = Client::new(ClientOptions {
                 connections: 1,
-                request_timeout: Duration::from_secs(30),
+                call_timeout: Duration::from_secs(30),
                 ..Default::default()
             })
             .unwrap();
-            let call = CallRequest {
-                options: RequestOptions {
+            let call = ClientCall {
+                options: ClientCallOptions {
                     timeout: Duration::from_millis(200),
                     ..Default::default()
                 },
-                ..CallRequest::get(format!("http://{address}/slow"))
+                ..ClientCall::get(format!("http://{address}/slow"))
             };
             let started = Instant::now();
             let Err(timed_out) = client.call(call) else {

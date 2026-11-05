@@ -17,14 +17,19 @@
 #include <utility>     // `std::pair`
 
 #include "ucall/ucall.h"
-#include "ucall/types.hpp"
-#include "ucall/network.hpp"
+#include "ucall/io/bsd_kqueue_engine.hpp"     // `bsd_kqueue_engine_t`
+#include "ucall/io/linux_epollaio_engine.hpp" // `linux_epollaio_engine_t`
+#include "ucall/io/posix_engine.hpp"          // `posix_engine_t`
+#include "ucall/network.hpp"                  // `serial_network`
+#include "ucall/utilities/sockets.hpp"        // `file_direct_alignment`, `io_vector_t`, `monotonic_ns`, `nonblocking`
+#include "ucall/utilities/types.hpp"          // `byte_t`, `bytes_view`, `text_view`
 
 #include "harness.hpp" // `expect`, `require`, `run_test`, `direct_directory_t`, `aligned_bytes_t`
 
 #if UCALL_OS_POSIX_
-#include <fcntl.h>    // `open`, `O_DIRECT`
-#include <sys/stat.h> // `mkfifo`, `mkdir`
+#include <fcntl.h>        // `open`, `O_DIRECT`
+#include <sys/resource.h> // `getrlimit`, `setrlimit`, `RLIMIT_MEMLOCK`
+#include <sys/stat.h>     // `mkfifo`, `mkdir`
 #endif
 
 namespace uc = unum::ucall;
@@ -52,7 +57,7 @@ struct fixture_t {
         ucall_server_request_body_t extract {server, &outcome, request, &body};
         ucall_server_request_body(&extract);
         failures += expect(outcome.status == ucall_status_success_k);
-        ucall_server_reply_content_t response {server, &outcome, request, nullptr, 0, body};
+        ucall_server_reply_content_t response {server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, body};
         ucall_server_reply_content(&response);
         failures += expect(outcome.status == ucall_status_success_k);
     }
@@ -71,10 +76,10 @@ struct fixture_t {
         ucall_network_interface_t network_interface {};
         network_interface.address = uc::bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 2;
-        ucall_server_config_t config {};
+        ucall_server_options_t config {};
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
-        ucall_server_config_t resolved {};
+        ucall_server_options_t resolved {};
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
         if ((status = outcome.status) != ucall_status_success_k) return;
@@ -87,7 +92,7 @@ struct fixture_t {
             if ((status = outcome.status) != ucall_status_success_k) return;
         }
         for (auto& client : clients) {
-            ucall_client_config_t client_config {};
+            ucall_client_options_t client_config {};
             client_config.max_concurrent_connections = 1;
             client_config.max_concurrent_calls = 2;
             ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
@@ -246,16 +251,94 @@ static case_result_t test_timeout_and_cancel_unit() {
         failures += expect(queued.outcome.status == ucall_status_success_k);
         ucall_client_free(fixture.clients[0]);
         fixture.clients[0] = nullptr;
+        // The first stop drains, which still takes replies; the second refuses them.
+        ucall_server_stop(fixture.server);
         ucall_server_stop(fixture.server);
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t detached {fixture.server, &outcome, fixture.held,
-                                               nullptr,        0,        uc::bytes_view("closed")};
+        ucall_server_reply_content_t detached {
+            fixture.server, &outcome, fixture.held, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("closed")};
         ucall_server_reply_content(&detached);
         failures += expect(outcome.status == ucall_status_connection_closed_k);
         fixture.held = nullptr;
         failures += fixture.failures;
     }
     return failures;
+}
+
+/** Once a stopped loop retires, every later round reports @c ucall_status_connection_closed_k, so a
+ *  caller polling in slices knows when to stop. */
+static case_result_t test_take_call_reports_retired() {
+    fixture_t fixture;
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    fixture.serve();
+    ucall_server_stop(fixture.server);
+    ucall_outcome_t outcome {};
+    ucall_server_take_call_t serving {fixture.server, &outcome, 0, 1000};
+    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    do ucall_server_take_call(&serving);
+    while (outcome.status == ucall_status_success_k && steady_clock::now() <= deadline);
+    failures += expect(outcome.status == ucall_status_connection_closed_k, "the drained loop answered {}",
+                       ucall_status_name(outcome.status));
+    ucall_server_take_call(&serving);
+    failures += expect(outcome.status == ucall_status_connection_closed_k, "a later round answered {}",
+                       ucall_status_name(outcome.status));
+    return failures + fixture.failures;
+}
+
+/** Under a locked-memory limit that fits a one-connection ring but not a large loop's, an automatic
+ *  server lands on epollaio at init instead of refusing its first poll. */
+static case_result_t test_ring_refused_at_init_falls_back() {
+#if UCALL_WITH_LINUX_URING && UCALL_WITH_LINUX_EPOLLAIO
+    // The backend an automatic server of `connections` picked and its first poll's status.
+    auto serve_once = [](std::size_t connections) {
+        std::pair<ucall_io_backend_t, ucall_status_t> result {ucall_io_backend_automatic_k, ucall_status_success_k};
+        ucall_server_t server {};
+        ucall_outcome_t outcome {};
+        ucall_network_interface_t network_interface {};
+        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.max_concurrent_connections = connections;
+        ucall_server_options_t config {}, resolved {};
+        config.interfaces = &network_interface;
+        config.interfaces_count = 1;
+        ucall_server_init_t init {&server, &outcome, &config, &resolved};
+        ucall_server_init(&init);
+        result.second = outcome.status;
+        if (outcome.status != ucall_status_success_k) return result;
+        result.first = resolved.backend;
+        ucall_server_take_call_t serving {server, &outcome, 0, 0};
+        ucall_server_take_call(&serving);
+        result.second = outcome.status;
+        ucall_server_free(server);
+        return result;
+    };
+    auto const on_ring = [](ucall_io_backend_t backend) {
+        return backend == ucall_io_backend_linux_uring618_k || backend == ucall_io_backend_linux_uring612_k;
+    };
+    rlimit original {};
+    if (::getrlimit(RLIMIT_MEMLOCK, &original) != 0) return case_result_t::skipped("the limit cannot be read");
+    rlim_t low = 0, high = original.rlim_cur == RLIM_INFINITY ? rlim_t {64} << 20 : original.rlim_cur;
+    if (!on_ring(serve_once(1).first)) return case_result_t::skipped("no io_uring backend serves here");
+    // The least limit at which a one-connection ring serves, leaving no room for a large loop's.
+    while (high - low > 16 * 1024) {
+        rlim_t const middle = low + (high - low) / 2;
+        rlimit lowered {middle, original.rlim_max};
+        if (::setrlimit(RLIMIT_MEMLOCK, &lowered) != 0) break;
+        auto const [backend, status] = serve_once(1);
+        (on_ring(backend) && status == ucall_status_success_k ? high : low) = middle;
+    }
+    rlimit lowered {high, original.rlim_max};
+    std::size_t failures = 0;
+    failures += expect(::setrlimit(RLIMIT_MEMLOCK, &lowered) == 0, "the locked-memory limit stayed");
+    auto const [backend, status] = serve_once(4096);
+    failures += expect(::setrlimit(RLIMIT_MEMLOCK, &original) == 0, "the locked-memory limit stayed lowered");
+    failures += expect(status == ucall_status_success_k && backend == ucall_io_backend_linux_epollaio_k,
+                       "under {} KiB a large loop picked {} and polled {}", high / 1024, int(backend),
+                       ucall_status_name(status));
+    return failures;
+#else
+    return case_result_t::skipped("io_uring or epollaio is not compiled");
+#endif
 }
 
 static case_result_t test_cpu_class_ceiling_unit() {
@@ -265,7 +348,7 @@ static case_result_t test_cpu_class_ceiling_unit() {
          cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1)) {
         ucall_client_t handle {};
         ucall_outcome_t outcome {};
-        ucall_client_config_t config {};
+        ucall_client_options_t config {};
         config.cpu_class = cpu_class;
         config.max_concurrent_connections = 1;
         ucall_client_init_t init {&handle, &outcome, &config, nullptr};
@@ -282,11 +365,11 @@ static case_result_t test_cpu_class_ceiling_unit() {
 
 static case_result_t test_origin_reuse_and_fairness_unit() {
 #if UCALL_WITH_POSIX
-    using network_t = uc::serial_network<uc::posix_engine_t>;
+    using network_t = uc::network::serial_network<uc::io::posix_engine_t>;
     std::size_t failures = 0;
     ucall_client_t handle {};
     ucall_outcome_t outcome {};
-    ucall_client_config_t config {};
+    ucall_client_options_t config {};
     config.backend = ucall_io_backend_posix_k;
     config.cpu_class = ucall_cpu_class_serial_k;
     config.max_concurrent_connections = 3;
@@ -306,46 +389,46 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
         failures += expect(outcome.status == ucall_status_success_k);
     }
     std::array<uc::descriptor_t, 3> descriptors {};
-    for (std::size_t i = 0; i != client.peers.size(); ++i) {
-        auto& peer = *client.peers[i];
-        peer.origin = client.exchanges[i == 1 ? 2 : 0].origin;
-        ++peer.origin->peers;
-        failures += expect(peer.connection.configure({}) == ucall_status_success_k);
-        descriptors[i] = peer.connection.descriptor = client.engine.open_socket(AF_INET);
+    for (std::size_t i = 0; i != client.connections.size(); ++i) {
+        auto& connection = *client.connections[i];
+        connection.origin = client.exchanges[i == 1 ? 2 : 0].origin;
+        ++connection.origin->connections;
+        failures += expect(connection.transport.configure({}, &connection) == ucall_status_success_k);
+        descriptors[i] = connection.transport.descriptor = client.engine->open_socket(AF_INET);
         failures += expect(descriptors[i] >= 0);
-        peer.connection.stage = network_t::connection_stage_t::open_k;
-        network_t::mark_ready(client, peer);
+        connection.transport.stage = network_t::transport_stage_t::open_k;
+        network_t::client_t::mark_ready(client, connection);
     }
     auto& origin = *client.exchanges[0].origin;
     failures += expect(client.exchanges[1].origin == &origin && client.exchanges[3].origin == &origin &&
                        client.exchanges[2].origin != &origin && origin.waiting == 3);
-    auto& busy = *client.peers[2];
-    busy.oldest_exchange = busy.newest_exchange = &network_t::unqueue_call(origin);
-    busy.exchanges_in_flight = 1;
-    busy.connection.transmitting = network_t::transmit_state_t::sending_k;
-    busy.connection.transmit_operation = network_t::operation_state_t::pending_k;
-    client.exchanges[0].stage = network_t::client_exchange_t::stage_t::active_k;
-    network_t::client_progress(client);
+    auto& busy = *client.connections[2];
+    busy.oldest_exchange = busy.newest_exchange = &network_t::client_t::unqueue_call(origin);
+    busy.outstanding_exchanges = 1;
+    busy.transport.transmitting = network_t::transmit_state_t::sending_k;
+    busy.transport.transmit_operation = network_t::operation_state_t::submitted_k;
+    client.exchanges[0].stage = uc::network::client_exchange_stage_t::pipelined_k;
+    network_t::client_t::client_progress(client);
     // Each idle connection takes its origin's waiting call due first, leaving the rest in order.
-    failures += expect(client.peers[0]->oldest_exchange == &client.exchanges[1]);
-    failures += expect(client.peers[1]->oldest_exchange == &client.exchanges[2]);
-    failures += expect(client.exchanges[3].stage == network_t::client_exchange_t::stage_t::queued_k &&
+    failures += expect(client.connections[0]->oldest_exchange == &client.exchanges[1]);
+    failures += expect(client.connections[1]->oldest_exchange == &client.exchanges[2]);
+    failures += expect(client.exchanges[3].stage == uc::network::client_exchange_stage_t::waiting_k &&
                        origin.waiting_head == &client.exchanges[3] && origin.waiting_tail == &client.exchanges[3]);
     for (std::size_t i = 0; i != descriptors.size(); ++i)
-        failures += expect(client.peers[i]->connection.descriptor == descriptors[i]);
-    client.engine.stop();
-    auto& released = *client.peers[1];
+        failures += expect(client.connections[i]->transport.descriptor == descriptors[i]);
+    client.engine->stop();
+    auto& released = *client.connections[1];
     released.oldest_exchange = released.newest_exchange = nullptr;
-    released.exchanges_in_flight = 0;
-    released.connection.transmitting = network_t::transmit_state_t::idle_k;
-    released.connection.transmit_operation = network_t::operation_state_t::idle_k;
-    client.exchanges[2].stage = network_t::client_exchange_t::stage_t::idle_k;
-    network_t::mark_ready(client, released);
-    network_t::client_progress(client);
+    released.outstanding_exchanges = 0;
+    released.transport.transmitting = network_t::transmit_state_t::idle_k;
+    released.transport.transmit_operation = network_t::operation_state_t::idle_k;
+    client.exchanges[2].stage = uc::network::client_exchange_stage_t::idle_k;
+    network_t::client_t::mark_ready(client, released);
+    network_t::client_t::client_progress(client);
     // The waiting call closes an idle connection to another origin, and dials once it has closed.
-    failures += expect(client.exchanges[3].stage == network_t::client_exchange_t::stage_t::queued_k &&
+    failures += expect(client.exchanges[3].stage == uc::network::client_exchange_stage_t::waiting_k &&
                        origin.waiting_head == &client.exchanges[3]);
-    failures += expect(released.connection.stage == network_t::connection_stage_t::closing_k);
+    failures += expect(released.transport.stage == network_t::transport_stage_t::closing_k);
     ucall_client_free(handle);
     return failures;
 #else
@@ -357,11 +440,11 @@ static case_result_t test_origin_reuse_and_fairness_unit() {
  *  output, in call order, so a single send carries them all. */
 static case_result_t test_client_batches_sends_unit() {
 #if UCALL_WITH_POSIX
-    using network_t = uc::serial_network<uc::posix_engine_t>;
+    using network_t = uc::network::serial_network<uc::io::posix_engine_t>;
     std::size_t failures = 0;
     ucall_client_t handle {};
     ucall_outcome_t outcome {};
-    ucall_client_config_t config {};
+    ucall_client_options_t config {};
     config.backend = ucall_io_backend_posix_k;
     config.cpu_class = ucall_cpu_class_serial_k;
     config.max_concurrent_connections = 1;
@@ -379,29 +462,29 @@ static case_result_t test_client_batches_sends_unit() {
         ucall_client_call(&call);
         failures += expect(outcome.status == ucall_status_success_k);
     }
-    auto& peer = *client.peers[0];
+    auto& connection = *client.connections[0];
     auto& origin = *client.exchanges[0].origin;
-    peer.origin = &origin;
-    ++origin.peers;
-    failures += expect(peer.connection.configure({}) == ucall_status_success_k);
-    peer.connection.descriptor = client.engine.open_socket(AF_INET);
-    failures += expect(peer.connection.descriptor >= 0);
-    peer.connection.stage = network_t::connection_stage_t::open_k;
-    network_t::mark_ready(client, peer);
-    network_t::client_progress(client);
-    failures += expect(peer.exchanges_in_flight == 16 && !origin.waiting, "{} calls aboard, {} waiting",
-                       peer.exchanges_in_flight, origin.waiting);
+    connection.origin = &origin;
+    ++origin.connections;
+    failures += expect(connection.transport.configure({}, &connection) == ucall_status_success_k);
+    connection.transport.descriptor = client.engine->open_socket(AF_INET);
+    failures += expect(connection.transport.descriptor >= 0);
+    connection.transport.stage = network_t::transport_stage_t::open_k;
+    network_t::client_t::mark_ready(client, connection);
+    network_t::client_t::client_progress(client);
+    failures += expect(connection.outstanding_exchanges == 16 && !origin.waiting, "{} calls aboard, {} waiting",
+                       connection.outstanding_exchanges, origin.waiting);
     std::size_t order = 0;
-    for (auto* exchange = peer.oldest_exchange; exchange; exchange = exchange->next)
+    for (auto* exchange = connection.oldest_exchange; exchange; exchange = exchange->next)
         failures += expect(exchange == &client.exchanges[order++]);
-    std::string_view const output {reinterpret_cast<char const*>(peer.connection.output.data()),
-                                   peer.connection.output.size()};
+    std::string_view const output {reinterpret_cast<char const*>(connection.transport.output.data()),
+                                   connection.transport.output.size()};
     std::size_t requests = 0;
     for (std::size_t at = output.find("PUT / HTTP/1.1"); at != std::string_view::npos;
          at = output.find("PUT / HTTP/1.1", at + 1))
         ++requests;
     failures += expect(requests == 16, "one output holds {} requests", requests);
-    client.engine.stop();
+    client.engine->stop();
     ucall_client_free(handle);
     return failures;
 #else
@@ -420,7 +503,7 @@ struct batch_context_t {
     std::chrono::steady_clock::time_point fired {};
     std::atomic<std::size_t> completed {};
 
-    /** Checks that failed on the draining thread. */
+    /** Checks that failed on the polling thread. */
     std::atomic<std::size_t> failures {};
 
     static void receive(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
@@ -452,8 +535,8 @@ struct batch_context_t {
     }
 };
 
-static std::thread drain_batches(ucall_server_t server, std::atomic<std::size_t>& failures,
-                                 ucall_http_batch_endpoint_t endpoint) {
+static std::thread poll_batches(ucall_server_t server, std::atomic<std::size_t>& failures,
+                                ucall_http_batch_endpoint_t endpoint) {
     return std::thread {[server, &failures, endpoint] {
         ucall_outcome_t outcome {};
         ucall_server_take_batches_t take {server, &outcome, endpoint};
@@ -494,8 +577,8 @@ static case_result_t test_application_batches_unit() {
         ucall_server_batch_endpoint_statistics(&query);
         return counters;
     };
-    auto drain = drain_batches(fixture.server, batches.failures, fixture.batch_endpoint);
-    auto prompt_drain = drain_batches(fixture.server, batches.failures, prompt);
+    auto poller = poll_batches(fixture.server, batches.failures, fixture.batch_endpoint);
+    auto prompt_poller = poll_batches(fixture.server, batches.failures, prompt);
     call_t first, second, partial;
     first.submit(fixture, 0, "/batch");
     second.submit(fixture, 1, "/batch");
@@ -539,10 +622,15 @@ static case_result_t test_application_batches_unit() {
             failures += partial.success(fixture.wait(0));
         }
     }
+    // A second stop cuts, so the polling owners return without the loops polled until they retire.
     ucall_server_stop(fixture.server);
-    fixture.serve();
-    drain.join();
-    prompt_drain.join();
+    ucall_server_stop(fixture.server);
+    ucall_server_take_call_t serving {fixture.server, &outcome, 0, 0};
+    ucall_server_take_call(&serving);
+    failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_connection_closed_k,
+                       "a cut round answered {}", ucall_status_name(outcome.status));
+    poller.join();
+    prompt_poller.join();
     return failures + fixture.failures + batches.failures;
 }
 
@@ -556,7 +644,7 @@ static case_result_t test_batches_across_loops_unit() {
     network_interface.address = uc::bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 4;
     network_interface.event_loops = 2;
-    ucall_server_config_t config {}, resolved {};
+    ucall_server_options_t config {}, resolved {};
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     ucall_server_init_t init {&server, &outcome, &config, &resolved};
@@ -570,12 +658,12 @@ static case_result_t test_batches_across_loops_unit() {
         10000000, &endpoint};
     ucall_server_add_http_batch_endpoint(&add);
     failures += expect(outcome.status == ucall_status_success_k);
-    ucall_client_config_t client_config {};
+    ucall_client_options_t client_config {};
     client_config.max_concurrent_connections = 4;
     ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
     ucall_client_init(&client_init);
     failures += expect(outcome.status == ucall_status_success_k);
-    auto drain = drain_batches(server, batches.failures, endpoint);
+    auto poller = poll_batches(server, batches.failures, endpoint);
     // Each loop owns two of the four connections, so each receives exactly half of the batch.
     std::string url = fmt::format("http://{}/batch", uc::text_view(resolved.interfaces[0].address));
     for (std::size_t i = 0; i != 4; ++i) {
@@ -595,7 +683,9 @@ static case_result_t test_batches_across_loops_unit() {
         for (std::size_t loop = 0; loop != 2; ++loop) {
             ucall_server_take_call_t serving {server, &outcome, loop, 0};
             ucall_server_take_call(&serving);
-            failures += expect(outcome.status == ucall_status_success_k);
+            // A round after the cut may retire the loop.
+            failures += expect(outcome.status == ucall_status_success_k ||
+                               outcome.status == ucall_status_connection_closed_k);
         }
         std::size_t count {};
         ucall_client_take_completed_t take {client, &outcome, completed.data() + received, completed.size() - received,
@@ -610,7 +700,8 @@ static case_result_t test_batches_across_loops_unit() {
                        batches.completed.load(), batches.sizes[0]);
     if (batches.completed == 1)
         for (auto request : batches.requests) {
-            ucall_server_reply_content_t response {server, &outcome, request, nullptr, 0, uc::bytes_view("echo")};
+            ucall_server_reply_content_t response {
+                server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("echo")};
             ucall_server_reply_content(&response);
             failures += expect(outcome.status == ucall_status_success_k);
         }
@@ -621,12 +712,75 @@ static case_result_t test_batches_across_loops_unit() {
         ucall_client_response_free(completed[i].response);
     }
     failures += expect(batches.completed == 1);
+    // A second stop cuts, so the polling owner returns without the loop polled until it retires.
+    ucall_server_stop(server);
     ucall_server_stop(server);
     progress();
-    drain.join();
+    poller.join();
     ucall_client_free(client);
     ucall_server_free(server);
     return failures + batches.failures;
+}
+
+/** A loop whose first poll fails retires at once and keeps reporting the failure, so one stop
+ *  still ends the batch polling once the other loop drained. */
+static case_result_t test_setup_failure_ends_batch_polling() {
+#if UCALL_WITH_POSIX && !UCALL_OS_WINDOWS_
+    using network_t = uc::network::serial_network<uc::io::posix_engine_t>;
+    std::size_t failures = 0;
+    ucall_server_t server {};
+    ucall_outcome_t outcome {};
+    ucall_network_interface_t network_interface {};
+    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.max_concurrent_connections = 2;
+    network_interface.event_loops = 2;
+    ucall_server_options_t config {};
+    config.interfaces = &network_interface;
+    config.interfaces_count = 1;
+    config.backend = ucall_io_backend_posix_k;
+    ucall_server_init_t init {&server, &outcome, &config, nullptr};
+    network_t::server_t::server_init(&init);
+    require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
+    batch_context_t batches;
+    ucall_http_batch_endpoint_t endpoint {};
+    ucall_server_add_http_batch_endpoint_t add {
+        server, &outcome, uc::bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 1, 1,
+        0,      &endpoint};
+    ucall_server_add_http_batch_endpoint(&add);
+    require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
+    // Past the counters a first poll sizes, as on a host with far more connections per loop.
+    static_cast<network_t::server_t*>(server)->event_loops[1]->max_exchanges =
+        std::size_t {std::numeric_limits<std::uint32_t>::max() / 8} + 1;
+    std::atomic<bool> returned {false};
+    std::thread poller {[&] {
+        ucall_outcome_t ended {};
+        ucall_server_take_batches_t take {server, &ended, endpoint};
+        ucall_server_take_batches(&take);
+        returned.store(true, std::memory_order_release);
+    }};
+    auto poll = [&](std::size_t loop) {
+        ucall_server_take_call_t serving {server, &outcome, loop, 1000};
+        ucall_server_take_call(&serving);
+        return outcome.status;
+    };
+    failures += expect(poll(0) == ucall_status_success_k, "loop 0 answered {}", ucall_status_name(outcome.status));
+    for (std::size_t round = 0; round != 2; ++round)
+        failures += expect(poll(1) == ucall_status_overflow_k, "loop 1 answered {} in round {}",
+                           ucall_status_name(outcome.status), round);
+    ucall_server_stop(server);
+    steady_clock::time_point const deadline = steady_clock::now() + 2s;
+    while (poll(0) == ucall_status_success_k && steady_clock::now() <= deadline) {}
+    while (!returned.load(std::memory_order_acquire) && steady_clock::now() <= deadline)
+        std::this_thread::sleep_for(1ms);
+    failures += expect(returned.load(std::memory_order_acquire), "the batch polling owner outlived one stop by 2 s");
+    // A cut ends a polling owner stuck behind the failed loop, so a failure never hangs the suite.
+    ucall_server_stop(server);
+    poller.join();
+    ucall_server_free(server);
+    return failures + batches.failures;
+#else
+    return case_result_t::skipped("needs the POSIX backend on a POSIX host");
+#endif
 }
 
 /** Two batch endpoints, the first of whose callbacks blocks until the second's batch arrives. */
@@ -650,7 +804,7 @@ struct relay_t {
     }
 };
 
-static case_result_t test_batch_endpoints_drain_apart_unit() {
+static case_result_t test_batch_endpoints_poll_apart_unit() {
     fixture_t fixture;
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
@@ -674,8 +828,8 @@ static case_result_t test_batch_endpoints_drain_apart_unit() {
         require(failures, outcome.status == ucall_status_success_k && endpoints[i], "{}",
                 ucall_status_name(outcome.status));
     }
-    auto first_drain = drain_batches(fixture.server, relay.failures, endpoints[0]);
-    auto second_drain = drain_batches(fixture.server, relay.failures, endpoints[1]);
+    auto first_poller = poll_batches(fixture.server, relay.failures, endpoints[0]);
+    auto second_poller = poll_batches(fixture.server, relay.failures, endpoints[1]);
     steady_clock::time_point const deadline = steady_clock::now() + 5s;
     auto serve_until = [&](std::size_t endpoint) {
         while (!relay.requests[endpoint].load(std::memory_order_acquire) && steady_clock::now() <= deadline) {
@@ -697,10 +851,16 @@ static case_result_t test_batch_endpoints_drain_apart_unit() {
         failures += first.success(fixture.wait(0));
         failures += second.success(fixture.wait(1));
     }
+    // A second stop cuts, so the polling owners return without the loops polled until they retire.
     ucall_server_stop(fixture.server);
-    fixture.serve();
-    first_drain.join();
-    second_drain.join();
+    ucall_server_stop(fixture.server);
+    ucall_outcome_t outcome {};
+    ucall_server_take_call_t serving {fixture.server, &outcome, 0, 0};
+    ucall_server_take_call(&serving);
+    failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_connection_closed_k,
+                       "a cut round answered {}", ucall_status_name(outcome.status));
+    first_poller.join();
+    second_poller.join();
     return failures + fixture.failures + relay.failures;
 }
 
@@ -713,7 +873,7 @@ static case_result_t test_batch_timeout_sleeps_unit() {
     ucall_server_take_batch_t missing {fixture.server, &outcome, nullptr, 0};
     ucall_server_take_batch(&missing);
     failures += expect(outcome.status == ucall_status_invalid_argument_k, "{}", ucall_status_name(outcome.status));
-    // No event loop is ever polled, so only the drain's own wait can end the call.
+    // No event loop is ever polled, so only the polling owner's own wait can end the call.
     auto const started = std::chrono::steady_clock::now();
     auto const processor_started = std::clock();
     ucall_server_take_batch_t take {fixture.server, &outcome, fixture.batch_endpoint, 100000};
@@ -740,7 +900,7 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
     network_interface.address = uc::bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
     network_interface.max_pipelined_requests = 4;
-    ucall_server_config_t config {}, resolved {};
+    ucall_server_options_t config {}, resolved {};
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     ucall_server_init_t init {&server, &outcome, &config, &resolved};
@@ -754,7 +914,7 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
         10000000, &endpoint};
     ucall_server_add_http_batch_endpoint(&add);
     failures += expect(outcome.status == ucall_status_success_k);
-    auto drain = drain_batches(server, batches.failures, endpoint);
+    auto poller = poll_batches(server, batches.failures, endpoint);
     std::thread serving {[&] {
         ucall_outcome_t served {};
         ucall_server_take_calls_t take {server, &served, 0};
@@ -780,7 +940,8 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
             ucall_server_request_body(&extract);
             failures += expect(outcome.status == ucall_status_success_k && body.length == 1 && body.data[0] == '0' + i,
                                "request {} of the batch", i);
-            ucall_server_reply_content_t response {server, &outcome, batches.requests[i], nullptr, 0, body};
+            ucall_server_reply_content_t response {
+                server, &outcome, batches.requests[i], ucall_http_status_ok_k, nullptr, 0, body};
             ucall_server_reply_content(&response);
             failures += expect(outcome.status == ucall_status_success_k);
         }
@@ -795,7 +956,7 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
     }
     ucall_server_stop(server);
     serving.join();
-    drain.join();
+    poller.join();
     ucall_server_free(server);
     return failures + batches.failures;
 #else
@@ -808,7 +969,7 @@ static case_result_t test_pipelined_batches_unit([[maybe_unused]] random_generat
 #pragma region Allocators
 
 #if UCALL_WITH_POSIX
-using counted_network_t = uc::serial_network<uc::posix_engine_t, counting_allocator<uc::byte_t>>;
+using counted_network_t = uc::network::serial_network<uc::io::posix_engine_t, counting_allocator<uc::byte_t>>;
 
 /** A server whose echo route keeps the outcome of its last reply, which no client can observe. */
 struct echo_route_t {
@@ -821,7 +982,7 @@ struct echo_route_t {
         ucall_bytes_view_t body {};
         ucall_server_request_body_t get {route.server, &outcome, request, &body};
         ucall_server_request_body(&get);
-        ucall_server_reply_content_t reply {route.server, &outcome, request, nullptr, 0, body};
+        ucall_server_reply_content_t reply {route.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, body};
         ucall_server_reply_content(&reply);
         route.replied = outcome.status;
     }
@@ -873,25 +1034,25 @@ static case_result_t test_allocator_propagation_unit() {
     ucall_network_interface_t network_interface {};
     network_interface.address = uc::bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
-    ucall_server_config_t server_config {}, resolved {};
+    ucall_server_options_t server_config {}, resolved {};
     server_config.interfaces = &network_interface;
     server_config.interfaces_count = 1;
     server_config.backend = ucall_io_backend_posix_k;
     ucall_server_init_t server_init {&route.server, &outcome, &server_config, &resolved};
-    counted_network_t::server_init(&server_init, allocator);
+    counted_network_t::server_t::server_init(&server_init, allocator);
     require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     failures += expect(route.add() == ucall_status_success_k);
     ucall_client_t client {};
-    ucall_client_config_t client_config {};
+    ucall_client_options_t client_config {};
     client_config.backend = ucall_io_backend_posix_k;
     client_config.max_concurrent_connections = 1;
     ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
     std::size_t const live = counts.live();
     counts.fail_from = counts.attempts;
-    counted_network_t::client_init(&client_init, allocator);
+    counted_network_t::client_t::client_init(&client_init, allocator);
     failures += expect(!client && outcome.status == ucall_status_out_of_memory_k && counts.live() == live);
     counts.fail_from = std::numeric_limits<std::size_t>::max();
-    counted_network_t::client_init(&client_init, allocator);
+    counted_network_t::client_t::client_init(&client_init, allocator);
     require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     std::string url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));
     std::string payload(1024, '\0');
@@ -940,16 +1101,16 @@ static case_result_t test_allocation_failure_safety() {
         ucall_network_interface_t network_interface {};
         network_interface.address = uc::bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 1;
-        ucall_server_config_t server_config {}, resolved {};
+        ucall_server_options_t server_config {}, resolved {};
         server_config.interfaces = &network_interface;
         server_config.interfaces_count = 1;
         ucall_server_init_t server_init {&route.server, &outcome, &server_config, &resolved};
-        counted_network_t::server_init(&server_init, counting_allocator<uc::byte_t> {counts});
+        counted_network_t::server_t::server_init(&server_init, counting_allocator<uc::byte_t> {counts});
         if (outcome.status == ucall_status_success_k) outcome.status = route.add();
         ucall_status_t completion = outcome.status;
         if (outcome.status == ucall_status_success_k) {
             ucall_client_t client {};
-            ucall_client_config_t client_config {};
+            ucall_client_options_t client_config {};
             client_config.max_concurrent_connections = 1;
             ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
             ucall_client_init(&client_init);
@@ -1004,15 +1165,15 @@ static uc::byte_t file_byte(std::uint64_t offset) noexcept {
 /** Polls @p engine until @p request completes, answering its result, or `-ETIMEDOUT` once
  *  @p deadline passes; other completions are dropped. */
 template <typename engine_type_>
-static uc::descriptor_t finish(engine_type_& engine, uc::io_request_t const& request, std::uint64_t deadline) {
-    uc::io_completion_t completed[1] {};
-    while (uc::monotonic_ns() < deadline)
-        if (engine.poll(completed, uc::io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+static uc::descriptor_t finish(engine_type_& engine, uc::io::io_request_t const& request, std::uint64_t deadline) {
+    uc::io::io_completion_t completed[1] {};
+    while (uc::utilities::monotonic_ns() < deadline)
+        if (engine.poll(completed, uc::io::io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
             return completed[0].result;
     return -ETIMEDOUT;
 }
 template <typename engine_type_>
-static uc::descriptor_t await(engine_type_& engine, uc::io_request_t& request, std::uint64_t deadline) {
+static uc::descriptor_t await(engine_type_& engine, uc::io::io_request_t& request, std::uint64_t deadline) {
     return engine.submit(request) == ucall_status_success_k ? finish(engine, request, deadline) : -EIO;
 }
 
@@ -1048,23 +1209,23 @@ static case_result_t direct_files() {
     require(failures, files.fill());
     std::size_t const alignment = files.directory.alignment;
     loopback_pair_t sockets = loopback_pair();
-    require(failures, sockets.connected() && uc::nonblocking(sockets.client) == ucall_status_success_k);
+    require(failures, sockets.connected() && uc::utilities::nonblocking(sockets.client) == ucall_status_success_k);
     auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
-    auto const deadline = uc::deadline_after(5000000);
+    auto const deadline = uc::utilities::deadline_after(5000000);
 
     announce("opening beneath a directory");
     int file = -1;
     for (std::string_view path : {"data.bin", "fifo", "subdir", "absolute", "../data.bin", "missing"}) {
         std::string terminated {path};
-        uc::io_request_t opening {.operation = uc::io_operation_t::file_open_k,
-                                  .descriptor = socket,
-                                  .data = reinterpret_cast<uc::byte_t*>(terminated.data()),
-                                  .length = terminated.size() + 1,
-                                  .file = {0, -1, files.directory.descriptor}};
+        uc::io::io_request_t opening {.operation = uc::io::io_operation_t::file_open_k,
+                                      .descriptor = socket,
+                                      .data = reinterpret_cast<uc::byte_t*>(terminated.data()),
+                                      .length = terminated.size() + 1,
+                                      .file = {0, -1, files.directory.descriptor}};
         uc::descriptor_t const opened = await(engine, opening, deadline);
         if (path == "data.bin") {
-            uc::file_geometry_t const geometry = opened >= 0 ? uc::file_direct_alignment(opened)
-                                                             : uc::file_geometry_t {};
+            uc::utilities::file_geometry_t const geometry = opened >= 0 ? uc::utilities::file_direct_alignment(opened)
+                                                                        : uc::utilities::file_geometry_t {};
             failures += expect(opened >= 0 && !geometry.error && geometry.size == files.content.size(),
                                "{} opened as {} measuring {}", path, opened, geometry.size);
             file = static_cast<int>(opened);
@@ -1078,30 +1239,30 @@ static case_result_t direct_files() {
 
     announce("refusing a buffered descriptor");
     int const buffered = ::open(files.directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC);
-    failures += expect(uc::file_direct_check(buffered) == ucall_status_invalid_argument_k &&
-                       uc::file_direct_check(file) == ucall_status_success_k);
+    failures += expect(uc::utilities::file_direct_check(buffered) == ucall_status_invalid_argument_k &&
+                       uc::utilities::file_direct_check(file) == ucall_status_success_k);
     ::close(buffered);
 
     announce("reading aligned extents, a short tail and vectors");
     aligned_bytes_t window {4 * alignment};
-    failures += expect(engine.register_memory(window.bytes()).pinning == uc::range_pinning_t::unpinned_k);
-    uc::io_request_t reading {.operation = uc::io_operation_t::file_read_k,
-                              .descriptor = socket,
-                              .data = window.data,
-                              .length = 2 * alignment,
-                              .file = {3 * alignment, file, -1}};
+    failures += expect(engine.register_memory(window.bytes()).pinning == uc::io::range_pinning_t::unpinned_k);
+    uc::io::io_request_t reading {.operation = uc::io::io_operation_t::file_read_k,
+                                  .descriptor = socket,
+                                  .data = window.data,
+                                  .length = 2 * alignment,
+                                  .file = {3 * alignment, file, -1}};
     failures += expect(await(engine, reading, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
                        std::memcmp(window.data, files.content.data() + 3 * alignment, 2 * alignment) == 0);
     reading.file.offset = 64 * alignment;
     reading.length = alignment;
     failures += expect(await(engine, reading, deadline) == 123 &&
                        std::memcmp(window.data, files.content.data() + 64 * alignment, 123) == 0);
-    uc::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
-    uc::io_request_t scattering {.operation = uc::io_operation_t::file_read_vectors_k,
-                                 .descriptor = socket,
-                                 .data = reinterpret_cast<uc::byte_t*>(vectors),
-                                 .length = 2,
-                                 .file = {5 * alignment, file, -1}};
+    uc::utilities::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
+    uc::io::io_request_t scattering {.operation = uc::io::io_operation_t::file_read_vectors_k,
+                                     .descriptor = socket,
+                                     .data = reinterpret_cast<uc::byte_t*>(vectors),
+                                     .length = 2,
+                                     .file = {5 * alignment, file, -1}};
     failures += expect(await(engine, scattering, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
                        std::memcmp(window.data, files.content.data() + 5 * alignment, alignment) == 0 &&
                        std::memcmp(window.data + 2 * alignment, files.content.data() + 6 * alignment, alignment) == 0);
@@ -1115,15 +1276,15 @@ static case_result_t test_direct_files_unit() {
     std::size_t failures = 0;
 #if UCALL_WITH_POSIX
     announce("posix");
-    failures += keeping_descriptors(direct_files<uc::posix_engine_t>).failures;
+    failures += keeping_descriptors(direct_files<uc::io::posix_engine_t>).failures;
 #endif
 #if UCALL_WITH_LINUX_EPOLLAIO
     announce("linux-epollaio");
-    failures += keeping_descriptors(direct_files<uc::linux_epollaio_engine_t>).failures;
+    failures += keeping_descriptors(direct_files<uc::io::linux_epollaio_engine_t>).failures;
 #endif
 #if UCALL_WITH_KQUEUE
-    announce("macos-kqueue");
-    failures += keeping_descriptors(direct_files<uc::kqueue_engine_t>).failures;
+    announce("bsd-kqueue");
+    failures += keeping_descriptors(direct_files<uc::io::bsd_kqueue_engine_t>).failures;
 #endif
     return failures;
 }
@@ -1148,18 +1309,18 @@ static case_result_t epollaio_reads() {
     require(failures, file >= 0);
     loopback_pair_t sockets = loopback_pair();
     require(failures, sockets.connected());
-    auto const deadline = uc::deadline_after(5000000);
+    auto const deadline = uc::utilities::deadline_after(5000000);
 
     announce("a host refusing AIO refuses the engine");
     {
-        uc::linux_epollaio_engine_t engine;
+        uc::io::linux_epollaio_engine_t engine;
         engine.files.depth = 0;
         failures += expect(engine.open(4, 4) == ucall_status_unsupported_k && engine.refusal &&
                            std::strstr(engine.refusal, "fs.aio-max-nr"));
     }
 
     announce("one AIO event serializes four reads");
-    uc::linux_epollaio_engine_t engine;
+    uc::io::linux_epollaio_engine_t engine;
     engine.files.depth = 1;
     ucall_status_t const opened = engine.open(8, 8);
     if (opened == ucall_status_unsupported_k) {
@@ -1169,9 +1330,9 @@ static case_result_t epollaio_reads() {
     require(failures, opened == ucall_status_success_k && engine.files.depth == 1);
     std::array<aligned_bytes_t, 4> windows {aligned_bytes_t {alignment}, aligned_bytes_t {alignment},
                                             aligned_bytes_t {alignment}, aligned_bytes_t {alignment}};
-    std::array<uc::io_request_t, 4> reads {};
+    std::array<uc::io::io_request_t, 4> reads {};
     for (std::size_t i = 0; i != reads.size(); ++i) {
-        reads[i] = {.operation = uc::io_operation_t::file_read_k,
+        reads[i] = {.operation = uc::io::io_operation_t::file_read_k,
                     .descriptor = sockets.client,
                     .data = windows[i].data,
                     .length = alignment,
@@ -1179,9 +1340,9 @@ static case_result_t epollaio_reads() {
         require(failures, engine.submit(reads[i]) == ucall_status_success_k);
     }
     std::size_t landed = 0;
-    while (landed != reads.size() && uc::monotonic_ns() < deadline) {
-        uc::io_completion_t completed[4] {};
-        int const count = engine.poll(completed, uc::io_wait_t::blocking_k, deadline);
+    while (landed != reads.size() && uc::utilities::monotonic_ns() < deadline) {
+        uc::io::io_completion_t completed[4] {};
+        int const count = engine.poll(completed, uc::io::io_wait_t::blocking_k, deadline);
         require(failures, count >= 0, "polling ended with {}", count);
         for (int i = 0; i != count; ++i) {
             auto const index = static_cast<std::size_t>(completed[i].request - reads.data());
@@ -1199,7 +1360,7 @@ static case_result_t epollaio_reads() {
 
     announce("cancelling reads in flight and waiting for an event");
     aligned_bytes_t large {32 * alignment};
-    reads[0] = {.operation = uc::io_operation_t::file_read_k,
+    reads[0] = {.operation = uc::io::io_operation_t::file_read_k,
                 .descriptor = sockets.client,
                 .data = large.data,
                 .length = large.size,
@@ -1210,9 +1371,9 @@ static case_result_t epollaio_reads() {
     failures += expect(engine.cancel(reads[1]) == ucall_status_success_k &&
                        engine.cancel(reads[0]) == ucall_status_success_k);
     std::array<uc::descriptor_t, 2> cancelled {0, 0};
-    for (std::size_t count = 0; count != cancelled.size() && uc::monotonic_ns() < deadline;) {
-        uc::io_completion_t completed[2] {};
-        int const polled = engine.poll(completed, uc::io_wait_t::blocking_k, deadline);
+    for (std::size_t count = 0; count != cancelled.size() && uc::utilities::monotonic_ns() < deadline;) {
+        uc::io::io_completion_t completed[2] {};
+        int const polled = engine.poll(completed, uc::io::io_wait_t::blocking_k, deadline);
         require(failures, polled >= 0, "polling ended with {}", polled);
         for (int i = 0; i != polled; ++i, ++count)
             cancelled[static_cast<std::size_t>(completed[i].request - reads.data())] = completed[i].result;
@@ -1229,33 +1390,33 @@ static case_result_t epollaio_reads() {
  *  error queue reported it; loopback copies, so that report demotes the socket, whose next
  *  zero-copy send copies and whose next release completes at once. */
 static case_result_t epollaio_zero_copy_sends() {
-    uc::linux_epollaio_engine_t engine;
+    uc::io::linux_epollaio_engine_t engine;
     ucall_status_t const opened = engine.open(8, 8);
     if (opened == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks Linux AIO");
     require(0, opened == ucall_status_success_k);
     std::size_t failures = 0;
     loopback_pair_t sockets = loopback_pair();
-    require(failures, sockets.connected() && uc::nonblocking(sockets.client) == ucall_status_success_k &&
-                          uc::nonblocking(sockets.peer) == ucall_status_success_k);
+    require(failures, sockets.connected() && uc::utilities::nonblocking(sockets.client) == ucall_status_success_k &&
+                          uc::utilities::nonblocking(sockets.peer) == ucall_status_success_k);
     aligned_bytes_t window {16384};
     for (std::size_t i = 0; i != window.size; ++i) window.data[i] = file_byte(i);
-    auto const deadline = uc::deadline_after(5000000);
+    auto const deadline = uc::utilities::deadline_after(5000000);
     std::string received;
     auto drain = [&](std::size_t expected) {
         char buffer[16384];
-        while (received.size() < expected && uc::monotonic_ns() < deadline)
+        while (received.size() < expected && uc::utilities::monotonic_ns() < deadline)
             if (ssize_t const length = recv(sockets.peer, buffer, sizeof(buffer), 0); length > 0)
                 received.append(buffer, static_cast<std::size_t>(length));
         return received.size() == expected && std::memcmp(received.data(), window.data, received.size()) == 0;
     };
 
     announce("a release completes only after its notification, and cancelling it changes nothing");
-    uc::io_request_t release {.operation = uc::io_operation_t::zero_copy_release_k};
-    uc::io_request_t sending {.operation = uc::io_operation_t::send_zero_copy_k,
-                              .descriptor = sockets.client,
-                              .data = window.data,
-                              .length = window.size,
-                              .release_request = &release};
+    uc::io::io_request_t release {.operation = uc::io::io_operation_t::zero_copy_release_k};
+    uc::io::io_request_t sending {.operation = uc::io::io_operation_t::send_zero_copy_k,
+                                  .descriptor = sockets.client,
+                                  .data = window.data,
+                                  .length = window.size,
+                                  .release_request = &release};
     uc::descriptor_t const sent = await(engine, sending, deadline);
     failures += expect(sent > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
                        engine.statistics.zero_copy_sends);
@@ -1291,13 +1452,16 @@ int main(int, char** argv) {
     run_test(totals, "test_allocation_failure_safety", test_allocation_failure_safety);
     run_test(totals, "test_origin_reuse_and_fairness_unit", test_origin_reuse_and_fairness_unit);
     run_test(totals, "test_client_batches_sends_unit", test_client_batches_sends_unit);
+    run_test(totals, "test_ring_refused_at_init_falls_back", test_ring_refused_at_init_falls_back);
     run_test(totals, "test_cpu_class_ceiling_unit", test_cpu_class_ceiling_unit);
     run_test(totals, "test_progress_and_retention_unit", test_progress_and_retention_unit);
     run_test(totals, "test_completion_credits_unit", test_completion_credits_unit);
     run_test(totals, "test_timeout_and_cancel_unit", test_timeout_and_cancel_unit);
+    run_test(totals, "test_take_call_reports_retired", test_take_call_reports_retired);
     run_test(totals, "test_application_batches_unit", test_application_batches_unit);
     run_test(totals, "test_batches_across_loops_unit", test_batches_across_loops_unit);
-    run_test(totals, "test_batch_endpoints_drain_apart_unit", test_batch_endpoints_drain_apart_unit);
+    run_test(totals, "test_batch_endpoints_poll_apart_unit", test_batch_endpoints_poll_apart_unit);
+    run_test(totals, "test_setup_failure_ends_batch_polling", test_setup_failure_ends_batch_polling);
     run_test(totals, "test_batch_timeout_sleeps_unit", test_batch_timeout_sleeps_unit);
     run_test(totals, "test_pipelined_batches_unit", test_pipelined_batches_unit);
 #if UCALL_OS_POSIX_

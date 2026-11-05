@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/curve25519.hpp
+ *  @file include/ucall/tunnel/curve25519.hpp
  *  @author Ash Vardanian
  *  @date August 4, 2026
  *  @brief Curve25519 scalar multiplication, the one Noise primitive with no home elsewhere.
@@ -44,27 +44,12 @@
 
 #include <cstdint> // `std::uint8_t`
 
-#include "ucall/types.hpp"
+#include "ucall/utilities/types.hpp" // `span`, `byte_t`
 
-/** Radix-51 limbs over 128-bit products. Absent under MSVC, which has no @c __int128. */
-#if !defined(UCALL_HAS_INT128_)
-#if defined(__SIZEOF_INT128__)
-#define UCALL_HAS_INT128_ 1
-#else
-#define UCALL_HAS_INT128_ 0
-#endif
-#endif // !defined(UCALL_HAS_INT128_)
+namespace unum::ucall::tunnel {
 
-/** Saturated limbs recompiled for ADX and BMI2. Needs the attribute those compilers accept. */
-#if !defined(UCALL_TARGET_X86_ADX)
-#if (UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_) && UCALL_ARCH_X8664_
-#define UCALL_TARGET_X86_ADX 1
-#else
-#define UCALL_TARGET_X86_ADX 0
-#endif
-#endif // !defined(UCALL_TARGET_X86_ADX)
-
-namespace unum::ucall {
+using utilities::byte_t;
+using utilities::span;
 
 /** Length of a Curve25519 scalar, public key, or shared secret, in bytes. */
 static constexpr std::size_t x25519_key_size_k = 32;
@@ -100,8 +85,8 @@ enum class x25519_tiers_t : std::uint8_t {
 /** The tiers this build compiled in. @c serial_k carries no switch and is always among them. */
 [[nodiscard]] constexpr x25519_tiers_t x25519_tiers_compiled() noexcept {
     return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(x25519_tiers_t::serial_k) |
-                                       static_cast<std::uint8_t>(x25519_tiers_t::radix51_k) * UCALL_HAS_INT128_ |
-                                       static_cast<std::uint8_t>(x25519_tiers_t::adx_k) * UCALL_TARGET_X86_ADX);
+                                       static_cast<std::uint8_t>(x25519_tiers_t::radix51_k) * UCALL_COMPILER_INT128_ |
+                                       static_cast<std::uint8_t>(x25519_tiers_t::adx_k) * UCALL_ARCH_X8664_ADX_);
 }
 
 /**
@@ -149,7 +134,7 @@ enum class x25519_tiers_t : std::uint8_t {
     span<byte_t const, x25519_key_size_k> scalar, //
     span<byte_t const, x25519_key_size_k> point) noexcept;
 
-#if UCALL_HAS_INT128_
+#if UCALL_COMPILER_INT128_
 
 /** Radix-51 tier of @c x25519_scalar_multiply. Needs 128-bit integers, so absent under MSVC. */
 [[nodiscard]] bool x25519_scalar_multiply_radix51( //
@@ -158,7 +143,7 @@ enum class x25519_tiers_t : std::uint8_t {
     span<byte_t const, x25519_key_size_k> point) noexcept;
 #endif
 
-#if UCALL_TARGET_X86_ADX
+#if UCALL_ARCH_X8664_ADX_
 
 /** ADX tier of @c x25519_scalar_multiply. Faults where @c x25519_tiers_runtime omits it. */
 [[nodiscard]] bool x25519_scalar_multiply_adx(    //
@@ -176,4 +161,4 @@ void x25519_derive_public(               //
     span<byte_t, x25519_key_size_k> out, //
     span<byte_t const, x25519_key_size_k> scalar) noexcept;
 
-} // namespace unum::ucall
+} // namespace unum::ucall::tunnel

@@ -23,7 +23,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "314t", "315"]') }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
@@ -65,7 +65,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "314t", "315"]') }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
@@ -107,7 +107,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "314t", "315"]') }}
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v7
@@ -149,7 +149,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "315"]') }}
+        python-version: ${{ fromJSON(inputs.smoke && '["312", "315"]' || '["312", "313", "314", "314t", "315"]') }}
         architecture: [AMD64, ARM64]
     steps:
       - name: Checkout Repository

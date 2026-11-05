@@ -12,9 +12,10 @@
 #include <smashtable/row_search.hpp>
 
 #include "ucall/ucall.h"
-#include "ucall/types.hpp"
-#include "ucall/http.hpp"
-#include "ucall/tunnel.hpp"
+#include "ucall/utilities/types.hpp" // `cpu_ceiling_t`, `publish`
+#include "ucall/http/messages.hpp"   // `compare_kit`, `find_kit`, `byteset_kit`, `hash_kit`, `fold_kit`
+#include "ucall/http/percent.hpp"    // `percent_kit`
+#include "ucall/tunnel/crypto.hpp"   // `sha256_kit`, `aes256_gcm_kit`
 
 namespace unum::ucall {
 
@@ -26,21 +27,17 @@ enum class cpu_class_t : std::uint32_t {
     intel_skylake_k,
     intel_icelake_k,
     intel_alder_k,
-    intel_sierra_k,
     aws_g2_k,
-    apple_m2_k,
     aws_g5_k,
     monoversioned_k,
 };
 
 constexpr cpu_class_t parent_class_of(cpu_class_t cpu) noexcept {
     switch (cpu) {
-    case cpu_class_t::intel_sierra_k: return cpu_class_t::intel_alder_k;
     case cpu_class_t::intel_alder_k: return cpu_class_t::intel_haswell_k;
     case cpu_class_t::intel_icelake_k: return cpu_class_t::intel_skylake_k;
     case cpu_class_t::intel_skylake_k: return cpu_class_t::intel_haswell_k;
-    case cpu_class_t::aws_g5_k: return cpu_class_t::apple_m2_k;
-    case cpu_class_t::apple_m2_k: return cpu_class_t::aws_g2_k;
+    case cpu_class_t::aws_g5_k: return cpu_class_t::aws_g2_k;
     default: return cpu_class_t::serial_k;
     }
 }
@@ -53,10 +50,8 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu) noexcept 
     case cpu_class_t::intel_icelake_k:
         return stringzilla_capabilities_of(cpu_class_t::intel_skylake_k) | sz_cap_icelake_k | sz_cap_goldmont_k;
     case cpu_class_t::intel_alder_k:
-    case cpu_class_t::intel_sierra_k:
         return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_goldmont_k;
     case cpu_class_t::aws_g2_k:
-    case cpu_class_t::apple_m2_k:
     case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
     case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
     default: return sz_cap_serial_k;
@@ -68,13 +63,6 @@ struct atomic_ref_for_cpu_class {
     template <typename value_type_>
     using type = fu::standard_atomic_ref<value_type_>;
 };
-#if FORKUNION_TARGET_X86_CMPCCXADD
-template <>
-struct atomic_ref_for_cpu_class<cpu_class_t::intel_sierra_k> {
-    template <typename value_type_>
-    using type = fu::x86_cmpccxadd_atomic_ref<value_type_>;
-};
-#endif
 #if FORKUNION_TARGET_ARM64_LSE
 template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::aws_g2_k> {
@@ -84,21 +72,11 @@ struct atomic_ref_for_cpu_class<cpu_class_t::aws_g2_k> {
 #endif
 #if FORKUNION_TARGET_ARM64_RCPC
 template <>
-struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
-    template <typename value_type_>
-    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
-};
-template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
     template <typename value_type_>
     using type = fu::arm64_rcpc_atomic_ref<value_type_>;
 };
 #elif FORKUNION_TARGET_ARM64_LSE
-template <>
-struct atomic_ref_for_cpu_class<cpu_class_t::apple_m2_k> {
-    template <typename value_type_>
-    using type = fu::arm64_lse_atomic_ref<value_type_>;
-};
 template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
     template <typename value_type_>
@@ -128,10 +106,6 @@ template <>
 struct row_kit_for_cpu_class<cpu_class_t::intel_alder_k> {
     using type = st::haswell_row_kit_t;
 };
-template <>
-struct row_kit_for_cpu_class<cpu_class_t::intel_sierra_k> {
-    using type = st::haswell_row_kit_t;
-};
 #endif
 #if SMASHTABLE_TARGET_SKYLAKE
 template <>
@@ -151,10 +125,6 @@ struct row_kit_for_cpu_class<cpu_class_t::aws_g2_k> {
     using type = st::neon_row_kit_t;
 };
 template <>
-struct row_kit_for_cpu_class<cpu_class_t::apple_m2_k> {
-    using type = st::neon_row_kit_t;
-};
-template <>
 struct row_kit_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = st::neon_row_kit_t;
 };
@@ -166,10 +136,10 @@ struct row_kit_for_cpu_class<cpu_class_t::monoversioned_k> {
 };
 #endif
 
-/** The wait instruction one CPU class pairs: x86 spins on PAUSE and the WAITPKG Xeons arm TPAUSE,
- *  the Arm classes spin on YIELD and the Graviton5 class sleeps in WFE, a monoversioned build takes
- *  ForkUnion's pick for its target, and everything else yields, as does any class whose
- *  @c FORKUNION_TARGET_<BIT> is off, such as under ThreadSanitizer. */
+/** The wait instruction one CPU class pairs: x86 spins on PAUSE, the Graviton2 class spins on YIELD
+ *  and the Graviton5 class sleeps in WFE, a monoversioned build takes its target's pick, and
+ *  everything else yields, as does any class whose @c FORKUNION_TARGET_<BIT> is off, such as in
+ *  builds under ThreadSanitizer. */
 template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
@@ -192,19 +162,9 @@ struct waiter_for_cpu_class<cpu_class_t::intel_alder_k> {
     using type = fu::x86_pause_t;
 };
 #endif
-#if FORKUNION_TARGET_X86_TPAUSE
-template <>
-struct waiter_for_cpu_class<cpu_class_t::intel_sierra_k> {
-    using type = fu::x86_tpause_t;
-};
-#endif
 #if FORKUNION_TARGET_ARM64_YIELD
 template <>
 struct waiter_for_cpu_class<cpu_class_t::aws_g2_k> {
-    using type = fu::arm64_yield_t;
-};
-template <>
-struct waiter_for_cpu_class<cpu_class_t::apple_m2_k> {
     using type = fu::arm64_yield_t;
 };
 #endif
@@ -221,23 +181,21 @@ struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
 };
 #endif
 
-/** The waiter a CPU class pairs, spelled short for the variants. */
-template <cpu_class_t cpu_class_>
-using waiter_of = typename waiter_for_cpu_class<cpu_class_>::type;
-
-/** The kits and atomic reference one CPU class builds its network from, each picked once here. */
+/** The kits, atomic reference and waiter one CPU class builds its network from. */
 template <cpu_class_t cpu_class_>
 struct cpu_traits {
     static constexpr sz_capability_t stringzilla_capabilities_k = stringzilla_capabilities_of(cpu_class_) &
                                                                   sz_capabilities_compiled_cpu_mask();
-    using compare_kit_t = compare_kit<stringzilla_capabilities_k>;
-    using find_kit_t = find_kit<stringzilla_capabilities_k>;
-    using byteset_kit_t = byteset_kit<stringzilla_capabilities_k>;
-    using hash_kit_t = hash_kit<stringzilla_capabilities_k>;
-    using fold_kit_t = fold_kit<stringzilla_capabilities_k>;
-    using sha256_kit_t = sha256_kit<stringzilla_capabilities_k>;
-    using aes256_gcm_kit_t = aes256_gcm_kit<stringzilla_capabilities_k>;
+    using compare_kit_t = http::compare_kit<stringzilla_capabilities_k>;
+    using find_kit_t = http::find_kit<stringzilla_capabilities_k>;
+    using byteset_kit_t = http::byteset_kit<stringzilla_capabilities_k>;
+    using hash_kit_t = http::hash_kit<stringzilla_capabilities_k>;
+    using fold_kit_t = http::fold_kit<stringzilla_capabilities_k>;
+    using percent_kit_t = http::percent_kit<stringzilla_capabilities_k>;
+    using sha256_kit_t = tunnel::sha256_kit<stringzilla_capabilities_k>;
+    using aes256_gcm_kit_t = tunnel::aes256_gcm_kit<stringzilla_capabilities_k>;
     using row_search_kit_t = typename row_kit_for_cpu_class<cpu_class_>::type;
+    using waiter_t = typename waiter_for_cpu_class<cpu_class_>::type;
 
     template <typename value_type_>
     using atomic_ref = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
@@ -267,14 +225,8 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
 #if UCALL_TARGET_INTEL_ALDER
     case cpu_class_t::intel_alder_k: return true;
 #endif
-#if UCALL_TARGET_INTEL_SIERRA
-    case cpu_class_t::intel_sierra_k: return true;
-#endif
 #if UCALL_TARGET_AWS_G2
     case cpu_class_t::aws_g2_k: return true;
-#endif
-#if UCALL_TARGET_APPLE_M2
-    case cpu_class_t::apple_m2_k: return true;
 #endif
 #if UCALL_TARGET_AWS_G5
     case cpu_class_t::aws_g5_k: return true;
@@ -286,8 +238,8 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
     }
 }
 
-/** Only a different picked kit or atomic reference earns another instantiation, or a parent the
- *  build left out, as a monoversioned build leaves serial. */
+/** Only a different picked kit, atomic reference or waiter earns another instantiation, or a parent
+ *  the build left out, as a monoversioned build leaves serial. */
 template <cpu_class_t cpu_class_>
 constexpr bool rung_advances() noexcept {
     using own_t = cpu_traits<cpu_class_>;
@@ -301,6 +253,7 @@ constexpr bool rung_advances() noexcept {
            !std::is_same_v<typename own_t::sha256_kit_t, typename parent_t::sha256_kit_t> ||
            !std::is_same_v<typename own_t::aes256_gcm_kit_t, typename parent_t::aes256_gcm_kit_t> ||
            !std::is_same_v<typename own_t::row_search_kit_t, typename parent_t::row_search_kit_t> ||
+           !std::is_same_v<typename own_t::waiter_t, typename parent_t::waiter_t> ||
            !std::is_same_v<typename own_t::template atomic_ref<std::uint32_t>,
                            typename parent_t::template atomic_ref<std::uint32_t>>;
 }
@@ -312,9 +265,7 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept
     case cpu_class_t::intel_skylake_k: return forkunion_capabilities_of<cpu_class_t::intel_skylake_k>();
     case cpu_class_t::intel_icelake_k: return forkunion_capabilities_of<cpu_class_t::intel_icelake_k>();
     case cpu_class_t::intel_alder_k: return forkunion_capabilities_of<cpu_class_t::intel_alder_k>();
-    case cpu_class_t::intel_sierra_k: return forkunion_capabilities_of<cpu_class_t::intel_sierra_k>();
     case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
-    case cpu_class_t::apple_m2_k: return forkunion_capabilities_of<cpu_class_t::apple_m2_k>();
     case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
     case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
     default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
@@ -357,47 +308,6 @@ inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t pinned, cpu_ceiling_t& 
 template <cpu_class_t cpu_class_, typename init_type_>
 void make_network_variant(init_type_* arguments) noexcept;
 
-#if UCALL_TARGET_SERIAL
-extern template void make_network_variant<cpu_class_t::serial_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::serial_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_INTEL_HASWELL
-extern template void make_network_variant<cpu_class_t::intel_haswell_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::intel_haswell_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_INTEL_SKYLAKE
-extern template void make_network_variant<cpu_class_t::intel_skylake_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::intel_skylake_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_INTEL_ICELAKE
-extern template void make_network_variant<cpu_class_t::intel_icelake_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::intel_icelake_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_INTEL_ALDER
-extern template void make_network_variant<cpu_class_t::intel_alder_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::intel_alder_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_INTEL_SIERRA
-extern template void make_network_variant<cpu_class_t::intel_sierra_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::intel_sierra_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_AWS_G2
-extern template void make_network_variant<cpu_class_t::aws_g2_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::aws_g2_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_APPLE_M2
-extern template void make_network_variant<cpu_class_t::apple_m2_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::apple_m2_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_AWS_G5
-extern template void make_network_variant<cpu_class_t::aws_g5_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::aws_g5_k>(ucall_client_init_t*) noexcept;
-#endif
-#if UCALL_TARGET_MONOVERSIONED
-extern template void make_network_variant<cpu_class_t::monoversioned_k>(ucall_server_init_t*) noexcept;
-extern template void make_network_variant<cpu_class_t::monoversioned_k>(ucall_client_init_t*) noexcept;
-#endif
-
 /** CPU classes newest first, the order a ladder tries them in. */
 template <cpu_class_t... classes_>
 struct cpu_ladder {};
@@ -407,9 +317,9 @@ struct cpu_ladder {};
 #if UCALL_TARGET_MONOVERSIONED
 using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
 #else
-using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_sierra_k, cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k,
-                                cpu_class_t::intel_alder_k, cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k,
-                                cpu_class_t::apple_m2_k, cpu_class_t::aws_g2_k, cpu_class_t::serial_k>;
+using cpu_ladder_t =
+    cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_alder_k,
+               cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k, cpu_class_t::serial_k>;
 #endif
 
 /** Builds the network on the newest rung of @p ladder the build compiled and @p ceiling fits, one
@@ -423,6 +333,64 @@ void make_network(cpu_ladder<classes_...>, init_type_* arguments, cpu_ceiling_t 
             if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, make_network_variant<class_>(arguments);
     };
     (rung.template operator()<classes_>(), ...);
+}
+
+/** The class-free entry points' verbs, lowered onto one CPU class: the outcome word through its
+ *  reference and waiter, and the percent codec through its kit. */
+struct host_verbs_t {
+    void (*publish)(ucall_outcome_t*, ucall_status_t, char const*) noexcept;
+    ucall_status_t (*load)(ucall_outcome_t const*) noexcept;
+
+    /** Loops on the class waiter while the status reads deferred. */
+    ucall_status_t (*wait)(ucall_outcome_t const*) noexcept;
+
+    ucall_status_t (*decode_percent)(ucall_bytes_view_t, ucall_byte_t*, std::size_t*, ucall_percent_mode_t) noexcept;
+};
+
+template <cpu_class_t cpu_class_>
+host_verbs_t host_verbs_of() noexcept {
+    using traits_t = cpu_traits<cpu_class_>;
+    using status_reader_t = typename traits_t::template atomic_ref<ucall_status_t const>;
+    using wait_t = typename traits_t::waiter_t;
+    return {
+        [](ucall_outcome_t* outcome, ucall_status_t status, char const* message) noexcept {
+            utilities::publish<traits_t::template atomic_ref>(outcome, status, message);
+        },
+        [](ucall_outcome_t const* outcome) noexcept {
+            return status_reader_t {outcome->status}.load(std::memory_order_acquire);
+        },
+        [](ucall_outcome_t const* outcome) noexcept {
+            status_reader_t const status {outcome->status};
+            ucall_status_t seen = status.load(std::memory_order_acquire);
+            // One word wakes the monitor, so the wait needs no timeout to notice the publish.
+            for (; seen == ucall_status_deferred_k; seen = status.load(std::memory_order_acquire))
+                wait_t {}(&outcome->status, seen, 0u, fu::wait_uncapped_k);
+            return seen;
+        },
+        &traits_t::percent_kit_t::decode,
+    };
+}
+
+/** The row of the newest class this machine admits, picked once by the ladder walk. */
+inline host_verbs_t const& host_verbs() noexcept {
+    static host_verbs_t const picked = []<cpu_class_t... classes_>(cpu_ladder<classes_...>) noexcept {
+        cpu_ceiling_t ceiling {};
+        if (pick_cpu_ceiling(ucall_cpu_class_unknown_k, ceiling) != ucall_status_success_k) ceiling = {};
+        host_verbs_t row = host_verbs_of<cpu_class_t::serial_k>();
+        bool found = false;
+        auto rung = [&]<cpu_class_t class_>() noexcept {
+            if constexpr (cpu_class_compiled(class_))
+                if (!found && cpu_rung_fits(class_, ceiling)) row = host_verbs_of<class_>(), found = true;
+        };
+        (rung.template operator()<classes_>(), ...);
+        return row;
+    }(cpu_ladder_t {});
+    return picked;
+}
+
+/** Publishes from the class-free entry points through the host's row. */
+inline void publish(ucall_outcome_t* outcome, ucall_status_t status) noexcept {
+    host_verbs().publish(outcome, status, ucall_status_name(status));
 }
 
 } // namespace unum::ucall

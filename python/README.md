@@ -6,7 +6,7 @@
 pip install ucall
 ```
 
-Wheels cover CPython 3.12 to 3.15 on Linux, macOS and Windows, and a source build needs CMake and a C++20 compiler.
+Wheels cover CPython 3.12 to 3.15 on Linux, macOS and Windows, plus the free-threaded 3.14t, where the module declares it runs without the interpreter lock, and a source build needs CMake and a C++20 compiler.
 The package picks its I/O backend and CPU kernels when a server or client starts, so one wheel adapts to the kernel and CPU it runs on.
 
 ## Quickstart
@@ -40,11 +40,13 @@ assert bytes(response.body) == b"Hello, world!"
 ## Serving
 
 `ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
-Its `log=` callable receives each line the server writes as a `ucall.LogLevel` and a `str`, on whichever thread wrote it and holding the interpreter lock, and `metrics=ucall.Metrics(address, sample_rate, prefix, tags, interval_us)` sends StatsD datagrams from every event loop.
+Its `log=` callable receives each line the server writes as a `ucall.LogLevel` and a `str`, on whichever thread wrote it and holding the interpreter lock, filtered by `log_level=` and shaped by `log_format=`, and `metrics=ucall.Metrics(address, sample_rate, prefix, tags, interval_microseconds)` sends StatsD datagrams from every event loop.
 An `Interface` also takes `max_request_bytes=`, past which a request is answered 413, and `reply_directories=`, the directories a `ucall.Path` part names by position.
+`descriptor=` takes a listening socket, or its descriptor, that systemd or a supervisor opened, TCP or AF_UNIX, in place of an address; the server accepts on duplicates and never closes it.
 Without interfaces it answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545".
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
+At its connection budget a new peer evicts the idle keep-alive connection that progressed least recently.
 Port zero binds a free port, which `server.addresses` reports.
 
 ```python
@@ -74,14 +76,16 @@ def anything(request: ucall.Request):
 Endpoints register before any loop is polled, with `route` taking any `Verb` and `get`, `post`, `put`, `delete` and `patch` naming one.
 Each decorator registers the function through `add_endpoint` and returns it unchanged, so it stays callable from Python.
 Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice raises `ucall.Error` with `Status.ALREADY_EXISTS`.
-A path no endpoint matches answers 404, and a request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
+Routing is exact: an empty segment is a segment, so `/users` and `/users/` are different paths.
+A path no endpoint matches answers 404, one whose endpoints take other verbs answers 405 with an `allow` header, a GET endpoint also serves HEAD, and `OPTIONS` answers 204 with the same `allow` list.
+A request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
 
 Registration reads a handler's signature once.
 A handler taking one parameter annotated `ucall.Request` receives the request itself.
 Any other handler takes parameters annotated `str`, `int`, `float`, `bool` or `bytes`, or left bare, and each binds by name from the first place that has it:
 
 - a placeholder of the template, as sent;
-- the query, percent-decoded with "+" as a space;
+- the query, percent-decoded with "+" as a space, a "%" without two hexadecimal digits answering 400;
 - a JSON object body, parsed once and only when an earlier place missed a parameter;
 - the parameter's default.
 
@@ -100,9 +104,10 @@ Divided by `requests`, they price one call.
 ## Requests
 
 A `Request` is what a handler annotated to take one receives.
-Its reads copy out of the received bytes: `verb`, `path`, `path_parameter(name)`, `query(name)` and `header(name)`, with `peer` naming the interface it arrived on and the client's authenticated Noise key.
-`path`, path parameters and query values stay percent-encoded as sent, header names match case-insensitively, a lookup that finds nothing answers None, and the body arrives whole, decoded from chunked framing if it was sent that way.
-`peer` is a tuple of the interface's index in the server's arguments and the client's 32-byte static key, 32 zero bytes on a plaintext interface.
+Its reads copy out of the received bytes: `verb`, `path`, `query_string`, `path_parameter(name)`, `query(name)` and `header(name)`, with `peer` naming where it came from.
+`path`, `query_string`, path parameters and query values stay percent-encoded as sent, header names match case-insensitively, a lookup that finds nothing answers None, and the body arrives whole, decoded from chunked framing if it was sent that way.
+`fields()` lists every header field in arrival order as `(name, value)` bytes, names lowercased and values trimmed, as a proxy forwards a head.
+`peer` is a tuple of the interface's index in the server's arguments, the client's 32-byte static key, 32 zero bytes on a plaintext interface, and its address: an `(ipaddress, port)` pair, "" for an AF_UNIX peer, or None.
 
 ```python
 import ucall
@@ -216,7 +221,7 @@ import ucall
 server = ucall.Server(ucall.Interface("127.0.0.1:0", pipelined_requests=8))
 
 
-@server.batch("/infer", min_size=16, max_size=64, max_latency_us=2_000)
+@server.batch("/infer", min_size=16, max_size=64, max_latency_microseconds=2_000)
 def infer(requests: list[ucall.Request]):
     scores = [str(len(request.body)).encode() for request in requests]
     for request, score in zip(requests, scores, strict=True):
@@ -234,14 +239,14 @@ for thread in threads:
 ```
 
 `server.batch` registers the function through `add_batch_endpoint` and replaces it with its `BatchEndpoint`, which `server.batch_endpoints` lists too.
-A batch is due as soon as `min_size` requests wait, holds at most `max_size`, and goes smaller once its oldest request waited `max_latency_us`; zeros mean 1, 32 and 10 milliseconds.
-The handler runs on the thread draining the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
+A batch is due as soon as `min_size` requests wait, holds at most `max_size`, and goes smaller once its oldest request waited `max_latency_microseconds`; zeros mean 1, 32 and 10 milliseconds.
+The handler runs on the thread polling the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
 It receives a list of `Request` objects in arrival order, and may reply in any order or keep requests to answer later from any thread.
 When the handler raises, every request it left unanswered answers 500.
 
 The queue holds as many requests as the interfaces admit at once, connections times pipelined requests, and refuses more with 503.
 `server.stop()` releases the requests still queued without a reply.
-`endpoint.statistics()` counts `batches` and `requests`, and how many batches were `filled_batches` on reaching `max_size`, `ready_batches` on reaching `min_size`, or `expired_batches` once `max_latency_us` passed, from any thread while the endpoint drains.
+`endpoint.statistics()` counts `batches` and `requests`, and how many batches were `filled_batches` on reaching `max_size`, `ready_batches` on reaching `min_size`, or `expired_batches` once `max_latency_microseconds` passed, from any thread while the endpoint is polled.
 
 ## Calling
 
@@ -275,7 +280,7 @@ for index in range(64):
     client.submit("POST", f"{base}/echo", bytes([index]), context=index)
 remaining = 64
 while remaining:
-    for completed in client.take_completed(timeout_us=1_000_000):
+    for completed in client.take_completed(timeout_microseconds=1_000_000):
         assert completed.status == ucall.Status.SUCCESS
         assert bytes(completed.response.body) == bytes([completed.context])
         remaining -= 1
@@ -286,16 +291,20 @@ server.stop()
 runner.join()
 ```
 
-`submit(verb, url, body, headers, security=..., server_key=..., context=...)` borrows its URL, header lines, body and key until the call completes, and tags it with any `context` object.
+`submit(verb, url, body, headers, security=..., noise_peer_key=..., context=...)` borrows its URL, header lines, body and key until the call completes, and tags it with any `context` object.
 A call admitted once completes exactly once, and a client already holding `calls` unretrieved calls refuses more with `ucall.Error` and `Status.CONTENDED`; `calls` defaults to `connections` times `pipelined_calls`.
-`take_completed(timeout_us, capacity)` drives every admitted call and returns up to `capacity` finished ones as `Completed` objects, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
+`take_completed(timeout_microseconds, capacity)` drives every admitted call and returns up to `capacity` finished ones as `Completed` objects, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
 A `Completed` carries the `context`, the final `status`, a `message` on failure, and the `response`, None on failure.
 
 `request`, `get`, `post`, `put`, `delete` and `patch` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
 They take `json=` to send a value as JSON with its content type, and raise `ucall.Error` when the exchange fails.
-Every calling method also takes this call's `timeout_us=`, `max_retries=` and `max_redirects=` in place of the client's, and a `client_key=` private key in place of its own.
+Every calling method also takes this call's `timeout_microseconds=`, `max_retries=` and `max_redirects=` in place of the client's, and a `noise_private_key=` private key in place of its own.
 
-Every received response is a `Response`, whatever its HTTP status, and only a failed exchange is an error.
+A `Client` takes `log=`, `log_level=` and `log_format=` as a server does, reporting dials that fail every address, refused handshakes and refused redirects.
+`max_response_bytes=` caps the response a call buffers, failing the call with `Status.OVERFLOW` past it, and zero takes the largest receive buffer the kernel grants a socket.
+Host names resolve through the library's own stub resolver, never blocking the calling thread on the system's, and connections race the answered addresses as Happy Eyeballs does.
+
+Every received response is a `Response`, whatever its HTTP status, and only a failed exchange is an error; `fields()` lists its header fields in arrival order as a request's does.
 A `Response` owns its received bytes, so it stays readable after its `Client` is gone, and supports the buffer protocol as a request does: `bytes(response)` copies its body and `response.body` views it.
 Releasing the client cancels the calls still in flight and discards completions not yet retrieved.
 
@@ -315,7 +324,7 @@ client_public_key = ucall.derive_noise_public_key(client_private_key)
 sealed = ucall.Interface(
     "127.0.0.1:0",
     security=ucall.Security.NOISE_XX,
-    private_key=server_private_key,
+    noise_private_key=server_private_key,
     peer_authorizer=lambda key: key == client_public_key,
 )
 server = ucall.Server(sealed)
@@ -331,7 +340,7 @@ runner = threading.Thread(target=server.run)
 runner.start()
 client = ucall.Client(
     connections=1,
-    private_key=client_private_key,
+    noise_private_key=client_private_key,
     peer_authorizer=lambda key: key == server_public_key,
 )
 response = client.get(f"http+noise://{server.addresses[0]}/whoami")
@@ -342,8 +351,8 @@ assert bytes(response.body) == client_public_key
 
 `generate_noise_keypair` draws from the operating system's entropy and raises `ucall.Error` with `Status.IO` when it is refused.
 `derive_noise_public_key` recovers the public half of a stored private key, which peers compare in their authorizers.
-Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `server_key=`.
-Noise KK has both sides name each other in advance: the interface admits one caller through `noise_peer_key=`, and the call names its own private key with `client_key=` and the server's with `server_key=`.
+Under Noise XX both sides learn each other's key during the handshake, so both need an authorizer; Noise IK has the client name the server's key in advance through `noise_peer_key=`.
+Noise KK has both sides name each other in advance: the interface admits one caller through `noise_peer_key=`, and the call names its own private key with `noise_private_key=` and the server's with `noise_peer_key=`.
 An `http+noise://` URL implies Noise XX, and a handler reads the client's authenticated key through `request.peer`.
 
 ## Errors
@@ -365,6 +374,7 @@ except ucall.Error as error:
 ```
 
 `ucall.Status`, `Backend`, `CPUClass`, `Security`, `Verb`, `BodyDelivery` and `LogLevel` are `enum.IntEnum` classes, and every argument taking one also takes its name in any case, with "-" or "_" between words.
+`ucall.Status.from_name("out-of-memory")` reads a status back from the spelling the library gives it, `ucall.version()` numbers the linked library, and `ucall.__version__` spells it with any candidate suffix.
 A submitted call that fails completes with that status in `Completed.status`, such as `CONNECTION_FAILED`, `CONNECTION_CLOSED`, `TIMEOUT`, `HANDSHAKE_FAILED` or `PEER_REJECTED`, and HTTP error statuses are ordinary responses.
 On the serving side, failures become replies rather than exceptions: 400 for parameters that do not bind, 500 for a handler that raised or a request released unanswered.
 
@@ -378,7 +388,8 @@ The package starts no threads and needs no event loop of its own: every handler 
 
 Each event loop and each batch endpoint has one polling owner at a time.
 `take_calls` and `take_batches` run until `server.stop()`, while `take_call` and `take_batch` return after one round, waiting up to their timeout, so a loop of them interleaves polling with other work on the same thread.
-`server.stop()` works from any thread, handlers included, and wakes every polling and draining thread; join them before releasing the server.
+`server.stop()` works from any thread, handlers included, and wakes every polling thread; join them before releasing the server.
+The first stop drains, answering every request already held before its connection closes, and a second one cuts the replies still in flight.
 An interface accepts on its own number of event loops, one by default, and `server.event_loops` reports the largest of those counts.
 
 ```python
@@ -398,6 +409,7 @@ for thread in threads:
 
 Every polling call releases the interpreter lock while it waits on the network and takes it back only to run a Python handler, authorizer or batch handler.
 So loops parse, route and send in parallel, while Python handlers on several loops take turns on the lock unless they release it themselves, as NumPy does in its kernels.
+On a free-threaded interpreter there is no lock to take turns on, and handlers on several loops run at once.
 Signals reach Python only on the main thread between calls, so `take_calls` and `take_batches` belong on other threads.
 
 `server.run()` covers the simplest server, one event loop and no batch endpoints, on the calling thread, and raises `RuntimeError` for anything larger.

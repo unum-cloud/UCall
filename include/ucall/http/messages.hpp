@@ -1,11 +1,12 @@
 /**
- *  @file include/ucall/http.hpp
+ *  @file include/ucall/http/messages.hpp
  *  @author Ash Vardanian
  *  @date July 21, 2023
  *  @brief Incremental HTTP framing and borrowed views, independent of sockets and event loops.
  */
 #pragma once
 
+#include <algorithm>
 #include <charconv>
 #include <initializer_list>
 #include <limits>
@@ -23,17 +24,6 @@
 #endif
 #if STRINGZILLA_TARGET_NEONAES
 #include <stringzilla/hash/neonaes.h>
-#endif
-#if STRINGZILLA_TARGET_SVE
-#include <stringzilla/compare/sve.h>
-#include <stringzilla/find/sve.h>
-#endif
-#if STRINGZILLA_TARGET_SVE2
-#include <stringzilla/find/sve2.h>
-#include <stringzilla/utf8_uncased_fold/sve2.h>
-#endif
-#if STRINGZILLA_TARGET_SVE2AES
-#include <stringzilla/hash/sve2aes.h>
 #endif
 #if STRINGZILLA_TARGET_HASWELL
 #include <stringzilla/compare/haswell.h>
@@ -56,9 +46,16 @@
 #include <stringzilla/utf8_uncased_fold/icelake.h>
 #endif
 
-#include "ucall/types.hpp"
+#include "ucall/utilities/types.hpp" // `highest_kit`, `span`, `byte_t`, `text_view`
 
-namespace unum::ucall {
+struct ucall_received_http_response_handle_t {};
+
+namespace unum::ucall::http {
+
+using utilities::byte_t;
+using utilities::highest_kit;
+using utilities::span;
+using utilities::text_view;
 
 #pragma region String Kits
 
@@ -90,77 +87,6 @@ struct serial_fold_kit_t {
     static constexpr bool compiled_k = true;
     static constexpr auto uncased_fold = sz_utf8_uncased_fold_serial;
 };
-
-#if STRINGZILLA_TARGET_SVE
-
-/** Arm SVE with scalable vector lengths. */
-struct sve_compare_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve_k;
-    static constexpr bool compiled_k = true;
-    static constexpr auto equal = sz_equal_sve;
-};
-struct sve_find_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve_k;
-    static constexpr bool compiled_k = true;
-    static constexpr auto find = sz_find_sve;
-    static constexpr auto rfind = sz_rfind_sve;
-};
-#else
-
-/** The kits this build cannot carry, kept so each ladder stays one list. */
-struct sve_compare_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve_k;
-    static constexpr bool compiled_k = false;
-};
-struct sve_find_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve_k;
-    static constexpr bool compiled_k = false;
-};
-#endif // STRINGZILLA_TARGET_SVE
-
-#if STRINGZILLA_TARGET_SVE2
-
-/** Arm SVE2, whose byte matching serves the byte sets. */
-struct sve2_byteset_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve2_k;
-    static constexpr bool compiled_k = true;
-    static constexpr auto find_byteset = sz_find_byteset_sve2;
-    static constexpr auto rfind_byteset = sz_rfind_byteset_sve2;
-};
-struct sve2_fold_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve2_k;
-    static constexpr bool compiled_k = true;
-    static constexpr auto uncased_fold = sz_utf8_uncased_fold_sve2;
-};
-#else
-
-/** The kits this build cannot carry, kept so each ladder stays one list. */
-struct sve2_byteset_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve2_k;
-    static constexpr bool compiled_k = false;
-};
-struct sve2_fold_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve2_k;
-    static constexpr bool compiled_k = false;
-};
-#endif // STRINGZILLA_TARGET_SVE2
-
-#if STRINGZILLA_TARGET_SVE2AES
-
-/** Arm SVE2 with the AES extension. */
-struct sve2aes_hash_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve2aes_k;
-    static constexpr bool compiled_k = true;
-    static constexpr auto hash = sz_hash_sve2aes;
-};
-#else
-
-/** The kit this build cannot carry, kept so the ladder stays one list. */
-struct sve2aes_hash_kit_t {
-    static constexpr sz_capability_t capability_k = sz_cap_sve2aes_k;
-    static constexpr bool compiled_k = false;
-};
-#endif // STRINGZILLA_TARGET_SVE2AES
 
 #if STRINGZILLA_TARGET_SKYLAKE
 
@@ -381,28 +307,28 @@ struct westmere_hash_kit_t {
 
 /** The widest @c equal kit among the backends @p caps_ admits, newest first. */
 template <sz_capability_t caps_>
-using compare_kit = typename highest_kit<caps_, serial_compare_kit_t, sve_compare_kit_t, skylake_compare_kit_t,
-                                         neon_compare_kit_t, haswell_compare_kit_t, westmere_compare_kit_t>::type;
+using compare_kit = typename highest_kit<caps_, serial_compare_kit_t, skylake_compare_kit_t, neon_compare_kit_t,
+                                         haswell_compare_kit_t, westmere_compare_kit_t>::type;
 
 /** The widest substring @c find and @c rfind kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using find_kit = typename highest_kit<caps_, serial_find_kit_t, sve_find_kit_t, skylake_find_kit_t, neon_find_kit_t,
-                                      haswell_find_kit_t, westmere_find_kit_t>::type;
+using find_kit = typename highest_kit<caps_, serial_find_kit_t, skylake_find_kit_t, neon_find_kit_t, haswell_find_kit_t,
+                                      westmere_find_kit_t>::type;
 
 /** The widest byte-set search kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using byteset_kit = typename highest_kit<caps_, serial_byteset_kit_t, sve2_byteset_kit_t, icelake_byteset_kit_t,
-                                         neon_byteset_kit_t, haswell_byteset_kit_t>::type;
+using byteset_kit = typename highest_kit<caps_, serial_byteset_kit_t, icelake_byteset_kit_t, neon_byteset_kit_t,
+                                         haswell_byteset_kit_t>::type;
 
 /** The widest @c hash kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using hash_kit = typename highest_kit<caps_, serial_hash_kit_t, sve2aes_hash_kit_t, icelake_hash_kit_t,
-                                      skylake_hash_kit_t, neonaes_hash_kit_t, westmere_hash_kit_t>::type;
+using hash_kit = typename highest_kit<caps_, serial_hash_kit_t, icelake_hash_kit_t, skylake_hash_kit_t,
+                                      neonaes_hash_kit_t, westmere_hash_kit_t>::type;
 
 /** The widest UTF-8 case-folding kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using fold_kit = typename highest_kit<caps_, serial_fold_kit_t, sve2_fold_kit_t, icelake_fold_kit_t, neon_fold_kit_t,
-                                      haswell_fold_kit_t>::type;
+using fold_kit =
+    typename highest_kit<caps_, serial_fold_kit_t, icelake_fold_kit_t, neon_fold_kit_t, haswell_fold_kit_t>::type;
 
 /** Every byte @p predicate admits, as a set built at compile time. */
 template <typename predicate_type_>
@@ -427,17 +353,14 @@ inline constexpr sz_byteset_t http_control_bytes_k = byteset_where(
 inline constexpr sz_byteset_t http_non_padding_bytes_k = byteset_where(
     [](sz_u8_t byte) noexcept { return byte != ' ' && byte != '\t'; });
 
-/** Bytes other than the slash that separates path segments. */
-inline constexpr sz_byteset_t non_slash_bytes_k = byteset_where([](sz_u8_t byte) noexcept { return byte != '/'; });
-
 #pragma endregion String Kits
 
 enum class http_role_t { request_k, response_k, head_response_k };
-enum class http_parse_t { incomplete_k, complete_k, malformed_k, unsupported_k, overflow_k };
-enum class http_framing_t { length_k, chunked_k, until_close_k };
-enum class http_connection_t { close_k, keep_alive_k };
-enum class http_body_state_t { framed_k, decoded_k };
-enum class http_chunk_state_t { size_k, payload_k, payload_end_k, trailers_k };
+enum class http_parse_t { incomplete_k, complete_k, malformed_k, unsupported_k, unsupported_version_k, overflow_k };
+enum class http_framing_t : std::uint8_t { length_k, chunked_k, until_close_k };
+enum class http_connection_t : std::uint8_t { close_k, keep_alive_k };
+enum class http_body_state_t : std::uint8_t { framed_k, decoded_k };
+enum class http_chunk_state_t : std::uint8_t { size_k, payload_k, payload_end_k, trailers_k };
 
 /** A received response keeps its bytes independently of the client and its CPU specialization. */
 struct received_response_t : ucall_received_http_response_handle_t {
@@ -463,7 +386,7 @@ std::string_view text_view(st::vector<element_type_, allocator_type_> const& byt
 
 template <typename compare_kit_type_, typename find_kit_type_, typename byteset_kit_type_, typename hash_kit_type_,
           typename fold_kit_type_>
-struct http {
+struct messages {
     using compare_kit_t = compare_kit_type_;
     using find_kit_t = find_kit_type_;
     using byteset_kit_t = byteset_kit_type_;
@@ -575,7 +498,10 @@ struct http {
         return verb != ucall_verb_unknown_k && name == http_verb_name(verb) ? verb : ucall_verb_unknown_k;
     }
 
-    /** Offsets survive buffer growth; views exist only during message dispatch. */
+    /** Offsets survive buffer growth; views exist only during message dispatch. A chunked
+     *  body's decoder keeps where it stands in @c chunk_state, the payload bytes left in its
+     *  current chunk in @c chunk_remaining, and how much of the pending line it already
+     *  searched in @c scanned. */
     struct http_message_t {
         std::size_t headers_length {}, body_length {}, wire_length {};
         std::size_t target_offset {}, target_length {}, cursor {}, decoded_length {};
@@ -585,8 +511,8 @@ struct http {
         ucall_http_status_t status {};
         http_connection_t connection {http_connection_t::close_k};
         http_body_state_t body_state {http_body_state_t::framed_k};
-        http_chunk_state_t chunk_state {http_chunk_state_t::size_k}; // Where a streamed body's decoder stands.
-        std::size_t chunk_remaining {};                              // Payload bytes left in its current chunk.
+        http_chunk_state_t chunk_state {http_chunk_state_t::size_k};
+        std::size_t chunk_remaining {}, scanned {};
         bool keep_alive() const noexcept { return connection == http_connection_t::keep_alive_k; }
 
         std::string_view target(std::string_view bytes) const noexcept {
@@ -607,16 +533,49 @@ struct http {
             }
             return {};
         }
+
+        /** The field lines of the head in @p bytes, whatever their names. */
+        std::size_t fields_count(std::string_view bytes) const noexcept {
+            std::size_t count = 0;
+            for (auto start = find(bytes, "\r\n") + 2; start + 2 < headers_length;
+                 start = find(bytes, "\r\n", start) + 2)
+                ++count;
+            return count;
+        }
+
+        /** Field line @p index in arrival order: its name, lowercased since parsing, and its value
+         *  trimmed, or false past the last one. */
+        bool field(std::string_view bytes, std::size_t index, std::string_view& name,
+                   std::string_view& value) const noexcept {
+            for (auto start = find(bytes, "\r\n") + 2; start + 2 < headers_length;) {
+                auto end = find(bytes, "\r\n", start), colon = find(bytes, ':', start);
+                if (!index--) {
+                    name = bytes.substr(start, colon - start);
+                    value = trim_http(bytes.substr(colon + 1, end - colon - 1));
+                    return true;
+                }
+                start = end + 2;
+            }
+            return false;
+        }
     };
 
-    /** Reads the chunk-size line at @p cursor into @p length, with @p line_end at its CRLF:
-     *  complete once the line is whole, overflow when @p length would pass @p decoded bytes. */
-    static http_parse_t http_chunk_size(std::string_view text, std::size_t cursor, std::size_t decoded,
-                                        std::size_t& line_end, std::size_t& length) noexcept {
-        line_end = find(text, "\r\n", cursor);
-        if (line_end == std::string_view::npos) return http_parse_t::incomplete_k;
+    /** Reads the chunk-size line at @p cursor into @p length, with @p line_end at its CRLF,
+     *  resuming the search past the @p scanned bytes an earlier call saw: complete once the line is
+     *  whole, overflow when @p length would pass @p decoded bytes. */
+    static http_parse_t http_chunk_size(std::string_view text, std::size_t cursor, std::size_t& scanned,
+                                        std::size_t decoded, std::size_t& line_end, std::size_t& length) noexcept {
+        line_end = find(text, "\r\n", cursor + scanned);
+        if (line_end == std::string_view::npos) {
+            // The kept byte may be the CR of a CRLF split across receives.
+            scanned = text.size() > cursor ? text.size() - cursor - 1 : 0;
+            return http_parse_t::incomplete_k;
+        }
+        scanned = 0;
         auto line = text.substr(cursor, line_end - cursor);
         auto digits = line.substr(0, find(line, ';'));
+        // RFC 9112 7.1.1 lets whitespace pad the size before an extension.
+        if (digits.size() != line.size()) digits = digits.substr(0, rfind_set(digits, http_non_padding_bytes_k) + 1);
         length = 0;
         auto result = std::from_chars(digits.data(), digits.data() + digits.size(), length, 16);
         if (digits.empty() || result.ec != std::errc {} || result.ptr != digits.data() + digits.size() ||
@@ -627,12 +586,18 @@ struct http {
     }
 
     /** Walks the trailers from @p trailer to the empty line ending them, lowercasing their names,
-     *  with @p end past that line once complete. */
-    static http_parse_t http_trailers(span<byte_t> bytes, std::size_t trailer, std::size_t& end) noexcept {
+     *  with @p end past that line once complete. Each validated line advances @p trailer, and the
+     *  search resumes past the @p scanned bytes of the pending one, so no byte is walked twice. */
+    static http_parse_t http_trailers(span<byte_t> bytes, std::size_t& trailer, std::size_t& scanned,
+                                      std::size_t& end) noexcept {
         auto text = text_view(bytes);
         for (;;) {
-            auto trailer_end = find(text, "\r\n", trailer);
-            if (trailer_end == std::string_view::npos) return http_parse_t::incomplete_k;
+            auto trailer_end = find(text, "\r\n", trailer + scanned);
+            if (trailer_end == std::string_view::npos) {
+                scanned = text.size() > trailer ? text.size() - trailer - 1 : 0;
+                return http_parse_t::incomplete_k;
+            }
+            scanned = 0;
             if (trailer_end == trailer) {
                 end = trailer + 2;
                 return http_parse_t::complete_k;
@@ -671,10 +636,21 @@ struct http {
                 message.target_offset = space + 1;
                 message.target_length = second - space - 1;
                 auto target = first.substr(message.target_offset, message.target_length);
-                if (target.empty() || target.front() != '/' ||
-                    (find(target, ' ') != std::string_view::npos || find(target, '#') != std::string_view::npos ||
-                     find(target, '\t') != std::string_view::npos) ||
-                    !http_value(target))
+                bool const asterisk = target == "*" && message.verb == ucall_verb_options_k;
+                if (!target.starts_with('/') && !asterisk) {
+                    // RFC 9112 3.2.2: absolute-form names the origin too, which routing ignores.
+                    auto const scheme = find(target, "://");
+                    if (scheme == std::string_view::npos || !http_token(target.substr(0, scheme)) ||
+                        target.size() == scheme + 3)
+                        return http_parse_t::malformed_k;
+                    auto const authority = target.substr(scheme + 3);
+                    std::size_t const path = std::min({find(authority, '/'), find(authority, '?'), authority.size()});
+                    message.target_offset += scheme + 3 + path;
+                    message.target_length -= scheme + 3 + path;
+                    target.remove_prefix(scheme + 3 + path);
+                }
+                if (find(target, ' ') != std::string_view::npos || find(target, '#') != std::string_view::npos ||
+                    find(target, '\t') != std::string_view::npos || !http_value(target))
                     return http_parse_t::malformed_k;
                 version = first.substr(second + 1);
             }
@@ -687,7 +663,11 @@ struct http {
                     (first.size() > space + 4 && first[space + 4] != ' ') || !http_value(first))
                     return http_parse_t::malformed_k;
             }
-            if (version != "HTTP/1.1" && version != "HTTP/1.0") return http_parse_t::unsupported_k;
+            // RFC 9112 2.3: no HTTP-version at all is 400; one this server does not speak is 505.
+            if (version.size() != 8 || !version.starts_with("HTTP/") || version[6] != '.' ||
+                static_cast<unsigned char>(version[5] - '0') > 9 || static_cast<unsigned char>(version[7] - '0') > 9)
+                return http_parse_t::malformed_k;
+            if (version != "HTTP/1.1" && version != "HTTP/1.0") return http_parse_t::unsupported_version_k;
             message.connection = version == "HTTP/1.1" ? http_connection_t::keep_alive_k : http_connection_t::close_k;
             bool has_length = false, has_transfer = false, has_host = false, has_close = false;
             std::size_t start = first_end + 2;
@@ -734,6 +714,8 @@ struct http {
             }
             if (has_close) message.connection = http_connection_t::close_k;
             if (has_length && has_transfer) return http_parse_t::malformed_k;
+            // RFC 9112 6.1: a 1.0 hop between would not decode chunks, so the framing is faulty.
+            if (has_transfer && version == "HTTP/1.0") return http_parse_t::malformed_k;
             if (role == http_role_t::request_k && version == "HTTP/1.1" && !has_host) return http_parse_t::malformed_k;
             message.headers_length = end + 4;
             message.cursor = message.headers_length;
@@ -759,23 +741,33 @@ struct http {
             return text.size() >= message.wire_length ? http_parse_t::complete_k : http_parse_t::incomplete_k;
         }
         while (message.cursor < text.size()) {
-            std::size_t line_end = 0, length = 0;
-            if (auto sized = http_chunk_size(text, message.cursor, message.decoded_length, line_end, length);
-                sized != http_parse_t::complete_k)
-                return sized;
-            if (!length) {
+            if (message.chunk_state == http_chunk_state_t::trailers_k) {
                 std::size_t end = 0;
-                if (auto trailed = http_trailers(bytes, line_end + 2, end); trailed != http_parse_t::complete_k)
+                if (auto trailed = http_trailers(bytes, message.cursor, message.scanned, end);
+                    trailed != http_parse_t::complete_k)
                     return trailed;
                 message.wire_length = end;
                 message.body_length = message.decoded_length;
                 return http_parse_t::complete_k;
             }
-            if (length > std::numeric_limits<std::size_t>::max() - 2 || text.size() - line_end - 2 < length + 2)
-                return http_parse_t::incomplete_k;
-            if (text.substr(line_end + 2 + length, 2) != "\r\n") return http_parse_t::malformed_k;
-            message.decoded_length += length;
-            message.cursor = line_end + 2 + length + 2;
+            if (message.chunk_state == http_chunk_state_t::payload_k) {
+                std::size_t const length = message.chunk_remaining;
+                if (length > std::numeric_limits<std::size_t>::max() - 2 || text.size() - message.cursor < length + 2)
+                    return http_parse_t::incomplete_k;
+                if (text.substr(message.cursor + length, 2) != "\r\n") return http_parse_t::malformed_k;
+                message.decoded_length += length;
+                message.cursor += length + 2;
+                message.chunk_state = http_chunk_state_t::size_k;
+                continue;
+            }
+            std::size_t line_end = 0, length = 0;
+            if (auto sized = http_chunk_size(text, message.cursor, message.scanned, message.decoded_length, line_end,
+                                             length);
+                sized != http_parse_t::complete_k)
+                return sized;
+            message.cursor = line_end + 2;
+            message.chunk_remaining = length;
+            message.chunk_state = length ? http_chunk_state_t::payload_k : http_chunk_state_t::trailers_k;
         }
         return http_parse_t::incomplete_k;
     }
@@ -799,9 +791,10 @@ struct http {
 
     /** Decodes the body @p bytes holds from its front in place, leaving @p payload decoded bytes
      *  there, and reports in @p consumed how many bytes it walked; complete once the body and its
-     *  trailers ended. An identity body takes what arrived up to its declared length. */
-    static http_parse_t http_stream_body(span<byte_t> bytes, http_message_t& message, std::size_t& payload,
-                                         std::size_t& consumed) noexcept {
+     *  trailers ended, overflow once framing waits for a line end past @p limit bytes. An identity
+     *  body takes what arrived up to its declared length. */
+    static http_parse_t http_stream_body(span<byte_t> bytes, http_message_t& message, std::size_t limit,
+                                         std::size_t& payload, std::size_t& consumed) noexcept {
         auto text = text_view(bytes);
         payload = consumed = 0;
         if (message.framing == http_framing_t::length_k) {
@@ -828,17 +821,23 @@ struct http {
                 break;
             case http_chunk_state_t::size_k: {
                 std::size_t line_end = 0, length = 0;
-                if (auto sized = http_chunk_size(text, consumed, message.decoded_length, line_end, length);
-                    sized != http_parse_t::complete_k)
-                    return sized;
+                auto sized = http_chunk_size(text, consumed, message.scanned, message.decoded_length, line_end, length);
+                // Framing is no payload a pull drains, so the request cap bounds a line still open.
+                if (sized == http_parse_t::incomplete_k && text.size() - consumed > limit)
+                    return http_parse_t::overflow_k;
+                if (sized != http_parse_t::complete_k) return sized;
                 consumed = line_end + 2;
                 message.chunk_remaining = length;
+                message.cursor = 0;
                 message.chunk_state = length ? http_chunk_state_t::payload_k : http_chunk_state_t::trailers_k;
                 break;
             }
             case http_chunk_state_t::trailers_k: {
-                std::size_t end = 0;
-                auto trailed = http_trailers(bytes, consumed, end);
+                std::size_t trailer = consumed + message.cursor, end = 0;
+                auto trailed = http_trailers(bytes, trailer, message.scanned, end);
+                message.cursor = trailer - consumed;
+                if (trailed == http_parse_t::incomplete_k && text.size() - consumed > limit)
+                    return http_parse_t::overflow_k;
                 if (trailed == http_parse_t::complete_k) consumed = end;
                 return trailed;
             }
@@ -870,4 +869,4 @@ struct http {
     }
 };
 
-} // namespace unum::ucall
+} // namespace unum::ucall::http
