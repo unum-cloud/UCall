@@ -4,8 +4,8 @@ description = "HTTP and Noise clients and servers with capability-specialized I/
 keywords = ["http", "server", "io-uring", "noise"]
 categories = ["network-programming", "web-programming::http-server", "web-programming::http-client"]
 edition = "2021"
-# `Waker::noop` in the tests; the library itself builds on 1.82.
-rust-version = "1.85"
+# The floor of the sibling crates whose trees CMake builds.
+rust-version = "1.100"
 include = [
   "/rust/**",
   "/include/**",
@@ -30,6 +30,12 @@ version = "1.0.0-rc.1"
 [lib]
 name = "ucall"
 path = "rust/lib.rs"
+
+[dependencies]
+# CMake builds each crate's tree in place of downloading the revision the submodule pins.
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", default-features = false }
+smashtable = { version = "1.0.0-rc.1", git = "https://github.com/ashvardanian/SmashTable" }
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", default-features = false }
 
 [build-dependencies]
 # The library is CMake's to build, so `build.rs` drives it rather than restating its per-class flags.

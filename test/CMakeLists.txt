@@ -7,6 +7,10 @@ endforeach ()
 
 target_link_libraries(ucall_test_noise PRIVATE stringzilla::header)
 
+# The kit rows name what the library compiled, which a unit at baseline flags cannot infer.
+target_include_directories(ucall_test_x25519 PRIVATE "${PROJECT_SOURCE_DIR}/src")
+target_link_libraries(ucall_test_x25519 PRIVATE stringzilla::cpu_capabilities_compiled)
+
 add_executable(ucall_test_c "${PROJECT_SOURCE_DIR}/c/test.c")
 target_link_libraries(ucall_test_c PRIVATE ucall_static ucall_sanitizers ucall_warnings)
 target_compile_features(ucall_test_c PRIVATE c_std_11)
@@ -50,6 +54,12 @@ set_tests_properties(
     polling PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT
                        UCALL_TEST_DIRECT_DIRECTORY=${CMAKE_CURRENT_BINARY_DIR}
 )
+
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_executable(ucall_test_kernel_abi kernel_abi.cpp)
+    target_link_libraries(ucall_test_kernel_abi PRIVATE ucall_static ucall_warnings)
+    add_test(NAME kernel_abi COMMAND ucall_test_kernel_abi)
+endif ()
 
 if (UCALL_WITH_LINUX_URING)
     add_executable(ucall_test_uring uring.cpp)

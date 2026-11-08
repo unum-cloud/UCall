@@ -105,10 +105,11 @@ static case_result_t engine_duplex(random_generator_t& generator) {
     for (auto& byte : payload) byte = static_cast<uc::byte_t>(generator());
     uc::span<uc::byte_t const> const message = uc::byte_span("receive");
     std::array<uc::byte_t, fixture_buffer_bytes_k> buffer {};
+    uc::io::io_vector_t room {buffer.data(), sizeof(buffer)};
     uc::io::io_request_t receiving {.operation = uc::io::io_operation_t::receive_k,
                                     .descriptor = owned,
-                                    .data = buffer.data(),
-                                    .length = buffer.size()};
+                                    .data = reinterpret_cast<uc::byte_t*>(&room),
+                                    .length = 1};
     uc::io::io_request_t sending {.operation = uc::io::io_operation_t::send_k,
                                   .descriptor = owned,
                                   .data = payload.data(),
@@ -139,7 +140,7 @@ static case_result_t engine_duplex(random_generator_t& generator) {
                 require(failures, completed.request == &receiving, "a completion named neither request");
                 require(failures, completed.result > 0, "receiving ended with {}", completed.result);
                 received = static_cast<std::size_t>(completed.result);
-                uc::span<uc::byte_t const> const delivered {completed.data ? completed.data : receiving.data, received};
+                uc::span<uc::byte_t const> const delivered {completed.data ? completed.data : buffer.data(), received};
                 failures += expect_bytes(delivered, message);
                 failures += expect(sent != payload.size(), "the send finished before the peer read");
             }

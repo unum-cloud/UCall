@@ -1746,6 +1746,12 @@ pub enum ReplyPart<'b, 'f> {
     Path(PathRange<'b>) = ucall_reply_part_path_k,
 }
 
+impl<'b> From<&'b std::io::IoSlice<'_>> for ReplyPart<'b, '_> {
+    fn from(slice: &'b std::io::IoSlice<'_>) -> Self {
+        ReplyPart::Bytes(BytesView::from(&**slice))
+    }
+}
+
 /// `ucall_file_range_t`: the caller's `O_DIRECT` descriptor, borrowed until the reply is final.
 #[derive(Clone, Copy, Debug)]
 #[repr(C)]
@@ -1998,7 +2004,7 @@ mod tests {
     use core::pin::pin;
     use core::task::{Context, Poll, Waker};
     use std::borrow::Cow;
-    use std::io::{Read, Write};
+    use std::io::{IoSlice, Read, Write};
     use std::net::{TcpStream, UdpSocket};
     use std::os::fd::AsFd;
     use std::sync::Mutex;
@@ -2397,8 +2403,9 @@ mod tests {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
                     let detached = next_detached(&received);
-                    let greeting = [b"Hello, ", detached.path_parameter("name").unwrap()].concat();
-                    let parts = [ReplyPart::Bytes(greeting.as_slice().into())];
+                    let name = detached.path_parameter("name").unwrap().to_vec();
+                    let slices = [IoSlice::new(b"Hello, "), IoSlice::new(&name)];
+                    let parts = slices.each_ref().map(ReplyPart::from);
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
                     assert!(deferred.is_none());
                     drop(next_detached(&received));

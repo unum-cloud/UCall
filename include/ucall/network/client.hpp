@@ -46,6 +46,7 @@ using utilities::allocator_delete;
 using utilities::byte_t;
 using utilities::bytes_view;
 using utilities::deadline_after;
+using utilities::largest_receive_buffer;
 using utilities::monotonic_ns;
 using utilities::publish;
 using utilities::sockets_start;
@@ -217,7 +218,7 @@ struct client_connection {
         transport.role = transport_role_t::client_k;
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(client_connection) == 2408);
+            static_assert(sizeof(client_connection) == 2400);
     }
     client_connection(client_connection const&) = delete;
     client_connection& operator=(client_connection const&) = delete;
@@ -631,7 +632,7 @@ struct client : ucall_client_handle_t {
             transport.transmit_request = {.operation = io_operation_t::connect_k,
                                           .descriptor = descriptor,
                                           .data = reinterpret_cast<byte_t*>(&connection.target),
-                                          .length = connection.target_length,
+                                          .length = static_cast<std::size_t>(connection.target_length),
                                           .deadline = transport.deadline,
                                           .context = &connection};
             // A later address, even one answered after this dial, races a connect past
@@ -977,7 +978,8 @@ struct client : ucall_client_handle_t {
         if (status == ucall_status_not_found_k) {
             response = take_response(client);
             if (!response) return transport.fail(ucall_status_out_of_memory_k);
-            if (!offset && message.wire_length == transport.input.size()) {
+            if (!offset && message.wire_length == transport.input.size() &&
+                transport.input_may_leave(message.wire_length)) {
                 std::swap(response->storage, transport.input);
             }
             else if (ucall_status_t const appended = http_t::append_text(
@@ -1074,6 +1076,7 @@ struct client : ucall_client_handle_t {
             consumed = input.empty() ? 0 : consumed + wire;
         }
         if (consumed) http_t::drop_bytes(input, consumed);
+        transport.aim_receive();
         if (transport.stage != transport_stage_t::open_k) return transport.advance();
         if (transport.peer_stream == peer_stream_t::closed_k || (!connection.oldest_exchange && !input.empty()))
             transport.receiving = receive_state_t::ended_k;
@@ -1109,8 +1112,7 @@ struct client : ucall_client_handle_t {
                 // Sealing failed the connection.
                 return transport.advance();
             }
-            if (transport.receive_operation == operation_state_t::idle_k)
-                return transport.emit(transport.receive_request, io_operation_t::receive_k, transport.received);
+            if (transport.receive_operation == operation_state_t::idle_k) return transport.emit_receive();
             return nullptr;
         }
         transport.fail(connection.oldest_exchange ? ucall_status_connection_closed_k : ucall_status_success_k);
@@ -1221,7 +1223,7 @@ struct client : ucall_client_handle_t {
         auto& connection = *static_cast<client_connection_t*>(completion.request->context);
         transport_t& transport = connection.transport;
         bool const connected = transport.stage == transport_stage_t::connecting_k && completion.result >= 0;
-        transport.complete(completion);
+        transport.complete(completion, connection.client->config.max_response_bytes);
         if (connected && connection.oldest_exchange) transport.deadline = connection.oldest_exchange->deadline;
         engine.release(completion);
     }
@@ -1336,7 +1338,7 @@ struct client : ucall_client_handle_t {
                 publish(arguments->outcome, started);
                 return;
             }
-            config.max_response_bytes = formatting_t::largest_receive_buffer(AF_INET);
+            config.max_response_bytes = largest_receive_buffer(AF_INET, max_unsent_bytes_k);
         }
         if (!config.max_pipelined_calls) config.max_pipelined_calls = 1;
         if (!config.max_concurrent_calls) {
@@ -1419,7 +1421,8 @@ struct client : ucall_client_handle_t {
             client->engine = bound;
             client->binding = client_binding_t::bound_k;
         }
-        else if (auto status = client->owned_engine.open(slots, slots); status != ucall_status_success_k) {
+        else if (auto status = client->owned_engine.open(slots, slots, io::io_issuer_scope_t::any_thread_k);
+                 status != ucall_status_success_k) {
             char const* message = ucall_status_name(status);
             // An engine refused by a host setting names the setting to raise.
             if constexpr (requires { client->owned_engine.refusal; })

@@ -2,7 +2,7 @@
  *  @file c/ucall/server.h
  *  @author Ash Vardanian
  *  @date February 3, 2023
- *  @brief The server lifecycle and HTTP and WebSocket operations of the UCall C interface.
+ *  @brief The server lifecycle and HTTP operations of the UCall C interface.
  */
 #ifndef UNUM_UCALL_SERVER_H
 #define UNUM_UCALL_SERVER_H
@@ -186,7 +186,9 @@ UCALL_EXPORT void ucall_server_init(ucall_server_init_t* arguments);
  *  @param[in] server Server from @c ucall_server_init(), or @c NULL.
  *
  *  @note Stop and join polling threads, and finish application use of retained requests before
- *      teardown. Remaining request handles become invalid. Native I/O retirement can block.
+ *      teardown. Remaining request handles become invalid. Native I/O retirement can block, and
+ *      on a thread other than a polling owner it waits for the kernel to end that owner's ring,
+ *      which a forked child that never called @c exec prolongs until it exits.
  *      Returns without freeing while a client bound to it lives; free those first.
  */
 UCALL_EXPORT void ucall_server_free(ucall_server_t server);
@@ -620,37 +622,6 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
  *    template.
  */
 UCALL_EXPORT void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments);
-
-/** Arguments of @c ucall_server_add_websocket_endpoint(). */
-typedef struct ucall_server_add_websocket_endpoint_t {
-
-    /** The server this call operates on. */
-    ucall_server_t server;
-
-    /** Receives a failure for a duplicate endpoint, an invalid template, or a lack of memory. */
-    ucall_outcome_t* outcome;
-
-    /** URI template, with an explicit byte length. */
-    ucall_bytes_view_t uri_template;
-
-    /** Function pointer to handle WebSocket events. */
-    ucall_websocket_callback_t callback;
-
-    /** Optional user-defined context pointer passed to all event callbacks. */
-    void* context;
-
-} ucall_server_add_websocket_endpoint_t;
-
-/**
- *  @brief Registers a WebSocket endpoint to accept incoming connections.
- *
- *  On HTTP Upgrade request, establishes a WebSocket connection and invokes @c callback for all
- *  events (open, message, error, close) on the application polling caller.
- *
- *  @note Call during setup only, before any loop is polled.
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* arguments);
 
 /**
  *  @brief Returns the HTTP method of the received request. Never @c ucall_verb_any_k.
@@ -1459,60 +1430,6 @@ typedef struct ucall_server_reply_end_t {
  *  - @c ucall_status_not_found_k A file part's file is missing, unreadable or irregular.
  */
 UCALL_EXPORT void ucall_server_reply_end(ucall_server_reply_end_t* arguments);
-
-/** Arguments of @c ucall_server_websocket_send(). */
-typedef struct ucall_server_websocket_send_t {
-
-    /** The server this call operates on. */
-    ucall_server_t server;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** WebSocket connection handle from the callback. */
-    ucall_websocket_t websocket;
-
-    /** Message type (text, binary, ping, pong). */
-    ucall_websocket_opcode_t opcode;
-
-    /** Message payload. */
-    ucall_bytes_view_t data;
-
-} ucall_server_websocket_send_t;
-
-/**
- *  @brief Sends a message to a connected WebSocket client.
- *
- *  Thread-safe, can be called from any thread including from within the callback itself.
- *
- *  @note @b Thread-safe.
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_server_websocket_send(ucall_server_websocket_send_t* arguments);
-
-/** Arguments of @c ucall_server_websocket_close(). */
-typedef struct ucall_server_websocket_close_t {
-
-    /** The server this call operates on. */
-    ucall_server_t server;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** WebSocket connection handle from the callback. Invalid once this call returns. */
-    ucall_websocket_t websocket;
-
-} ucall_server_websocket_close_t;
-
-/**
- *  @brief Closes a WebSocket connection.
- *
- *  Thread-safe, can be called from any thread including from within the callback itself.
- *
- *  @note @b Thread-safe.
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_server_websocket_close(ucall_server_websocket_close_t* arguments);
 
 #ifdef __cplusplus
 }

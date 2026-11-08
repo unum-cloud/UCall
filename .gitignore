@@ -39,6 +39,7 @@ wheelhouse/
 # Rust
 target/
 Cargo.lock
+/.cargo/config.toml
 
 # Editors, assistants, language servers and tool caches
 /compile_commands.json
@@ -50,3 +51,4 @@ Cargo.lock
 
 # Local scratch
 *.log
+

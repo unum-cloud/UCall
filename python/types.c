@@ -151,6 +151,9 @@ static char const doc_Error[] =                                                 
     "\n"                                                                            //
     "A failed verb, raised with the `Status` it reported and a static detail.\n"    //
     "\n"                                                                            //
+    "Each failing status raises its own subclass, like `ConnectionFailedError`,\n"  //
+    "which derives the built-in naming the same fault, here `ConnectionError`.\n"   //
+    "\n"                                                                            //
     "Args:\n"                                                                       //
     "  status (Status): The failure, such as `Status.CONTENDED`.\n"                 //
     "  message (str): The detail of the failure, or the status name without one.\n" //
@@ -197,6 +200,75 @@ PyTypeObject ErrorType = {
     .tp_str = (reprfunc)Error_str,
     .tp_getset = Error_getset,
 };
+
+/** The class each failing status raises, indexed by status; success and deferred never raise. */
+static PyObject* status_error_types[ucall_status_would_block_k + 1];
+
+/** One failing status, the dotted name of the class it raises, the built-in naming the same
+ *  fault or NULL when none does, and its doc. */
+static struct {
+    ucall_status_t status;
+    char const* name;
+    PyObject** builtin;
+    char const* doc;
+} const status_errors[] = {
+    {ucall_status_out_of_memory_k, "ucall.OutOfMemoryError", &PyExc_MemoryError,
+     "An allocation could not be satisfied."},
+    {ucall_status_io_k, "ucall.InputOutputError", &PyExc_OSError,
+     "A file or socket could not be opened, read, written, or closed."},
+    {ucall_status_malformed_k, "ucall.MalformedError", &PyExc_ValueError,
+     "The peer sent bytes that do not decode as the expected protocol."},
+    {ucall_status_internal_k, "ucall.InternalError", NULL,
+     "The library violated its contract, which points at a defect."},
+    {ucall_status_overflow_k, "ucall.OverflowError", &PyExc_OverflowError,
+     "A requested size exceeds the representable range."},
+    {ucall_status_uninitialized_k, "ucall.UninitializedError", NULL,
+     "The call needs a handle that was never initialized."},
+    {ucall_status_contended_k, "ucall.ContendedError", NULL,
+     "The call was refused rather than waited for, like a submission to a full client."},
+    {ucall_status_unsupported_k, "ucall.UnsupportedError", &PyExc_NotImplementedError,
+     "The build, backend, or machine does not implement the requested feature."},
+    {ucall_status_invalid_argument_k, "ucall.InvalidArgumentError", &PyExc_ValueError,
+     "An argument is missing, out of range, or contradicts another argument."},
+    {ucall_status_not_found_k, "ucall.NotFoundError", &PyExc_KeyError,
+     "The requested endpoint, header, parameter, or file does not exist."},
+    {ucall_status_already_exists_k, "ucall.AlreadyExistsError", &PyExc_ValueError,
+     "An endpoint with the same template and verb is already registered."},
+    {ucall_status_connection_failed_k, "ucall.ConnectionFailedError", &PyExc_ConnectionError,
+     "DNS lookup or connection establishment failed."},
+    {ucall_status_connection_closed_k, "ucall.ConnectionClosedError", &PyExc_ConnectionError,
+     "The connection closed before the exchange completed."},
+    {ucall_status_timeout_k, "ucall.TimeoutError", &PyExc_TimeoutError,
+     "The exchange did not finish within its deadline."},
+    {ucall_status_handshake_failed_k, "ucall.HandshakeFailedError", NULL,
+     "The Noise handshake failed to authenticate or agree on keys."},
+    {ucall_status_peer_rejected_k, "ucall.PeerRejectedError", NULL,
+     "The peer authorizer declined the authenticated static key."},
+    {ucall_status_would_block_k, "ucall.WouldBlockError", &PyExc_BlockingIOError,
+     "Nothing was ready, like a body pull on the polling thread before any bytes arrived."},
+};
+
+PyObject* ucall_py_status_error_type(ucall_status_t status) {
+    PyObject* const type = (size_t)status < sizeof(status_error_types) / sizeof(status_error_types[0])
+                               ? status_error_types[status]
+                               : NULL;
+    return type ? type : (PyObject*)&ErrorType;
+}
+
+int ucall_py_errors_register(PyObject* module) {
+    for (size_t row = 0; row != sizeof(status_errors) / sizeof(status_errors[0]); ++row) {
+        PyObject* const bases = status_errors[row].builtin
+                                    ? PyTuple_Pack(2, (PyObject*)&ErrorType, *status_errors[row].builtin)
+                                    : Py_NewRef((PyObject*)&ErrorType);
+        if (!bases) return -1;
+        PyObject* const type = PyErr_NewExceptionWithDoc(status_errors[row].name, status_errors[row].doc, bases, NULL);
+        Py_DECREF(bases);
+        if (!type) return -1;
+        status_error_types[status_errors[row].status] = type;
+        if (PyModule_AddObjectRef(module, status_errors[row].name + sizeof("ucall.") - 1, type) < 0) return -1;
+    }
+    return 0;
+}
 
 #pragma endregion Errors
 

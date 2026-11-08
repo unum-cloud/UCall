@@ -2,7 +2,7 @@
  *  @file include/ucall/tunnel/crypto.hpp
  *  @author Ash Vardanian
  *  @date August 9, 2026
- *  @brief SHA-256 and AES-256-GCM kits, and the Noise primitives and pattern state built on them.
+ *  @brief SHA-256, AES-256-GCM and X25519 kits, with the Noise primitives and state over them.
  */
 #pragma once
 
@@ -33,7 +33,7 @@
 #include <stringzilla/cipher/icelake.h>
 #endif
 
-#include "ucall/tunnel/curve25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
+#include "ucall/tunnel/curve25519.hpp" // `x25519_multiply_serial`, `x25519_derive_public`
 #include "ucall/tunnel/types.hpp"      // `secure_tunnel_fault_t`, `secure_tunnel_key_size_k`, `secure_tunnel_mode_t`
 #include "ucall/utilities/types.hpp"   // `highest_kit`, `span`, `byte_t`
 
@@ -67,6 +67,13 @@ struct serial_aes256_gcm_kit_t {
     static constexpr auto key_init = sz_aes256_gcm_key_init_serial;
     static constexpr auto encrypt = sz_aes256_gcm_encrypt_serial;
     static constexpr auto decrypt = sz_aes256_gcm_decrypt_serial;
+};
+
+/** Saturated X25519 over 32×32 partial products, the floor of its ladder. */
+struct serial_x25519_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_serial_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto multiply = x25519_multiply_serial;
 };
 
 #if STRINGZILLA_TARGET_NEONSHA
@@ -164,6 +171,40 @@ struct westmere_aes256_gcm_kit_t {
 };
 #endif // STRINGZILLA_TARGET_WESTMERE
 
+#if STRINGZILLA_TARGET_HASWELL
+
+/** Saturated X25519 over MULX, ADC and SBB chains. */
+struct haswell_x25519_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_haswell_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto multiply = x25519_multiply_haswell;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct haswell_x25519_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_haswell_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_HASWELL
+
+#if STRINGZILLA_TARGET_NEON
+
+/** Radix-51 X25519 over UMULH. */
+struct neon_x25519_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neon_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto multiply = x25519_multiply_neon;
+};
+#else
+
+/** The kit this build cannot carry, kept so the ladder stays one list. */
+struct neon_x25519_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_neon_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_NEON
+
 /** The widest SHA-256 kit among the backends @p caps_ admits, newest first. */
 template <sz_capability_t caps_>
 using sha256_kit = typename highest_kit<caps_, serial_sha256_kit_t, neonsha_sha256_kit_t, goldmont_sha256_kit_t>::type;
@@ -173,13 +214,19 @@ template <sz_capability_t caps_>
 using aes256_gcm_kit = typename highest_kit<caps_, serial_aes256_gcm_kit_t, icelake_aes256_gcm_kit_t,
                                             neonaes_aes256_gcm_kit_t, westmere_aes256_gcm_kit_t>::type;
 
+/** The X25519 kit among the backends @p caps_ admits. */
+template <sz_capability_t caps_>
+using x25519_kit = typename highest_kit<caps_, serial_x25519_kit_t, haswell_x25519_kit_t, neon_x25519_kit_t>::type;
+
 #pragma endregion Cipher Kits
 
-/** Cryptographic primitives and pattern state over the hashing and cipher kits it is handed. */
-template <typename sha256_kit_type_, typename aes256_gcm_kit_type_>
+/** Cryptographic primitives and pattern state over the hashing, cipher and X25519 kits it is
+ *  handed. */
+template <typename sha256_kit_type_, typename aes256_gcm_kit_type_, typename x25519_kit_type_>
 struct secure_tunnel_crypto {
     using sha256_kit_t = sha256_kit_type_;
     using aes256_gcm_kit_t = aes256_gcm_kit_type_;
+    using x25519_kit_t = x25519_kit_type_;
 
     static constexpr auto sha_init = sha256_kit_t::init;
     static constexpr auto sha_update = sha256_kit_t::update;
@@ -922,7 +969,8 @@ struct secure_tunnel_crypto {
             span<byte_t const, secure_tunnel_key_size_k> scalar,
             span<byte_t const, secure_tunnel_key_size_k> point) noexcept {
             byte_t shared[secure_tunnel_key_size_k];
-            if (!x25519_scalar_multiply(shared, scalar, point)) return secure_tunnel_fault_t::authentication_failed_k;
+            if (!x25519_kit_t::multiply(std::span {shared}, scalar, point))
+                return secure_tunnel_fault_t::authentication_failed_k;
             transcript.mix_key(shared);
             secure_zero(shared);
             return secure_tunnel_fault_t::none_k;
@@ -932,7 +980,7 @@ struct secure_tunnel_crypto {
             if (secure_tunnel_fault_t const fault = secure_random_bytes(local_ephemeral_private);
                 fault != secure_tunnel_fault_t::none_k)
                 return fault;
-            x25519_derive_public(local_ephemeral_public, local_ephemeral_private);
+            x25519_derive_public<x25519_kit_t>(local_ephemeral_public, local_ephemeral_private);
             return secure_tunnel_fault_t::none_k;
         }
 

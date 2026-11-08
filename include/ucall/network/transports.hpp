@@ -16,6 +16,7 @@ namespace unum::ucall::network {
 
 using io::io_completion_t;
 using io::io_operation_t;
+using io::io_receive_memory_t;
 using io::io_request_t;
 using io::registered_memory_t;
 using io::tally;
@@ -29,6 +30,7 @@ using tunnel::secure_tunnel_request_t;
 using tunnel::secure_tunnel_state_t;
 using utilities::byte_t;
 using utilities::descriptor_t;
+using utilities::io_vector_t;
 using utilities::page_size;
 using utilities::span;
 using utilities::text_view;
@@ -41,6 +43,7 @@ struct transport {
     using tunnel_t = typename network_t::tunnel_t;
     using crypto_t = typename network_t::crypto_t;
     using allocator_t = typename network_t::allocator_t;
+    using engine_t = typename network_t::engine_t;
     using http_message_t = typename network_t::http_message_t;
     template <typename value_type_>
     using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
@@ -51,11 +54,10 @@ struct transport {
 
     explicit transport(allocator_t const& allocator = {}) noexcept
         : input(rebound_allocator<byte_t> {allocator}), encrypted(rebound_allocator<byte_t> {allocator}),
-          output(rebound_allocator<byte_t> {allocator}), received(rebound_allocator<byte_t> {allocator}),
-          record(rebound_allocator<byte_t> {allocator}) {
+          output(rebound_allocator<byte_t> {allocator}), record(rebound_allocator<byte_t> {allocator}) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(transport) == 2168);
+            static_assert(sizeof(transport) == 2160);
     }
     transport(transport const&) = delete;
     transport& operator=(transport const&) = delete;
@@ -88,8 +90,11 @@ struct transport {
     listing_t readiness {};
     transport_role_t role {};
 
+    /** The tail of the receive's destination, which @c receive_request names. */
+    io_vector_t receive_vector {};
+
     /** @c record holds handshake messages only. */
-    vector<byte_t> received {}, record {};
+    vector<byte_t> record {};
     byte_t* sending {};
     std::size_t sending_length {}, sending_offset {};
 
@@ -124,17 +129,15 @@ struct transport {
         crypto_t::secure_zero(peer_static_key);
         auto fault = tunnel.make(config);
         if (fault != secure_tunnel_fault_t::none_k) return ucall_status_handshake_failed_k;
-        auto page = page_size();
-        if (page <= 0) return ucall_status_io_k;
-        if (st::failed(received.resize(static_cast<std::size_t>(page)))) return ucall_status_out_of_memory_k;
+        if (!page_size()) return ucall_status_io_k;
         peer_verdict = config.mode == secure_tunnel_mode_t::plain_k ? peer_verdict_t::authorized_k
                                                                     : peer_verdict_t::unverified_k;
         return ucall_status_success_k;
     }
 
-    /** Records what one completion did to bytes and operation states,
-     *  deciding nothing for the protocol. */
-    void complete(io_completion_t const& completion) noexcept {
+    /** Records what one completion did to bytes and operation states, deciding nothing for the
+     *  protocol; a receive that filled its room doubles it, while under @p limit bytes. */
+    void complete(io_completion_t const& completion, std::size_t limit) noexcept {
         auto& completed = *completion.request;
         (&completed == &receive_request ? receive_operation : transmit_operation) = operation_state_t::idle_k;
         auto result = completion.result;
@@ -167,17 +170,20 @@ struct transport {
         }
         else if (!result) peer_stream = peer_stream_t::closed_k;
         else {
-            auto& destination = tunnel.encrypts() ? encrypted : input;
-            std::string_view const arrived {
-                reinterpret_cast<char const*>(completion.data ? completion.data : received.data()),
-                static_cast<std::size_t>(result)};
-            if (ucall_status_t const appended = http_t::append_text(destination, {arrived});
-                appended != ucall_status_success_k)
-                fail(appended);
-            else if (statistics) {
-                tally<atomic_ref>(statistics->bytes_received, static_cast<std::uint64_t>(result));
-                tally<atomic_ref>(statistics->bytes_copied, static_cast<std::uint64_t>(result));
+            vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
+            std::size_t const arrived = static_cast<std::size_t>(result);
+            std::size_t const previous = destination.size();
+            if (st::failed(destination.resize(st::assume_uninitialized, previous + arrived)))
+                return fail(ucall_status_out_of_memory_k);
+            if constexpr (engine_t::receive_memory_k == io_receive_memory_t::engine_k) {
+                std::memcpy(destination.data() + previous, completion.data, arrived);
+                if (statistics) tally<atomic_ref>(statistics->bytes_copied, arrived);
             }
+            // A failed reservation only leaves the room as it was.
+            else if (arrived >= receive_vector.iov_len && destination.capacity() < limit) {
+                [[maybe_unused]] st::status_t const grown = destination.reserve(destination.capacity() + 1);
+            }
+            if (statistics) tally<atomic_ref>(statistics->bytes_received, arrived);
         }
     }
 
@@ -228,14 +234,14 @@ struct transport {
             // The FIN follows any Noise close record, then receives drain the peer.
             if (stage == transport_stage_t::lingering_k)
                 return transmit_request.operation == io_operation_t::shutdown_k
-                           ? emit(receive_request, io_operation_t::receive_k, received)
+                           ? emit_receive()
                            : emit(transmit_request, io_operation_t::shutdown_k, {});
             if (step.state != secure_tunnel_state_t::ready_k) {
                 if (peer_stream == peer_stream_t::closed_k) {
                     fail(ucall_status_connection_closed_k);
                     continue;
                 }
-                return emit(receive_request, io_operation_t::receive_k, received);
+                return emit_receive();
             }
             if (peer_verdict == peer_verdict_t::unverified_k) {
                 if (!tunnel.peer_key(std::as_writable_bytes(std::span {peer_static_key}))) {
@@ -262,6 +268,25 @@ struct transport {
                    .deadline = operation == io_operation_t::close_k ? 0 : deadline,
                    .context = request.context};
         return &request;
+    }
+
+    /** Points the receive at the tail of its destination, moved or not, so an armed one follows. */
+    void aim_receive() noexcept {
+        if constexpr (engine_t::receive_memory_k == io_receive_memory_t::submitter_k) {
+            vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
+            // A receive of no bytes would read as a peer close.
+            if (destination.size() == destination.capacity() &&
+                st::failed(destination.reserve(destination.size() + page_size())))
+                return fail(ucall_status_out_of_memory_k);
+            receive_vector = {destination.data() + destination.size(), destination.capacity() - destination.size()};
+        }
+    }
+
+    /** Starts a receive, or steps the close of a transport that could not grow its room. */
+    io_request_t* emit_receive() noexcept {
+        aim_receive();
+        if (stage == transport_stage_t::closing_k) return advance();
+        return emit(receive_request, io_operation_t::receive_k, {reinterpret_cast<byte_t*>(&receive_vector), 1});
     }
 
     /** Starts sending @p bytes, which lie in engine memory @p registered_memory, without copying
@@ -353,6 +378,12 @@ struct transport {
         crypto_t::secure_zero(peer_static_key);
     }
     std::string_view text() const noexcept { return text_view(input); }
+
+    /** Whether @c input may leave with the @p wire bytes it holds, as room that outgrew them would
+     *  stay pinned in whatever pool keeps them next. */
+    bool input_may_leave(std::size_t wire) const noexcept {
+        return input.capacity() / 2 <= wire || input.capacity() <= page_size();
+    }
 };
 
 } // namespace unum::ucall::network

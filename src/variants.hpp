@@ -26,7 +26,7 @@ void make_network_for_engine(init_type_* arguments) noexcept {
         engine_type_, atomic_ref_for_cpu_class<cpu_class_>::template type, typename traits_t::waiter_t,
         typename traits_t::compare_kit_t, typename traits_t::find_kit_t, typename traits_t::byteset_kit_t,
         typename traits_t::hash_kit_t, typename traits_t::fold_kit_t, typename traits_t::sha256_kit_t,
-        typename traits_t::aes256_gcm_kit_t, typename traits_t::row_search_kit_t>;
+        typename traits_t::aes256_gcm_kit_t, typename traits_t::x25519_kit_t, typename traits_t::row_search_kit_t>;
     // The network reports the class it was built for, which only this layer names.
     auto options = *arguments->options;
     options.cpu_class = static_cast<ucall_cpu_class_t>(cpu_class_);

@@ -32,6 +32,7 @@ using http::serial_fold_kit_t;
 using http::serial_hash_kit_t;
 using tunnel::serial_aes256_gcm_kit_t;
 using tunnel::serial_sha256_kit_t;
+using tunnel::serial_x25519_kit_t;
 using utilities::allocated_ptr;
 using utilities::byte_t;
 
@@ -39,12 +40,12 @@ using utilities::byte_t;
  *  groups, which take it as their one parameter and read each other through it. */
 template <typename engine_type_, template <typename> class atomic_ref_template_, typename waiter_type_,
           typename compare_kit_type_, typename find_kit_type_, typename byteset_kit_type_, typename hash_kit_type_,
-          typename fold_kit_type_, typename sha256_kit_type_, typename aes256_gcm_kit_type_, typename row_kit_type_,
-          typename allocator_type_ = st::default_allocator<byte_t>>
+          typename fold_kit_type_, typename sha256_kit_type_, typename aes256_gcm_kit_type_, typename x25519_kit_type_,
+          typename row_kit_type_, typename allocator_type_ = st::default_allocator<byte_t>>
 struct network_variant {
     using http_t = http::messages<compare_kit_type_, find_kit_type_, byteset_kit_type_, hash_kit_type_, fold_kit_type_>;
-    using tunnel_t = tunnel::secure_tunnel<sha256_kit_type_, aes256_gcm_kit_type_>;
-    using crypto_t = tunnel::secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_>;
+    using tunnel_t = tunnel::secure_tunnel<sha256_kit_type_, aes256_gcm_kit_type_, x25519_kit_type_>;
+    using crypto_t = tunnel::secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_, x25519_kit_type_>;
     using waiter_t = waiter_type_;
     using row_kit_t = row_kit_type_;
     using allocator_t = allocator_type_;
@@ -98,6 +99,6 @@ template <typename engine_type_, typename allocator_type_ = st::default_allocato
 using serial_network =
     network_variant<engine_type_, fu::standard_atomic_ref, fu::standard_yield_t, serial_compare_kit_t,
                     serial_find_kit_t, serial_byteset_kit_t, serial_hash_kit_t, serial_fold_kit_t, serial_sha256_kit_t,
-                    serial_aes256_gcm_kit_t, st::serial_row_kit_t, allocator_type_>;
+                    serial_aes256_gcm_kit_t, serial_x25519_kit_t, st::serial_row_kit_t, allocator_type_>;
 
 } // namespace unum::ucall::network

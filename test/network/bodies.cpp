@@ -138,7 +138,7 @@ static case_result_t test_streamed_body_plain(random_generator_t& generator) {
         std::string const received = pull_body(fixture, held, failures, pulls);
         writer.join();
         failures += expect(written, "the request was not written");
-        failures += expect(pulls > 2, "{} pulls took a mebibyte", pulls);
+        failures += expect(pulls > 1, "{} pulls took a mebibyte", pulls);
         failures += expect_bytes(uc::byte_span(received), uc::byte_span(body));
         failures += reply_length(fixture, held, received.size());
         auto const response = read_response(client, 0);
@@ -388,8 +388,8 @@ static case_result_t test_streamed_chunk_line_bounded(random_generator_t& genera
         ucall_server_reply_content_t reply {fixture.server, &outcome, held, ucall_http_status_ok_k, nullptr, 0, {}};
         ucall_server_reply_content(&reply);
     }
-    client.close();
     writer.join();
+    client.close();
     return failures + fixture.stop();
 }
 

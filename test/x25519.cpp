@@ -2,19 +2,21 @@
  *  @file test/x25519.cpp
  *  @author Ash Vardanian
  *  @date August 4, 2026
- *  @brief Tests for @c crypto_x25519.hpp against RFC 7748 §5.2 and Project Wycheproof vectors.
+ *  @brief Tests for the X25519 kits against RFC 7748 §5.2 and Project Wycheproof vectors.
  *
  *  Vectors come verbatim from RFC 7748 and from Google's Project Wycheproof (`x25519_test.json`,
  *  `XdhComp` group, curve25519); the low-order-point cases are that suite's, not hand-derived.
  *
- *  Checked once against the tier this machine dispatches to, and separately against every tier
- *  compiled in, because a dispatcher only ever exercises one.
+ *  Checked against every kit compiled in and this machine runs, because a CPU class only ever
+ *  exercises one, and against the radix-51 field on targets no kit picks it for.
  */
 #include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
-#include "ucall/tunnel/curve25519.hpp" // `x25519_scalar_multiply`, `x25519_derive_public`
-#include "harness.hpp"                 // `expect`, `run_test`, `from_hex`
+#include "crypto_x25519_radix51.hpp" // `field_radix51`, `serial_words`, `scalar_multiply_through`
+#include "harness.hpp"               // `expect`, `run_test`, `from_hex`
+
+#include "ucall/tunnel/crypto.hpp" // `serial_x25519_kit_t`, `haswell_x25519_kit_t`, `neon_x25519_kit_t`
 
 using namespace unum::ucall;
 using namespace unum::ucall::tunnel;
@@ -104,34 +106,43 @@ struct decoded_vector_t {
 struct x25519_backend_t {
     char const* name;
 
-    /** Which tier must be runnable here, or @c none_k for one that always is. */
-    x25519_tiers_t tier;
+    /** Which capability must be runnable here. */
+    sz_capability_t capability;
 
-    /** Called with spans, as GCC 16 decays an array argument of an indirect call to a pointer. */
+    /** Empty for a kit this build left out. Called with spans, as GCC 16 decays an array argument
+     *  of an indirect call to a pointer. */
     bool (*multiply)(span<byte_t, x25519_key_size_k>, span<byte_t const, x25519_key_size_k>,
                      span<byte_t const, x25519_key_size_k>) noexcept;
 };
 
-/*  The dispatcher leads, so whatever it picks is checked against the tiers themselves, and the
- *  baseline follows as the reference every candidate is compared with. This is the only place in
- *  the file where a tier is named by the preprocessor. */
+template <typename kit_type_>
+constexpr x25519_backend_t row_of(char const* name) noexcept {
+    if constexpr (kit_type_::compiled_k) return {name, kit_type_::capability_k, kit_type_::multiply};
+    else return {name, kit_type_::capability_k, nullptr};
+}
+
+[[nodiscard]] static bool multiply_radix51(span<byte_t, x25519_key_size_k> out,
+                                           span<byte_t const, x25519_key_size_k> scalar,
+                                           span<byte_t const, x25519_key_size_k> point) noexcept {
+    return scalar_multiply_through<field_radix51<serial_words<void>>>(out, scalar, point);
+}
+
+/*  The baseline leads as the reference every candidate is compared with. */
 static x25519_backend_t const x25519_backends_k[] = {
-    {"dispatched", x25519_tiers_t::none_k, &x25519_scalar_multiply},
-    {"serial", x25519_tiers_t::serial_k, &x25519_scalar_multiply_serial},
-#if UCALL_COMPILER_INT128_
-    {"radix51", x25519_tiers_t::radix51_k, &x25519_scalar_multiply_radix51},
-#endif
-#if UCALL_ARCH_X8664_ADX_
-    {"adx", x25519_tiers_t::adx_k, &x25519_scalar_multiply_adx},
-#endif
+    row_of<serial_x25519_kit_t>("serial"),
+    row_of<haswell_x25519_kit_t>("haswell"),
+    row_of<neon_x25519_kit_t>("neon"),
+    {"radix51", sz_cap_serial_k, &multiply_radix51}, // Instantiates `field_radix51` on every target.
 };
 
 /** The backend every other one is checked against: the one always built and always runnable. */
-static x25519_backend_t const& x25519_reference_k = x25519_backends_k[1];
+static x25519_backend_t const& x25519_reference_k = x25519_backends_k[0];
 
-/** Whether this machine can execute @p backend. Compiled in does not mean runnable. */
+/** Whether this build carries @p backend and this machine can execute it. */
 [[nodiscard]] static bool runnable_here(x25519_backend_t const& backend) noexcept {
-    return backend.tier == x25519_tiers_t::none_k || x25519_has_tiers(x25519_tiers_runtime(), backend.tier);
+    sz_capability_t detected = sz_cap_serial_k;
+    if (sz_capabilities_detected_cpu(&detected) != sz_success_k) detected = sz_cap_serial_k;
+    return backend.multiply && (detected & backend.capability) != 0;
 }
 
 /** Reads the library's yes/no answer as the named state it stands for. */
@@ -158,12 +169,12 @@ case_result_t test_x25519_unit() {
     scalar[0] = byte_t {9}, point[0] = byte_t {9};
 
     byte_t after_one[x25519_key_size_k];
-    failures += expect(x25519_scalar_multiply(after_one, scalar, point));
+    failures += expect(x25519_multiply_serial(after_one, scalar, point));
     failures += expect_hex(after_one, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
 
     for (std::size_t iteration = 0; iteration != 1000; ++iteration) {
         byte_t next[x25519_key_size_k];
-        [[maybe_unused]] bool const usable = x25519_scalar_multiply(next, scalar, point);
+        [[maybe_unused]] bool const usable = x25519_multiply_serial(next, scalar, point);
         std::memcpy(point, scalar, x25519_key_size_k);
         std::memcpy(scalar, next, x25519_key_size_k);
     }
@@ -180,8 +191,8 @@ case_result_t test_x25519_unit() {
                                 {shared_point, shared_point + x25519_key_size_k}));
 
     byte_t from_raw[x25519_key_size_k], from_clamped[x25519_key_size_k];
-    failures += expect(x25519_scalar_multiply(from_raw, raw_scalar, shared_point));
-    failures += expect(x25519_scalar_multiply(from_clamped, clamped_scalar, shared_point));
+    failures += expect(x25519_multiply_serial(from_raw, raw_scalar, shared_point));
+    failures += expect(x25519_multiply_serial(from_clamped, clamped_scalar, shared_point));
     failures += expect_bytes(from_raw, from_clamped);
     failures += expect_hex(from_raw, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
 
@@ -189,17 +200,17 @@ case_result_t test_x25519_unit() {
     byte_t nine[x25519_key_size_k] {};
     nine[0] = byte_t {9};
     byte_t derived[x25519_key_size_k];
-    x25519_derive_public(derived, nine);
+    x25519_derive_public<serial_x25519_kit_t>(derived, nine);
     failures += expect_hex(derived, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
     return failures;
 }
 
 #pragma endregion Known Answers
 
-#pragma region Tier Differential
+#pragma region Kit Differential
 
 /**
- *  @brief Every tier compiled into this build, against every vector and along a dependent chain.
+ *  @brief Every kit compiled into this build, against every vector and along a dependent chain.
  *
  *  The chain matters separately from the vectors: a carry bug a single multiplication hides
  *  compounds once each result feeds the next.
@@ -244,17 +255,14 @@ case_result_t test_x25519_all() {
     return failures;
 }
 
-#pragma endregion Tier Differential
+#pragma endregion Kit Differential
 
 int main(int, char** argv) {
     install_test_signal_handlers();
     fmt::print("Hi, dear tester! You look nice today!\n");
-    fmt::print("  x25519 tiers built     serial={} radix51={} adx={}\n",
-               x25519_has_tiers(x25519_tiers_compiled(), x25519_tiers_t::serial_k),
-               x25519_has_tiers(x25519_tiers_compiled(), x25519_tiers_t::radix51_k),
-               x25519_has_tiers(x25519_tiers_compiled(), x25519_tiers_t::adx_k));
-    fmt::print("  x25519 adx runnable    {}\n", x25519_has_tiers(x25519_tiers_runtime(), x25519_tiers_t::adx_k));
-    fmt::print("  x25519 tier preferred  {}\n", x25519_tier_name(x25519_tier_preferred()));
+    for (x25519_backend_t const& backend : x25519_backends_k)
+        fmt::print("  x25519 {:<8} built={} runnable={}\n", backend.name, backend.multiply != nullptr,
+                   runnable_here(backend));
     configure_tests();
 
     suite_totals_t totals {.program = argv[0]};

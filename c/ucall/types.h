@@ -11,16 +11,21 @@
 #include <stddef.h> // size_t
 #include <stdint.h> // uint32_t, int32_t
 
+/** Major version of the C interface; it changes when a release breaks it. */
 #define UCALL_VERSION_MAJOR 1
+
+/** Minor version of the C interface; it changes when a release adds to it. */
 #define UCALL_VERSION_MINOR 0
+
+/** Patch version of the C interface; it changes when a release only fixes it. */
 #define UCALL_VERSION_PATCH 0
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-/** Marks exported functions. Define @c UCALL_BUILDING while compiling UCall itself, or predefine
- *  @c UCALL_EXPORT as empty to link it statically on Windows. */
+/*  Marks exported functions. Define `UCALL_BUILDING` while compiling UCall itself, or predefine
+ *  `UCALL_EXPORT` as empty to link it statically on Windows. */
 #ifndef UCALL_EXPORT
 #if (defined(_WIN32) || defined(__CYGWIN__)) && defined(UCALL_BUILDING)
 #define UCALL_EXPORT __declspec(dllexport)
@@ -49,25 +54,57 @@ typedef struct ucall_bytes_view_t {
 
 /** A concrete I/O implementation; automatic chooses an available native implementation. */
 typedef enum ucall_io_backend_t {
+
+    /** Initialization picks the fastest backend this machine and its limits allow. */
     ucall_io_backend_automatic_k = 0,
+
+    /** Blocking sockets and files, polled with @c poll, on any POSIX system. */
     ucall_io_backend_posix_k,
+
+    /** Linux epoll for sockets and Linux AIO for files, the path where io_uring is blocked. */
     ucall_io_backend_linux_epollaio_k,
+
+    /** io_uring as Linux 6.12, the older LTS line, provides it. */
     ucall_io_backend_linux_uring612_k,
+
+    /** io_uring as Linux 6.18, the newer LTS line, provides it, with multishot receives. */
     ucall_io_backend_linux_uring618_k,
+
+    /** kqueue on FreeBSD, with FreeBSD AIO for files, and on macOS. */
     ucall_io_backend_bsd_kqueue_k,
+
+    /** I/O completion ports on Windows. */
     ucall_io_backend_windows_iocp_k
 } ucall_io_backend_t;
 
 /** A CPU kernel bundle, named with the same native classes as the sibling libraries. */
 typedef enum ucall_cpu_class_t {
+
+    /** No class requested: initialization picks the best class this machine runs. */
     ucall_cpu_class_unknown_k = 0,
+
+    /** Portable kernels with no SIMD, which every machine runs. */
     ucall_cpu_class_serial_k,
+
+    /** AVX2 kernels, as on Intel Haswell. */
     ucall_cpu_class_intel_haswell_k,
+
+    /** Adds AVX-512 kernels, as on Intel Skylake-X. */
     ucall_cpu_class_intel_skylake_k,
+
+    /** Adds Ice Lake's AVX-512 extensions and SHA, as on Intel Ice Lake. */
     ucall_cpu_class_intel_icelake_k,
+
+    /** AVX2 kernels with SHA and no AVX-512, as on Intel Alder Lake. */
     ucall_cpu_class_intel_alder_k,
+
+    /** NEON kernels with the AES and SHA extensions, as on AWS Graviton2. */
     ucall_cpu_class_aws_g2_k,
+
+    /** As on AWS Graviton5, running the kernels of @c ucall_cpu_class_aws_g2_k. */
     ucall_cpu_class_aws_g5_k,
+
+    /** The one class a monoversioned build compiles, over every capability it targets. */
     ucall_cpu_class_monoversioned_k
 } ucall_cpu_class_t;
 
@@ -131,7 +168,11 @@ typedef struct ucall_received_http_response_handle_t* ucall_received_http_respon
 /** When an endpoint's callback runs: once the body is buffered, or at headers time with the body
  *  pulled through ucall_server_request_body_chunk(). */
 typedef enum ucall_body_delivery_t {
+
+    /** The callback runs once the whole body is buffered, within @c max_request_bytes. */
     ucall_body_delivery_buffered_k = 0,
+
+    /** The callback runs at headers time and pulls the body in chunks. */
     ucall_body_delivery_streamed_k = 1,
 } ucall_body_delivery_t;
 
@@ -195,24 +236,20 @@ typedef enum ucall_verb_t {
     ucall_verb_any_k
 } ucall_verb_t;
 
-/** Library-level outcomes, preserving USearch numbers for shared statuses.
+/**
+ *  @brief Library-level outcomes, preserving USearch numbers for shared statuses.
  *
  *  These codes represent library/transport-level outcomes. For HTTP-specific status codes (200,
  *  404, 500), use @c ucall_http_status_t.
  *
- *  Statuses fall into five categories. Resources: @c ucall_status_out_of_memory_k,
- *  @c ucall_status_io_k, @c ucall_status_connection_failed_k and
- *  @c ucall_status_connection_closed_k. Input: @c ucall_status_invalid_argument_k,
- *  @c ucall_status_malformed_k, @c ucall_status_handshake_failed_k and
- *  @c ucall_status_peer_rejected_k. State: @c ucall_status_uninitialized_k,
- *  @c ucall_status_unsupported_k, @c ucall_status_not_found_k, @c ucall_status_already_exists_k,
- *  @c ucall_status_overflow_k and @c ucall_status_contended_k. Interruptions:
- *  @c ucall_status_deferred_k, @c ucall_status_would_block_k and @c ucall_status_timeout_k.
- *  Defects: @c ucall_status_internal_k. Any verb that allocates, binds a device or touches a file
- *  or a socket may also return a Resources status. A verb's own block lists only what its contract
- *  adds. */
-typedef uint32_t ucall_status_t;
-enum {
+ *  Statuses fall into five categories. Resources: out of memory, I/O, and connections that failed
+ *  or closed. Input: invalid arguments, malformed bytes, failed handshakes and rejected peers.
+ *  State: uninitialized handles, unsupported features, names not found or already existing,
+ *  overflow and contention. Interruptions: deferral, would-block and timeouts. Defects: internal
+ *  failures. Any verb that allocates, binds a device or touches a file or a socket may also return
+ *  a Resources status. A verb's own block lists only what its contract adds.
+ */
+typedef enum ucall_status_t {
 
     /** The call succeeded; the outcome message is NULL. */
     ucall_status_success_k = 0,
@@ -238,7 +275,7 @@ enum {
     /** The call needs a handle that was never initialized. */
     ucall_status_uninitialized_k = 12,
 
-    /** The call was refused rather than waited for, such as submission to a full deferred table. */
+    /** The call was refused rather than waited for, such as a handle another call holds. */
     ucall_status_contended_k = 14,
 
     /** The build, backend, or machine does not implement the requested feature. */
@@ -271,7 +308,7 @@ enum {
     /** A nonblocking poll had no progress to report. */
     ucall_status_would_block_k = 25,
 
-};
+} ucall_status_t;
 
 /**
  *  @brief Decides whether a peer presenting a given static key may proceed past the handshake.
@@ -304,13 +341,14 @@ typedef struct ucall_outcome_t {
 } ucall_outcome_t;
 
 /**
- *  @brief Blocks until @p outcome is final, without spinning, and with acquire ordering.
+ *  @brief Blocks until @p outcome is final, waiting on its status word through the CPU class's
+ *      waiter, and with acquire ordering.
  *  @param[in] outcome An outcome passed to a call, read until its status leaves @c
  *      ucall_status_deferred_k.
  *  @return The final status.
  *
- *  Producers publish the final status with a release store and notify all waiters on that word.
- *  Never wait from a callback that the call itself must finish before it can complete.
+ *  Producers publish the final status with a release store on that word, which the waiter
+ *  watches. Never wait from a callback that the call itself must finish before it can complete.
  *
  *
  *  @note @b Thread-safe. Any number of threads may wait on one outcome.
@@ -383,21 +421,37 @@ UCALL_EXPORT void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments);
 
 /** The family of a peer's socket address. */
 typedef enum ucall_address_family_t {
+
+    /** No address was read for this peer. */
     ucall_address_family_unknown_k = 0,
+
+    /** IPv4, in the first 4 bytes. */
     ucall_address_family_ipv4_k = 1,
+
+    /** IPv6, in all 16 bytes, with its scope. */
     ucall_address_family_ipv6_k = 2,
+
+    /** A local AF_UNIX peer, with no address bytes. */
     ucall_address_family_unix_k = 3,
 } ucall_address_family_t;
 
 /** A peer's socket address: IPv4 in the first 4 @c bytes, IPv6 in all 16, both in network order,
  *  the port in host order and the IPv6 scope; AF_UNIX peers carry only the family. */
 typedef struct ucall_peer_address_t {
+
+    /** The address in network order: IPv4 in the first 4 bytes, IPv6 in all 16. */
     ucall_byte_t bytes[16];
+
+    /** The IPv6 scope, 0 otherwise. */
     uint32_t scope;
+
+    /** The port in host order. */
     uint16_t port;
 
     /** A @c ucall_address_family_t, one byte wide. */
     uint8_t family;
+
+    /** Zero, keeping the record at 24 bytes. */
     uint8_t reserved;
 } ucall_peer_address_t;
 
@@ -483,10 +537,20 @@ enum {
 
 /** Severity of a log line, from the most verbose up. */
 typedef enum ucall_log_level_t {
+
+    /** Detail for debugging. */
     ucall_log_level_debug_k,
+
+    /** Normal lifecycle events. */
     ucall_log_level_info_k,
+
+    /** Something unexpected that the library recovered from. */
     ucall_log_level_warning_k,
+
+    /** An operation failed. */
     ucall_log_level_error_k,
+
+    /** The server or client cannot continue. */
     ucall_log_level_fatal_k
 } ucall_log_level_t;
 
@@ -530,49 +594,6 @@ typedef struct ucall_log_t {
     ucall_log_level_t level;
 
 } ucall_log_t;
-
-/** WebSocket event types, shared between client and server. */
-typedef enum ucall_websocket_event_t {
-
-    /** Connection established. */
-    ucall_websocket_event_open_k,
-
-    /** Message received. */
-    ucall_websocket_event_message_k,
-
-    /** Error occurred. */
-    ucall_websocket_event_error_k,
-
-    /** Connection closed. */
-    ucall_websocket_event_close_k
-} ucall_websocket_event_t;
-
-/** WebSocket message types (RFC 6455). */
-typedef enum ucall_websocket_opcode_t {
-    ucall_websocket_opcode_text_k = 0x1,
-    ucall_websocket_opcode_binary_k = 0x2,
-    ucall_websocket_opcode_ping_k = 0x9,
-    ucall_websocket_opcode_pong_k = 0xA
-} ucall_websocket_opcode_t;
-
-/** Opaque handle to a WebSocket connection.
- *
- *  Valid from @c ucall_websocket_event_open_k event until @c ucall_websocket_event_close_k
- *  event. */
-typedef struct ucall_websocket_handle_t* ucall_websocket_t;
-
-/**
- *  @brief Callback for WebSocket events on both client and server sides.
- *  @param[in] websocket WebSocket connection handle.
- *  @param[in] event Type of event.
- *  @param[in] opcode Message opcode (only valid for @c ucall_websocket_event_message_k event).
- *  @param[in] data Event data. Message payload for @c ucall_websocket_event_message_k. Error
- *      description for @c ucall_websocket_event_error_k. Otherwise an empty view.
- *  @param[in] context User-supplied context pointer from the WebSocket initialization.
- */
-typedef void (*ucall_websocket_callback_t)(                                                      //
-    ucall_websocket_t websocket, ucall_websocket_event_t event, ucall_websocket_opcode_t opcode, //
-    ucall_bytes_view_t data, void* context);
 
 /**
  *  @brief Returns the canonical lowercase, dash-separated spelling of a status, as @c

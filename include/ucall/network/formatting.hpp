@@ -33,6 +33,7 @@ using utilities::byte_t;
 using utilities::bytes_view;
 using utilities::descriptor_t;
 using utilities::file_direct_check;
+using utilities::largest_receive_buffer;
 using utilities::receive_queues_count;
 using utilities::socket_close;
 using utilities::socket_duplicate_listener;
@@ -124,28 +125,6 @@ struct formatting {
         }
         else if (address.ss_family == AF_UNIX) peer.family = ucall_address_family_unix_k;
         return peer;
-    }
-
-    /** The largest @c SO_RCVBUF the kernel grants, probed on a socket of its own, since setting it
-     *  on the listener would pin every accepted socket's buffer and stop receive autotuning. */
-    static std::size_t largest_receive_buffer(int family) noexcept {
-        descriptor_t const probe = socket_open(family);
-        if (probe < 0) return max_unsent_bytes_k;
-        // Linux clamps an oversized request where FreeBSD and macOS refuse it, so refusals bisect.
-        int accepted = 0, refused = std::numeric_limits<int>::max();
-        if (socket_option(probe, SOL_SOCKET, SO_RCVBUF, &refused, sizeof(refused)) == 0) accepted = refused;
-        while (refused - accepted > 1) {
-            int const requested = accepted + (refused - accepted) / 2;
-            if (socket_option(probe, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) == 0) accepted = requested;
-            else refused = requested;
-        }
-        int granted = 0;
-        socket_length_t length = sizeof(granted);
-        if (!accepted || getsockopt(probe, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&granted), &length) != 0 ||
-            granted <= 0)
-            granted = static_cast<int>(max_unsent_bytes_k);
-        socket_close(probe);
-        return static_cast<std::size_t>(granted);
     }
 
     /** Binds and listens on the interface's address, trying each address it resolves to. */
@@ -243,7 +222,7 @@ struct formatting {
             send_buffer = static_cast<int>(max_unsent_bytes_k);
         network_interface.send_buffer_bytes = static_cast<std::size_t>(send_buffer);
         if (!network_interface.config.max_request_bytes)
-            network_interface.config.max_request_bytes = largest_receive_buffer(bound.ss_family);
+            network_interface.config.max_request_bytes = largest_receive_buffer(bound.ss_family, max_unsent_bytes_k);
         acceptor.network_interface = &network_interface;
         acceptor.request = {.operation = io_operation_t::accept_k,
                             .descriptor = descriptor,

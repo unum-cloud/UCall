@@ -286,8 +286,8 @@ static case_result_t test_take_call_reports_retired() {
     return failures + fixture.failures;
 }
 
-/** Under a locked-memory limit that fits a one-connection ring but not a large loop's, an automatic
- *  server lands on epollaio at init instead of refusing its first poll. */
+/** Under a locked-memory limit just short of a one-connection ring's, an automatic server lands on
+ *  epollaio at init instead of refusing its first poll. */
 static case_result_t test_ring_refused_at_init_falls_back() {
 #if UCALL_WITH_LINUX_URING && UCALL_WITH_LINUX_EPOLLAIO
     // The backend an automatic server of `connections` picked and its first poll's status.
@@ -319,7 +319,12 @@ static case_result_t test_ring_refused_at_init_falls_back() {
     if (::getrlimit(RLIMIT_MEMLOCK, &original) != 0) return case_result_t::skipped("the limit cannot be read");
     rlim_t low = 0, high = original.rlim_cur == RLIM_INFINITY ? rlim_t {64} << 20 : original.rlim_cur;
     if (!on_ring(serve_once(1).first)) return case_result_t::skipped("no io_uring backend serves here");
-    // The least limit at which a one-connection ring serves, leaving no room for a large loop's.
+    rlimit const none {0, original.rlim_max};
+    if (::setrlimit(RLIMIT_MEMLOCK, &none) == 0 && on_ring(serve_once(1).first)) {
+        [[maybe_unused]] int const restored = ::setrlimit(RLIMIT_MEMLOCK, &original);
+        return case_result_t::skipped("this kernel bills no ring to the locked-memory limit");
+    }
+    // Bisects the least limit at which a one-connection ring serves; just under it, no ring opens.
     while (high - low > 16 * 1024) {
         rlim_t const middle = low + (high - low) / 2;
         rlimit lowered {middle, original.rlim_max};
@@ -327,13 +332,13 @@ static case_result_t test_ring_refused_at_init_falls_back() {
         auto const [backend, status] = serve_once(1);
         (on_ring(backend) && status == ucall_status_success_k ? high : low) = middle;
     }
-    rlimit lowered {high, original.rlim_max};
+    rlimit lowered {low, original.rlim_max};
     std::size_t failures = 0;
     failures += expect(::setrlimit(RLIMIT_MEMLOCK, &lowered) == 0, "the locked-memory limit stayed");
     auto const [backend, status] = serve_once(4096);
     failures += expect(::setrlimit(RLIMIT_MEMLOCK, &original) == 0, "the locked-memory limit stayed lowered");
     failures += expect(status == ucall_status_success_k && backend == ucall_io_backend_linux_epollaio_k,
-                       "under {} KiB a large loop picked {} and polled {}", high / 1024, int(backend),
+                       "under {} KiB a large loop picked {} and polled {}", low / 1024, int(backend),
                        ucall_status_name(status));
     return failures;
 #else
@@ -1411,6 +1416,7 @@ static case_result_t epollaio_zero_copy_sends() {
     };
 
     announce("a release completes only after its notification, and cancelling it changes nothing");
+    engine.reserve_releases(1);
     uc::io::io_request_t release {.operation = uc::io::io_operation_t::zero_copy_release_k};
     uc::io::io_request_t sending {.operation = uc::io::io_operation_t::send_zero_copy_k,
                                   .descriptor = sockets.client,

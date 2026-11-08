@@ -1,4 +1,4 @@
-# Benchmarking UCall
+# UCall Benchmarks
 
 These benchmarks pressure the networking stack itself with two workloads whose handlers do no work of their own.
 Application workloads, like the batched inference service, live with the inference example in `examples/inference`, and its FastAPI and LitServe baselines run under [Inference](#inference).
@@ -395,7 +395,7 @@ Add `--server-key` with the printed public key against the IK server, and `--clo
 | AWS Graviton4, 96 Neoverse V2 cores, 1 domain | `apple-m2` | 64 KiB  | Noise IK  | Closed      |      1,885 | 142,606 | 142,606 |                  530.5 | 2026-11-02 |
 
 On kept-alive connections Noise costs 21% of the 1 KiB throughput and about half of the 64 KiB throughput on both machines.
-A handshake per request costs about 235 µs of server CPU for XX and 280 µs for IK on the Intel core, and 330 µs and 370 µs on the Graviton core, which dominates every closed row: the three X25519 exchanges of a handshake run the portable constant-time code in `curve25519.hpp`.
+A handshake per request costs about 235 µs of server CPU for XX and 280 µs for IK on the Intel core, and 330 µs and 370 µs on the Graviton core, which dominates every closed row: the X25519 exchanges of a handshake run the portable constant-time code in `curve25519.hpp`.
 
 The baseline is TLS 1.3 terminated by nginx in front of the same plaintext server, which is how deployments behind a proxy run.
 The native driver speaks no TLS, so [wrk](https://github.com/wg/wrk) drives all three paths closed-loop with the byte-verifying [bench/http.lua](http.lua).
@@ -602,7 +602,6 @@ Process CPU: 1.284000 s
 ```
 
 `--stats json` prints the same counters as one JSON object instead, with `event_loops` and `batch_endpoints` arrays in loop and registration order and the process's `cpu_seconds` last.
-At startup the server also prints whether ForkUnion pinned its serving loops to cores, as `Serving loops pinned` or `Serving loops floating`.
 A batch endpoint counts its callbacks and the requests they carried, and why each fired: __filled__ on reaching `--batch-max`, __ready__ on reaching `--batch-min` below it, and __expired__ below `--batch-min` once `--batch-latency-us` passed.
 
 The counters cover the server's whole life, warmup included, so divide them by its own `requests` rather than by the driver's measured count:

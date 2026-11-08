@@ -15,7 +15,7 @@
 #include "ucall/utilities/types.hpp" // `cpu_ceiling_t`, `publish`
 #include "ucall/http/messages.hpp"   // `compare_kit`, `find_kit`, `byteset_kit`, `hash_kit`, `fold_kit`
 #include "ucall/http/percent.hpp"    // `percent_kit`
-#include "ucall/tunnel/crypto.hpp"   // `sha256_kit`, `aes256_gcm_kit`
+#include "ucall/tunnel/crypto.hpp"   // `sha256_kit`, `aes256_gcm_kit`, `x25519_kit`
 
 namespace unum::ucall {
 
@@ -194,6 +194,7 @@ struct cpu_traits {
     using percent_kit_t = http::percent_kit<stringzilla_capabilities_k>;
     using sha256_kit_t = tunnel::sha256_kit<stringzilla_capabilities_k>;
     using aes256_gcm_kit_t = tunnel::aes256_gcm_kit<stringzilla_capabilities_k>;
+    using x25519_kit_t = tunnel::x25519_kit<stringzilla_capabilities_k>;
     using row_search_kit_t = typename row_kit_for_cpu_class<cpu_class_>::type;
     using waiter_t = typename waiter_for_cpu_class<cpu_class_>::type;
 
@@ -252,6 +253,7 @@ constexpr bool rung_advances() noexcept {
            !std::is_same_v<typename own_t::fold_kit_t, typename parent_t::fold_kit_t> ||
            !std::is_same_v<typename own_t::sha256_kit_t, typename parent_t::sha256_kit_t> ||
            !std::is_same_v<typename own_t::aes256_gcm_kit_t, typename parent_t::aes256_gcm_kit_t> ||
+           !std::is_same_v<typename own_t::x25519_kit_t, typename parent_t::x25519_kit_t> ||
            !std::is_same_v<typename own_t::row_search_kit_t, typename parent_t::row_search_kit_t> ||
            !std::is_same_v<typename own_t::waiter_t, typename parent_t::waiter_t> ||
            !std::is_same_v<typename own_t::template atomic_ref<std::uint32_t>,
@@ -336,7 +338,7 @@ void make_network(cpu_ladder<classes_...>, init_type_* arguments, cpu_ceiling_t 
 }
 
 /** The class-free entry points' verbs, lowered onto one CPU class: the outcome word through its
- *  reference and waiter, and the percent codec through its kit. */
+ *  reference and waiter, and the percent codec and X25519 through their kits. */
 struct host_verbs_t {
     void (*publish)(ucall_outcome_t*, ucall_status_t, char const*) noexcept;
     ucall_status_t (*load)(ucall_outcome_t const*) noexcept;
@@ -345,6 +347,9 @@ struct host_verbs_t {
     ucall_status_t (*wait)(ucall_outcome_t const*) noexcept;
 
     ucall_status_t (*decode_percent)(ucall_bytes_view_t, ucall_byte_t*, std::size_t*, ucall_percent_mode_t) noexcept;
+
+    void (*derive_public)(tunnel::span<tunnel::byte_t, tunnel::x25519_key_size_k>,
+                          tunnel::span<tunnel::byte_t const, tunnel::x25519_key_size_k>) noexcept;
 };
 
 template <cpu_class_t cpu_class_>
@@ -368,6 +373,7 @@ host_verbs_t host_verbs_of() noexcept {
             return seen;
         },
         &traits_t::percent_kit_t::decode,
+        &tunnel::x25519_derive_public<typename traits_t::x25519_kit_t>,
     };
 }
 

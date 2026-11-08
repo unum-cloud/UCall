@@ -6,11 +6,11 @@
  *
  *  One extension, one file per header of the C interface: @c types.c owns statuses, enums, the
  *  error type and Noise keys, @c server.c owns interfaces, servers, requests and batch endpoints,
- *  @c client.c owns clients, completions and responses, and @c lib.c owns the argument parsing,
- *  enum mirrors and error mapping every file shares, with the module glue. A Python object's
- *  structure takes its class name, @c Server for @c ucall.Server, and its type object
- *  @c ServerType. A helper shared through this header takes the @c ucall_py_ prefix, and one a
- *  file keeps to itself takes none.
+ *  @c client.c owns clients, completions and responses, @c json.c converts JSON values, and
+ *  @c lib.c owns the argument parsing, enum mirrors and error mapping every file shares, with the
+ *  module glue. A Python object's structure takes its class name, @c Server for @c ucall.Server,
+ *  and its type object @c ServerType. A helper shared through this header takes the @c ucall_py_
+ *  prefix, and one a file keeps to itself takes none.
  *
  *  @section python_polling Polling Owners
  *
@@ -67,10 +67,13 @@
 #ifndef UNUM_UCALL_PYTHON_LIB_H
 #define UNUM_UCALL_PYTHON_LIB_H
 
+#define PY_SSIZE_T_CLEAN
 #include <Python.h>
 
 #include <stddef.h> // `size_t`, `offsetof`
 #include <string.h> // `memcpy`, `memset`, `strlen`
+
+#include <yyjson.h> // `yyjson_val`
 
 #include "ucall/ucall.h"
 
@@ -243,7 +246,17 @@ int ucall_py_enum_from_object(PyObject* object, char const* field, ucall_py_enum
 /** The member of @p mirror valued @p value, or a plain `int` for a value it does not name. */
 PyObject* ucall_py_enum_to_object(ucall_py_enum_mirror_t const* mirror, long value);
 
-/** Raises a @c ucall.Error for @p status, spelling the message from the status when C gave none. */
+/** The @c ucall.Error subclass @p status raises, or @c ucall.Error for one without its own. */
+PyObject* ucall_py_status_error_type(ucall_status_t status);
+
+/**
+ *  @brief Builds one @c ucall.Error subclass per failing status and adds each to @p module.
+ *  @return 0 on success, or -1 with an exception set.
+ */
+int ucall_py_errors_register(PyObject* module);
+
+/** Raises the @c ucall.Error subclass of @p status, spelling the message from the status when C
+ *  gave none. */
 PyObject* ucall_py_raise_status(ucall_status_t status, char const* message);
 
 /** Returns 0 for a successful outcome, or -1 with its @c ucall.Error raised. */
@@ -265,11 +278,15 @@ int ucall_py_log_from_objects(PyObject* callback, PyObject* level, PyObject* for
 /** Calls a Python `peer_authorizer(static_key)`, truthy to admit, from the handshaking thread. */
 ucall_status_t ucall_py_authorize_peer(ucall_noise_key_t const* peer_static_key, void* context);
 
-/** `json.dumps`, imported once at module init, which replies and client calls serialize with. */
+/** @c json.dumps, imported once at module init, for the values yyjson cannot write. */
 extern PyObject* ucall_py_json_dumps;
 
-/** `json.loads`, imported once at module init, which typed handlers parse request bodies with. */
-extern PyObject* ucall_py_json_loads;
+/** Converts a parsed JSON value to Python objects, keeping integers of any width exact. */
+PyObject* ucall_py_object_from_json(yyjson_val* value);
+
+/** Serializes @p object as JSON bytes through yyjson, or through @c json.dumps for a value it
+ *  cannot write, such as a dict keyed by numbers. */
+PyObject* ucall_py_json_from_object(PyObject* object);
 
 /** The address a server without interfaces answers on, exported as `ucall.DEFAULT_ADDRESS`. */
 extern char const ucall_py_default_address_k[];

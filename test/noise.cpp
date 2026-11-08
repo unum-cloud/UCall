@@ -17,7 +17,7 @@ using namespace unum::ucall;
 using namespace unum::ucall::tunnel;
 using namespace unum::ucall::test;
 
-using crypto_t = secure_tunnel_crypto<serial_sha256_kit_t, serial_aes256_gcm_kit_t>;
+using crypto_t = secure_tunnel_crypto<serial_sha256_kit_t, serial_aes256_gcm_kit_t, serial_x25519_kit_t>;
 
 #pragma region Fixtures
 

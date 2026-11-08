@@ -2,7 +2,7 @@
 
 find_package(Python 3.12 REQUIRED COMPONENTS Interpreter Development.Module)
 
-# Module glue first, then the shared vocabulary, then one file per header of the C interface.
+# Module glue first, then the shared vocabulary, then one file per header of the C interface, then JSON.
 python_add_library(
     ucall_python
     MODULE
@@ -11,6 +11,7 @@ python_add_library(
     types.c
     server.c
     client.c
+    json.c
 )
 
 # `ucall/__init__.py` imports it as `ucall.lib`, so the file name is part of the interface.
@@ -22,7 +23,8 @@ set_target_properties(
                C_VISIBILITY_PRESET hidden
                LINKER_LANGUAGE CXX
 )
-target_link_libraries(ucall_python PRIVATE ucall_static)
+# Typed handlers, their replies and client calls convert JSON through yyjson.
+target_link_libraries(ucall_python PRIVATE ucall_static yyjson::yyjson)
 # The module's one export is its init function; the archives linked inside, UCall's own and its siblings', keep their
 # symbols to themselves.
 set_target_properties(ucall_python PROPERTIES VISIBILITY_INLINES_HIDDEN ON)

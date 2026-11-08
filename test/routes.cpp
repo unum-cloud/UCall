@@ -459,7 +459,8 @@ case_result_t test_percent_codec() {
     auto decodes = [&](std::string_view encoded, ucall_percent_mode_t mode, std::string_view expected) noexcept {
         decoding_t const decoded = decode(encoded, mode);
         return expect(decoded.status == ucall_status_success_k && decoded.text == expected,
-                      "'{}' decoded to '{}' with status {}, not '{}'", encoded, decoded.text, decoded.status, expected);
+                      "'{}' decoded to '{}' with status {}, not '{}'", encoded, decoded.text,
+                      ucall_status_name(decoded.status), expected);
     };
     failures += decodes("a+b%20c", ucall_percent_path_k, "a+b c");
     failures += decodes("a+b%20c", ucall_percent_query_k, "a b c");

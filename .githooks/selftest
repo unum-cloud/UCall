@@ -3203,7 +3203,6 @@ stage_release_fixture() { # stage_release_fixture <version> [<relative-path> <se
         mkdir -p c/ucall
         printf '%s\n' "$version" > VERSION
         printf '[package]\nname = "ucall"\nversion = "%s"\n' "$version" > Cargo.toml
-        printf 'cff-version: 1.2.0\nversion: %s\n' "$version" > CITATION.cff
         printf '#define UCALL_VERSION_MAJOR %s\n#define UCALL_VERSION_MINOR %s\n#define UCALL_VERSION_PATCH %s\n' \
             "$major" "$minor" "$patch" > c/ucall/types.h
         [ $# -lt 3 ] || { sed "$3" "$2" > "$2.edited" && mv "$2.edited" "$2"; }

@@ -34,7 +34,7 @@ The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
 `ucall_cli`, the `ucall` command-line client in `cli/`, builds with the examples and with any install, and `ucall_test_cli` drives it against an in-process server.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
-`UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python-builds) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust-builds) describe.
+`UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust) describe.
 
 `cmake --install` installs `ucall::static`, the C headers, a CMake package and the license.
 `UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build, and installs it beside the archive with a `ucall.pc`.
@@ -119,7 +119,7 @@ git submodule update --init forkunion
 ./verification/check.sh segment_links.pml
 ```
 
-## Python Builds
+## Python
 
 `pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `UCALL_BUILD_PYTHON=ON` and installs the `ucall_python` target, the extension `ucall.lib`, into the `python/ucall/` package.
 `python/lib.c` holds the module and the shared argument parsing, while `types.c`, `server.c`, and `client.c` wrap the types, the server, and the client.
@@ -132,7 +132,7 @@ uv pip install --no-build-isolation -e .
 python -X faulthandler -m pytest
 ```
 
-## Rust Builds
+## Rust
 
 The root `Cargo.toml` builds the crate from `rust/lib.rs`, and `build.rs` compiles the native library through CMake.
 `UCALL_LIBRARY_DIR`, naming the directory of a `libucall_static.a` CMake already built, links that archive and the system's liburing instead.

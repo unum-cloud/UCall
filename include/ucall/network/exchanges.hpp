@@ -104,6 +104,10 @@ struct endpoint {
  *  exchange once, and survives the exchange's recycling. */
 enum exchange_state_t : std::uint32_t { claimed_k = 1, replied_k = 2, detached_k = 4, listed_k = 8 };
 
+/** What a streamed body's reader asked of the loop: nothing, to read on with no pull left behind,
+ *  or to finish a pull whose view and outcome it published. */
+enum pull_request_t : std::uint32_t { pull_unrequested_k, pull_more_k, pull_waiting_k };
+
 /** The bit index of one @p state flag, as the single-bit test-and-set takes it. */
 constexpr unsigned bit_of(exchange_state_t state) noexcept {
     return static_cast<unsigned>(std::countr_zero(static_cast<std::uint32_t>(state)));
@@ -336,8 +340,8 @@ struct server_exchange : ucall_received_http_request_handle_t {
     struct alignas(fu::default_alignment_k) shared_t {
         std::uint32_t state {};
 
-        /** Raised by a pull from any thread, lowered by the loop. */
-        std::uint32_t pull_requested {};
+        /** A @c pull_request_t, raised by a pull from any thread, lowered by the loop. */
+        std::uint32_t pull_requested {pull_unrequested_k};
 
         /** Queued ones the loop has not retired. */
         std::uint32_t unsent_file_segments {};

@@ -495,6 +495,65 @@ static case_result_t test_client_response_cap(random_generator_t& generator) {
     return failures + fixture.stop();
 }
 
+/** A response that overtakes its own long request waits in the transport behind a receive armed
+ *  meanwhile, which must follow the buffer once that response moves into its call, as the next
+ *  response lands through it. */
+static case_result_t test_receive_follows_early_response(random_generator_t& generator) {
+    fixture_t fixture {{}};
+    raw_listener_t listener;
+    require(0, fixture.status == ucall_status_success_k && !listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    // Beyond what the sockets buffer while the peer reads nothing, so the send stays pending.
+    std::string const body(std::size_t {16} << 20, 'b');
+    std::string const url = fmt::format("http://{}/long", listener.address);
+    std::thread peer_thread {[&, seed = generator()] {
+        random_generator_t peer_generator {seed};
+        auto const deadline = steady_clock::now() + 10s;
+        raw_client_t peer;
+        if (!listener.accept(peer, deadline)) return;
+        auto read_head = [&](std::size_t from) {
+            while (peer.received.find("\r\n\r\n", from) == std::string::npos)
+                if (peer.read(peer.received.size() + 1, deadline) != read_end_t::filled_k) return std::string::npos;
+            return peer.received.find("\r\n\r\n", from) + 4;
+        };
+        std::size_t const head = read_head(0);
+        std::string const early = answer_ok("early").bytes, late = answer_ok("late").bytes;
+        if (head == std::string::npos || !peer.write(uc::byte_span(early), early.size(), peer_generator, deadline))
+            return;
+        // The client reads the response and arms its next receive before the request ends.
+        std::this_thread::sleep_for(100ms);
+        if (peer.read(head + body.size(), deadline) != read_end_t::filled_k) return;
+        if (read_head(head + body.size()) == std::string::npos) return;
+        [[maybe_unused]] bool const written = peer.write(uc::byte_span(late), late.size(), peer_generator, deadline);
+    }};
+    std::size_t failures = 0;
+    auto call = [&](ucall_verb_t verb, std::string_view sent, std::string_view expected) {
+        ucall_outcome_t outcome {};
+        ucall_client_call_t arguments {};
+        arguments.client = fixture.client;
+        arguments.outcome = &outcome;
+        arguments.url = uc::bytes_view(url);
+        arguments.verb = verb;
+        arguments.body = uc::bytes_view(sent);
+        ucall_client_call(&arguments);
+        failures += expect(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
+        auto const completed = fixture.wait();
+        failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}",
+                           ucall_status_name(completed.outcome.status));
+        if (!completed.response) return;
+        ucall_bytes_view_t answered {};
+        ucall_client_response_body_t get {completed.response, &outcome, &answered};
+        ucall_client_response_body(&get);
+        std::string_view const text {reinterpret_cast<char const*>(answered.data), answered.length};
+        failures += expect(text == expected, "answered {:?} for {:?}", text, expected);
+        ucall_client_response_free(completed.response);
+    };
+    call(ucall_verb_post_k, body, "early");
+    call(ucall_verb_get_k, {}, "late");
+    peer_thread.join();
+    return failures + fixture.stop();
+}
+
 #pragma region Scripted Resolver
 
 /** One resource record of a scripted answer, its data already in wire form, its owner not yet. */
@@ -615,7 +674,7 @@ struct scripted_resolver_t {
         uc::dns::resolver_options_t settings {};
         std::memcpy(&settings.nameservers[0], &bound, sizeof(bound));
         settings.nameservers_count = 1;
-        std::memcpy(settings.search, search.data(), search.size());
+        search.copy(settings.search, search.size());
         settings.search_length = static_cast<std::uint32_t>(search.size());
         settings.timeout_seconds = 1;
         return settings;
@@ -1104,6 +1163,7 @@ void run_client(suite_totals_t& totals) {
     run_test(totals, "test_server_close_mid_pipeline", test_server_close_mid_pipeline);
     run_test(totals, "test_redirect_mid_pipeline", test_redirect_mid_pipeline);
     run_test(totals, "test_client_response_cap", test_client_response_cap);
+    run_test(totals, "test_receive_follows_early_response", test_receive_follows_early_response);
     run_test(totals, "test_redirect_query_only", test_redirect_query_only);
     run_test(totals, "test_client_response_fields", test_client_response_fields);
     run_test(totals, "test_client_log_lines", test_client_log_lines);

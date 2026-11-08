@@ -22,7 +22,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Install Linux Compilers
@@ -57,7 +57,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Install Linux Compilers
@@ -96,7 +96,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Install Linux Compilers
@@ -134,7 +134,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Configure C and C++
@@ -165,7 +165,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Configure C and C++
@@ -194,7 +194,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Install Clang 22
@@ -221,7 +221,7 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
       - name: Install Clang 22 and libFuzzer
@@ -245,7 +245,7 @@ jobs:
           path: build_fuzz/findings/
 
   # The archive and the shared library as a C program sees them once installed: through CMake's package and through
-  # pkg-config. The installed archive links the system's liburing, so the runner needs its development package.
+  # pkg-config. The installed archive brings the liburing it was built with as `ucall::uring`, so the runner has none.
   install_ubuntu:
     name: Install And Consume On Ubuntu
     runs-on: ubuntu-26.04
@@ -264,11 +264,11 @@ jobs:
       - name: Set Up Python
         uses: actions/setup-python@v7
         with:
-          python-version: "3.14"
+          python-version: "3.15t"
       - name: Install CMake
         run: python -m pip install "cmake>=3.28"
-      - name: Install Clang 22, liburing and pkg-config
-        run: sudo apt-get update && sudo apt-get install -y clang-22 liburing-dev pkg-config
+      - name: Install Clang 22 and pkg-config
+        run: sudo apt-get update && sudo apt-get install -y clang-22 pkg-config
       - name: Build and Install
         run: |
           cmake -B build_install -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
@@ -293,6 +293,24 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/ucall/lib/pkgconfig"
           "$CC" examples/hello.c $(pkg-config --cflags --libs ucall) -o "$RUNNER_TEMP/hello_pkg_config"
           LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" ldd "$RUNNER_TEMP/hello_pkg_config" | grep -q libucall_shared
+
+  # AlmaLinux 8 carries Linux 4.18 headers, so the build proves the kernel mirrors suffice and the test checks them.
+  test_old_kernel_headers:
+    name: Build C Library on Old Kernel Headers
+    runs-on: ubuntu-26.04
+    timeout-minutes: 30
+    container: quay.io/pypa/manylinux_2_28_x86_64
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Build C Library
+        run: |
+          cmake -B build_old_headers -D UCALL_BUILD_SHARED=ON -D UCALL_BUILD_TEST=ON -D CMAKE_BUILD_TYPE=Release
+          cmake --build build_old_headers --parallel 4 --target ucall_shared ucall_test_c
+      - name: Test C Library
+        run: build_old_headers/ucall_test_c
 
   # Each machine profile builds the library for one CPU; the Arm ones build natively on Arm runners. Clang 22 compiles
   # it, as older compilers predate Olympus.

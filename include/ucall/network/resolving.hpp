@@ -188,13 +188,13 @@ struct resolving {
             return submit(client, lookup, question, question.receive_request);
         }
         if (result <= 0) return retry(client, lookup, question);
-        byte_t const* const bytes = completion.data ? completion.data : question.answer;
         std::size_t const length = static_cast<std::size_t>(result);
-        if (question.stage == question_stage_t::asking_k) return decided(client, lookup, question, {bytes, length});
+        if (question.stage == question_stage_t::asking_k)
+            return decided(client, lookup, question, {question.answer, length});
         auto& stream = lookup.stream;
         std::size_t const previous = stream.size();
         if (st::failed(stream.resize(previous + length))) return retry(client, lookup, question);
-        std::memcpy(stream.data() + previous, bytes, length);
+        std::memcpy(stream.data() + previous, question.answer, length);
         std::size_t const declared = stream.size() < 2 ? 0
                                                        : std::to_integer<std::size_t>(stream[0]) << 8 |
                                                              std::to_integer<std::size_t>(stream[1]);
@@ -315,7 +315,7 @@ struct resolving {
                                  .length = question.query_length,
                                  .deadline = deadline,
                                  .context = &lookup};
-        question.receive_request = {.operation = io_operation_t::receive_k,
+        question.receive_request = {.operation = io_operation_t::read_k,
                                     .descriptor = question.descriptor,
                                     .data = question.answer,
                                     .length = sizeof(question.answer),
@@ -341,7 +341,7 @@ struct resolving {
                                  .length = server.ss_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in),
                                  .deadline = deadline,
                                  .context = &lookup};
-        question.receive_request = {.operation = io_operation_t::receive_k,
+        question.receive_request = {.operation = io_operation_t::read_k,
                                     .descriptor = question.descriptor,
                                     .data = question.answer,
                                     .length = sizeof(question.answer),

@@ -91,24 +91,6 @@
 #endif // defined(__GNUC__) && !defined(__clang__)
 #endif // !defined(UCALL_COMPILER_GCC_)
 
-/*  128-bit products for radix-51 limbs; MSVC has no `__int128`. */
-#if !defined(UCALL_COMPILER_INT128_)
-#if defined(__SIZEOF_INT128__)
-#define UCALL_COMPILER_INT128_ 1
-#else
-#define UCALL_COMPILER_INT128_ 0
-#endif // defined(__SIZEOF_INT128__)
-#endif // !defined(UCALL_COMPILER_INT128_)
-
-/*  ADX and BMI2 recompiles need the target attribute GCC and Clang accept. */
-#if !defined(UCALL_ARCH_X8664_ADX_)
-#if (UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_) && UCALL_ARCH_X8664_
-#define UCALL_ARCH_X8664_ADX_ 1
-#else
-#define UCALL_ARCH_X8664_ADX_ 0
-#endif // (UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_) && UCALL_ARCH_X8664_
-#endif // !defined(UCALL_ARCH_X8664_ADX_)
-
 #define UCALL_OS_POSIX_ (UCALL_OS_LINUX_ || UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_)
 
 #if !defined(UCALL_WITH_LINUX_URING)
@@ -138,6 +120,19 @@
 namespace unum::ucall {
 namespace fu = ashvardanian::forkunion;
 namespace st = ashvardanian::smashtable;
+
+/** The base Linux adds to syscall numbers on MIPS and Alpha, so mirrored numbers add it too. */
+#if defined(_MIPS_SIM) && _MIPS_SIM == _ABIO32
+inline constexpr long linux_syscall_offset_k = 4000;
+#elif defined(_MIPS_SIM) && _MIPS_SIM == _ABI64
+inline constexpr long linux_syscall_offset_k = 5000;
+#elif defined(_MIPS_SIM) && _MIPS_SIM == _ABIN32
+inline constexpr long linux_syscall_offset_k = 6000;
+#elif defined(__alpha__)
+inline constexpr long linux_syscall_offset_k = 110;
+#else
+inline constexpr long linux_syscall_offset_k = 0;
+#endif
 } // namespace unum::ucall
 namespace uc = unum::ucall;
 

@@ -349,8 +349,8 @@ struct server : ucall_server_handle_t {
 #endif
             event_loops_count = std::max(event_loops_count, settings.event_loops);
             if (settings.noise_private_key)
-                x25519_derive_public(network_interface.public_key,
-                                     std::as_bytes(std::span {*settings.noise_private_key}));
+                x25519_derive_public<typename crypto_t::x25519_kit_t>(
+                    network_interface.public_key, std::as_bytes(std::span {*settings.noise_private_key}));
         }
         if (st::failed(server->event_loops.resize(event_loops_count))) {
             publish(arguments->outcome, ucall_status_out_of_memory_k);
@@ -445,6 +445,7 @@ struct server : ucall_server_handle_t {
             std::size_t windows = 0, slots = 0;
             ucall_status_t status = event_loop_slots(*event_loop, windows, slots);
             if (status == ucall_status_success_k) status = event_loop->engine.open(slots, slots);
+            if (status == ucall_status_success_k) reserve_releases(*event_loop, windows);
             if (status != ucall_status_success_k) {
                 char const* message = ucall_status_name(status);
                 // An engine refused by a host setting names the setting to raise.
@@ -539,12 +540,21 @@ struct server : ucall_server_handle_t {
         std::size_t windows = 0, slots = 0;
         if (ucall_status_t const sized = event_loop_slots(event_loop, windows, slots); sized != ucall_status_success_k)
             return sized;
-        if constexpr (requires { event_loop.engine.grow(slots); }) return event_loop.engine.grow(slots);
+        ucall_status_t grown = ucall_status_success_k;
+        if constexpr (requires { event_loop.engine.grow(slots); }) grown = event_loop.engine.grow(slots);
         else {
             std::destroy_at(&event_loop.engine);
             std::construct_at(&event_loop.engine, server.allocator);
-            return event_loop.engine.open(slots, slots);
+            grown = event_loop.engine.open(slots, slots);
         }
+        if (grown == ucall_status_success_k) reserve_releases(event_loop, windows);
+        return grown;
+    }
+
+    /** Sets aside what the windows and exchanges of @p event_loop can name, within its slots. */
+    static void reserve_releases(event_loop_t& event_loop, std::size_t windows) noexcept {
+        if constexpr (requires { event_loop.engine.reserve_releases(windows); })
+            event_loop.engine.reserve_releases(windows + 2 * event_loop.max_exchanges);
     }
 
     /** Makes a client of @c options->server's loop @c options->event_loop, sharing its engine,
@@ -1299,16 +1309,19 @@ struct server : ucall_server_handle_t {
         publish(arguments->outcome, ucall_status_deferred_k);
         // Only the loop touches the chunks, so a pull on the polling thread can finish at once.
         if (exchange.event_loop->polled_by_this_thread()) {
-            atomic_ref<std::uint32_t> {exchange.shared.pull_requested}.store(1, std::memory_order_relaxed);
-            if (!exchange.body_chunk.empty() || exchange.body_stage == body_stage_t::ended_k)
+            auto requested = atomic_ref<std::uint32_t> {exchange.shared.pull_requested};
+            if (!exchange.body_chunk.empty() || exchange.body_stage == body_stage_t::ended_k) {
+                requested.store(pull_waiting_k, std::memory_order_relaxed);
                 return serving_t::finish_pull(exchange, ucall_status_success_k);
+            }
             // Nothing arrives until this thread polls again, so the pull keeps no outcome or view.
             exchange.pull_outcome = nullptr;
             exchange.pulled_view = nullptr;
+            requested.store(pull_more_k, std::memory_order_relaxed);
             if (auto* connection = exchange.connection) serving_t::mark_ready(*exchange.event_loop, *connection);
             return publish(arguments->outcome, ucall_status_would_block_k);
         }
-        atomic_ref<std::uint32_t> {exchange.shared.pull_requested}.store(1, std::memory_order_release);
+        atomic_ref<std::uint32_t> {exchange.shared.pull_requested}.store(pull_waiting_k, std::memory_order_release);
         // The loop reads on and finishes the pull as bytes arrive.
         replies_t::list_replied(exchange);
     }

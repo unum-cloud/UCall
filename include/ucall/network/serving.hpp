@@ -59,7 +59,7 @@ struct server_connection {
     explicit server_connection(allocator_t const& allocator = {}) noexcept : transport(allocator) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(server_connection) == 2392);
+            static_assert(sizeof(server_connection) == 2384);
     }
     server_connection(server_connection const&) = delete;
     server_connection& operator=(server_connection const&) = delete;
@@ -127,7 +127,8 @@ struct server_connection {
     /** Records one completion as @c transport_t::complete does, and a file operation's, whose
      *  outcome belongs to the segment it served, which the server lands. */
     void complete(io_completion_t const& completion) noexcept {
-        if (completion.request != &file_read_request) return transport.complete(completion);
+        if (completion.request != &file_read_request)
+            return transport.complete(completion, network_interface->config.max_request_bytes);
         file_read_operation = operation_state_t::idle_k;
         if (transport.statistics && completion.result > 0 &&
             completion.request->operation != io_operation_t::file_open_k)
@@ -320,7 +321,7 @@ struct serving {
         exchange->shared.pushed_segments = exchange->pushed_tail = exchange->newest_segment = nullptr;
         exchange->shared.pushed_file_segments = exchange->pushed_file_tail = exchange->newest_file_segment = nullptr;
         exchange->parts_state = parts_state_t::unlocated_k;
-        exchange->shared.pull_requested = 0;
+        exchange->shared.pull_requested = pull_unrequested_k;
         exchange->body_stage = body_stage_t::buffered_k;
         exchange->body_status = ucall_status_success_k;
         exchange->reply_status = 0;
@@ -347,7 +348,7 @@ struct serving {
         auto* exchange = enqueue_exchange(event_loop, connection);
         if (!exchange) return;
         auto wire = connection.transport.message.wire_length;
-        if (!offset && wire == connection.transport.input.size())
+        if (!offset && wire == connection.transport.input.size() && connection.transport.input_may_leave(wire))
             std::swap(exchange->input, connection.transport.input);
         else if (ucall_status_t const appended = http_t::append_text(
                      exchange->input, {text_view(connection.transport.input).substr(offset, wire)});
@@ -437,10 +438,8 @@ struct serving {
     static void finish_pull(server_exchange_t& exchange, ucall_status_t status) noexcept {
         // Acquiring the request orders the puller's outcome and view before these reads.
         auto requested = atomic_ref<std::uint32_t> {exchange.shared.pull_requested};
-        if (!requested.load(std::memory_order_acquire)) return;
-        // A polling-thread pull that found nothing left its bytes for the next one, not for a view.
-        if (!exchange.pulled_view) return;
-        requested.store(0, std::memory_order_relaxed);
+        if (requested.load(std::memory_order_acquire) != pull_waiting_k) return;
+        requested.store(pull_unrequested_k, std::memory_order_relaxed);
         auto* outcome = std::exchange(exchange.pull_outcome, nullptr);
         *exchange.pulled_view = {};
         if (status == ucall_status_success_k && exchange.body_chunk.empty()) status = exchange.body_status;
@@ -662,6 +661,7 @@ struct serving {
             consumed = connection.transport.input.empty() ? 0 : consumed + wire;
         }
         if (consumed) http_t::drop_bytes(connection.transport.input, consumed);
+        connection.transport.aim_receive();
         if (connection.transport.stage != transport_stage_t::open_k) return connection.advance();
         if (auto* oldest = connection.oldest_exchange) replies_t::adopt_segments(*oldest);
         if (connection.file_read_operation == operation_state_t::idle_k) {
@@ -677,8 +677,7 @@ struct serving {
         if (connection.transport.receiving == receive_state_t::reading_k &&
             connection.transport.receive_operation == operation_state_t::idle_k &&
             (!connection.streaming || connection.streaming->body_chunk.empty()))
-            return connection.transport.emit(connection.transport.receive_request, io_operation_t::receive_k,
-                                             connection.transport.received);
+            return connection.transport.emit_receive();
         if (connection.transport.receiving == receive_state_t::ended_k && !connection.oldest_exchange &&
             connection.transport.transmitting == transmit_state_t::idle_k) {
             // A peer that closed left nothing unread, so only a live receive side lingers.

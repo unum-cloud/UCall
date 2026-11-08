@@ -30,7 +30,6 @@ using http::serial_fold_kit_t;
 using http::serial_hash_kit_t;
 using tunnel::secure_tunnel_fault_t;
 using tunnel::secure_tunnel_generate_keypair;
-using tunnel::x25519_derive_public;
 
 /** Responses outlive their client and its CPU class, so reading one takes the serial kits. */
 using response_http_t =
@@ -124,8 +123,8 @@ void ucall_noise_key_derive(ucall_noise_key_derive_t* arguments) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    x25519_derive_public(std::as_writable_bytes(std::span {*arguments->public_key}),
-                         std::as_bytes(std::span {*arguments->private_key}));
+    host_verbs().derive_public(std::as_writable_bytes(std::span {*arguments->public_key}),
+                               std::as_bytes(std::span {*arguments->private_key}));
     publish(arguments->outcome, ucall_status_success_k);
 }
 
@@ -355,38 +354,10 @@ void ucall_client_response_free(ucall_received_http_response_t response) {
     received->destroy(received);
 }
 
-void ucall_client_websocket_connect(ucall_client_websocket_connect_t* arguments) {
-    if (!arguments) return;
-    if (arguments->websocket) *arguments->websocket = {};
-    publish(arguments->outcome, ucall_status_unsupported_k);
-}
-
-void ucall_client_websocket_receive(ucall_client_websocket_receive_t* arguments) {
-    if (!arguments) return;
-    if (arguments->opcode) *arguments->opcode = {};
-    if (arguments->data) *arguments->data = {};
-    publish(arguments->outcome, ucall_status_unsupported_k);
-}
-
-void ucall_client_websocket_send(ucall_client_websocket_send_t* arguments) {
-    if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
-}
-
-void ucall_client_websocket_close(ucall_client_websocket_close_t* arguments) {
-    if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
-}
-
 void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments) {
     if (!arguments) return;
     if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->add_http_batch_endpoint(arguments);
-}
-
-void ucall_server_add_websocket_endpoint(ucall_server_add_websocket_endpoint_t* arguments) {
-    if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
 void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* arguments) {
@@ -431,16 +402,6 @@ void ucall_server_reply_end(ucall_server_reply_end_t* arguments) {
     if (!arguments) return;
     if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->reply_end(arguments);
-}
-
-void ucall_server_websocket_send(ucall_server_websocket_send_t* arguments) {
-    if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
-}
-
-void ucall_server_websocket_close(ucall_server_websocket_close_t* arguments) {
-    if (!arguments) return;
-    publish(arguments->outcome, ucall_status_unsupported_k);
 }
 
 } // extern "C"

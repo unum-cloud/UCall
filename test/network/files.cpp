@@ -956,6 +956,16 @@ static case_result_t test_client_free_on_another_ring_thread() {
         std::size_t failures = 0;
         auto completed = call_and_wait(fixture, ucall_verb_get_k, "/echo/1", ucall_security_none_k, failures);
         if (completed.response) ucall_client_response_free(completed.response);
+        // Left in flight, so the free also has to end what the polling thread started.
+        std::string const url = fmt::format("{}/echo/2", fixture.url);
+        ucall_outcome_t pending {};
+        ucall_client_call_t call {};
+        call.client = fixture.client;
+        call.outcome = &pending;
+        call.url = uc::bytes_view(url);
+        call.verb = ucall_verb_get_k;
+        ucall_client_call(&call);
+        failures += expect(pending.status == ucall_status_success_k, "call: {}", ucall_status_name(pending.status));
         // Shared, so a stuck thread left behind never writes into a finished case.
         auto freed = std::make_shared<std::atomic<int>>(0);
         std::thread freeing {[freed, client = std::exchange(fixture.client, nullptr)] {
@@ -978,6 +988,23 @@ static case_result_t test_client_free_on_another_ring_thread() {
         if (outcome) freeing.join();
         else freeing.detach();
         return failures;
+    });
+}
+
+/** A server freed off the thread that polled it, which a single-issuer ring refuses, waits for the
+ *  kernel to end that ring instead of leaking what its requests may still reach. */
+static case_result_t test_server_free_off_its_polling_owner() {
+    return keeping_descriptors([]() -> case_result_t {
+        fixture_t fixture {{}};
+        require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+        std::thread owner {[&] {
+            ucall_outcome_t outcome {};
+            ucall_server_take_call_t serving {fixture.server, &outcome, 0, 0};
+            ucall_server_take_call(&serving);
+        }};
+        owner.join();
+        ucall_server_free(std::exchange(fixture.server, nullptr));
+        return 0;
     });
 }
 
@@ -1296,6 +1323,7 @@ void run_files(suite_totals_t& totals) {
     run_test(totals, "test_stop_drains_held_reply", test_stop_drains_held_reply);
     run_test(totals, "test_stop_resets_held_replies", test_stop_resets_held_replies);
     run_test(totals, "test_client_free_on_another_ring_thread", test_client_free_on_another_ring_thread);
+    run_test(totals, "test_server_free_off_its_polling_owner", test_server_free_off_its_polling_owner);
     run_test(totals, "test_linger_then_reset", test_linger_then_reset);
     run_test(totals, "test_many_lingers_expire", test_many_lingers_expire);
     run_test(totals, "test_zero_copy_pins_past_memlock", test_zero_copy_pins_past_memlock);

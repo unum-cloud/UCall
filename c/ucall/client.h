@@ -2,7 +2,7 @@
  *  @file c/ucall/client.h
  *  @author Ash Vardanian
  *  @date February 3, 2023
- *  @brief The client lifecycle and HTTP and WebSocket operations of the UCall C interface.
+ *  @brief The client lifecycle and HTTP operations of the UCall C interface.
  */
 #ifndef UNUM_UCALL_CLIENT_H
 #define UNUM_UCALL_CLIENT_H
@@ -93,7 +93,7 @@ typedef struct ucall_client_init_t {
 
 /**
  *  @brief Initializes the client state.
- *  @note Initialize, submit, poll, and free the client on the same owner thread.
+ *  @note One owner at a time may submit, poll, or free the client, on any thread.
  *
  *  @par Statuses:
  *  - @c ucall_status_invalid_argument_k An output or the configuration is missing, the connection
@@ -238,69 +238,6 @@ typedef struct ucall_client_take_completed_t {
  */
 UCALL_EXPORT void ucall_client_take_completed(ucall_client_take_completed_t* arguments);
 
-/** Arguments of @c ucall_client_websocket_connect(). */
-typedef struct ucall_client_websocket_connect_t {
-
-    /** The client this call operates on. */
-    ucall_client_t client;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** Full URL, with an explicit byte length. */
-    ucall_bytes_view_t url;
-
-    /** Output for the WebSocket handle. */
-    ucall_websocket_t* websocket;
-
-    /** Timeouts, retries, and security for the handshake. Zeroed fields take their defaults. */
-    ucall_client_call_options_t options;
-
-} ucall_client_websocket_connect_t;
-
-/**
- *  @brief Establishes a WebSocket connection and blocks until the handshake completes.
- *  @note Call on the client owner thread.
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_client_websocket_connect(ucall_client_websocket_connect_t* arguments);
-
-/** Arguments of @c ucall_client_websocket_receive(). */
-typedef struct ucall_client_websocket_receive_t {
-
-    /** The client this call operates on. */
-    ucall_client_t client;
-
-    /** Receives @c ucall_status_timeout_k if no message arrived, @c
-     *  ucall_status_connection_closed_k once the peer closes the connection. */
-    ucall_outcome_t* outcome;
-
-    /** WebSocket handle from @c ucall_client_websocket_connect(). */
-    ucall_websocket_t websocket;
-
-    /** Output for the received message type. */
-    ucall_websocket_opcode_t* opcode;
-
-    /** Output for the message payload. Valid until the next call. */
-    ucall_bytes_view_t* data;
-
-    /** Maximum time to block. Zero returns immediately. */
-    size_t timeout_microseconds;
-
-} ucall_client_websocket_receive_t;
-
-/**
- *  @brief Blocks until a message arrives on an established WebSocket connection.
- *
- *  @note Call on the client owner thread.
- *
- *  Unlike the server side, which dispatches to @c ucall_websocket_callback_t from within its own
- *  loop, the client receives on a loop the application owns.
- *
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_client_websocket_receive(ucall_client_websocket_receive_t* arguments);
-
 /**
  *  @brief Returns the HTTP status of a received response.
  *  @param[in] response Response from ucall_client_take_completed().
@@ -431,55 +368,6 @@ UCALL_EXPORT void ucall_client_response_body(ucall_client_response_body_t* argum
  *      concurrently.
  */
 UCALL_EXPORT void ucall_client_response_free(ucall_received_http_response_t response);
-
-/** Arguments of @c ucall_client_websocket_send(). */
-typedef struct ucall_client_websocket_send_t {
-
-    /** The client this call operates on. */
-    ucall_client_t client;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** WebSocket connection handle from @c ucall_client_websocket_connect(). */
-    ucall_websocket_t websocket;
-
-    /** Message type (text, binary, ping, pong). */
-    ucall_websocket_opcode_t opcode;
-
-    /** Message payload. */
-    ucall_bytes_view_t data;
-
-} ucall_client_websocket_send_t;
-
-/**
- *  @brief Sends a message over an established WebSocket connection.
- *  @note Call on the client owner thread.
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_client_websocket_send(ucall_client_websocket_send_t* arguments);
-
-/** Arguments of @c ucall_client_websocket_close(). */
-typedef struct ucall_client_websocket_close_t {
-
-    /** The client this call operates on. */
-    ucall_client_t client;
-
-    /** Output for the outcome, final once its status leaves ucall_status_deferred_k. */
-    ucall_outcome_t* outcome;
-
-    /** WebSocket connection handle from @c ucall_client_websocket_connect(). Invalid once this call
-     *  returns. */
-    ucall_websocket_t websocket;
-
-} ucall_client_websocket_close_t;
-
-/**
- *  @brief Closes a WebSocket connection.
- *  @note Call on the client owner thread.
- *  @warning Declared, not yet implemented: it answers @c ucall_status_unsupported_k.
- */
-UCALL_EXPORT void ucall_client_websocket_close(ucall_client_websocket_close_t* arguments);
 
 #ifdef __cplusplus
 }

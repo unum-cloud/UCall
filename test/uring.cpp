@@ -76,7 +76,7 @@ static case_result_t failed_submission() {
                           .descriptor = owned,
                           .data = content,
                           .length = sizeof(content)};
-    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = owned, .length = engine.queue.page};
+    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = owned};
     require(failures, engine.submit(sending) == ucall_status_success_k);
     require(failures, engine.submit(receiving) == ucall_status_success_k);
     require(failures, engine.queue.enter(0, 0) >= 0);
@@ -101,7 +101,7 @@ static case_result_t failed_submission() {
 
     failures += expect(!engine.is_open() && engine.queue.file_registration == uring_registration_t::unregistered_k &&
                        engine.queue.buffer_registration == uring_registration_t::unregistered_k);
-    failures += expect(!engine.queue.receive_ring && engine.queue.storage);
+    failures += expect(!engine.queue.provided.receive_ring && engine.queue.storage);
     failures += expect(!engine.has_kernel_work());
     failures += expect(recv(sockets.peer, &received, sizeof(received), 0) == 0);
     return failures;
@@ -157,6 +157,56 @@ static case_result_t test_uring618_failed_submission() { return failed_submissio
 static case_result_t test_uring612_streamed_transmit() { return streamed_transmit<linux_uring612_engine_t>(); }
 static case_result_t test_uring618_streamed_transmit() { return streamed_transmit<linux_uring618_engine_t>(); }
 
+/** A request landing before its receive waits one round uncopied, and past that leaves the pool. */
+static case_result_t test_uring618_slice_waits_a_round() {
+    allocation_counts_t counts;
+    std::size_t failures = 0;
+    {
+        linux_uring618_engine<counting_allocator<byte_t>> engine {counting_allocator<byte_t> {counts}};
+        auto status = engine.open(8, 4);
+        if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this generation");
+        require(failures, status == ucall_status_success_k, "{}", ucall_status_name(status));
+        loopback_pair_t sockets = loopback_pair();
+        require(failures, sockets.connected());
+        auto descriptor = engine.import_socket(sockets.client);
+        require(failures, descriptor >= 0);
+        sockets.client = -1;
+        byte_t const message[16] {byte_t {7}};
+        auto deadline = deadline_after(1000000);
+        io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = descriptor};
+        io_completion_t completed[2] {};
+        require(failures, engine.submit(receiving) == ucall_status_success_k);
+        require(failures, send_all(sockets.peer, message));
+        require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline) == 1);
+        engine.release(completed[0]);
+
+        announce("the next request waits for its receive without a copy");
+        auto* owner = engine.socket_slots.find(descriptor);
+        auto const copied = engine.statistics.bytes_copied;
+        require(failures, send_all(sockets.peer, message));
+        while (owner->waiting_slice.empty()) {
+            engine.reap();
+            require(failures, monotonic_ns() < deadline, "the slice never landed");
+            [[maybe_unused]] int const entered = engine.queue.enter(0, 0);
+        }
+        require(failures, engine.submit(receiving) == ucall_status_success_k);
+        require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline) == 1);
+        failures += expect(completed[0].result == sizeof(message) && engine.statistics.bytes_copied == copied,
+                           "{} bytes arrived and {} were copied", completed[0].result,
+                           engine.statistics.bytes_copied - copied);
+        engine.release(completed[0]);
+
+        announce("a slice nothing claims leaves the pool after its round");
+        require(failures, send_all(sockets.peer, message));
+        while (owner->backlog.empty()) {
+            failures += expect(engine.poll(span<io_completion_t> {completed}.first(1), io_wait_t::nonblocking_k) == 0);
+            require(failures, monotonic_ns() < deadline, "the slice never left the pool");
+        }
+        failures += expect(owner->waiting_slice.empty() && owner->backlog.size() == sizeof(message));
+    }
+    return failures;
+}
+
 static case_result_t test_uring618_paused_receive() {
     allocation_counts_t counts;
     std::size_t failures = 0;
@@ -171,12 +221,11 @@ static case_result_t test_uring618_paused_receive() {
         auto second = engine.import_socket(other.client);
         require(failures, first >= 0 && second >= 0);
         held.client = other.client = -1;
-        auto original = engine.queue.page * (engine.queue.buffer_count + 1);
-        std::vector<byte_t> payload(original + engine.queue.page, byte_t {17});
+        auto& provided = engine.queue.provided;
+        auto original = provided.buffer_bytes * (provided.buffer_count + 1);
+        std::vector<byte_t> payload(original + provided.buffer_bytes, byte_t {17});
         std::fill(payload.begin() + static_cast<std::ptrdiff_t>(original), payload.end(), byte_t {34});
-        io_request_t receiving {.operation = io_operation_t::receive_k,
-                                .descriptor = first,
-                                .length = engine.queue.page};
+        io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = first};
         require(failures, engine.submit(receiving) == ucall_status_success_k);
         require(failures, send_all(held.peer, span<byte_t const> {payload}.first(original)));
         io_completion_t completed[2] {};
@@ -188,7 +237,7 @@ static case_result_t test_uring618_paused_receive() {
         announce("a paused socket parks its backlog");
         auto* owner = engine.socket_slots.find(first);
         auto deadline = deadline_after(1000000);
-        while (owner->receive_head == engine.absent_k) {
+        while (owner->backlog.empty()) {
             auto const spare = span<io_completion_t> {completed}.subspan(1);
             failures += expect(engine.poll(spare, io_wait_t::nonblocking_k) == 0);
             require(failures, monotonic_ns() < deadline, "the backlog never filled");
@@ -198,9 +247,7 @@ static case_result_t test_uring618_paused_receive() {
         require(failures, send_all(held.peer, span<byte_t const> {payload}.subspan(original)));
 
         byte_t marker[1] {byte_t {51}};
-        io_request_t independent {.operation = io_operation_t::receive_k,
-                                  .descriptor = second,
-                                  .length = engine.queue.page};
+        io_request_t independent {.operation = io_operation_t::receive_k, .descriptor = second};
         require(failures, engine.submit(independent) == ucall_status_success_k);
         require(failures, send_all(other.peer, marker));
         require(failures, engine.poll(completed, io_wait_t::blocking_k, deadline) == 1);
@@ -211,8 +258,8 @@ static case_result_t test_uring618_paused_receive() {
             failures += expect(engine.poll(completed, io_wait_t::nonblocking_k) == 0);
             require(failures, monotonic_ns() < deadline, "the paused receive never retired");
         }
-        failures += expect(owner->receive_head == engine.absent_k && !owner->backlog.empty());
-        failures += expect(engine.queue.available_buffers == engine.queue.buffer_count);
+        failures += expect(!owner->backlog.empty());
+        failures += expect(provided.available_buffers == provided.provided_buffers);
 
         announce("pausing with a receive in flight, then cancelling one");
         require(failures, engine.submit(independent) == ucall_status_success_k);
@@ -255,6 +302,160 @@ static case_result_t test_uring618_paused_receive() {
     failures += expect(counts.allocations && !counts.bytes && counts.allocations == counts.deallocations,
                        "{} allocations, {} deallocations, {} bytes kept", counts.allocations, counts.deallocations,
                        counts.bytes);
+    return failures;
+}
+
+/** A receive on @p handle answering @p expected, leaving its slice lent; @p completed names it. */
+template <typename engine_type_>
+static std::size_t expect_slice(engine_type_& engine, io_request_t& receiving, io_completion_t& completed,
+                                span<byte_t const> expected) {
+    require(0, engine.submit(receiving) == ucall_status_success_k);
+    require(0, engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1);
+    std::size_t failures = expect(completed.request == &receiving && completed.result > 0 && completed.lease,
+                                  "receiving ended with {}", completed.result);
+    return failures + expect(completed.result > 0 && static_cast<std::size_t>(completed.result) == expected.size() &&
+                             std::memcmp(completed.data, expected.data(), expected.size()) == 0);
+}
+
+/** An end of stream names the buffer being filled and consumes none of it, so the next socket's
+ *  bytes land right behind the last ones. */
+template <typename engine_type_>
+static case_result_t end_of_stream_in_partly_used_buffer() {
+    engine_type_ engine;
+    auto status = engine.open(8, 8);
+    if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t leaving = loopback_pair(), staying = loopback_pair();
+    require(failures, leaving.connected() && staying.connected());
+    auto const first = engine.import_socket(std::exchange(leaving.client, -1));
+    auto const second = engine.import_socket(std::exchange(staying.client, -1));
+    require(failures, first >= 0 && second >= 0);
+    auto& provided = engine.queue.provided;
+    byte_t const bytes[4] {byte_t {1}, byte_t {2}, byte_t {3}, byte_t {4}};
+    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = first};
+    io_request_t other {.operation = io_operation_t::receive_k, .descriptor = second};
+    io_completion_t completed {};
+    require(failures, send_all(leaving.peer, bytes));
+    failures += expect_slice(engine, receiving, completed, bytes);
+    byte_t const* const landed = completed.data;
+    engine.release(completed);
+    unsigned const before = provided.available_buffers;
+
+    announce("the end of the stream consumes nothing");
+    require(failures, ::shutdown(leaving.peer, SHUT_WR) == 0);
+    require(failures, engine.submit(receiving) == ucall_status_success_k);
+    require(failures, engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1);
+    failures += expect(completed.result == 0 && !completed.lease && !completed.data, "the end answered {}",
+                       completed.result);
+    engine.release(completed);
+    failures += expect(provided.available_buffers == before && provided.newest_buffer != engine.absent_k &&
+                           provided.records[provided.newest_buffer].consumed_bytes == sizeof(bytes),
+                       "{} buffers left of {}", provided.available_buffers, before);
+
+    announce("the next bytes land behind the last");
+    require(failures, send_all(staying.peer, bytes));
+    failures += expect_slice(engine, other, completed, bytes);
+    failures += expect(completed.data == landed + sizeof(bytes));
+    engine.release(completed);
+    failures += expect(engine.close_socket(first) == 0 && engine.close_socket(second) == 0);
+    return failures;
+}
+static case_result_t test_uring612_end_of_stream() {
+    return keeping_descriptors(end_of_stream_in_partly_used_buffer<linux_uring612_engine_t>);
+}
+static case_result_t test_uring618_end_of_stream() {
+    return keeping_descriptors(end_of_stream_in_partly_used_buffer<linux_uring618_engine_t>);
+}
+
+/** Two sockets take turns in one buffer, and neither slice moves while the other is lent. */
+template <typename engine_type_>
+static case_result_t sockets_interleave_in_one_buffer() {
+    engine_type_ engine;
+    auto status = engine.open(8, 8);
+    if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t left = loopback_pair(), right = loopback_pair();
+    require(failures, left.connected() && right.connected());
+    auto const first = engine.import_socket(std::exchange(left.client, -1));
+    auto const second = engine.import_socket(std::exchange(right.client, -1));
+    require(failures, first >= 0 && second >= 0);
+    byte_t const left_bytes[3] {byte_t {11}, byte_t {12}, byte_t {13}};
+    byte_t const right_bytes[5] {byte_t {21}, byte_t {22}, byte_t {23}, byte_t {24}, byte_t {25}};
+    io_request_t left_receive {.operation = io_operation_t::receive_k, .descriptor = first};
+    io_request_t right_receive {.operation = io_operation_t::receive_k, .descriptor = second};
+    io_completion_t lent[4] {};
+    require(failures, send_all(left.peer, left_bytes));
+    failures += expect_slice(engine, left_receive, lent[0], left_bytes);
+    require(failures, send_all(right.peer, right_bytes));
+    failures += expect_slice(engine, right_receive, lent[1], right_bytes);
+    require(failures, send_all(left.peer, left_bytes));
+    failures += expect_slice(engine, left_receive, lent[2], left_bytes);
+    require(failures, send_all(right.peer, right_bytes));
+    failures += expect_slice(engine, right_receive, lent[3], right_bytes);
+    failures += expect(lent[1].data == lent[0].data + sizeof(left_bytes) &&
+                       lent[2].data == lent[1].data + sizeof(right_bytes) &&
+                       lent[3].data == lent[2].data + sizeof(left_bytes));
+    failures += expect(std::memcmp(lent[0].data, left_bytes, sizeof(left_bytes)) == 0 &&
+                       std::memcmp(lent[1].data, right_bytes, sizeof(right_bytes)) == 0);
+    auto& provided = engine.queue.provided;
+    auto const& record = provided.records[provided.newest_buffer];
+    failures += expect(record.leased_slices == 4 &&
+                       record.consumed_bytes == 2 * sizeof(left_bytes) + 2 * sizeof(right_bytes));
+    for (auto const& completed : lent) engine.release(completed);
+    failures += expect(!record.leased_slices && provided.available_buffers == provided.provided_buffers);
+    failures += expect(engine.close_socket(first) == 0 && engine.close_socket(second) == 0);
+    return failures;
+}
+static case_result_t test_uring612_sockets_interleave() {
+    return keeping_descriptors(sockets_interleave_in_one_buffer<linux_uring612_engine_t>);
+}
+static case_result_t test_uring618_sockets_interleave() {
+    return keeping_descriptors(sockets_interleave_in_one_buffer<linux_uring618_engine_t>);
+}
+
+/** Exhausting the buffers provided at open doubles them from memory already reserved. */
+static case_result_t test_uring612_provides_past_two_buffers() {
+    allocation_counts_t counts;
+    std::size_t failures = 0;
+    {
+        linux_uring612_engine<counting_allocator<byte_t>> engine {counting_allocator<byte_t> {counts}};
+        auto status = engine.open(8, 8192);
+        if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this generation");
+        require(failures, status == ucall_status_success_k, "{}", ucall_status_name(status));
+        auto& provided = engine.queue.provided;
+        if (provided.buffer_count < 4) return case_result_t::skipped("the pool holds two buffers");
+        failures += expect(provided.provided_buffers == 2 && provided.available_buffers == 2);
+        loopback_pair_t sockets = loopback_pair();
+        require(failures, sockets.connected());
+        auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+        require(failures, socket >= 0);
+        std::size_t const allocations = counts.allocations;
+        std::vector<byte_t> chunk(65536, byte_t {7});
+        std::vector<io_completion_t> lent;
+        io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = socket};
+        auto const deadline = deadline_after(10000000);
+        while (provided.provided_buffers == 2) {
+            require(failures, send_all(sockets.peer, chunk));
+            for (std::size_t landed = 0; landed != chunk.size();) {
+                io_completion_t completed {};
+                require(failures, engine.submit(receiving) == ucall_status_success_k);
+                require(failures, engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline) == 1);
+                require(failures, completed.result > 0, "receiving ended with {}", completed.result);
+                landed += static_cast<std::size_t>(completed.result);
+                lent.push_back(completed);
+            }
+            require(failures, monotonic_ns() < deadline, "{} slices kept two buffers", lent.size());
+        }
+        failures += expect(provided.provided_buffers == 4 && counts.allocations == allocations,
+                           "{} buffers provided after {} allocations", provided.provided_buffers,
+                           counts.allocations - allocations);
+        for (auto const& completed : lent) engine.release(completed);
+        failures += expect(provided.available_buffers == provided.provided_buffers);
+        failures += expect(engine.close_socket(socket) == 0);
+    }
+    failures += expect(!counts.bytes && counts.allocations == counts.deallocations);
     return failures;
 }
 
@@ -407,6 +608,7 @@ static case_result_t zero_copy_sends() {
     };
 
     announce("a release completes only after its notification, and cancelling it changes nothing");
+    engine.reserve_releases(1);
     io_request_t release {.operation = io_operation_t::zero_copy_release_k};
     io_request_t sending {.operation = io_operation_t::send_zero_copy_k,
                           .registered_memory = registration.index,
@@ -475,6 +677,12 @@ int main(int, char** argv) {
     run_test(totals, "test_uring612_streamed_transmit", test_uring612_streamed_transmit);
     run_test(totals, "test_uring618_streamed_transmit", test_uring618_streamed_transmit);
     run_test(totals, "test_uring618_paused_receive", test_uring618_paused_receive);
+    run_test(totals, "test_uring618_slice_waits_a_round", test_uring618_slice_waits_a_round);
+    run_test(totals, "test_uring612_end_of_stream", test_uring612_end_of_stream);
+    run_test(totals, "test_uring618_end_of_stream", test_uring618_end_of_stream);
+    run_test(totals, "test_uring612_sockets_interleave", test_uring612_sockets_interleave);
+    run_test(totals, "test_uring618_sockets_interleave", test_uring618_sockets_interleave);
+    run_test(totals, "test_uring612_provides_past_two_buffers", test_uring612_provides_past_two_buffers);
     run_test(totals, "test_uring612_direct_files", test_uring612_direct_files);
     run_test(totals, "test_uring618_direct_files", test_uring618_direct_files);
     run_test(totals, "test_uring612_zero_copy_sends", test_uring612_zero_copy_sends);

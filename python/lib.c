@@ -258,8 +258,9 @@ PyObject* ucall_py_enum_to_object(ucall_py_enum_mirror_t const* mirror, long val
 PyObject* ucall_py_raise_status(ucall_status_t status, char const* message) {
     PyObject* const member = ucall_py_enum_to_object(&ucall_py_status_enum, (long)status);
     PyObject* const text = member ? PyUnicode_FromString(message ? message : ucall_status_name(status)) : NULL;
-    PyObject* const error = text ? PyObject_CallFunctionObjArgs((PyObject*)&ErrorType, member, text, NULL) : NULL;
-    if (error) PyErr_SetObject((PyObject*)&ErrorType, error);
+    PyObject* const type = ucall_py_status_error_type(status);
+    PyObject* const error = text ? PyObject_CallFunctionObjArgs(type, member, text, NULL) : NULL;
+    if (error) PyErr_SetObject(type, error);
     Py_XDECREF(error);
     Py_XDECREF(text);
     Py_XDECREF(member);
@@ -372,7 +373,6 @@ static PyMethodDef module_methods[] = {
 };
 
 PyObject* ucall_py_json_dumps = NULL;
-PyObject* ucall_py_json_loads = NULL;
 
 static char const doc_module[] =                                                                     //
     "Native HTTP and Noise networking with caller-owned polling and request batching.\n"             //
@@ -434,14 +434,13 @@ static PyModuleDef module_definition = {
     .m_size = -1,
 };
 
-/** Imports `json.dumps` and `json.loads` once, for replies, typed handlers and client calls. */
+/** Imports @c json.dumps once, for the replies and client calls yyjson cannot write. */
 static int json_import(void) {
     PyObject* const json = PyImport_ImportModule("json");
     if (!json) return -1;
     ucall_py_json_dumps = PyObject_GetAttrString(json, "dumps");
-    ucall_py_json_loads = ucall_py_json_dumps ? PyObject_GetAttrString(json, "loads") : NULL;
     Py_DECREF(json);
-    return ucall_py_json_loads ? 0 : -1;
+    return ucall_py_json_dumps ? 0 : -1;
 }
 
 PyMODINIT_FUNC PyInit_lib(void) {
@@ -455,7 +454,7 @@ PyMODINIT_FUNC PyInit_lib(void) {
     if (!module) return NULL;
     // Module-level objects are written here, before anyone imports the module, and only read after.
     if (ucall_py_module_without_lock(module) < 0) goto failed;
-    if (ucall_py_enums_register(module) < 0 || status_methods_register() < 0 ||
+    if (ucall_py_enums_register(module) < 0 || status_methods_register() < 0 || ucall_py_errors_register(module) < 0 ||
         PyModule_AddFunctions(module, ucall_py_noise_methods) < 0 ||
         PyModule_AddFunctions(module, module_methods) < 0 ||
         PyModule_AddStringConstant(module, "__version__", ucall_version_name()) < 0 ||

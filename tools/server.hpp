@@ -284,15 +284,10 @@ struct server_t {
         if (status == fu_success_k) status = fu_pool_new("ucall-server", fu_capabilities_all_k, &pool);
         if (status == fu_success_k) status = fu_pool_spawn(topology, pool, threads, fu_caller_exclusive_k);
         if (topology) fu_topology_delete(topology);
-        fu_capabilities_t effective {};
-        if (status == fu_success_k) status = fu_pool_capabilities(pool, &effective);
         if (status != fu_success_k) {
             std::fprintf(stderr, "ForkUnion initialization failed: %d\n", static_cast<int>(status));
             return 1;
         }
-        std::printf("Serving loops %s\n",
-                    effective & fu_capability_place_threads_by_affinity_k ? "pinned" : "floating");
-        std::fflush(stdout);
         if (fu_pool_unsafe_for_threads(pool, serve, this, &generation) != fu_success_k) return 1;
         while (!stop_requested.load(std::memory_order_relaxed))
             std::this_thread::sleep_for(std::chrono::milliseconds {100});

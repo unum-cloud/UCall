@@ -25,7 +25,7 @@ use std::sync::Arc;
 
 pub(crate) type ucall_byte_t = u8;
 pub(crate) type ucall_noise_key_t = [ucall_byte_t; 32];
-pub(crate) type ucall_status_t = u32;
+pub(crate) type ucall_status_t = i32;
 pub(crate) type ucall_http_status_t = u32;
 pub(crate) type ucall_io_backend_t = c_int;
 pub(crate) type ucall_cpu_class_t = c_int;
@@ -147,7 +147,7 @@ extern "C" {
 // endregion: Raw Declarations
 
 /// Why a call failed, numbered as the library numbers it; success is the `Ok` of a [`Result`].
-#[repr(u32)]
+#[repr(i32)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[non_exhaustive]
 pub enum Status {
@@ -363,7 +363,7 @@ impl<'f> IntoFuture for Deferred<'f> {
 /// polled again.
 ///
 /// The library has no wake-up, so an executor re-polls it while other tasks run, spinning only
-/// when nothing else is ready; [`Deferred::wait`] blocks without spinning.
+/// when nothing else is ready; [`Deferred::wait`] blocks on the CPU class's waiter.
 #[must_use = "an awaited reply does nothing unless polled"]
 pub struct Wait<'f>(Option<Deferred<'f>>);
 
@@ -1002,7 +1002,7 @@ mod tests {
     #[test]
     fn statuses_round_trip_through_their_numbers() {
         for status in [Status::IO, Status::NotFound, Status::WouldBlock] {
-            assert_eq!(Status::from_raw(status as u32), Err(status));
+            assert_eq!(Status::from_raw(status as ucall_status_t), Err(status));
         }
         assert_eq!(Status::from_raw(0), Ok(()));
         assert_eq!(Status::from_raw(3), Err(Status::Internal));

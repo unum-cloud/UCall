@@ -186,7 +186,8 @@ struct epoll_readiness {
                 signalled();
                 continue;
             }
-            auto const handle = std::bit_cast<typename watches_t::handle_t>(events[i].data.u64);
+            // `epoll_event` is packed on x86-64, so the word is copied before a reference binds it.
+            auto const handle = std::bit_cast<typename watches_t::handle_t>(std::uint64_t {events[i].data.u64});
             readiness_watch_t const* watch = watches.at(handle);
             if (!watch) continue;
             if ((flags & EPOLLERR) && (watch->oldest_run != absent_k || watch->stage == watch_stage_t::closing_k))
@@ -312,6 +313,7 @@ struct linux_epollaio_engine {
     template <typename value_type_>
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     struct operation_t {
         io_request_t* request {};
         unsigned next {absent_k}, timed {absent_k};
@@ -326,6 +328,8 @@ struct linux_epollaio_engine {
         io_interest_t interest {io_interest_t::unarmed_k};
     };
     static_assert(sizeof(operation_t) == 32);
+    using operation_cold_t = operation_t;
+    operation_cold_t& cold_fields(unsigned index) noexcept { return operations[index]; }
     using release_index_t = st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t,
                                                  rebound_allocator<byte_t>, row_kit_type_>;
 
@@ -335,7 +339,12 @@ struct linux_epollaio_engine {
     epoll_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness;
     release_index_t releases;
     linux_aio_t files;
-    operation_list_t free_operations, fresh_operations, ready_operations, landed_operations, waiting_files;
+    operation_list_t free_operations, free_releases, fresh_operations, ready_operations, landed_operations,
+        waiting_files;
+
+    /** Records from here on serve releases a send named, so the kernel holding those for as long
+     *  as it likes never drains what connections need. */
+    unsigned first_release {};
     unsigned free_runs {absent_k};
     std::size_t active {};
 
@@ -361,7 +370,19 @@ struct linux_epollaio_engine {
     memory_registration_t register_memory(span<byte_t>) noexcept { return {}; }
     void release(io_completion_t const&) noexcept {}
 
-    ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
+    /** Splits the free records before any is taken: the last @p count serve named releases. */
+    void reserve_releases(std::size_t count) noexcept {
+        first_release = static_cast<unsigned>(operations.size() - count);
+        free_operations = free_releases = {};
+        for (unsigned i = 0; i != first_release; ++i) free_operations.push(operations, i);
+        for (unsigned i = first_release; i != operations.size(); ++i) free_releases.push(operations, i);
+    }
+    operation_list_t& free_list(unsigned index) noexcept {
+        return index < first_release ? free_operations : free_releases;
+    }
+
+    ucall_status_t open(std::size_t, std::size_t capacity,
+                        io_issuer_scope_t = io_issuer_scope_t::one_thread_k) noexcept {
         if (st::failed(operations.resize(capacity)) || st::failed(timed.reserve(capacity)) ||
             st::failed(runs.resize(capacity)))
             return ucall_status_out_of_memory_k;
@@ -477,7 +498,7 @@ struct linux_epollaio_engine {
                          extended->sends == std::numeric_limits<std::uint16_t>::max() ||
                          extended->first_id + extended->sends != watch.next_zero_copy_id))
             extended = nullptr;
-        if ((release == absent_k && free_operations.empty()) || (!extended && free_runs == absent_k))
+        if ((release == absent_k && free_releases.empty()) || (!extended && free_runs == absent_k))
             return send_copying(request);
         auto const length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length,
@@ -489,7 +510,7 @@ struct linux_epollaio_engine {
         if (sent <= 0) return sent < 0 ? -errno : 0;
         tally<atomic_ref_template_>(statistics.zero_copy_sends);
         if (release == absent_k) {
-            release = free_operations.pop(operations);
+            release = free_releases.pop(operations);
             operations[release] = {};
             operations[release].request = request.release_request;
             [[maybe_unused]] st::status_t const indexed = releases.insert(release_key(request.release_request), release,
@@ -729,14 +750,12 @@ struct linux_epollaio_engine {
                 readiness.remove(descriptor);
                 socket_close(descriptor);
             }
-        free_operations = fresh_operations = ready_operations = landed_operations = waiting_files = {};
+        fresh_operations = ready_operations = landed_operations = waiting_files = {};
         timed.clear();
         active = 0;
         refusal = nullptr;
-        for (unsigned i = 0; i != operations.size(); ++i) {
-            operations[i] = {};
-            free_operations.push(operations, i);
-        }
+        for (unsigned i = 0; i != operations.size(); ++i) operations[i] = {};
+        reserve_releases(0);
         free_runs = absent_k;
         for (unsigned i = static_cast<unsigned>(runs.size()); i--;) {
             runs[i] = {};

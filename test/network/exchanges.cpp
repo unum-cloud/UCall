@@ -36,12 +36,15 @@ static case_result_t exchanges(ucall_security_t security) {
                            ucall_status_name(completed.outcome.status));
         if (completed.response) failures += check_response(completed.response, expected);
     };
+    // Rings copy what lands in their pool; other engines land straight in the transport's buffers.
+    bool const rings = backend_under_test == ucall_io_backend_linux_uring612_k ||
+                       backend_under_test == ucall_io_backend_linux_uring618_k;
     auto copies_beyond_receipt = [&] {
         ucall_event_loop_statistics_t counters {};
         ucall_outcome_t queried {};
         ucall_server_event_loop_statistics_t query {fixture.server, &queried, 0, &counters};
         ucall_server_event_loop_statistics(&query);
-        return counters.bytes_copied - counters.bytes_received;
+        return rings ? counters.bytes_copied - counters.bytes_received : counters.bytes_copied;
     };
     // A reply's copy is counted once its send completes, which can trail the client's completion.
     auto settled_copies = [&](std::uint64_t since, std::uint64_t expected) {
@@ -59,8 +62,11 @@ static case_result_t exchanges(ucall_security_t security) {
     auto const before = settled_copies(0, payload.size());
     exchange(payload);
     auto const copied = settled_copies(before, payload.size()) - before;
-    failures += expect(copied == payload.size(), "{} bytes copied beyond those received for a {}-byte echo", copied,
-                       payload.size());
+    // A 618 stream that outruns its receive copies those bytes into the backlog as well.
+    std::size_t const copied_limit = backend_under_test == ucall_io_backend_linux_uring618_k ? 3 * payload.size()
+                                                                                             : payload.size();
+    failures += expect(copied >= payload.size() && copied <= copied_limit,
+                       "{} bytes copied beyond those received for a {}-byte echo", copied, payload.size());
     if (security != ucall_security_none_k) return failures + fixture.stop();
     announce("a named host");
     auto named_url = url;
@@ -87,6 +93,49 @@ static case_result_t exchanges(ucall_security_t security) {
     if (completed.response) failures += check_response(completed.response, {});
     return failures + fixture.stop();
 }
+
+/** A warm 64 KB echo costs a handful of completions, however many pages its records span, as a
+ *  receive takes all that the socket holds; only the first ones grow the room it lands in. */
+static case_result_t echo_completions(ucall_security_t security) {
+    fixture_t fixture {{.security = security}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    std::string const payload(64 * 1024, 'x');
+    auto const url = fmt::format("{}/echo/42", fixture.url);
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(url);
+    call.verb = ucall_verb_post_k;
+    call.body = uc::bytes_view(payload);
+    call.options.security = security;
+    call.options.noise_peer_key = &fixture.server_public;
+    auto echo = [&] {
+        ucall_client_call(&call);
+        failures += expect(outcome.status == ucall_status_success_k);
+        auto const completed = fixture.wait();
+        failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}",
+                           ucall_status_name(completed.outcome.status));
+        if (completed.response) ucall_client_response_free(completed.response);
+    };
+    auto completions = [&] {
+        ucall_event_loop_statistics_t counters {};
+        ucall_outcome_t queried {};
+        ucall_server_event_loop_statistics_t query {fixture.server, &queried, 0, &counters};
+        ucall_server_event_loop_statistics(&query);
+        return counters.completions;
+    };
+    for (std::size_t warming = 0; warming != 8; ++warming) echo();
+    std::uint64_t const warm = completions();
+    std::size_t const echoes = 16;
+    for (std::size_t measured = 0; measured != echoes; ++measured) echo();
+    std::uint64_t const spent = completions() - warm;
+    failures += expect(spent <= 8 * echoes, "{} completions for {} echoes", spent, echoes);
+    return failures + fixture.stop();
+}
+static case_result_t test_echo_completions_plain() { return echo_completions(ucall_security_none_k); }
+static case_result_t test_echo_completions_noise_xx() { return echo_completions(ucall_security_noise_xx_k); }
 
 static case_result_t test_exchanges_plain() { return exchanges(ucall_security_none_k); }
 static case_result_t test_exchanges_noise_xx() { return exchanges(ucall_security_noise_xx_k); }
@@ -1068,13 +1117,13 @@ static case_result_t test_request_peer_ipv6() {
     failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
                        static_cast<ssize_t>(request.size()));
     failures += expect(read_response(client, 0).body == "seen", "the request was not answered");
+    ucall_server_stop(captured.server);
+    poller.join();
     failures += expect(captured.address.family == ucall_address_family_ipv6_k &&
                            std::memcmp(captured.address.bytes, &own.sin6_addr, 16) == 0 &&
                            captured.address.port == ntohs(own.sin6_port),
                        "reported family {} port {} for port {}", captured.address.family, captured.address.port,
                        ntohs(own.sin6_port));
-    ucall_server_stop(captured.server);
-    poller.join();
     ucall_server_free(captured.server);
     return failures;
 }
@@ -1549,6 +1598,8 @@ void run_exchanges(suite_totals_t& totals) {
     run_test(totals, "test_exchanges_noise_xx", test_exchanges_noise_xx);
     run_test(totals, "test_exchanges_noise_ik", test_exchanges_noise_ik);
     run_test(totals, "test_exchanges_noise_kk", test_exchanges_noise_kk);
+    run_test(totals, "test_echo_completions_plain", test_echo_completions_plain);
+    run_test(totals, "test_echo_completions_noise_xx", test_echo_completions_noise_xx);
     run_test(totals, "test_server_kk_wrong_initiator", test_server_kk_wrong_initiator);
     run_test(totals, "test_multiloop_retention", test_multiloop_retention);
     run_test(totals, "test_cross_thread_replies_stress", test_cross_thread_replies_stress);

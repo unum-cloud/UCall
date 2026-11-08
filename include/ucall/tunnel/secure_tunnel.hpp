@@ -11,7 +11,7 @@
 
 #include <memory> // `std::construct_at`
 
-#include "ucall/tunnel/crypto.hpp"   // `secure_tunnel_crypto`, `serial_sha256_kit_t`, `serial_aes256_gcm_kit_t`
+#include "ucall/tunnel/crypto.hpp"   // `secure_tunnel_crypto`, the serial kits
 #include "ucall/tunnel/types.hpp"    // `secure_tunnel_state_t`, `secure_tunnel_config_t`, `secure_tunnel_geometry_t`
 #include "ucall/utilities/types.hpp" // `span`, `byte_t`
 
@@ -38,9 +38,9 @@ using utilities::span;
  *  place, so a returned payload can alias the buffer it came from. Overlap corrupts a record
  *  pipelined behind a handshake message, silently, inside one live allocation no sanitizer sees.
  */
-template <typename sha256_kit_type_, typename aes256_gcm_kit_type_>
+template <typename sha256_kit_type_, typename aes256_gcm_kit_type_, typename x25519_kit_type_>
 class secure_tunnel {
-    using crypto_t = secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_>;
+    using crypto_t = secure_tunnel_crypto<sha256_kit_type_, aes256_gcm_kit_type_, x25519_kit_type_>;
     using remote_static_t = typename crypto_t::remote_static_t;
     using secure_tunnel_noise_t = typename crypto_t::secure_tunnel_noise_t;
     using secure_tunnel_pattern_t = typename crypto_t::secure_tunnel_pattern_t;
@@ -155,7 +155,7 @@ class secure_tunnel {
         std::memcpy(noise.local_static_private, config.local_private.data(), secure_tunnel_key_size_k);
         if (config.local_public.size())
             std::memcpy(noise.local_static_public, config.local_public.data(), secure_tunnel_key_size_k);
-        else x25519_derive_public(noise.local_static_public, noise.local_static_private);
+        else x25519_derive_public<x25519_kit_type_>(noise.local_static_public, noise.local_static_private);
 
         if (config.peer_public.size()) {
             std::memcpy(noise.remote_static, config.peer_public.data(), secure_tunnel_key_size_k);
@@ -587,6 +587,6 @@ class secure_tunnel {
 };
 
 /** Portable tunnel specialization for callers without a CPU dispatch point. */
-using secure_tunnel_t = secure_tunnel<serial_sha256_kit_t, serial_aes256_gcm_kit_t>;
+using secure_tunnel_t = secure_tunnel<serial_sha256_kit_t, serial_aes256_gcm_kit_t, serial_x25519_kit_t>;
 
 } // namespace unum::ucall::tunnel

@@ -41,6 +41,10 @@ enum class close_mode_t : std::uint8_t { orderly_k, reset_k };
 /** Whether a record is linked on a list that steps or reaps it, such as a ready queue. */
 enum class listing_t : std::uint8_t { unlisted_k, listed_k };
 
+/** Which threads may enter an engine: the first one for good, or one at a time in any order, so
+ *  a runtime's collector may free what another thread polled. */
+enum class io_issuer_scope_t : std::uint8_t { one_thread_k, any_thread_k };
+
 /** What a request asks of its socket or of a file; file operations keep @c descriptor as the
  *  socket they serve, so its close waits for them, and their offsets, lengths and buffers meet the
  *  file's @c file_direct_alignment. */
@@ -53,7 +57,8 @@ enum class io_operation_t : std::uint8_t {
     /** Connects to the address of @c length bytes in @c data. */
     connect_k,
 
-    /** Receives into @c data. */
+    /** Receives into the vector @c data names, read at each attempt so its owner may move it, or
+     *  into engine memory where the engine's @c receive_memory_k says so. */
     receive_k,
 
     /** Sends @c data by copying. */
@@ -64,7 +69,8 @@ enum class io_operation_t : std::uint8_t {
      *  release after the last send naming it completed. */
     send_zero_copy_k,
 
-    /** Reads a descriptor that is no socket, such as a wakeup channel, into @c data. */
+    /** Reads into @c data, never into engine memory, for a wakeup or a datagram that must stay
+     *  whole. */
     read_k,
 
     /** Shuts the sending direction of the socket down. */
@@ -88,6 +94,9 @@ enum class io_operation_t : std::uint8_t {
      *  pins its sends at all. */
     zero_copy_release_k,
 };
+
+/** Where an engine lands a receive: the submitter's vector, or memory of its own it lends. */
+enum class io_receive_memory_t : std::uint8_t { submitter_k, engine_k };
 
 /** The engine buffer index a request's memory lies in, scoped so no descriptor binds to it. */
 enum class registered_memory_t : std::uint16_t {};
@@ -256,7 +265,7 @@ struct wake_channel_t {
     void wait(std::uint64_t deadline) noexcept {
         auto now = monotonic_ns();
         auto remaining = deadline > now ? deadline - now : 0;
-#if UCALL_OS_LINUX_
+#if UCALL_OS_LINUX_ || UCALL_OS_FREEBSD_
         timespec timeout {static_cast<time_t>(remaining / 1000000000), static_cast<long>(remaining % 1000000000)};
         pollfd polled {static_cast<int>(descriptors[0]), POLLIN, 0};
         ::ppoll(&polled, 1, deadline ? &timeout : nullptr, nullptr);
@@ -282,7 +291,7 @@ struct wake_channel_t {
 /** An intrusive FIFO of engine operations, linked through their @c next indices. */
 using operation_list_t = st::intrusive_list<unsigned>;
 
-/** The vectors a @c file_read_vectors_k request scatters into, which its @c data points at. */
+/** The vectors a @c file_read_vectors_k or @c receive_k request fills, named by its @c data. */
 inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
     return {reinterpret_cast<io_vector_t*>(request.data), request.length};
 }
@@ -341,7 +350,12 @@ inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, 
             socklen_t size = sizeof(error);
             return getsockopt(descriptor, SOL_SOCKET, SO_ERROR, &error, &size) == 0 ? -error : -errno;
         }
-    case io_operation_t::receive_k: result = recv(descriptor, request.data, length, 0); break;
+    case io_operation_t::receive_k: {
+        io_vector_t const& room = io_vectors(request).front();
+        result = recv(descriptor, room.iov_base, std::min<std::size_t>(room.iov_len, std::numeric_limits<int>::max()),
+                      0);
+        break;
+    }
     case io_operation_t::send_k:
     case io_operation_t::send_zero_copy_k: result = send(descriptor, request.data, length, socket_send_flags_k); break;
     case io_operation_t::read_k: result = read(descriptor, request.data, length); break;
@@ -370,7 +384,7 @@ void readiness_wake(engine_type_& engine, unsigned index) noexcept {
 /** Parks a finished operation's result until the next collect of a readiness engine. */
 template <typename engine_type_>
 void readiness_land(engine_type_& engine, unsigned index, descriptor_t result) noexcept {
-    engine.operations[index].result = result;
+    engine.cold_fields(index).result = result;
     engine.landed_operations.push(engine.operations, index);
 }
 
@@ -379,14 +393,16 @@ template <template <typename> class atomic_ref_template_, typename engine_type_>
 io_completion_t readiness_finish(engine_type_& engine, unsigned index, descriptor_t result) noexcept {
     auto& operation = engine.operations[index];
     auto& request = *operation.request;
-    if (operation.timed != engine_type_::absent_k) {
-        engine.timed[operation.timed] = engine.timed.back();
-        engine.operations[engine.timed.back()].timed = operation.timed;
+    typename engine_type_::operation_cold_t& cold = engine.cold_fields(index);
+    if (cold.timed != engine_type_::absent_k) {
+        engine.timed[cold.timed] = engine.timed.back();
+        engine.cold_fields(engine.timed.back()).timed = cold.timed;
         engine.timed.pop_back();
     }
     if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
     operation = {};
-    engine.free_operations.push(engine.operations, index);
+    cold = {};
+    engine.free_list(index).push(engine.operations, index);
     --engine.active;
     tally<atomic_ref_template_>(engine.statistics.completions);
     return {&request, result};
@@ -398,8 +414,9 @@ std::size_t readiness_collect(engine_type_& engine, span<io_completion_t> comple
     while (count != completions.size()) {
         auto index = engine.landed_operations.pop(engine.operations);
         if (index == engine_type_::absent_k) break;
-        auto const& operation = engine.operations[index];
-        descriptor_t const result = operation.stage == operation_stage_t::cancelled_k ? -ECANCELED : operation.result;
+        descriptor_t const result = engine.operations[index].stage == operation_stage_t::cancelled_k
+                                        ? -ECANCELED
+                                        : engine.cold_fields(index).result;
         completions[count++] = readiness_finish<atomic_ref_template_>(engine, index, result);
     }
     return count;

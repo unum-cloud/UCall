@@ -127,7 +127,7 @@ endif ()
 if (NOT UCALL_BUILD_SHARED)
     set(ucall_library_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
-set(ucall_sources_ src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519.cpp)
+set(ucall_sources_ src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519_serial.cpp)
 add_library(ucall_static STATIC ${ucall_sources_})
 add_library(ucall_shared SHARED ${ucall_library_exclusion_} ${ucall_sources_})
 add_library(ucall::static ALIAS ucall_static)
@@ -254,6 +254,23 @@ ucall_cpu_variant(
 ucall_cpu_variant(intel_alder INTEL_ALDER westmere goldmont haswell)
 ucall_cpu_variant(aws_g2 AWS_G2 neon neonaes neonsha arm64_lse)
 
+# One unit per X25519 kit, apart from class units, keeps throughput flags off constant-time kernels.
+function (ucall_x25519_unit capability_)
+    if (NOT stringzilla_target_${capability_}_enabled)
+        return()
+    endif ()
+    target_sources(ucall_static PRIVATE src/crypto_x25519_${capability_}.cpp)
+    target_sources(ucall_shared PRIVATE src/crypto_x25519_${capability_}.cpp)
+    if (NOT stringzilla_target_${capability_}_implied)
+        set_source_files_properties(
+            src/crypto_x25519_${capability_}.cpp PROPERTIES COMPILE_OPTIONS
+                                                            "${stringzilla_target_${capability_}_flags}"
+        )
+    endif ()
+endfunction ()
+ucall_x25519_unit(haswell)
+ucall_x25519_unit(neon)
+
 if (UCALL_MARCH)
     set(ucall_floor_ "${UCALL_MARCH}")
 else ()
@@ -309,6 +326,7 @@ if (UCALL_BUILD_BENCH)
     endforeach ()
 endif ()
 if (UCALL_BUILD_PYTHON)
+    include(cmake/yyjson.cmake)
     add_subdirectory(python)
 endif ()
 

@@ -7,6 +7,7 @@ cargo add ucall
 ```
 
 The crate links the UCall library, which its build script compiles through CMake, so building needs CMake and a C++20 compiler.
+CMake builds StringZilla, ForkUnion and SmashTable from the trees of those crates, which the crate depends on, rather than fetching them again.
 The library picks its I/O backend and CPU kernels when a server or client starts, so one build adapts to the kernel and CPU it runs on.
 
 ## Quickstart
@@ -146,6 +147,7 @@ std::thread::scope(|scope| {
 ```
 
 `reply_parts` concatenates `ReplyPart::Bytes`, `ReplyPart::Path` and `ReplyPart::File` parts into one body whose Content-Length is measured from the files.
+`ReplyPart::from` turns a borrowed `std::io::IoSlice` into a bytes part, so vectored buffers from other I/O code map over directly.
 A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and the event loop opens, reads and closes it unbuffered.
 A `File` borrows the caller's descriptor, opened with `O_DIRECT`, for the `Deferred`'s lifetime, while bytes and paths are copied before the call returns, so they may be dropped right after it.
 A file that is missing, unreadable or too short replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
@@ -339,10 +341,6 @@ An interface accepts on its own number of event loops, one by default, and the s
 Registration takes `&mut Server`, and polling, stopping and statistics take `&Server`, so the borrow checker orders setup before serving.
 A `Request` and a `Response` move between threads, while a `Client` stays on the thread that created it.
 Every thread that polls, replies or reads must run on a CPU supporting the CPU class the server or client resolved at start, so `CPUClass::Serial` is the safe choice on machines mixing CPU generations.
-
-## What This Crate Does Not Expose
-
-The crate leaves out WebSocket endpoints, connections and messages, on either side.
 
 ## Design
 

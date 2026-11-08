@@ -22,6 +22,7 @@ namespace unum::ucall::io {
 using utilities::byte_t;
 using utilities::descriptor_t;
 using utilities::file_open_beneath;
+using utilities::io_vector_t;
 using utilities::monotonic_ns;
 using utilities::socket_close;
 using utilities::socket_error;
@@ -36,7 +37,8 @@ using utilities::span;
  *
  *  A file read reopens its file unbuffered and overlapped on the port for its own lifetime; a path
  *  opens beneath its directory at once, vectored reads answer @c -ENOSYS, and zero-copy sends copy,
- *  so their releases complete as submitted.
+ *  so their releases complete as submitted. A receive waits with a zero-byte @c WSARecv, pinning
+ *  nothing, then reads its vector with @c recv, so the vector may move while it waits.
  */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
@@ -49,6 +51,7 @@ struct windows_iocp_engine {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     enum class operation_stage_t { pending_k, immediate_k, cancelling_k, timing_out_k };
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     struct operation_t {
         OVERLAPPED overlapped {};
         io_request_t* request {};
@@ -99,7 +102,8 @@ struct windows_iocp_engine {
     operation_list_t free_operations, immediate_operations;
     std::size_t active {};
     io_statistics_t statistics {};
-    ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
+    ucall_status_t open(std::size_t, std::size_t capacity,
+                        io_issuer_scope_t = io_issuer_scope_t::one_thread_k) noexcept {
         if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
         if (st::failed(operations.resize(capacity)) || st::failed(timed.reserve(capacity)) ||
             st::failed(entries.resize(capacity)))
@@ -183,7 +187,7 @@ struct windows_iocp_engine {
                          : SOCKET_ERROR;
             break;
         }
-        case io_operation_t::receive_k:
+        case io_operation_t::receive_k: result = wait_readable(*operation); break;
         case io_operation_t::read_k: {
             WSABUF buffer {static_cast<ULONG>(std::min<std::size_t>(request.length, std::numeric_limits<int>::max())),
                            reinterpret_cast<char*>(request.data)};
@@ -219,6 +223,24 @@ struct windows_iocp_engine {
         }
         ++active;
         return ucall_status_success_k;
+    }
+
+    /** Posts the zero-byte receive that completes once @p operation's socket is readable. */
+    int wait_readable(operation_t& operation) noexcept {
+        WSABUF nothing {};
+        DWORD bytes {}, flags {};
+        return WSARecv(static_cast<SOCKET>(operation.request->descriptor), &nothing, 1, &bytes, &flags,
+                       &operation.overlapped, nullptr);
+    }
+
+    /** Reads what a zero-byte receive announced into the vector @p request names now. */
+    descriptor_t receive_ready(io_request_t const& request) noexcept {
+        tally<atomic_ref_template_>(statistics.kernel_enters);
+        io_vector_t const& room = io_vectors(request).front();
+        int const received = recv(
+            static_cast<SOCKET>(request.descriptor), static_cast<char*>(room.iov_base),
+            static_cast<int>(std::min<std::size_t>(room.iov_len, std::numeric_limits<int>::max())), 0);
+        return received >= 0 ? static_cast<descriptor_t>(received) : -socket_last_error();
     }
 
     /** Reads through a handle reopened unbuffered and overlapped, associated with the port. */
@@ -350,6 +372,14 @@ struct windows_iocp_engine {
                                                     &operation.overlapped, &bytes, FALSE, &flags)
                                  ? static_cast<descriptor_t>(bytes)
                                  : -socket_last_error();
+                if (result >= 0 && operation.request->operation == io_operation_t::receive_k) {
+                    result = receive_ready(*operation.request);
+                    if (result == -EAGAIN) {
+                        operation.overlapped = {};
+                        if (wait_readable(operation) == 0 || WSAGetLastError() == WSA_IO_PENDING) continue;
+                        result = -socket_last_error();
+                    }
+                }
                 completions[count++] = finish(operation, result);
             }
         }

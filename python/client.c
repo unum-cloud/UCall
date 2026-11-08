@@ -420,7 +420,9 @@ static int Client_clear(Client* self) {
 static void Client_dealloc(Client* self) {
     PyObject_GC_UnTrack(self);
     // The C client cancels every accepted call, so their borrowed inputs return only after it.
+    Py_BEGIN_ALLOW_THREADS;
     ucall_client_free(self->handle);
+    Py_END_ALLOW_THREADS;
     self->handle = NULL;
     while (self->in_flight) {
         Completed* const call = self->in_flight;
@@ -656,9 +658,7 @@ static PyObject* client_request(Client* self, ucall_verb_t verb, PyObject* url, 
     if (client_owned(self) != 0) return NULL;
     PyObject *encoded = NULL, *lines = NULL;
     if (json && json != Py_None) {
-        PyObject* const text = PyObject_CallOneArg(ucall_py_json_dumps, json);
-        encoded = text ? PyUnicode_AsUTF8String(text) : NULL;
-        Py_XDECREF(text);
+        encoded = ucall_py_json_from_object(json);
         lines = !encoded ? NULL : headers ? PySequence_List(headers) : PyList_New(0);
         PyObject* const line = lines ? PyUnicode_FromString("content-type: application/json") : NULL;
         if (!line || PyList_Append(lines, line) != 0) {

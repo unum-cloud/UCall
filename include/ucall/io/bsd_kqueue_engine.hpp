@@ -45,17 +45,21 @@ struct bsd_kqueue_engine {
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
     using rebind = bsd_kqueue_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     struct operation_t {
         io_request_t* request {};
-        unsigned next {absent_k}, timed {absent_k};
-
-        /** What a landed file read completes with. */
-        descriptor_t result {};
-
+        unsigned next {absent_k};
         operation_stage_t stage {operation_stage_t::fresh_k};
         io_interest_t interest {io_interest_t::unarmed_k};
+    };
+    static_assert(sizeof(operation_t) == 16);
+
+    /** Touched only by timed operations and landed reads. */
+    struct operation_cold_t {
+        unsigned timed {absent_k};
+        descriptor_t result {};
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
@@ -80,20 +84,27 @@ struct bsd_kqueue_engine {
         return ucall_status_not_found_k;
     }
     explicit bsd_kqueue_engine(allocator_t const& allocator = {}) noexcept
-        : operations(rebound_allocator<operation_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
-          readiness(allocator) {}
+        : operations(rebound_allocator<operation_t> {allocator}), cold(rebound_allocator<operation_cold_t> {allocator}),
+          timed(rebound_allocator<unsigned> {allocator}), readiness(allocator) {}
     bsd_kqueue_engine(bsd_kqueue_engine const&) = delete;
     bsd_kqueue_engine& operator=(bsd_kqueue_engine const&) = delete;
     bsd_kqueue_engine(bsd_kqueue_engine&&) = delete;
     bsd_kqueue_engine& operator=(bsd_kqueue_engine&&) = delete;
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+    st::vector<operation_cold_t, rebound_allocator<operation_cold_t>> cold {};
     st::vector<unsigned, rebound_allocator<unsigned>> timed {};
     kqueue_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness {};
     operation_list_t free_operations, fresh_operations, ready_operations, landed_operations;
     std::size_t active {};
     io_statistics_t statistics {};
-    ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
-        if (st::failed(operations.resize(capacity)) || st::failed(timed.reserve(capacity)))
+    operation_list_t& free_list(unsigned) noexcept { return free_operations; }
+    operation_cold_t& cold_fields(unsigned index) noexcept { return cold[index]; }
+
+    ucall_status_t open(std::size_t, std::size_t capacity,
+                        io_issuer_scope_t = io_issuer_scope_t::one_thread_k) noexcept {
+        // Sized first, so after a failed open `stop` walks no operation without a cold record.
+        if (st::failed(cold.resize(capacity)) || st::failed(operations.resize(capacity)) ||
+            st::failed(timed.reserve(capacity)))
             return ucall_status_out_of_memory_k;
         stop();
         return readiness.open(capacity);
@@ -103,10 +114,11 @@ struct bsd_kqueue_engine {
         if (index == absent_k) return ucall_status_contended_k;
         auto& operation = operations[index];
         operation = {};
+        cold[index] = {};
         operation.request = &request;
         fresh_operations.push(operations, index);
         if (request.deadline) {
-            operation.timed = static_cast<unsigned>(timed.size());
+            cold[index].timed = static_cast<unsigned>(timed.size());
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
         ++active;
@@ -190,6 +202,7 @@ struct bsd_kqueue_engine {
         active = 0;
         for (unsigned i = 0; i != operations.size(); ++i) {
             operations[i] = {};
+            cold[i] = {};
             free_operations.push(operations, i);
         }
     }

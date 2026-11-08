@@ -13,6 +13,7 @@
 # Bypass knowingly, which you almost never should, with: git commit --no-verify
 
 set -u
+
 export LC_ALL=C
 
 approved_verbs='Add|Break|Chore|Docs|Fix|Improve|Make'
@@ -34,7 +35,6 @@ Release:*)
         core=${version%%-*} stale=""
         IFS=. read -r major minor patch <<< "$core"
         [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
-        git show :CITATION.cff 2>/dev/null | grep -qxF "version: $version" || stale="$stale CITATION.cff"
         git show :Cargo.toml 2>/dev/null | grep -qxF "version = \"$version\"" || stale="$stale Cargo.toml"
         # The C macros take numbers only, so a candidate keeps its core there.
         for field in "MAJOR $major" "MINOR $minor" "PATCH $patch"; do

@@ -9,6 +9,7 @@ Date: October 25, 2026
 import _thread
 import asyncio
 import concurrent.futures
+import dataclasses
 import hashlib
 import json
 import os
@@ -84,16 +85,16 @@ def test_typed_parameters_bind_from_path_query_and_json(backend, loopback, servi
         document = {"times": 2, "ratio": 3, "raw": "z", "loud": True, "note": [1]}
         widened = {**defaults, "times": 2, "ratio": 3.0, "raw": "z", "loud": True, "note": [1]}
         assert answer(client.post(f"{base}/describe/hi?times=2", json=document)) == (200, widened)
+        nested = {"deep": {"exact": 2**60, "wide": -(2**70), "items": [1.5, None, True, "naïve"]}}
+        assert answer(client.post(f"{base}/describe/hi", json={"note": nested}))[1]["note"] == nested
         assert bytes(client.get(f"{base}/scale/1.5?factor=3").body) == b"4.5"
 
-        with pytest.raises(json.JSONDecodeError) as malformed:
-            json.loads(b"{")
         refusals = [
             (client.get(f"{base}/describe/hi?times=one"), "invalid literal for int() with base 10: 'one'\n"),
             (client.get(f"{base}/describe/hi?loud=maybe"), "expected a boolean, got 'maybe'\n"),
             (client.post(f"{base}/describe/hi", json={"times": "2"}), "expected int, got str\n"),
             (client.post(f"{base}/describe/hi", b"[1]"), "expected a JSON object body\n"),
-            (client.post(f"{base}/describe/hi", b"{"), f"{malformed.value}\n"),
+            (client.post(f"{base}/describe/hi", b"{"), "the body is not JSON: unexpected end of data at byte 1\n"),
             (client.get(f"{base}/need"), "missing parameter 'value'\n"),
             (client.get(f"{base}/describe/hi?note=100%"), "a '%' in the query lacks two hexadecimal digits\n"),
         ]
@@ -108,6 +109,7 @@ def test_replies_serialize_by_returned_type(backend, loopback, serving):
         "memoryview": memoryview(b"viewed"),
         "text": "naïve",
         "json": {"list": [1, 2.5, None]},
+        "keyed": {1: "one"},
     }
 
     @server.get("/typed/{kind}")
@@ -122,7 +124,8 @@ def test_replies_serialize_by_returned_type(backend, loopback, serving):
     with serving(server) as base:
         client = ucall.Client(connections=1, backend=backend)
         replies = {
-            kind: client.get(f"{base}/typed/{kind}") for kind in ("bytes", "bytearray", "memoryview", "text", "json")
+            kind: client.get(f"{base}/typed/{kind}")
+            for kind in ("bytes", "bytearray", "memoryview", "text", "json", "keyed")
         }
         replies["none"] = client.get(f"{base}/typed/none")
         replies["raw"] = client.get(f"{base}/raw")
@@ -135,7 +138,8 @@ def test_replies_serialize_by_returned_type(backend, loopback, serving):
         "bytearray": (200, binary, b"grown"),
         "memoryview": (200, binary, b"viewed"),
         "text": (200, text, "naïve".encode()),
-        "json": (200, document, b'{"list": [1, 2.5, null]}'),
+        "json": (200, document, b'{"list":[1,2.5,null]}'),
+        "keyed": (200, document, b'{"1": "one"}'),
         "none": (204, None, b""),
         "raw": (200, text, b"from the request"),
     }
@@ -156,8 +160,11 @@ def test_registration_refuses_unbindable_parameters(loopback):
     def wide(a0, a1, a2, a3, a4, a5, a6, a7, a8, a9, a10, a11, a12, a13, a14, a15, a16):
         return a0
 
+    async def awaited(value: int):
+        return value
+
     refusals = []
-    for handler in (variadic, keywords, listed, wide):
+    for handler in (variadic, keywords, listed, wide, awaited):
         with pytest.raises(TypeError) as refused:
             server.get(f"/{handler.__name__}")(handler)
         refusals.append(str(refused.value))
@@ -167,6 +174,8 @@ def test_registration_refuses_unbindable_parameters(loopback):
         f"{scope}.keywords cannot bind *values from a request",
         f"{scope}.listed annotates values as <class 'list'>, not a scalar or Request",
         f"{scope}.wide takes 17 parameters, more than the 16 a request binds",
+        f"{awaited!r} is a coroutine function: register a plain function, call request.detach(), "
+        "and reply from your own event loop",
     ]
 
 
@@ -306,9 +315,13 @@ def test_handler_failures_answer_500(backend, loopback, serving, monkeypatch):
     def silent(request: ucall.Request):
         return None
 
+    @dataclasses.dataclass
+    class Point:
+        x: int
+
     @server.get("/unserializable")
     def unserializable():
-        return object()
+        return Point(1)
 
     with serving(server) as base:
         client = ucall.Client(connections=1, backend=backend)
@@ -317,6 +330,7 @@ def test_handler_failures_answer_500(backend, loopback, serving, monkeypatch):
         assert client.get(f"{base}/unserializable").status_code == 500
         assert client.get(f"{base}/missing").status_code == 404
     assert [type(report.exc_value) for report in unraisable] == [ValueError, TypeError]
+    assert str(unraisable[1].exc_value) == "Object of type Point is not JSON serializable"
 
 
 def test_run_refuses_more_than_one_loop_or_any_batch(loopback):
@@ -534,8 +548,12 @@ def test_body_chunks_on_worker(backend, loopback, serving):
         chunks = detached.body_chunks()
         first = next(chunks)
         digest.update(first)
-        for chunk in chunks:
-            digest.update(chunk)
+
+        async def rest():
+            async for chunk in chunks:
+                digest.update(chunk)
+
+        asyncio.run(rest())
         try:
             first.tobytes()
         except ValueError:

@@ -13,10 +13,6 @@ use std::error::Error;
 use std::fs;
 use std::path::{Path, PathBuf};
 
-/// The siblings CMake fetches by pinned revision unless `FETCHCONTENT_SOURCE_DIR_<NAME>` names a
-/// local checkout.
-const SIBLINGS: &[&str] = &["STRINGZILLA", "FORKUNION", "SMASHTABLE"];
-
 /// The paths whose contents rebuild the library.
 const SOURCES: &[&str] = &["CMakeLists.txt", "VERSION", "c", "include", "src"];
 
@@ -81,6 +77,14 @@ fn main() -> Result<(), Box<dyn Error>> {
     Ok(())
 }
 
+/// The tree a sibling crate reports through its `links` metadata.
+fn sibling_source(links: &str) -> Result<String, String> {
+    let variable = format!("DEP_{}_SOURCE", links.to_uppercase());
+    env::var(&variable).map_err(|_| {
+        format!("{variable} is unset: this `{links}` crate predates reporting its tree")
+    })
+}
+
 /// Builds `ucall_static` through CMake and links it with the liburing its io_uring backends need.
 fn build_library(manifest: &Path) -> Result<(), Box<dyn Error>> {
     let mut library = cmake::Config::new(manifest);
@@ -88,12 +92,13 @@ fn build_library(manifest: &Path) -> Result<(), Box<dyn Error>> {
         .profile("Release")
         .build_target("ucall_static")
         .define("UCALL_INSTALL", "OFF");
-    for sibling in SIBLINGS {
-        let variable = format!("FETCHCONTENT_SOURCE_DIR_{sibling}");
-        println!("cargo:rerun-if-env-changed={variable}");
-        if let Some(source) = env::var_os(&variable) {
-            library.define(&variable, source);
-        }
+    // `FetchContent` builds each sibling crate's tree rather than fetching the pinned revision.
+    for (variable, links) in [
+        ("FETCHCONTENT_SOURCE_DIR_FORKUNION", "forkunion"),
+        ("FETCHCONTENT_SOURCE_DIR_SMASHTABLE", "smashtable"),
+        ("FETCHCONTENT_SOURCE_DIR_STRINGZILLA", "stringzilla"),
+    ] {
+        library.define(variable, sibling_source(links)?);
     }
 
     // `build_target` stops short of installing, and the project collects every archive at the root

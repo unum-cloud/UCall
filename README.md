@@ -1,15 +1,12 @@
 <h1 align="center">UCall</h1>
 <h3 align="center">
-  Simple Secure Web Client and Server Framework<br />
-  Caller-Owned Polling, SIMD Kernels, and Retained Request Batches<br />
+  Low-Latency Client-Server Communication Engine<br />
+  Built around Noise, io_uring &amp; SIMD<br />
 </h3>
 <br />
 
-> What would a web framework look like built around Noise, io_uring, and SIMD?
-> UCall keeps application handlers synchronous while its connection state machines overlap network I/O.
-
 <p align="center">
-  <a href="https://discord.gg/xuDmpbEDnQ"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
+  <a href="https://discord.gg/4mxGrenbNt"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
   &nbsp;&nbsp;&nbsp;
   <a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
   &nbsp;&nbsp;&nbsp;
@@ -22,9 +19,14 @@
 
 ---
 
-UCall is a ¹ performance-oriented, ² portable, and ³ compact HTTP framework, with a ⁴ twist!
+![UCall banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/UCall-v1.png?raw=true)
+
+> What would a client-server communication engine look like built around Noise, io_uring, and SIMD?
+> UCall keeps application handlers synchronous while its connection state machines overlap network I/O.
+
+UCall is a ¹ performance-oriented, ² portable, and ³ compact client-server communication engine, with a ⁴ twist!
 How ¹ fast?
-About 291,000 1 KiB echoes per second from one server thread natively, about 278,000 through its Rust bindings and about 268,000 through its Python bindings, against about 83,000 for gRPC on tonic, 21,000 for FastAPI and 15,000 for Python gRPC, in the [framework comparison](bench/README.md#framework-comparison).
+About 291,000 1 KB echoes per second from one server thread natively, about 278,000 through its Rust bindings and about 268,000 through its Python bindings, against about 83,000 for gRPC on tonic, 21,000 for FastAPI and 15,000 for Python gRPC, in the [framework comparison](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison).
 How ² portable?
 A C ABI fronts a C++20 core with POSIX, Linux epoll with AIO and io_uring, macOS and FreeBSD kqueue, and Windows IOCP backends.
 IOCP runs one event loop per interface.
@@ -36,11 +38,11 @@ For encrypted native connections, it uses the Noise secure communication protoco
 
 Moreover, it's easy to use synchronous handlers, even when the underlying backend uses asynchronous IO like Linux `io_uring`.
 And it provides server-side batching for high-latency batch-processing endpoints, like GPU inference tasks and OLAP database queries.
-The [native examples](examples/README.md) demonstrate binary echo, conditional key-value writes, atomic ledger transfers, and batched inference through the C ABI.
+The [native examples](https://github.com/unum-cloud/UCall/blob/main/examples/README.md) demonstrate binary echo, conditional key-value writes, atomic ledger transfers, and batched inference through the C ABI.
 
-## 📊 FastAPI UX Comparison
+## FastAPI UX Comparison
 
-Both columns serve the same typed endpoint; UCall's [Python bindings](python/README.md) bind its parameters in C and answer on the polling thread.
+Both columns serve the same typed endpoint; UCall's [Python bindings](https://github.com/unum-cloud/UCall/blob/main/python/README.md) bind its parameters in C and answer on the polling thread.
 
 <table width="100%">
 <tr>
@@ -108,17 +110,18 @@ cmake --build build_release --parallel
 cmake --install build_release --prefix ~/.local
 ```
 
-The install holds the C headers, `libucall_static`, `libucall_shared`, a `ucall.pc`, and a CMake package naming `ucall::static` and `ucall::shared`, which a C program links like any C library.
-It also holds `ucall`, a command-line client for one HTTP or Noise call, as in `ucall -d @body.json http://127.0.0.1:8080/echo`.
-`-H` adds a header line, `-d @-` reads the body from standard input, `-i` prints the status line and every response field before the body, and `--server-key` pins the server for an `http+noise://` URL.
-`ucall keygen FILE` writes a fresh Noise private key and prints its public half, and the exit code is 0 for a 2xx answer and the status's hundreds digit otherwise.
-Leaving `UCALL_BUILD_SHARED` off installs the archive without the shared library and its `ucall.pc`.
-`pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](CONTRIBUTING.md) lists the presets, tests and cross builds.
+> The install holds the C headers, `libucall_static`, `libucall_shared`, a `ucall.pc`, and a CMake package naming `ucall::static` and `ucall::shared`, which a C program links like any C library.
+> It also holds `ucall`, a command-line client for one HTTP or Noise call, as in `ucall -d @body.json http://127.0.0.1:8080/echo`.
+> `-H` adds a header line, `-d @-` reads the body from standard input, `-i` prints the status line and every response field before the body, and `--server-key` pins the server for an `http+noise://` URL.
+> `ucall keygen FILE` writes a fresh Noise private key and prints its public half, and the exit code is 0 for a 2xx answer and the status's hundreds digit otherwise.
+> Leaving `UCALL_BUILD_SHARED` off installs the archive without the shared library and its `ucall.pc`.
+
+`pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](https://github.com/unum-cloud/UCall/blob/main/CONTRIBUTING.md) lists the presets, tests and cross builds.
 
 ## C Quickstart
 
 One callback reads a request's body and replies with it, and `main` initializes the server, registers the route, and polls its one loop on the calling thread.
-The listing is [`examples/hello.c`](examples/hello.c), which CI links against both installed libraries:
+The listing is [`examples/hello.c`](https://github.com/unum-cloud/UCall/blob/main/examples/hello.c), which CI links against both installed libraries:
 
 ```c
 #include <stdio.h>
@@ -208,21 +211,21 @@ std::thread::scope(|scope| {
 })?;
 ```
 
-The [Rust guide](rust/README.md) covers streaming, files, Noise and metrics.
+The [Rust guide](https://github.com/unum-cloud/UCall/blob/main/rust/README.md) covers streaming, files, Noise and metrics.
 
-## 📈 Performance Metrics
+## Performance
 
-The native [benchmark driver](bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
+The native [benchmark driver](https://github.com/unum-cloud/UCall/blob/main/bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
 It runs closed-loop by default, or open-loop at a fixed arrival rate that charges each call its delay from the intended send time.
 Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
 On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
-The [framework comparison](bench/README.md#framework-comparison) serves a 1 KiB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
+The [framework comparison](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison) serves a 1 KB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
 The guide also measures pipelining depth, Noise against TLS 1.3 behind nginx, scaling across event loops, and 10,000 connections.
-The [C ABI page](c/README.md) describes the implemented native surface; SDK, WebSocket, and authorization plans below are labeled as such.
+The [C ABI page](https://github.com/unum-cloud/UCall/blob/main/c/README.md) describes the implemented native surface; SDK and authorization plans below are labeled as such.
 
 ## Design Principles
 
-### Asynchronous Framework for Synchronous Applications
+### Asynchronous Engine for Synchronous Applications
 
 Talking to remote services over a network can cost much more than the local computation that handles a request.
 Moreover, the packet exchange between the application and the network card involves multiple context switches and kernel calls.
@@ -280,7 +283,6 @@ There is a better way... that is broadly deployed, but little known.
 The Noise Protocol Framework!
 
 UCall uses a `protocol+transport` URL scheme convention (like Docker's `http+unix://`) to explicitly specify the transport: `http://` or `http+noise://`.
-WebSocket transports are planned.
 Noise uses a Diffie-Hellman __(DH)__ key exchange to establish a shared secret between the client and server, with the handshake pattern determining which keys each side must know.
 Several handshake patterns are defined, each suitable for different use cases:
 
@@ -309,7 +311,7 @@ Then, it uses the [AES-256-GCM](https://en.wikipedia.org/wiki/Advanced_Encryptio
 Finally, it uses the [SHA-256](https://en.wikipedia.org/wiki/SHA-2) hash function for hashing operations during the handshake and key derivation.
 
 Why choose AES-256-GCM and SHA-256?
-Both primitives ship in [StringZilla][stringzilla], so the transport shares the framework's capability-selected kernels rather than maintaining a separate cryptographic backend.
+Both primitives ship in [StringZilla][stringzilla], so the transport shares the engine's capability-selected kernels rather than maintaining a separate cryptographic backend.
 The selected CPU class carries matching string searches, AES-GCM, SHA-256, and atomic operations together.
 The implemented x86 and Arm kernels use the available cryptographic instruction paths, with serial fallbacks for the baseline class.
 
@@ -358,7 +360,7 @@ check if resource($r), $r.starts_with("/api/");
 ```
 
 The proposed integration would cover time bounds, path patterns, HTTP methods, IP ranges, and application-defined restrictions.
-A possible `Authorization` header format is `Authorization: Macaroon <base64>` or `Authorization: Biscuit <base64>`; the current framework does not interpret either token.
+A possible `Authorization` header format is `Authorization: Macaroon <base64>` or `Authorization: Biscuit <base64>`; the current engine does not interpret either token.
 
 Why "pastries"?
 Because capability-based tokens are delicious - they're self-contained, offline-verifiable, and delegation-friendly.
@@ -448,7 +450,7 @@ A path no route takes answers 404, and a path whose routes take other verbs answ
 A GET route serves HEAD as well, an `OPTIONS` request answers 204 with the same `allow` list, and `OPTIONS *` lists every verb.
 A request sending `Expect: 100-continue` gets its interim `100 Continue` once the requests before it on its connection were answered, or on a streamed endpoint once its handler first pulls the body.
 
-### Multipart Data and Rich Types
+### Multipart Data & Rich Types
 
 __Roadmap:__ Python rich-type conversion and the following SDK example await implementation or migration.
 
@@ -493,7 +495,7 @@ curl -X POST http://localhost:8545/vectorize \
 When building high-throughput applications, it's common to batch multiple requests together on the client side to reduce network overhead.
 That batch is one request from one client, which the server must split, dispatch and reassemble itself.
 Server-side batching instead collects independent HTTP requests from different clients and every polling loop into each batch endpoint's queue, and passes their retained handles as a counted array.
-Each request keeps its own response and transaction boundary, as the [key-value and ledger examples](examples/README.md) demonstrate.
+Each request keeps its own response and transaction boundary, as the [key-value and ledger examples](https://github.com/unum-cloud/UCall/blob/main/examples/README.md) demonstrate.
 
 ### Resumable Uploads & Downloads
 
@@ -557,21 +559,13 @@ __Security__ (Server → Client):
 - `X-Frame-Options`: Clickjacking protection (`DENY`, `SAMEORIGIN`)
 - `Content-Security-Policy`: Controls resource loading to prevent XSS attacks
 
-### WebSockets and Streaming
+### Streaming
 
-__Roadmap:__ The declared WebSocket operations currently return unsupported.
 Streamed replies are implemented: `ucall_server_reply_begin()`, `ucall_server_reply_append()` and `ucall_server_reply_end()` send a chunked body from any thread, long after the callback returned.
 Streamed request bodies are implemented too: an endpoint registered with `ucall_body_delivery_streamed_k` runs once the head parsed, and each `ucall_server_request_body_chunk()` takes every byte decoded since the last one, finishing later through its outcome when none arrived yet.
 The Python and Rust bindings expose both through a detached request a worker finishes, described in their Files & Streams sections.
 The connection reads on only as the handler pulls, so a slow handler slows its own peer and nobody else, and no request pipelined behind the body parses before the body ended.
 Buffered requests are capped by `max_request_bytes`, which defaults to the largest receive buffer the kernel grants a socket; past it the reply is 413.
-
-WebSockets have very different semantics from remaining request-response one-shot functionality.
-Communication is bidirectional and long-lived, with messages flowing in both directions independently.
-Often small, frequent messages, should be handled differently.
-
-The planned WebSocket callbacks would deliver messages as they arrive.
-An application would not be required to form one response for every message inside the callback.
 
 ### Observability & Metrics
 
@@ -604,7 +598,7 @@ ucall_server_options_t config = {
 
 A datagram that fails to send is dropped, and the next one carries its counters, so collectors see every request counted once.
 
-## Design Differences and Limitations
+## Differences & Limitations
 
 ### Where Would You Prefer WebRTC?
 
@@ -618,7 +612,7 @@ In the future, WebRTC DataChannels may be added.
 
 ### What About HTTP/2?
 
-UCall currently supports HTTP/1.1; WebSocket upgrades are planned.
+UCall currently supports HTTP/1.1.
 HTTP/2 adds several important features:
 
 - Extended `CONNECT` for protocols that tunnel bidirectional traffic.
@@ -700,3 +694,22 @@ server {
     return 301 https://$server_name$request_uri;
 }
 ```
+
+## Citation
+
+If UCall helps your research or product, please cite it:
+
+```bibtex
+@software{Vardanian_UCall,
+  author = {Vardanian, Ash},
+  title = {{UCall: Low-Latency Client-Server Networking Stack Built around Noise Encryption, io\_uring and SIMD}},
+  doi = {10.5281/zenodo.7951496},
+  url = {https://github.com/unum-cloud/UCall},
+  license = {Apache-2.0}
+}
+```
+
+## License
+
+Licensed under the Apache License, Version 2.0.
+See `LICENSE` for details.

@@ -14,28 +14,25 @@
  *  secret-dependent branch or table index here is a key-recovery bug, so the implementation needs
  *  constant-time discipline that sits badly beside code compiled for maximum throughput.
  *
- *  So it lives in one translation unit rather than a dependency, with the field arithmetic
+ *  So each kit lives in one translation unit rather than a dependency, with the field arithmetic
  *  transcribed from a machine-verified implementation - fiat-crypto's generated C carries a proof
  *  of both functional correctness and constant-time behaviour, and is what BoringSSL and NSS ship.
  *  A subtly wrong field multiply still produces a shared secret that looks random.
  *
- *  @section Tiers
+ *  @section x25519_kits Kits
  *
- *  Three field backends, chosen at runtime. @c saturated is four saturated limbs in plain C++ and
- *  runs wherever this file compiles; @c radix51 is five limbs over 128-bit products, so it needs @c
- *  __int128 ; @c adx is @c saturated recompiled with @c target("adx,bmi2") , which lets the
- *  compiler emit @c MULX and makes it illegal on x86-64 without BMI2.
- *
- *  @c saturated is the baseline and carries no switch: one that can be compiled out is not a
- *  baseline. The two switches follow StringZilla's @c SZ_USE_* - always defined to 1 or 0, so @c
- *  \#if never reads an undefined identifier as zero and silently drops a tier.
+ *  Three kits, selected by CPU class like every other. @c serial_x25519_kit_t is four saturated
+ *  limbs over 32×32 partial products and runs wherever this file compiles;
+ *  @c haswell_x25519_kit_t is the same field over @c MULX, @c ADC and @c SBB chains, and
+ *  @c neon_x25519_kit_t is five radix-51 limbs over @c UMULH. Each builds apart from the class
+ *  units, so their throughput flags never reach a constant-time kernel.
  *
  *  @section Cost
  *
  *  One scalar multiplication is on the order of 100'000 cycles, and a Noise XX handshake needs four
  *  per side. That cost is @b per @b handshake, unlike AES-GCM which is per byte, so it disappears
  *  entirely under connection reuse and dominates under connection churn. An x86-64 path compiled to
- *  @c MULX carry chains ships as @c x25519_scalar_multiply_adx, selected at runtime. The remaining
+ *  @c MULX carry chains ships as @c haswell_x25519_kit_t, selected by CPU class. The remaining
  *  levers, worth measuring before pulling: the hand-scheduled @c ADCX / @c ADOX dual-chain assembly
  *  BoringSSL ships, which no compiler synthesizes from C, then batching independent handshakes
  *  across AVX-512IFMA lanes.
@@ -55,63 +52,7 @@ using utilities::span;
 static constexpr std::size_t x25519_key_size_k = 32;
 
 /**
- *  @brief Bitmask over the field-arithmetic tiers this library knows about.
- *
- *  A bitmask rather than one enumerator per tier because the useful questions are about sets: which
- *  tiers a build contains, which this machine favours, and which one it therefore picked.
- */
-enum class x25519_tiers_t : std::uint8_t {
-    none_k = 0,
-
-    /** Four limbs over a multiply built from 32-bit products. Always compiled, always runs. */
-    serial_k = 1u << 0,
-
-    /** Five limbs over 128-bit products. Faster than @c serial_k wherever it compiles. */
-    radix51_k = 1u << 1,
-
-    /** Four limbs built for ADX and BMI2, so it runs only where CPUID reports them. */
-    adx_k = 1u << 2,
-};
-
-[[nodiscard]] constexpr x25519_tiers_t operator&(x25519_tiers_t left, x25519_tiers_t right) noexcept {
-    return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(left) & static_cast<std::uint8_t>(right));
-}
-
-/** Whether @p available contains every tier in @p wanted. */
-[[nodiscard]] constexpr bool x25519_has_tiers(x25519_tiers_t available, x25519_tiers_t wanted) noexcept {
-    return (available & wanted) == wanted;
-}
-
-/** The tiers this build compiled in. @c serial_k carries no switch and is always among them. */
-[[nodiscard]] constexpr x25519_tiers_t x25519_tiers_compiled() noexcept {
-    return static_cast<x25519_tiers_t>(static_cast<std::uint8_t>(x25519_tiers_t::serial_k) |
-                                       static_cast<std::uint8_t>(x25519_tiers_t::radix51_k) * UCALL_COMPILER_INT128_ |
-                                       static_cast<std::uint8_t>(x25519_tiers_t::adx_k) * UCALL_ARCH_X8664_ADX_);
-}
-
-/**
- *  @brief The tiers this machine can execute, whatever was compiled.
- *
- *  Only @c adx_k is conditional. The other two hold no instruction a supported CPU can lack.
- */
-[[nodiscard]] x25519_tiers_t x25519_tiers_runtime() noexcept;
-
-/** The tiers both compiled in and runnable here. Never empty: @c saturated_k is in both. */
-[[nodiscard]] inline x25519_tiers_t x25519_tiers() noexcept { return x25519_tiers_compiled() & x25519_tiers_runtime(); }
-
-/**
- *  @brief The single tier @c x25519_scalar_multiply dispatches to on this machine.
- *
- *  Exposed because a benchmark that does not name the tier it measured is unreadable, and a test
- *  cross-checking tiers has to know which one the dispatcher already covered.
- */
-[[nodiscard]] x25519_tiers_t x25519_tier_preferred() noexcept;
-
-/** Names one tier, for diagnostics. Answers @c "none" for a mask with no bits set. */
-[[nodiscard]] char const* x25519_tier_name(x25519_tiers_t tier) noexcept;
-
-/**
- *  @brief Computes @p out = @p scalar * @p point on Curve25519, per RFC 7748 §5.
+ *  @brief Computes @p out = @p scalar * @p point on Curve25519, per RFC 7748 §5, in the serial kit.
  *  @param[out] out The 32-byte result. For key generation this is a public key; for Diffie-Hellman
  *      it is the shared secret.
  *  @param[in] scalar The 32-byte secret scalar. Clamped internally, so callers may pass raw random
@@ -123,42 +64,35 @@ enum class x25519_tiers_t : std::uint8_t {
  *  @warning Must execute in time independent of @p scalar. Any implementation swapped in here has
  *      to preserve that - it is the whole reason this primitive is isolated.
  */
-[[nodiscard]] bool x25519_scalar_multiply(        //
+[[nodiscard]] bool x25519_multiply_serial(        //
     span<byte_t, x25519_key_size_k> out,          //
     span<byte_t const, x25519_key_size_k> scalar, //
     span<byte_t const, x25519_key_size_k> point) noexcept;
 
-/** Baseline tier of @c x25519_scalar_multiply. Always built, and runs on any supported CPU. */
-[[nodiscard]] bool x25519_scalar_multiply_serial( //
+/** The @c x25519_multiply_serial contract in the Haswell kit, which needs BMI2. */
+[[nodiscard]] bool x25519_multiply_haswell(       //
     span<byte_t, x25519_key_size_k> out,          //
     span<byte_t const, x25519_key_size_k> scalar, //
     span<byte_t const, x25519_key_size_k> point) noexcept;
 
-#if UCALL_COMPILER_INT128_
-
-/** Radix-51 tier of @c x25519_scalar_multiply. Needs 128-bit integers, so absent under MSVC. */
-[[nodiscard]] bool x25519_scalar_multiply_radix51( //
-    span<byte_t, x25519_key_size_k> out,           //
-    span<byte_t const, x25519_key_size_k> scalar,  //
-    span<byte_t const, x25519_key_size_k> point) noexcept;
-#endif
-
-#if UCALL_ARCH_X8664_ADX_
-
-/** ADX tier of @c x25519_scalar_multiply. Faults where @c x25519_tiers_runtime omits it. */
-[[nodiscard]] bool x25519_scalar_multiply_adx(    //
+/** The @c x25519_multiply_serial contract in the NEON kit. */
+[[nodiscard]] bool x25519_multiply_neon(          //
     span<byte_t, x25519_key_size_k> out,          //
     span<byte_t const, x25519_key_size_k> scalar, //
     span<byte_t const, x25519_key_size_k> point) noexcept;
-#endif
 
 /**
  *  @brief Derives the public key matching @p scalar, multiplying by the standard base point.
  *  @param[out] out The 32-byte public key.
  *  @param[in] scalar The 32-byte secret scalar.
  */
-void x25519_derive_public(               //
+template <typename x25519_kit_type_>
+inline static void x25519_derive_public( //
     span<byte_t, x25519_key_size_k> out, //
-    span<byte_t const, x25519_key_size_k> scalar) noexcept;
+    span<byte_t const, x25519_key_size_k> scalar) noexcept {
+    static constexpr byte_t base_point_k[x25519_key_size_k] = {byte_t {9}};
+    // The standard base point has prime order, so a clamped scalar never maps it to zero.
+    [[maybe_unused]] bool const nonzero = x25519_kit_type_::multiply(out, scalar, std::span {base_point_k});
+}
 
 } // namespace unum::ucall::tunnel

@@ -46,8 +46,6 @@ struct linux_uring618_engine {
     struct alignas(8) socket_slot_t {
         unsigned index {}, next {operation_list_t::absent_k}, owned_head {operation_list_t::absent_k};
         unsigned close_operation {operation_list_t::absent_k}, receive_operation {operation_list_t::absent_k};
-        unsigned receive_head {operation_list_t::absent_k}, receive_tail {operation_list_t::absent_k};
-        unsigned queued_buffers {};
         std::uint64_t serial {};
         vector<byte_t> backlog;
         std::size_t backlog_offset {};
@@ -61,15 +59,15 @@ struct linux_uring618_engine {
         stream_start_t stream_start {stream_start_t::first_k};
         uring_lease_t backlog_lease {uring_lease_t::returned_k};
         listing_t rearm_listing {listing_t::unlisted_k};
+        listing_t waiting_listing {listing_t::unlisted_k};
+
+        /** One slice waiting a poll round for a receive, implying an empty backlog. */
+        span<byte_t> waiting_slice {};
+        unsigned next_waiting {operation_list_t::absent_k};
         explicit socket_slot_t(allocator_t const& allocator) noexcept : backlog(allocator) {}
         bool receive_in_flight() const noexcept {
             return receive_stage == receive_stage_t::submitted_k || receive_stage == receive_stage_t::cancelling_k;
         }
-    };
-    struct buffer_t {
-        unsigned next {operation_list_t::absent_k};
-        int length {};
-        uring_lease_t lease {uring_lease_t::returned_k};
     };
     using queue_t = uring_queue<allocator_t, atomic_ref_template_>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
@@ -82,17 +80,18 @@ struct linux_uring618_engine {
         IORING_OP_SEND,         IORING_OP_READ,         IORING_OP_SHUTDOWN,  IORING_OP_CLOSE,
         IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD, IORING_OP_OPENAT2,
         IORING_OP_SEND_ZC,      IORING_OP_READ_FIXED,   IORING_OP_READV,     IORING_OP_READV_FIXED};
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::engine_k;
 
     io_statistics_t statistics {};
     queue_t queue;
     socket_slots_t socket_slots;
     operations_t operations;
     zero_copy_t zero_copy;
-    vector<buffer_t> buffers;
 
     /** Receives with a deadline, and the sockets whose stream re-arms as receive credits allow. */
     operation_list_t timed_operations;
     unsigned rearming_socket_slots {absent_k};
+    unsigned waiting_socket_slots {absent_k};
 
     /** Sockets whose stream is submitted or cancelling, which the kernel still holds. */
     unsigned receiving_socket_slots {};
@@ -104,8 +103,7 @@ struct linux_uring618_engine {
     char const* refusal {};
 
     explicit linux_uring618_engine(allocator_t const& instance = {}) noexcept
-        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(statistics),
-          buffers(rebound_allocator<buffer_t> {instance}) {}
+        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(statistics) {}
     linux_uring618_engine(linux_uring618_engine const&) = delete;
     linux_uring618_engine& operator=(linux_uring618_engine const&) = delete;
     linux_uring618_engine(linux_uring618_engine&&) = delete;
@@ -118,20 +116,20 @@ struct linux_uring618_engine {
                socket_slots.closing() || receiving_socket_slots != 0;
     }
 
-    ucall_status_t open(std::size_t depth, std::size_t capacity) noexcept {
+    ucall_status_t open(std::size_t depth, std::size_t capacity,
+                        io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k) noexcept {
         if (!depth || !capacity) return ucall_status_invalid_argument_k;
         if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
         if (queue.stage != uring_engine_stage_t::idle_k) return ucall_status_invalid_argument_k;
         // Releases take no file, and the kernel registers no more files than descriptors.
-        std::size_t const sockets = std::min(capacity, open_files_limit());
+        std::size_t const sockets = std::min(capacity, open_files_limit() - 1);
         if (ucall_status_t const reserved = queue.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
             socket_slots.open(sockets, queue.allocator) != ucall_status_success_k ||
-            zero_copy.open(capacity, queue.allocator) != ucall_status_success_k ||
-            st::failed(buffers.resize(queue.buffer_count)))
+            zero_copy.open(capacity, queue.allocator) != ucall_status_success_k)
             return ucall_status_out_of_memory_k;
-        ucall_status_t const opened = queue.open(depth, sockets, opcodes_k);
+        ucall_status_t const opened = queue.open(depth, sockets, opcodes_k, scope);
         if (opened == ucall_status_success_k) return opened;
         // Only ring setup fails before the ring opens.
         if (queue.is_open()) stop();
@@ -149,106 +147,99 @@ struct linux_uring618_engine {
         return socket_slots.import_socket(descriptor, queue);
     }
     descriptor_t open_socket(int family) noexcept { return uring_open_socket(*this, family); }
-    void recycle(unsigned index) noexcept { uring_recycle(*this, index); }
+
+    /** Takes back what @p completion lent: a slice of the pool, or a socket's backlog past it. */
     void release(io_completion_t const& completion) noexcept {
         if (!queue.is_open() || !completion.lease) return;
-        if (completion.lease >= static_cast<std::uintptr_t>(registered_socket_t::tag_k)) {
-            auto* owner = socket_slots.find(static_cast<descriptor_t>(completion.lease));
-            if (!owner || owner->backlog_lease != uring_lease_t::leased_k) return;
-            owner->backlog_lease = uring_lease_t::returned_k;
-            owner->backlog_offset += static_cast<std::size_t>(completion.result);
-            if (owner->backlog_offset == owner->backlog.size()) {
-                owner->backlog.clear();
-                owner->backlog_offset = 0;
-            }
-            if (owner->receive_flow == receive_flow_t::paused_k) park_receive(*owner);
-            if (owner->retirement == uring_retirement_t::serving_k) deliver_receive(*owner);
-            else retire(*owner);
-            return;
-        }
-        auto index = static_cast<unsigned>(completion.lease - 1);
-        if (index < buffers.size() && buffers[index].lease == uring_lease_t::leased_k) {
-            if (queue.receive_ring) recycle(index);
-            else buffers[index].lease = uring_lease_t::returned_k;
-        }
-    }
-    void park_receive(socket_slot_t& owner) noexcept {
-        // Late CQEs keep their finite ring credits until cancellation stops prefetch.
-        if (owner.backlog_lease == uring_lease_t::leased_k || owner.receive_stage == receive_stage_t::cancelling_k)
-            return;
-        if (owner.backlog_offset) {
-            auto remaining = owner.backlog.size() - owner.backlog_offset;
-            if (remaining) std::memmove(owner.backlog.data(), owner.backlog.data() + owner.backlog_offset, remaining);
-            tally<atomic_ref_template_>(statistics.bytes_copied, remaining);
-            [[maybe_unused]] st::status_t const shrunk = owner.backlog.resize(remaining);
+        std::size_t const pool = queue.provided.memory.size();
+        if (completion.lease <= pool)
+            return queue.provided.return_slice({completion.data, static_cast<std::size_t>(completion.result)});
+        socket_slot_t& owner = socket_slots.records[completion.lease - pool - 1];
+        if (owner.backlog_lease != uring_lease_t::leased_k) return;
+        owner.backlog_lease = uring_lease_t::returned_k;
+        owner.backlog_offset += static_cast<std::size_t>(completion.result);
+        if (owner.backlog_offset == owner.backlog.size()) {
+            owner.backlog.clear();
             owner.backlog_offset = 0;
         }
-        while (owner.receive_head != absent_k) {
-            auto index = owner.receive_head;
-            auto& buffer = buffers[index];
-            if (buffer.length > 0) {
-                auto previous = owner.backlog.size();
-                auto length = static_cast<std::size_t>(buffer.length);
-                if (length > std::numeric_limits<std::size_t>::max() - previous) {
-                    queue.fault = -EOVERFLOW;
-                    return;
-                }
-                if (st::failed(owner.backlog.resize(previous + length))) {
-                    queue.fault = -ENOMEM;
-                    return;
-                }
-                std::memcpy(owner.backlog.data() + previous, queue.receive_data(index).data(), length);
-                tally<atomic_ref_template_>(statistics.bytes_copied, length);
-            }
-            else {
-                if (owner.receive_in_flight()) --receiving_socket_slots;
-                owner.receive_stage = receive_stage_t::ended_k;
-                owner.terminal = buffer.length;
-            }
-            owner.receive_head = buffer.next;
-            --owner.queued_buffers;
-            recycle(index);
-        }
-        owner.receive_tail = absent_k;
+        if (owner.receive_flow == receive_flow_t::paused_k) park_receive(owner);
+        if (owner.retirement == uring_retirement_t::serving_k) deliver_receive(owner);
+        else retire(owner);
+    }
+
+    /** Slides what a paused socket still holds to the front of its backlog, unless it is lent. */
+    void park_receive(socket_slot_t& owner) noexcept {
+        if (owner.backlog_lease == uring_lease_t::leased_k || !owner.backlog_offset) return;
+        auto remaining = owner.backlog.size() - owner.backlog_offset;
+        if (remaining) std::memmove(owner.backlog.data(), owner.backlog.data() + owner.backlog_offset, remaining);
+        tally<atomic_ref_template_>(statistics.bytes_copied, remaining);
+        [[maybe_unused]] st::status_t const shrunk = owner.backlog.resize(remaining);
+        owner.backlog_offset = 0;
     }
     void receive_pause(descriptor_t descriptor) noexcept {
         auto* owner = socket_slots.find(descriptor);
         if (!owner || owner->retirement == uring_retirement_t::retiring_k || owner->receive_operation != absent_k)
             return;
         owner->receive_flow = receive_flow_t::paused_k;
+        spill_slice(*owner);
         park_receive(*owner);
         if (owner->receive_stage == receive_stage_t::submitted_k) {
             if (cancel_stream(*owner) != ucall_status_success_k) queue.fault = -EIO;
             else owner->receive_stage = receive_stage_t::cancelling_k;
         }
     }
-    void queue_buffer(socket_slot_t& owner, unsigned index, int length) noexcept {
-        auto& buffer = buffers[index];
-        buffer.length = length;
-        buffer.next = absent_k;
-        if (owner.receive_tail != absent_k) buffers[owner.receive_tail].next = index;
-        else owner.receive_head = index;
-        owner.receive_tail = index;
-        ++owner.queued_buffers;
+
+    /** Copies @p slice to the end of @p owner's backlog and gives the pool its bytes back,
+     *  cancelling the stream of a socket past its fair share of the pool. */
+    void append_backlog(socket_slot_t& owner, span<byte_t> slice) noexcept {
+        uring_provided_buffers<allocator_t>& provided = queue.provided;
+        std::size_t const previous = owner.backlog.size();
+        if (st::failed(owner.backlog.resize(st::assume_uninitialized, previous + slice.size()))) queue.fault = -ENOMEM;
+        else std::memcpy(owner.backlog.data() + previous, slice.data(), slice.size());
+        tally<atomic_ref_template_>(statistics.bytes_copied, slice.size());
+        provided.return_slice(slice);
+        assert(socket_slots.records.size() > socket_slots.vacant_socket_slots);
+        std::size_t const share = std::min(
+            provided.buffer_bytes,
+            provided.memory.size() / (socket_slots.records.size() - socket_slots.vacant_socket_slots));
+        if (owner.backlog.size() - owner.backlog_offset >= share &&
+            owner.receive_stage == receive_stage_t::submitted_k) {
+            if (cancel_stream(owner) != ucall_status_success_k) queue.fault = -EIO;
+            else owner.receive_stage = receive_stage_t::cancelling_k;
+        }
+    }
+    void spill_slice(socket_slot_t& owner) noexcept {
+        if (!owner.waiting_slice.empty()) append_backlog(owner, std::exchange(owner.waiting_slice, {}));
+    }
+
+    /** Ends the round slices waited for their receives, so none pins a buffer past it. */
+    void spill_waiting_slices() noexcept {
+        while (waiting_socket_slots != absent_k) {
+            socket_slot_t& owner = socket_slots.records[waiting_socket_slots];
+            waiting_socket_slots = std::exchange(owner.next_waiting, absent_k);
+            owner.waiting_listing = listing_t::unlisted_k;
+            spill_slice(owner);
+        }
+    }
+
+    /** Hands @p slice straight to the receive waiting on @p owner. */
+    void deliver_slice(socket_slot_t& owner, span<byte_t> slice) noexcept {
+        operation_t& operation = operations[std::exchange(owner.receive_operation, absent_k)];
+        operation.buffer = static_cast<unsigned>(queue.provided.offset_of(slice));
+        operation.result = static_cast<descriptor_t>(slice.size());
+        unlist_timed(operation);
+        operations.complete(operation);
     }
     void deliver_receive(socket_slot_t& owner) noexcept {
         if (owner.receive_operation == absent_k) return;
+        if (!owner.waiting_slice.empty()) return deliver_slice(owner, std::exchange(owner.waiting_slice, {}));
         auto& operation = operations[owner.receive_operation];
         if (owner.backlog_offset != owner.backlog.size()) {
             if (owner.backlog_lease == uring_lease_t::leased_k) return;
             operation.receive_source = uring_receive_source_t::backlog_k;
-            operation.result = static_cast<descriptor_t>(
-                std::min(owner.backlog.size() - owner.backlog_offset, std::min(operation.request->length, queue.page)));
+            operation.result = static_cast<descriptor_t>(std::min<std::size_t>(
+                owner.backlog.size() - owner.backlog_offset, std::numeric_limits<descriptor_t>::max()));
             owner.backlog_lease = uring_lease_t::leased_k;
-        }
-        else if (owner.receive_head != absent_k) {
-            auto index = owner.receive_head;
-            owner.receive_head = buffers[index].next;
-            if (owner.receive_head == absent_k) owner.receive_tail = absent_k;
-            --owner.queued_buffers;
-            buffers[index].lease = uring_lease_t::leased_k;
-            operation.buffer = index;
-            operation.result = buffers[index].length;
         }
         else if (owner.receive_stage == receive_stage_t::ended_k) operation.result = owner.terminal;
         else return;
@@ -264,7 +255,7 @@ struct linux_uring618_engine {
     ucall_status_t start_receive(socket_slot_t& owner) noexcept {
         if (owner.receive_stage != receive_stage_t::idle_k || owner.receive_flow == receive_flow_t::paused_k ||
             owner.retirement == uring_retirement_t::retiring_k || queue.stage != uring_engine_stage_t::running_k ||
-            !queue.available_buffers)
+            !queue.provided.available_buffers)
             return ucall_status_success_k;
         auto* submission = queue.entry();
         if (!submission) return ucall_status_io_k;
@@ -380,13 +371,6 @@ struct linux_uring618_engine {
                 if (cancel_stream(owner) != ucall_status_success_k) queue.fault = -EIO;
                 else owner.receive_stage = receive_stage_t::cancelling_k;
             }
-            while (owner.receive_head != absent_k) {
-                auto index = owner.receive_head;
-                owner.receive_head = buffers[index].next;
-                --owner.queued_buffers;
-                recycle(index);
-            }
-            owner.receive_tail = absent_k;
         }
         if (owner.stage == uring_socket_stage_t::installing_k || owner.receive_in_flight() ||
             owner.stage == uring_socket_stage_t::closing_k || operations.owns_in_flight(owner))
@@ -403,9 +387,10 @@ struct linux_uring618_engine {
                     *link = owner.next;
                     break;
                 }
-        owner.receive_operation = owner.receive_head = owner.receive_tail = absent_k;
-        owner.queued_buffers = 0;
+        owner.receive_operation = absent_k;
+        if (!owner.waiting_slice.empty()) queue.provided.return_slice(std::exchange(owner.waiting_slice, {}));
         owner.backlog.clear();
+        if (owner.backlog.capacity() > queue.page) owner.backlog = vector<byte_t> {queue.allocator};
         owner.backlog_offset = 0;
         owner.terminal = 0;
         owner.receive_stage = receive_stage_t::idle_k;
@@ -446,23 +431,26 @@ struct linux_uring618_engine {
             if (owner.receive_in_flight()) --receiving_socket_slots;
             owner.receive_stage = receive_stage_t::idle_k;
         }
-        if (completion.flags & IORING_CQE_F_BUFFER) {
-            --queue.available_buffers;
-            unsigned index = completion.flags >> IORING_CQE_BUFFER_SHIFT;
+        uring_provided_buffers<allocator_t>& provided = queue.provided;
+        if (completion.res > 0 && (completion.flags & IORING_CQE_F_BUFFER)) {
+            span<byte_t> const slice = provided.lease_slice(completion.flags >> IORING_CQE_BUFFER_SHIFT,
+                                                            static_cast<std::size_t>(completion.res));
             if (owner.retirement == uring_retirement_t::retiring_k || queue.stage != uring_engine_stage_t::running_k)
-                recycle(index);
-            else {
-                queue_buffer(owner, index, completion.res);
-                if (owner.receive_flow == receive_flow_t::paused_k) park_receive(owner);
-                else deliver_receive(owner);
-                // One open socket may hold at most its fair share of the shared receive ring.
-                assert(socket_slots.records.size() > socket_slots.vacant_socket_slots);
-                if (owner.queued_buffers >=
-                        queue.buffer_count / (socket_slots.records.size() - socket_slots.vacant_socket_slots) &&
-                    owner.receive_stage == receive_stage_t::submitted_k) {
-                    if (cancel_stream(owner) != ucall_status_success_k) queue.fault = -EIO;
-                    else owner.receive_stage = receive_stage_t::cancelling_k;
+                provided.return_slice(slice);
+            else if (owner.receive_operation != absent_k && owner.backlog_offset == owner.backlog.size())
+                deliver_slice(owner, slice);
+            else if (owner.waiting_slice.empty() && owner.backlog_offset == owner.backlog.size() &&
+                     owner.receive_flow == receive_flow_t::flowing_k) {
+                // The next request often lands before its receive, so it waits a round.
+                owner.waiting_slice = slice;
+                if (owner.waiting_listing == listing_t::unlisted_k) {
+                    owner.waiting_listing = listing_t::listed_k;
+                    owner.next_waiting = std::exchange(waiting_socket_slots, owner.index);
                 }
+            }
+            else {
+                spill_slice(owner);
+                append_backlog(owner, slice);
             }
         }
         else if (completion.res != -ENOBUFS && completion.res != -ECANCELED) {
@@ -471,7 +459,6 @@ struct linux_uring618_engine {
             owner.terminal = completion.res;
             deliver_receive(owner);
         }
-        if (owner.receive_flow == receive_flow_t::paused_k && !owner.receive_in_flight()) park_receive(owner);
         if (owner.retirement == uring_retirement_t::retiring_k) retire(owner);
         else if (owner.receive_stage == receive_stage_t::idle_k) rearm(owner);
     }
@@ -485,7 +472,7 @@ struct linux_uring618_engine {
             if (operation->receive_source == uring_receive_source_t::backlog_k) {
                 auto& owner = *operation->socket_slot;
                 completed.data = owner.backlog.data() + owner.backlog_offset;
-                completed.lease = static_cast<std::uintptr_t>(registered_socket_t {owner.index}.handle());
+                completed.lease = queue.provided.memory.size() + 1 + owner.index;
             }
             output[count++] = completed;
             operations.vacate(*operation);
@@ -517,17 +504,19 @@ struct linux_uring618_engine {
             owner.rearm_listing = listing_t::unlisted_k;
             if (owner.receive_operation == absent_k || owner.receive_in_flight()) continue;
             if (start_receive(owner) != ucall_status_success_k) queue.fault = -EIO;
-            else if (!queue.available_buffers) rearm(owner);
+            else if (!queue.provided.available_buffers) rearm(owner);
         }
     }
     int poll(span<io_completion_t> output, io_wait_t policy, std::uint64_t deadline = 0) noexcept {
         if (!queue.is_open()) return -EBADF;
         for (;;) {
+            spill_waiting_slices();
             reap();
             maintain();
             if (queue.fault) return queue.fault;
             int count = collect(output);
             if (count) return count;
+            spill_waiting_slices();
             auto now = monotonic_ns();
             auto wait_deadline = deadline;
             if (!timed_operations.empty())
@@ -552,6 +541,7 @@ struct linux_uring618_engine {
     }
     void discard_unsubmitted() noexcept { uring_discard_unsubmitted(*this); }
     [[nodiscard]] ucall_status_t drain_after_fault() noexcept { return uring_drain_after_fault(*this); }
+    void reserve_releases(std::size_t count) noexcept { operations.reserve_releases(count); }
     [[nodiscard]] ucall_status_t grow(std::size_t capacity) noexcept {
         return uring_grow(*this, capacity, queue.allocator);
     }

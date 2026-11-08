@@ -505,6 +505,12 @@ typedef struct BodyChunks {
 
     /** The memoryview the last pull yielded, which the next pull releases, or NULL. */
     PyObject* chunk;
+
+    /** The last pull's outcome, which the event loop makes final while an awaited pull waits. */
+    ucall_outcome_t outcome;
+
+    /** The bytes the last pull decoded, written with its outcome. */
+    ucall_bytes_view_t data;
 } BodyChunks;
 
 static char const reply_dropped_k[] = "The endpoint released the request without a reply";
@@ -560,10 +566,8 @@ static int serialize_result(PyObject* result, PyObject** body, ucall_bytes_view_
         return 0;
     }
     int const textual = PyUnicode_Check(result);
-    PyObject* const text = textual ? Py_NewRef(result) : PyObject_CallOneArg(ucall_py_json_dumps, result);
     *header = textual ? &text_header_k : &json_header_k;
-    *body = text ? PyUnicode_AsUTF8String(text) : NULL;
-    Py_XDECREF(text);
+    *body = textual ? PyUnicode_AsUTF8String(result) : ucall_py_json_from_object(result);
     return *body ? 0 : -1;
 }
 
@@ -1650,7 +1654,7 @@ static char const doc_DetachedRequest_body_chunks[] =                           
     "    or badly framed, or `Status.WOULD_BLOCK` on the polling thread with nothing decoded.\n"    //
     "\n"                                                                                            //
     "Example:\n"                                                                                    //
-    "  >>> for chunk in detached.body_chunks():\n"                                                  //
+    "  >>> async for chunk in detached.body_chunks():  # or: for chunk in detached.body_chunks()\n" //
     "  ...     digest.update(chunk)";
 
 static PyObject* DetachedRequest_body_chunks(Request* self, [[maybe_unused]] PyObject* unused) {
@@ -1659,6 +1663,8 @@ static PyObject* DetachedRequest_body_chunks(Request* self, [[maybe_unused]] PyO
     if (!chunks) return NULL;
     chunks->request = (Request*)Py_NewRef(self);
     chunks->chunk = NULL;
+    chunks->outcome = (ucall_outcome_t) {0};
+    chunks->data = (ucall_bytes_view_t) {0};
     return (PyObject*)chunks;
 }
 
@@ -1803,27 +1809,103 @@ static int body_chunks_release(BodyChunks* self) {
     return released ? 0 : -1;
 }
 
-static PyObject* BodyChunks_next(BodyChunks* self) {
+/** Starts the next pull into the iterator's outcome: 0 once started, -1 with an exception set. */
+static int body_chunks_pull(BodyChunks* self) {
     Request* const request = self->request;
-    if (body_chunks_release(self) != 0 || request_live(request) != 0) return NULL;
-    if (request->exports)
-        return PyErr_Format(PyExc_BufferError,
-                            "%zd views over the request's bytes are alive, and the next pull would free them; " //
-                            "drop them or copy with bytes() first",
-                            request->exports);
-    ucall_outcome_t outcome = {0};
-    ucall_bytes_view_t data = {0};
-    ucall_server_request_body_chunk_t pull = {request->server->handle, &outcome, request->handle, &data};
-    ucall_server_request_body_chunk(&pull);
-    if (ucall_outcome_status(&outcome) == ucall_status_deferred_k) {
-        Py_BEGIN_ALLOW_THREADS;
-        ucall_outcome_wait(&outcome);
-        Py_END_ALLOW_THREADS;
+    if (ucall_outcome_status(&self->outcome) == ucall_status_deferred_k) {
+        PyErr_SetString(PyExc_RuntimeError, "the previous pull of this body is still waiting");
+        return -1;
     }
-    if (ucall_py_raise_outcome(&outcome) != 0 || !data.length) return NULL;
-    self->chunk = request_bytes_view(request, data);
+    if (body_chunks_release(self) != 0 || request_live(request) != 0) return -1;
+    if (request->exports) {
+        PyErr_Format(PyExc_BufferError,
+                     "%zd views over the request's bytes are alive, and the next pull would free them; " //
+                     "drop them or copy with bytes() first",
+                     request->exports);
+        return -1;
+    }
+    self->outcome = (ucall_outcome_t) {0};
+    self->data = (ucall_bytes_view_t) {0};
+    ucall_server_request_body_chunk_t pull = {request->server->handle, &self->outcome, request->handle, &self->data};
+    ucall_server_request_body_chunk(&pull);
+    return 0;
+}
+
+/** The chunk a final pull decoded, or NULL with an exception set or, at the body's end, without. */
+static PyObject* body_chunks_yield(BodyChunks* self) {
+    if (ucall_py_raise_outcome(&self->outcome) != 0 || !self->data.length) return NULL;
+    self->chunk = request_bytes_view(self->request, self->data);
     return Py_XNewRef(self->chunk);
 }
+
+static PyObject* BodyChunks_next(BodyChunks* self) {
+    if (body_chunks_pull(self) != 0) return NULL;
+    if (ucall_outcome_status(&self->outcome) == ucall_status_deferred_k) {
+        Py_BEGIN_ALLOW_THREADS;
+        ucall_outcome_wait(&self->outcome);
+        Py_END_ALLOW_THREADS;
+    }
+    return body_chunks_yield(self);
+}
+
+/** The chunk of a final pull for @c async @c for, which ends on @c StopAsyncIteration. */
+static PyObject* body_chunks_yield_async(BodyChunks* self) {
+    PyObject* const chunk = body_chunks_yield(self);
+    if (!chunk && !PyErr_Occurred()) PyErr_SetNone(PyExc_StopAsyncIteration);
+    return chunk;
+}
+
+/** Waits for a deferred pull in an executor thread, without the interpreter lock. */
+static PyObject* body_chunks_finish(BodyChunks* self, [[maybe_unused]] PyObject* unused) {
+    Py_BEGIN_ALLOW_THREADS;
+    ucall_outcome_wait(&self->outcome);
+    Py_END_ALLOW_THREADS;
+    return body_chunks_yield_async(self);
+}
+
+static PyMethodDef body_chunks_finish_method = {"finish", (PyCFunction)body_chunks_finish, METH_NOARGS, NULL};
+
+/** A future the running loop resolves at once to a final pull's chunk, or to its exception. */
+static PyObject* body_chunks_resolved(BodyChunks* self, PyObject* loop) {
+    PyObject* const future = PyObject_CallMethod(loop, "create_future", NULL);
+    if (!future) return NULL;
+    PyObject* const chunk = body_chunks_yield_async(self);
+    PyObject* const raised = chunk ? NULL : PyErr_GetRaisedException();
+    PyObject* const set = PyObject_CallMethod(future, chunk ? "set_result" : "set_exception", "O",
+                                              chunk ? chunk : raised);
+    Py_XDECREF(chunk);
+    Py_XDECREF(raised);
+    if (!set) {
+        Py_DECREF(future);
+        return NULL;
+    }
+    Py_DECREF(set);
+    return future;
+}
+
+/** @c async @c for pulls as @c next does, running a deferred pull's wait in the running loop's
+ *  default executor. */
+static PyObject* BodyChunks_anext(BodyChunks* self) {
+    PyObject* const asyncio = PyImport_ImportModule("asyncio");
+    PyObject* const loop = asyncio ? PyObject_CallMethod(asyncio, "get_running_loop", NULL) : NULL;
+    PyObject* future = NULL;
+    if (loop && body_chunks_pull(self) == 0) {
+        if (ucall_outcome_status(&self->outcome) != ucall_status_deferred_k) future = body_chunks_resolved(self, loop);
+        else {
+            PyObject* const finish = PyCFunction_New(&body_chunks_finish_method, (PyObject*)self);
+            future = finish ? PyObject_CallMethod(loop, "run_in_executor", "OO", Py_None, finish) : NULL;
+            Py_XDECREF(finish);
+        }
+    }
+    Py_XDECREF(loop);
+    Py_XDECREF(asyncio);
+    return future;
+}
+
+static PyAsyncMethods BodyChunks_async = {
+    .am_aiter = PyObject_SelfIter,
+    .am_anext = (unaryfunc)BodyChunks_anext,
+};
 
 static void BodyChunks_dealloc(BodyChunks* self) {
     // Releasing may run while an exception unwinds past the iterator, which must survive it.
@@ -1834,11 +1916,15 @@ static void BodyChunks_dealloc(BodyChunks* self) {
     PyObject_Free(self);
 }
 
-static char const doc_BodyChunks[] =                                                          //
-    "The iterator `DetachedRequest.body_chunks` returns, yielding memoryviews of the body.\n" //
-    "\n"                                                                                      //
-    "Example:\n"                                                                              //
-    "  >>> received = sum(len(chunk) for chunk in detached.body_chunks())";
+static char const doc_BodyChunks[] =                                                                //
+    "The iterator `DetachedRequest.body_chunks` returns, yielding memoryviews of the body.\n"       //
+    "\n"                                                                                            //
+    "`async for` returns a chunk already decoded at once and waits for one still arriving in the\n" //
+    "running loop's default executor; `for` waits on the calling thread.\n"                         //
+    "\n"                                                                                            //
+    "Example:\n"                                                                                    //
+    "  >>> async for chunk in detached.body_chunks():  # or: for chunk in detached.body_chunks()\n" //
+    "  ...     digest.update(chunk)";
 
 PyTypeObject BodyChunksType = {
     PyVarObject_HEAD_INIT(NULL, 0).tp_name = "ucall.BodyChunks",
@@ -1846,6 +1932,7 @@ PyTypeObject BodyChunksType = {
     .tp_flags = Py_TPFLAGS_DEFAULT,
     .tp_doc = doc_BodyChunks,
     .tp_dealloc = (destructor)BodyChunks_dealloc,
+    .tp_as_async = &BodyChunks_async,
     .tp_iter = PyObject_SelfIter,
     .tp_iternext = (iternextfunc)BodyChunks_next,
 };
@@ -2084,9 +2171,14 @@ static PyObject* request_document(ucall_server_t server, ucall_received_http_req
     ucall_server_request_body(&extract);
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
     if (!body.length) return PyDict_New();
-    PyObject* const bytes = PyBytes_FromStringAndSize((char const*)body.data, (Py_ssize_t)body.length);
-    PyObject* document = bytes ? PyObject_CallOneArg(ucall_py_json_loads, bytes) : NULL;
-    Py_XDECREF(bytes);
+    yyjson_read_err error = {0};
+    // yyjson writes into its input only with `YYJSON_READ_INSITU`, which is never set.
+    yyjson_doc* const parsed = yyjson_read_opts(
+        (char*)body.data, body.length, YYJSON_READ_ALLOW_INF_AND_NAN | YYJSON_READ_BIGNUM_AS_RAW, NULL, &error);
+    PyObject* document = parsed ? ucall_py_object_from_json(yyjson_doc_get_root(parsed))
+                                : PyErr_Format(PyExc_ValueError, "the body is not JSON: %s at byte %zu", error.msg,
+                                               error.pos);
+    yyjson_doc_free(parsed);
     if (document && !PyDict_Check(document)) {
         Py_CLEAR(document);
         PyErr_SetString(PyExc_ValueError, "expected a JSON object body");
@@ -2281,7 +2373,17 @@ static int endpoint_resolve(Endpoint* endpoint, ucall_bytes_view_t path,
              *qualname = NULL;
     int resolved = -1;
     inspect = PyImport_ImportModule("inspect");
-    typing = inspect ? PyImport_ImportModule("typing") : NULL;
+    PyObject* const coroutine = inspect ? PyObject_CallMethod(inspect, "iscoroutinefunction", "O", handler) : NULL;
+    if (!coroutine) goto finished;
+    Py_DECREF(coroutine);
+    if (coroutine == Py_True) {
+        PyErr_Format(PyExc_TypeError,
+                     "%R is a coroutine function: register a plain function, call request.detach(), " //
+                     "and reply from your own event loop",
+                     handler);
+        goto finished;
+    }
+    typing = PyImport_ImportModule("typing");
     signature = typing ? PyObject_CallMethod(inspect, "signature", "O", handler) : NULL;
     hints = signature ? PyObject_CallMethod(typing, "get_type_hints", "O", handler) : NULL;
     if (!hints) goto finished;

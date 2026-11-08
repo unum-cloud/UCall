@@ -1,18 +1,24 @@
 cff-version: 1.2.0
-title: "UCall: Simple Secure Web Client and Server Framework"
+title: "UCall: Low-Latency Client-Server Networking Stack Built around Noise Encryption, io_uring and SIMD"
 message: "If you use this software, please cite it as below."
 type: software
 license: Apache-2.0
-version: 1.0.0-rc.1
-doi: 10.5281/zenodo.7951496
 repository-code: https://github.com/unum-cloud/UCall
 url: https://github.com/unum-cloud/UCall
+doi: 10.5281/zenodo.7951496
 abstract: >-
-  UCall is a performance-oriented, portable, and compact HTTP framework built around Noise,
-  io_uring, and SIMD. Application handlers stay synchronous while caller-owned polling drives
+  UCall is a low-latency client-server communication engine built around Noise, io_uring and
+  SIMD. Application handlers stay synchronous while caller-owned polling drives
   connection state machines that overlap network I/O and retain request batches, with HTTP and Noise
   clients and servers on capability-specialized I/O backends, exposed through a C ABI with C++,
   Python, and Rust bindings.
+keywords:
+  - client-server communication
+  - network protocol
+  - noise protocol
+  - io_uring
+  - simd
+  - http
 
 authors:
   - family-names: Vardanian

@@ -35,6 +35,7 @@ struct posix_engine {
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
     using rebind = posix_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 
@@ -86,7 +87,8 @@ struct posix_engine {
     posix_engine(posix_engine&&) = delete;
     posix_engine& operator=(posix_engine&&) = delete;
     ~posix_engine() noexcept { stop(); }
-    ucall_status_t open(std::size_t, std::size_t capacity) noexcept {
+    ucall_status_t open(std::size_t, std::size_t capacity,
+                        io_issuer_scope_t = io_issuer_scope_t::one_thread_k) noexcept {
         if (st::failed(operations.resize(capacity)) || st::failed(polling.resize(capacity)) ||
             st::failed(polled.resize(capacity)))
             return ucall_status_out_of_memory_k;

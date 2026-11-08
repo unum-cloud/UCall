@@ -66,9 +66,10 @@ def test_blocking_calls_keep_other_completions(backend, loopback, serving):
         assert [bytes(completed.response.body) for completed in kept] == [b"first", b"second"]
         assert client.take_completed() == []
 
-        with pytest.raises(ucall.Error) as refused:
+        with pytest.raises(ucall.ConnectionFailedError) as refused:
             client.get("http://127.0.0.1:1/")
         assert refused.value.status == ucall.Status.CONNECTION_FAILED
+        assert isinstance(refused.value, ConnectionError)
 
 
 def test_response_cap_fails_with_overflow(backend, loopback, serving):

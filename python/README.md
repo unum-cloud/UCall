@@ -6,7 +6,7 @@
 pip install ucall
 ```
 
-Wheels cover CPython 3.12 to 3.15 on Linux, macOS and Windows, plus the free-threaded 3.14t, where the module declares it runs without the interpreter lock, and a source build needs CMake and a C++20 compiler.
+Wheels cover CPython 3.12 to 3.15 on Linux, macOS and Windows, plus the free-threaded 3.14t and 3.15t, where the module declares it runs without the interpreter lock, and a source build needs CMake and a C++20 compiler.
 The package picks its I/O backend and CPU kernels when a server or client starts, so one wheel adapts to the kernel and CPU it runs on.
 
 ## Quickstart
@@ -86,15 +86,16 @@ Any other handler takes parameters annotated `str`, `int`, `float`, `bool` or `b
 
 - a placeholder of the template, as sent;
 - the query, percent-decoded with "+" as a space, a "%" without two hexadecimal digits answering 400;
-- a JSON object body, parsed once and only when an earlier place missed a parameter;
+- a JSON object body, parsed once in C and only when an earlier place missed a parameter, with integers of any width kept exact;
 - the parameter's default.
 
 Text converts as `int(text)` and `float(text)` do, `bool` reads "1", "true", "yes" and "on" or "0", "false", "no" and "off" in any case, and `bytes` takes the raw bytes.
 A JSON value must already have the annotated type, except that an integer widens to `float` and a string encodes to `bytes`.
 A missing or malformed value answers 400 with the reason as plain text, such as "missing parameter 'limit'", without calling the handler.
 Registration raises `TypeError` for `*args`, `**kwargs`, more than 16 parameters, or an annotation outside that list.
+It refuses an `async def` handler with `TypeError` too, since handlers run on the polling thread; a coroutine application registers a plain function, calls `request.detach()`, and replies from its own event loop.
 
-What a handler returns becomes the reply: `bytes`, `bytearray` and `memoryview` as application/octet-stream, `str` as UTF-8 text/plain, and anything else through `json.dumps` as application/json.
+What a handler returns becomes the reply: `bytes`, `bytearray` and `memoryview` as application/octet-stream, `str` as UTF-8 text/plain, and anything else as application/json, written in C, or through `json.dumps` for a value C does not write, such as a dict keyed by numbers.
 None from a typed handler answers 204, and None from a handler taking the request means it replies itself.
 A handler's exception reaches `sys.unraisablehook` and answers 500, and the loop keeps serving.
 
@@ -146,7 +147,7 @@ Handlers run on the polling thread, so a reply or a pull that finishes later run
 | :------------------------------------ | :-------------------------------------------------- | :------------------------------------- |
 | `reply_parts(parts, status, headers)` | `None` for bytes alone, else a `ucall.Deferred`     | every part is sent                     |
 | `reply_stream(status, headers)`       | a `ucall.ReplyStream` with `append(parts)`, `end()` | `end()` returns `None` or a `Deferred` |
-| `body_chunks()`                       | an iterator of `memoryview` chunks                  | the body ended                         |
+| `body_chunks()`                       | an iterator and async iterator of `memoryview`s     | the body ended                         |
 
 ### Serving a File
 
@@ -195,7 +196,7 @@ import hashlib
 
 def store(detached: ucall.DetachedRequest):
     digest = hashlib.sha256()
-    for chunk in detached.body_chunks():
+    for chunk in detached.body_chunks():  # or: async for chunk in detached.body_chunks()
         digest.update(chunk)
     detached.reply(digest.hexdigest().encode())
 
@@ -207,6 +208,7 @@ def upload(request: ucall.Request):
 
 An endpoint registered with `body=ucall.BodyDelivery.STREAMED`, on `add_endpoint`, `route` and every verb decorator, runs its handler once the headers arrived.
 `body_chunks()` yields each chunk as a `memoryview` valid until the next pull, which releases it, and waits for bytes without the interpreter lock.
+`async for` over it returns a chunk already decoded at once and runs the wait for one still arriving on the running loop's default executor, as `await deferred` does.
 
 ## Batches
 
@@ -358,6 +360,8 @@ An `http+noise://` URL implies Noise XX, and a handler reads the client's authen
 ## Errors
 
 A failed operation raises `ucall.Error`, a `RuntimeError` whose `status` is the `ucall.Status` it reported and whose `message` is a static detail beside it.
+Each failing status raises a subclass of its own, named after the status, such as `ucall.ConnectionFailedError` or `ucall.NotFoundError`.
+Where a built-in exception names the same fault, the subclass derives it too: `ConnectionError` for connection failures, `TimeoutError`, `MemoryError`, `OSError`, `ValueError` for invalid or malformed input, `KeyError`, `NotImplementedError`, `OverflowError` and `BlockingIOError`.
 `str(error)` joins the two, as in "CONNECTION_FAILED: connection-failed".
 Arguments of the wrong type raise `TypeError`, a key of the wrong length or an unknown enum name raises `ValueError`, and a reply while views over the body are alive raises `BufferError`.
 
@@ -368,7 +372,7 @@ client = ucall.Client(connections=1)
 try:
     response = client.get("http://127.0.0.1:1/")
     print("answered", response.status_code)
-except ucall.Error as error:
+except ucall.ConnectionFailedError as error:  # or: except ConnectionError
     assert error.status == ucall.Status.CONNECTION_FAILED
     print("nobody listens:", error)
 ```
@@ -419,12 +423,6 @@ The blocking client calls wait in the same slices, so Ctrl+C interrupts them too
 A `Client` belongs to the thread that created it, and any other thread calling it gets `ucall.Error` with `Status.INVALID_ARGUMENT`, so a program calling from several threads makes one client per thread.
 A `Request` and a `Response` move freely between threads.
 Every thread that polls, replies or reads must run on a CPU supporting the CPU class the server or client resolved at start, so `CPUClass.SERIAL` is the safe choice on machines mixing CPU generations.
-
-## What This Binding Does Not Expose
-
-The binding leaves these out:
-
-- WebSocket endpoints, connections and messages, on either side.
 
 ## Design
 

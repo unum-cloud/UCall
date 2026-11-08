@@ -40,12 +40,59 @@
 #include <unistd.h>
 #endif
 #if UCALL_OS_LINUX_
-#include <dirent.h>        // `opendir`, `readdir`, `closedir`
-#include <linux/openat2.h> // `open_how`, `RESOLVE_BENEATH`
-#include <sys/syscall.h>   // `SYS_openat2`
-#endif                     // UCALL_OS_LINUX_
+#include <dirent.h>      // `opendir`, `readdir`, `closedir`
+#include <sys/syscall.h> // `SYS_statx`
+#endif
 
 namespace unum::ucall::utilities {
+
+#pragma region Kernel
+
+/** @c open_how, the arguments of @c openat2, from Linux 5.6. */
+struct linux_open_how_t {
+    std::uint64_t flags;
+    std::uint64_t mode;
+    std::uint64_t resolve;
+};
+static_assert(sizeof(linux_open_how_t) == 24, "the kernel reads a 24-byte open_how");
+
+/** @c statx_timestamp. */
+struct linux_statx_timestamp_t {
+    std::int64_t tv_sec;
+    std::uint32_t tv_nsec;
+    std::int32_t reserved;
+};
+
+/** @c statx, with the unbuffered-read alignments Linux 6.1 added. */
+struct linux_statx_t {
+    std::uint32_t mask;
+    std::uint32_t blksize;
+    std::uint64_t attributes;
+    std::uint32_t nlink;
+    std::uint32_t uid;
+    std::uint32_t gid;
+    std::uint16_t mode;
+    std::uint16_t spare0;
+    std::uint64_t ino;
+    std::uint64_t size;
+    std::uint64_t blocks;
+    std::uint64_t attributes_mask;
+    linux_statx_timestamp_t atime;
+    linux_statx_timestamp_t btime;
+    linux_statx_timestamp_t ctime;
+    linux_statx_timestamp_t mtime;
+    std::uint32_t rdev_major;
+    std::uint32_t rdev_minor;
+    std::uint32_t dev_major;
+    std::uint32_t dev_minor;
+    std::uint64_t mnt_id;
+    std::uint32_t dio_mem_align;
+    std::uint32_t dio_offset_align;
+    std::uint64_t spare3[12];
+};
+static_assert(sizeof(linux_statx_t) == 256, "the kernel writes a 256-byte statx");
+
+#pragma endregion Kernel
 
 inline std::uint64_t monotonic_ns() noexcept {
     return std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch())
@@ -164,6 +211,28 @@ inline descriptor_t socket_open(int family) noexcept {
     }
 #endif
     return descriptor;
+}
+
+/** The largest @c SO_RCVBUF the kernel grants, or @p fallback, probed on a socket of its own, since
+ *  setting it on a listener would pin every accepted socket's buffer and stop autotuning. */
+inline std::size_t largest_receive_buffer(int family, std::size_t fallback) noexcept {
+    descriptor_t const probe = socket_open(family);
+    if (probe < 0) return fallback;
+    // Linux clamps an oversized request where FreeBSD and macOS refuse it, so refusals bisect.
+    int accepted = 0, refused = std::numeric_limits<int>::max();
+    if (socket_option(probe, SOL_SOCKET, SO_RCVBUF, &refused, sizeof(refused)) == 0) accepted = refused;
+    while (refused - accepted > 1) {
+        int const requested = accepted + (refused - accepted) / 2;
+        if (socket_option(probe, SOL_SOCKET, SO_RCVBUF, &requested, sizeof(requested)) == 0) accepted = requested;
+        else refused = requested;
+    }
+    int granted = 0;
+    socket_length_t length = sizeof(granted);
+    bool const measured = accepted &&
+                          getsockopt(probe, SOL_SOCKET, SO_RCVBUF, reinterpret_cast<char*>(&granted), &length) == 0 &&
+                          granted > 0;
+    socket_close(probe);
+    return measured ? static_cast<std::size_t>(granted) : fallback;
 }
 
 /** A nonblocking UDP socket connected to @p address, so sends need no destination, or -1. */
@@ -401,15 +470,18 @@ inline int file_open_beneath(int directory, char const* path) noexcept {
 
 #if UCALL_OS_LINUX_
 
-/** Measures the open regular @p file and asks its filesystem what unbuffered reads demand. */
+/** Measures the open regular @p file and asks its filesystem what unbuffered reads demand; the
+ *  alignments need Linux 6.1. */
 inline file_geometry_t file_direct_alignment(int file) noexcept {
-    struct statx status {};
-    if (statx(file, "", AT_EMPTY_PATH, STATX_TYPE | STATX_SIZE | STATX_DIOALIGN, &status) != 0) return {0, 0, -errno};
-    if (!S_ISREG(status.stx_mode)) return {0, 0, -ENXIO};
+    std::uint32_t const dioalign = 0x2000; // STATX_DIOALIGN
+    linux_statx_t status {};
+    if (syscall(SYS_statx, file, "", AT_EMPTY_PATH, STATX_TYPE | STATX_SIZE | dioalign, &status) != 0)
+        return {0, 0, -errno};
+    if (!S_ISREG(status.mode)) return {0, 0, -ENXIO};
     std::uint32_t alignment = file_portable_alignment_k;
-    if ((status.stx_mask & STATX_DIOALIGN) && status.stx_dio_mem_align && status.stx_dio_offset_align)
-        alignment = std::max(status.stx_dio_mem_align, status.stx_dio_offset_align);
-    return {status.stx_size, alignment, 0};
+    if ((status.mask & dioalign) && status.dio_mem_align && status.dio_offset_align)
+        alignment = std::max(status.dio_mem_align, status.dio_offset_align);
+    return {status.size, alignment, 0};
 }
 
 #else
@@ -501,21 +573,9 @@ inline int directory_open(char const* path) noexcept {
     return directory >= 0 ? directory : -errno;
 }
 
-/** Opens @p path for unbuffered reads strictly beneath @p directory: a descriptor, or a negated
- *  errno. */
-inline int file_open_beneath(int directory, char const* path) noexcept {
-#if UCALL_OS_LINUX_
-    open_how how {};
-    how.flags = file_open_flags_k;
-    how.resolve = RESOLVE_BENEATH | RESOLVE_NO_MAGICLINKS;
-    long const opened = syscall(SYS_openat2, directory, path, &how, sizeof(how));
-    int file = opened >= 0 ? static_cast<int>(opened) : -errno;
-#elif UCALL_OS_FREEBSD_
-    int file = openat(directory, path, file_open_flags_k | O_RESOLVE_BENEATH);
-    // FreeBSD refuses an escape with ENOTCAPABLE where Linux's beneath resolution answers EXDEV.
-    if (file < 0) file = errno == ENOTCAPABLE ? -EXDEV : -errno;
-#else
-    // Lacking a beneath resolution, a walk that takes no `..` and follows no link stays inside.
+/** Opens @p path with @c file_open_flags_k beneath @p directory one name at a time, taking no
+ *  <tt>..</tt> and following no link, so it stays inside: a descriptor, or a negated errno. */
+inline int file_open_beneath_walk(int directory, char const* path) noexcept {
     int file = directory;
     char name[NAME_MAX + 1];
     for (char const* cursor = path; file >= 0 && *cursor;) {
@@ -533,7 +593,30 @@ inline int file_open_beneath(int directory, char const* path) noexcept {
         file = next;
         cursor = *end ? end + 1 : end;
     }
-    if (file == directory) file = -EISDIR;
+    return file == directory ? -EISDIR : file;
+}
+
+/** Opens @p path for unbuffered reads strictly beneath @p directory: a descriptor, or a negated
+ *  errno. */
+inline int file_open_beneath(int directory, char const* path) noexcept {
+#if UCALL_OS_LINUX_
+    long const openat2 = 437 + linux_syscall_offset_k; // SYS_openat2, mirrored for headers older than 5.6
+
+    std::uint64_t const no_magiclinks = 0x02; // RESOLVE_NO_MAGICLINKS
+    std::uint64_t const beneath = 0x08;       // RESOLVE_BENEATH
+    linux_open_how_t how {};
+    how.flags = file_open_flags_k;
+    how.resolve = beneath | no_magiclinks;
+    long const opened = syscall(openat2, directory, path, &how, sizeof(how));
+    int file = opened >= 0 ? static_cast<int>(opened) : -errno;
+    // A kernel older than 5.6 has no beneath resolution, so the walk stands in for it.
+    if (file == -ENOSYS) file = file_open_beneath_walk(directory, path);
+#elif UCALL_OS_FREEBSD_
+    int file = openat(directory, path, file_open_flags_k | O_RESOLVE_BENEATH);
+    // FreeBSD refuses an escape with ENOTCAPABLE where Linux's beneath resolution answers EXDEV.
+    if (file < 0) file = errno == ENOTCAPABLE ? -EXDEV : -errno;
+#else
+    int file = file_open_beneath_walk(directory, path);
 #endif // UCALL_OS_LINUX_
     if (file < 0) return file;
     // FreeBSD opens directories and FIFOs under these flags, and a FIFO read would block the loop.
