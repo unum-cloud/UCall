@@ -34,8 +34,15 @@ jobs:
         uses: dtolnay/rust-toolchain@master
         with:
           toolchain: beta-2026-10-18
+      - name: Set Up Pixi
+        uses: prefix-dev/setup-pixi@v0
+        with:
+          pixi-version: v0.84.1
+      # Mojo comes from the workspace's Pixi environment, as test-mojo.yml takes it.
       - name: Build Docs
-        run: .github/scripts/build-docs.sh
+        run: |
+          eval "$(pixi shell-hook)"
+          .github/scripts/build-docs.sh
       - name: Upload Docs
         uses: actions/upload-artifact@v7
         with:

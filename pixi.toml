@@ -1,0 +1,54 @@
+# The workspace, and the `ucall` package the Mojo binding `dlopen`s. Built by the tree's own CMake, so the I/O
+# backends, the CPU classes and the submodule pins are the ones every other SDK gets.
+
+[workspace]
+authors = ["Ash Vardanian <info@unum.cloud>"]
+channels = ["conda-forge", "https://conda.modular.com/max"]
+description = "Native HTTP and Noise networking with caller-owned polling and request batching"
+license = "Apache-2.0"
+license-file = "LICENSE"
+name = "ucall"
+# The io_uring backends build against the Linux headers of conda-forge's 2.39 sysroot.
+platforms = [
+  { name = "linux-64-glibc239", platform = "linux-64", glibc = "2.39" },
+  { name = "linux-aarch64-glibc239", platform = "linux-aarch64", glibc = "2.39" },
+  "osx-arm64",
+]
+preview = ["pixi-build"]
+readme = "README.md"
+version = "1.0.0-rc.1"
+
+[workspace.target.linux-64.build-variants]
+c_stdlib_version = ["2.39"]
+
+[workspace.target.linux-aarch64.build-variants]
+c_stdlib_version = ["2.39"]
+
+# A dependency of the environment too, so `pixi run` puts the library in the prefix `mojo build` bakes as runpath.
+[dependencies]
+mojo = ">=1.2.0,<1.3" # ? Mojo minors still change the language, as 1.1 and 1.2 did, so each is adopted by hand
+ucall = { path = "." }
+
+# `mojo build` links against a MAX runtime that needs a newer glibc than conda-forge's default
+# sysroot, which otherwise fails with a wall of GLIBC_2.34 undefined references.
+[target.linux-64.dependencies]
+sysroot_linux-64 = ">=2.34"
+
+[target.linux-aarch64.dependencies]
+sysroot_linux-aarch64 = ">=2.34"
+
+[package]
+name = "ucall"
+version = "1.0.0-rc.1"
+
+[package.build]
+backend = { name = "pixi-build-cmake", version = "0.*" }
+
+# The backend defaults to a C++-only toolchain, and the C interface's own units compile as C.
+[package.build.config]
+compilers = ["c", "cxx"]
+extra-args = ["-DBUILD_SHARED_LIBS=OFF", "-DUCALL_BUILD_SHARED=1"]
+
+[tasks]
+build = { cmd = "mkdir -p build_mojo && mojo build -I mojo mojo/test.mojo -o build_mojo/mojo_test" }
+test = { cmd = "mojo run -I mojo mojo/test.mojo" }
