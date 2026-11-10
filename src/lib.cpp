@@ -6,7 +6,6 @@
  *      word and the percent codec through the host class's rows, and the Noise key and
  *      received response verbs.
  */
-#include <cstdint>
 #include <cstring> // `std::memset`
 
 #include <span>        // `std::as_bytes`, `std::as_writable_bytes`
