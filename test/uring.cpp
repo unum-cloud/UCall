@@ -462,9 +462,9 @@ static case_result_t test_uring612_provides_past_two_buffers() {
 /** The byte at @p offset of the patterned file the file cases read. */
 static byte_t file_byte(std::uint64_t offset) noexcept { return static_cast<byte_t>((offset * 2654435761u) >> 13); }
 
-/** Opens beneath a directory with `OPENAT2` for unbuffered reads, refusing escapes; refuses a
- *  buffered descriptor; then reads aligned extents, a short tail, a registered buffer through
- *  `READ_FIXED`, and vectors that `READV` or `READV_FIXED` scatter into. */
+/** Opens beneath a directory with @c OPENAT2 for unbuffered reads, refusing escapes; switches a
+ *  buffered descriptor, twice; then reads aligned extents, a short tail, a registered buffer
+ *  through @c READ_FIXED, and vectors that @c READV or @c READV_FIXED scatter into. */
 template <typename engine_type_>
 static case_result_t direct_files() {
     direct_directory_t directory;
@@ -505,13 +505,14 @@ static case_result_t direct_files() {
                               .descriptor = socket,
                               .data = reinterpret_cast<byte_t*>(terminated.data()),
                               .length = terminated.size() + 1,
-                              .file = {0, -1, directory.descriptor}};
+                              .file = {0, directory.descriptor}};
         descriptor_t const opened = await(opening);
         if (path == "data.bin") {
-            file_geometry_t const geometry = opened >= 0 ? file_direct_alignment(opened) : file_geometry_t {};
+            file_geometry_t const geometry = opened >= 0 ? direct_alignment_of(opened) : file_geometry_t {};
+            std::size_t const measured = std::max(geometry.memory_alignment, geometry.offset_alignment);
             failures += expect(
-                opened >= 0 && !geometry.error && geometry.size == content.size() && geometry.alignment == alignment,
-                "{} opened as {} measuring {} bytes aligned to {}", path, opened, geometry.size, geometry.alignment);
+                opened >= 0 && !geometry.error && geometry.size == content.size() && measured == alignment,
+                "{} opened as {} measuring {} bytes aligned to {}", path, opened, geometry.size, measured);
             file = static_cast<int>(opened);
         }
         else {
@@ -521,10 +522,12 @@ static case_result_t direct_files() {
     }
     require(failures, file >= 0);
 
-    announce("refusing a buffered descriptor");
-    int const buffered = ::open(directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC);
-    failures += expect(file_direct_check(buffered) == ucall_status_invalid_argument_k &&
-                       file_direct_check(file) == ucall_status_success_k);
+    announce("switching a buffered descriptor twice");
+    native_file_t buffered = ::open(directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    failures += expect(file_direct_switch(buffered) == ucall_status_success_k &&
+                           file_direct_switch(buffered) == ucall_status_success_k &&
+                           (fcntl(buffered, F_GETFL) & (O_DIRECT | O_NONBLOCK)) == O_DIRECT,
+                       "the switch left flags {:#x}", fcntl(buffered, F_GETFL));
     ::close(buffered);
 
     announce("reading aligned extents and a short tail");
@@ -533,7 +536,7 @@ static case_result_t direct_files() {
                           .descriptor = socket,
                           .data = window.data,
                           .length = 2 * alignment,
-                          .file = {3 * alignment, file, -1}};
+                          .file = {3 * alignment, file}};
     failures += expect(await(reading) == static_cast<descriptor_t>(2 * alignment) &&
                        std::memcmp(window.data, content.data() + 3 * alignment, 2 * alignment) == 0);
     reading.file.offset = 64 * alignment;
@@ -558,7 +561,7 @@ static case_result_t direct_files() {
                              .descriptor = socket,
                              .data = reinterpret_cast<byte_t*>(vectors),
                              .length = 2,
-                             .file = {5 * alignment, file, -1}};
+                             .file = {5 * alignment, file}};
     failures += expect(await(scattering) == static_cast<descriptor_t>(2 * alignment) &&
                        std::memcmp(window.data, content.data() + 5 * alignment, alignment) == 0 &&
                        std::memcmp(window.data + 2 * alignment, content.data() + 6 * alignment, alignment) == 0);

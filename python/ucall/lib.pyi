@@ -135,6 +135,7 @@ class Backend(enum.IntEnum):
     LINUX_URING618 = 4
     BSD_KQUEUE = 5
     WINDOWS_IOCP = 6
+    WINDOWS_RIO = 7
 
 class CPUClass(enum.IntEnum):
     """A bundle of CPU kernels for `Server` and `Client`; `UNKNOWN` picks the initializing thread's.
@@ -833,7 +834,7 @@ class DetachedRequest(Buffer):
 
         Raises:
           BufferError: A view over the request's bytes is still alive.
-          Error: A refused part, such as a descriptor without O_DIRECT, or a request already
+          Error: A refused part, such as a socket for a file, or a request already
             answered, with `Status.ALREADY_EXISTS`.
 
         Example:
@@ -1333,8 +1334,8 @@ class Server:
             `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,
             `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,
             `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,
-            `refused_requests`, `handshake_failures` and `authorizer_refusals`, each read on its
-            own.
+            `refused_requests`, `handshake_failures`, `authorizer_refusals`, `shed_connections` and
+            `windows_unpinned`, each read on its own.
 
         Raises:
           Error: An `event_loop` past the last one.

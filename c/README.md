@@ -107,7 +107,7 @@ Server shutdown uses baseline atomics and native wakeups, so another thread can 
 ## Design
 
 - __Backends.__
-  Select `automatic`, `posix`, `linux-epollaio`, `linux-uring612`, `linux-uring618`, `bsd-kqueue`, or `windows-iocp` in the server or client configuration; explicit unavailable selections fail.
+  Select `automatic`, `posix`, `linux-epollaio`, `linux-uring612`, `linux-uring618`, `bsd-kqueue`, `windows-iocp`, or `windows-rio` in the server or client configuration; explicit unavailable selections fail.
   All variants use the same HTTP/1.1 and Noise connection automata.
 - __io_uring.__
   Both io_uring variants use registered files, direct descriptors, an incremental provided receive-buffer ring, a sparse table of registered buffers, `SEND_ZC` zero-copy sends and `READ_FIXED` file reads.

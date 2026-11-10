@@ -599,10 +599,14 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
     """Connections whose Noise handshake failed."""
     var authorizer_refusals: UInt64
     """Connections whose authenticated peer key the interface's authorizer refused."""
+    var shed_connections: UInt64
+    """Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under Noise."""
+    var windows_unpinned: UInt64
+    """File windows the engine left unpinned, whose sends pin or copy on their own."""
 
     def __init__(out self):
         """Every counter at zero, as a failed read leaves them."""
-        self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 @fieldwise_init

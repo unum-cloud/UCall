@@ -12,15 +12,15 @@
 
 #include <cstdio> // `std::fopen`, `std::fread`
 
+#include <charconv> // `std::from_chars`
+
+#include "ucall/dns/messages.hpp" // `lowercase`
+
 #if UCALL_OS_WINDOWS_
 #include <iphlpapi.h> // `GetAdaptersAddresses`
 #else
 #include <net/if.h> // `if_nametoindex`
 #endif
-
-#include <charconv> // `std::from_chars`
-
-#include "ucall/dns/messages.hpp" // `lowercase`
 
 namespace unum::ucall::dns {
 

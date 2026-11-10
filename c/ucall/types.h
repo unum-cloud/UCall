@@ -11,6 +11,151 @@
 #include <stddef.h> // size_t
 #include <stdint.h> // uint32_t, int32_t
 
+#pragma region Platform Identity
+
+/*  Derived once from the OS and architecture predefines, which no other file reads. */
+#if defined(UCALL_OS_LINUX_) || defined(UCALL_OS_APPLE_) || defined(UCALL_OS_WINDOWS_) || \
+    defined(UCALL_OS_FREEBSD_) || defined(UCALL_OS_POSIX_) || defined(UCALL_ARCH_ARM64_)
+#error "UCALL_OS_*_ and UCALL_ARCH_*_ are identity, derived from the compiler; set a UCALL_WITH_* facility instead"
+#endif
+
+/** Whether the kernel is Linux, Android included, as 1 or 0. */
+#if defined(__linux__)
+#define UCALL_OS_LINUX_ 1
+#else
+#define UCALL_OS_LINUX_ 0
+#endif
+
+/** Whether the kernel is Darwin: macOS, iOS, tvOS, watchOS or visionOS, as 1 or 0. */
+#if defined(__APPLE__)
+#define UCALL_OS_APPLE_ 1
+#else
+#define UCALL_OS_APPLE_ 0
+#endif
+
+/** Whether the target is Windows, MinGW included and Cygwin not, as 1 or 0. */
+#if defined(_WIN32)
+#define UCALL_OS_WINDOWS_ 1
+#else
+#define UCALL_OS_WINDOWS_ 0
+#endif
+
+/** Whether the kernel is FreeBSD, as 1 or 0. */
+#if defined(__FreeBSD__)
+#define UCALL_OS_FREEBSD_ 1
+#else
+#define UCALL_OS_FREEBSD_ 0
+#endif
+
+/** Whether the POSIX interfaces exist: Linux, Darwin, FreeBSD or Cygwin, as 1 or 0. */
+#if UCALL_OS_LINUX_ || UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_ || defined(__CYGWIN__)
+#define UCALL_OS_POSIX_ 1
+#else
+#define UCALL_OS_POSIX_ 0
+#endif
+
+/** Whether the target is 64-bit Arm, as 1 or 0. */
+#if defined(__aarch64__) || defined(_M_ARM64)
+#define UCALL_ARCH_ARM64_ 1
+#else
+#define UCALL_ARCH_ARM64_ 0
+#endif
+
+#if UCALL_OS_LINUX_ + UCALL_OS_APPLE_ + UCALL_OS_WINDOWS_ + UCALL_OS_FREEBSD_ > 1
+#error "Two operating-system identities hold at once"
+#endif
+#if UCALL_OS_POSIX_ && UCALL_OS_WINDOWS_
+#error "POSIX and Windows identities hold at once"
+#endif
+
+#pragma endregion Platform Identity
+
+/*  Kernel facilities default to what the operating system offers, and dependency facilities to 0,
+ *  which the target linking the dependency sets; each refuses an operating system lacking it. */
+#pragma region Facilities
+
+/** Whether the portable engine over nonblocking POSIX calls and @c poll is compiled, as 1 or 0. */
+#if !defined(UCALL_WITH_POSIX)
+#define UCALL_WITH_POSIX UCALL_OS_POSIX_
+#endif
+#if UCALL_WITH_POSIX && !UCALL_OS_POSIX_
+#error "UCALL_WITH_POSIX needs a POSIX system"
+#endif
+
+/** Whether the engine over epoll and Linux AIO is compiled, as 1 or 0. */
+#if !defined(UCALL_WITH_LINUX_EPOLLAIO)
+#define UCALL_WITH_LINUX_EPOLLAIO UCALL_OS_LINUX_
+#endif
+#if UCALL_WITH_LINUX_EPOLLAIO && !UCALL_OS_LINUX_
+#error "UCALL_WITH_LINUX_EPOLLAIO needs Linux"
+#endif
+
+/** Whether the io_uring engines are compiled, as 1 or 0, which the target linking liburing sets. */
+#if !defined(UCALL_WITH_LINUX_URING)
+#define UCALL_WITH_LINUX_URING 0
+#endif
+#if UCALL_WITH_LINUX_URING && !UCALL_OS_LINUX_
+#error "UCALL_WITH_LINUX_URING needs Linux"
+#endif
+
+/** Whether the kqueue engine is compiled, as 1 or 0. */
+#if !defined(UCALL_WITH_BSD_KQUEUE)
+#define UCALL_WITH_BSD_KQUEUE (UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_)
+#endif
+#if UCALL_WITH_BSD_KQUEUE && !(UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_)
+#error "UCALL_WITH_BSD_KQUEUE needs Darwin or FreeBSD"
+#endif
+
+/** Whether the I/O completion port engine is compiled, as 1 or 0. */
+#if !defined(UCALL_WITH_WINDOWS_IOCP)
+#define UCALL_WITH_WINDOWS_IOCP UCALL_OS_WINDOWS_
+#endif
+#if UCALL_WITH_WINDOWS_IOCP && !UCALL_OS_WINDOWS_
+#error "UCALL_WITH_WINDOWS_IOCP needs Windows"
+#endif
+
+/** Whether the Registered I/O engine is compiled, as 1 or 0. */
+#if !defined(UCALL_WITH_WINDOWS_RIO)
+#define UCALL_WITH_WINDOWS_RIO UCALL_OS_WINDOWS_
+#endif
+#if UCALL_WITH_WINDOWS_RIO && !UCALL_OS_WINDOWS_
+#error "UCALL_WITH_WINDOWS_RIO needs Windows"
+#endif
+
+/** Whether this unit builds the shared library, as 1 or 0. */
+#if !defined(UCALL_EXPORTING)
+#define UCALL_EXPORTING 0
+#endif
+
+/** Whether this unit links the shared library rather than the archive, as 1 or 0. */
+#if !defined(UCALL_SHARED)
+#define UCALL_SHARED 0
+#endif
+
+/**
+ *  @brief Marks every function the library exports, and nothing else.
+ *
+ *  On Windows it exports from the shared library, which builds with @c UCALL_EXPORTING, imports
+ *  where a consumer of that library sets @c UCALL_SHARED, as linking @c ucall::shared does, and
+ *  expands to nothing for the static library. GCC and Clang give the function default visibility,
+ *  so it survives @c -fvisibility=hidden.
+ */
+#if !defined(UCALL_EXPORT)
+#if UCALL_OS_WINDOWS_ && UCALL_EXPORTING
+#define UCALL_EXPORT __declspec(dllexport)
+#elif UCALL_OS_WINDOWS_ && UCALL_SHARED
+#define UCALL_EXPORT __declspec(dllimport)
+#elif UCALL_OS_WINDOWS_
+#define UCALL_EXPORT
+#elif defined(__GNUC__) || defined(__clang__)
+#define UCALL_EXPORT __attribute__((visibility("default")))
+#else
+#define UCALL_EXPORT
+#endif
+#endif // !defined(UCALL_EXPORT)
+
+#pragma endregion Facilities
+
 /** Major version of the C interface; it changes when a release breaks it. */
 #define UCALL_VERSION_MAJOR 1
 
@@ -23,18 +168,6 @@
 #ifdef __cplusplus
 extern "C" {
 #endif
-
-/*  Marks exported functions. Define `UCALL_BUILDING` while compiling UCall itself, or predefine
- *  `UCALL_EXPORT` as empty to link it statically on Windows. */
-#ifndef UCALL_EXPORT
-#if (defined(_WIN32) || defined(__CYGWIN__)) && defined(UCALL_BUILDING)
-#define UCALL_EXPORT __declspec(dllexport)
-#elif defined(_WIN32) || defined(__CYGWIN__)
-#define UCALL_EXPORT __declspec(dllimport)
-#else
-#define UCALL_EXPORT __attribute__((visibility("default")))
-#endif // Windows import or export
-#endif // !defined(UCALL_EXPORT)
 
 /** One byte of raw storage shared by views and cryptographic keys. */
 typedef uint8_t ucall_byte_t;
@@ -74,7 +207,10 @@ typedef enum ucall_io_backend_t {
     ucall_io_backend_bsd_kqueue_k,
 
     /** I/O completion ports on Windows. */
-    ucall_io_backend_windows_iocp_k
+    ucall_io_backend_windows_iocp_k,
+
+    /** Registered I/O on Windows for stream sockets, beside a completion port for the rest. */
+    ucall_io_backend_windows_rio_k
 } ucall_io_backend_t;
 
 /** A CPU kernel bundle, named with the same native classes as the sibling libraries. */

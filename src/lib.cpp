@@ -50,36 +50,7 @@ static void init_network(init_type_* arguments) noexcept {
         publish(arguments->outcome, picked);
         return;
     }
-    auto options = *arguments->options;
-    auto request = *arguments;
-    request.options = &options;
-    auto try_backend = [&](ucall_io_backend_t backend) {
-        options.backend = backend;
-        make_network(cpu_ladder_t {}, &request, ceiling);
-        auto status = request.outcome->status;
-        return status != ucall_status_unsupported_k && status != ucall_status_io_k;
-    };
-    if (options.backend != ucall_io_backend_automatic_k) make_network(cpu_ladder_t {}, &request, ceiling);
-    else {
-        bool finished = false;
-#if UCALL_WITH_LINUX_URING
-        finished = try_backend(ucall_io_backend_linux_uring618_k);
-        if (!finished) finished = try_backend(ucall_io_backend_linux_uring612_k);
-#endif
-#if UCALL_WITH_LINUX_EPOLLAIO
-        if (!finished) finished = try_backend(ucall_io_backend_linux_epollaio_k);
-#endif
-#if UCALL_WITH_KQUEUE
-        if (!finished) finished = try_backend(ucall_io_backend_bsd_kqueue_k);
-#endif
-#if UCALL_WITH_IOCP
-        if (!finished) finished = try_backend(ucall_io_backend_windows_iocp_k);
-#endif
-#if UCALL_WITH_POSIX
-        if (!finished) finished = try_backend(ucall_io_backend_posix_k);
-#endif
-        if (!finished) publish(arguments->outcome, ucall_status_unsupported_k);
-    }
+    make_network(cpu_ladder_t {}, arguments, ceiling);
 }
 
 } // namespace unum::ucall

@@ -2,20 +2,15 @@
  *  @file test/network.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief The network suite's entry point, with engine duplex and backend parity.
+ *  @brief The network suite's entry point, with engine duplex, accept batches and backend parity.
  *
  *  Every case runs against the backend `--backend` names, or the automatic one without it. Backend
  *  parity runs only in the automatic invocation, since it walks every backend the build carries.
  */
-#include "ucall/io/bsd_kqueue_engine.hpp"     // `bsd_kqueue_engine_t`
-#include "ucall/io/linux_epollaio_engine.hpp" // `linux_epollaio_engine_t`
-#include "ucall/io/types.hpp"                 // `io_request_t`, `io_completion_t`, `io_wait_t`
-#if UCALL_WITH_LINUX_URING
-#include "ucall/io/linux_uring612_engine.hpp" // `linux_uring612_engine_t`
-#include "ucall/io/linux_uring618_engine.hpp" // `linux_uring618_engine_t`
-#endif
+#include "ucall/io/types.hpp" // `io_request_t`, `io_completion_t`, `io_wait_t`
 
 #include "network.hpp"
+#include "variants.hpp" // `io_engines_t`
 
 using namespace unum::ucall::test;
 using namespace unum::ucall::test::network;
@@ -34,7 +29,8 @@ static std::string without_dates(std::string wire) {
 static case_result_t test_backend_parity(random_generator_t& generator) {
     static constexpr ucall_io_backend_t backends_k[] {
         ucall_io_backend_posix_k,          ucall_io_backend_linux_epollaio_k, ucall_io_backend_linux_uring612_k,
-        ucall_io_backend_linux_uring618_k, ucall_io_backend_bsd_kqueue_k,     ucall_io_backend_windows_iocp_k};
+        ucall_io_backend_linux_uring618_k, ucall_io_backend_bsd_kqueue_k,     ucall_io_backend_windows_iocp_k,
+        ucall_io_backend_windows_rio_k};
     std::size_t failures = 0, compared = 0;
     std::string reference;
     char const* reference_name = "";
@@ -79,13 +75,12 @@ static case_result_t test_backend_parity(random_generator_t& generator) {
 #pragma region Engines
 #if UCALL_OS_POSIX_
 
-/** A mebibyte send and a receive wait on one socket together,
- *  and each completes as its own request. */
-template <typename engine_type_>
-static case_result_t engine_duplex(random_generator_t& generator) {
-    engine_type_ engine;
-    auto const status = engine.open(2, 2);
-    if (status == ucall_status_unsupported_k) return case_result_t::skipped("the kernel lacks this backend");
+/** The engine <tt>--backend</tt> names keeps a mebibyte send and a receive pending on one socket
+ *  at once, and each completes as its own request. */
+static case_result_t test_engine_duplex_delivery(random_generator_t& generator) {
+    uc::io_engines_t engine;
+    auto const status = engine.open(backend_under_test, 2, 2);
+    if (status == ucall_status_unsupported_k) return skipped_backend(backend_under_test, engine.backend());
     require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
     std::size_t failures = 0;
     loopback_pair_t sockets = loopback_pair();
@@ -164,24 +159,83 @@ static case_result_t engine_duplex(random_generator_t& generator) {
     return failures;
 }
 
-/** The engine `--backend` names keeps a receive and a send pending on one socket at once. */
-static case_result_t test_engine_duplex_delivery(random_generator_t& generator) {
-    switch (backend_under_test) {
-#if UCALL_WITH_POSIX
-    case ucall_io_backend_posix_k: return engine_duplex<uc::io::posix_engine_t>(generator);
-#endif
-#if UCALL_WITH_LINUX_EPOLLAIO
-    case ucall_io_backend_linux_epollaio_k: return engine_duplex<uc::io::linux_epollaio_engine_t>(generator);
-#endif
-#if UCALL_WITH_LINUX_URING
-    case ucall_io_backend_linux_uring612_k: return engine_duplex<uc::io::linux_uring612_engine_t>(generator);
-    case ucall_io_backend_linux_uring618_k: return engine_duplex<uc::io::linux_uring618_engine_t>(generator);
-#endif
-#if UCALL_WITH_KQUEUE
-    case ucall_io_backend_bsd_kqueue_k: return engine_duplex<uc::io::bsd_kqueue_engine_t>(generator);
-#endif
-    default: return case_result_t::skipped("no named POSIX engine");
+/** One accept of the engine <tt>--backend</tt> names takes every queued connection, each completing
+ *  with its own peer while the request stays pending, and the request then ends exactly once. */
+static case_result_t test_engine_accept_batch(random_generator_t&) {
+    constexpr std::size_t connections_k = 8;
+    uc::io_engines_t engine;
+    auto const status = engine.open(backend_under_test, 64, 64);
+    if (status == ucall_status_unsupported_k) return skipped_backend(backend_under_test, engine.backend());
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    int const listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_length = sizeof(address);
+    require(failures, listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&address), address_length) == 0 &&
+                          ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0 &&
+                          ::listen(listener, connections_k) == 0 &&
+                          uc::utilities::nonblocking(listener) == ucall_status_success_k);
+    auto const owned = engine.import_socket(listener);
+    require(failures, owned >= 0, "importing the listener ended with {}", owned);
+    std::array<uc::io::io_peer_address_t, connections_k> peers {};
+    uc::io::io_request_t accepting {.operation = uc::io::io_operation_t::accept_k,
+                                    .descriptor = owned,
+                                    .data = reinterpret_cast<uc::byte_t*>(peers.data()),
+                                    .length = connections_k};
+    require(failures, engine.submit(accepting) == ucall_status_success_k);
+
+    std::string const target = fmt::format("127.0.0.1:{}", ntohs(address.sin_port));
+    std::array<raw_client_t, connections_k> clients;
+    std::vector<unsigned> ports;
+    for (auto& client : clients) {
+        sockaddr_in local {};
+        socklen_t local_length = sizeof(local);
+        require(failures,
+                client.connect(target) &&
+                    ::getsockname(client.descriptor, reinterpret_cast<sockaddr*>(&local), &local_length) == 0);
+        ports.push_back(ntohs(local.sin_port));
     }
+    std::vector<uc::descriptor_t> accepted;
+    std::size_t endings = 0;
+    // Room past every connection, so a readiness engine never ends the accept for want of it.
+    uc::io::io_completion_t completions[4 * connections_k] {};
+    auto const deadline = uc::utilities::deadline_after(5000000);
+    while (!endings) {
+        // Every client connected, so a request still pending afterwards only ends once cancelled.
+        if (accepted.size() == connections_k && accepting.length)
+            require(failures, engine.cancel(accepting) == ucall_status_success_k);
+        int const count = engine.poll(uc::span<uc::io::io_completion_t> {completions}, uc::io::io_wait_t::blocking_k,
+                                      deadline);
+        require(failures, count >= 0, "polling ended with {}", count);
+        for (auto const& completed :
+             uc::span<uc::io::io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+            require(failures, completed.request == &accepting, "a completion named another request");
+            if (completed.result < 0) {
+                failures += expect(completed.result == -ECANCELED, "accepting ended with {}", completed.result);
+                continue;
+            }
+            accepted.push_back(completed.result);
+            auto const* written = completed.data ? completed.data : accepting.data;
+            auto const& peer = reinterpret_cast<uc::io::io_peer_address_t const*>(written)->address;
+            auto const port = ntohs(reinterpret_cast<sockaddr_in const&>(peer).sin_port);
+            auto const found = std::find(ports.begin(), ports.end(), port);
+            failures += expect(peer.ss_family == AF_INET && found != ports.end(), "a peer at port {} connected", port);
+            if (found != ports.end()) ports.erase(found);
+        }
+        endings += accepting.length == 0;
+        require(failures, uc::utilities::monotonic_ns() < deadline, "{} of {} accepted", accepted.size(),
+                connections_k);
+    }
+    failures += expect(accepted.size() == connections_k && ports.empty(), "{} of {} accepted", accepted.size(),
+                       connections_k);
+    failures += expect(
+        engine.poll(uc::span<uc::io::io_completion_t> {completions}, uc::io::io_wait_t::nonblocking_k) == 0,
+        "the accept completed after it ended");
+    for (auto descriptor : accepted) failures += expect(engine.close_socket(descriptor) == 0);
+    failures += expect(engine.close_socket(owned) == 0);
+    return failures;
 }
 
 #endif // UCALL_OS_POSIX_
@@ -238,6 +292,7 @@ int main(int argc, char** argv) {
     network::run_client(totals);
     network::run_files(totals);
     run_test(totals, "test_engine_duplex_delivery", test_engine_duplex_delivery);
+    run_test(totals, "test_engine_accept_batch", test_engine_accept_batch);
     if (backend_under_test == ucall_io_backend_automatic_k)
         run_test(totals, "test_backend_parity", test_backend_parity);
 #endif

@@ -63,8 +63,8 @@ static case_result_t exchanges(ucall_security_t security) {
     exchange(payload);
     auto const copied = settled_copies(before, payload.size()) - before;
     // A 618 stream that outruns its receive copies those bytes into the backlog as well.
-    std::size_t const copied_limit = backend_under_test == ucall_io_backend_linux_uring618_k ? 3 * payload.size()
-                                                                                             : payload.size();
+    bool const streams = backend_under_test == ucall_io_backend_linux_uring618_k;
+    std::size_t const copied_limit = streams ? 3 * payload.size() : payload.size();
     failures += expect(copied >= payload.size() && copied <= copied_limit,
                        "{} bytes copied beyond those received for a {}-byte echo", copied, payload.size());
     if (security != ucall_security_none_k) return failures + fixture.stop();
@@ -1307,9 +1307,11 @@ static case_result_t test_drain_closes_listener(random_generator_t& generator) {
     return failures + fixture.stop();
 }
 
-/** Running out of descriptors pauses accepting rather than cutting the server: peers that connected
- *  meanwhile are served once descriptors free up, and the loop ends as it began. */
-static case_result_t test_accept_exhaustion_pauses(random_generator_t& generator) {
+/** Running out of descriptors sheds the peers queued behind the exhausted table rather than
+ *  stalling them or cutting the server: each reads a 503 or a close within two seconds, or is
+ *  served where descriptors came back first or a ring accepts into slots of its own, and a fresh
+ *  peer is served afterwards. */
+static case_result_t test_accept_exhaustion_sheds(random_generator_t& generator) {
     fixture_t fixture {{.connections = 4}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
@@ -1342,13 +1344,29 @@ static case_result_t test_accept_exhaustion_pauses(random_generator_t& generator
     std::this_thread::sleep_for(200ms);
     failures += expect(::setrlimit(RLIMIT_NOFILE, &original) == 0, "the descriptor limit stayed lowered");
     for (auto& client : clients) {
-        failures += expect(client.write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
-        failures += expect(read_response(client, 0).status == 200, "a backlog client was not served");
+        // A shed peer may be gone before it writes, so only what it reads decides.
+        [[maybe_unused]] bool const written = client.write(uc::byte_span(request), 0, generator,
+                                                           steady_clock::now() + 2s);
+        auto const deadline = steady_clock::now() + 2s;
+        read_end_t end = read_end_t::filled_k;
+        wire_response_t response = parse_response(client.received);
+        while (!response.length && end == read_end_t::filled_k) {
+            end = client.read(client.received.size() + 1, deadline);
+            response = parse_response(client.received);
+        }
+        bool const closed = !response.length && (end == read_end_t::closed_k || end == read_end_t::failed_k);
+        failures += expect(response.status == 503 || response.status == 200 || closed,
+                           "a backlog client read {} bytes, answered {}, ending as {}", client.received.size(),
+                           response.status, static_cast<int>(end));
     }
     fresh.received.clear();
     require(failures + fixture.stop(), fresh.connect(fixture.address));
     failures += expect(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
     failures += expect(read_response(fresh, 0).status == 200, "a fresh client was not served");
+    bool const rings = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
+                       fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
+    std::uint64_t const shed = loop_statistics(fixture).shed_connections;
+    failures += expect(rings || shed, "no peer was shed on {}", ucall_io_backend_name(fixture.resolved.backend));
     return failures + fixture.stop();
 }
 
@@ -1635,7 +1653,7 @@ void run_exchanges(suite_totals_t& totals) {
     run_test(totals, "test_cross_thread_teardown_delivery", test_cross_thread_teardown_delivery);
     run_test(totals, "test_admission_across_loops", test_admission_across_loops);
     run_test(totals, "test_drain_closes_listener", test_drain_closes_listener);
-    run_test(totals, "test_accept_exhaustion_pauses", test_accept_exhaustion_pauses);
+    run_test(totals, "test_accept_exhaustion_sheds", test_accept_exhaustion_sheds);
     run_test(totals, "test_keepalive_eviction", test_keepalive_eviction);
     run_test(totals, "test_orphaned_exchanges_bounded", test_orphaned_exchanges_bounded);
     run_test(totals, "test_request_peer_ipv6", test_request_peer_ipv6);

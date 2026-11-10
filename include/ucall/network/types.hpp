@@ -207,7 +207,8 @@ struct file_segment {
     using file_segment_t = typename network_t::file_segment_t;
 
     explicit file_segment(allocator_t const& allocator = {}) noexcept : segment(allocator) {
-        static_assert(sizeof(file_segment_t) == sizeof(reply_segment_t) + 32);
+        // A Windows handle takes 8 bytes where a descriptor takes 4, which pads the record by 8.
+        static_assert(sizeof(file_segment_t) == sizeof(reply_segment_t) + (UCALL_OS_WINDOWS_ ? 40 : 32));
         static_assert(!std::is_empty_v<allocator_t> || sizeof(reply_segment_t) == 32,
                       "a stateless allocator keeps reply segments at 32 bytes and file segments at 64");
     }
@@ -226,7 +227,7 @@ struct file_segment {
     std::uint64_t remaining_bytes {};
 
     /** The directory while unopened, then the file. */
-    int file_descriptor {-1};
+    native_file_t file {utilities::invalid_native_file_k};
     file_segment_stage_t stage {};
     file_origin_t file_origin {};
 
@@ -316,7 +317,8 @@ struct order_link_t {
 /** The event loop's own counters beside its engine's, on lines no other thread writes. */
 struct alignas(fu::default_alignment_k) event_loop_statistics_t {
     std::uint64_t polls {}, empty_polls {}, accepts {}, requests {}, bytes_received {}, bytes_sent {}, bytes_copied {},
-        bytes_read {}, file_window_overlaps {}, linger_resets {}, ready_passes {}, replied_dequeues {};
+        bytes_read {}, file_window_overlaps {}, linger_resets {}, ready_passes {}, replied_dequeues {},
+        shed_connections {}, windows_unpinned {};
 };
 
 /** The statuses the loop answers itself with, in @c interface_statistics_t::refused order. */

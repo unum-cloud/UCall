@@ -6,7 +6,7 @@
  */
 #pragma once
 
-#include <bit> // `std::bit_ceil`
+#include <bit> // `std::bit_ceil`, `std::bit_cast`
 
 #include "ucall/http/multipart.hpp" // `split_multipart`, `header_parameter`, `part_header`
 #include "ucall/http/routes.hpp" // `count_path_segments`, `extract_path_component`, `parse_segment`, `parsed_segment_t`
@@ -164,11 +164,11 @@ struct server : ucall_server_handle_t {
             return ucall_status_out_of_memory_k;
         char const* name = names.data();
         for (std::size_t i = 0; i != settings.reply_directories_count; ++i) {
-            int const directory = directory_open(name);
+            descriptor_t const directory = directory_open(name);
             if (directory < 0)
                 return directory == -ENOENT || directory == -ENOTDIR ? ucall_status_not_found_k : ucall_status_io_k;
             [[maybe_unused]] st::status_t const kept = network_interface.reply_directory_descriptors.push_back(
-                st::assume_reserved, int {directory});
+                st::assume_reserved, std::bit_cast<native_file_t>(directory));
             std::size_t const length = settings.reply_directories[i].length;
             network_interface.reply_directory_views[i] = {reinterpret_cast<ucall_byte_t const*>(name), length};
             name += length + 1;
@@ -396,7 +396,7 @@ struct server : ucall_server_handle_t {
                 publish(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
-            for (std::size_t i = 0; i != acceptors_count; ++i) std::construct_at(acceptors + i);
+            for (std::size_t i = 0; i != acceptors_count; ++i) std::construct_at(acceptors + i, allocator);
             event_loop.interface_acceptors = {acceptors, acceptors_count};
             for (auto& connection : event_loop.connections) {
                 connection = allocate_unique<connection_t>(allocator, allocator);
@@ -414,6 +414,11 @@ struct server : ucall_server_handle_t {
                 if (event_loop_index < network_interface.config.event_loops) {
                     auto& acceptor = event_loop.interface_acceptors[acceptor_index++];
                     acceptor.event_loop = &event_loop;
+                    if (st::failed(acceptor.peer_addresses.resize(
+                            std::max<std::size_t>(network_interface.quota(event_loop_index), 1)))) {
+                        publish(arguments->outcome, ucall_status_out_of_memory_k);
+                        return;
+                    }
                     ucall_status_t result;
                     if (!event_loop_index) result = formatting_t::bind_acceptor(network_interface, acceptor);
 #if UCALL_OS_POSIX_
@@ -426,7 +431,6 @@ struct server : ucall_server_handle_t {
                         acceptor.network_interface = &network_interface;
                         acceptor.request = {.operation = io_operation_t::accept_k,
                                             .descriptor = descriptor,
-                                            .data = reinterpret_cast<byte_t*>(&acceptor.peer_address),
                                             .context = &acceptor};
                     }
 #else
@@ -439,23 +443,24 @@ struct server : ucall_server_handle_t {
                     acceptor.descriptor = acceptor.request.descriptor;
                 }
         }
-        // Every engine opens here, where a refusal still lets initialization pick another backend;
-        // a ring serves the thread that first polls it.
+        // Every engine opens here, the later loops on the backend the first one resolved; a ring
+        // serves the thread that first polls it.
+        ucall_io_backend_t backend = config->backend;
         for (auto& event_loop : server->event_loops) {
             std::size_t windows = 0, slots = 0;
             ucall_status_t status = event_loop_slots(*event_loop, windows, slots);
-            if (status == ucall_status_success_k) status = event_loop->engine.open(slots, slots);
-            if (status == ucall_status_success_k) reserve_releases(*event_loop, windows);
+            if (status == ucall_status_success_k) status = event_loop->engine.open(backend, slots, slots);
             if (status != ucall_status_success_k) {
-                char const* message = ucall_status_name(status);
                 // An engine refused by a host setting names the setting to raise.
-                if constexpr (requires { event_loop->engine.refusal; })
-                    if (event_loop->engine.refusal) message = event_loop->engine.refusal;
-                publish(arguments->outcome, status, message);
+                char const* refusal = event_loop->engine.refusal();
+                publish(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
                 return;
             }
+            reserve_releases(*event_loop, windows);
+            backend = event_loop->engine.backend();
         }
         server->config = *config;
+        server->config.backend = backend;
         for (std::size_t i = 0; i != config->interfaces_count; ++i)
             server->resolved[i] = server->network_interfaces[i].config;
         server->config.interfaces = server->resolved.data();
@@ -516,8 +521,9 @@ struct server : ucall_server_handle_t {
     }
 
     /** The file windows @p event_loop may hold and the engine slots it opens: each connection one
-     *  operation per direction and one for files, each window one release, each pipelined exchange
-     *  two, and the wakeup and the metrics socket one each. */
+     *  operation per direction and one for files, each acceptor one, as its accept and the refusal
+     *  of a peer it sheds never overlap, each window one release, each pipelined exchange two, and
+     *  the wakeup and the metrics socket one each. */
     static ucall_status_t event_loop_slots(event_loop_t const& event_loop, std::size_t& windows,
                                            std::size_t& slots) noexcept {
         auto connections = event_loop.connections.size(), acceptors = event_loop.interface_acceptors.size();
@@ -536,25 +542,18 @@ struct server : ucall_server_handle_t {
 
     /** Grows @p event_loop's engine to its present size, as only a loop not yet polled may: a ring
      *  keeps the size and the locked memory initialization proved, and other engines lock none. */
-    static ucall_status_t grow_engine(server_t& server, event_loop_t& event_loop) noexcept {
+    static ucall_status_t grow_engine(event_loop_t& event_loop) noexcept {
         std::size_t windows = 0, slots = 0;
         if (ucall_status_t const sized = event_loop_slots(event_loop, windows, slots); sized != ucall_status_success_k)
             return sized;
-        ucall_status_t grown = ucall_status_success_k;
-        if constexpr (requires { event_loop.engine.grow(slots); }) grown = event_loop.engine.grow(slots);
-        else {
-            std::destroy_at(&event_loop.engine);
-            std::construct_at(&event_loop.engine, server.allocator);
-            grown = event_loop.engine.open(slots, slots);
-        }
+        ucall_status_t const grown = event_loop.engine.grow(slots);
         if (grown == ucall_status_success_k) reserve_releases(event_loop, windows);
         return grown;
     }
 
     /** Sets aside what the windows and exchanges of @p event_loop can name, within its slots. */
     static void reserve_releases(event_loop_t& event_loop, std::size_t windows) noexcept {
-        if constexpr (requires { event_loop.engine.reserve_releases(windows); })
-            event_loop.engine.reserve_releases(windows + 2 * event_loop.max_exchanges);
+        event_loop.engine.reserve_releases(windows + 2 * event_loop.max_exchanges);
     }
 
     /** Makes a client of @c options->server's loop @c options->event_loop, sharing its engine,
@@ -577,16 +576,14 @@ struct server : ucall_server_handle_t {
         auto* client = static_cast<client_t*>(*arguments->client);
         std::size_t const slots = client_t::engine_slots(client->config);
         event_loop.bound_slots += slots;
-        if (ucall_status_t const grown = grow_engine(server, event_loop); grown != ucall_status_success_k) {
+        if (ucall_status_t const grown = grow_engine(event_loop); grown != ucall_status_success_k) {
             event_loop.bound_slots -= slots;
             allocator_delete<client_t, allocator_t> {client->allocator}(client);
             *arguments->client = nullptr;
             // The loop keeps serving at its former size, or reports why not from its first poll.
-            event_loop.setup_status = grow_engine(server, event_loop);
-            char const* message = ucall_status_name(grown);
-            if constexpr (requires { event_loop.engine.refusal; })
-                if (event_loop.engine.refusal) message = event_loop.engine.refusal;
-            publish(arguments->outcome, grown, message);
+            event_loop.setup_status = grow_engine(event_loop);
+            char const* refusal = event_loop.engine.refusal();
+            publish(arguments->outcome, grown, refusal ? refusal : ucall_status_name(grown));
             return;
         }
         client->next_bound = std::exchange(event_loop.bound_clients, client);
@@ -628,7 +625,8 @@ struct server : ucall_server_handle_t {
             return sized;
         auto& pool = event_loop.file_windows;
         pool.max_windows = static_cast<std::uint32_t>(windows);
-        if (st::failed(pool.window_memory.reserve(pool.max_windows)) ||
+        if (st::failed(pool.window_runs.reserve(pool.max_windows)) ||
+            st::failed(pool.window_memory.reserve(pool.max_windows)) ||
             st::failed(pool.windows.reserve(pool.max_windows)) ||
             st::failed(pool.release_requests.reserve(pool.max_windows)))
             return ucall_status_out_of_memory_k;
@@ -647,6 +645,8 @@ struct server : ucall_server_handle_t {
             if (imported < 0) return ucall_status_io_k;
             acceptor.request.descriptor = imported;
             acceptor.descriptor = -1;
+            acceptor.reserve_descriptor = socket_open(acceptor.network_interface->family);
+            if (acceptor.reserve_descriptor < 0) return ucall_status_io_k;
         }
         return ucall_status_success_k;
     }
@@ -674,8 +674,8 @@ struct server : ucall_server_handle_t {
         if (event_loop.stage == event_loop_stage_t::retired_k)
             return atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire);
         // A close waiting for the kernel's releases resets at its deadline, metrics go out at
-        // theirs, paused acceptors retry at theirs, and bound clients step at theirs, with
-        // nothing to poll.
+        // theirs, reserves the residue held closed reopen at theirs, and bound clients step at
+        // theirs, with nothing to poll.
         for (std::uint64_t const due : {serving_t::release_deadline(event_loop), event_loop.metrics.due,
                                         event_loop.accept_deadline, bound_progress(event_loop)})
             if (due && (!deadline || due < deadline)) deadline = due;
@@ -715,6 +715,10 @@ struct server : ucall_server_handle_t {
                 advance_completion(event_loop.engine, completion);
             else if (completion.request->operation == io_operation_t::zero_copy_release_k) {
                 replies_t::complete_release(event_loop, completion);
+                event_loop.engine.release(completion);
+            }
+            else if (auto* const acceptor = serving_t::shedding_acceptor(event_loop, completion.request)) {
+                serving_t::shed_sent(event_loop, *acceptor);
                 event_loop.engine.release(completion);
             }
             else if (client_t* const client = bound_client(event_loop, completion))
@@ -775,7 +779,7 @@ struct server : ucall_server_handle_t {
     /** Every counter of @p event_loop, as any thread may read them while the loop runs. */
     static ucall_event_loop_statistics_t loop_totals(event_loop_t& event_loop) noexcept {
         auto& loop = event_loop.statistics;
-        auto& engine = event_loop.engine.statistics;
+        auto& engine = event_loop.engine.statistics();
         auto read = [](std::uint64_t& counter) noexcept {
             return atomic_ref<std::uint64_t> {counter}.load(std::memory_order_relaxed);
         };
@@ -800,7 +804,9 @@ struct server : ucall_server_handle_t {
                                               .file_window_overlaps = read(loop.file_window_overlaps),
                                               .linger_resets = read(loop.linger_resets),
                                               .ready_passes = read(loop.ready_passes),
-                                              .replied_dequeues = read(loop.replied_dequeues)};
+                                              .replied_dequeues = read(loop.replied_dequeues),
+                                              .shed_connections = read(loop.shed_connections),
+                                              .windows_unpinned = read(loop.windows_unpinned)};
         for (auto& counters : event_loop.interface_statistics) {
             for (auto& refused : counters.refused) totals.refused_requests += read(refused);
             totals.handshake_failures += read(counters.handshake_failures);

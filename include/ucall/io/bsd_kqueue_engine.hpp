@@ -45,6 +45,7 @@ struct bsd_kqueue_engine {
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
     using rebind = bsd_kqueue_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+    static constexpr ucall_io_backend_t backend_k = ucall_io_backend_bsd_kqueue_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
@@ -63,25 +64,20 @@ struct bsd_kqueue_engine {
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
-    int close_socket(descriptor_t descriptor) noexcept {
-        readiness.remove(descriptor);
-        return socket_close(descriptor);
-    }
+    int close_socket(descriptor_t descriptor) noexcept { return socket_close(descriptor); }
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return socket_reset_on_close(descriptor);
     }
     memory_registration_t register_memory(span<byte_t>) noexcept { return {}; }
     void release(io_completion_t const&) noexcept {}
     ucall_status_t cancel(io_request_t& request) noexcept {
-        for (unsigned i = 0; i != operations.size(); ++i)
-            if (operations[i].request == &request) {
-                tally<atomic_ref_template_>(statistics.cancellations);
-                // A landing file read keeps its buffer until the kernel answers, then reports it.
-                operations[i].stage = operation_stage_t::cancelled_k;
-                if (operations[i].interest == io_interest_t::armed_k) wake(i);
-                return ucall_status_success_k;
-            }
-        return ucall_status_not_found_k;
+        unsigned const index = request.operation_index;
+        if (index >= operations.size() || operations[index].request != &request) return ucall_status_not_found_k;
+        tally<atomic_ref_template_>(statistics.cancellations);
+        // A landing file read keeps its buffer until the kernel answers, then reports it.
+        operations[index].stage = operation_stage_t::cancelled_k;
+        if (operations[index].interest == io_interest_t::armed_k) readiness_wake(*this, index);
+        return ucall_status_success_k;
     }
     explicit bsd_kqueue_engine(allocator_t const& allocator = {}) noexcept
         : operations(rebound_allocator<operation_t> {allocator}), cold(rebound_allocator<operation_cold_t> {allocator}),
@@ -116,6 +112,7 @@ struct bsd_kqueue_engine {
         operation = {};
         cold[index] = {};
         operation.request = &request;
+        request.operation_index = index;
         fresh_operations.push(operations, index);
         if (request.deadline) {
             cold[index].timed = static_cast<unsigned>(timed.size());
@@ -125,74 +122,26 @@ struct bsd_kqueue_engine {
         tally<atomic_ref_template_>(statistics.submissions);
         return ucall_status_success_k;
     }
-    void wake(unsigned index) noexcept { readiness_wake(*this, index); }
-    void land(unsigned index, descriptor_t result) noexcept { readiness_land(*this, index, result); }
-    io_completion_t finish(unsigned index, descriptor_t result) noexcept {
-        return readiness_finish<atomic_ref_template_>(*this, index, result);
+    descriptor_t attempt(unsigned index) noexcept {
+        auto& operation = operations[index];
+        return readiness.attempt(index, *operation.request, operation.stage, operation.interest, statistics);
     }
-    std::size_t progress(operation_list_t& list, span<io_completion_t> completions, std::size_t count,
-                         std::uint64_t now) noexcept {
-        while (count != completions.size()) {
-            auto index = list.pop(operations);
-            if (index == absent_k) break;
-            auto& operation = operations[index];
-            auto& request = *operation.request;
-            bool fired = operation.interest == io_interest_t::ready_k;
-            descriptor_t result = -ETIMEDOUT;
-            // An edge-triggered operation hears nothing more until its syscall reports EAGAIN.
-            if (!request.deadline || request.deadline > now) {
-                if (request.operation == io_operation_t::close_k) readiness.remove(request.descriptor);
-                do {
-                    result = readiness.attempt(index, request, operation.stage, operation.interest, statistics);
-                } while (fired && result == -EINTR);
-            }
-            if (operation.interest == io_interest_t::landing_k) continue;
-            if (io_pending(result) && !fired) {
-                io_direction_t direction = io_direction(request.operation);
-                if (int armed = readiness.arm(request.descriptor, direction, index, statistics); armed < 0)
-                    result = armed;
-            }
-            if (io_pending(result)) operation.interest = io_interest_t::armed_k;
-            else completions[count++] = finish(index, result);
-        }
-        return count;
-    }
-    std::size_t collect(span<io_completion_t> completions, std::size_t count) noexcept {
-        return readiness_collect<atomic_ref_template_>(*this, completions, count);
+    int wait(std::uint64_t nanoseconds) noexcept {
+        tally<atomic_ref_template_>(statistics.kernel_enters);
+        return readiness.wait(
+            nanoseconds,
+            [&](unsigned index, descriptor_t descriptor, short events) noexcept {
+                readiness_fire(*this, index, descriptor, events);
+            },
+            [&](unsigned index, descriptor_t result) noexcept {
+                if (operations[index].interest != io_interest_t::armed_k) return;
+                operations[index].interest = io_interest_t::landing_k;
+                readiness_land(*this, index, result);
+            },
+            [&](unsigned index, descriptor_t result) noexcept { readiness_land(*this, index, result); });
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
-        if (!completions.size()) return 0;
-        std::size_t count {};
-        for (unsigned round = 0; round != 2; ++round) {
-            auto now = monotonic_ns();
-            auto wait = wait_policy == io_wait_t::blocking_k ? std::numeric_limits<std::uint64_t>::max() : 0;
-            if (deadline) wait = std::min(wait, deadline > now ? deadline - now : 0);
-            for (auto index : timed) {
-                auto expiry = operations[index].request->deadline;
-                if (expiry > now) wait = std::min(wait, expiry - now);
-                else if (operations[index].interest == io_interest_t::armed_k) wake(index);
-            }
-            count = collect(completions, count);
-            count = progress(fresh_operations, completions, count, now);
-            count = progress(ready_operations, completions, count, now);
-            if (count || round || !active) break;
-            int timeout = wait == std::numeric_limits<std::uint64_t>::max()
-                              ? -1
-                              : static_cast<int>(std::min<std::uint64_t>(wait / 1'000'000 + (wait % 1'000'000 != 0),
-                                                                         std::numeric_limits<int>::max()));
-            tally<atomic_ref_template_>(statistics.kernel_enters);
-            int result = readiness.wait(
-                timeout,
-                [&](unsigned index, descriptor_t descriptor, short events) noexcept {
-                    auto& operation = operations[index];
-                    if (operation.interest == io_interest_t::armed_k && operation.request->descriptor == descriptor &&
-                        (events & io_events(operation.request->operation)))
-                        wake(index);
-                },
-                [&](unsigned index, descriptor_t result) noexcept { land(index, result); });
-            if (result < 0 && result != -EINTR) return result;
-        }
-        return static_cast<int>(count);
+        return readiness_poll<atomic_ref_template_>(*this, completions, wait_policy, deadline);
     }
     void stop() noexcept {
         // File reads still in the kernel write into their buffers until they land.
@@ -255,9 +204,6 @@ struct kqueue_readiness {
         tally<atomic_ref_template_>(statistics.kernel_enters);
         return kevent(descriptor, &change, 1, nullptr, 0, nullptr) == 0 ? 0 : -errno;
     }
-    // Closing a descriptor drops its knotes.
-    void remove(descriptor_t) noexcept {}
-
 #if UCALL_OS_FREEBSD_
     ucall_status_t reserve_file_reads(std::size_t capacity) noexcept {
         return st::failed(file_reads.resize(capacity)) ? ucall_status_out_of_memory_k : ucall_status_success_k;
@@ -273,7 +219,7 @@ struct kqueue_readiness {
         if (stage == operation_stage_t::cancelled_k) return -ECANCELED;
         aiocb& block = file_reads[index];
         block = {};
-        block.aio_fildes = request.file.file_descriptor;
+        block.aio_fildes = request.file.file;
         block.aio_offset = static_cast<off_t>(request.file.offset);
         block.aio_sigevent.sigev_notify = SIGEV_KEVENT;
         block.aio_sigevent.sigev_notify_kqueue = descriptor;
@@ -307,16 +253,22 @@ struct kqueue_readiness {
     }
 #endif // UCALL_OS_FREEBSD_
 
-    template <typename fired_type_, typename landed_type_>
-    int wait(int timeout, fired_type_&& fired, landed_type_&& landed) noexcept {
-        timespec duration {timeout / 1000, (timeout % 1000) * 1'000'000L};
+    /** Waits up to @p nanoseconds, the maximum meaning forever, reporting readiness to @p fired,
+     *  a failed registration to @p errored and a landed file read to @p landed, by operation. */
+    template <typename fired_type_, typename errored_type_, typename landed_type_>
+    int wait(std::uint64_t nanoseconds, fired_type_&& fired, errored_type_&& errored, landed_type_&& landed) noexcept {
+        timespec const duration {static_cast<time_t>(nanoseconds / 1'000'000'000),
+                                 static_cast<long>(nanoseconds % 1'000'000'000)};
         int count = kevent(descriptor, nullptr, 0, events.data(),
                            static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
-                           timeout < 0 ? nullptr : &duration);
+                           nanoseconds == std::numeric_limits<std::uint64_t>::max() ? nullptr : &duration);
         if (count < 0) return -errno;
         for (int i = 0; i != count; ++i) {
-            if (events[i].flags & EV_ERROR) return -static_cast<int>(events[i].data);
             auto const index = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(events[i].udata));
+            if (events[i].flags & EV_ERROR) {
+                errored(index, -static_cast<descriptor_t>(events[i].data));
+                continue;
+            }
             if (events[i].filter == EVFILT_READ || events[i].filter == EVFILT_WRITE)
                 fired(index, static_cast<descriptor_t>(events[i].ident),
                       static_cast<short>(events[i].filter == EVFILT_READ ? POLLIN : POLLOUT));

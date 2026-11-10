@@ -11,7 +11,7 @@
 #include "ucall/io/types.hpp"          // `io_completion_t`, `io_operation_t`, `io_request_t`, `range_pinning_t`
 #include "ucall/network/exchanges.hpp" // `replied_k`
 #include "ucall/network/types.hpp" // `operation_state_t`, `file_window_records_k`, `file_record_stride_k`, `page_bytes_k`
-#include "ucall/utilities/sockets.hpp" // `file_close`, `socket_close`
+#include "ucall/utilities/sockets.hpp" // `close_native_file`, `socket_close`
 #include "ucall/utilities/types.hpp"   // `allocator_delete`, `is_current_thread`, `polling_thread_t`, `byte_t`
 
 namespace unum::ucall::network {
@@ -25,8 +25,8 @@ using io::registered_memory_t;
 using io::wake_channel_t;
 using utilities::allocator_delete;
 using utilities::byte_t;
+using utilities::close_native_file;
 using utilities::descriptor_t;
-using utilities::file_close;
 using utilities::is_current_thread;
 using utilities::polling_thread_t;
 using utilities::socket_close;
@@ -43,7 +43,7 @@ struct network_interface {
 
     explicit network_interface(allocator_t const& allocator = {}) noexcept
         : address(rebound_allocator<char> {allocator}), device(rebound_allocator<char> {allocator}),
-          reply_directory_descriptors(rebound_allocator<int> {allocator}),
+          reply_directory_descriptors(rebound_allocator<native_file_t> {allocator}),
           reply_directory_names(rebound_allocator<char> {allocator}),
           reply_directory_views(rebound_allocator<ucall_bytes_view_t> {allocator}) {}
     network_interface(network_interface const&) = delete;
@@ -52,7 +52,7 @@ struct network_interface {
     network_interface& operator=(network_interface&&) = delete;
 
     ~network_interface() noexcept {
-        for (int directory : reply_directory_descriptors) file_close(directory);
+        for (native_file_t directory : reply_directory_descriptors) close_native_file(directory);
     }
 
     ucall_network_interface_t config {};
@@ -61,10 +61,13 @@ struct network_interface {
     ucall_noise_key_t private_key {}, peer_key {};
 
     /** Opened from @c reply_directories, which path parts resolve beneath. */
-    vector<int> reply_directory_descriptors {};
+    vector<native_file_t> reply_directory_descriptors {};
 
     /** The listener's @c SO_SNDBUF, which every accepted socket inherits. */
     std::size_t send_buffer_bytes {};
+
+    /** The listener's address family, which each acceptor's reserve socket takes. */
+    int family {};
 
     /** Every reply directory, NUL-terminated, back to back. */
     vector<char> reply_directory_names {};
@@ -88,30 +91,47 @@ struct interface_acceptor {
     using network_t = network_type_;
     using network_interface_t = typename network_t::network_interface_t;
     using event_loop_t = typename network_t::event_loop_t;
+    using allocator_t = typename network_t::allocator_t;
+    template <typename value_type_>
+    using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
+    template <typename value_type_>
+    using vector = typename network_t::template vector<value_type_>;
 
-    interface_acceptor() noexcept = default;
+    explicit interface_acceptor(allocator_t const& allocator = {}) noexcept
+        : peer_addresses(rebound_allocator<io_peer_address_t> {allocator}) {}
     interface_acceptor(interface_acceptor const&) = delete;
     interface_acceptor& operator=(interface_acceptor const&) = delete;
     interface_acceptor(interface_acceptor&&) = delete;
     interface_acceptor& operator=(interface_acceptor&&) = delete;
     io_request_t request {};
 
-    /** Where the engine writes the address of the peer each accept takes, as @c request says. */
-    io_peer_address_t peer_address {};
+    /** Where the engine writes the addresses of the peers one accept takes, one each, as many as
+     *  the loop's share of the interface admits. */
+    vector<io_peer_address_t> peer_addresses {};
     network_interface_t* network_interface {};
     event_loop_t* event_loop {};
 
-    /** Idle, accepting, accepting without admission to find a peer worth an eviction, or paused
-     *  while the host is out of descriptors or buffers. */
-    enum class stage_t { idle_k, submitted_k, probing_k, paused_k };
+    /** Idle, accepting, accepting without admission to find a peer worth an eviction, or shedding
+     *  the peer an exhausted descriptor table queued: accepting it into the freed reserve, then,
+     *  while @c shed_request holds its socket, refusing it. */
+    enum class stage_t { idle_k, submitted_k, probing_k, shedding_k };
     stage_t stage {stage_t::idle_k};
     descriptor_t descriptor {-1};
+
+    /** A socket of the listener's family held so that freeing it lets one accept through when the
+     *  process ran out of descriptors; closed only while shedding or while the residue waits. */
+    descriptor_t reserve_descriptor {-1};
+
+    /** The refusal of a shed peer, whose socket its @c descriptor holds until closed: a send of
+     *  @c shed_reply_k, or under Noise a reset at once. */
+    io_request_t shed_request {};
 };
 
-/** One event loop's windows, after UStore's @c registered_memory_arena: each a slab of a page of
- *  headroom and four record strides, registered with the engine at its index while the engine pins
- *  them, grown on demand up to @c max_windows and never shrunk. Streams borrow windows in file
- *  order, and each returns once the kernel let go of it, serving the oldest waiting stream. */
+/** One event loop's windows, after UStore's @c registered_memory_arena: each a page of headroom and
+ *  four record strides, grown on demand up to @c max_windows in runs filling the allocator's page,
+ *  each run registered with the engine once while the engine pins them, and never shrunk. Streams
+ *  borrow windows in file order, and each comes back once the kernel let go of it, to serve the
+ *  oldest stream waiting. */
 template <typename network_type_>
 struct file_window_pool {
     using network_t = network_type_;
@@ -127,12 +147,16 @@ struct file_window_pool {
         byte_t bytes[page_bytes_k];
     };
     explicit file_window_pool(allocator_t const& allocator = {}) noexcept
-        : window_memory(rebound_allocator<byte_t*> {allocator}), windows(rebound_allocator<file_window_t> {allocator}),
+        : window_runs(rebound_allocator<span<byte_t>> {allocator}),
+          window_memory(rebound_allocator<byte_t*> {allocator}), windows(rebound_allocator<file_window_t> {allocator}),
           release_requests(rebound_allocator<io_request_t> {allocator}) {}
     file_window_pool(file_window_pool const&) = delete;
     file_window_pool& operator=(file_window_pool const&) = delete;
     file_window_pool(file_window_pool&&) = delete;
     file_window_pool& operator=(file_window_pool&&) = delete;
+
+    /** One allocation each, holding whole windows. */
+    vector<span<byte_t>> window_runs {};
 
     /** One window each. */
     vector<byte_t*> window_memory {};
@@ -290,7 +314,8 @@ struct event_loop {
      *  as each waits @c linger_microseconds_k. */
     st::intrusive_list<std::uint32_t> expiring {};
 
-    /** When paused acceptors retry, unless a connection closes first; zero when none is paused. */
+    /** When the reserves a host short of more than descriptors held closed reopen, unless a
+     *  connection closes first; zero when every reserve is open or shedding. */
     std::uint64_t accept_deadline {};
     void notify() noexcept {
         // A running loop meets what was listed before it sleeps, so only a sleeper is written.
@@ -320,15 +345,16 @@ struct event_loop {
             allocator_delete<server_exchange_t, allocator_t> {allocator}(exchanges);
             exchanges = next;
         }
-        for (byte_t* slab : file_windows.window_memory)
+        for (span<byte_t> run : file_windows.window_runs)
             rebound_allocator<typename file_window_pool_t::page_t> {allocator}.deallocate(
-                reinterpret_cast<typename file_window_pool_t::page_t*>(slab),
-                file_window_pool_t::window_bytes / page_bytes_k);
+                reinterpret_cast<typename file_window_pool_t::page_t*>(run.data()), run.size() / page_bytes_k);
         for (auto& acceptor : interface_acceptors) {
             if (acceptor.request.descriptor >= 0) {
                 if (acceptor.descriptor >= 0) socket_close(acceptor.descriptor);
                 else engine.close_socket(acceptor.request.descriptor);
             }
+            if (acceptor.shed_request.descriptor >= 0) engine.close_socket(acceptor.shed_request.descriptor);
+            if (acceptor.reserve_descriptor >= 0) socket_close(acceptor.reserve_descriptor);
             std::destroy_at(&acceptor);
         }
         if (!interface_acceptors.empty())

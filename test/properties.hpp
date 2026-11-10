@@ -244,9 +244,9 @@ inline std::size_t reference_route(std::vector<reference_route_t> const& routes,
 #if UCALL_OS_POSIX_
 
 /** The client of the serial network, whose URL parsing and redirect joins need no instance. */
-using property_client_t = network::serial_network<io::posix_engine_t>::client_t;
-using property_exchange_t = network::serial_network<io::posix_engine_t>::client_exchange_t;
-using property_message_t = network::serial_network<io::posix_engine_t>::http_message_t;
+using property_client_t = network::serial_network<io::io_engine_variant<io::posix_engine_t>>::client_t;
+using property_exchange_t = network::serial_network<io::io_engine_variant<io::posix_engine_t>>::client_exchange_t;
+using property_message_t = network::serial_network<io::io_engine_variant<io::posix_engine_t>>::http_message_t;
 
 /** Parses @p url as a client call would, and when it parses, parses the URL spelled back from its
  *  parts again, counting the parts that differ or break their promises: a target that starts with

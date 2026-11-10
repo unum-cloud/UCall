@@ -13,7 +13,7 @@
 #include "ucall/io/types.hpp"          // `io_request_t`, `wake_channel_t`
 #include "ucall/network/types.hpp"     // `exchange_stage_t`, `body_stage_t`, `parts_state_t`, `request_part_t`
 #include "ucall/tunnel/types.hpp"      // `secure_tunnel_geometry_t`
-#include "ucall/utilities/sockets.hpp" // `file_close`
+#include "ucall/utilities/sockets.hpp" // `close_native_file`
 #include "ucall/utilities/types.hpp"   // `text_view`, `allocator_delete`, `byte_t`, `publish`
 
 namespace unum::ucall::network {
@@ -23,7 +23,7 @@ using io::wake_channel_t;
 using tunnel::secure_tunnel_geometry_t;
 using utilities::allocator_delete;
 using utilities::byte_t;
-using utilities::file_close;
+using utilities::close_native_file;
 using utilities::publish;
 using utilities::text_view;
 
@@ -186,7 +186,7 @@ struct server_exchange : ucall_received_http_request_handle_t {
               releases[0].sent_file_segments, releases[1].sent_file_segments})
             while (file_segment) {
                 file_segment_t* next = file_segment->next;
-                if (replies_t::owns_file_descriptor(*file_segment)) file_close(file_segment->file_descriptor);
+                if (replies_t::owns_file(*file_segment)) close_native_file(file_segment->file);
                 allocator_delete<file_segment_t, allocator_t> {event_loop->allocator}(file_segment);
                 file_segment = next;
             }

@@ -116,7 +116,7 @@ ucall_py_enum_mirror_t ucall_py_status_enum = {
     "Status", doc_Status, ucall_status_success_k, ucall_status_would_block_k, spell_status, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_backend_enum = {
-    "Backend", doc_Backend, ucall_io_backend_automatic_k, ucall_io_backend_windows_iocp_k, spell_backend, NULL,
+    "Backend", doc_Backend, ucall_io_backend_automatic_k, ucall_io_backend_windows_rio_k, spell_backend, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_cpu_class_enum = {
     "CPUClass", doc_CPUClass, ucall_cpu_class_unknown_k, ucall_cpu_class_monoversioned_k, spell_cpu_class, NULL,

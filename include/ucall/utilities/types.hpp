@@ -19,83 +19,7 @@
 #include <type_traits> // `std::is_convertible_v`
 #include <utility>     // `std::move`
 
-#if !defined(UCALL_OS_LINUX_)
-#if defined(__linux__)
-#define UCALL_OS_LINUX_ 1
-#else
-#define UCALL_OS_LINUX_ 0
-#endif // defined(__linux__)
-#endif // !defined(UCALL_OS_LINUX_)
-
-#if !defined(UCALL_OS_APPLE_)
-#if defined(__APPLE__)
-#define UCALL_OS_APPLE_ 1
-#else
-#define UCALL_OS_APPLE_ 0
-#endif // defined(__APPLE__)
-#endif // !defined(UCALL_OS_APPLE_)
-
-#if !defined(UCALL_OS_WINDOWS_)
-#if defined(_WIN32)
-#define UCALL_OS_WINDOWS_ 1
-#else
-#define UCALL_OS_WINDOWS_ 0
-#endif // defined(_WIN32)
-#endif // !defined(UCALL_OS_WINDOWS_)
-
-#if !defined(UCALL_OS_FREEBSD_)
-#if defined(__FreeBSD__)
-#define UCALL_OS_FREEBSD_ 1
-#else
-#define UCALL_OS_FREEBSD_ 0
-#endif // defined(__FreeBSD__)
-#endif // !defined(UCALL_OS_FREEBSD_)
-
-#if !defined(UCALL_ARCH_X8664_)
-#if defined(__x86_64__) || defined(_M_X64)
-#define UCALL_ARCH_X8664_ 1
-#else
-#define UCALL_ARCH_X8664_ 0
-#endif // defined(__x86_64__) || defined(_M_X64)
-#endif // !defined(UCALL_ARCH_X8664_)
-
-#if !defined(UCALL_ARCH_ARM64_)
-#if defined(__aarch64__) || defined(_M_ARM64)
-#define UCALL_ARCH_ARM64_ 1
-#else
-#define UCALL_ARCH_ARM64_ 0
-#endif // defined(__aarch64__) || defined(_M_ARM64)
-#endif // !defined(UCALL_ARCH_ARM64_)
-
-#if !defined(UCALL_COMPILER_CLANG_)
-#if defined(__clang__)
-#define UCALL_COMPILER_CLANG_ 1
-#else
-#define UCALL_COMPILER_CLANG_ 0
-#endif // defined(__clang__)
-#endif // !defined(UCALL_COMPILER_CLANG_)
-
-#if !defined(UCALL_COMPILER_MSVC_)
-#if defined(_MSC_VER) && !defined(__clang__)
-#define UCALL_COMPILER_MSVC_ 1
-#else
-#define UCALL_COMPILER_MSVC_ 0
-#endif // defined(_MSC_VER) && !defined(__clang__)
-#endif // !defined(UCALL_COMPILER_MSVC_)
-
-#if !defined(UCALL_COMPILER_GCC_)
-#if defined(__GNUC__) && !defined(__clang__)
-#define UCALL_COMPILER_GCC_ 1
-#else
-#define UCALL_COMPILER_GCC_ 0
-#endif // defined(__GNUC__) && !defined(__clang__)
-#endif // !defined(UCALL_COMPILER_GCC_)
-
-#define UCALL_OS_POSIX_ (UCALL_OS_LINUX_ || UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_)
-
-#if !defined(UCALL_WITH_LINUX_URING)
-#define UCALL_WITH_LINUX_URING 0
-#endif // !defined(UCALL_WITH_LINUX_URING)
+#include "ucall/types.h" // `UCALL_OS_WINDOWS_`
 
 /*  `<winsock2.h>` has to precede `<windows.h>`, which otherwise drags in the Winsock 1.1
  *  declarations and leaves the socket backends with two incompatible definitions of each. */
@@ -229,12 +153,22 @@ using descriptor_t = std::intptr_t;
 using polling_thread_t = DWORD;
 inline polling_thread_t current_polling_thread() noexcept { return GetCurrentThreadId(); }
 inline bool is_current_thread(polling_thread_t thread) noexcept { return thread == GetCurrentThreadId(); }
+
+/** The handle a file is read through: opened once, overlapped and unbuffered, on the loop's
+ *  completion port. */
+using native_file_t = HANDLE;
+inline native_file_t const invalid_native_file_k = INVALID_HANDLE_VALUE;
 #else
 using descriptor_t = int;
 using polling_thread_t = pthread_t;
 inline polling_thread_t current_polling_thread() noexcept { return pthread_self(); }
 inline bool is_current_thread(polling_thread_t thread) noexcept { return pthread_equal(thread, pthread_self()); }
-#endif
+
+/** The descriptor a file is read through. */
+using native_file_t = int;
+inline constexpr native_file_t invalid_native_file_k = -1;
+#endif // UCALL_OS_WINDOWS_
+static_assert(sizeof(native_file_t) == sizeof(descriptor_t), "a file open completes as a descriptor's bits");
 
 template <typename element_type_, std::size_t extent_ = std::dynamic_extent>
 using span = std::span<element_type_, extent_>;
@@ -269,6 +203,7 @@ using utilities::byte_t;
 using utilities::bytes_view;
 using utilities::cpu_ceiling_t;
 using utilities::descriptor_t;
+using utilities::native_file_t;
 using utilities::span;
 using utilities::text_view;
 

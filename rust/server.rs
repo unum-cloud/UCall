@@ -1123,6 +1123,12 @@ pub struct EventLoopStatistics {
     pub handshake_failures: u64,
     /// Connections whose authenticated peer key the interface's authorizer refused.
     pub authorizer_refusals: u64,
+    /// Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under
+    /// Noise.
+    pub shed_connections: u64,
+    /// File windows the engine left unpinned, as it pins none, or the locked-memory cap or a full
+    /// table refused; their sends pin or copy on their own.
+    pub windows_unpinned: u64,
 }
 
 /// When a batch endpoint hands its queue to the handler; zero fields take the defaults of 1

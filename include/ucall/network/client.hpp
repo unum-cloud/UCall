@@ -218,7 +218,7 @@ struct client_connection {
         transport.role = transport_role_t::client_k;
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(client_connection) == 2400);
+            static_assert(sizeof(client_connection) == 2416);
     }
     client_connection(client_connection const&) = delete;
     client_connection& operator=(client_connection const&) = delete;
@@ -617,6 +617,7 @@ struct client : ucall_client_handle_t {
                 return result;
             }
             transport.descriptor = descriptor;
+            transport.receive_memory = client.engine->receive_memory();
             connection.answered_exchanges = 0;
             transport.output_offset = 0;
             transport.sending = nullptr;
@@ -1421,15 +1422,15 @@ struct client : ucall_client_handle_t {
             client->engine = bound;
             client->binding = client_binding_t::bound_k;
         }
-        else if (auto status = client->owned_engine.open(slots, slots, io::io_issuer_scope_t::any_thread_k);
+        else if (auto status = client->owned_engine.open(config.backend, slots, slots,
+                                                         io::io_issuer_scope_t::any_thread_k);
                  status != ucall_status_success_k) {
-            char const* message = ucall_status_name(status);
             // An engine refused by a host setting names the setting to raise.
-            if constexpr (requires { client->owned_engine.refusal; })
-                if (client->owned_engine.refusal) message = client->owned_engine.refusal;
-            publish(arguments->outcome, status, message);
+            char const* refusal = client->owned_engine.refusal();
+            publish(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
             return;
         }
+        else config.backend = client->owned_engine.backend();
         for (auto& connection : client->connections) {
             connection = allocate_unique<client_connection_t>(allocator, allocator);
             if (!connection) {

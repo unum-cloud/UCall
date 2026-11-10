@@ -357,6 +357,8 @@ struct Backend(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """BSD kqueue on FreeBSD, with FreeBSD AIO for files, and on macOS."""
     comptime WINDOWS_IOCP = Self(6)
     """I/O completion ports on Windows."""
+    comptime WINDOWS_RIO = Self(7)
+    """Registered I/O on Windows for stream sockets, beside a completion port for the rest."""
 
 
 @fieldwise_init

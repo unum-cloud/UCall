@@ -57,7 +57,7 @@ struct transport {
           output(rebound_allocator<byte_t> {allocator}), record(rebound_allocator<byte_t> {allocator}) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(transport) == 2160);
+            static_assert(sizeof(transport) == 2176);
     }
     transport(transport const&) = delete;
     transport& operator=(transport const&) = delete;
@@ -89,6 +89,9 @@ struct transport {
     peer_stream_t peer_stream {};
     listing_t readiness {};
     transport_role_t role {};
+
+    /** Where its engine lands receives, set with its socket. */
+    io_receive_memory_t receive_memory {};
 
     /** The tail of the receive's destination, which @c receive_request names. */
     io_vector_t receive_vector {};
@@ -175,7 +178,7 @@ struct transport {
             std::size_t const previous = destination.size();
             if (st::failed(destination.resize(st::assume_uninitialized, previous + arrived)))
                 return fail(ucall_status_out_of_memory_k);
-            if constexpr (engine_t::receive_memory_k == io_receive_memory_t::engine_k) {
+            if (receive_memory == io_receive_memory_t::engine_k) {
                 std::memcpy(destination.data() + previous, completion.data, arrived);
                 if (statistics) tally<atomic_ref>(statistics->bytes_copied, arrived);
             }
@@ -260,8 +263,12 @@ struct transport {
             return nullptr;
         }
     }
+
+    /** Rewrites @p request for @p operation over @p bytes, keeping what an engine still holding it
+     *  finds it by, as an armed receive is re-aimed in place. */
     io_request_t* emit(io_request_t& request, io_operation_t operation, span<byte_t> bytes) noexcept {
         request = {.operation = operation,
+                   .operation_index = request.operation_index,
                    .descriptor = descriptor,
                    .data = bytes.data(),
                    .length = bytes.size(),
@@ -272,7 +279,7 @@ struct transport {
 
     /** Points the receive at the tail of its destination, moved or not, so an armed one follows. */
     void aim_receive() noexcept {
-        if constexpr (engine_t::receive_memory_k == io_receive_memory_t::submitter_k) {
+        if (receive_memory == io_receive_memory_t::submitter_k) {
             vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
             // A receive of no bytes would read as a peer close.
             if (destination.size() == destination.capacity() &&

@@ -10,8 +10,10 @@
 #include <climits>
 #include <cstdio>  // `std::snprintf`
 #include <cstring> // `std::strchr`, `std::memcpy`
+#include <ctime>   // `timespec`
 
 #include <algorithm> // `std::min`, `std::max`
+#include <bit>       // `std::bit_cast`
 #include <chrono>    // `std::chrono::steady_clock`
 #include <limits>    // `std::numeric_limits`
 #include <string_view>
@@ -19,10 +21,8 @@
 #include "ucall/utilities/types.hpp" // `descriptor_t`, `span`, `byte_t`
 
 #if UCALL_OS_WINDOWS_
-#include <fcntl.h>    // `_O_RDONLY`
-#include <io.h>       // `_get_osfhandle`, `_open_osfhandle`
+#include <io.h>       // `_get_osfhandle`
 #include <winternl.h> // `NtCreateFile`, `OBJECT_ATTRIBUTES`
-#include <sys/stat.h> // `_fstat64`
 #include <ws2tcpip.h>
 #include <afunix.h> // `sockaddr_un`
 #else
@@ -42,6 +42,10 @@
 #if UCALL_OS_LINUX_
 #include <dirent.h>      // `opendir`, `readdir`, `closedir`
 #include <sys/syscall.h> // `SYS_statx`
+#endif
+#if UCALL_OS_APPLE_
+#include <libproc.h>   // `proc_pidfdinfo`, `socket_fdinfo`
+#include <sys/event.h> // `kqueue`, `kevent`
 #endif
 
 namespace unum::ucall::utilities {
@@ -116,6 +120,8 @@ inline int socket_error(int error) noexcept {
     case WSAECONNABORTED: return ECONNABORTED;
     case WSAECONNREFUSED: return ECONNREFUSED;
     case WSAETIMEDOUT: return ETIMEDOUT;
+    case WSAEMFILE: return EMFILE;
+    case WSAENOBUFS: return ENOBUFS;
     case ERROR_OPERATION_ABORTED: return ECANCELED;
     default: return EIO;
     }
@@ -173,6 +179,27 @@ inline int socket_option(descriptor_t descriptor, int level, int name, void cons
 #else
     return setsockopt(static_cast<int>(descriptor), level, name, value, static_cast<socklen_t>(length));
 #endif
+}
+
+/** Waits up to @p nanoseconds, the maximum meaning forever, for any of the @p count descriptors in
+ *  @p polled: how many reported, or a negated errno. Linux and FreeBSD wait to the nanosecond, and
+ *  the rest to the millisecond, rounded up so a wait never ends early. */
+inline int socket_poll(pollfd* polled, std::size_t count, std::uint64_t nanoseconds) noexcept {
+    bool const forever = nanoseconds == std::numeric_limits<std::uint64_t>::max();
+    [[maybe_unused]] int const milliseconds = forever ? -1
+                                                      : static_cast<int>(std::min<std::uint64_t>(
+                                                            nanoseconds / 1'000'000 + (nanoseconds % 1'000'000 != 0),
+                                                            std::numeric_limits<int>::max()));
+#if UCALL_OS_LINUX_ || UCALL_OS_FREEBSD_
+    timespec const timeout {static_cast<time_t>(nanoseconds / 1'000'000'000),
+                            static_cast<long>(nanoseconds % 1'000'000'000)};
+    int const result = ::ppoll(polled, static_cast<nfds_t>(count), forever ? nullptr : &timeout, nullptr);
+#elif UCALL_OS_WINDOWS_
+    int const result = WSAPoll(polled, static_cast<ULONG>(count), milliseconds);
+#else
+    int const result = ::poll(polled, static_cast<nfds_t>(count), milliseconds);
+#endif // UCALL_OS_LINUX_ || UCALL_OS_FREEBSD_
+    return result < 0 ? -socket_last_error() : result;
 }
 
 /** The @c SO_LINGER setting that makes a close send a reset rather than a FIN. */
@@ -276,6 +303,22 @@ inline std::size_t receive_queues_count([[maybe_unused]] std::string_view device
 #endif // UCALL_OS_LINUX_
 }
 
+/** Whether @p descriptor listens for connections; Darwin answers only through @c proc_pidfdinfo, as
+ *  its @c getsockopt refuses @c SO_ACCEPTCONN with @c ENOPROTOOPT. */
+inline bool socket_listening(descriptor_t descriptor) noexcept {
+#if UCALL_OS_APPLE_
+    socket_fdinfo information {};
+    return proc_pidfdinfo(getpid(), static_cast<int>(descriptor), PROC_PIDFDSOCKETINFO, &information,
+                          sizeof(information)) == static_cast<int>(sizeof(information)) &&
+           (information.psi.soi_options & SO_ACCEPTCONN);
+#else
+    int listening = 0;
+    socket_length_t length = sizeof(listening);
+    return getsockopt(descriptor, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<char*>(&listening), &length) == 0 &&
+           listening;
+#endif // UCALL_OS_APPLE_
+}
+
 /** A nonblocking duplicate of @p handed, a listening stream socket a caller passed in, or -1 when
  *  it is none; the caller's own descriptor stays open and shares the nonblocking flag. */
 inline descriptor_t socket_duplicate_listener(std::intptr_t handed) noexcept {
@@ -289,12 +332,10 @@ inline descriptor_t socket_duplicate_listener(std::intptr_t handed) noexcept {
     descriptor_t descriptor = fcntl(static_cast<int>(handed), F_DUPFD_CLOEXEC, 0);
 #endif
     if (descriptor == -1) return -1;
-    int listening = 0, type = 0;
-    socket_length_t listening_length = sizeof(listening), type_length = sizeof(type);
-    if (getsockopt(descriptor, SOL_SOCKET, SO_ACCEPTCONN, reinterpret_cast<char*>(&listening), &listening_length) ==
-            0 &&
-        getsockopt(descriptor, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &type_length) == 0 && listening &&
-        type == SOCK_STREAM && nonblocking(descriptor) == ucall_status_success_k)
+    int type = 0;
+    socket_length_t type_length = sizeof(type);
+    if (getsockopt(descriptor, SOL_SOCKET, SO_TYPE, reinterpret_cast<char*>(&type), &type_length) == 0 &&
+        type == SOCK_STREAM && socket_listening(descriptor) && nonblocking(descriptor) == ucall_status_success_k)
         return descriptor;
     socket_close(descriptor);
     return -1;
@@ -368,24 +409,24 @@ using io_vector_t = iovec;
 #endif
 static_assert(sizeof(io_vector_t) == 16);
 
-/** Closes a file or directory descriptor, as opposed to a socket. */
-inline void file_close(int file) noexcept {
+/** Closes a file or directory, as opposed to a socket. */
+inline void close_native_file(native_file_t file) noexcept {
 #if UCALL_OS_WINDOWS_
-    _close(file);
+    CloseHandle(file);
 #else
     close(file);
 #endif
 }
 
-/** What @c file_direct_alignment learned of an open file: its size and the alignment its unbuffered
- *  reads meet in offset, length and memory, or a negated errno, which is @c -ENXIO for anything but
- *  a regular file. */
+/** What @c direct_alignment_of learned of an open file: its size, the alignment its unbuffered
+ *  reads keep in memory and the one they keep in offset and length, or a negated errno, which is
+ *  @c -ENXIO for anything but a regular file. */
 struct file_geometry_t {
     std::uint64_t size {};
-    std::uint32_t alignment {};
+    std::uint32_t memory_alignment {}, offset_alignment {};
     std::int32_t error {};
 };
-static_assert(sizeof(file_geometry_t) == 16);
+static_assert(sizeof(file_geometry_t) == 24);
 
 /** The alignment unbuffered reads assume where the filesystem cannot say, a page everywhere. */
 inline constexpr std::uint32_t file_portable_alignment_k = 4096;
@@ -394,15 +435,23 @@ inline constexpr std::uint32_t file_portable_alignment_k = 4096;
 
 /** Measures the open regular @p file; unbuffered handles want sector alignment, which no volume
  *  sets above a page. */
-inline file_geometry_t file_direct_alignment(int file) noexcept {
-    struct _stat64 status {};
-    if (_fstat64(file, &status) != 0) return {0, 0, -errno};
-    if (!(status.st_mode & _S_IFREG)) return {0, 0, -ENXIO};
-    return {static_cast<std::uint64_t>(status.st_size), file_portable_alignment_k, 0};
+inline file_geometry_t direct_alignment_of(native_file_t file) noexcept {
+    if (GetFileType(file) != FILE_TYPE_DISK) return {0, 0, 0, -ENXIO};
+    FILE_STANDARD_INFO standard {};
+    if (!GetFileInformationByHandleEx(file, FileStandardInfo, &standard, sizeof(standard))) return {0, 0, 0, -EIO};
+    if (standard.Directory) return {0, 0, 0, -ENXIO};
+    return {static_cast<std::uint64_t>(standard.EndOfFile.QuadPart), file_portable_alignment_k,
+            file_portable_alignment_k, 0};
 }
 
-/** Accepts any descriptor, since the IOCP engine reopens each file unbuffered for its reads. */
-inline ucall_status_t file_direct_check(int) noexcept { return ucall_status_success_k; }
+/** Checks that the borrowed @p file reads a disk file. The loop reads it through a handle it
+ *  reopens once beneath @p file with an empty name, since only its engine binds to its port. */
+inline ucall_status_t file_direct_switch(native_file_t& file) noexcept {
+    return GetFileType(file) == FILE_TYPE_DISK ? ucall_status_success_k : ucall_status_invalid_argument_k;
+}
+
+/** The handle the C interface's CRT descriptor @p file reads through, which stays the caller's. */
+inline native_file_t native_file_of(int file) noexcept { return reinterpret_cast<HANDLE>(_get_osfhandle(file)); }
 
 /** @p path as UTF-16 with backslashes, in @p wide of @p capacity characters: its length, or zero
  *  when it does not convert or fit. */
@@ -413,18 +462,16 @@ inline int file_path_wide(char const* path, wchar_t* wide, int capacity) noexcep
     return length > 1 ? length - 1 : 0;
 }
 
-/** Opens the directory @p path as a CRT descriptor whose handle path parts open beneath. */
-inline int directory_open(char const* path) noexcept {
+/** Opens the directory @p path as a handle path parts open beneath: its value, or a negated
+ *  errno. */
+inline descriptor_t directory_open(char const* path) noexcept {
     wchar_t wide[MAX_PATH];
     if (!file_path_wide(path, wide, MAX_PATH)) return -ENOENT;
     HANDLE const directory = CreateFileW(wide, FILE_LIST_DIRECTORY,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr, OPEN_EXISTING,
                                          FILE_FLAG_BACKUP_SEMANTICS, nullptr);
-    if (directory == INVALID_HANDLE_VALUE)
-        return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? -ENOENT : -EIO;
-    int const descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(directory), _O_RDONLY);
-    if (descriptor < 0) CloseHandle(directory);
-    return descriptor < 0 ? -EIO : descriptor;
+    if (directory != INVALID_HANDLE_VALUE) return std::bit_cast<descriptor_t>(directory);
+    return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? -ENOENT : -EIO;
 }
 
 /** Whether @p path names something beneath its directory: relative, without a drive, a <tt>..</tt>
@@ -441,29 +488,27 @@ inline bool file_path_beneath(std::string_view path) noexcept {
     return true;
 }
 
-/** Opens @p path for reads strictly beneath the descriptor @p directory names, following no
- *  reparse point on the way, as @c RESOLVE_BENEATH does on Linux: a descriptor, or a negated
- *  errno; every refusal reads as missing, so permissions are never revealed. */
-inline int file_open_beneath(int directory, char const* path) noexcept {
+/** Opens @p path for unbuffered, overlapped reads strictly beneath the handle @p directory,
+ *  following no reparse point on the way, as @c RESOLVE_BENEATH does on Linux; an empty @p path
+ *  reopens the file @p directory names that way. Answers the handle's value, or a negated errno;
+ *  every refusal reads as missing, so permissions are never revealed. */
+inline descriptor_t open_native_file_beneath(native_file_t directory, char const* path) noexcept {
     wchar_t wide[MAX_PATH];
-    int const length = file_path_beneath(path) ? file_path_wide(path, wide, MAX_PATH) : 0;
-    if (!length) return -ENOENT;
+    int const length = *path && file_path_beneath(path) ? file_path_wide(path, wide, MAX_PATH) : 0;
+    if (*path && !length) return -ENOENT;
     UNICODE_STRING name {static_cast<USHORT>(length * sizeof(wchar_t)),
                          static_cast<USHORT>((length + 1) * sizeof(wchar_t)), wide};
     OBJECT_ATTRIBUTES attributes {};
     attributes.Length = sizeof(attributes);
-    attributes.RootDirectory = reinterpret_cast<HANDLE>(_get_osfhandle(directory));
+    attributes.RootDirectory = directory;
     attributes.ObjectName = &name;
     attributes.Attributes = OBJ_CASE_INSENSITIVE | OBJ_DONT_REPARSE;
     IO_STATUS_BLOCK status {};
     HANDLE file {};
     NTSTATUS const opened = NtCreateFile(&file, FILE_GENERIC_READ, &attributes, &status, nullptr, 0,
                                          FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, FILE_OPEN,
-                                         FILE_NON_DIRECTORY_FILE | FILE_SYNCHRONOUS_IO_NONALERT, nullptr, 0);
-    if (opened < 0) return -ENOENT;
-    int const descriptor = _open_osfhandle(reinterpret_cast<intptr_t>(file), _O_RDONLY);
-    if (descriptor < 0) CloseHandle(file);
-    return descriptor < 0 ? -EIO : descriptor;
+                                         FILE_NON_DIRECTORY_FILE | FILE_NO_INTERMEDIATE_BUFFERING, nullptr, 0);
+    return opened < 0 ? -ENOENT : std::bit_cast<descriptor_t>(file);
 }
 
 #else
@@ -472,44 +517,44 @@ inline int file_open_beneath(int directory, char const* path) noexcept {
 
 /** Measures the open regular @p file and asks its filesystem what unbuffered reads demand; the
  *  alignments need Linux 6.1. */
-inline file_geometry_t file_direct_alignment(int file) noexcept {
+inline file_geometry_t direct_alignment_of(native_file_t file) noexcept {
     std::uint32_t const dioalign = 0x2000; // STATX_DIOALIGN
     linux_statx_t status {};
     if (syscall(SYS_statx, file, "", AT_EMPTY_PATH, STATX_TYPE | STATX_SIZE | dioalign, &status) != 0)
-        return {0, 0, -errno};
-    if (!S_ISREG(status.mode)) return {0, 0, -ENXIO};
-    std::uint32_t alignment = file_portable_alignment_k;
+        return {0, 0, 0, -errno};
+    if (!S_ISREG(status.mode)) return {0, 0, 0, -ENXIO};
     if ((status.mask & dioalign) && status.dio_mem_align && status.dio_offset_align)
-        alignment = std::max(status.dio_mem_align, status.dio_offset_align);
-    return {status.size, alignment, 0};
+        return {status.size, status.dio_mem_align, status.dio_offset_align, 0};
+    return {status.size, file_portable_alignment_k, file_portable_alignment_k, 0};
 }
 
 #else
 
 /** Measures the open regular @p file; these kernels report no unbuffered alignment, so a page. */
-inline file_geometry_t file_direct_alignment(int file) noexcept {
+inline file_geometry_t direct_alignment_of(native_file_t file) noexcept {
     struct stat status {};
-    if (fstat(file, &status) != 0) return {0, 0, -errno};
-    if (!S_ISREG(status.st_mode)) return {0, 0, -ENXIO};
-    return {static_cast<std::uint64_t>(status.st_size), file_portable_alignment_k, 0};
+    if (fstat(file, &status) != 0) return {0, 0, 0, -errno};
+    if (!S_ISREG(status.st_mode)) return {0, 0, 0, -ENXIO};
+    return {static_cast<std::uint64_t>(status.st_size), file_portable_alignment_k, file_portable_alignment_k, 0};
 }
 
 #endif // UCALL_OS_LINUX_
 
 #if UCALL_OS_APPLE_
 
-/** Switches the borrowed @p file to uncached reads, as Darwin keeps no flag to check instead. */
-inline ucall_status_t file_direct_check(int file) noexcept {
+/** Adopts the borrowed @p file for uncached reads; the switch is shared with the caller's open file
+ *  description, and Darwin names no flag to read it back by. */
+inline ucall_status_t file_direct_switch(native_file_t& file) noexcept {
     return fcntl(file, F_NOCACHE, 1) == 0 ? ucall_status_success_k : ucall_status_invalid_argument_k;
 }
 
 /** The flags every file open beneath a directory takes; a FIFO opens without waiting for a writer,
- *  and @c file_open_finish drops the nonblocking flag from what opened. */
-inline constexpr int file_open_flags_k = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
+ *  and @c open_native_file_finish drops the nonblocking flag from what opened. */
+inline constexpr int native_file_open_flags_k = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK;
 
-/** Readies a @p file just opened with @c file_open_flags_k for blocking uncached reads: the
+/** Readies a @p file just opened with @c native_file_open_flags_k for blocking uncached reads: the
  *  descriptor, or a negated errno with the file closed. */
-inline int file_open_finish(int file) noexcept {
+inline native_file_t open_native_file_finish(native_file_t file) noexcept {
     int const flags = fcntl(file, F_GETFL);
     if (flags != -1 && fcntl(file, F_SETFL, flags & ~O_NONBLOCK) == 0 && fcntl(file, F_NOCACHE, 1) == 0) return file;
     int const error = errno;
@@ -519,21 +564,23 @@ inline int file_open_finish(int file) noexcept {
 
 #else
 
-/** Refuses a borrowed @p file opened without @c O_DIRECT, whose reads would go through the
- *  cache. */
-inline ucall_status_t file_direct_check(int file) noexcept {
+/** Adopts the borrowed @p file for unbuffered, blocking reads; the switch is shared with the
+ *  caller's open file description, and a no-op once switched. */
+inline ucall_status_t file_direct_switch(native_file_t& file) noexcept {
     int const flags = fcntl(file, F_GETFL);
-    return flags != -1 && (flags & O_DIRECT) ? ucall_status_success_k : ucall_status_invalid_argument_k;
+    int const wanted = (flags | O_DIRECT) & ~O_NONBLOCK;
+    return flags != -1 && (wanted == flags || fcntl(file, F_SETFL, wanted) == 0) ? ucall_status_success_k
+                                                                                 : ucall_status_invalid_argument_k;
 }
 
 /** The flags every file open beneath a directory takes; a FIFO opens without waiting for a writer,
- *  then fails the direct check, and @c file_open_finish drops the nonblocking flag from a file, as
- *  io_uring answers a nonblocking file's blocked read with @c -EAGAIN instead of a worker. */
-inline constexpr int file_open_flags_k = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK | O_DIRECT;
+ *  then fails the direct check, and @c open_native_file_finish drops the nonblocking flag from a
+ *  file, as io_uring answers a nonblocking file's blocked read with @c -EAGAIN, not a worker. */
+inline constexpr int native_file_open_flags_k = O_RDONLY | O_CLOEXEC | O_NOCTTY | O_NONBLOCK | O_DIRECT;
 
-/** Readies a @p file just opened with @c file_open_flags_k for blocking unbuffered reads: the
- *  descriptor, or a negated errno with the file closed. */
-inline int file_open_finish(int file) noexcept {
+/** Readies a @p file just opened with @c native_file_open_flags_k for blocking unbuffered reads:
+ *  the descriptor, or a negated errno with the file closed. */
+inline native_file_t open_native_file_finish(native_file_t file) noexcept {
     int const flags = fcntl(file, F_GETFL);
     if (flags != -1 && fcntl(file, F_SETFL, flags & ~O_NONBLOCK) == 0) return file;
     int const error = errno;
@@ -543,8 +590,11 @@ inline int file_open_finish(int file) noexcept {
 
 #endif // UCALL_OS_APPLE_
 
+/** The descriptor @p file reads through, itself. */
+inline native_file_t native_file_of(int file) noexcept { return file; }
+
 /** Reads @p file at @p offset into @p bytes, blocking: a count, or a negated errno. */
-inline descriptor_t file_read(int file, span<byte_t> bytes, std::uint64_t offset) noexcept {
+inline descriptor_t read_native_file(native_file_t file, span<byte_t> bytes, std::uint64_t offset) noexcept {
     ssize_t read;
     do
         read = pread(file, bytes.data(), std::min<std::size_t>(bytes.size(), std::numeric_limits<int>::max()),
@@ -554,7 +604,8 @@ inline descriptor_t file_read(int file, span<byte_t> bytes, std::uint64_t offset
 }
 
 /** Scatters @p file from @p offset into @p vectors, blocking: a count, or a negated errno. */
-inline descriptor_t file_read_vectors(int file, span<io_vector_t const> vectors, std::uint64_t offset) noexcept {
+inline descriptor_t read_native_file_vectors(native_file_t file, span<io_vector_t const> vectors,
+                                             std::uint64_t offset) noexcept {
     ssize_t read;
     do
         read = preadv(file, vectors.data(), static_cast<int>(std::min<std::size_t>(vectors.size(), IOV_MAX)),
@@ -564,7 +615,7 @@ inline descriptor_t file_read_vectors(int file, span<io_vector_t const> vectors,
 }
 
 /** Opens the directory @p path as a descriptor path parts open beneath, or a negated errno. */
-inline int directory_open(char const* path) noexcept {
+inline descriptor_t directory_open(char const* path) noexcept {
 #if UCALL_OS_LINUX_
     int const directory = ::open(path, O_PATH | O_DIRECTORY | O_CLOEXEC);
 #else
@@ -573,9 +624,9 @@ inline int directory_open(char const* path) noexcept {
     return directory >= 0 ? directory : -errno;
 }
 
-/** Opens @p path with @c file_open_flags_k beneath @p directory one name at a time, taking no
- *  <tt>..</tt> and following no link, so it stays inside: a descriptor, or a negated errno. */
-inline int file_open_beneath_walk(int directory, char const* path) noexcept {
+/** Opens @p path with @c native_file_open_flags_k beneath @p directory one name at a time, taking
+ *  no <tt>..</tt> and following no link, so it stays inside: a descriptor, or a negated errno. */
+inline native_file_t open_native_file_beneath_walk(native_file_t directory, char const* path) noexcept {
     int file = directory;
     char name[NAME_MAX + 1];
     for (char const* cursor = path; file >= 0 && *cursor;) {
@@ -586,7 +637,8 @@ inline int file_open_beneath_walk(int directory, char const* path) noexcept {
         if (length && length <= NAME_MAX && !(length == 2 && cursor[0] == '.' && cursor[1] == '.')) {
             std::memcpy(name, cursor, length);
             name[length] = '\0';
-            next = openat(file, name, (*end ? O_RDONLY | O_DIRECTORY | O_CLOEXEC : file_open_flags_k) | O_NOFOLLOW);
+            next = openat(file, name,
+                          (*end ? O_RDONLY | O_DIRECTORY | O_CLOEXEC : native_file_open_flags_k) | O_NOFOLLOW);
             if (next < 0) next = -errno;
         }
         if (file != directory) close(file);
@@ -598,25 +650,25 @@ inline int file_open_beneath_walk(int directory, char const* path) noexcept {
 
 /** Opens @p path for unbuffered reads strictly beneath @p directory: a descriptor, or a negated
  *  errno. */
-inline int file_open_beneath(int directory, char const* path) noexcept {
+inline native_file_t open_native_file_beneath(native_file_t directory, char const* path) noexcept {
 #if UCALL_OS_LINUX_
     long const openat2 = 437 + linux_syscall_offset_k; // SYS_openat2, mirrored for headers older than 5.6
 
     std::uint64_t const no_magiclinks = 0x02; // RESOLVE_NO_MAGICLINKS
     std::uint64_t const beneath = 0x08;       // RESOLVE_BENEATH
     linux_open_how_t how {};
-    how.flags = file_open_flags_k;
+    how.flags = native_file_open_flags_k;
     how.resolve = beneath | no_magiclinks;
     long const opened = syscall(openat2, directory, path, &how, sizeof(how));
     int file = opened >= 0 ? static_cast<int>(opened) : -errno;
     // A kernel older than 5.6 has no beneath resolution, so the walk stands in for it.
-    if (file == -ENOSYS) file = file_open_beneath_walk(directory, path);
+    if (file == -ENOSYS) file = open_native_file_beneath_walk(directory, path);
 #elif UCALL_OS_FREEBSD_
-    int file = openat(directory, path, file_open_flags_k | O_RESOLVE_BENEATH);
+    int file = openat(directory, path, native_file_open_flags_k | O_RESOLVE_BENEATH);
     // FreeBSD refuses an escape with ENOTCAPABLE where Linux's beneath resolution answers EXDEV.
     if (file < 0) file = errno == ENOTCAPABLE ? -EXDEV : -errno;
 #else
-    int file = file_open_beneath_walk(directory, path);
+    int file = open_native_file_beneath_walk(directory, path);
 #endif // UCALL_OS_LINUX_
     if (file < 0) return file;
     // FreeBSD opens directories and FIFOs under these flags, and a FIFO read would block the loop.
@@ -625,7 +677,7 @@ inline int file_open_beneath(int directory, char const* path) noexcept {
         close(file);
         return -ENXIO;
     }
-    return file_open_finish(file);
+    return open_native_file_finish(file);
 }
 
 #endif // UCALL_OS_WINDOWS_

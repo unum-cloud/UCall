@@ -69,6 +69,7 @@ char const* ucall_io_backend_name(ucall_io_backend_t backend) {
     case ucall_io_backend_linux_uring618_k: return "linux-uring618";
     case ucall_io_backend_bsd_kqueue_k: return "bsd-kqueue";
     case ucall_io_backend_windows_iocp_k: return "windows-iocp";
+    case ucall_io_backend_windows_rio_k: return "windows-rio";
     }
     return "unknown";
 }
@@ -89,7 +90,7 @@ char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
 }
 
 ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name) {
-    for (auto backend = ucall_io_backend_posix_k; backend <= ucall_io_backend_windows_iocp_k;
+    for (auto backend = ucall_io_backend_posix_k; backend <= ucall_io_backend_windows_rio_k;
          backend = static_cast<ucall_io_backend_t>(backend + 1))
         if (named(ucall_io_backend_name(backend), name)) return backend;
     return ucall_io_backend_automatic_k;

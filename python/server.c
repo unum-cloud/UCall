@@ -1523,7 +1523,7 @@ static char const doc_DetachedRequest_reply_parts[] =                           
     "\n"                                                                                              //
     "Raises:\n"                                                                                       //
     "  BufferError: A view over the request's bytes is still alive.\n"                                //
-    "  Error: A refused part, such as a descriptor without O_DIRECT, or a request already\n"          //
+    "  Error: A refused part, such as a socket for a file, or a request already\n"                    //
     "    answered, with `Status.ALREADY_EXISTS`.\n"                                                   //
     "\n"                                                                                              //
     "Example:\n"                                                                                      //
@@ -3423,30 +3423,30 @@ static PyObject* Server_stop(Server* self, [[maybe_unused]] PyObject* unused) {
     Py_RETURN_NONE;
 }
 
-static char const doc_Server_event_loop_statistics[] =                                           //
-    "event_loop_statistics(event_loop, /) -> dict[str, int]\n"                                   //
-    "\n"                                                                                         //
-    "Counts what one event loop did since initialization.\n"                                     //
-    "\n"                                                                                         //
-    "Divided by `requests`, the counters price one call.\n"                                      //
-    "\n"                                                                                         //
-    "Args:\n"                                                                                    //
-    "  event_loop (int): The loop to read, below `event_loops`.\n"                               //
-    "\n"                                                                                         //
-    "Returns:\n"                                                                                 //
-    "  dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,\n" //
-    "    `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,\n"          //
-    "    `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,\n"              //
-    "    `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,\n"     //
-    "    `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,\n"         //
-    "    `refused_requests`, `handshake_failures` and `authorizer_refusals`, each read on its\n" //
-    "    own.\n"                                                                                 //
-    "\n"                                                                                         //
-    "Raises:\n"                                                                                  //
-    "  Error: An `event_loop` past the last one.\n"                                              //
-    "\n"                                                                                         //
-    "Example:\n"                                                                                 //
-    "  >>> server.event_loop_statistics(0)[\"requests\"]\n"                                      //
+static char const doc_Server_event_loop_statistics[] =                                              //
+    "event_loop_statistics(event_loop, /) -> dict[str, int]\n"                                      //
+    "\n"                                                                                            //
+    "Counts what one event loop did since initialization.\n"                                        //
+    "\n"                                                                                            //
+    "Divided by `requests`, the counters price one call.\n"                                         //
+    "\n"                                                                                            //
+    "Args:\n"                                                                                       //
+    "  event_loop (int): The loop to read, below `event_loops`.\n"                                  //
+    "\n"                                                                                            //
+    "Returns:\n"                                                                                    //
+    "  dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,\n"    //
+    "    `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,\n"             //
+    "    `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,\n"                 //
+    "    `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,\n"        //
+    "    `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,\n"            //
+    "    `refused_requests`, `handshake_failures`, `authorizer_refusals`, `shed_connections` and\n" //
+    "    `windows_unpinned`, each read on its own.\n"                                               //
+    "\n"                                                                                            //
+    "Raises:\n"                                                                                     //
+    "  Error: An `event_loop` past the last one.\n"                                                 //
+    "\n"                                                                                            //
+    "Example:\n"                                                                                    //
+    "  >>> server.event_loop_statistics(0)[\"requests\"]\n"                                         //
     "  0";
 
 static PyObject* Server_event_loop_statistics(Server* self, PyObject* const* values, Py_ssize_t count,
@@ -3462,7 +3462,7 @@ static PyObject* Server_event_loop_statistics(Server* self, PyObject* const* val
     ucall_server_event_loop_statistics_t query = {self->handle, &outcome, index, &counters};
     ucall_server_event_loop_statistics(&query);
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
-    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                          //
+    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                      //
                          "polls", (unsigned long long)counters.polls,                                     //
                          "empty_polls", (unsigned long long)counters.empty_polls,                         //
                          "kernel_enters", (unsigned long long)counters.kernel_enters,                     //
@@ -3487,7 +3487,9 @@ static PyObject* Server_event_loop_statistics(Server* self, PyObject* const* val
                          "replied_dequeues", (unsigned long long)counters.replied_dequeues,               //
                          "refused_requests", (unsigned long long)counters.refused_requests,               //
                          "handshake_failures", (unsigned long long)counters.handshake_failures,           //
-                         "authorizer_refusals", (unsigned long long)counters.authorizer_refusals);
+                         "authorizer_refusals", (unsigned long long)counters.authorizer_refusals,         //
+                         "shed_connections", (unsigned long long)counters.shed_connections,               //
+                         "windows_unpinned", (unsigned long long)counters.windows_unpinned);
 }
 
 static PyObject* Server_get_event_loops(Server* self, [[maybe_unused]] void* closure) {

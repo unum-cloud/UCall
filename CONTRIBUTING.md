@@ -20,7 +20,8 @@ The `relwithdebinfo` and `release` presets build the same suites with optimizati
 Tests, tools and benchmarks are off unless a preset or a `-D` switch asks for them.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
 The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, and `ucall::header`, the C headers alone.
-`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_LINUX_URING`, `UCALL_WITH_KQUEUE`, and `UCALL_WITH_IOCP` control compiled backends; the main project enables those supported by the target operating system.
+`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each engine where the target operating system has it, and the header refuses one forced on elsewhere.
+`UCALL_WITH_LINUX_URING`, on for Linux, also links liburing, and a library or subproject build serves whichever compiled engine the host admits first.
 CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
 Each class unit compiles when StringZilla and ForkUnion enable every capability it uses, with StringZilla's flags for them.
 `UCALL_MARCH` raises the floor of UCall's own units to an ISA level, `native` or a CPU name like `graniterapids`, and hands the same value to the siblings.
@@ -174,6 +175,25 @@ Keep scalar control in the state machine and bulk byte work in capability-select
 An explicit CPU instantiation exists only when its selected kernels, atomics, or waits differ from its parent.
 Use ForkUnion references for cross-thread admission and publication; keep single-owner counters local.
 Do not add an abstraction, wrapper, flag, or dedicated file for symmetry or a possible future use.
+
+### Macros
+
+Every all-caps name starts with the full project name, `UCALL_`.
+A trailing `_` marks a name as internal: it may change in any release, and nothing outside this repository may define or test it.
+A name without it is a public contract, either a switch you may set or a value you may read.
+
+| Family                    | Form                           | Example                 |
+| :------------------------ | :----------------------------- | :---------------------- |
+| CPU class                 | `UCALL_TARGET_<CLASS>`         | `UCALL_TARGET_SERIAL`   |
+| Optional facility         | `UCALL_WITH_[<OS>_]<FACILITY>` | `UCALL_WITH_BSD_KQUEUE` |
+| Architecture fact         | `UCALL_ARCH_<ARCH>_`           | `UCALL_ARCH_ARM64_`     |
+| Operating-system identity | `UCALL_OS_<OS>_`               | `UCALL_OS_POSIX_`       |
+
+Every name in these families is always defined, as 0 or 1, and tested with `#if`.
+`defined(...)` appears only in a `!defined` default and in a guard that an `#error` follows.
+A kernel facility, like `UCALL_WITH_WINDOWS_IOCP`, defaults from the identity, while `UCALL_WITH_LINUX_URING` defaults to 0, and the target that links liburing sets it.
+Only the Platform Identity region of `c/ucall/types.h` reads operating-system predefines like `__linux__`.
+Compiler predefines like `__clang__`, `__GNUC__` and `_MSC_VER` are read raw where they matter.
 
 ### Capacities and Bounds
 

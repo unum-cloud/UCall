@@ -67,10 +67,8 @@ struct file_tree_t {
         return directory.write(fmt::format("served/{}", relative), content);
     }
 
-    /** Opens @p relative for the unbuffered reads every file part demands. */
-    int open(std::string_view relative) const {
-        return ::open(name(relative).c_str(), O_RDONLY | O_CLOEXEC | O_DIRECT);
-    }
+    /** Opens @p relative for a file part, which switches it to unbuffered reads. */
+    int open(std::string_view relative) const { return ::open(name(relative).c_str(), O_RDONLY | O_CLOEXEC); }
 
     /** The patterned bytes <tt>big.bin</tt> holds from @p offset on, @p length of them. */
     static std::string big(std::size_t offset = 0, std::size_t length = big_size_k) {
@@ -301,31 +299,30 @@ static case_result_t test_path_refusals_noise_xx() {
     return keeping_descriptors([] { return path_refusals(ucall_security_noise_xx_k); });
 }
 
-/** A descriptor opened without @c O_DIRECT is refused on the spot, vectored or streamed: nothing of
- *  its call is queued, and the caller keeps the descriptor. */
-static case_result_t test_buffered_descriptor_refused() {
-#if UCALL_OS_LINUX_
+/** A descriptor that cannot switch to unbuffered reads, such as a socket, is refused on the spot,
+ *  vectored or streamed: nothing of its call is queued, and the caller keeps the descriptor. */
+static case_result_t test_unbufferable_descriptor_refused() {
     return keeping_descriptors([]() -> case_result_t {
         file_tree_t tree;
         if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
         fixture_t fixture {{.directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::size_t failures = 0;
-        int const buffered = ::open(tree.name("hello.txt").c_str(), O_RDONLY | O_CLOEXEC);
-        require(failures, buffered >= 0);
+        int const socket_descriptor = ::socket(AF_INET, SOCK_STREAM, 0);
+        require(failures, socket_descriptor >= 0);
         auto* vectored = hold_call(fixture, ucall_verb_get_k, ucall_security_none_k, failures);
         require(failures, vectored);
         ucall_outcome_t outcome {};
-        failures += reply_parts(fixture, vectored, outcome, {bytes_part("never"), file_part(buffered)}, {},
+        failures += reply_parts(fixture, vectored, outcome, {bytes_part("never"), file_part(socket_descriptor)}, {},
                                 ucall_status_invalid_argument_k);
-        ucall_server_reply_error_t error {fixture.server, &outcome, vectored, 400, uc::bytes_view("buffered")};
+        ucall_server_reply_error_t error {fixture.server, &outcome, vectored, 400, uc::bytes_view("refused")};
         ucall_server_reply_error(&error);
-        failures += check_answer(fixture.wait(), ucall_http_status_bad_request_k, "buffered");
+        failures += check_answer(fixture.wait(), ucall_http_status_bad_request_k, "refused");
         auto* streamed = hold_call(fixture, ucall_verb_get_k, ucall_security_none_k, failures);
         require(failures, streamed);
         ucall_server_reply_begin_t begin {fixture.server, &outcome, streamed, 0, nullptr, 0};
         ucall_server_reply_begin(&begin);
-        std::vector<ucall_reply_part_t> const refused {bytes_part("never"), file_part(buffered)};
+        std::vector<ucall_reply_part_t> const refused {bytes_part("never"), file_part(socket_descriptor)};
         ucall_server_reply_append_t append {fixture.server, &outcome, streamed, refused.data(), refused.size()};
         ucall_server_reply_append(&append);
         failures += expect(outcome.status == ucall_status_invalid_argument_k, "streamed: {}",
@@ -337,13 +334,10 @@ static case_result_t test_buffered_descriptor_refused() {
         ucall_server_reply_end_t end {fixture.server, &ended, streamed};
         ucall_server_reply_end(&end);
         failures += check_answer(fixture.wait(), ucall_http_status_ok_k, "kept");
-        failures += expect(open_descriptor(buffered), "the refused descriptor was closed");
-        ::close(buffered);
+        failures += expect(open_descriptor(socket_descriptor), "the refused descriptor was closed");
+        ::close(socket_descriptor);
         return failures + fixture.stop();
     });
-#else
-    return case_result_t::skipped("only Linux tells a buffered descriptor apart");
-#endif
 }
 
 /** A path part answering a request on an interface that registered no directory is refused on the
@@ -690,7 +684,7 @@ static case_result_t test_short_file_reset() {
         fixture.serve_in_background();
         std::size_t failures = 0;
         // Far more than the loopback buffers hold, so the server is mid-file when it shrinks.
-        int const shrinking = ::open(tree.name("shrinking.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_DIRECT, 0600);
+        int const shrinking = ::open(tree.name("shrinking.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         require(failures + fixture.stop(), shrinking >= 0 && ftruncate(shrinking, off_t {256} << 20) == 0);
         raw_client_t client;
         require(failures + fixture.stop(), client.connect(fixture.address));
@@ -704,11 +698,19 @@ static case_result_t test_short_file_reset() {
         while (client.received.find("\r\n\r\n") == std::string::npos &&
                client.read(client.received.size() + 1, deadline) == read_end_t::filled_k) {}
         failures += expect(ftruncate(shrinking, 4096) == 0);
-        auto const end = client.read_until_close(steady_clock::now() + 10s);
+        failures += expect_outcome(fixture, outcome, ucall_status_io_k);
+        // Darwin may leave the reset unseen until the client writes into the connection it reset.
+        auto end = client.read_until_close(steady_clock::now() + 200ms);
+        if (end != read_end_t::failed_k) {
+            char const probe = 0;
+            // A send the reset already refused reports it itself.
+            end = ::send(client.descriptor, &probe, 1, MSG_NOSIGNAL) == 1
+                      ? client.read_until_close(steady_clock::now() + 10s)
+                      : read_end_t::failed_k;
+        }
         int const error = errno;
         failures += expect(end == read_end_t::failed_k && error == ECONNRESET, "the read ended as {} with errno {}",
                            static_cast<int>(end), error);
-        failures += expect_outcome(fixture, outcome, ucall_status_io_k);
         failures += expect(open_descriptor(shrinking), "the borrowed descriptor was closed");
         ::close(shrinking);
         return failures + fixture.stop();
@@ -726,7 +728,7 @@ static case_result_t test_short_file_noise_xx() {
             {.security = security, .directory = tree.served, .max_response_bytes = std::size_t {128} << 20}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::size_t failures = 0;
-        int const shrinking = ::open(tree.name("shrinking.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC | O_DIRECT, 0600);
+        int const shrinking = ::open(tree.name("shrinking.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         require(failures, shrinking >= 0 && ftruncate(shrinking, off_t {64} << 20) == 0);
         // A lost POST is never retried, so the cut reply ends the call.
         auto* request = hold_call(fixture, ucall_verb_post_k, security, failures);
@@ -851,9 +853,10 @@ static case_result_t test_stop_while_releasing() {
         }
         failures += expect(ucall_outcome_status(&outcome) == ucall_status_connection_closed_k, "the outcome turned {}",
                            ucall_status_name(ucall_outcome_status(&outcome)));
-        // A wider window drains what an orderly close still delivers instead of a trickle.
+        // A wider window drains what an orderly close still delivers instead of a trickle; Darwin
+        // refuses it once the peer reset, which leaves nothing to drain anyway.
         int const wide = 1 << 20;
-        failures += expect(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &wide, sizeof(wide)) == 0);
+        [[maybe_unused]] int const widened = setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &wide, sizeof(wide));
         auto const end = client.read_until_close(steady_clock::now() + 5s);
         failures += expect(end == read_end_t::closed_k || end == read_end_t::failed_k, "the read ended as {}",
                            static_cast<int>(end));
@@ -1309,7 +1312,7 @@ void run_files(suite_totals_t& totals) {
     run_test(totals, "test_misaligned_ranges_noise_xx", test_misaligned_ranges_noise_xx);
     run_test(totals, "test_path_refusals_plain", test_path_refusals_plain);
     run_test(totals, "test_path_refusals_noise_xx", test_path_refusals_noise_xx);
-    run_test(totals, "test_buffered_descriptor_refused", test_buffered_descriptor_refused);
+    run_test(totals, "test_unbufferable_descriptor_refused", test_unbufferable_descriptor_refused);
     run_test(totals, "test_path_beyond_interface", test_path_beyond_interface);
     run_test(totals, "test_mixed_stream_plain", test_mixed_stream_plain);
     run_test(totals, "test_mixed_stream_noise_xx", test_mixed_stream_noise_xx);

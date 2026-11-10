@@ -587,7 +587,8 @@ inline ucall_event_loop_statistics_t loop_statistics(fixture_t& fixture) {
 }
 
 #if UCALL_WITH_POSIX
-using counted_network_t = uc::network::serial_network<uc::io::posix_engine_t, counting_allocator<uc::byte_t>>;
+using counted_network_t =
+    uc::network::serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>, counting_allocator<uc::byte_t>>;
 #endif
 #endif // UCALL_OS_POSIX_
 

@@ -1,21 +1,3 @@
-# The backends each OS supports, and the CPU UCall's own units are tuned for.
-
-if (UCALL_WITH_POSIX AND NOT UNIX)
-    message(FATAL_ERROR "The POSIX backend requires a POSIX platform")
-endif ()
-if (UCALL_WITH_LINUX_URING AND NOT CMAKE_SYSTEM_NAME STREQUAL "Linux")
-    message(FATAL_ERROR "The io_uring backends require Linux")
-endif ()
-if (UCALL_WITH_LINUX_EPOLLAIO AND NOT CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
-    message(FATAL_ERROR "The epoll-AIO backend requires Linux or Android")
-endif ()
-if (UCALL_WITH_KQUEUE AND NOT (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD"))
-    message(FATAL_ERROR "The kqueue backend requires macOS or FreeBSD")
-endif ()
-if (UCALL_WITH_IOCP AND NOT WIN32)
-    message(FATAL_ERROR "The IOCP backend requires Windows")
-endif ()
-
 # UCALL_MARCH raises the floor of UCall's own units, which all link `ucall_warnings`: an ISA level like `x86-64-v3`,
 # `native` for this host, or a CPU name like `graniterapids`, also when cross-compiling. Fetched dependencies keep their
 # own flags.

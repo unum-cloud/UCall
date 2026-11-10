@@ -686,11 +686,7 @@ struct raw_client_t {
      */
     [[nodiscard]] bool write(span<byte_t const> bytes, std::size_t max_chunk, random_generator_t& generator,
                              deadline_t deadline) noexcept {
-#if defined(MSG_NOSIGNAL)
         constexpr int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
-#else
-        constexpr int flags = MSG_DONTWAIT;
-#endif
         std::size_t offset = 0;
         while (offset != bytes.size()) {
             std::size_t const remaining = bytes.size() - offset;
@@ -910,6 +906,22 @@ struct case_result_t {
         return result;
     }
 };
+
+/** Why a case skips @p backend, which an engine set answered unsupported while holding the engine
+ *  of @p tried: the kernel lacks it, or the build left its engine out. */
+inline case_result_t skipped_backend(ucall_io_backend_t backend, ucall_io_backend_t tried) noexcept {
+    if (tried == backend) return case_result_t::skipped("the kernel lacks this backend");
+    switch (backend) {
+    case ucall_io_backend_posix_k: return case_result_t::skipped("built without UCALL_WITH_POSIX");
+    case ucall_io_backend_linux_epollaio_k: return case_result_t::skipped("built without UCALL_WITH_LINUX_EPOLLAIO");
+    case ucall_io_backend_linux_uring612_k:
+    case ucall_io_backend_linux_uring618_k: return case_result_t::skipped("built without UCALL_WITH_LINUX_URING");
+    case ucall_io_backend_bsd_kqueue_k: return case_result_t::skipped("built without UCALL_WITH_BSD_KQUEUE");
+    case ucall_io_backend_windows_iocp_k: return case_result_t::skipped("built without UCALL_WITH_WINDOWS_IOCP");
+    case ucall_io_backend_windows_rio_k: return case_result_t::skipped("built without UCALL_WITH_WINDOWS_RIO");
+    default: return case_result_t::skipped("built without any engine");
+    }
+}
 
 /** The counts one suite's @c main owns and every @c run_test rolls into. */
 struct suite_totals_t {

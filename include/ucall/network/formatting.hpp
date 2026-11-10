@@ -18,7 +18,7 @@
 #include "ucall/io/types.hpp"      // `io_operation_t`
 #include "ucall/network/types.hpp" // `reply_framing_t`, `max_unsent_bytes_k`
 #include "ucall/tunnel/types.hpp" // `secure_tunnel_config_t`, `secure_tunnel_geometry_t`, `secure_tunnel_mode_t`, `secure_tunnel_role_t`
-#include "ucall/utilities/sockets.hpp" // `file_direct_check`, `socket_close`, `socket_length_t`, `socket_open`
+#include "ucall/utilities/sockets.hpp" // `file_direct_switch`, `socket_close`, `socket_length_t`, `socket_open`
 #include "ucall/utilities/types.hpp"   // `text_view`, `byte_t`, `bytes_view`, `descriptor_t`
 
 namespace unum::ucall::network {
@@ -32,8 +32,10 @@ using tunnel::secure_tunnel_role_t;
 using utilities::byte_t;
 using utilities::bytes_view;
 using utilities::descriptor_t;
-using utilities::file_direct_check;
+using utilities::file_direct_switch;
 using utilities::largest_receive_buffer;
+using utilities::native_file_of;
+using utilities::native_file_t;
 using utilities::receive_queues_count;
 using utilities::socket_close;
 using utilities::socket_duplicate_listener;
@@ -43,6 +45,11 @@ using utilities::socket_option;
 using utilities::sockets_start;
 using utilities::span;
 using utilities::text_view;
+
+/** What a plaintext peer the loop sheds reads before its close, while the process is out of
+ *  descriptors. */
+inline constexpr std::string_view shed_reply_k =
+    "HTTP/1.1 503 Service Unavailable\r\nconnection: close\r\ncontent-length: 0\r\n\r\n";
 
 /** One field of a log line: its name and its already formatted value. */
 struct log_field_t {
@@ -221,13 +228,11 @@ struct formatting {
             send_buffer <= 0)
             send_buffer = static_cast<int>(max_unsent_bytes_k);
         network_interface.send_buffer_bytes = static_cast<std::size_t>(send_buffer);
+        network_interface.family = bound.ss_family;
         if (!network_interface.config.max_request_bytes)
             network_interface.config.max_request_bytes = largest_receive_buffer(bound.ss_family, max_unsent_bytes_k);
         acceptor.network_interface = &network_interface;
-        acceptor.request = {.operation = io_operation_t::accept_k,
-                            .descriptor = descriptor,
-                            .data = reinterpret_cast<byte_t*>(&acceptor.peer_address),
-                            .context = &acceptor};
+        acceptor.request = {.operation = io_operation_t::accept_k, .descriptor = descriptor, .context = &acceptor};
         return ucall_status_success_k;
     }
 
@@ -524,15 +529,16 @@ struct formatting {
     }
 
     /** Checks one part against @p exchange's interface, answering why it cannot be queued. A
-     *  caller's descriptor must read unbuffered, as the loop reads files only that way. */
+     *  caller's descriptor switches to unbuffered reads, the only way the loop reads files. */
     static ucall_status_t check_part(server_exchange_t const& exchange, ucall_reply_part_t const& part) noexcept {
         switch (part.kind) {
         case ucall_reply_part_bytes_k:
             return http_t::valid_view(part.data.bytes) ? ucall_status_success_k : ucall_status_invalid_argument_k;
         case ucall_reply_part_file_k: {
             ucall_file_range_t const& file = part.data.file;
-            if (file.file_descriptor < 0 || file_direct_check(file.file_descriptor) != ucall_status_success_k)
-                return ucall_status_invalid_argument_k;
+            if (file.file_descriptor < 0) return ucall_status_invalid_argument_k;
+            native_file_t native_file = native_file_of(file.file_descriptor);
+            if (file_direct_switch(native_file) != ucall_status_success_k) return ucall_status_invalid_argument_k;
             return check_range(file.offset, file.length);
         }
         case ucall_reply_part_path_k: {

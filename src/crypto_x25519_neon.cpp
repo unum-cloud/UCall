@@ -15,7 +15,7 @@ bool tunnel::x25519_multiply_neon(span<byte_t, x25519_key_size_k> out, span<byte
         static void fiat_mulx_u64(std::uint64_t* out1, std::uint64_t* out2, std::uint64_t arg1,
                                   std::uint64_t arg2) noexcept {
             *out1 = arg1 * arg2;
-#if UCALL_COMPILER_MSVC_
+#if defined(_MSC_VER) && !defined(__clang__)
             *out2 = __umulh(arg1, arg2);
 #else
             __asm__("umulh %x0, %x1, %x2" : "=r"(*out2) : "r"(arg1), "r"(arg2));

@@ -6,13 +6,7 @@
  */
 #include <network.hpp>
 
-#if UCALL_WITH_LINUX_EPOLLAIO
-#include "ucall/io/linux_epollaio_engine.hpp" // `linux_epollaio_engine_t`
-#endif
-#if UCALL_WITH_LINUX_URING
-#include "ucall/io/linux_uring612_engine.hpp" // `linux_uring612_engine_t`
-#include "ucall/io/linux_uring618_engine.hpp" // `linux_uring618_engine_t`
-#endif
+#include "variants.hpp" // `io_engines_t`
 
 namespace unum::ucall::test::network {
 
@@ -736,34 +730,19 @@ struct scripted_resolver_t {
 };
 
 /** A client of @p connections on the backend under test that asks @p options' nameservers. */
-template <typename engine_type_>
-static ucall_client_t resolving_client_on(uc::dns::resolver_options_t const& options, std::size_t connections) {
-    using network_t = uc::network::serial_network<engine_type_>;
+static ucall_client_t resolving_client(uc::dns::resolver_options_t const& options, std::size_t connections = 1) {
+    using network_t = uc::network::serial_network<uc::io_engines_t>;
     ucall_client_t client {};
     ucall_outcome_t outcome {};
     ucall_client_options_t config {};
     config.max_concurrent_connections = connections;
+    config.backend = backend_under_test;
     ucall_client_init_t init {&client, &outcome, &config, nullptr};
     network_t::client_t::client_init(&init);
     if (outcome.status != ucall_status_success_k) return nullptr;
     // Settings are read once at init, so a case points the client at its own server after it.
-    static_cast<typename network_t::client_t*>(client)->resolver = options;
+    static_cast<network_t::client_t*>(client)->resolver = options;
     return client;
-}
-static ucall_client_t resolving_client(uc::dns::resolver_options_t const& options, std::size_t connections = 1) {
-    switch (backend_under_test) {
-#if UCALL_WITH_LINUX_EPOLLAIO
-    case ucall_io_backend_linux_epollaio_k:
-        return resolving_client_on<uc::io::linux_epollaio_engine_t>(options, connections);
-#endif
-#if UCALL_WITH_LINUX_URING
-    case ucall_io_backend_linux_uring612_k:
-        return resolving_client_on<uc::io::linux_uring612_engine_t>(options, connections);
-    case ucall_io_backend_linux_uring618_k:
-        return resolving_client_on<uc::io::linux_uring618_engine_t>(options, connections);
-#endif
-    default: return resolving_client_on<uc::io::posix_engine_t>(options, connections);
-    }
 }
 
 /** Calls @p url once on @p client over a connection of its own, which it closes, and waits up to
@@ -916,10 +895,23 @@ static case_result_t test_client_walks_search_names() {
     return failures + fixture.server.stop();
 }
 
+/** Whether a SYN to @p address, whose listener's queue is full, goes unanswered for 200 ms: Linux
+ *  drops it, where Darwin completes the handshake anyway and FreeBSD's syncache resets it. */
+static bool syn_swallowed(sockaddr_in6 const& address) {
+    int const probe = ::socket(AF_INET6, SOCK_STREAM, 0);
+    if (probe < 0) return false;
+    fcntl(probe, F_SETFL, fcntl(probe, F_GETFL) | O_NONBLOCK);
+    bool const started = ::connect(probe, reinterpret_cast<sockaddr const*>(&address), sizeof(address)) != 0 &&
+                         errno == EINPROGRESS;
+    pollfd watched {probe, POLLOUT, 0};
+    bool const swallowed = started && ::poll(&watched, 1, 200) == 0;
+    ::close(probe);
+    return swallowed;
+}
+
 /** When the AAAA address takes SYNs and never answers them, the A address races it after RFC
  *  8305's attempt delay on a second connection, long before the connect timeout. */
 static case_result_t test_client_races_ipv4_after_silent_ipv6() {
-    if constexpr (UCALL_OS_FREEBSD_) return case_result_t::skipped("FreeBSD's syncache resets SYNs a full queue drops");
     resolving_fixture_t fixture {[](dns_question_t const& question, std::string_view query) {
         if (question.type == dns_aaaa_k)
             return dns_reply(query, 0, dns_truncation_t::whole_k,
@@ -939,9 +931,15 @@ static case_result_t test_client_races_ipv4_after_silent_ipv6() {
         if (silent >= 0) ::close(silent);
         return case_result_t::skipped("::1 cannot bind beside the server", fixture.server.stop());
     }
-    int const filler = ::socket(AF_INET6, SOCK_STREAM | SOCK_NONBLOCK, 0);
+    int const filler = ::socket(AF_INET6, SOCK_STREAM, 0);
+    fcntl(filler, F_SETFL, fcntl(filler, F_GETFL) | O_NONBLOCK);
     [[maybe_unused]] int const filled = ::connect(filler, reinterpret_cast<sockaddr*>(&bound), sizeof(bound));
     std::this_thread::sleep_for(50ms);
+    if (!syn_swallowed(bound)) {
+        ::close(filler);
+        ::close(silent);
+        return case_result_t::skipped("the kernel answers SYNs a full queue would drop", fixture.server.stop());
+    }
     ucall_client_t client = resolving_client(fixture.resolver.options(), 2);
     std::size_t failures = 0;
     if (client) {

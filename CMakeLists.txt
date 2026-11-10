@@ -18,28 +18,22 @@ set(CMAKE_CXX_EXTENSIONS NO)
 # No target uses C++20 modules, and a Clang installed without `clang-scan-deps` would fail every C++ unit.
 set(CMAKE_CXX_SCAN_FOR_MODULES OFF)
 
-set(ucall_default_posix_ OFF)
-set(ucall_default_linux_ OFF)
-set(ucall_default_kqueue_ OFF)
-set(ucall_default_iocp_ OFF)
-if (PROJECT_IS_TOP_LEVEL)
-    if (UNIX)
-        set(ucall_default_posix_ ON)
-    endif ()
-    if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
-        set(ucall_default_linux_ ON)
-    elseif (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-        set(ucall_default_kqueue_ ON)
-    elseif (WIN32)
-        set(ucall_default_iocp_ ON)
-    endif ()
+# Each kernel facility is a tri-state: AUTO passes nothing, so `c/ucall/types.h` derives it from the target alone, while
+# ON and OFF pass `=1` or `=0`, and the header refuses an operating system lacking it. io_uring needs liburing linked,
+# so it stays a plain switch, on for Linux.
+foreach (facility_ UCALL_WITH_POSIX UCALL_WITH_LINUX_EPOLLAIO UCALL_WITH_BSD_KQUEUE UCALL_WITH_WINDOWS_IOCP
+                   UCALL_WITH_WINDOWS_RIO
+)
+    set(${facility_}
+        "AUTO"
+        CACHE STRING "Compile the engine: AUTO, ON or OFF"
+    )
+    set_property(CACHE ${facility_} PROPERTY STRINGS "AUTO;ON;OFF")
+endforeach ()
+if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    set(ucall_linux_ ON)
 endif ()
-
-option(UCALL_WITH_POSIX "Include the portable POSIX backend" ${ucall_default_posix_})
-option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 6.18 backends" ${ucall_default_linux_})
-option(UCALL_WITH_LINUX_EPOLLAIO "Include the Linux epoll and AIO backend" ${ucall_default_linux_})
-option(UCALL_WITH_KQUEUE "Include the macOS and FreeBSD kqueue backend" ${ucall_default_kqueue_})
-option(UCALL_WITH_IOCP "Include the Windows IOCP backend" ${ucall_default_iocp_})
+option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 6.18 backends" ${ucall_linux_})
 option(UCALL_BUILD_PYTHON "Build the CPython extension; `pyproject.toml` switches it on" OFF)
 option(UCALL_BUILD_EXAMPLES "Build the hello, echo, ledger, key-value, and inference examples" OFF)
 option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
@@ -149,15 +143,15 @@ function (ucall_setup_library target_ scope_)
         ${target_} ${scope_} "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>" PRIVATE "${PROJECT_SOURCE_DIR}/src"
     )
     target_compile_features(${target_} ${scope_} cxx_std_20)
-    target_compile_definitions(${target_} PRIVATE UCALL_BUILDING UCALL_VERSION_NAME="${ucall_version_name_}")
+    target_compile_definitions(${target_} PRIVATE UCALL_VERSION_NAME="${ucall_version_name_}")
     target_compile_definitions(
         ${target_}
         ${scope_}
-        UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}>
-        UCALL_WITH_LINUX_EPOLLAIO=$<BOOL:${UCALL_WITH_LINUX_EPOLLAIO}>
-        UCALL_WITH_LINUX_URING=$<BOOL:${UCALL_WITH_LINUX_URING}>
-        UCALL_WITH_KQUEUE=$<BOOL:${UCALL_WITH_KQUEUE}>
-        UCALL_WITH_IOCP=$<BOOL:${UCALL_WITH_IOCP}>
+        $<$<NOT:$<STREQUAL:${UCALL_WITH_POSIX},AUTO>>:UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}>>
+        $<$<NOT:$<STREQUAL:${UCALL_WITH_LINUX_EPOLLAIO},AUTO>>:UCALL_WITH_LINUX_EPOLLAIO=$<BOOL:${UCALL_WITH_LINUX_EPOLLAIO}>>
+        $<$<NOT:$<STREQUAL:${UCALL_WITH_BSD_KQUEUE},AUTO>>:UCALL_WITH_BSD_KQUEUE=$<BOOL:${UCALL_WITH_BSD_KQUEUE}>>
+        $<$<NOT:$<STREQUAL:${UCALL_WITH_WINDOWS_IOCP},AUTO>>:UCALL_WITH_WINDOWS_IOCP=$<BOOL:${UCALL_WITH_WINDOWS_IOCP}>>
+        $<$<NOT:$<STREQUAL:${UCALL_WITH_WINDOWS_RIO},AUTO>>:UCALL_WITH_WINDOWS_RIO=$<BOOL:${UCALL_WITH_WINDOWS_RIO}>>
     )
     target_link_libraries(
         ${target_}
@@ -180,10 +174,11 @@ function (ucall_setup_library target_ scope_)
         target_compile_options(${target_} ${scope_} $<$<COMPILE_LANGUAGE:CXX>:-fno-strict-aliasing>)
     endif ()
     if (WIN32)
-        target_link_libraries(${target_} PRIVATE bcrypt ws2_32 mswsock ntdll)
+        target_link_libraries(${target_} PRIVATE bcrypt ws2_32 mswsock ntdll iphlpapi)
     endif ()
     if (UCALL_WITH_LINUX_URING)
         target_link_libraries(${target_} ${scope_} uring::uring)
+        target_compile_definitions(${target_} ${scope_} UCALL_WITH_LINUX_URING=1)
     endif ()
 endfunction ()
 ucall_setup_library(ucall_static PUBLIC)
@@ -191,9 +186,11 @@ ucall_setup_library(ucall_shared PRIVATE)
 # A C program links the archive with the C driver, which leaves out the C++ runtime the library needs.
 target_link_libraries(ucall_static INTERFACE $<$<LINK_LANGUAGE:C>:${CMAKE_CXX_IMPLICIT_LINK_LIBRARIES}>)
 # The archive's consumers call it directly, so on Windows only the shared library exports and its consumers import.
-if (WIN32)
-    target_compile_definitions(ucall_static PUBLIC UCALL_EXPORT=)
-endif ()
+target_compile_definitions(
+    ucall_shared
+    PRIVATE UCALL_EXPORTING=1
+    INTERFACE UCALL_SHARED=1
+)
 # The linker hides what hidden visibility misses: the standard library templates its headers declare visible.
 if (APPLE)
     target_link_options(ucall_shared PRIVATE "LINKER:-exported_symbol,_ucall_*")

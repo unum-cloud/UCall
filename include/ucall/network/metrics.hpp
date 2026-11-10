@@ -192,7 +192,9 @@ struct metrics {
             {"file_window_overlaps", &ucall_event_loop_statistics_t::file_window_overlaps},
             {"linger_resets", &ucall_event_loop_statistics_t::linger_resets},
             {"ready_passes", &ucall_event_loop_statistics_t::ready_passes},
-            {"replied_dequeues", &ucall_event_loop_statistics_t::replied_dequeues}};
+            {"replied_dequeues", &ucall_event_loop_statistics_t::replied_dequeues},
+            {"shed_connections", &ucall_event_loop_statistics_t::shed_connections},
+            {"windows_unpinned", &ucall_event_loop_statistics_t::windows_unpinned}};
         ucall_event_loop_statistics_t const totals = server_t::loop_totals(event_loop);
         ucall_status_t fitted = ucall_status_success_k;
         for (auto [name, counter] : counters_k) {

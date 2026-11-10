@@ -257,7 +257,7 @@ struct linux_aio_t {
         iocb block {};
         block.aio_data = index;
         block.aio_lio_opcode = request.operation == io_operation_t::file_read_k ? IOCB_CMD_PREAD : IOCB_CMD_PREADV;
-        block.aio_fildes = static_cast<std::uint32_t>(request.file.file_descriptor);
+        block.aio_fildes = static_cast<std::uint32_t>(request.file.file);
         block.aio_buf = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(request.data));
         block.aio_nbytes = request.length;
         block.aio_offset = static_cast<std::int64_t>(request.file.offset);
@@ -313,6 +313,7 @@ struct linux_epollaio_engine {
     template <typename value_type_>
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
+    static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_epollaio_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     struct operation_t {
         io_request_t* request {};
@@ -330,14 +331,11 @@ struct linux_epollaio_engine {
     static_assert(sizeof(operation_t) == 32);
     using operation_cold_t = operation_t;
     operation_cold_t& cold_fields(unsigned index) noexcept { return operations[index]; }
-    using release_index_t = st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t,
-                                                 rebound_allocator<byte_t>, row_kit_type_>;
 
     vector<operation_t> operations;
     vector<unsigned> timed;
     vector<zero_copy_run_t> runs;
     epoll_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness;
-    release_index_t releases;
     linux_aio_t files;
     operation_list_t free_operations, free_releases, fresh_operations, ready_operations, landed_operations,
         waiting_files;
@@ -388,10 +386,6 @@ struct linux_epollaio_engine {
             return ucall_status_out_of_memory_k;
         stop();
         if (ucall_status_t const opened = readiness.open(capacity); opened != ucall_status_success_k) return opened;
-        st::expected<release_index_t> made = release_index_t::make(
-            capacity, {}, rebound_allocator<byte_t> {operations.get_allocator()});
-        if (!made) return ucall_status_out_of_memory_k;
-        releases = std::move(*made);
         if (ucall_status_t const opened = files.open(); opened != ucall_status_success_k) {
             if (opened == ucall_status_unsupported_k)
                 refusal = "Linux AIO refused a context: raise `fs.aio-max-nr`, as `sysctl -w fs.aio-max-nr=1048576`";
@@ -400,18 +394,21 @@ struct linux_epollaio_engine {
         return readiness.watch_signal(files.signal_descriptor);
     }
 
+    /** The record carrying @p request, or @c absent_k. */
+    unsigned carrying(io_request_t const& request) const noexcept {
+        unsigned const index = request.operation_index;
+        return index < operations.size() && operations[index].request == &request ? index : absent_k;
+    }
+
     ucall_status_t submit(io_request_t& request) noexcept {
-        unsigned index = absent_k;
-        // A release some send already named exists since that send; it now leaves the index.
-        if (request.operation == io_operation_t::zero_copy_release_k) index = releases.find(release_key(&request));
-        if (index != absent_k) {
-            [[maybe_unused]] st::status_t const unindexed = releases.erase(release_key(&request), index);
-        }
-        else {
+        // A release some send already named holds its record since that send.
+        unsigned index = request.operation == io_operation_t::zero_copy_release_k ? carrying(request) : absent_k;
+        if (index == absent_k) {
             index = free_operations.pop(operations);
             if (index == absent_k) return ucall_status_contended_k;
             operations[index] = {};
             operations[index].request = &request;
+            request.operation_index = index;
         }
         auto& operation = operations[index];
         fresh_operations.push(operations, index);
@@ -428,30 +425,22 @@ struct linux_epollaio_engine {
     }
 
     ucall_status_t cancel(io_request_t& request) noexcept {
-        for (unsigned i = 0; i != operations.size(); ++i) {
-            auto& operation = operations[i];
-            if (operation.request != &request) continue;
-            // A release ends on its notifications, a closing socket on its last one, never sooner.
-            if (request.operation == io_operation_t::zero_copy_release_k ||
-                (request.operation == io_operation_t::close_k && operation.interest == io_interest_t::landing_k))
-                return ucall_status_success_k;
-            tally<atomic_ref_template_>(statistics.cancellations);
-            operation.stage = operation_stage_t::cancelled_k;
-            if (operation.interest == io_interest_t::armed_k) wake(i);
-            else if (operation.interest == io_interest_t::landing_k &&
-                     waiting_files.erase(operations, i) == st::success_k) {
-                operation.interest = io_interest_t::unarmed_k;
-                fresh_operations.push(operations, i);
-            }
+        unsigned const index = carrying(request);
+        if (index == absent_k) return ucall_status_not_found_k;
+        auto& operation = operations[index];
+        // A release ends on its notifications, a closing socket on its last one, never sooner.
+        if (request.operation == io_operation_t::zero_copy_release_k ||
+            (request.operation == io_operation_t::close_k && operation.interest == io_interest_t::landing_k))
             return ucall_status_success_k;
+        tally<atomic_ref_template_>(statistics.cancellations);
+        operation.stage = operation_stage_t::cancelled_k;
+        if (operation.interest == io_interest_t::armed_k) readiness_wake(*this, index);
+        else if (operation.interest == io_interest_t::landing_k &&
+                 waiting_files.erase(operations, index) == st::success_k) {
+            operation.interest = io_interest_t::unarmed_k;
+            fresh_operations.push(operations, index);
         }
-        return ucall_status_not_found_k;
-    }
-
-    void wake(unsigned index) noexcept { readiness_wake(*this, index); }
-    void land(unsigned index, descriptor_t result) noexcept { readiness_land(*this, index, result); }
-    io_completion_t finish(unsigned index, descriptor_t result) noexcept {
-        return readiness_finish<atomic_ref_template_>(*this, index, result);
+        return ucall_status_success_k;
     }
 
     /** Starts a file read, or queues it for an AIO event; it lands through @c files.drain. */
@@ -492,7 +481,7 @@ struct linux_epollaio_engine {
                                   : zero_copy_stage_t::copying_k;
         }
         if (watch.zero_copy == zero_copy_stage_t::copying_k) return send_copying(request);
-        unsigned release = releases.find(release_key(request.release_request));
+        unsigned release = request.release_request ? carrying(*request.release_request) : absent_k;
         zero_copy_run_t* extended = watch.newest_run != absent_k ? &runs[watch.newest_run] : nullptr;
         if (extended && (extended->release_operation != release || release == absent_k ||
                          extended->sends == std::numeric_limits<std::uint16_t>::max() ||
@@ -513,8 +502,7 @@ struct linux_epollaio_engine {
             release = free_releases.pop(operations);
             operations[release] = {};
             operations[release].request = request.release_request;
-            [[maybe_unused]] st::status_t const indexed = releases.insert(release_key(request.release_request), release,
-                                                                          st::assume_unique);
+            request.release_request->operation_index = release;
         }
         ++operations[release].outstanding_notifications;
         if (extended) ++extended->sends;
@@ -592,7 +580,7 @@ struct linux_epollaio_engine {
                 auto& release = operations[run.release_operation];
                 release.outstanding_notifications -= overlap;
                 if (!release.outstanding_notifications && release.interest == io_interest_t::landing_k)
-                    land(run.release_operation, release_verdict(*release.request));
+                    readiness_land(*this, run.release_operation, release_verdict(*release.request));
             }
             if (run.notified == run.sends) {
                 if (previous != absent_k) runs[previous].next = next;
@@ -633,12 +621,12 @@ struct linux_epollaio_engine {
         unsigned const closing = watch.transmit_operation;
         readiness.remove(descriptor);
         descriptor_t const closed = socket_close(descriptor) == 0 || errno == EINTR ? 0 : -errno;
-        if (closing != absent_k) land(closing, closed);
+        if (closing != absent_k) readiness_land(*this, closing, closed);
     }
 
     /** Hands landed AIO reads on, then starts the reads that waited for their events. */
     void drain_files() noexcept {
-        files.drain([&](unsigned index, descriptor_t result) noexcept { land(index, result); });
+        files.drain([&](unsigned index, descriptor_t result) noexcept { readiness_land(*this, index, result); });
         while (files.in_flight != files.depth) {
             unsigned const index = waiting_files.pop(operations);
             if (index == absent_k) break;
@@ -660,70 +648,22 @@ struct linux_epollaio_engine {
         default: return attempt_io<atomic_ref_template_>(request, operation.stage, operation.interest, statistics);
         }
     }
-    std::size_t progress(operation_list_t& list, span<io_completion_t> completions, std::size_t count,
-                         std::uint64_t now) noexcept {
-        while (count != completions.size()) {
-            auto index = list.pop(operations);
-            if (index == absent_k) break;
-            auto& operation = operations[index];
-            auto& request = *operation.request;
-            bool fired = operation.interest == io_interest_t::ready_k;
-            descriptor_t result = -ETIMEDOUT;
-            // An edge-triggered operation hears nothing more until its syscall reports EAGAIN.
-            if (!request.deadline || request.deadline > now || operation.timed == absent_k) {
-                do { result = attempt(index); } while (fired && result == -EINTR);
-            }
-            if (operation.interest == io_interest_t::landing_k) continue;
-            if (io_pending(result) && !fired) {
-                io_direction_t direction = io_direction(request.operation);
-                if (int armed = readiness.arm(request.descriptor, direction, index, statistics); armed < 0)
-                    result = armed;
-            }
-            if (io_pending(result)) operation.interest = io_interest_t::armed_k;
-            else completions[count++] = finish(index, result);
-        }
-        return count;
-    }
-    std::size_t collect(span<io_completion_t> completions, std::size_t count) noexcept {
-        return readiness_collect<atomic_ref_template_>(*this, completions, count);
-    }
-    int wait(int timeout) noexcept {
+    int wait(std::uint64_t nanoseconds) noexcept {
+        int const timeout = nanoseconds == std::numeric_limits<std::uint64_t>::max()
+                                ? -1
+                                : static_cast<int>(
+                                      std::min<std::uint64_t>(nanoseconds / 1'000'000 + (nanoseconds % 1'000'000 != 0),
+                                                              std::numeric_limits<int>::max()));
         tally<atomic_ref_template_>(statistics.kernel_enters);
         return readiness.wait(
             timeout,
             [&](unsigned index, descriptor_t descriptor, short events) noexcept {
-                auto& operation = operations[index];
-                if (operation.interest == io_interest_t::armed_k && operation.request->descriptor == descriptor &&
-                    (events & io_events(operation.request->operation)))
-                    wake(index);
+                readiness_fire(*this, index, descriptor, events);
             },
             [&](std::uint32_t chosen) noexcept { drain_error_queue(chosen); }, [&]() noexcept { drain_files(); });
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
-        if (!completions.size()) return 0;
-        std::size_t count {};
-        for (unsigned round = 0; round != 2; ++round) {
-            auto now = monotonic_ns();
-            auto wait_for = wait_policy == io_wait_t::blocking_k ? std::numeric_limits<std::uint64_t>::max() : 0;
-            if (deadline) wait_for = std::min(wait_for, deadline > now ? deadline - now : 0);
-            for (auto index : timed) {
-                auto expiry = operations[index].request->deadline;
-                if (expiry > now) wait_for = std::min(wait_for, expiry - now);
-                else if (operations[index].interest == io_interest_t::armed_k) wake(index);
-            }
-            count = collect(completions, count);
-            count = progress(fresh_operations, completions, count, now);
-            count = progress(ready_operations, completions, count, now);
-            if (count || round || !active) break;
-            int timeout = wait_for == std::numeric_limits<std::uint64_t>::max()
-                              ? -1
-                              : static_cast<int>(
-                                    std::min<std::uint64_t>(wait_for / 1'000'000 + (wait_for % 1'000'000 != 0),
-                                                            std::numeric_limits<int>::max()));
-            int result = wait(timeout);
-            if (result < 0 && result != -EINTR) return result;
-        }
-        return static_cast<int>(count);
+        return readiness_poll<atomic_ref_template_>(*this, completions, wait_policy, deadline);
     }
 
     /** Waits for every AIO read, then resets each socket the kernel still sends zero-copy bytes
@@ -762,7 +702,6 @@ struct linux_epollaio_engine {
             runs[i].next = free_runs;
             free_runs = i;
         }
-        releases.clear();
     }
 };
 using linux_epollaio_engine_t = linux_epollaio_engine<>;

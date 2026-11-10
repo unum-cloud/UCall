@@ -10,11 +10,12 @@
 #include "ucall/http/routes.hpp"        // `extract_path_component`
 #include "ucall/io/types.hpp"           // `io_completion_t`, `io_operation_t`, `io_request_t`, `tally`
 #include "ucall/network/exchanges.hpp"  // `detached_k`, `listed_k`
+#include "ucall/network/formatting.hpp" // `shed_reply_k`
 #include "ucall/network/loops.hpp"      // `event_loop_stage_t`, `metrics_state_t`
 #include "ucall/network/transports.hpp" // `transport`
 #include "ucall/network/types.hpp" // `server_stage_t`, `transport_stage_t`, `linger_microseconds_k`, `operation_state_t`
 #include "ucall/tunnel/types.hpp"  // `secure_tunnel_role_t`
-#include "ucall/utilities/sockets.hpp" // `deadline_after`, `io_vector_t`, `monotonic_ns`
+#include "ucall/utilities/sockets.hpp" // `deadline_after`, `io_vector_t`, `monotonic_ns`, `socket_open`
 #include "ucall/utilities/types.hpp"   // `text_view`, `byte_t`, `bytes_view`, `publish`
 
 namespace unum::ucall::network {
@@ -29,6 +30,7 @@ using http::http_role_t;
 using http::verb_set_t;
 using io::io_completion_t;
 using io::io_operation_t;
+using io::io_peer_address_t;
 using io::io_request_t;
 using io::tally;
 using tunnel::secure_tunnel_role_t;
@@ -40,6 +42,8 @@ using utilities::deadline_after;
 using utilities::io_vector_t;
 using utilities::monotonic_ns;
 using utilities::publish;
+using utilities::socket_close;
+using utilities::socket_open;
 using utilities::span;
 using utilities::text_view;
 
@@ -59,7 +63,7 @@ struct server_connection {
     explicit server_connection(allocator_t const& allocator = {}) noexcept : transport(allocator) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(server_connection) == 2384);
+            static_assert(sizeof(server_connection) == 2408);
     }
     server_connection(server_connection const&) = delete;
     server_connection& operator=(server_connection const&) = delete;
@@ -596,9 +600,8 @@ struct serving {
             if (connection.streaming) {
                 if (stream_body(connection) == http_parse_t::complete_k) continue;
                 // An engine prefetching into a shared ring parks what an unpulled body holds there.
-                if constexpr (requires { event_loop.engine.receive_pause(connection.transport.descriptor); })
-                    if (connection.streaming && !connection.streaming->body_chunk.empty())
-                        event_loop.engine.receive_pause(connection.transport.descriptor);
+                if (connection.streaming && !connection.streaming->body_chunk.empty())
+                    event_loop.engine.receive_pause(connection.transport.descriptor);
                 break;
             }
             if (connection.outstanding_exchanges == depth) {
@@ -823,8 +826,10 @@ struct serving {
         if (connection.transport.stage == transport_stage_t::closed_k && !connection.outstanding_releases()) {
             replies_t::detach(event_loop, connection);
             unlist(event_loop, connection);
-            // A descriptor just came free, so a paused acceptor retries now.
-            event_loop.accept_deadline = 0;
+            // A descriptor just came free, so the reserves the residue held closed reopen now.
+            if (std::exchange(event_loop.accept_deadline, 0))
+                for (auto& acceptor : event_loop.interface_acceptors)
+                    if (acceptor.stage == acceptor_stage_t::idle_k) reopen_reserve(event_loop, acceptor);
             if (auto* counters = connection.transport.interface_statistics)
                 atomic_ref<std::uint64_t> {counters->connections}.store(counters->connections - 1,
                                                                         std::memory_order_relaxed);
@@ -889,7 +894,8 @@ struct serving {
             auto& order = interface_order(server, event_loop, network_interface);
             if (stage != server_stage_t::serving_k) {
                 // An open listener keeps completing handshakes that no loop will accept.
-                if (acceptor.stage == acceptor_stage_t::submitted_k || acceptor.stage == acceptor_stage_t::probing_k)
+                if (acceptor.stage == acceptor_stage_t::submitted_k || acceptor.stage == acceptor_stage_t::probing_k ||
+                    (acceptor.stage == acceptor_stage_t::shedding_k && acceptor.shed_request.descriptor < 0))
                     engine.cancel(acceptor.request);
                 else if (acceptor.request.descriptor >= 0) {
                     engine.close_socket(acceptor.request.descriptor);
@@ -899,11 +905,15 @@ struct serving {
                 order.evicted = absent_k;
                 continue;
             }
-            if (acceptor.stage == acceptor_stage_t::paused_k) {
+            // Nothing accepts without a reserve, which the residue holds closed until its deadline.
+            if (acceptor.stage == acceptor_stage_t::idle_k && acceptor.reserve_descriptor < 0) {
                 if (event_loop.accept_deadline && monotonic_ns() < event_loop.accept_deadline) continue;
                 event_loop.accept_deadline = 0;
-                acceptor.stage = acceptor_stage_t::idle_k;
+                reopen_reserve(event_loop, acceptor);
+                if (acceptor.reserve_descriptor < 0) continue;
             }
+            // A pending accept reads its budget at each attempt, so every round renews it.
+            if (acceptor.stage == acceptor_stage_t::submitted_k) aim_accept(event_loop, acceptor);
             if (acceptor.stage != acceptor_stage_t::idle_k || order.evicting >= 0) continue;
             auto active = atomic_ref<std::size_t> {network_interface.active};
             auto const limit = network_interface.config.max_concurrent_connections;
@@ -918,6 +928,7 @@ struct serving {
                 continue;
             acceptor.stage = admitted ? acceptor_stage_t::submitted_k : acceptor_stage_t::probing_k;
             if (admitted) accepting.add(1, std::memory_order_relaxed);
+            aim_accept(event_loop, acceptor);
             if (engine.submit(acceptor.request) == ucall_status_success_k) continue;
             acceptor.stage = acceptor_stage_t::idle_k;
             if (admitted) {
@@ -947,14 +958,15 @@ struct serving {
         } while (collect_replies(event_loop) == ucall_status_success_k);
         if (stage != server_stage_t::serving_k) {
             bool busy = event_loop.open_connections != 0 || event_loop.metrics.state == metrics_state_t::sending_k;
-            for (auto& acceptor : event_loop.interface_acceptors)
-                busy |= acceptor.stage == acceptor_stage_t::submitted_k ||
-                        acceptor.stage == acceptor_stage_t::probing_k;
+            for (auto& acceptor : event_loop.interface_acceptors) busy |= acceptor.stage != acceptor_stage_t::idle_k;
             if (!busy) {
                 if (event_loop.metrics.state != metrics_state_t::closed_k) {
                     engine.close_socket(event_loop.metrics.send_request.descriptor);
                     event_loop.metrics.state = metrics_state_t::closed_k;
                 }
+                for (auto const& acceptor : event_loop.interface_acceptors)
+                    assert((acceptor.reserve_descriptor >= 0 || event_loop.accept_deadline) &&
+                           "an idle loop's reserves are open unless the residue holds them closed");
                 retire_event_loop(server, event_loop);
             }
         }
@@ -971,51 +983,148 @@ struct serving {
         if (retired.fetch_add(1, std::memory_order_acq_rel) + 1 == server.event_loops.size())
             for (auto* endpoint : server.batch_endpoints) endpoint->wake.notify();
     }
+
+    /** Points @p acceptor's accept at its first peer address, for as many connections as it may
+     *  take at once: the admission a submitted accept holds, and what the interface's budget and
+     *  the loop's idle connections still admit beside it; a probe takes one. */
+    static void aim_accept(event_loop_t const& event_loop, interface_acceptor_t& acceptor) noexcept {
+        std::size_t headroom = 0;
+        if (acceptor.stage == acceptor_stage_t::submitted_k) {
+            std::size_t const limit = acceptor.network_interface->config.max_concurrent_connections;
+            std::size_t const active = atomic_ref<std::size_t> {acceptor.network_interface->active}.load(
+                std::memory_order_relaxed);
+            std::size_t const idle = event_loop.connections.size() - event_loop.open_connections;
+            headroom = std::min(
+                {limit > active ? limit - active : 0, idle ? idle - 1 : 0, acceptor.peer_addresses.size() - 1});
+        }
+        acceptor.request.data = reinterpret_cast<byte_t*>(acceptor.peer_addresses.data());
+        acceptor.request.length = 1 + headroom;
+    }
+
+    /** Frees the reserve so the accept queued behind an exhausted table goes through, refusing its
+     *  peer; a shed takes no admission. A shed accept refused again, as kernel memory or another
+     *  thread can make it, or one without a reserve to free, leaves the reserve closed until a
+     *  close frees a descriptor or @c accept_deadline passes. */
+    static void shed_accept(event_loop_t& event_loop, interface_acceptor_t& acceptor,
+                            acceptor_stage_t failed) noexcept {
+        if (failed == acceptor_stage_t::shedding_k || acceptor.reserve_descriptor < 0) {
+            if (!event_loop.accept_deadline) event_loop.accept_deadline = deadline_after(linger_microseconds_k);
+            return;
+        }
+        socket_close(std::exchange(acceptor.reserve_descriptor, -1));
+        acceptor.stage = acceptor_stage_t::shedding_k;
+        aim_accept(event_loop, acceptor);
+        if (event_loop.engine.submit(acceptor.request) == ucall_status_success_k) return;
+        acceptor.stage = acceptor_stage_t::idle_k;
+        reopen_reserve(event_loop, acceptor);
+    }
+
+    /** Closes the shed peer once its refusal is done, counts it, and reopens the reserve. */
+    static void shed_sent(event_loop_t& event_loop, interface_acceptor_t& acceptor) noexcept {
+        event_loop.engine.close_socket(std::exchange(acceptor.shed_request.descriptor, -1));
+        tally<atomic_ref>(event_loop.statistics.shed_connections);
+        acceptor.stage = acceptor_stage_t::idle_k;
+        reopen_reserve(event_loop, acceptor);
+    }
+
+    /** Reopens @p acceptor's reserve, or, refused, holds it closed until a close frees a descriptor
+     *  or @c accept_deadline passes. */
+    static void reopen_reserve(event_loop_t& event_loop, interface_acceptor_t& acceptor) noexcept {
+        if (acceptor.reserve_descriptor < 0)
+            acceptor.reserve_descriptor = socket_open(acceptor.network_interface->family);
+        if (acceptor.reserve_descriptor < 0 && !event_loop.accept_deadline)
+            event_loop.accept_deadline = deadline_after(linger_microseconds_k);
+    }
+
+    /** The acceptor whose refusal @p request sends, or null. */
+    static interface_acceptor_t* shedding_acceptor(event_loop_t& event_loop, io_request_t const* request) noexcept {
+        for (auto& acceptor : event_loop.interface_acceptors)
+            if (request == &acceptor.shed_request) return &acceptor;
+        return nullptr;
+    }
+
+    /** Takes one connection an accept completed with, or its failure. An accept stays pending while
+     *  its request keeps a @c length, each further connection then taking an admission of its own,
+     *  and ends, cancelled, once none is left. */
     static void accepted(io_completion_t const& completion) noexcept {
         auto& acceptor = *static_cast<interface_acceptor_t*>(completion.request->context);
         auto& event_loop = *acceptor.event_loop;
         auto& server = *event_loop.server;
         auto& network_interface = *acceptor.network_interface;
-        auto const stage = std::exchange(acceptor.stage, acceptor_stage_t::idle_k);
-        if (stage == acceptor_stage_t::submitted_k)
+        bool const pending = completion.request->length != 0;
+        auto const stage = pending ? acceptor.stage : std::exchange(acceptor.stage, acceptor_stage_t::idle_k);
+        if (stage == acceptor_stage_t::submitted_k && !pending)
             atomic_ref<std::size_t> {network_interface.accepting}.sub(1, std::memory_order_relaxed);
         if (completion.result < 0) {
             if (stage == acceptor_stage_t::submitted_k) release_admission(server, network_interface);
             auto const failure = utilities::accept_failure(static_cast<int>(-completion.result));
+            if (stage == acceptor_stage_t::shedding_k && failure != accept_failure_t::exhausted_k)
+                reopen_reserve(event_loop, acceptor);
             if (failure == accept_failure_t::peer_k) return;
             char digits[std::numeric_limits<int>::digits10 + 1];
             formatting_t::log_line(
                 server.config.log,
                 failure == accept_failure_t::exhausted_k ? ucall_log_level_warning_k : ucall_log_level_error_k,
-                failure == accept_failure_t::exhausted_k ? "accept_paused" : "accept_failed",
+                failure == accept_failure_t::exhausted_k ? "accept_exhausted" : "accept_failed",
                 {{"errno", formatting_t::format_decimal(digits, -completion.result)},
                  {"address", text_view(network_interface.config.address)}});
             if (failure == accept_failure_t::broken_k) {
                 atomic_ref<ucall_status_t> {server.failure}.store(ucall_status_io_k, std::memory_order_release);
                 return server_t::server_cut(server);
             }
-            // A readiness engine keeps an exhausted listener readable, so re-arming at
-            // once would spin.
-            acceptor.stage = acceptor_stage_t::paused_k;
-            if (!event_loop.accept_deadline) event_loop.accept_deadline = deadline_after(linger_microseconds_k);
-            return;
+            return shed_accept(event_loop, acceptor, stage);
         }
         descriptor_t const descriptor = completion.result;
-        auto const peer = formatting_t::peer_address(acceptor.peer_address.address);
-        if (stage == acceptor_stage_t::submitted_k)
-            return admit(server, event_loop, network_interface, descriptor, peer);
-        // A probe took no admission, so it admits only what a close freed meanwhile,
-        // or else evicts.
+        // A connection the accept took on its way names its own address; the last one, where the
+        // request now points.
+        byte_t const* const written = completion.data ? completion.data : completion.request->data;
+        auto const peer = formatting_t::peer_address(reinterpret_cast<io_peer_address_t const*>(written)->address);
         auto active = atomic_ref<std::size_t> {network_interface.active};
         auto const limit = network_interface.config.max_concurrent_connections;
+        if (stage == acceptor_stage_t::submitted_k) {
+            admit(server, event_loop, network_interface, descriptor, peer);
+            if (!pending) return;
+            // The accept still pending holds an admission of its own, or, saturated, ends.
+            if (event_loop.idle && active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit) return;
+            atomic_ref<std::size_t> {network_interface.accepting}.sub(1, std::memory_order_relaxed);
+            acceptor.stage = acceptor_stage_t::probing_k;
+            event_loop.engine.cancel(*completion.request);
+            return;
+        }
+        if (stage == acceptor_stage_t::shedding_k) acceptor.reserve_descriptor = socket_open(network_interface.family);
+        // A reserve that reopens shows the descriptor freed for a shed peer was not the last, so
+        // only a peer that took the last is refused: a plaintext one reads `shed_reply_k` before
+        // the close, and a Noise one, which no plaintext reaches, takes a reset.
+        if (stage == acceptor_stage_t::shedding_k && acceptor.reserve_descriptor < 0) {
+            acceptor.stage = acceptor_stage_t::shedding_k;
+            acceptor.shed_request = {.operation = io_operation_t::send_k,
+                                     .descriptor = descriptor,
+                                     .context = &acceptor};
+            if (network_interface.config.security != ucall_security_none_k) {
+                [[maybe_unused]] ucall_status_t const reset = event_loop.engine.reset_on_close(descriptor);
+                return shed_sent(event_loop, acceptor);
+            }
+            static_assert(shed_reply_k.size() <= sizeof(io_peer_address_t));
+            // The accept is done with its peer address, and a send takes writable bytes.
+            byte_t* const reply = reinterpret_cast<byte_t*>(acceptor.peer_addresses.data());
+            std::memcpy(reply, shed_reply_k.data(), shed_reply_k.size());
+            acceptor.shed_request.data = reply;
+            acceptor.shed_request.length = shed_reply_k.size();
+            if (event_loop.engine.submit(acceptor.shed_request) != ucall_status_success_k)
+                shed_sent(event_loop, acceptor);
+            return;
+        }
+        // A probe or a shed accept took no admission, so it admits only what a close freed
+        // meanwhile, or else evicts.
         if (event_loop.idle && active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit)
             return admit(server, event_loop, network_interface, descriptor, peer);
-        if (server_stage(server) != server_stage_t::serving_k) {
+        auto& order = interface_order(server, event_loop, network_interface);
+        // One peer waits for an eviction at a time; a saturated accept's later ones are refused.
+        if (server_stage(server) != server_stage_t::serving_k || order.evicting >= 0) {
             event_loop.engine.close_socket(descriptor);
             return;
         }
         // The next close passes its slot to this peer, so admission never passes its budget.
-        auto& order = interface_order(server, event_loop, network_interface);
         order.evicting = descriptor;
         order.evicting_peer = peer;
         evict(event_loop, order);
@@ -1046,6 +1155,7 @@ struct serving {
         event_loop.idle = chosen->next;
         ++event_loop.open_connections;
         chosen->transport.descriptor = descriptor;
+        chosen->transport.receive_memory = event_loop.engine.receive_memory();
         chosen->transport.peer_address = peer;
         chosen->network_interface = &network_interface;
         chosen->send_buffer_bytes = network_interface.send_buffer_bytes;

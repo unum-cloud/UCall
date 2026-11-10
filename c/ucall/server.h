@@ -345,6 +345,14 @@ typedef struct ucall_event_loop_statistics_t {
     /** Connections whose authenticated peer key the interface's authorizer refused. */
     uint64_t authorizer_refusals;
 
+    /** Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under
+     *  Noise. */
+    uint64_t shed_connections;
+
+    /** File windows the engine left unpinned, as it pins none, or the locked-memory cap or a full
+     *  table refused; their sends pin or copy on their own. */
+    uint64_t windows_unpinned;
+
 } ucall_event_loop_statistics_t;
 
 /** Arguments of @c ucall_server_event_loop_statistics(). */
@@ -1182,8 +1190,11 @@ typedef enum ucall_reply_part_kind_t {
  *  after any synchronous refusal. */
 typedef struct ucall_file_range_t {
 
-    /** A regular file opened with @c O_DIRECT, borrowed; a descriptor without it is refused with
-     *  @c ucall_status_invalid_argument_k. */
+    /** A regular file, borrowed. Queuing it switches the open file description the caller shares
+     *  to unbuffered, blocking reads: @c O_DIRECT on and @c O_NONBLOCK off on Linux and FreeBSD,
+     *  @c F_NOCACHE on macOS. On Windows it is a CRT descriptor of a disk file, which the loop
+     *  reopens once for its own unbuffered, overlapped reads, leaving the caller's untouched. A
+     *  descriptor that cannot switch is refused with @c ucall_status_invalid_argument_k. */
     int file_descriptor;
 
     /** The range's first byte. */

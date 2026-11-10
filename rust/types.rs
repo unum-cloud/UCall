@@ -699,6 +699,8 @@ pub enum Backend {
     BSDKqueue,
     /// Windows I/O completion ports.
     WindowsIOCP,
+    /// Windows Registered I/O for stream sockets, beside a completion port for the rest.
+    WindowsRIO,
 }
 
 impl Backend {
@@ -714,6 +716,7 @@ impl Backend {
             4 => Backend::LinuxURing618,
             5 => Backend::BSDKqueue,
             6 => Backend::WindowsIOCP,
+            7 => Backend::WindowsRIO,
             _ => Backend::Automatic,
         }
     }

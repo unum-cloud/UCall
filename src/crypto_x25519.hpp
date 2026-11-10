@@ -43,7 +43,7 @@
 
 #include "ucall/tunnel/curve25519.hpp"
 
-#if UCALL_COMPILER_MSVC_
+#if defined(_MSC_VER) && !defined(__clang__)
 #include <intrin.h> // `__umulh`, `_addcarry_u64`, `_subborrow_u64`
 #endif
 
@@ -70,7 +70,7 @@ using fiat_25519_int1_t = signed char;
  *  round-trip is strictly stronger.
  */
 [[nodiscard]] inline static std::uint64_t value_barrier(std::uint64_t value) noexcept {
-#if UCALL_COMPILER_GCC_ || UCALL_COMPILER_CLANG_
+#if defined(__GNUC__) || defined(__clang__)
     __asm__("" : "+r"(value));
     return value;
 #else

@@ -72,7 +72,7 @@ struct linux_uring618_engine {
     using queue_t = uring_queue<allocator_t, atomic_ref_template_>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
-    using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_, row_kit_type_>;
+    using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_>;
     using operation_t = typename operations_t::operation_t;
     static_assert(sizeof(operation_t) == 64);
     static constexpr io_uring_op opcodes_k[] {
@@ -80,6 +80,7 @@ struct linux_uring618_engine {
         IORING_OP_SEND,         IORING_OP_READ,         IORING_OP_SHUTDOWN,  IORING_OP_CLOSE,
         IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD, IORING_OP_OPENAT2,
         IORING_OP_SEND_ZC,      IORING_OP_READ_FIXED,   IORING_OP_READV,     IORING_OP_READV_FIXED};
+    static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_uring618_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::engine_k;
 
     io_statistics_t statistics {};
@@ -126,8 +127,7 @@ struct linux_uring618_engine {
         if (ucall_status_t const reserved = queue.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
-            socket_slots.open(sockets, queue.allocator) != ucall_status_success_k ||
-            zero_copy.open(capacity, queue.allocator) != ucall_status_success_k)
+            socket_slots.open(sockets, queue.allocator) != ucall_status_success_k)
             return ucall_status_out_of_memory_k;
         ucall_status_t const opened = queue.open(depth, sockets, opcodes_k, scope);
         if (opened == ucall_status_success_k) return opened;
@@ -316,16 +316,17 @@ struct linux_uring618_engine {
     }
     ucall_status_t start_operation(operation_t& operation) noexcept {
         auto& request = *operation.request;
-        ucall_status_t status;
-        auto* submission = operations.entry(operation, queue, socket_slots, status);
-        if (!submission) return status;
+        if (request.operation == io_operation_t::accept_k)
+            return operations.arm_accepts(operation, queue, socket_slots);
+        auto* submission = operations.entry(operation, queue);
+        if (!submission) return ucall_status_io_k;
         if (request.operation == io_operation_t::file_read_vectors_k) {
             if (request.registered_memory != io_unregistered_k)
-                io_uring_prep_readv_fixed(submission, request.file.file_descriptor, io_vectors(request).data(),
+                io_uring_prep_readv_fixed(submission, request.file.file, io_vectors(request).data(),
                                           static_cast<unsigned>(request.length), request.file.offset, 0,
                                           static_cast<int>(request.registered_memory));
             else
-                io_uring_prep_readv(submission, request.file.file_descriptor, io_vectors(request).data(),
+                io_uring_prep_readv(submission, request.file.file, io_vectors(request).data(),
                                     static_cast<unsigned>(request.length), request.file.offset);
             tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
         }
@@ -344,6 +345,9 @@ struct linux_uring618_engine {
             operation.stage == uring_operation_stage_t::cancelling_k)
             return ucall_status_success_k;
         tally<atomic_ref_template_>(statistics.cancellations);
+        if (operations.carrying(*operation.request) == &operation &&
+            operation.request->operation == io_operation_t::accept_k)
+            return operations.end_accepts(operation, queue);
         if (operation.in_flight()) return operations.cancel_in_flight(operation, queue);
         auto& owner = *operation.socket_slot;
         if (owner.receive_operation != operations.index_of(operation))
@@ -468,7 +472,7 @@ struct linux_uring618_engine {
         while (count != output.size()) {
             auto* operation = operations.pop(operations.completed_operations);
             if (!operation) break;
-            io_completion_t completed = operations.completion_of(*operation, queue);
+            io_completion_t completed = operations.completion_of(*operation, queue, socket_slots);
             if (operation->receive_source == uring_receive_source_t::backlog_k) {
                 auto& owner = *operation->socket_slot;
                 completed.data = owner.backlog.data() + owner.backlog_offset;

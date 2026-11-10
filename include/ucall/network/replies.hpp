@@ -6,7 +6,7 @@
  */
 #pragma once
 
-#include <bit>      // `std::countr_zero`, `std::has_single_bit`
+#include <bit>      // `std::bit_cast`, `std::countr_zero`, `std::has_single_bit`
 #include <optional> // `std::optional`
 
 #include "ucall/http/messages.hpp"     // `http_connection_t`, `http_role_t`
@@ -14,7 +14,7 @@
 #include "ucall/network/exchanges.hpp" // `bit_of`, `claimed_k`, `replied_k`, `detached_k`
 #include "ucall/network/types.hpp" // `transport_stage_t`, `operation_state_t`, `receive_state_t`, `transmit_state_t`
 #include "ucall/tunnel/types.hpp"  // `secure_tunnel_geometry_t`, `secure_tunnel_overhead_k`
-#include "ucall/utilities/sockets.hpp" // `file_close`, `file_direct_alignment`, `file_geometry_t`
+#include "ucall/utilities/sockets.hpp" // `close_native_file`, `direct_alignment_of`, `native_file_of`
 #include "ucall/utilities/types.hpp"   // `text_view`, `byte_t`, `descriptor_t`, `publish`
 
 namespace unum::ucall::network {
@@ -32,10 +32,13 @@ using tunnel::secure_tunnel_geometry_t;
 using tunnel::secure_tunnel_overhead_k;
 using utilities::allocate_unique;
 using utilities::byte_t;
+using utilities::close_native_file;
 using utilities::descriptor_t;
-using utilities::file_close;
-using utilities::file_direct_alignment;
+using utilities::direct_alignment_of;
 using utilities::file_geometry_t;
+using utilities::invalid_native_file_k;
+using utilities::native_file_of;
+using utilities::native_file_t;
 using utilities::publish;
 using utilities::span;
 using utilities::text_view;
@@ -73,9 +76,9 @@ struct replies {
 
     /** Whether @p file_segment holds a file the loop opened from its path, which only the loop
      *  closes. */
-    static bool owns_file_descriptor(file_segment_t const& file_segment) noexcept {
+    static bool owns_file(file_segment_t const& file_segment) noexcept {
         return file_segment.file_origin == file_origin_t::opened_path_k &&
-               file_segment.stage != file_segment_stage_t::unopened_k && file_segment.file_descriptor >= 0;
+               file_segment.stage != file_segment_stage_t::unopened_k && file_segment.file != invalid_native_file_k;
     }
 
     /** A free file segment for @p exchange's replier: its own, then those the loop released, else
@@ -135,15 +138,24 @@ struct replies {
                 ucall_file_range_t const& file = part.data.file;
                 record->file_offset = file.offset;
                 record->remaining_bytes = file.length;
-                record->file_descriptor = file.file_descriptor;
+                record->file = native_file_of(file.file_descriptor);
                 record->stage = file_segment_stage_t::opened_k;
                 record->file_origin = file_origin_t::caller_descriptor_k;
+                // Windows reads through a handle its loop reopens beneath the caller's, owning it.
+                if constexpr (UCALL_OS_WINDOWS_) {
+                    record->stage = file_segment_stage_t::unopened_k;
+                    record->file_origin = file_origin_t::opened_path_k;
+                    if (ucall_status_t const named = http_t::append_text(record->segment.bytes,
+                                                                         {std::string_view {"\0", 1}});
+                        named != ucall_status_success_k)
+                        return named;
+                }
             }
             else {
                 ucall_path_range_t const& path = part.data.path;
                 record->file_offset = path.offset;
                 record->remaining_bytes = path.length;
-                record->file_descriptor = exchange.network_interface->reply_directory_descriptors[path.directory_index];
+                record->file = exchange.network_interface->reply_directory_descriptors[path.directory_index];
                 record->stage = file_segment_stage_t::unopened_k;
                 record->file_origin = file_origin_t::opened_path_k;
                 if (ucall_status_t const copied = http_t::append_text(
@@ -541,8 +553,8 @@ struct replies {
      *  the replier, or keeps it while the kernel may hold its framing. */
     static void retire_file_segment(server_exchange_t& exchange, file_segment_t& file_segment) noexcept {
         exchange.oldest_file_segment = &file_segment == exchange.newest_file_segment ? nullptr : file_segment.next;
-        if (owns_file_descriptor(file_segment)) file_close(file_segment.file_descriptor);
-        file_segment.file_descriptor = -1;
+        if (owns_file(file_segment)) close_native_file(file_segment.file);
+        file_segment.file = invalid_native_file_k;
         // Releasing orders the last use of a borrowed descriptor before a replier sees none unsent.
         atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.sub(1, std::memory_order_release);
         if ((&file_segment == exchange.newest_file_segment || &file_segment.segment == exchange.newest_segment) &&
@@ -748,12 +760,14 @@ struct replies {
     }
 
     /** Measures a file segment's file on the loop, as a @c statx never waits on a peer: its size,
-     *  and the alignment its unbuffered reads keep. */
+     *  and the alignment its unbuffered reads keep in offset and length. */
     static void stat_file_segment(server_exchange_t const& exchange, file_segment_t& file_segment) noexcept {
-        file_geometry_t const geometry = file_direct_alignment(file_segment.file_descriptor);
-        std::size_t const alignment = std::max<std::size_t>(geometry.alignment, 512);
+        file_geometry_t const geometry = direct_alignment_of(file_segment.file);
+        std::size_t const alignment = std::max<std::size_t>(geometry.offset_alignment, 512);
+        // Reads land on whole pages of a window, so a file wanting more of memory fails here.
         if (geometry.error == -ENXIO) file_segment.stage = file_segment_stage_t::not_found_k;
-        else if (geometry.error || alignment > file_max_alignment_k || !std::has_single_bit(alignment))
+        else if (geometry.error || geometry.memory_alignment > page_bytes_k || alignment > file_max_alignment_k ||
+                 !std::has_single_bit(alignment))
             file_segment.stage = file_segment_stage_t::failed_k;
         else {
             file_segment.alignment_log2 = static_cast<std::uint8_t>(std::countr_zero(alignment));
@@ -770,7 +784,7 @@ struct replies {
         while (file_segment->stage != file_segment_stage_t::unopened_k) file_segment = file_segment->next;
         file_segment->segment.bytes.clear();
         descriptor_t const result = completion.result;
-        file_segment->file_descriptor = result >= 0 ? static_cast<int>(result) : -1;
+        file_segment->file = result >= 0 ? std::bit_cast<native_file_t>(result) : invalid_native_file_k;
         if (result >= 0) {
             file_segment->stage = file_segment_stage_t::opened_k;
             return;
@@ -796,7 +810,7 @@ struct replies {
         io_request_t* request = connection.transport.emit(connection.file_read_request, io_operation_t::file_open_k,
                                                           file_segment.segment.bytes);
         request->deadline = 0;
-        request->file = {.directory_descriptor = file_segment.file_descriptor};
+        request->file = {.file = file_segment.file};
         return request;
     }
 
@@ -933,32 +947,62 @@ struct replies {
         return oldest;
     }
 
-    /** A vacant window for @p connection's stream: a free one, a slab the pool grows by while below
-     *  its limit, else none, queuing the stream for the next release. */
-    static std::uint32_t borrow_window(event_loop_t& event_loop, connection_t& connection) noexcept {
+    /** Grows the pool by one run of windows in one allocation, registered with the engine once: as
+     *  many windows as fill the allocator's page, at least one and at most the pool's limit, so a
+     *  huge page holds many. A run the engine fails to register, rather than declining to pin it,
+     *  adds no window. */
+    static ucall_status_t grow_windows(event_loop_t& event_loop) noexcept {
         auto& pool = event_loop.file_windows;
-        std::uint32_t window = pool.free_windows;
-        if (window != absent_k) pool.free_windows = pool.windows[window].next;
-        else if (pool.allocated_windows != pool.max_windows) {
-            using page_t = typename file_window_pool_t::page_t;
-            auto* slab = rebound_allocator<page_t> {event_loop.allocator}.allocate(file_window_pool_t::window_bytes /
-                                                                                   page_bytes_k);
-            if (!slab) return absent_k;
-            window = pool.allocated_windows++;
-            [[maybe_unused]] st::status_t const listed = pool.window_memory.push_back(st::assume_reserved,
-                                                                                      reinterpret_cast<byte_t*>(slab));
-            [[maybe_unused]] st::status_t const added = pool.windows.push_back(st::assume_reserved, file_window_t {});
-            io_request_t release {.operation = io_operation_t::zero_copy_release_k, .context = &pool};
-            // Past the engine's table or its locked-memory cap, sends pin each window themselves.
-            if (pool.pinning == range_pinning_t::pinned_k) {
-                memory_registration_t const registration = event_loop.engine.register_memory(
-                    {reinterpret_cast<byte_t*>(slab), file_window_pool_t::window_bytes});
-                pool.pinning = registration.pinning;
-                if (registration.pinning == range_pinning_t::pinned_k) release.registered_memory = registration.index;
+        using page_t = typename file_window_pool_t::page_t;
+        rebound_allocator<page_t> pages {event_loop.allocator};
+        std::size_t granularity = page_bytes_k;
+        if constexpr (requires { pages.default_page_size(); })
+            granularity = std::max<std::size_t>(pages.default_page_size(), page_bytes_k);
+        std::size_t const window_bytes = file_window_pool_t::window_bytes;
+        std::size_t const run_windows = std::min<std::size_t>(std::max<std::size_t>(granularity / window_bytes, 1),
+                                                              pool.max_windows - pool.allocated_windows);
+        std::size_t const run_bytes = (run_windows * window_bytes + granularity - 1) / granularity * granularity;
+        page_t* const run = pages.allocate(run_bytes / page_bytes_k);
+        if (!run) return ucall_status_out_of_memory_k;
+        byte_t* const base = reinterpret_cast<byte_t*>(run);
+        io_request_t release {.operation = io_operation_t::zero_copy_release_k, .context = &pool};
+        // Past the engine's table or its locked-memory cap, sends pin each window themselves.
+        if (pool.pinning == range_pinning_t::pinned_k) {
+            memory_registration_t const registration = event_loop.engine.register_memory(
+                {base, run_windows * window_bytes});
+            if (registration.status != ucall_status_success_k) {
+                pages.deallocate(run, run_bytes / page_bytes_k);
+                return registration.status;
             }
+            pool.pinning = registration.pinning;
+            if (registration.pinning == range_pinning_t::pinned_k) release.registered_memory = registration.index;
+        }
+        if (release.registered_memory == io_unregistered_k)
+            tally<atomic_ref>(event_loop.statistics.windows_unpinned, run_windows);
+        [[maybe_unused]] st::status_t const kept = pool.window_runs.push_back(st::assume_reserved,
+                                                                              span<byte_t> {base, run_bytes});
+        for (std::size_t offset = run_windows * window_bytes; offset;) {
+            offset -= window_bytes;
+            [[maybe_unused]] st::status_t const listed = pool.window_memory.push_back(st::assume_reserved,
+                                                                                      base + offset);
+            [[maybe_unused]] st::status_t const added = pool.windows.push_back(
+                st::assume_reserved, file_window_t {.next = std::exchange(pool.free_windows, pool.allocated_windows)});
             [[maybe_unused]] st::status_t const named = pool.release_requests.push_back(st::assume_reserved,
                                                                                         io_request_t {release});
+            ++pool.allocated_windows;
         }
+        return ucall_status_success_k;
+    }
+
+    /** A vacant window for @p connection's stream: a free one, one of a run the pool grows by while
+     *  below its limit, else none, queuing the stream for the next release. */
+    static std::uint32_t borrow_window(event_loop_t& event_loop, connection_t& connection) noexcept {
+        auto& pool = event_loop.file_windows;
+        if (pool.free_windows == absent_k && pool.allocated_windows != pool.max_windows &&
+            grow_windows(event_loop) != ucall_status_success_k)
+            return absent_k;
+        std::uint32_t const window = pool.free_windows;
+        if (window != absent_k) pool.free_windows = pool.windows[window].next;
         else {
             connection.file_reading = file_read_state_t::waiting_window_k;
             if (pool.newest_waiting_connection) pool.newest_waiting_connection->next_waiting_connection = &connection;
@@ -1012,7 +1056,7 @@ struct replies {
         }
         request->deadline = 0;
         request->registered_memory = pool.registered_memory(window);
-        request->file = {.offset = record.extent_offset, .file_descriptor = file_segment.file_descriptor};
+        request->file = {.offset = record.extent_offset, .file = file_segment.file};
         return request;
     }
 

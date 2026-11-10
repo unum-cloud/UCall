@@ -330,7 +330,9 @@ struct server_t {
             {"replied_dequeues", "replied dequeues", &ucall_event_loop_statistics_t::replied_dequeues},
             {"refused_requests", "refused requests", &ucall_event_loop_statistics_t::refused_requests},
             {"handshake_failures", "handshake failures", &ucall_event_loop_statistics_t::handshake_failures},
-            {"authorizer_refusals", "authorizer refusals", &ucall_event_loop_statistics_t::authorizer_refusals}};
+            {"authorizer_refusals", "authorizer refusals", &ucall_event_loop_statistics_t::authorizer_refusals},
+            {"shed_connections", "shed connections", &ucall_event_loop_statistics_t::shed_connections},
+            {"windows_unpinned", "unpinned windows", &ucall_event_loop_statistics_t::windows_unpinned}};
         ucall_outcome_t outcome {};
         if (json) std::printf("{\"event_loops\":[");
         for (std::size_t index = 0; index != event_loops; ++index) {
