@@ -351,7 +351,8 @@ struct uring_queue {
         io_uring_cqe* completion {};
         int result = deadline ? io_uring_submit_and_wait_timeout(&ring, &completion, wait, &timeout, nullptr)
                               : io_uring_submit_and_wait(&ring, wait);
-        return result == -ETIME || result == -EINTR ? 0 : result;
+        // A signal, the deadline, or a full queue's overflow ends it empty; reaping makes room.
+        return result == -ETIME || result == -EINTR || result == -EBUSY ? 0 : result;
     }
 
     /** Sizes the receive pool for @p capacity operations before the ring opens. */
@@ -1612,11 +1613,13 @@ struct linux_uring612_engine {
             if (count) return count;
             unsigned wait = policy == io_wait_t::blocking_k && (!deadline || monotonic_ns() < deadline) ? 1 : 0;
             int result = queue.enter(wait, deadline);
-            if (result < 0) return result;
+            // A kernel short of request memory took nothing; the submissions wait in the ring.
+            if (result < 0 && result != -EAGAIN) return result;
             reap();
             maintain();
             count = collect(output);
-            if (count || policy == io_wait_t::nonblocking_k || (deadline && monotonic_ns() >= deadline)) return count;
+            if (count || result < 0 || policy == io_wait_t::nonblocking_k || (deadline && monotonic_ns() >= deadline))
+                return count;
         }
     }
     void discard(std::uint64_t user_data) noexcept {

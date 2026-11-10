@@ -32,6 +32,7 @@ using utilities::byte_t;
 using utilities::bytes_view;
 using utilities::descriptor_t;
 using utilities::file_direct_switch;
+using utilities::file_path_beneath;
 using utilities::largest_receive_buffer;
 using utilities::native_file_of;
 using utilities::native_file_t;
@@ -520,19 +521,6 @@ struct formatting {
         return end != std::string_view::npos && end >= 8 && http_t::equal(text.substr(end - 8, 8), "HTTP/1.0");
     }
 
-    /** Whether @p path names a file beneath a directory: not empty, not absolute, and free of NUL
-     *  bytes and <tt>..</tt> components. */
-    static bool stays_beneath_directory(std::string_view path) noexcept {
-        if (path.empty() || path.front() == '/' || http_t::find(path, '\0') != std::string_view::npos) return false;
-        for (std::size_t start = 0; start <= path.size();) {
-            std::size_t const slash = http_t::find(path, '/', start);
-            std::size_t const end = slash == std::string_view::npos ? path.size() : slash;
-            if (http_t::equal(path.substr(start, end - start), "..")) return false;
-            start = end + 1;
-        }
-        return true;
-    }
-
     /** Refuses a range whose end overflows its counter, which no file can satisfy. */
     static ucall_status_t check_range(std::uint64_t offset, std::uint64_t length) noexcept {
         return length > (std::numeric_limits<std::uint64_t>::max)() - offset ? ucall_status_invalid_argument_k
@@ -556,7 +544,7 @@ struct formatting {
             ucall_path_range_t const& path = part.data.path;
             if (!http_t::valid_view(path.relative_path) ||
                 path.directory_index >= exchange.network_interface->reply_directory_descriptors.size() ||
-                !stays_beneath_directory(text_view(path.relative_path)))
+                !file_path_beneath(text_view(path.relative_path)))
                 return ucall_status_invalid_argument_k;
             return check_range(path.offset, path.length);
         }

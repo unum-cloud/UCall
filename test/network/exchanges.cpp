@@ -1065,6 +1065,43 @@ static case_result_t test_keepalive_eviction(random_generator_t& generator) {
     return failures + fixture.stop();
 }
 
+/** At its connection budget the server evicts a peer that sent a streamed head and stalled on its
+ *  body ahead of a keep-alive connection idle since, so a dribbler cannot hold its slot. */
+static case_result_t test_stalled_stream_eviction(random_generator_t& generator) {
+    fixture_t fixture {{.connections = 2}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string_view const stalled = "POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n";
+    std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
+    auto send = [&](raw_client_t& client, std::string_view bytes) {
+        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + 5s));
+    };
+    raw_client_t dribbler, idle, waiting;
+    require(failures + fixture.stop(), dribbler.connect(fixture.address));
+    send(dribbler, stalled);
+    failures += await_held_in_background(fixture, 1);
+    require(failures + fixture.stop(), idle.connect(fixture.address));
+    send(idle, echo);
+    failures += expect(read_response(idle, 0).status == 200, "the idle client was not served");
+    require(failures + fixture.stop(), waiting.connect(fixture.address));
+    send(waiting, echo);
+    read_end_t const answered = waiting.read(1, steady_clock::now() + 1s);
+    failures += expect(answered == read_end_t::filled_k && read_response(waiting, 0).status == 200,
+                       "the waiting client ended as {}", static_cast<int>(answered));
+    failures += expect(dribbler.read_until_close(steady_clock::now() + 1s) == read_end_t::closed_k,
+                       "the stalled stream was not evicted first");
+    failures += expect(idle.read(idle.received.size() + 1, steady_clock::now() + 100ms) == read_end_t::timed_out_k,
+                       "the idle client was evicted ahead of the stalled stream");
+    ucall_outcome_t outcome {};
+    ucall_server_reply_content_t reply {fixture.server, &outcome, fixture.take_held(),   ucall_http_status_ok_k,
+                                        nullptr,        0,        uc::bytes_view("late")};
+    ucall_server_reply_content(&reply);
+    failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_connection_closed_k,
+                       "the evicted stream's reply answered {}", ucall_status_name(outcome.status));
+    return failures + fixture.stop();
+}
+
 /** A request whose peer left lives until answered, so once a loop holds as many of those as it
  *  holds exchanges, new requests answer 503 until one is answered. */
 static case_result_t test_orphaned_exchanges_bounded(random_generator_t& generator) {
@@ -1698,6 +1735,7 @@ void run_exchanges(suite_totals_t& totals) {
     run_test(totals, "test_drain_closes_listener", test_drain_closes_listener);
     run_test(totals, "test_accept_exhaustion_sheds", test_accept_exhaustion_sheds);
     run_test(totals, "test_keepalive_eviction", test_keepalive_eviction);
+    run_test(totals, "test_stalled_stream_eviction", test_stalled_stream_eviction);
     run_test(totals, "test_orphaned_exchanges_bounded", test_orphaned_exchanges_bounded);
     run_test(totals, "test_request_peer_ipv6", test_request_peer_ipv6);
     run_test(totals, "test_interface_listen_descriptor", test_interface_listen_descriptor);

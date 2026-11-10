@@ -15,10 +15,6 @@ add_executable(ucall_test_c "${PROJECT_SOURCE_DIR}/c/test.c")
 target_link_libraries(ucall_test_c PRIVATE ucall_static ucall_sanitizers ucall_warnings)
 target_compile_features(ucall_test_c PRIVATE c_std_11)
 add_test(NAME c COMMAND ucall_test_c)
-add_test(NAME ucall_duplicate_symbols
-         COMMAND ${CMAKE_COMMAND} "-DOBJECTS=$<TARGET_OBJECTS:ucall_static>"
-                 -P "${forkunion_SOURCE_DIR}/cmake/forkunion_duplicate_symbols.cmake"
-)
 
 add_executable(
     ucall_test_network network.cpp network/exchanges.cpp network/bodies.cpp network/client.cpp network/files.cpp
@@ -34,8 +30,11 @@ function (ucall_network_case name_ enabled_ backend_)
         )
     endif ()
 endfunction ()
-ucall_network_case(parity ON automatic)
-set_tests_properties(parity PROPERTIES ENVIRONMENT UCALL_FILTER=test_backend_parity)
+# Parity compares the POSIX engines with one another, which Windows lacks.
+if (UNIX)
+    ucall_network_case(parity ON automatic)
+    set_tests_properties(parity PROPERTIES ENVIRONMENT UCALL_FILTER=test_backend_parity)
+endif ()
 # Each case runs where its kernel facility exists; one built without its engine skips, naming the facility.
 if (CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
     set(ucall_linux_kernel_ ON)

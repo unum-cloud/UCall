@@ -220,8 +220,9 @@ static case_result_t test_misaligned_ranges_noise_xx() {
 
 /** A path that is missing, unreadable, a FIFO, a directory, or a link out of the directory replaces
  *  the reply with @c 404, without hanging, and a range past the end with @c 416 naming the size;
- *  the outcome turns from deferred to the cause. Paths naming @c .., absolute ones, and directories
- *  past the interface's list are refused at once; the caller keeps the descriptors. */
+ *  the outcome turns from deferred to the cause. Paths naming @c .., absolute ones, ones holding a
+ *  NUL, a backslash or a colon, and directories past the interface's list are refused at once; the
+ *  caller keeps the descriptors. */
 static case_result_t path_refusals(ucall_security_t security) {
     file_tree_t tree;
     if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
@@ -272,9 +273,10 @@ static case_result_t path_refusals(ucall_security_t security) {
         }
     std::string_view const nul {"a\0b", 3};
     int const kept = tree.open("hello.txt");
-    for (ucall_reply_part_t const& refused : {path_part("../hello.txt"), path_part("subdir/../../outside.txt"),
-                                              path_part("/etc/hostname"), path_part("/proc/self/fd/0"), path_part(""),
-                                              path_part(nul), path_part("hello.txt", 0, 0, 1), file_part(-1)}) {
+    for (ucall_reply_part_t const& refused :
+         {path_part("../hello.txt"), path_part("subdir/../../outside.txt"), path_part("/etc/hostname"),
+          path_part("/proc/self/fd/0"), path_part(""), path_part(nul), path_part("..\\hello.txt"),
+          path_part("c:hello.txt"), path_part("hello.txt", 0, 0, 1), file_part(-1)}) {
         announce("refusing {:?}", refused.kind == ucall_reply_part_path_k
                                       ? uc::text_view(refused.data.path.relative_path)
                                       : std::string_view {"descriptor -1"});

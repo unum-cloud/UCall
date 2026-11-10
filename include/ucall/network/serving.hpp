@@ -799,9 +799,12 @@ struct serving {
             else connection.submitted(*next);
         }
         auto const stage = connection.transport.stage;
-        // Saturation evicts the connection that progressed least recently and holds no request.
+        server_exchange_t const* const oldest = connection.oldest_exchange;
+        // Saturation evicts the connection that progressed least recently and holds no request, or
+        // only a streamed one waiting on its peer: every byte pulled, and no reply adopted.
         if ((stage == transport_stage_t::open_k || stage == transport_stage_t::handshake_k) &&
-            !connection.oldest_exchange) {
+            (!oldest || (oldest == connection.streaming && oldest->stage == exchange_stage_t::dispatched_k &&
+                         oldest->body_chunk.empty()))) {
             relist(event_loop, connection, connection_order_t::keepalive_k);
             // A peer parked while every connection was busy evicts the first to turn idle.
             evict(event_loop, interface_order(server, event_loop, *connection.network_interface));

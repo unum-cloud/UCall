@@ -527,11 +527,13 @@ struct linux_uring618_engine {
                 wait_deadline = !wait_deadline ? earliest_timed : fu::min_of(wait_deadline, earliest_timed);
             unsigned wait = policy == io_wait_t::blocking_k && (!wait_deadline || now < wait_deadline) ? 1 : 0;
             int result = queue.enter(wait, wait_deadline);
-            if (result < 0) return result;
+            // A kernel short of request memory took nothing; the submissions wait in the ring.
+            if (result < 0 && result != -EAGAIN) return result;
             reap();
             maintain();
             count = collect(output);
-            if (count || policy == io_wait_t::nonblocking_k || (deadline && monotonic_ns() >= deadline)) return count;
+            if (count || result < 0 || policy == io_wait_t::nonblocking_k || (deadline && monotonic_ns() >= deadline))
+                return count;
         }
     }
     void discard(std::uint64_t user_data) noexcept {

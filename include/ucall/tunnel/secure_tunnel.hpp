@@ -289,7 +289,8 @@ class secure_tunnel {
      *  shared between backends.
      *
      *  On first reaching @c ready_k, the bytes past @c consumed are the peer's first record and
-     *  must be opened before posting a read, or both sides wait until the idle timeout.
+     *  must be opened before posting a read, or both sides wait until a client call's deadline or
+     *  the server's saturation eviction closes the connection.
      *
      *  Idempotent once the record layer is live, so a driver may call it on every completion
      *  without checking first.
@@ -489,7 +490,8 @@ class secure_tunnel {
      *
      *  @warning Being keyless means it believes the prefix. A peer that inflates one makes this ask
      *      for bytes that will never arrive, and nothing here can tell that from a large record
-     *      still in flight. The idle timeout is what closes such a connection, not this function.
+     *      still in flight. A client call's deadline or the server's saturation eviction closes
+     *      such a connection, while this function never does.
      *
      *  A declared length the wire format does not allow still reads as a boundary here; that is
      *  @c open's to reject.

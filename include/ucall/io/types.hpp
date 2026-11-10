@@ -554,7 +554,8 @@ int readiness_poll(engine_type_& engine, span<io_completion_t> completions, io_w
         count = readiness_progress<atomic_ref_template_>(engine, engine.ready_operations, completions, count, now);
         if (count || round || !engine.active) break;
         int const result = engine.wait(wait);
-        if (result < 0 && result != -EINTR) return result;
+        // A signal, or poll(2) short of kernel memory, ends the wait with nothing landed.
+        if (result < 0 && result != -EINTR && result != -EAGAIN && result != -ENOMEM) return result;
     }
     return static_cast<int>(count);
 }
@@ -602,6 +603,8 @@ class io_engine_variant {
      *    it cannot accept from borrowed @p listeners.
      *  - @c io_k The setup was refused, or under automatic every engine's was, the last one's
      *    status answering for all of them.
+     *  - @c out_of_memory_k The setup ran short of memory, which under automatic passes on to the
+     *    next engine like a refusal.
      */
     ucall_status_t open(ucall_io_backend_t backend, std::size_t depth, std::size_t capacity,
                         io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k,

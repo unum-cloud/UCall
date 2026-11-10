@@ -417,7 +417,8 @@ typedef enum ucall_status_t {
     /** The build, backend, or machine does not implement the requested feature. */
     ucall_status_unsupported_k = 16,
 
-    /** An argument is null, out of range, or contradicts another argument. */
+    /** An argument is null, out of range, or contradicts another argument. The outcome itself is
+     *  never @c NULL: it is where this status lands. */
     ucall_status_invalid_argument_k = 17,
 
     /** The requested endpoint, header, or parameter does not exist. */
@@ -786,6 +787,8 @@ UCALL_EXPORT ucall_status_t ucall_decode_percent(ucall_bytes_view_t encoded, uca
  *  @param[out] major Output for the major version.
  *  @param[out] minor Output for the minor version.
  *  @param[out] patch Output for the patch version.
+ *
+ *  None of the three outputs may be @c NULL.
  */
 UCALL_EXPORT void ucall_version(int* major, int* minor, int* patch);
 

@@ -432,6 +432,21 @@ static_assert(sizeof(file_geometry_t) == 24);
 /** The alignment unbuffered reads assume where the filesystem cannot say, a page everywhere. */
 inline constexpr std::uint32_t file_portable_alignment_k = 4096;
 
+/** Whether @p path names something beneath its directory: relative, and free of NUL bytes,
+ *  backslashes, <tt>:</tt> drives or streams, and <tt>..</tt> segments, alike on every platform. */
+inline bool file_path_beneath(std::string_view path) noexcept {
+    if (path.empty() || path.front() == '/' ||
+        path.find_first_of(std::string_view {"\\:\0", 3}) != std::string_view::npos)
+        return false;
+    for (std::size_t start = 0; start <= path.size();) {
+        std::size_t end = path.find('/', start);
+        if (end == std::string_view::npos) end = path.size();
+        if (path.substr(start, end - start) == "..") return false;
+        start = end + 1;
+    }
+    return true;
+}
+
 #if UCALL_OS_WINDOWS_
 
 /** Measures the open regular @p file; unbuffered handles want sector alignment, which no volume
@@ -473,20 +488,6 @@ inline descriptor_t directory_open(char const* path) noexcept {
                                          FILE_FLAG_BACKUP_SEMANTICS, nullptr);
     if (directory != INVALID_HANDLE_VALUE) return std::bit_cast<descriptor_t>(directory);
     return GetLastError() == ERROR_FILE_NOT_FOUND || GetLastError() == ERROR_PATH_NOT_FOUND ? -ENOENT : -EIO;
-}
-
-/** Whether @p path names something beneath its directory: relative, without a drive, a <tt>..</tt>
- *  segment or a <tt>:</tt> stream. */
-inline bool file_path_beneath(std::string_view path) noexcept {
-    if (path.empty() || path.front() == '/' || path.front() == '\\' || path.find(':') != std::string_view::npos)
-        return false;
-    for (std::size_t start = 0; start <= path.size();) {
-        std::size_t end = path.find_first_of("/\\", start);
-        if (end == std::string_view::npos) end = path.size();
-        if (path.substr(start, end - start) == "..") return false;
-        start = end + 1;
-    }
-    return true;
 }
 
 /** Opens @p path for unbuffered, overlapped reads strictly beneath the handle @p directory,
