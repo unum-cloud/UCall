@@ -48,6 +48,10 @@ enum class listing_t : std::uint8_t { unlisted_k, listed_k };
  *  a runtime's collector may free what another thread polled. */
 enum class io_issuer_scope_t : std::uint8_t { one_thread_k, any_thread_k };
 
+/** Where a server's listeners come from: created through its engines, or handed over by the caller
+ *  as some are. */
+enum class io_listeners_t : std::uint8_t { created_k, borrowed_k };
+
 /** What a request asks of its socket or of a file; file operations keep @c descriptor as the
  *  socket they serve, so its close waits for them, and their offsets, lengths and buffers meet the
  *  file's @c direct_alignment_of. */
@@ -112,10 +116,10 @@ enum class io_receive_memory_t : std::uint8_t { submitter_k, engine_k };
 enum class registered_memory_t : std::uint16_t {};
 
 /** The @c registered_memory of a request whose buffer lies in no engine-registered range. */
-inline constexpr registered_memory_t io_unregistered_k {std::numeric_limits<std::uint16_t>::max()};
+inline constexpr registered_memory_t io_unregistered_k {(std::numeric_limits<std::uint16_t>::max)()};
 
 /** The @c operation_index of a request no engine record carries. */
-inline constexpr std::uint32_t io_unindexed_k = std::numeric_limits<std::uint32_t>::max();
+inline constexpr std::uint32_t io_unindexed_k = (std::numeric_limits<std::uint32_t>::max)();
 
 /** The file a read reads, or the directory a @c file_open_k opens beneath, borrowed from the
  *  submitter. */
@@ -222,12 +226,20 @@ struct wake_channel_t {
 
     /** A kqueue watching the read end, as Darwin's @c poll waits in whole milliseconds. */
     int queue {-1};
+#elif UCALL_OS_WINDOWS_
+
+    /** An event the read end signals and a high-resolution timer, as @c WSAPoll waits in whole
+     *  scheduler ticks. */
+    HANDLE readable {}, timer {};
 #endif // UCALL_OS_APPLE_
     ~wake_channel_t() noexcept {
         for (auto descriptor : descriptors)
             if (descriptor >= 0) socket_close(descriptor);
 #if UCALL_OS_APPLE_
         if (queue >= 0) ::close(queue);
+#elif UCALL_OS_WINDOWS_
+        if (readable) CloseHandle(readable);
+        if (timer) CloseHandle(timer);
 #endif // UCALL_OS_APPLE_
     }
     [[nodiscard]] ucall_status_t open() noexcept {
@@ -266,6 +278,12 @@ struct wake_channel_t {
         if (nonblocking(descriptors[0]) != ucall_status_success_k ||
             nonblocking(descriptors[1]) != ucall_status_success_k)
             return ucall_status_io_k;
+#if UCALL_OS_WINDOWS_
+        readable = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        if (!readable || !timer || WSAEventSelect(static_cast<SOCKET>(descriptors[0]), readable, FD_READ) != 0)
+            return ucall_status_io_k;
+#endif // UCALL_OS_WINDOWS_
         request = {.operation = io_operation_t::read_k,
                    .descriptor = descriptors[0],
                    .data = bytes,
@@ -286,12 +304,16 @@ struct wake_channel_t {
      *  channel whose read end no engine imported. */
     void wait(std::uint64_t deadline) noexcept {
         std::uint64_t const now = monotonic_ns();
-        std::uint64_t const remaining = !deadline        ? std::numeric_limits<std::uint64_t>::max()
+        std::uint64_t const remaining = !deadline        ? (std::numeric_limits<std::uint64_t>::max)()
                                         : deadline > now ? deadline - now
                                                          : 0;
 #if UCALL_OS_WINDOWS_
-        pollfd polled {static_cast<SOCKET>(descriptors[0]), POLLRDNORM, 0};
-        utilities::socket_poll(&polled, 1, remaining);
+        // Relative, in 100 ns ticks rounded up, so the wait never ends early.
+        LARGE_INTEGER due {};
+        due.QuadPart = -static_cast<LONGLONG>(remaining / 100 + (remaining % 100 != 0));
+        HANDLE const handles[] {readable, timer};
+        if (!deadline || SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE))
+            WaitForMultipleObjects(deadline ? 2 : 1, handles, FALSE, INFINITE);
         while (recv(static_cast<SOCKET>(descriptors[0]), reinterpret_cast<char*>(bytes), sizeof(bytes), 0) > 0) {}
 #elif UCALL_OS_APPLE_
         timespec const timeout {static_cast<time_t>(remaining / 1'000'000'000),
@@ -349,7 +371,7 @@ inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, 
     tally<atomic_ref_template_>(statistics.kernel_enters);
     auto descriptor = static_cast<int>(request.descriptor);
     ssize_t result = -1;
-    auto length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
+    auto length = fu::min_of<std::size_t>(request.length, (std::numeric_limits<int>::max)());
     switch (request.operation) {
     case io_operation_t::accept_k: {
         io_peer_address_t unnamed {};
@@ -373,8 +395,8 @@ inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, 
         }
     case io_operation_t::receive_k: {
         io_vector_t const& room = io_vectors(request).front();
-        result = recv(descriptor, room.iov_base, std::min<std::size_t>(room.iov_len, std::numeric_limits<int>::max()),
-                      0);
+        result = recv(descriptor, room.iov_base,
+                      fu::min_of<std::size_t>(room.iov_len, (std::numeric_limits<int>::max)()), 0);
         break;
     }
     case io_operation_t::send_k:
@@ -520,11 +542,11 @@ int readiness_poll(engine_type_& engine, span<io_completion_t> completions, io_w
     std::size_t count {};
     for (unsigned round = 0; round != 2; ++round) {
         std::uint64_t const now = monotonic_ns();
-        std::uint64_t wait = wait_policy == io_wait_t::blocking_k ? std::numeric_limits<std::uint64_t>::max() : 0;
-        if (deadline) wait = std::min(wait, deadline > now ? deadline - now : 0);
+        std::uint64_t wait = wait_policy == io_wait_t::blocking_k ? (std::numeric_limits<std::uint64_t>::max)() : 0;
+        if (deadline) wait = fu::min_of(wait, deadline > now ? deadline - now : 0);
         for (unsigned index : engine.timed) {
             std::uint64_t const expiry = engine.operations[index].request->deadline;
-            if (expiry > now) wait = std::min(wait, expiry - now);
+            if (expiry > now) wait = fu::min_of(wait, expiry - now);
             else if (engine.operations[index].interest == io_interest_t::armed_k) readiness_wake(engine, index);
         }
         count = readiness_collect<atomic_ref_template_>(engine, completions, count);
@@ -548,7 +570,9 @@ enum class zero_copy_stage_t : std::uint8_t { untried_k, enabled_k, copying_k };
  *
  *  Under @c ucall_io_backend_automatic_k it tries the engines in declaration order, so a ring a
  *  seccomp profile or the locked-memory cap refuses falls to the next. Any other backend opens
- *  exactly its own engine or answers why it could not.
+ *  exactly its own engine or answers why it could not. An engine that accepts only from listeners
+ *  it creates declares @c borrowed_listener_refusal_k, and a server with a borrowed listener passes
+ *  over it, or is refused where it names it.
  */
 template <typename... engine_types_>
 class io_engine_variant {
@@ -574,13 +598,15 @@ class io_engine_variant {
      *      one whose setup the host admits, for @p capacity operations.
      *
      *  @par Statuses:
-     *  - @c unsupported_k The set has no engine for @p backend, or the named one's kernel lacks it.
+     *  - @c unsupported_k The set has no engine for @p backend, the named one's kernel lacks it, or
+     *    it cannot accept from borrowed @p listeners.
      *  - @c io_k The setup was refused, or under automatic every engine's was, the last one's
      *    status answering for all of them.
      */
     ucall_status_t open(ucall_io_backend_t backend, std::size_t depth, std::size_t capacity,
-                        io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k) noexcept {
-        return open_<0>(backend, depth, capacity, scope, ucall_status_unsupported_k);
+                        io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k,
+                        io_listeners_t listeners = io_listeners_t::created_k) noexcept {
+        return open_<0>(backend, depth, capacity, scope, listeners, ucall_status_unsupported_k);
     }
 
     /** The backend of the engine @c open picked, or tried last. */
@@ -652,6 +678,17 @@ class io_engine_variant {
     descriptor_t open_socket(int family) noexcept {
         return std::visit([&](auto& engine) noexcept { return engine.open_socket(family); }, engines_);
     }
+
+    /** A stream socket of @p family for a listener to bind, which the loop imports once it listens:
+     *  created with the engine's flags where its accepted sockets must share them. */
+    descriptor_t open_listener(int family) noexcept {
+        return std::visit(
+            [&](auto& engine) noexcept {
+                if constexpr (requires { engine.open_listener(family); }) return engine.open_listener(family);
+                else return socket_open(family);
+            },
+            engines_);
+    }
     descriptor_t import_socket(descriptor_t descriptor) noexcept {
         return std::visit([&](auto& engine) noexcept { return engine.import_socket(descriptor); }, engines_);
     }
@@ -677,18 +714,25 @@ class io_engine_variant {
 
     template <std::size_t index_>
     ucall_status_t open_(ucall_io_backend_t backend, std::size_t depth, std::size_t capacity, io_issuer_scope_t scope,
-                         ucall_status_t refused) noexcept {
+                         io_listeners_t listeners, ucall_status_t refused) noexcept {
         if constexpr (index_ == sizeof...(engine_types_)) return refused;
         else {
-            if (backend != ucall_io_backend_automatic_k && backend != backends_k[index_])
-                return open_<index_ + 1>(backend, depth, capacity, scope, refused);
+            using engine_t = std::variant_alternative_t<index_, engines_t>;
+            bool const automatic = backend == ucall_io_backend_automatic_k;
+            if (!automatic && backend != backends_k[index_])
+                return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
+            if constexpr (requires { engine_t::borrowed_listener_refusal_k; })
+                if (listeners == io_listeners_t::borrowed_k) {
+                    if (automatic) return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
+                    engines_.template emplace<index_>(allocator_).refusal = engine_t::borrowed_listener_refusal_k;
+                    return ucall_status_unsupported_k;
+                }
             ucall_status_t const opened = engines_.template emplace<index_>(allocator_).open(depth, capacity, scope);
             // Only the automatic ladder passes on, and only past a host refusing an engine's setup.
-            if (backend != ucall_io_backend_automatic_k ||
-                (opened != ucall_status_unsupported_k && opened != ucall_status_io_k &&
-                 opened != ucall_status_out_of_memory_k))
+            if (!automatic || (opened != ucall_status_unsupported_k && opened != ucall_status_io_k &&
+                               opened != ucall_status_out_of_memory_k))
                 return opened;
-            return open_<index_ + 1>(backend, depth, capacity, scope, opened);
+            return open_<index_ + 1>(backend, depth, capacity, scope, listeners, opened);
         }
     }
 

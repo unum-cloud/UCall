@@ -9,7 +9,6 @@
 #include <cstdio>  // `std::snprintf`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>        // `std::min`
 #include <chrono>           // `std::chrono::year_month_day`, `std::chrono::hh_mm_ss`, `std::chrono::weekday`
 #include <initializer_list> // `std::initializer_list`
 #include <optional>         // `std::optional`
@@ -60,6 +59,7 @@ struct log_field_t {
 template <typename network_type_>
 struct formatting {
     using network_t = network_type_;
+    using engine_t = typename network_t::engine_t;
     using http_t = typename network_t::http_t;
     using server_exchange_t = typename network_t::server_exchange_t;
     using network_interface_t = typename network_t::network_interface_t;
@@ -134,8 +134,10 @@ struct formatting {
         return peer;
     }
 
-    /** Binds and listens on the interface's address, trying each address it resolves to. */
-    static ucall_status_t bind_listener(network_interface_t& network_interface, descriptor_t& descriptor) noexcept {
+    /** Binds and listens on the interface's address through @p engine, trying each address it
+     *  resolves to. */
+    static ucall_status_t bind_listener(network_interface_t& network_interface, engine_t& engine,
+                                        descriptor_t& descriptor) noexcept {
         vector<char> host {rebound_allocator<char> {network_interface.address.get_allocator()}},
             service {host.get_allocator()};
         if (auto status = split_address(text_view(network_interface.config.address), host, service);
@@ -148,7 +150,7 @@ struct formatting {
         addrinfo* addresses = nullptr;
         if (getaddrinfo(host.data(), service.data(), &hints, &addresses) != 0) return ucall_status_connection_failed_k;
         for (auto* address = addresses; address; address = address->ai_next) {
-            descriptor = socket_open(address->ai_family);
+            descriptor = engine.open_listener(address->ai_family);
             if (descriptor < 0) continue;
             int enabled = 1;
 #if UCALL_OS_WINDOWS_
@@ -168,8 +170,8 @@ struct formatting {
 #endif // UCALL_OS_LINUX_
             if (configured && bind(descriptor, address->ai_addr, address->ai_addrlen) == 0 &&
                 listen(descriptor,
-                       static_cast<int>(std::min<std::size_t>(network_interface.config.max_concurrent_connections,
-                                                              std::numeric_limits<int>::max()))) == 0)
+                       static_cast<int>(fu::min_of<std::size_t>(network_interface.config.max_concurrent_connections,
+                                                                (std::numeric_limits<int>::max)()))) == 0)
                 break;
             socket_close(descriptor);
             descriptor = -1;
@@ -178,17 +180,34 @@ struct formatting {
         return descriptor < 0 ? ucall_status_connection_failed_k : ucall_status_success_k;
     }
 
-    /** Readies loop zero's acceptor on a duplicate of the listener the interface was handed, or on
-     *  one bound to its address, and reports the bound address, or an AF_UNIX socket's path. */
-    static ucall_status_t bind_acceptor(network_interface_t& network_interface,
-                                        interface_acceptor_t& acceptor) noexcept {
+    /** The send buffer the interface's accepted sockets inherit, read before any engine opens to
+     *  size the loops' file windows: a borrowed listener's own, or else the TCP default, which a
+     *  fresh socket of either family shows just as the listener bound later will. */
+    static std::size_t listener_send_buffer(network_interface_t const& network_interface) noexcept {
+        std::intptr_t const* const borrowed = network_interface.config.listen_descriptor;
+        descriptor_t const descriptor = borrowed ? static_cast<descriptor_t>(*borrowed) : socket_open(AF_INET);
+        int send_buffer = 0;
+        socket_length_t length = sizeof(send_buffer);
+        bool const measured = descriptor >= 0 &&
+                              getsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&send_buffer),
+                                         &length) == 0 &&
+                              send_buffer > 0;
+        if (!borrowed && descriptor >= 0) socket_close(descriptor);
+        return measured ? static_cast<std::size_t>(send_buffer) : max_unsent_bytes_k;
+    }
+
+    /** Readies loop zero's @p acceptor on a duplicate of the listener its interface was handed, or
+     *  on one @p engine opens and binds to its address, and reports the bound address, or an
+     *  AF_UNIX socket's path. */
+    static ucall_status_t bind_acceptor(interface_acceptor_t& acceptor, engine_t& engine) noexcept {
         if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
+        network_interface_t& network_interface = *acceptor.network_interface;
         descriptor_t descriptor = -1;
         if (network_interface.config.listen_descriptor) {
             descriptor = socket_duplicate_listener(*network_interface.config.listen_descriptor);
             if (descriptor < 0) return ucall_status_invalid_argument_k;
         }
-        else if (ucall_status_t const listened = bind_listener(network_interface, descriptor);
+        else if (ucall_status_t const listened = bind_listener(network_interface, engine, descriptor);
                  listened != ucall_status_success_k)
             return listened;
         sockaddr_storage bound {};
@@ -201,7 +220,7 @@ struct formatting {
         // sockets take keepalives.
         if (unix_domain) {
             auto const& path = reinterpret_cast<sockaddr_un const&>(bound).sun_path;
-            std::size_t const path_length = std::min(std::strlen(path), sizeof(path) - 1);
+            std::size_t const path_length = fu::min_of(std::strlen(path), sizeof(path) - 1);
             std::memcpy(text, path, path_length);
             text[path_length] = '\0';
         }
@@ -221,17 +240,9 @@ struct formatting {
         }
         network_interface.config.address = bytes_view(
             {network_interface.address.data(), network_interface.address.size() - 1});
-        int send_buffer = 0;
-        socket_length_t send_buffer_length = sizeof(send_buffer);
-        if (getsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&send_buffer), &send_buffer_length) !=
-                0 ||
-            send_buffer <= 0)
-            send_buffer = static_cast<int>(max_unsent_bytes_k);
-        network_interface.send_buffer_bytes = static_cast<std::size_t>(send_buffer);
         network_interface.family = bound.ss_family;
         if (!network_interface.config.max_request_bytes)
             network_interface.config.max_request_bytes = largest_receive_buffer(bound.ss_family, max_unsent_bytes_k);
-        acceptor.network_interface = &network_interface;
         acceptor.request = {.operation = io_operation_t::accept_k, .descriptor = descriptor, .context = &acceptor};
         return ucall_status_success_k;
     }
@@ -282,7 +293,7 @@ struct formatting {
         std::size_t length = 0;
         auto put = [&](auto const&... texts) noexcept {
             for (std::string_view const text : {std::string_view {texts}...}) {
-                std::size_t const fits = std::min(text.size(), sizeof(line) - length);
+                std::size_t const fits = fu::min_of(text.size(), sizeof(line) - length);
                 std::memcpy(line + length, text.data(), fits);
                 length += fits;
             }
@@ -305,7 +316,7 @@ struct formatting {
     static std::string_view format_date(char (&output)[http_date_length_k], std::time_t now) noexcept {
         static constexpr char weekdays_k[] = "SunMonTueWedThuFriSat",
                               months_k[] = "JanFebMarAprMayJunJulAugSepOctNovDec";
-        std::chrono::sys_seconds const seconds {std::chrono::seconds {std::max<std::time_t>(now, 0)}};
+        std::chrono::sys_seconds const seconds {std::chrono::seconds {fu::max_of<std::time_t>(now, 0)}};
         std::chrono::sys_days const days = std::chrono::floor<std::chrono::days>(seconds);
         std::chrono::year_month_day const date {days};
         std::chrono::hh_mm_ss<std::chrono::seconds> const time {seconds - days};
@@ -426,7 +437,7 @@ struct formatting {
                     [[maybe_unused]] st::status_t const gap = bytes.resize(bytes.size() + overhead);
                     position = geometry.headroom;
                 }
-                std::size_t const taken = std::min(text.size(), payload_end - position), end = bytes.size();
+                std::size_t const taken = fu::min_of(text.size(), payload_end - position), end = bytes.size();
                 [[maybe_unused]] st::status_t const grown = bytes.resize(end + taken);
                 std::memcpy(bytes.data() + end, text.data(), taken);
                 text.remove_prefix(taken);
@@ -446,7 +457,7 @@ struct formatting {
         for (std::size_t record = records - 1; record; --record)
             std::memmove(bytes.data() + record * stride + geometry.headroom,
                          bytes.data() + geometry.headroom + record * payload_limit,
-                         std::min(payload_limit, payload - record * payload_limit));
+                         fu::min_of(payload_limit, payload - record * payload_limit));
         return ucall_status_success_k;
     }
 
@@ -471,7 +482,7 @@ struct formatting {
         if (!output.empty()) return ucall_status_already_exists_k;
         std::size_t length = 0;
         for (ucall_reply_part_t const& part : parts) {
-            if (part.data.bytes.length > std::numeric_limits<std::size_t>::max() - length)
+            if (part.data.bytes.length > (std::numeric_limits<std::size_t>::max)() - length)
                 return ucall_status_invalid_argument_k;
             length += part.data.bytes.length;
         }
@@ -524,8 +535,8 @@ struct formatting {
 
     /** Refuses a range whose end overflows its counter, which no file can satisfy. */
     static ucall_status_t check_range(std::uint64_t offset, std::uint64_t length) noexcept {
-        return length > std::numeric_limits<std::uint64_t>::max() - offset ? ucall_status_invalid_argument_k
-                                                                           : ucall_status_success_k;
+        return length > (std::numeric_limits<std::uint64_t>::max)() - offset ? ucall_status_invalid_argument_k
+                                                                             : ucall_status_success_k;
     }
 
     /** Checks one part against @p exchange's interface, answering why it cannot be queued. A

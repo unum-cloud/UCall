@@ -196,9 +196,9 @@ struct replies {
     static void push_reply_batch(server_exchange_t& exchange, reply_batch_t& batch, reply_segment_t* first = nullptr,
                                  reply_segment_t* last = nullptr) noexcept {
         exchange.copied += batch.copied;
-        atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.add(batch.bytes, std::memory_order_relaxed);
-        atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.add(batch.file_segments,
-                                                                             std::memory_order_relaxed);
+        atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.store_add(batch.bytes, std::memory_order_relaxed);
+        atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.store_add(batch.file_segments,
+                                                                                   std::memory_order_relaxed);
         if (batch.newest_file_segment)
             link_chain(exchange.shared.pushed_file_segments, exchange.pushed_file_tail, *batch.newest_file_segment,
                        *batch.oldest_file_segment);
@@ -362,7 +362,7 @@ struct replies {
                                                                               : part.data.path.length;
             if (part.kind != ucall_reply_part_bytes_k && !size && exchange.framing == reply_framing_t::length_k)
                 return ucall_status_invalid_argument_k;
-            if (size > std::numeric_limits<std::uint64_t>::max() - length) return ucall_status_overflow_k;
+            if (size > (std::numeric_limits<std::uint64_t>::max)() - length) return ucall_status_overflow_k;
             length += size;
         }
         if (exchange.framing == reply_framing_t::bodiless_k) {
@@ -523,7 +523,8 @@ struct replies {
      *  named a release the kernel has not completed. */
     static void retire_segment(server_exchange_t& exchange, reply_segment_t& segment) noexcept {
         if (&segment == &exchange.head_segment || &segment == &exchange.end_segment) return;
-        atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.sub(segment.bytes.size(), std::memory_order_relaxed);
+        atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.store_sub(segment.bytes.size(),
+                                                                         std::memory_order_relaxed);
         if (&segment == exchange.newest_segment && replier_links(exchange)) {
             exchange.parked_segment = &segment;
             return;
@@ -556,7 +557,7 @@ struct replies {
         if (owns_file(file_segment)) close_native_file(file_segment.file);
         file_segment.file = invalid_native_file_k;
         // Releasing orders the last use of a borrowed descriptor before a replier sees none unsent.
-        atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.sub(1, std::memory_order_release);
+        atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.store_sub(1, std::memory_order_release);
         if ((&file_segment == exchange.newest_file_segment || &file_segment.segment == exchange.newest_segment) &&
             replier_links(exchange)) {
             exchange.parked_file_segment = &file_segment;
@@ -763,7 +764,7 @@ struct replies {
      *  and the alignment its unbuffered reads keep in offset and length. */
     static void stat_file_segment(server_exchange_t const& exchange, file_segment_t& file_segment) noexcept {
         file_geometry_t const geometry = direct_alignment_of(file_segment.file);
-        std::size_t const alignment = std::max<std::size_t>(geometry.offset_alignment, 512);
+        std::size_t const alignment = fu::max_of<std::size_t>(geometry.offset_alignment, 512);
         // Reads land on whole pages of a window, so a file wanting more of memory fails here.
         if (geometry.error == -ENXIO) file_segment.stage = file_segment_stage_t::not_found_k;
         else if (geometry.error || geometry.memory_alignment > page_bytes_k || alignment > file_max_alignment_k ||
@@ -876,7 +877,7 @@ struct replies {
         for (file_segment_t* file_segment = exchange.oldest_file_segment; file_segment && !refused;
              file_segment = file_segment->next) {
             if (file_segment->stage != file_segment_stage_t::measured_k) refused = file_segment;
-            else if (file_segment->remaining_bytes > std::numeric_limits<std::uint64_t>::max() - length) {
+            else if (file_segment->remaining_bytes > (std::numeric_limits<std::uint64_t>::max)() - length) {
                 file_segment->stage = file_segment_stage_t::failed_k;
                 refused = file_segment;
             }
@@ -957,10 +958,10 @@ struct replies {
         rebound_allocator<page_t> pages {event_loop.allocator};
         std::size_t granularity = page_bytes_k;
         if constexpr (requires { pages.default_page_size(); })
-            granularity = std::max<std::size_t>(pages.default_page_size(), page_bytes_k);
+            granularity = fu::max_of<std::size_t>(pages.default_page_size(), page_bytes_k);
         std::size_t const window_bytes = file_window_pool_t::window_bytes;
-        std::size_t const run_windows = std::min<std::size_t>(std::max<std::size_t>(granularity / window_bytes, 1),
-                                                              pool.max_windows - pool.allocated_windows);
+        std::size_t const run_windows = fu::min_of<std::size_t>(fu::max_of<std::size_t>(granularity / window_bytes, 1),
+                                                                pool.max_windows - pool.allocated_windows);
         std::size_t const run_bytes = (run_windows * window_bytes + granularity - 1) / granularity * granularity;
         page_t* const run = pages.allocate(run_bytes / page_bytes_k);
         if (!run) return ucall_status_out_of_memory_k;
@@ -1034,7 +1035,7 @@ struct replies {
         record.extent_offset = file_segment.file_offset / alignment * alignment;
         record.skipped = static_cast<std::uint16_t>(file_segment.file_offset - record.extent_offset);
         record.slice_bytes = static_cast<std::uint32_t>(
-            std::min<std::uint64_t>(file_segment.remaining_bytes, file_window_records_k * payload - record.skipped));
+            fu::min_of<std::uint64_t>(file_segment.remaining_bytes, file_window_records_k * payload - record.skipped));
         record.sent_bytes = 0;
         record.stage = file_window_stage_t::reading_k;
         file_segment.file_offset += record.slice_bytes;
@@ -1050,7 +1051,7 @@ struct replies {
             std::size_t const slots = (length + payload - 1) / payload;
             for (std::size_t slot = 0; slot != slots; ++slot)
                 connection.file_read_vectors[slot] = {base + slot * file_record_stride_k,
-                                                      std::min(payload, length - slot * payload)};
+                                                      fu::min_of(payload, length - slot * payload)};
             request = connection.transport.emit(connection.file_read_request, io_operation_t::file_read_vectors_k,
                                                 {reinterpret_cast<byte_t*>(connection.file_read_vectors), slots});
         }
@@ -1082,7 +1083,7 @@ struct replies {
      *  socket's @p send_buffer_bytes, so zero-copy never holds more than a copying send would. */
     static std::uint32_t stream_windows_limit(std::size_t send_buffer_bytes) noexcept {
         std::size_t const buffer = file_window_pool_t::window_bytes;
-        return static_cast<std::uint32_t>(std::max<std::size_t>(2, (send_buffer_bytes + buffer - 1) / buffer));
+        return static_cast<std::uint32_t>(fu::max_of<std::size_t>(2, (send_buffer_bytes + buffer - 1) / buffer));
     }
 
     /** The next file request of the oldest reply: open and measure every file segment of a
@@ -1167,7 +1168,7 @@ struct replies {
             secure_tunnel_geometry_t const geometry = connection.transport.tunnel.geometry();
             std::size_t const payload = window_record_payload(geometry, file_segment),
                               position = record.skipped + record.sent_bytes, slot = position / payload,
-                              end = std::min<std::size_t>(record.skipped + record.slice_bytes, (slot + 1) * payload);
+                              end = fu::min_of<std::size_t>(record.skipped + record.slice_bytes, (slot + 1) * payload);
             byte_t* const start = base + slot * file_record_stride_k + (position - slot * payload);
             bytes = {start - geometry.headroom, end - position + secure_tunnel_overhead_k};
             if (connection.transport.tunnel.seal(bytes, end - position).empty()) {

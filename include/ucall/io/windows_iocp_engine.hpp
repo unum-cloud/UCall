@@ -19,6 +19,12 @@
 
 #include <mswsock.h>
 
+extern "C" {
+NTSTATUS NTAPI NtCreateWaitCompletionPacket(PHANDLE packet, ACCESS_MASK access, POBJECT_ATTRIBUTES attributes);
+NTSTATUS NTAPI NtAssociateWaitCompletionPacket(HANDLE packet, HANDLE port, HANDLE target, PVOID key, PVOID context,
+                                               NTSTATUS status, ULONG_PTR information, PBOOLEAN signaled);
+}
+
 namespace unum::ucall::io {
 
 using utilities::accepted_socket;
@@ -47,6 +53,9 @@ inline constexpr DWORD windows_accept_address_bytes_k = sizeof(sockaddr_storage)
 /** The completion key every handle an engine binds to its port carries; anything else posted there
  *  is a notification another component of the engine armed. */
 inline constexpr ULONG_PTR windows_overlapped_key_k = 0;
+
+/** The completion key the port's own timer posts with, apart from Registered I/O's notification. */
+inline constexpr ULONG_PTR windows_timer_key_k = 2;
 
 /** The Winsock extensions accepts and connects go through, loaded once per engine. */
 struct windows_extensions_t {
@@ -143,8 +152,9 @@ struct windows_operation_t {
  *  with a zero-byte @c WSARecv, pinning nothing, then reads its vector with @c recv, so the vector
  *  may move while it waits. An accept arms up to @c length sockets, each completing one connection
  *  that takes one from @c length; the one that would spend its last cancels the rest, and the last
- *  record to complete ends the request with @c length zero. Packets under another completion key
- *  count as notifications of the component that armed them.
+ *  record to complete ends the request with @c length zero. A wait for a deadline sleeps on a
+ *  high-resolution timer tied to the port, as the port itself waits in whole ticks. Packets under
+ *  another completion key count as notifications of the component that armed them.
  */
 template <typename allocator_type_, template <typename> class atomic_ref_template_>
 struct windows_overlapped {
@@ -163,10 +173,16 @@ struct windows_overlapped {
     windows_overlapped(windows_overlapped&&) = delete;
     windows_overlapped& operator=(windows_overlapped&&) = delete;
     ~windows_overlapped() noexcept {
+        if (timer_packet) CloseHandle(timer_packet);
+        if (timer) CloseHandle(timer);
         if (port) CloseHandle(port);
     }
 
     HANDLE port {};
+    HANDLE timer {}, timer_packet {};
+
+    /** The moment the timer's packet is armed for, or zero while none is. */
+    std::uint64_t timer_due {};
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
     st::vector<unsigned, rebound_allocator<unsigned>> timed {};
     st::vector<OVERLAPPED_ENTRY, rebound_allocator<OVERLAPPED_ENTRY>> entries {};
@@ -175,10 +191,11 @@ struct windows_overlapped {
     /** Records the kernel or the immediate list still owes a completion. */
     std::size_t active {};
 
-    /** Packets other components armed on the port and have not yet received. */
+    /** Packets armed on the port, by other components or the timer, and not yet received. */
     std::size_t foreign {};
 
-    /** The flags an accept creates an IPv4 or IPv6 socket with, which Registered I/O extends. */
+    /** The flags an IPv4 or IPv6 socket is accepted with, which Registered I/O extends, as it
+     *  creates its listeners with them too. */
     DWORD accept_flags {WSA_FLAG_OVERLAPPED};
 
     [[nodiscard]] ucall_status_t open(std::size_t capacity) noexcept {
@@ -188,7 +205,10 @@ struct windows_overlapped {
             return ucall_status_out_of_memory_k;
         for (unsigned i = 0; i != operations.size(); ++i) free_operations.push(operations, i);
         port = CreateIoCompletionPort(INVALID_HANDLE_VALUE, nullptr, 0, 1);
-        return port ? ucall_status_success_k : ucall_status_io_k;
+        timer = CreateWaitableTimerExW(nullptr, nullptr, CREATE_WAITABLE_TIMER_HIGH_RESOLUTION, TIMER_ALL_ACCESS);
+        return port && timer && NtCreateWaitCompletionPacket(&timer_packet, GENERIC_ALL, nullptr) >= 0
+                   ? ucall_status_success_k
+                   : ucall_status_io_k;
     }
 
     /** Binds @p handle to the port for good, so its completions arrive there, except those that
@@ -244,15 +264,17 @@ struct windows_overlapped {
         }
         case io_operation_t::receive_k: return issued(index, wait_readable(operation), statistics);
         case io_operation_t::read_k: {
-            WSABUF buffer {static_cast<ULONG>(std::min<std::size_t>(request.length, std::numeric_limits<int>::max())),
-                           reinterpret_cast<char*>(request.data)};
+            WSABUF buffer {
+                static_cast<ULONG>(fu::min_of<std::size_t>(request.length, (std::numeric_limits<int>::max)())),
+                reinterpret_cast<char*>(request.data)};
             bool const read = WSARecv(socket, &buffer, 1, &bytes, &flags, &operation.overlapped, nullptr) == 0;
             return issued(index, read ? 0 : WSAGetLastError(), statistics);
         }
         case io_operation_t::send_k:
         case io_operation_t::send_zero_copy_k: {
-            WSABUF buffer {static_cast<ULONG>(std::min<std::size_t>(request.length, std::numeric_limits<int>::max())),
-                           reinterpret_cast<char*>(request.data)};
+            WSABUF buffer {
+                static_cast<ULONG>(fu::min_of<std::size_t>(request.length, (std::numeric_limits<int>::max)())),
+                reinterpret_cast<char*>(request.data)};
             bool const sent = WSASend(socket, &buffer, 1, &bytes, 0, &operation.overlapped, nullptr) == 0;
             return issued(index, sent ? 0 : WSAGetLastError(), statistics);
         }
@@ -284,13 +306,13 @@ struct windows_overlapped {
         std::size_t count {};
         while (count < completions.size() && (active || foreign) && !notifications) {
             std::uint64_t const now = monotonic_ns();
-            DWORD wait = wait_policy == io_wait_t::blocking_k && !count ? INFINITE : DWORD {0};
-            if (deadline) wait = std::min(wait, milliseconds_until(deadline, now));
+            std::uint64_t nearest = deadline ? deadline : ~std::uint64_t {0};
+            DWORD const wait = wait_policy == io_wait_t::blocking_k && !count && nearest > now ? INFINITE : DWORD {0};
             for (std::size_t i = 0; i != timed.size();) {
                 operation_t& operation = operations[timed[i]];
                 std::uint64_t const expiry = operation.request->deadline;
                 if (expiry > now) {
-                    wait = std::min(wait, milliseconds_until(expiry, now));
+                    nearest = fu::min_of(nearest, expiry);
                     ++i;
                     continue;
                 }
@@ -307,20 +329,19 @@ struct windows_overlapped {
                 continue;
             }
             ULONG dequeued {};
-            ULONG const limit = static_cast<ULONG>(std::min(completions.size() - count, entries.size()));
+            ULONG const limit = static_cast<ULONG>(fu::min_of(completions.size() - count, entries.size()));
+            // The port waits in ticks, so the timer posts a packet at the nanosecond deadline.
+            if (wait && nearest != ~std::uint64_t {0} && arm_timer(nearest, now) != ucall_status_success_k) return -EIO;
             tally<atomic_ref_template_>(statistics.kernel_enters);
             if (!GetQueuedCompletionStatusEx(port, entries.data(), limit, &dequeued, wait, FALSE)) {
-                if (GetLastError() == WAIT_TIMEOUT) {
-                    if (wait_policy == io_wait_t::blocking_k && !count && (!deadline || monotonic_ns() < deadline))
-                        continue;
-                    break;
-                }
+                if (GetLastError() == WAIT_TIMEOUT) break;
                 return -EIO;
             }
             for (ULONG i = 0; i != dequeued; ++i) {
                 if (entries[i].lpCompletionKey != windows_overlapped_key_k) {
                     --foreign;
-                    ++notifications;
+                    if (entries[i].lpCompletionKey == windows_timer_key_k) timer_due = 0;
+                    else ++notifications;
                     continue;
                 }
                 operation_t& operation = *reinterpret_cast<operation_t*>(entries[i].lpOverlapped);
@@ -349,11 +370,23 @@ struct windows_overlapped {
         }
     }
 
-    /** Milliseconds from @p now until @p moment, rounded up so a wait never ends early. */
-    static DWORD milliseconds_until(std::uint64_t moment, std::uint64_t now) noexcept {
-        std::uint64_t const duration = moment > now ? moment - now : 0;
-        return static_cast<DWORD>(
-            std::min<std::uint64_t>(duration / 1'000'000 + (duration % 1'000'000 != 0), INFINITE - 1));
+    /** Sets the timer to post its packet at @p moment, after @p now, unless it is armed for it: a
+     *  timer still armed only moves, one that fired is tied to the port again. */
+    ucall_status_t arm_timer(std::uint64_t moment, std::uint64_t now) noexcept {
+        if (moment == timer_due) return ucall_status_success_k;
+        // Relative, in 100 ns ticks rounded up, so the packet never posts early.
+        LARGE_INTEGER due {};
+        due.QuadPart = -static_cast<LONGLONG>((moment - now) / 100 + ((moment - now) % 100 != 0));
+        if (!SetWaitableTimer(timer, &due, 0, nullptr, nullptr, FALSE)) return ucall_status_io_k;
+        if (!timer_due) {
+            BOOLEAN signaled {};
+            if (NtAssociateWaitCompletionPacket(timer_packet, port, timer, reinterpret_cast<PVOID>(windows_timer_key_k),
+                                                nullptr, 0, 0, &signaled) < 0)
+                return ucall_status_io_k;
+            ++foreign;
+        }
+        timer_due = moment;
+        return ucall_status_success_k;
     }
 
     /** A free record carrying @p request on @p socket, or @c absent_k. */
@@ -423,7 +456,7 @@ struct windows_overlapped {
         operation.overlapped.OffsetHigh = static_cast<DWORD>(request.file.offset >> 32);
         if (request.operation == io_operation_t::file_read_k) {
             DWORD const length = static_cast<DWORD>(
-                std::min<std::size_t>(request.length, std::numeric_limits<DWORD>::max()));
+                fu::min_of<std::size_t>(request.length, (std::numeric_limits<DWORD>::max)()));
             return ReadFile(operation.handle, request.data, length, nullptr, &operation.overlapped) ? 0
                                                                                                     : GetLastError();
         }
@@ -450,7 +483,7 @@ struct windows_overlapped {
         io_vector_t const& room = io_vectors(*operation.request).front();
         int const received = recv(
             reinterpret_cast<SOCKET>(operation.handle), static_cast<char*>(room.iov_base),
-            static_cast<int>(std::min<std::size_t>(room.iov_len, std::numeric_limits<int>::max())), 0);
+            static_cast<int>(fu::min_of<std::size_t>(room.iov_len, (std::numeric_limits<int>::max)())), 0);
         return received >= 0 ? static_cast<descriptor_t>(received) : -socket_last_error();
     }
 
@@ -468,7 +501,7 @@ struct windows_overlapped {
         if (getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) != 0)
             return settle_now(index, -socket_last_error());
         first.accepting = 0;
-        std::size_t const wanted = std::max<std::size_t>(request.length, 1);
+        std::size_t const wanted = fu::max_of<std::size_t>(request.length, 1);
         for (unsigned member = index;;) {
             DWORD const error = arm_accept(member, listener, address.ss_family, extensions);
             tally<atomic_ref_template_>(statistics.kernel_enters);
@@ -526,7 +559,7 @@ struct windows_overlapped {
         extensions.addresses(operation.addresses, 0, windows_accept_address_bytes_k, windows_accept_address_bytes_k,
                              &local, &local_length, &remote, &remote_length);
         if (io_peer_address_t* const peer = reinterpret_cast<io_peer_address_t*>(operation.request->data)) {
-            peer->length = std::min<int>(remote_length, static_cast<int>(sizeof(peer->address)));
+            peer->length = fu::min_of<int>(remote_length, static_cast<int>(sizeof(peer->address)));
             std::memcpy(&peer->address, remote, static_cast<std::size_t>(peer->length));
         }
         descriptor_t const descriptor = accepted_socket(static_cast<descriptor_t>(accepted), remote->sa_family);

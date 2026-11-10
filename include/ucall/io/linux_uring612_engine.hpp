@@ -213,7 +213,7 @@ struct uring_provided_buffers {
 
     /** Doubles the buffers handed to the kernel, once it has none left to pick. */
     void provide_more() noexcept {
-        unsigned const target = std::min(std::max(provided_buffers * 2, 2u), buffer_count);
+        unsigned const target = fu::min_of(fu::max_of(provided_buffers * 2, 2u), buffer_count);
         for (; provided_buffers != target; ++provided_buffers) provide(provided_buffers);
     }
 
@@ -359,7 +359,7 @@ struct uring_queue {
         storage = allocate_unique<storage_t>(allocator);
         if (!storage) return ucall_status_out_of_memory_k;
         page = page_size();
-        if (!page || capacity > std::numeric_limits<std::size_t>::max() / page) return ucall_status_overflow_k;
+        if (!page || capacity > (std::numeric_limits<std::size_t>::max)() / page) return ucall_status_overflow_k;
         return provided.reserve(capacity, page);
     }
 
@@ -376,12 +376,12 @@ struct uring_queue {
                                 : IORING_SETUP_COOP_TASKRUN | IORING_SETUP_TASKRUN_FLAG;
         // Each one-shot operation may carry a linked timeout.
         auto entries = static_cast<unsigned>(
-            std::min(depth, static_cast<std::size_t>(std::numeric_limits<unsigned>::max() / 2)) * 2);
+            fu::min_of(depth, static_cast<std::size_t>((std::numeric_limits<unsigned>::max)() / 2)) * 2);
         // io_uring bills rings to the locked-memory limit, so ENOMEM points at it, not the heap.
         int result = io_uring_queue_init_params(entries, &ring, &parameters);
         if (result < 0) return ucall_status_unsupported_k;
         stage = uring_engine_stage_t::running_k;
-        constexpr auto probe_length = unsigned {std::numeric_limits<decltype(io_uring_probe_op::op)>::max()} + 1;
+        constexpr auto probe_length = unsigned {(std::numeric_limits<decltype(io_uring_probe_op::op)>::max)()} + 1;
         struct alignas(io_uring_probe) probe_scratch_t {
             byte_t bytes[sizeof(io_uring_probe) + probe_length * sizeof(io_uring_probe_op)] {};
         };
@@ -581,7 +581,7 @@ struct uring_socket_slots {
     template <typename queue_type_>
     descriptor_t import_socket(descriptor_t descriptor, queue_type_& queue) noexcept {
         if (queue.fault) return queue.fault;
-        if (descriptor < 0 || descriptor > std::numeric_limits<int>::max()) return -EINVAL;
+        if (descriptor < 0 || descriptor > (std::numeric_limits<int>::max)()) return -EINVAL;
         int protocol {}, enabled = 1;
         socklen_t length = sizeof(protocol);
         if (getsockopt(static_cast<int>(descriptor), SOL_SOCKET, SO_PROTOCOL, &protocol, &length) == 0 &&
@@ -837,7 +837,7 @@ struct uring_operations {
         unsigned const anchored = index_of(anchor);
         anchor.stage = uring_operation_stage_t::accepting_k;
         ucall_status_t status = ucall_status_success_k;
-        while (anchor.accepting < std::max<std::size_t>(request.length, 1)) {
+        while (anchor.accepting < fu::max_of<std::size_t>(request.length, 1)) {
             operation_t* accept = take(request, anchor.socket_slot);
             request.operation_index = anchored;
             socket_slot_t* accepted = accept ? socket_slots.reserve() : nullptr;
@@ -1019,7 +1019,7 @@ struct uring_zero_copy {
                       operations_t& operations) noexcept {
         auto const& request = *operation.request;
         auto* owner = operation.socket_slot;
-        auto const length = std::min(request.length, std::size_t {std::numeric_limits<unsigned>::max()});
+        auto const length = fu::min_of(request.length, std::size_t {(std::numeric_limits<unsigned>::max)()});
         if (request.registered_memory != io_unregistered_k)
             io_uring_prep_send_zc_fixed(submission, static_cast<int>(owner->index), request.data, length, MSG_NOSIGNAL,
                                         IORING_SEND_ZC_REPORT_USAGE, static_cast<int>(request.registered_memory));
@@ -1117,7 +1117,7 @@ void uring_prepare(io_uring_sqe* submission, typename operations_type_::operatio
     auto& request = *operation.request;
     auto const socket = static_cast<int>(operation.socket_slot->index);
     // The submission length field is 32 bits wide.
-    auto const sent = std::min(request.length, std::size_t {std::numeric_limits<unsigned>::max()});
+    auto const sent = fu::min_of(request.length, std::size_t {(std::numeric_limits<unsigned>::max)()});
     switch (request.operation) {
     case io_operation_t::connect_k:
         io_uring_prep_connect(submission, socket, reinterpret_cast<sockaddr*>(request.data),
@@ -1138,11 +1138,11 @@ void uring_prepare(io_uring_sqe* submission, typename operations_type_::operatio
         break;
     case io_operation_t::read_k:
         io_uring_prep_read(submission, socket, request.data,
-                           static_cast<unsigned>(std::min(request.length, queue.page)), -1);
+                           static_cast<unsigned>(fu::min_of(request.length, queue.page)), -1);
         break;
     case io_operation_t::file_read_k: {
         auto const bytes = static_cast<unsigned>(
-            std::min<std::size_t>(request.length, std::numeric_limits<unsigned>::max()));
+            fu::min_of<std::size_t>(request.length, (std::numeric_limits<unsigned>::max)()));
         if (request.registered_memory != io_unregistered_k)
             io_uring_prep_read_fixed(submission, request.file.file, request.data, bytes, request.file.offset,
                                      static_cast<int>(request.registered_memory));
@@ -1346,7 +1346,7 @@ template <typename engine_type_, typename... slot_arguments_type_>
     if (queue.stage != uring_engine_stage_t::running_k || queue.issuer != uring_issuer_t::unclaimed_k)
         return ucall_status_invalid_argument_k;
     if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
-    std::size_t const sockets = std::min(capacity, open_files_limit() - 1);
+    std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
     std::destroy_at(&engine.operations);
     std::construct_at(&engine.operations, queue.allocator);
     std::destroy_at(&engine.socket_slots);
@@ -1458,7 +1458,7 @@ struct linux_uring612_engine {
         if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
         if (queue.stage != uring_engine_stage_t::idle_k) return ucall_status_invalid_argument_k;
         // Releases take no file, and the kernel registers no more files than descriptors.
-        std::size_t const sockets = std::min(capacity, open_files_limit() - 1);
+        std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
         if (ucall_status_t const reserved = queue.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k || socket_slots.open(sockets) != ucall_status_success_k)

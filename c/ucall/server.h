@@ -32,7 +32,8 @@ typedef struct ucall_network_interface_t {
     /** A listening stream socket to accept on instead of binding @c address, such as one systemd
      *  or a supervisor passed in, or NULL to bind. Read during @c ucall_server_init(), which
      *  accepts on duplicates of it: UCall never closes it, though the duplicates share its
-     *  @c O_NONBLOCK. Default: NULL. */
+     *  @c O_NONBLOCK. Registered I/O accepts only from listeners it creates, so an automatic
+     *  backend passes over it and @c ucall_io_backend_windows_rio_k refuses it. Default: NULL. */
     intptr_t const* listen_descriptor;
 
     /** Physical device to pin this interface to with @c SO_BINDTODEVICE, such as "eth0", or empty

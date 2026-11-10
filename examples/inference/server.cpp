@@ -15,7 +15,6 @@
 #include <cstdio>  // `std::printf`, `std::fprintf`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::min`
 #include <array>       // `std::array`
 #include <chrono>      // `std::chrono::microseconds`
 #include <limits>      // `std::numeric_limits`
@@ -110,7 +109,7 @@ static void pack_slices(void* context, std::size_t thread, std::size_t) {
     for (std::size_t index = thread; index < call.slices.size(); index += call.threads.size()) {
         model_slice_t& slice = call.slices[index];
         slice.first_row = index * slice_rows_k;
-        std::size_t const last_row = std::min(slice.first_row + slice_rows_k, rows);
+        std::size_t const last_row = fu::min_of(slice.first_row + slice_rows_k, rows);
         auto [packed,
               packed_status] = packed_model_t::make(call.model(nk::range(slice.first_row, last_row), nk::slice));
         own.status = packed_status;
@@ -178,7 +177,7 @@ struct service_t {
         fu_capabilities_t const floating = static_cast<fu_capabilities_t>(
             fu_capabilities_all_k &
             ~(fu_capability_place_threads_by_affinity_k | fu_capability_place_memory_on_domain_k));
-        std::size_t const threads = std::min(cores, slices_count);
+        std::size_t const threads = fu::min_of(cores, slices_count);
         if (status == fu_success_k) status = fu_pool_new("ucall-inference", floating, &pool);
         if (status == fu_success_k) status = fu_pool_spawn(topology, pool, threads, fu_caller_inclusive_k);
         if (topology) fu_topology_delete(topology);
@@ -342,8 +341,8 @@ int main(int argc, char** argv) {
          {"--seed", "SplitMix64 seed of the matrix", service.seed},
          {"--slow-batch-us", "sleep of each /slow/batch callback in microseconds", service.slow_batch_microseconds}});
     if (flagged) return flagged < 0 ? 1 : 0;
-    if (!service.rows || !service.dimensions || service.rows - 1 > std::numeric_limits<std::uint32_t>::max() ||
-        service.rows > std::numeric_limits<std::size_t>::max() / service.dimensions) {
+    if (!service.rows || !service.dimensions || service.rows - 1 > (std::numeric_limits<std::uint32_t>::max)() ||
+        service.rows > (std::numeric_limits<std::size_t>::max)() / service.dimensions) {
         std::fputs("--rows must fit a u32 index and --rows times --dimensions a size\n", stderr);
         return 1;
     }

@@ -23,31 +23,29 @@ function (ucall_sibling name_ override_ repository_ tag_)
 endfunction ()
 
 # The siblings compile at the same floor and build kind.
-if (UCALL_MARCH)
-    set(FORKUNION_MARCH ${UCALL_MARCH})
-    set(STRINGZILLA_MARCH ${UCALL_MARCH})
-    set(NUMKONG_MARCH ${UCALL_MARCH})
-endif ()
+set(FORKUNION_MARCH "${UCALL_MARCH}")
+set(STRINGZILLA_MARCH "${UCALL_MARCH}")
+set(NUMKONG_MARCH "${UCALL_MARCH}")
 set(FORKUNION_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
 set(STRINGZILLA_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
 set(NUMKONG_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
 
 ucall_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
-    cff25ca8f55aa223dd6ab437b8665009e928e493
+    8b16eea7891d5df9f44706972112d739917b5bf3
 )
 ucall_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
-    1bd5eaeee9588d9c6df33206cc7627377f18fb1c
+    9a69946aa5e9a8cbe56b51dab1dfae7f2281537d
 )
 ucall_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
-    a65d5b81763f683c3a2a167c3a4e3426942a76cd
+    788a94f7baef9eae8923009a444fb6b3dae5f8c4
 )
 
 if (UCALL_BUILD_EXAMPLES)
     ucall_sibling(
         numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
-        8b3df749915fdcc01e563df8ff119c3e09c04789
+        0a027dc6ab79fed17f08e20a7cd3bdc94e59f655
     )
 endif ()

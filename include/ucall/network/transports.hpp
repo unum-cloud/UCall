@@ -338,7 +338,7 @@ struct transport {
         if (!tunnel.encrypts()) return ucall_status_success_k;
         std::size_t const stride = tunnel.geometry().record_size();
         for (std::size_t start = 0; start < bytes.size(); start += stride) {
-            std::size_t const length = std::min(stride, bytes.size() - start);
+            std::size_t const length = fu::min_of(stride, bytes.size() - start);
             if (tunnel.seal(bytes.subspan(start, length), length - secure_tunnel_overhead_k).empty())
                 return ucall_status_handshake_failed_k;
         }

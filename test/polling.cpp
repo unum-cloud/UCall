@@ -361,7 +361,8 @@ static case_result_t test_cpu_class_ceiling_unit() {
         // No CPU runs both the x86 and the Arm classes, so a pin past what this one runs must fail.
         refused |= outcome.status == ucall_status_unsupported_k && !handle;
         failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_unsupported_k);
-        failures += expect(cpu_class != ucall_cpu_class_serial_k || outcome.status == ucall_status_success_k);
+        failures += expect(cpu_class != ucall_cpu_class_serial_k || !UCALL_TARGET_SERIAL ||
+                           outcome.status == ucall_status_success_k);
         ucall_client_free(handle);
     }
     failures += expect(refused);
@@ -757,7 +758,7 @@ static case_result_t test_setup_failure_ends_batch_polling() {
     require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     // Past the counters a first poll sizes, as on a host with far more connections per loop.
     static_cast<network_t::server_t*>(server)->event_loops[1]->max_exchanges =
-        std::size_t {std::numeric_limits<std::uint32_t>::max() / 8} + 1;
+        std::size_t {(std::numeric_limits<std::uint32_t>::max)() / 8} + 1;
     std::atomic<bool> returned {false};
     std::thread poller {[&] {
         ucall_outcome_t ended {};
@@ -881,11 +882,24 @@ static case_result_t test_batch_timeout_sleeps_unit() {
     ucall_server_take_batch(&missing);
     failures += expect(outcome.status == ucall_status_invalid_argument_k, "{}", ucall_status_name(outcome.status));
     // No event loop is ever polled, so only the polling owner's own wait can end the call.
+    // The Windows `clock` counts wall time, so there the process's processor time is read.
+    auto const processor_now = [] {
+#if UCALL_OS_WINDOWS_
+        FILETIME created, exited, kernel, user;
+        GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user);
+        auto const hundreds = [](FILETIME time) {
+            return std::uint64_t {time.dwHighDateTime} << 32 | time.dwLowDateTime;
+        };
+        return static_cast<std::clock_t>((hundreds(kernel) + hundreds(user)) * CLOCKS_PER_SEC / 10'000'000);
+#else
+        return std::clock();
+#endif
+    };
     auto const started = std::chrono::steady_clock::now();
-    auto const processor_started = std::clock();
+    auto const processor_started = processor_now();
     ucall_server_take_batch_t take {fixture.server, &outcome, fixture.batch_endpoint, 100000};
     ucall_server_take_batch(&take);
-    auto const processor_spent = std::clock() - processor_started;
+    auto const processor_spent = processor_now() - processor_started;
     auto const waited =
         std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - started).count();
     failures += expect(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
@@ -1059,7 +1073,7 @@ static case_result_t test_allocator_propagation_unit() {
     counts.fail_from = counts.attempts;
     counted_network_t::client_t::client_init(&client_init, allocator);
     failures += expect(!client && outcome.status == ucall_status_out_of_memory_k && counts.live() == live);
-    counts.fail_from = std::numeric_limits<std::size_t>::max();
+    counts.fail_from = (std::numeric_limits<std::size_t>::max)();
     counted_network_t::client_t::client_init(&client_init, allocator);
     require(failures, outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     std::string url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));

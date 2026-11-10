@@ -305,8 +305,8 @@ struct random_generator_t {
 
     explicit random_generator_t(result_type seed) noexcept : counter(seed) {}
 
-    [[nodiscard]] static constexpr result_type min() noexcept { return 0; }
-    [[nodiscard]] static constexpr result_type max() noexcept { return ~result_type {0}; }
+    [[nodiscard]] static constexpr result_type(min)() noexcept { return 0; }
+    [[nodiscard]] static constexpr result_type(max)() noexcept { return ~result_type {0}; }
 
     [[nodiscard]] result_type operator()() noexcept { return fu::split_mix(counter++); }
 
@@ -426,7 +426,7 @@ struct allocation_counts_t {
     std::size_t attempts {}, allocations {}, deallocations {}, bytes {};
 
     /** Every attempt from this one onward fails, so a case can starve setup at any step. */
-    std::size_t fail_from {std::numeric_limits<std::size_t>::max()};
+    std::size_t fail_from {(std::numeric_limits<std::size_t>::max)()};
 
     [[nodiscard]] std::size_t live() const noexcept { return allocations - deallocations; }
 };
@@ -569,7 +569,7 @@ struct direct_directory_t {
         struct statx status {};
         bool const answered = statx(file, "", AT_EMPTY_PATH, STATX_DIOALIGN, &status) == 0 &&
                               (status.stx_mask & STATX_DIOALIGN) && status.stx_dio_offset_align;
-        alignment = answered ? std::max(status.stx_dio_mem_align, status.stx_dio_offset_align) : 0;
+        alignment = answered ? fu::max_of(status.stx_dio_mem_align, status.stx_dio_offset_align) : 0;
         void* block = nullptr;
         bool const read = alignment && posix_memalign(&block, alignment, alignment) == 0 &&
                           ::pread(file, block, alignment, 0) == static_cast<ssize_t>(alignment);

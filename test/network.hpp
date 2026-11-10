@@ -9,7 +9,6 @@
 #include <cstdlib> // `std::quick_exit`
 #include <cstring> // `std::memcmp`, `std::strlen`
 
-#include <algorithm>   // `std::max`
 #include <array>       // `std::array`
 #include <atomic>      // `std::atomic`
 #include <charconv>    // `std::from_chars`
@@ -515,6 +514,15 @@ inline std::size_t check_answer(ucall_completed_call_t const& completed, ucall_h
     return failures;
 }
 
+/** One counter of event loop zero, read from any thread. */
+inline ucall_event_loop_statistics_t loop_statistics(fixture_t& fixture) {
+    ucall_outcome_t outcome {};
+    ucall_event_loop_statistics_t statistics {};
+    ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &statistics};
+    ucall_server_event_loop_statistics(&query);
+    return statistics;
+}
+
 #if UCALL_OS_POSIX_
 
 /** Sends @p request whole, reads until the server closes in order, never with a reset, and
@@ -575,15 +583,6 @@ inline std::size_t expect_outcome(fixture_t& fixture, ucall_outcome_t& outcome, 
     ucall_status_t const status = await_outcome(fixture, outcome);
     return expect(status == expected, "the outcome turned {} rather than {}", ucall_status_name(status),
                   ucall_status_name(expected));
-}
-
-/** One counter of event loop zero, read from any thread. */
-inline ucall_event_loop_statistics_t loop_statistics(fixture_t& fixture) {
-    ucall_outcome_t outcome {};
-    ucall_event_loop_statistics_t statistics {};
-    ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &statistics};
-    ucall_server_event_loop_statistics(&query);
-    return statistics;
 }
 
 #if UCALL_WITH_POSIX

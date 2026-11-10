@@ -833,8 +833,9 @@ static case_result_t test_stop_while_releasing() {
             require(failures + fixture.stop(), huge >= 0 && ftruncate(huge, off_t {64} << 20) == 0);
             ::close(huge);
             require(failures + fixture.stop(), client.connect(fixture.address));
-            int const small = 4096;
-            failures += expect(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+            int const receive_buffer_bytes = 4096;
+            failures += expect(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes,
+                                          sizeof(receive_buffer_bytes)) == 0);
             std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
             failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
                                static_cast<ssize_t>(request.size()));
@@ -925,8 +926,9 @@ static case_result_t test_stop_resets_held_replies() {
             require(failures + fixture.stop(), huge >= 0 && ftruncate(huge, off_t {64} << 20) == 0);
             ::close(huge);
             require(failures + fixture.stop(), client.connect(fixture.address));
-            int const small = 4096;
-            failures += expect(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+            int const receive_buffer_bytes = 4096;
+            failures += expect(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes,
+                                          sizeof(receive_buffer_bytes)) == 0);
             std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
             failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
                                static_cast<ssize_t>(request.size()));
@@ -1023,8 +1025,9 @@ static case_result_t test_linger_then_reset() {
     std::size_t failures = 0;
     raw_client_t silent;
     require(failures + fixture.stop(), silent.connect(fixture.address));
-    int const small = 4096;
-    failures += expect(setsockopt(silent.descriptor, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+    int const receive_buffer_bytes = 4096;
+    failures += expect(
+        setsockopt(silent.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes, sizeof(receive_buffer_bytes)) == 0);
     std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     failures += expect(::send(silent.descriptor, request.data(), request.size(), 0) ==
                        static_cast<ssize_t>(request.size()));
@@ -1189,8 +1192,9 @@ static case_result_t test_file_fairness() {
         ::close(huge);
         raw_client_t stalled;
         require(failures + fixture.stop(), stalled.connect(fixture.address));
-        int const small = 4096;
-        failures += expect(setsockopt(stalled.descriptor, SOL_SOCKET, SO_RCVBUF, &small, sizeof(small)) == 0);
+        int const receive_buffer_bytes = 4096;
+        failures += expect(setsockopt(stalled.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes,
+                                      sizeof(receive_buffer_bytes)) == 0);
         failures += expect(::send(stalled.descriptor, request.data(), request.size(), 0) ==
                            static_cast<ssize_t>(request.size()));
         failures += await_held_in_background(fixture, 1);

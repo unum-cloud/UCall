@@ -105,7 +105,7 @@ struct scripted_server_t {
                 }
                 for (auto const until = steady_clock::now() + pause;
                      peer.read(peer.received.size() + 1, until) == read_end_t::filled_k;) {}
-                deepest = std::max(deepest, whole_requests(std::string_view {peer.received}.substr(answered_bytes)));
+                deepest = fu::max_of(deepest, whole_requests(std::string_view {peer.received}.substr(answered_bytes)));
                 for (std::size_t length;
                      open && (length = request_length(std::string_view {peer.received}.substr(answered_bytes)));) {
                     auto const answer = script(std::string_view {peer.received}.substr(answered_bytes, length),
@@ -562,10 +562,10 @@ struct dns_record_t {
 static std::string dns_wire_name(std::string_view dotted) {
     std::string wire;
     while (!dotted.empty()) {
-        auto const dot = std::min(dotted.find('.'), dotted.size());
+        auto const dot = fu::min_of(dotted.find('.'), dotted.size());
         wire += static_cast<char>(dot);
         wire += dotted.substr(0, dot);
-        dotted.remove_prefix(std::min(dot + 1, dotted.size()));
+        dotted.remove_prefix(fu::min_of(dot + 1, dotted.size()));
     }
     return wire + '\0';
 }

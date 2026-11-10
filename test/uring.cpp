@@ -509,7 +509,7 @@ static case_result_t direct_files() {
         descriptor_t const opened = await(opening);
         if (path == "data.bin") {
             file_geometry_t const geometry = opened >= 0 ? direct_alignment_of(opened) : file_geometry_t {};
-            std::size_t const measured = std::max(geometry.memory_alignment, geometry.offset_alignment);
+            std::size_t const measured = fu::max_of(geometry.memory_alignment, geometry.offset_alignment);
             failures += expect(
                 opened >= 0 && !geometry.error && geometry.size == content.size() && measured == alignment,
                 "{} opened as {} measuring {} bytes aligned to {}", path, opened, geometry.size, measured);

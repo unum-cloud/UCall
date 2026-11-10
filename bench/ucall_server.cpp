@@ -48,7 +48,7 @@ static void sum(ucall_received_http_request_t request, void* context) {
     using limits_t = std::numeric_limits<std::int64_t>;
     std::int64_t a {}, b {};
     if (!query_integer(server, request, "a", a) || !query_integer(server, request, "b", b) ||
-        (b > 0 ? a > limits_t::max() - b : a < limits_t::min() - b))
+        (b > 0 ? a > (limits_t::max)() - b : a < (limits_t::min)() - b))
         return uc::tools::reply_error(server, request, ucall_http_status_bad_request_k,
                                       "Expected integers a and b with a representable sum\n");
     char digits[limits_t::digits10 + 2] {};

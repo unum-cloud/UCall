@@ -15,7 +15,7 @@
 #include <cstdlib> // `std::getenv`
 #include <cstring> // `std::memcmp`
 
-#include <algorithm>   // `std::find_if`, `std::any_of`, `std::max`, `std::min`
+#include <algorithm>   // `std::find_if`, `std::any_of`
 #include <array>       // `std::array`
 #include <bit>         // `std::bit_width`
 #include <bitset>      // `std::bitset`
@@ -59,7 +59,7 @@ enum class output_format_t { human_k, json_k };
 enum class phase_t { warmup_k, measured_k };
 
 /** A quota no run reaches, for a phase bounded by its time limit alone. */
-static constexpr std::size_t unlimited_k = std::numeric_limits<std::size_t>::max();
+static constexpr std::size_t unlimited_k = (std::numeric_limits<std::size_t>::max)();
 
 static constexpr double nanoseconds_per_microsecond_k = std::chrono::nanoseconds(std::chrono::microseconds(1)).count();
 static constexpr double bytes_per_gigabyte_k = std::giga::num;
@@ -211,7 +211,7 @@ static void usage(char const* binary) {
         auto width = static_cast<int>(flag.name.size() + (flag.placeholder.empty() ? 0 : flag.placeholder.size() + 1));
         std::printf("  %.*s%s%.*s%*s%.*s [env: %s]\n", static_cast<int>(flag.name.size()), flag.name.data(),
                     flag.placeholder.empty() ? "" : " ", static_cast<int>(flag.placeholder.size()),
-                    flag.placeholder.data(), std::max(column_k - width, 1), "", static_cast<int>(flag.help.size()),
+                    flag.placeholder.data(), fu::max_of(column_k - width, 1), "", static_cast<int>(flag.help.size()),
                     flag.help.data(), environment_variable(flag).c_str());
     }
     std::printf("  --help%*sprint this usage\n", column_k - 6, "");
@@ -320,7 +320,7 @@ struct latency_histogram_t {
         std::uint64_t total = 0;
         for (auto count : bins) total += count;
         if (!total) return 0;
-        auto rank = std::max<std::uint64_t>(1, static_cast<std::uint64_t>(std::ceil(fraction * total)));
+        auto rank = fu::max_of<std::uint64_t>(1, static_cast<std::uint64_t>(std::ceil(fraction * total)));
         std::uint64_t cumulative = 0;
         std::size_t bin = 0;
         while (bin + 1 != bins_k && (cumulative += bins[bin]) < rank) ++bin;
@@ -356,7 +356,7 @@ struct origin_t {
 /** When a phase starts, when it stops issuing calls, and which quotas bound it. */
 struct schedule_t {
     phase_t phase {phase_t::measured_k};
-    time_point_t begin {}, deadline {time_point_t::max()};
+    time_point_t begin {}, deadline {(time_point_t::max)()};
 };
 
 struct worker_t {
@@ -450,7 +450,7 @@ struct worker_t {
             time_point_t const now = clock_t::now();
             while (!idle.empty()) {
                 time_point_t const intended = arrival_time(settings, schedule.begin, arrivals);
-                if (intended >= schedule.deadline) return time_point_t::max();
+                if (intended >= schedule.deadline) return (time_point_t::max)();
                 if (intended > now) return intended;
                 std::size_t const group_index = idle.back();
                 group_t& group = groups[group_index];
@@ -460,15 +460,15 @@ struct worker_t {
                 arrivals += width;
                 if (!group.outstanding) idle.push_back(group_index);
             }
-            return time_point_t::max();
+            return (time_point_t::max)();
         };
         idle.clear();
         for (std::size_t group_index = 0; group_index != groups.size(); ++group_index)
             if (settings.rate) idle.push_back(group_index);
             else fill(groups[group_index]);
         for (;;) {
-            time_point_t const wake = settings.rate ? issue_due() : time_point_t::max();
-            bool const waiting = wake != time_point_t::max();
+            time_point_t const wake = settings.rate ? issue_due() : (time_point_t::max)();
+            bool const waiting = wake != (time_point_t::max)();
             if (!outstanding && !waiting) break;
             time_point_t const now = clock_t::now();
             std::chrono::nanoseconds const until_wake =
@@ -553,9 +553,9 @@ struct worker_t {
                     response_bytes += bytes;
                     result.response_bytes += bytes;
                     result.latency_sum += elapsed;
-                    result.latency_max = std::max(result.latency_max, elapsed);
+                    result.latency_max = fu::max_of(result.latency_max, elapsed);
                     if (slot.sequence < result.largest_sequence) ++result.reordered;
-                    result.largest_sequence = std::max(result.largest_sequence, slot.sequence);
+                    result.largest_sequence = fu::max_of(result.largest_sequence, slot.sequence);
                     if (measured) latencies.record(elapsed);
                 }
                 ucall_client_response_free(completion.response);
@@ -621,7 +621,7 @@ struct run_t {
     bool dispatch(phase_t phase, std::chrono::nanoseconds limit) {
         schedule.phase = phase;
         schedule.begin = clock_t::now();
-        schedule.deadline = limit.count() ? schedule.begin + limit : time_point_t::max();
+        schedule.deadline = limit.count() ? schedule.begin + limit : (time_point_t::max)();
         return fu_pool_for_threads(resources.pool, execute, this) == fu_success_k;
     }
 };
@@ -639,8 +639,8 @@ static void print_json_string(std::string_view text) {
 static int run(settings_t const& settings) {
     resources_t resources;
     auto width = settings.reply_order == reply_order_t::reordered_k ? 2u : 1u;
-    auto clients = std::min({settings.threads, settings.connections / settings.urls.size() / width,
-                             settings.in_flight / settings.urls.size() / width});
+    auto clients = fu::min_of(settings.threads, fu::min_of(settings.connections / settings.urls.size() / width,
+                                                           settings.in_flight / settings.urls.size() / width));
     if (!clients) {
         std::fprintf(stderr, "Each active origin needs at least %u connections and in-flight slots per worker\n",
                      width);
@@ -651,7 +651,7 @@ static int run(settings_t const& settings) {
     std::uint64_t const run_id = static_cast<std::uint64_t>(clock_t::now().time_since_epoch().count());
     auto group_budget = settings.in_flight / width;
     if (settings.reply_order == reply_order_t::reordered_k)
-        group_budget = std::min(group_budget, settings.connections / width);
+        group_budget = fu::min_of(group_budget, settings.connections / width);
     // Splits a total across origins, then workers, in pairs; zero leaves it to the time limit.
     auto share = [&](std::size_t total, std::size_t origin_index, std::size_t worker_index) {
         if (!total) return unlimited_k;
@@ -750,7 +750,7 @@ static int run(settings_t const& settings) {
     std::uint64_t latency_max = 0;
     for (std::size_t origin_index = 0; origin_index != settings.urls.size(); ++origin_index) {
         auto& total = origins[origin_index];
-        total.first_completed = time_point_t::max();
+        total.first_completed = (time_point_t::max)();
         for (auto const& worker : workers) {
             auto const& result = worker.origins[origin_index].result;
             total.issued += result.issued;
@@ -762,12 +762,12 @@ static int run(settings_t const& settings) {
             total.byte_checks += result.byte_checks;
             total.reordered += result.reordered;
             total.latency_sum += result.latency_sum;
-            total.latency_max = std::max(total.latency_max, result.latency_max);
-            if (result.completed) total.first_completed = std::min(total.first_completed, result.first_completed);
-            total.last_completed = std::max(total.last_completed, result.last_completed);
+            total.latency_max = fu::max_of(total.latency_max, result.latency_max);
+            if (result.completed) total.first_completed = fu::min_of(total.first_completed, result.first_completed);
+            total.last_completed = fu::max_of(total.last_completed, result.last_completed);
         }
         latency_sum += total.latency_sum;
-        latency_max = std::max(latency_max, total.latency_max);
+        latency_max = fu::max_of(latency_max, total.latency_max);
     }
     auto microseconds = [](auto nanoseconds) {
         return static_cast<double>(nanoseconds) / nanoseconds_per_microsecond_k;

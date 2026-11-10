@@ -8,7 +8,6 @@
 
 #include <cstdint> // `std::uint64_t`
 
-#include <algorithm>   // `std::min`
 #include <string_view> // `std::string_view`
 
 #include "ucall/utilities/types.hpp" // `st::failed`
@@ -49,7 +48,7 @@ std::string_view header_parameter(std::string_view value, std::string_view name)
 template <typename search_type_>
 std::string_view part_header(std::string_view block, std::string_view name) noexcept {
     for (std::size_t start = 0; start < block.size();) {
-        auto end = std::min(search_type_::find(block, "\r\n", start), block.size());
+        auto end = fu::min_of(search_type_::find(block, "\r\n", start), block.size());
         auto const colon = search_type_::find(block, ':', start);
         if (colon < end && search_type_::equal_ascii_uncased(block.substr(start, colon - start), name))
             return search_type_::trim_http(block.substr(colon + 1, end - colon - 1));

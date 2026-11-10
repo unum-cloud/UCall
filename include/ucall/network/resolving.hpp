@@ -106,7 +106,7 @@ struct resolving {
      *  order, AAAA and A alternating from the first AAAA, then the longer family's rest. */
     static utilities::socket_length_t target(client_origin_t const& origin, std::uint32_t index,
                                              sockaddr_storage& address) noexcept {
-        std::uint32_t const shared = std::min(origin.ipv6_count, origin.ipv4_count);
+        std::uint32_t const shared = fu::min_of(origin.ipv6_count, origin.ipv4_count);
         bool const inet6 = index < 2 * shared ? index % 2 == 0 : origin.ipv6_count > origin.ipv4_count;
         std::uint32_t const slot = index < 2 * shared ? index / 2 : index - shared;
         address = {};
@@ -138,7 +138,7 @@ struct resolving {
     /** When @p origin next needs a look without any completion: an A waiting out its AAAA. */
     static std::uint64_t due(client_origin_t const& origin) noexcept {
         if (origin.lookup && origin.lookup->settle_deadline) return origin.lookup->settle_deadline;
-        return std::numeric_limits<std::uint64_t>::max();
+        return (std::numeric_limits<std::uint64_t>::max)();
     }
 
     /** Asks for @p origin's addresses when it has none or they expired, and dials an answered A
@@ -261,7 +261,7 @@ struct resolving {
         client.free_lookups = std::exchange(lookup->next, nullptr);
         lookup->origin = &origin;
         lookup->candidate = 0;
-        lookup->ttl_seconds = std::numeric_limits<std::uint32_t>::max();
+        lookup->ttl_seconds = (std::numeric_limits<std::uint32_t>::max)();
         lookup->settle_deadline = 0;
         origin.lookup = lookup;
         origin.resolution = resolution_t::resolving_k;
@@ -425,7 +425,8 @@ struct resolving {
         if (inet6.stage != question_stage_t::answered_k || inet4.stage != question_stage_t::answered_k) return;
         if (addresses_count(origin)) return finish(client, lookup, resolution_t::resolved_k);
         bool const answered = inet6.verdict != dns::answer_t::failed_k && inet4.verdict != dns::answer_t::failed_k;
-        lookup.ttl_seconds = answered ? std::min({lookup.ttl_seconds, inet6.ttl_seconds, inet4.ttl_seconds}) : 0;
+        lookup.ttl_seconds = answered ? fu::min_of(lookup.ttl_seconds, fu::min_of(inet6.ttl_seconds, inet4.ttl_seconds))
+                                      : 0;
         ++lookup.candidate;
         ask_candidate(client, lookup);
     }
@@ -433,14 +434,14 @@ struct resolving {
     /** Ends @p lookup with @p resolution, cached for the least TTL its answers relied on. */
     static void finish(client_t& client, client_lookup_t& lookup, resolution_t resolution) noexcept {
         client_origin_t& origin = *lookup.origin;
-        std::uint32_t ttl = lookup.ttl_seconds == std::numeric_limits<std::uint32_t>::max() ? 0 : lookup.ttl_seconds;
+        std::uint32_t ttl = lookup.ttl_seconds == (std::numeric_limits<std::uint32_t>::max)() ? 0 : lookup.ttl_seconds;
         if (resolution == resolution_t::resolved_k) {
-            ttl = std::numeric_limits<std::uint32_t>::max();
+            ttl = (std::numeric_limits<std::uint32_t>::max)();
             for (question_t const& question : lookup.questions)
-                if (question.verdict == dns::answer_t::addresses_k) ttl = std::min(ttl, question.ttl_seconds);
+                if (question.verdict == dns::answer_t::addresses_k) ttl = fu::min_of(ttl, question.ttl_seconds);
         }
         // RFC 1035 §3.2.1: a zero TTL serves only the transaction at hand, which a second covers.
-        origin.expires = deadline_after(std::size_t {std::max(ttl, std::uint32_t {1})} * 1'000'000);
+        origin.expires = deadline_after(std::size_t {fu::max_of(ttl, std::uint32_t {1})} * 1'000'000);
         origin.resolution = resolution;
         origin.lookup = nullptr;
         lookup.origin = nullptr;

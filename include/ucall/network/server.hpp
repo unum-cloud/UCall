@@ -273,6 +273,7 @@ struct server : ucall_server_handle_t {
             std::construct_at(network_interfaces + i, allocator);
         server->network_interfaces = {network_interfaces, config->interfaces_count};
         std::size_t event_loops_count = 1;
+        io::io_listeners_t listeners = io::io_listeners_t::created_k;
         for (std::size_t i = 0; i != config->interfaces_count; ++i) {
             auto& network_interface = server->network_interfaces[i];
             network_interface.config = config->interfaces[i];
@@ -332,11 +333,11 @@ struct server : ucall_server_handle_t {
             if (settings.event_loops > settings.max_concurrent_connections)
                 settings.event_loops = settings.max_concurrent_connections;
             if (!settings.max_pipelined_requests) settings.max_pipelined_requests = 1;
-            if (settings.max_pipelined_requests > std::numeric_limits<std::uint32_t>::max() ||
+            if (settings.max_pipelined_requests > (std::numeric_limits<std::uint32_t>::max)() ||
                 settings.max_concurrent_connections >
-                    std::numeric_limits<std::size_t>::max() / settings.max_pipelined_requests ||
+                    (std::numeric_limits<std::size_t>::max)() / settings.max_pipelined_requests ||
                 settings.max_concurrent_connections * settings.max_pipelined_requests >
-                    std::numeric_limits<std::size_t>::max() - server->requests_budget) {
+                    (std::numeric_limits<std::size_t>::max)() - server->requests_budget) {
                 publish(arguments->outcome, ucall_status_overflow_k);
                 return;
             }
@@ -347,7 +348,9 @@ struct server : ucall_server_handle_t {
                 return;
             }
 #endif
-            event_loops_count = std::max(event_loops_count, settings.event_loops);
+            event_loops_count = fu::max_of(event_loops_count, settings.event_loops);
+            if (settings.listen_descriptor) listeners = io::io_listeners_t::borrowed_k;
+            network_interface.send_buffer_bytes = formatting_t::listener_send_buffer(network_interface);
             if (settings.noise_private_key)
                 x25519_derive_public<typename crypto_t::x25519_kit_t>(
                     network_interface.public_key, std::as_bytes(std::span {*settings.noise_private_key}));
@@ -378,7 +381,7 @@ struct server : ucall_server_handle_t {
             for (auto& network_interface : server->network_interfaces)
                 if (event_loop_index < network_interface.config.event_loops) {
                     std::size_t const quota = network_interface.quota(event_loop_index);
-                    if (quota > std::numeric_limits<std::size_t>::max() - connections_count) {
+                    if (quota > (std::numeric_limits<std::size_t>::max)() - connections_count) {
                         publish(arguments->outcome, ucall_status_overflow_k);
                         return;
                     }
@@ -414,50 +417,55 @@ struct server : ucall_server_handle_t {
                 if (event_loop_index < network_interface.config.event_loops) {
                     auto& acceptor = event_loop.interface_acceptors[acceptor_index++];
                     acceptor.event_loop = &event_loop;
+                    acceptor.network_interface = &network_interface;
                     if (st::failed(acceptor.peer_addresses.resize(
-                            std::max<std::size_t>(network_interface.quota(event_loop_index), 1)))) {
+                            fu::max_of<std::size_t>(network_interface.quota(event_loop_index), 1)))) {
                         publish(arguments->outcome, ucall_status_out_of_memory_k);
                         return;
                     }
-                    ucall_status_t result;
-                    if (!event_loop_index) result = formatting_t::bind_acceptor(network_interface, acceptor);
-#if UCALL_OS_POSIX_
-                    else {
-                        auto network_interface_index = static_cast<std::size_t>(&network_interface -
-                                                                                server->network_interfaces.data());
-                        auto& first = server->event_loops[0]->interface_acceptors[network_interface_index];
-                        int descriptor = fcntl(static_cast<int>(first.request.descriptor), F_DUPFD_CLOEXEC, 0);
-                        result = descriptor >= 0 ? ucall_status_success_k : ucall_status_io_k;
-                        acceptor.network_interface = &network_interface;
-                        acceptor.request = {.operation = io_operation_t::accept_k,
-                                            .descriptor = descriptor,
-                                            .context = &acceptor};
-                    }
-#else
-                    else result = ucall_status_unsupported_k;
-#endif
-                    if (result != ucall_status_success_k) {
-                        publish(arguments->outcome, result);
-                        return;
-                    }
-                    acceptor.descriptor = acceptor.request.descriptor;
                 }
         }
-        // Every engine opens here, the later loops on the backend the first one resolved; a ring
-        // serves the thread that first polls it.
+        // Each engine opens before its loop's listeners, the later loops on the backend the first
+        // one resolved, so loop zero's listeners and the sockets they accept carry its engine's
+        // flags, and the later loops accept on duplicates of them; a ring serves the thread that
+        // first polls it.
         ucall_io_backend_t backend = config->backend;
         for (auto& event_loop : server->event_loops) {
             std::size_t windows = 0, slots = 0;
             ucall_status_t status = event_loop_slots(*event_loop, windows, slots);
-            if (status == ucall_status_success_k) status = event_loop->engine.open(backend, slots, slots);
+            if (status == ucall_status_success_k)
+                status = event_loop->engine.open(backend, slots, slots, io::io_issuer_scope_t::one_thread_k, listeners);
             if (status != ucall_status_success_k) {
-                // An engine refused by a host setting names the setting to raise.
+                // An engine refused by a host setting or a borrowed listener names what to change.
                 char const* refusal = event_loop->engine.refusal();
                 publish(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
                 return;
             }
             reserve_releases(*event_loop, windows);
             backend = event_loop->engine.backend();
+            for (auto& acceptor : event_loop->interface_acceptors) {
+                ucall_status_t result;
+                if (!event_loop->index) result = formatting_t::bind_acceptor(acceptor, event_loop->engine);
+#if UCALL_OS_POSIX_
+                else {
+                    auto network_interface_index = static_cast<std::size_t>(acceptor.network_interface -
+                                                                            server->network_interfaces.data());
+                    auto& first = server->event_loops[0]->interface_acceptors[network_interface_index];
+                    int descriptor = fcntl(static_cast<int>(first.request.descriptor), F_DUPFD_CLOEXEC, 0);
+                    result = descriptor >= 0 ? ucall_status_success_k : ucall_status_io_k;
+                    acceptor.request = {.operation = io_operation_t::accept_k,
+                                        .descriptor = descriptor,
+                                        .context = &acceptor};
+                }
+#else
+                else result = ucall_status_unsupported_k;
+#endif
+                if (result != ucall_status_success_k) {
+                    publish(arguments->outcome, result);
+                    return;
+                }
+                acceptor.descriptor = acceptor.request.descriptor;
+            }
         }
         server->config = *config;
         server->config.backend = backend;
@@ -527,7 +535,7 @@ struct server : ucall_server_handle_t {
     static ucall_status_t event_loop_slots(event_loop_t const& event_loop, std::size_t& windows,
                                            std::size_t& slots) noexcept {
         auto connections = event_loop.connections.size(), acceptors = event_loop.interface_acceptors.size();
-        std::size_t const counted_limit = std::numeric_limits<std::uint32_t>::max() / 8;
+        std::size_t const counted_limit = (std::numeric_limits<std::uint32_t>::max)() / 8;
         if (connections > counted_limit || acceptors > counted_limit || event_loop.max_exchanges > counted_limit)
             return ucall_status_overflow_k;
         // Every stream holds at most its socket's send buffer in windows, so the pool sums them.
@@ -873,7 +881,7 @@ struct server : ucall_server_handle_t {
         expiry = 0;
         if (endpoint.collected.empty()) return flushed;
         auto arrived = static_cast<server_exchange_t*>(endpoint.collected.front())->arrived;
-        auto maximum = std::numeric_limits<std::uint64_t>::max();
+        auto maximum = (std::numeric_limits<std::uint64_t>::max)();
         auto due = endpoint.max_latency_microseconds > (maximum - arrived) / 1000
                        ? maximum
                        : arrived + endpoint.max_latency_microseconds * 1000;
@@ -919,7 +927,7 @@ struct server : ucall_server_handle_t {
             if (collect_deposits(endpoint, stage, expiry) == ucall_status_success_k || batches_ended(server, stage) ||
                 monotonic_ns() >= deadline)
                 break;
-            wait_for_deposits(server, endpoint, expiry ? std::min(expiry, deadline) : deadline);
+            wait_for_deposits(server, endpoint, expiry ? fu::min_of(expiry, deadline) : deadline);
         }
         publish(arguments->outcome, atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
     }

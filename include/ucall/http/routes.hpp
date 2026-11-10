@@ -36,7 +36,7 @@ using route_search_t =
 
 template <typename search_type_ = route_search_t>
 inline std::string_view extract_path_component(std::string_view url) noexcept {
-    return url.substr(0, std::min(search_type_::find(url, '?'), search_type_::find(url, '#')));
+    return url.substr(0, fu::min_of(search_type_::find(url, '?'), search_type_::find(url, '#')));
 }
 
 /** Walks a path as @c / followed by segments split on @c /, exactly as sent: @c / holds none, and
@@ -242,7 +242,7 @@ class route_trie {
         if (!root_) return nullptr;
         path_cursor<search_type_> cursor {extract_path_component<search_type_>(path)};
         auto const remains = [&](std::size_t start) noexcept {
-            return std::max<std::size_t>(start, 1) < cursor.path.size();
+            return fu::max_of<std::size_t>(start, 1) < cursor.path.size();
         };
         auto current = root_;
         for (;;) {

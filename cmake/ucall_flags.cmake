@@ -4,7 +4,8 @@
 # named arguments as partially designated structs, leaving the rest zeroed.
 add_library(ucall_warnings INTERFACE)
 if (MSVC)
-    target_compile_options(ucall_warnings INTERFACE /W3)
+    # The conformance switches MSVC leaves off by default, which every other supported compiler behaves as.
+    target_compile_options(ucall_warnings INTERFACE /W3 /permissive- /Zc:preprocessor /Zc:__cplusplus /utf-8 /bigobj)
     if (UCALL_WERROR)
         target_compile_options(ucall_warnings INTERFACE /WX)
     endif ()

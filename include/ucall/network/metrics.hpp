@@ -53,7 +53,7 @@ struct metrics {
     /** @p key followed by as much of @p value as @p output holds. */
     template <std::size_t capacity_>
     static std::string_view tag_text(char (&output)[capacity_], std::string_view key, std::string_view value) noexcept {
-        std::size_t const length = std::min(value.size(), capacity_ - key.size());
+        std::size_t const length = fu::min_of(value.size(), capacity_ - key.size());
         std::memcpy(output, key.data(), key.size());
         if (length) std::memcpy(output + key.size(), value.data(), length);
         return {output, key.size() + length};
@@ -207,14 +207,14 @@ struct metrics {
             auto const& live = event_loop.interface_statistics[i];
             auto const& reported = metrics.interfaces_reported[i];
             auto& reporting = metrics.interfaces_reporting[i];
-            std::string_view const interface = tag_text(interface_text, "interface:", i);
+            std::string_view const interface_name = tag_text(interface_text, "interface:", i);
             fitted = append_metric(server, datagram, "connections",
-                                   formatting_t::format_decimal(digits, live.connections), "g", {loop, interface});
+                                   formatting_t::format_decimal(digits, live.connections), "g", {loop, interface_name});
             for (std::size_t j = 0; j != std::size(refused_statuses_k) && fitted == ucall_status_success_k; ++j) {
                 if (live.refused[j] == reported.refused[j]) continue;
                 fitted = append_metric(server, datagram, "refused",
                                        formatting_t::format_decimal(digits, live.refused[j] - reported.refused[j]), "c",
-                                       {loop, interface, tag_text(status_text, "status:", refused_statuses_k[j])});
+                                       {loop, interface_name, tag_text(status_text, "status:", refused_statuses_k[j])});
                 if (fitted == ucall_status_success_k) reporting.refused[j] = live.refused[j];
             }
             using failure_t = std::uint64_t interface_statistics_t::*;
@@ -224,7 +224,7 @@ struct metrics {
                 if (live.*failure == reported.*failure || fitted != ucall_status_success_k) continue;
                 fitted = append_metric(server, datagram, name,
                                        formatting_t::format_decimal(digits, live.*failure - reported.*failure), "c",
-                                       {loop, interface});
+                                       {loop, interface_name});
                 if (fitted == ucall_status_success_k) reporting.*failure = live.*failure;
             }
         }

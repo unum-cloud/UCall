@@ -55,7 +55,6 @@ set(UCALL_MARCH
 option(UCALL_MULTIVERSIONED "Keep every CPU class the toolchain compiles, or only the best ones UCALL_MARCH implies" ON)
 
 include(cmake/ucall_flags.cmake)
-include(cmake/ucall_platform.cmake)
 
 # Make Release by default
 if (NOT CMAKE_BUILD_TYPE)
@@ -102,6 +101,7 @@ find_package(Threads REQUIRED)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(cmake/ucall_siblings.cmake)
+include(cmake/ucall_platform.cmake)
 
 if (UCALL_WITH_LINUX_URING)
     include(cmake/liburing.cmake)
@@ -202,26 +202,19 @@ endif ()
 set_target_properties(ucall_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 
 # One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
-# kits and atomics use, oldest first, `serial` over none. A class exists when each of them is enabled. Its unit takes
-# the StringZilla flags of those capabilities in that order, so on Arm the last `-march` holds every extension. A
-# multiversioned build keeps every class that exists. A monoversioned one keeps none of them, serial included, and
-# compiles the `monoversioned` class instead, over every capability the libraries enabled: what `UCALL_MARCH` implies
-# and what a preset vouches for, with the flags of the vouched ones. Every gate is `UCALL_TARGET_<CLASS>` set to 0 or 1.
+# kits and atomics use, oldest first, `serial` over none. A class exists when each of them is enabled. Its unit compiles
+# at the floor: StringZilla's kernels are archive symbols carrying their own targets and ForkUnion spells its
+# instructions in assembly, so no shared inline function is emitted with a class's instruction set. A multiversioned
+# build keeps every class that exists. A monoversioned one keeps none of them, serial included, and compiles the
+# `monoversioned` class instead, over every capability the libraries enabled. Every gate is `UCALL_TARGET_<CLASS>`.
 function (ucall_cpu_variant class_ target_macro_)
     set(kept_ FALSE)
     if (UCALL_MULTIVERSIONED OR class_ STREQUAL "monoversioned")
         set(kept_ TRUE)
     endif ()
-    set(flags_)
     foreach (capability_ IN LISTS ARGN)
         if (NOT stringzilla_target_${capability_}_enabled AND NOT forkunion_target_${capability_}_enabled)
             set(kept_ FALSE)
-        endif ()
-        # MSVC takes one `/arch:`, the newest capability's, and warns when a later one overrides an earlier.
-        if (MSVC AND stringzilla_target_${capability_}_flags)
-            set(flags_ ${stringzilla_target_${capability_}_flags})
-        else ()
-            list(APPEND flags_ ${stringzilla_target_${capability_}_flags})
         endif ()
     endforeach ()
     if (kept_)
@@ -229,7 +222,6 @@ function (ucall_cpu_variant class_ target_macro_)
         target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_${target_macro_}=1)
         target_sources(ucall_static PRIVATE src/variants_${class_}.cpp)
         target_sources(ucall_shared PRIVATE src/variants_${class_}.cpp)
-        set_source_files_properties(src/variants_${class_}.cpp PROPERTIES COMPILE_OPTIONS "${flags_}")
     else ()
         target_compile_definitions(ucall_static PRIVATE UCALL_TARGET_${target_macro_}=0)
         target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_${target_macro_}=0)
@@ -281,20 +273,8 @@ else ()
     get_property(ucall_capabilities_enabled_ GLOBAL PROPERTY stringzilla_capabilities_enabled)
     get_property(forkunion_capabilities_enabled_ GLOBAL PROPERTY forkunion_capabilities_enabled)
     list(APPEND ucall_capabilities_enabled_ ${forkunion_capabilities_enabled_})
-    # The floor already holds what it implies, and a later `-march` would lower an Arm `-mcpu` floor.
-    set(ucall_capabilities_summary_)
-    set(ucall_capabilities_vouched_)
-    foreach (capability_ IN LISTS ucall_capabilities_enabled_)
-        string(APPEND ucall_capabilities_summary_ " ${capability_}")
-        if (NOT capability_ STREQUAL "serial"
-            AND NOT stringzilla_target_${capability_}_implied
-            AND NOT forkunion_target_${capability_}_implied
-        )
-            list(APPEND ucall_capabilities_vouched_ ${capability_})
-        endif ()
-    endforeach ()
-    message(STATUS "UCall: monoversioned for ${ucall_floor_}:${ucall_capabilities_summary_}")
-    ucall_cpu_variant(monoversioned MONOVERSIONED ${ucall_capabilities_vouched_})
+    message(STATUS "UCall: monoversioned for ${ucall_floor_}: ${ucall_capabilities_enabled_}")
+    ucall_cpu_variant(monoversioned MONOVERSIONED)
 endif ()
 
 if (UCALL_BUILD_EXAMPLES)

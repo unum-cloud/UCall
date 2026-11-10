@@ -22,8 +22,8 @@ StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve 
 The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, and `ucall::header`, the C headers alone.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each engine where the target operating system has it, and the header refuses one forced on elsewhere.
 `UCALL_WITH_LINUX_URING`, on for Linux, also links liburing, and a library or subproject build serves whichever compiled engine the host admits first.
-CPU probes select separate instantiation units and apply their instruction flags without raising the dispatch code's baseline.
-Each class unit compiles when StringZilla and ForkUnion enable every capability it uses, with StringZilla's flags for them.
+CPU probes select separate instantiation units, each compiled at the floor like the dispatch code.
+Each class unit compiles when StringZilla and ForkUnion enable every capability it uses.
 `UCALL_MARCH` raises the floor of UCall's own units to an ISA level, `native` or a CPU name like `graniterapids`, and hands the same value to the siblings.
 `UCALL_MULTIVERSIONED`, on by default, compiles every class that exists, `serial` included, and picks among them at run time.
 Off, it builds for one machine and compiles only the `monoversioned` class, over every capability the libraries enabled: what the floor implies and what a preset vouches for with `-D <LIBRARY>_TARGET_<CAPABILITY>=1`.

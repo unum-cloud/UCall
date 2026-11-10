@@ -252,7 +252,7 @@ inline constexpr std::size_t page_bytes_k = 4096;
 inline constexpr std::size_t file_max_alignment_k = 32768;
 
 /** No index, as @c file_window_t links and borrowers spell it. */
-inline constexpr std::uint32_t absent_k = std::numeric_limits<std::uint32_t>::max();
+inline constexpr std::uint32_t absent_k = (std::numeric_limits<std::uint32_t>::max)();
 
 /** Where a pooled window is: free, read into, holding read bytes, being sent, or waiting for
  *  the kernel to let go of it. */

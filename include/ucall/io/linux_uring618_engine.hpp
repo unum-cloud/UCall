@@ -123,7 +123,7 @@ struct linux_uring618_engine {
         if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
         if (queue.stage != uring_engine_stage_t::idle_k) return ucall_status_invalid_argument_k;
         // Releases take no file, and the kernel registers no more files than descriptors.
-        std::size_t const sockets = std::min(capacity, open_files_limit() - 1);
+        std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
         if (ucall_status_t const reserved = queue.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
@@ -199,7 +199,7 @@ struct linux_uring618_engine {
         tally<atomic_ref_template_>(statistics.bytes_copied, slice.size());
         provided.return_slice(slice);
         assert(socket_slots.records.size() > socket_slots.vacant_socket_slots);
-        std::size_t const share = std::min(
+        std::size_t const share = fu::min_of(
             provided.buffer_bytes,
             provided.memory.size() / (socket_slots.records.size() - socket_slots.vacant_socket_slots));
         if (owner.backlog.size() - owner.backlog_offset >= share &&
@@ -237,8 +237,8 @@ struct linux_uring618_engine {
         if (owner.backlog_offset != owner.backlog.size()) {
             if (owner.backlog_lease == uring_lease_t::leased_k) return;
             operation.receive_source = uring_receive_source_t::backlog_k;
-            operation.result = static_cast<descriptor_t>(std::min<std::size_t>(
-                owner.backlog.size() - owner.backlog_offset, std::numeric_limits<descriptor_t>::max()));
+            operation.result = static_cast<descriptor_t>(fu::min_of<std::size_t>(
+                owner.backlog.size() - owner.backlog_offset, (std::numeric_limits<descriptor_t>::max)()));
             owner.backlog_lease = uring_lease_t::leased_k;
         }
         else if (owner.receive_stage == receive_stage_t::ended_k) operation.result = owner.terminal;
@@ -493,7 +493,7 @@ struct linux_uring618_engine {
                 index = operation.next;
                 std::uint64_t const expiry = operation.request->deadline;
                 if (expiry > now) {
-                    earliest_timed = earliest_timed ? std::min(earliest_timed, expiry) : expiry;
+                    earliest_timed = earliest_timed ? fu::min_of(earliest_timed, expiry) : expiry;
                     continue;
                 }
                 operation.expiry = uring_expiry_t::expired_k;
@@ -524,7 +524,7 @@ struct linux_uring618_engine {
             auto now = monotonic_ns();
             auto wait_deadline = deadline;
             if (!timed_operations.empty())
-                wait_deadline = !wait_deadline ? earliest_timed : std::min(wait_deadline, earliest_timed);
+                wait_deadline = !wait_deadline ? earliest_timed : fu::min_of(wait_deadline, earliest_timed);
             unsigned wait = policy == io_wait_t::blocking_k && (!wait_deadline || now < wait_deadline) ? 1 : 0;
             int result = queue.enter(wait, wait_deadline);
             if (result < 0) return result;

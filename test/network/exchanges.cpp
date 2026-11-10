@@ -36,15 +36,14 @@ static case_result_t exchanges(ucall_security_t security) {
                            ucall_status_name(completed.outcome.status));
         if (completed.response) failures += check_response(completed.response, expected);
     };
-    // Rings copy what lands in their pool; other engines land straight in the transport's buffers.
-    bool const rings = backend_under_test == ucall_io_backend_linux_uring612_k ||
-                       backend_under_test == ucall_io_backend_linux_uring618_k;
+    // Rings and Registered I/O copy what lands in their pool; other engines land straight in the
+    // transport's buffers.
+    ucall_io_backend_t const backend = fixture.resolved.backend;
+    bool const pooled = backend == ucall_io_backend_linux_uring612_k || backend == ucall_io_backend_linux_uring618_k ||
+                        backend == ucall_io_backend_windows_rio_k;
     auto copies_beyond_receipt = [&] {
-        ucall_event_loop_statistics_t counters {};
-        ucall_outcome_t queried {};
-        ucall_server_event_loop_statistics_t query {fixture.server, &queried, 0, &counters};
-        ucall_server_event_loop_statistics(&query);
-        return rings ? counters.bytes_copied - counters.bytes_received : counters.bytes_copied;
+        ucall_event_loop_statistics_t const counters = loop_statistics(fixture);
+        return pooled ? counters.bytes_copied - counters.bytes_received : counters.bytes_copied;
     };
     // A reply's copy is counted once its send completes, which can trail the client's completion.
     auto settled_copies = [&](std::uint64_t since, std::uint64_t expected) {
@@ -63,10 +62,13 @@ static case_result_t exchanges(ucall_security_t security) {
     exchange(payload);
     auto const copied = settled_copies(before, payload.size()) - before;
     // A 618 stream that outruns its receive copies those bytes into the backlog as well.
-    bool const streams = backend_under_test == ucall_io_backend_linux_uring618_k;
+    bool const streams = backend == ucall_io_backend_linux_uring618_k;
     std::size_t const copied_limit = streams ? 3 * payload.size() : payload.size();
     failures += expect(copied >= payload.size() && copied <= copied_limit,
                        "{} bytes copied beyond those received for a {}-byte echo", copied, payload.size());
+    // Only a socket accepted in Registered I/O sends unregistered bytes through a slice.
+    failures += expect(backend != ucall_io_backend_windows_rio_k || loop_statistics(fixture).copying_sends > 0,
+                       "the server's connections sent outside Registered I/O");
     if (security != ucall_security_none_k) return failures + fixture.stop();
     announce("a named host");
     auto named_url = url;
@@ -604,6 +606,46 @@ static case_result_t test_head_replies() {
     ucall_server_event_loop_statistics(&query);
     failures += expect(counters.accepts == 1, "the server accepted {} connections", counters.accepts);
     return failures + fixture.stop();
+}
+
+/** A listener the caller hands over is served by an engine accepting from any listener: an
+ *  automatic server passes over Registered I/O, and one naming it is refused, saying why. */
+static case_result_t test_borrowed_listener_backend() {
+    uc::utilities::descriptor_t const listener = uc::utilities::socket_open(AF_INET);
+    sockaddr_in bound {};
+    bound.sin_family = AF_INET;
+    bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    require(0,
+            listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) == 0 &&
+                ::listen(listener, 4) == 0,
+            "no TCP listener");
+    std::intptr_t const handed = listener;
+    ucall_network_interface_t network_interface {};
+    network_interface.listen_descriptor = &handed;
+    network_interface.max_concurrent_connections = 1;
+    ucall_server_options_t config {};
+    config.interfaces = &network_interface;
+    config.interfaces_count = 1;
+    config.backend = backend_under_test;
+    config.cpu_class = cpu_class_under_test;
+    ucall_server_t server {};
+    ucall_server_options_t resolved {};
+    ucall_outcome_t outcome {};
+    ucall_server_init_t init {&server, &outcome, &config, &resolved};
+    ucall_server_init(&init);
+    std::size_t failures = 0;
+    if (backend_under_test == ucall_io_backend_windows_rio_k)
+        failures += expect(outcome.status == ucall_status_unsupported_k && outcome.message &&
+                               std::string_view {outcome.message}.find("listen_descriptor") != std::string_view::npos,
+                           "Registered I/O over a borrowed listener: {}", ucall_status_name(outcome.status));
+    else
+        failures += expect(
+            outcome.status == ucall_status_success_k && resolved.backend != ucall_io_backend_windows_rio_k,
+            "a borrowed listener: {} on {}", ucall_status_name(outcome.status),
+            ucall_io_backend_name(resolved.backend));
+    ucall_server_free(server);
+    uc::utilities::socket_close(listener);
+    return failures;
 }
 
 #pragma endregion Library Clients
@@ -1242,7 +1284,7 @@ static case_result_t test_interface_listen_descriptor(random_generator_t& genera
         int const listener = ::socket(AF_UNIX, SOCK_STREAM, 0);
         sockaddr_un bound {};
         bound.sun_family = AF_UNIX;
-        std::memcpy(bound.sun_path, path.c_str(), std::min(path.size() + 1, sizeof(bound.sun_path) - 1));
+        std::memcpy(bound.sun_path, path.c_str(), fu::min_of(path.size() + 1, sizeof(bound.sun_path) - 1));
         require(failures,
                 listener >= 0 && path.size() < sizeof(bound.sun_path) &&
                     ::bind(listener, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) == 0 &&
@@ -1633,6 +1675,7 @@ void run_exchanges(suite_totals_t& totals) {
     run_test(totals, "test_pipelined_streams_plain", test_pipelined_streams_plain);
     run_test(totals, "test_pipelined_streams_noise_xx", test_pipelined_streams_noise_xx);
     run_test(totals, "test_head_replies", test_head_replies);
+    run_test(totals, "test_borrowed_listener_backend", test_borrowed_listener_backend);
 #if UCALL_OS_POSIX_
     run_test(totals, "test_log_lines", test_log_lines);
     run_test(totals, "test_streamed_reply_would_block", test_streamed_reply_would_block);

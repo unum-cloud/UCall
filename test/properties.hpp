@@ -14,7 +14,7 @@
 #include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
-#include <algorithm>   // `std::min`
+#include <algorithm>   // `std::equal`
 #include <memory>      // `std::unique_ptr`
 #include <string>      // `std::string`
 #include <string_view> // `std::string_view`
@@ -105,7 +105,7 @@ using property_http_t = http::messages<http::serial_compare_kit_t, http::serial_
     message_t message {};
     std::size_t previous = 0;
     for (std::size_t index = 0; index <= cuts.size(); ++index) {
-        std::size_t const end = index == cuts.size() ? wire.size() : std::min(cuts[index], wire.size());
+        std::size_t const end = index == cuts.size() ? wire.size() : fu::min_of(cuts[index], wire.size());
         if (end < previous) continue;
         previous = end;
         exact_copy_t prefix {wire.first(end)};
@@ -127,7 +127,7 @@ using property_http_t = http::messages<http::serial_compare_kit_t, http::serial_
     std::size_t delivered = expected.headers_length;
     auto const body_end = expected.wire_length;
     auto feed = [&](std::size_t until) -> http::http_parse_t {
-        until = std::min(until, body_end);
+        until = fu::min_of(until, body_end);
         if (until > delivered) pending.append(text_view(wire).substr(delivered, until - delivered)), delivered = until;
         exact_copy_t input {byte_span(pending)};
         std::size_t payload = 0, consumed = 0;
@@ -161,7 +161,7 @@ inline std::vector<std::string_view> reference_segments(std::string_view path) {
     std::vector<std::string_view> segments;
     if (path.size() <= 1) return segments;
     for (std::size_t start = 1;;) {
-        std::size_t const end = std::min(path.find('/', start), path.size());
+        std::size_t const end = fu::min_of(path.find('/', start), path.size());
         segments.push_back(path.substr(start, end - start));
         if (end == path.size()) return segments;
         start = end + 1;
@@ -172,7 +172,7 @@ inline std::vector<std::string_view> reference_segments(std::string_view path) {
  *  wildcard, or false when it does not. A parameter takes a non-empty segment, while a wildcard
  *  takes any non-empty rest. */
 inline bool reference_match(std::string_view route, std::string_view path, std::vector<std::uint8_t>& kinds) {
-    std::string_view const bare = path.substr(0, std::min(path.find('?'), path.find('#')));
+    std::string_view const bare = path.substr(0, fu::min_of(path.find('?'), path.find('#')));
     std::vector<std::string_view> const wanted = reference_segments(route), given = reference_segments(bare);
     kinds.clear();
     std::size_t start = 1;
@@ -419,10 +419,10 @@ struct property_tunnel_pair_t {
 
     if (!pair.usable() && !pair.connect()) return failures + 1;
     std::size_t const flips = copy.size ? std::to_integer<std::size_t>(copy.bytes[0]) % 5 : 0;
-    std::size_t const payload_at = std::min(copy.size, 1 + 2 * flips);
+    std::size_t const payload_at = fu::min_of(copy.size, 1 + 2 * flips);
     span<byte_t const> const payload {copy.bytes.get() + payload_at, copy.size - payload_at};
     span<byte_t> const window = pair.client.payload_window(pair.wire);
-    std::size_t const filled = std::min(payload.size(), window.size());
+    std::size_t const filled = fu::min_of(payload.size(), window.size());
     if (filled) std::memcpy(window.data(), payload.data(), filled);
     auto const sealed = pair.client.seal(pair.wire, filled);
     if (sealed.empty()) return failures + 1;

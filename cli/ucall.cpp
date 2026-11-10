@@ -525,7 +525,7 @@ static int proxy(std::span<char*> arguments) {
         for (;;) {
             ucall_outcome_t outcome {};
             // Waits for a request or an answer; a stop wakes it, and it drains before closing.
-            ucall_server_take_call_t take {proxy.server, &outcome, 0, std::numeric_limits<std::uint32_t>::max()};
+            ucall_server_take_call_t take {proxy.server, &outcome, 0, (std::numeric_limits<std::uint32_t>::max)()};
             ucall_server_take_call(&take);
             proxy.answer_completed();
             if (outcome.status == ucall_status_connection_closed_k) {

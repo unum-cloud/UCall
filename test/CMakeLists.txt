@@ -15,6 +15,10 @@ add_executable(ucall_test_c "${PROJECT_SOURCE_DIR}/c/test.c")
 target_link_libraries(ucall_test_c PRIVATE ucall_static ucall_sanitizers ucall_warnings)
 target_compile_features(ucall_test_c PRIVATE c_std_11)
 add_test(NAME c COMMAND ucall_test_c)
+add_test(NAME ucall_duplicate_symbols
+         COMMAND ${CMAKE_COMMAND} "-DOBJECTS=$<TARGET_OBJECTS:ucall_static>"
+                 -P "${forkunion_SOURCE_DIR}/cmake/forkunion_duplicate_symbols.cmake"
+)
 
 add_executable(
     ucall_test_network network.cpp network/exchanges.cpp network/bodies.cpp network/client.cpp network/files.cpp
@@ -58,6 +62,8 @@ endif ()
 add_executable(ucall_test_polling polling.cpp)
 target_include_directories(ucall_test_polling PRIVATE "${PROJECT_SOURCE_DIR}/src")
 target_link_libraries(ucall_test_polling PRIVATE ucall_static ucall_sanitizers ucall_warnings fmt::fmt)
+# Serial needs no capability, so the library compiles it exactly when it keeps every class that exists.
+target_compile_definitions(ucall_test_polling PRIVATE UCALL_TARGET_SERIAL=$<BOOL:${UCALL_MULTIVERSIONED}>)
 add_test(NAME polling COMMAND ucall_test_polling)
 set_tests_properties(
     polling PROPERTIES TIMEOUT 30 SKIP_RETURN_CODE 77 ENVIRONMENT

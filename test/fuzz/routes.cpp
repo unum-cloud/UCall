@@ -20,9 +20,9 @@ extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const* data, std::size_t size
     std::vector<std::string_view> templates, paths;
     std::vector<ucall_verb_t> verbs;
     while (!text.empty() && paths.size() != 8) {
-        std::size_t const end = std::min(text.find('\n'), text.size());
+        std::size_t const end = fu::min_of(text.find('\n'), text.size());
         std::string_view const line = text.substr(0, end);
-        text.remove_prefix(std::min(end + 1, text.size()));
+        text.remove_prefix(fu::min_of(end + 1, text.size()));
         if (templates.size() == templates_count) paths.push_back(line);
         else if (!line.empty()) {
             verbs.push_back(verbs_k[static_cast<unsigned char>(line.front()) % 4]);

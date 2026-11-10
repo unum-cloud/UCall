@@ -138,7 +138,8 @@ struct server_t {
             ucall_bytes_view_t const name = bytes_view(value);
             std::initializer_list<count_flag_t>::iterator const extra = std::find_if(
                 counts.begin(), counts.end(), [&](count_flag_t const& count) { return count.name == flag; });
-            if (flag == "--port") valid = parse_count(value, port) && port <= std::numeric_limits<std::uint16_t>::max();
+            if (flag == "--port")
+                valid = parse_count(value, port) && port <= (std::numeric_limits<std::uint16_t>::max)();
             else if (flag == "--host") {
                 host = value;
                 valid = !value.empty() && value.size() <= sizeof("ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255") - 1;
@@ -213,7 +214,7 @@ struct server_t {
         network_interface.address = bytes_view(address);
         network_interface.max_concurrent_connections = connections;
         network_interface.max_pipelined_requests = pipelined_requests;
-        network_interface.event_loops = std::min(threads, connections);
+        network_interface.event_loops = fu::min_of(threads, connections);
         if (reply_directory.length) {
             network_interface.reply_directories = &reply_directory;
             network_interface.reply_directories_count = 1;

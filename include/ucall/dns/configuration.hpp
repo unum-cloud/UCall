@@ -81,7 +81,7 @@ inline void parse_option(std::string_view word, std::string_view option, std::ui
     word.remove_prefix(option.size());
     std::uint32_t parsed = 0;
     if (std::from_chars(word.data(), word.data() + word.size(), parsed).ptr != word.data() + word.size()) return;
-    value = std::min(parsed, ceiling);
+    value = fu::min_of(parsed, ceiling);
 }
 
 /** Reads the file at @p path into @p buffer, answering the bytes read, or zero without a file. */
@@ -100,7 +100,7 @@ inline void parse_resolv_conf(std::string_view text, resolver_options_t& options
         auto const newline = text.find('\n');
         auto line = text.substr(0, newline);
         text.remove_prefix(newline == std::string_view::npos ? text.size() : newline + 1);
-        line = line.substr(0, std::min(line.find('#'), line.find(';')));
+        line = line.substr(0, fu::min_of(line.find('#'), line.find(';')));
         auto const keyword = next_word(line);
         if (keyword == "nameserver") {
             if (options.nameservers_count == resolver_options_t::max_nameservers_k) continue;
@@ -186,7 +186,7 @@ inline void read_system(resolver_options_t& options) noexcept {
                 if (options.nameservers_count == resolver_options_t::max_nameservers_k) break;
                 auto& slot = options.nameservers[options.nameservers_count++];
                 std::memcpy(&slot, server->Address.lpSockaddr,
-                            std::min<std::size_t>(server->Address.iSockaddrLength, sizeof(slot)));
+                            fu::min_of<std::size_t>(server->Address.iSockaddrLength, sizeof(slot)));
                 reinterpret_cast<sockaddr_in&>(slot).sin_port = htons(53);
             }
         }

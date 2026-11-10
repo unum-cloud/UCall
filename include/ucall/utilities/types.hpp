@@ -11,7 +11,6 @@
 #include <cstring> // `std::memset`, `std::memcpy`
 
 #include <atomic>      // `std::atomic`
-#include <algorithm>   // `std::max`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <span>        // `std::span`, `std::as_bytes`
@@ -22,11 +21,9 @@
 #include "ucall/types.h" // `UCALL_OS_WINDOWS_`
 
 /*  `<winsock2.h>` has to precede `<windows.h>`, which otherwise drags in the Winsock 1.1
- *  declarations and leaves the socket backends with two incompatible definitions of each. */
+ *  declarations and leaves the socket backends with two incompatible definitions of each. Neither
+ *  `NOMINMAX` nor `WIN32_LEAN_AND_MEAN` is set, so a user's own `<windows.h>` reads the same. */
 #if UCALL_OS_WINDOWS_
-#if !defined(WIN32_LEAN_AND_MEAN)
-#define WIN32_LEAN_AND_MEAN
-#endif
 #include <winsock2.h>
 #include <windows.h>
 #else

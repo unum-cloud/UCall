@@ -63,7 +63,7 @@ static std::string lettered_body() {
 static std::string chunked_body(std::string_view body, random_generator_t& generator) {
     std::string wire;
     for (std::size_t offset = 0; offset != body.size();) {
-        std::size_t const length = std::min<std::size_t>(1 + generator.below(70000), body.size() - offset);
+        std::size_t const length = fu::min_of<std::size_t>(1 + generator.below(70000), body.size() - offset);
         wire += fmt::format("{:x}{}\r\n{}\r\n", length, offset ? "" : ";first=1", body.substr(offset, length));
         offset += length;
     }
@@ -590,9 +590,9 @@ static case_result_t test_statsd_metrics() {
             failures += expect(!fixture.poll(completed), "a call completed unasked");
             for (ssize_t received; (received = ::recv(listener, datagram, sizeof(datagram), MSG_DONTWAIT)) > 0;)
                 for (std::string_view rest {datagram, static_cast<std::size_t>(received)}; !rest.empty();) {
-                    auto const end = std::min(rest.find('\n'), rest.size());
+                    auto const end = fu::min_of(rest.find('\n'), rest.size());
                     lines.emplace_back(rest.substr(0, end));
-                    rest.remove_prefix(std::min(end + 1, rest.size()));
+                    rest.remove_prefix(fu::min_of(end + 1, rest.size()));
                 }
         }
         failures += expect(metric_sum(lines, "probe.requests", "") == 51, "requests added up to {}",

@@ -642,7 +642,7 @@ struct serving {
             bool const body_fits = message.framing != http_framing_t::length_k
                                        ? (parsed == http_parse_t::complete_k ? message.wire_length : unparsed.size()) <=
                                              cap
-                                       : message.content_length <= cap - std::min(cap, head);
+                                       : message.content_length <= cap - fu::min_of(cap, head);
             if ((!head_fits || (head && !body_fits)) &&
                 (parsed == http_parse_t::incomplete_k || parsed == http_parse_t::complete_k))
                 parsed = http_parse_t::overflow_k;
@@ -927,13 +927,13 @@ struct serving {
                  active.load(std::memory_order_relaxed) - accepting.load(std::memory_order_relaxed) < limit))
                 continue;
             acceptor.stage = admitted ? acceptor_stage_t::submitted_k : acceptor_stage_t::probing_k;
-            if (admitted) accepting.add(1, std::memory_order_relaxed);
+            if (admitted) accepting.store_add(1, std::memory_order_relaxed);
             aim_accept(event_loop, acceptor);
             if (engine.submit(acceptor.request) == ucall_status_success_k) continue;
             acceptor.stage = acceptor_stage_t::idle_k;
             if (admitted) {
-                accepting.sub(1, std::memory_order_relaxed);
-                active.sub(1, std::memory_order_relaxed);
+                accepting.store_sub(1, std::memory_order_relaxed);
+                active.store_sub(1, std::memory_order_relaxed);
             }
         }
         collect_replies(event_loop);
@@ -994,8 +994,8 @@ struct serving {
             std::size_t const active = atomic_ref<std::size_t> {acceptor.network_interface->active}.load(
                 std::memory_order_relaxed);
             std::size_t const idle = event_loop.connections.size() - event_loop.open_connections;
-            headroom = std::min(
-                {limit > active ? limit - active : 0, idle ? idle - 1 : 0, acceptor.peer_addresses.size() - 1});
+            headroom = fu::min_of(fu::min_of(limit > active ? limit - active : 0, idle ? idle - 1 : 0),
+                                  acceptor.peer_addresses.size() - 1);
         }
         acceptor.request.data = reinterpret_cast<byte_t*>(acceptor.peer_addresses.data());
         acceptor.request.length = 1 + headroom;
@@ -1054,7 +1054,7 @@ struct serving {
         bool const pending = completion.request->length != 0;
         auto const stage = pending ? acceptor.stage : std::exchange(acceptor.stage, acceptor_stage_t::idle_k);
         if (stage == acceptor_stage_t::submitted_k && !pending)
-            atomic_ref<std::size_t> {network_interface.accepting}.sub(1, std::memory_order_relaxed);
+            atomic_ref<std::size_t> {network_interface.accepting}.store_sub(1, std::memory_order_relaxed);
         if (completion.result < 0) {
             if (stage == acceptor_stage_t::submitted_k) release_admission(server, network_interface);
             auto const failure = utilities::accept_failure(static_cast<int>(-completion.result));
@@ -1086,7 +1086,7 @@ struct serving {
             if (!pending) return;
             // The accept still pending holds an admission of its own, or, saturated, ends.
             if (event_loop.idle && active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit) return;
-            atomic_ref<std::size_t> {network_interface.accepting}.sub(1, std::memory_order_relaxed);
+            atomic_ref<std::size_t> {network_interface.accepting}.store_sub(1, std::memory_order_relaxed);
             acceptor.stage = acceptor_stage_t::probing_k;
             event_loop.engine.cancel(*completion.request);
             return;

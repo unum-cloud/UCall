@@ -92,7 +92,7 @@ struct epoll_readiness {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 
     /** The event data of the one descriptor that is no watch, the AIO completion counter. */
-    static constexpr std::uint64_t signal_k = std::numeric_limits<std::uint64_t>::max();
+    static constexpr std::uint64_t signal_k = (std::numeric_limits<std::uint64_t>::max)();
     using watches_t = st::basic_fixed_pool<readiness_watch_t, std::uint32_t, rebound_allocator<byte_t>>;
     using watch_index_t =
         st::basic_hash_index<std::int32_t, std::uint32_t, st::default_hash_t, rebound_allocator<byte_t>, row_kit_type_>;
@@ -176,9 +176,9 @@ struct epoll_readiness {
      *  watches awaiting notifications to @p errored, and the signal descriptor to @p signalled. */
     template <typename fired_type_, typename errored_type_, typename signalled_type_>
     int wait(int timeout, fired_type_&& fired, errored_type_&& errored, signalled_type_&& signalled) noexcept {
-        int count = epoll_wait(descriptor, events.data(),
-                               static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
-                               timeout);
+        int count = epoll_wait(
+            descriptor, events.data(),
+            static_cast<int>(fu::min_of<std::size_t>(events.size(), (std::numeric_limits<int>::max)())), timeout);
         if (count < 0) return -errno;
         for (int i = 0; i != count; ++i) {
             auto flags = events[i].events;
@@ -458,7 +458,7 @@ struct linux_epollaio_engine {
 
     /** Sends copying, as a socket does once zero-copy is refused or reported copied. */
     descriptor_t send_copying(io_request_t const& request) noexcept {
-        auto const length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
+        auto const length = fu::min_of<std::size_t>(request.length, (std::numeric_limits<int>::max)());
         tally<atomic_ref_template_>(statistics.copying_sends);
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length, MSG_NOSIGNAL);
         return sent >= 0 ? static_cast<descriptor_t>(sent) : -errno;
@@ -484,12 +484,12 @@ struct linux_epollaio_engine {
         unsigned release = request.release_request ? carrying(*request.release_request) : absent_k;
         zero_copy_run_t* extended = watch.newest_run != absent_k ? &runs[watch.newest_run] : nullptr;
         if (extended && (extended->release_operation != release || release == absent_k ||
-                         extended->sends == std::numeric_limits<std::uint16_t>::max() ||
+                         extended->sends == (std::numeric_limits<std::uint16_t>::max)() ||
                          extended->first_id + extended->sends != watch.next_zero_copy_id))
             extended = nullptr;
         if ((release == absent_k && free_releases.empty()) || (!extended && free_runs == absent_k))
             return send_copying(request);
-        auto const length = std::min<std::size_t>(request.length, std::numeric_limits<int>::max());
+        auto const length = fu::min_of<std::size_t>(request.length, (std::numeric_limits<int>::max)());
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length,
                                   MSG_NOSIGNAL | MSG_ZEROCOPY);
         if (sent < 0 && errno == ENOBUFS) {
@@ -573,8 +573,8 @@ struct linux_epollaio_engine {
             unsigned const next = run.next;
             std::uint32_t const into_run = lowest - run.first_id, into_span = run.first_id - lowest;
             std::uint32_t overlap = 0;
-            if (into_run < run.sends) overlap = std::min<std::uint32_t>(run.sends - into_run, span);
-            else if (into_span < span) overlap = std::min<std::uint32_t>(span - into_span, run.sends);
+            if (into_run < run.sends) overlap = fu::min_of<std::uint32_t>(run.sends - into_run, span);
+            else if (into_span < span) overlap = fu::min_of<std::uint32_t>(span - into_span, run.sends);
             if (overlap) {
                 run.notified = static_cast<std::uint16_t>(run.notified + overlap);
                 auto& release = operations[run.release_operation];
@@ -649,11 +649,11 @@ struct linux_epollaio_engine {
         }
     }
     int wait(std::uint64_t nanoseconds) noexcept {
-        int const timeout = nanoseconds == std::numeric_limits<std::uint64_t>::max()
+        int const timeout = nanoseconds == (std::numeric_limits<std::uint64_t>::max)()
                                 ? -1
-                                : static_cast<int>(
-                                      std::min<std::uint64_t>(nanoseconds / 1'000'000 + (nanoseconds % 1'000'000 != 0),
-                                                              std::numeric_limits<int>::max()));
+                                : static_cast<int>(fu::min_of<std::uint64_t>(
+                                      nanoseconds / 1'000'000 + (nanoseconds % 1'000'000 != 0),
+                                      (std::numeric_limits<int>::max)()));
         tally<atomic_ref_template_>(statistics.kernel_enters);
         return readiness.wait(
             timeout,

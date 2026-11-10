@@ -12,7 +12,6 @@
 
 #include <cstring> // `std::memcpy`, `std::memcmp`
 
-#include <algorithm>   // `std::min`
 #include <string_view> // `std::string_view`
 
 #include "ucall/dns/types.hpp"
@@ -136,7 +135,7 @@ struct decoded_answer_t {
                 cursor + 20 != position + length)
                 return false;
             if (ttl & 0x80000000u) ttl = 0; // RFC 2181 §8: the top bit makes a TTL read as zero.
-            ttl_seconds = std::min(ttl, read_u32(packet.data() + cursor + 16));
+            ttl_seconds = fu::min_of(ttl, read_u32(packet.data() + cursor + 16));
         }
         position += length;
     }
@@ -190,13 +189,13 @@ struct decoded_answer_t {
             if (record_type == static_cast<std::uint16_t>(record_type_t::cname_k)) {
                 std::size_t end = 0;
                 if (!decode_name(packet, position, target, end) || end != position + length) return decoded;
-                least_ttl = std::min(least_ttl, ttl);
+                least_ttl = fu::min_of(least_ttl, ttl);
             }
             else if (record_type == static_cast<std::uint16_t>(type)) {
                 if (length != width) return decoded;
                 if ((decoded.addresses_count + 1) * width <= addresses.size())
                     std::memcpy(addresses.data() + decoded.addresses_count++ * width, packet.data() + position, width);
-                least_ttl = std::min(least_ttl, ttl);
+                least_ttl = fu::min_of(least_ttl, ttl);
             }
         }
         position += length;

@@ -16,7 +16,7 @@ extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const* data, std::size_t size
     using namespace unum::ucall;
     if (size < 2) return 0;
     std::size_t cuts[8];
-    std::size_t const count = std::min<std::size_t>(data[0] % 9, size - 1);
+    std::size_t const count = fu::min_of<std::size_t>(data[0] % 9, size - 1);
     std::size_t const wire_size = size - 1 - count;
     for (std::size_t index = 0; index != count; ++index)
         cuts[index] = wire_size ? data[1 + index] % (wire_size + 1) : 0;

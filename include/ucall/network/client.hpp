@@ -406,7 +406,7 @@ struct client : ucall_client_handle_t {
             exchange.arguments.options.security = ucall_security_noise_xx_k;
         auto rest = url.substr(scheme + 3);
         auto slash = http_t::find(rest, '/'), query = http_t::find(rest, '?'), fragment = http_t::find(rest, '#');
-        auto boundary = std::min(slash, std::min(query, fragment));
+        auto boundary = fu::min_of(slash, fu::min_of(query, fragment));
         auto authority = rest.substr(0, boundary);
         if (authority.empty() || http_t::find(authority, '@') != std::string_view::npos ||
             !http_t::http_value(authority) || http_t::find(authority, ' ') != std::string_view::npos ||
@@ -446,7 +446,7 @@ struct client : ucall_client_handle_t {
         unsigned number = 0;
         auto parsed = std::from_chars(port.data(), port.data() + port.size(), number);
         if (parsed.ec != std::errc {} || parsed.ptr != port.data() + port.size() || !number ||
-            number > std::numeric_limits<std::uint16_t>::max() || host.empty())
+            number > (std::numeric_limits<std::uint16_t>::max)() || host.empty())
             return ucall_status_invalid_argument_k;
         if (ucall_status_t const copied = formatting_t::copy_text(exchange.host, host);
             copied != ucall_status_success_k)
@@ -628,8 +628,8 @@ struct client : ucall_client_handle_t {
             transport.status = ucall_status_success_k;
             transport.authorizer = client.config.peer_authorizer;
             transport.authorizer_context = client.config.peer_authorizer_context;
-            transport.deadline = std::min(exchange.deadline,
-                                          deadline_after(client.config.connect_timeout_microseconds));
+            transport.deadline = fu::min_of(exchange.deadline,
+                                            deadline_after(client.config.connect_timeout_microseconds));
             transport.transmit_request = {.operation = io_operation_t::connect_k,
                                           .descriptor = descriptor,
                                           .data = reinterpret_cast<byte_t*>(&connection.target),
@@ -701,7 +701,7 @@ struct client : ucall_client_handle_t {
     static void push_call(client_connection_t& connection, client_exchange_t& exchange) noexcept {
         exchange.stage = client_exchange_stage_t::pipelined_k;
         std::uint64_t& deadline = connection.transport.deadline;
-        deadline = connection.oldest_exchange ? std::min(deadline, exchange.deadline) : exchange.deadline;
+        deadline = connection.oldest_exchange ? fu::min_of(deadline, exchange.deadline) : exchange.deadline;
         if (connection.newest_exchange) connection.newest_exchange->next = &exchange;
         else connection.oldest_exchange = &exchange;
         connection.newest_exchange = &exchange;
@@ -717,7 +717,7 @@ struct client : ucall_client_handle_t {
         --connection.outstanding_exchanges;
         std::uint64_t deadline = 0;
         for (client_exchange_t const* left = connection.oldest_exchange; left; left = left->next)
-            deadline = deadline ? std::min(deadline, left->deadline) : left->deadline;
+            deadline = deadline ? fu::min_of(deadline, left->deadline) : left->deadline;
         connection.transport.deadline = deadline;
         return exchange;
     }
@@ -954,7 +954,7 @@ struct client : ucall_client_handle_t {
             response->storage.clear();
         }
         else response = allocate_unique<response_t>(client.allocator, *client.responses).release();
-        if (response) atomic_ref<std::size_t> {client.responses->outside}.add(1, std::memory_order_relaxed);
+        if (response) atomic_ref<std::size_t> {client.responses->outside}.store_add(1, std::memory_order_relaxed);
         return response;
     }
 
@@ -1041,7 +1041,7 @@ struct client : ucall_client_handle_t {
             // Bounded as a server bounds requests: a declared length up front, anything else
             // as it arrives.
             bool const fits = message.headers_length && message.framing == http_framing_t::length_k
-                                  ? message.content_length <= cap - std::min(cap, message.headers_length)
+                                  ? message.content_length <= cap - fu::min_of(cap, message.headers_length)
                                   : (parsed == http_parse_t::complete_k ? message.wire_length : unparsed.size()) <= cap;
             if (!fits && (parsed == http_parse_t::incomplete_k || parsed == http_parse_t::complete_k))
                 parsed = http_parse_t::overflow_k;
@@ -1292,8 +1292,8 @@ struct client : ucall_client_handle_t {
             while (current.waiting_head && current.resolution == resolution_t::refused_k)
                 finish_exchange(client, unqueue_call(current), ucall_status_not_found_k);
             if (current.waiting_head) {
-                std::uint64_t const due = std::min(current.waiting_head->deadline, resolving_t::due(current));
-                deadline = !deadline ? due : std::min(deadline, due);
+                std::uint64_t const due = fu::min_of(current.waiting_head->deadline, resolving_t::due(current));
+                deadline = !deadline ? due : fu::min_of(deadline, due);
             }
             else if (!current.connections && !current.lookup) retire_origin(client, current);
         }
@@ -1345,7 +1345,7 @@ struct client : ucall_client_handle_t {
         if (!config.max_concurrent_calls) {
             // Every connection may carry its full pipeline at once.
             if (config.max_concurrent_connections >
-                std::numeric_limits<std::size_t>::max() / config.max_pipelined_calls) {
+                (std::numeric_limits<std::size_t>::max)() / config.max_pipelined_calls) {
                 publish(arguments->outcome, ucall_status_invalid_argument_k);
                 return;
             }
@@ -1353,9 +1353,9 @@ struct client : ucall_client_handle_t {
         }
         // Each connection keeps one operation per direction, and origin slots index one origin per
         // call and per connection below `absent_k`.
-        if (config.max_pipelined_calls > std::numeric_limits<std::uint32_t>::max() ||
-            config.max_concurrent_connections > std::numeric_limits<std::uint32_t>::max() / 4 ||
-            config.max_concurrent_calls > std::numeric_limits<std::uint32_t>::max() / 4) {
+        if (config.max_pipelined_calls > (std::numeric_limits<std::uint32_t>::max)() ||
+            config.max_concurrent_connections > (std::numeric_limits<std::uint32_t>::max)() / 4 ||
+            config.max_concurrent_calls > (std::numeric_limits<std::uint32_t>::max)() / 4) {
             publish(arguments->outcome, ucall_status_overflow_k);
             return;
         }
@@ -1405,7 +1405,10 @@ struct client : ucall_client_handle_t {
         {
             char hosts[64 * 1024];
             std::size_t const length = dns::read_file(dns::hosts_path(), hosts);
-            if (ucall_status_t const copied = http_t::append_text(client->hosts, {std::string_view {hosts, length}});
+            // Windows answers `localhost` in its resolver, so its hosts file leaves the name out.
+            std::string_view const implied = UCALL_OS_WINDOWS_ ? "\n127.0.0.1 localhost\n::1 localhost\n" : "";
+            if (ucall_status_t const copied = http_t::append_text(client->hosts,
+                                                                  {std::string_view {hosts, length}, implied});
                 copied != ucall_status_success_k) {
                 publish(arguments->outcome, copied);
                 return;
@@ -1564,7 +1567,7 @@ struct client : ucall_client_handle_t {
         if (client.failure == ucall_status_success_k && client.binding == client_binding_t::owned_k) {
             auto next_deadline = client_progress(client);
             do {
-                auto round_deadline = deadline && next_deadline ? std::min(next_deadline, deadline)
+                auto round_deadline = deadline && next_deadline ? fu::min_of(next_deadline, deadline)
                                       : deadline                ? deadline
                                                                 : next_deadline;
                 auto wait = arguments->timeout_microseconds && client.admitted && client.completed.empty()

@@ -581,7 +581,7 @@ struct messages {
         if (digits.empty() || result.ec != std::errc {} || result.ptr != digits.data() + digits.size() ||
             !http_value(line))
             return http_parse_t::malformed_k;
-        if (length > std::numeric_limits<std::size_t>::max() - decoded) return http_parse_t::overflow_k;
+        if (length > (std::numeric_limits<std::size_t>::max)() - decoded) return http_parse_t::overflow_k;
         return http_parse_t::complete_k;
     }
 
@@ -644,7 +644,8 @@ struct messages {
                         target.size() == scheme + 3)
                         return http_parse_t::malformed_k;
                     auto const authority = target.substr(scheme + 3);
-                    std::size_t const path = std::min({find(authority, '/'), find(authority, '?'), authority.size()});
+                    std::size_t const path = fu::min_of(fu::min_of(find(authority, '/'), find(authority, '?')),
+                                                        authority.size());
                     message.target_offset += scheme + 3 + path;
                     message.target_length -= scheme + 3 + path;
                     target.remove_prefix(scheme + 3 + path);
@@ -734,7 +735,7 @@ struct messages {
         }
         if (message.framing == http_framing_t::until_close_k) return http_parse_t::incomplete_k;
         if (message.framing == http_framing_t::length_k) {
-            if (message.content_length > std::numeric_limits<std::size_t>::max() - message.headers_length)
+            if (message.content_length > (std::numeric_limits<std::size_t>::max)() - message.headers_length)
                 return http_parse_t::overflow_k;
             message.wire_length = message.headers_length + message.content_length;
             message.body_length = message.content_length;
@@ -752,7 +753,7 @@ struct messages {
             }
             if (message.chunk_state == http_chunk_state_t::payload_k) {
                 std::size_t const length = message.chunk_remaining;
-                if (length > std::numeric_limits<std::size_t>::max() - 2 || text.size() - message.cursor < length + 2)
+                if (length > (std::numeric_limits<std::size_t>::max)() - 2 || text.size() - message.cursor < length + 2)
                     return http_parse_t::incomplete_k;
                 if (text.substr(message.cursor + length, 2) != "\r\n") return http_parse_t::malformed_k;
                 message.decoded_length += length;
@@ -798,7 +799,7 @@ struct messages {
         auto text = text_view(bytes);
         payload = consumed = 0;
         if (message.framing == http_framing_t::length_k) {
-            payload = consumed = std::min(bytes.size(), message.content_length - message.decoded_length);
+            payload = consumed = fu::min_of(bytes.size(), message.content_length - message.decoded_length);
             message.decoded_length += payload;
             return message.decoded_length == message.content_length ? http_parse_t::complete_k
                                                                     : http_parse_t::incomplete_k;
@@ -806,7 +807,7 @@ struct messages {
         while (consumed < text.size()) {
             switch (message.chunk_state) {
             case http_chunk_state_t::payload_k: {
-                std::size_t const taken = std::min(message.chunk_remaining, text.size() - consumed);
+                std::size_t const taken = fu::min_of(message.chunk_remaining, text.size() - consumed);
                 std::memmove(bytes.data() + payload, bytes.data() + consumed, taken);
                 payload += taken, consumed += taken, message.chunk_remaining -= taken;
                 message.decoded_length += taken;
@@ -853,7 +854,7 @@ struct messages {
         static_assert(sizeof(element_type_) == 1);
         std::size_t offset = bytes.size(), length = offset;
         for (std::string_view const text : texts) {
-            if (text.size() > std::numeric_limits<std::size_t>::max() - length) return ucall_status_overflow_k;
+            if (text.size() > (std::numeric_limits<std::size_t>::max)() - length) return ucall_status_overflow_k;
             length += text.size();
         }
         if (st::failed(bytes.resize(length))) return ucall_status_out_of_memory_k;

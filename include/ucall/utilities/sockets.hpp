@@ -12,7 +12,6 @@
 #include <cstring> // `std::strchr`, `std::memcpy`
 #include <ctime>   // `timespec`
 
-#include <algorithm> // `std::min`, `std::max`
 #include <bit>       // `std::bit_cast`
 #include <chrono>    // `std::chrono::steady_clock`
 #include <limits>    // `std::numeric_limits`
@@ -104,7 +103,7 @@ inline std::uint64_t monotonic_ns() noexcept {
 }
 inline std::uint64_t deadline_after(std::size_t microseconds) noexcept {
     auto now = monotonic_ns();
-    auto maximum = std::numeric_limits<std::uint64_t>::max();
+    auto maximum = (std::numeric_limits<std::uint64_t>::max)();
     return microseconds > (maximum - now) / 1000 ? maximum : now + microseconds * 1000;
 }
 
@@ -138,7 +137,9 @@ inline ucall_status_t start_windows_sockets() noexcept {
 inline int socket_close(descriptor_t descriptor) noexcept { return closesocket(static_cast<SOCKET>(descriptor)); }
 [[nodiscard]] inline ucall_status_t nonblocking(descriptor_t descriptor) noexcept {
     u_long enabled = 1;
-    return ioctlsocket(static_cast<SOCKET>(descriptor), FIONBIO, &enabled) == 0 &&
+    // A Registered I/O socket refuses the flag, and no call it governs ever reaches one.
+    return (ioctlsocket(static_cast<SOCKET>(descriptor), FIONBIO, &enabled) == 0 ||
+            WSAGetLastError() == WSAEOPNOTSUPP) &&
                    SetHandleInformation(reinterpret_cast<HANDLE>(descriptor), HANDLE_FLAG_INHERIT, 0)
                ? ucall_status_success_k
                : ucall_status_io_k;
@@ -169,7 +170,7 @@ inline std::size_t page_size() noexcept {
 inline std::size_t open_files_limit() noexcept {
     rlimit files {};
     return getrlimit(RLIMIT_NOFILE, &files) == 0 ? static_cast<std::size_t>(files.rlim_cur)
-                                                 : std::numeric_limits<std::size_t>::max();
+                                                 : (std::numeric_limits<std::size_t>::max)();
 }
 #endif
 inline int socket_option(descriptor_t descriptor, int level, int name, void const* value, std::size_t length) noexcept {
@@ -185,11 +186,11 @@ inline int socket_option(descriptor_t descriptor, int level, int name, void cons
  *  @p polled: how many reported, or a negated errno. Linux and FreeBSD wait to the nanosecond, and
  *  the rest to the millisecond, rounded up so a wait never ends early. */
 inline int socket_poll(pollfd* polled, std::size_t count, std::uint64_t nanoseconds) noexcept {
-    bool const forever = nanoseconds == std::numeric_limits<std::uint64_t>::max();
+    bool const forever = nanoseconds == (std::numeric_limits<std::uint64_t>::max)();
     [[maybe_unused]] int const milliseconds = forever ? -1
-                                                      : static_cast<int>(std::min<std::uint64_t>(
+                                                      : static_cast<int>(fu::min_of<std::uint64_t>(
                                                             nanoseconds / 1'000'000 + (nanoseconds % 1'000'000 != 0),
-                                                            std::numeric_limits<int>::max()));
+                                                            (std::numeric_limits<int>::max)()));
 #if UCALL_OS_LINUX_ || UCALL_OS_FREEBSD_
     timespec const timeout {static_cast<time_t>(nanoseconds / 1'000'000'000),
                             static_cast<long>(nanoseconds % 1'000'000'000)};
@@ -246,7 +247,7 @@ inline std::size_t largest_receive_buffer(int family, std::size_t fallback) noex
     descriptor_t const probe = socket_open(family);
     if (probe < 0) return fallback;
     // Linux clamps an oversized request where FreeBSD and macOS refuse it, so refusals bisect.
-    int accepted = 0, refused = std::numeric_limits<int>::max();
+    int accepted = 0, refused = (std::numeric_limits<int>::max)();
     if (socket_option(probe, SOL_SOCKET, SO_RCVBUF, &refused, sizeof(refused)) == 0) accepted = refused;
     while (refused - accepted > 1) {
         int const requested = accepted + (refused - accepted) / 2;
@@ -328,7 +329,7 @@ inline descriptor_t socket_duplicate_listener(std::intptr_t handed) noexcept {
     auto descriptor = static_cast<descriptor_t>(
         WSASocketW(FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, FROM_PROTOCOL_INFO, &information, 0, WSA_FLAG_OVERLAPPED));
 #else
-    if (handed < 0 || handed > std::numeric_limits<int>::max()) return -1;
+    if (handed < 0 || handed > (std::numeric_limits<int>::max)()) return -1;
     descriptor_t descriptor = fcntl(static_cast<int>(handed), F_DUPFD_CLOEXEC, 0);
 #endif
     if (descriptor == -1) return -1;
@@ -597,7 +598,7 @@ inline native_file_t native_file_of(int file) noexcept { return file; }
 inline descriptor_t read_native_file(native_file_t file, span<byte_t> bytes, std::uint64_t offset) noexcept {
     ssize_t read;
     do
-        read = pread(file, bytes.data(), std::min<std::size_t>(bytes.size(), std::numeric_limits<int>::max()),
+        read = pread(file, bytes.data(), fu::min_of<std::size_t>(bytes.size(), (std::numeric_limits<int>::max)()),
                      static_cast<off_t>(offset));
     while (read < 0 && errno == EINTR);
     return read >= 0 ? static_cast<descriptor_t>(read) : -errno;
@@ -608,7 +609,7 @@ inline descriptor_t read_native_file_vectors(native_file_t file, span<io_vector_
                                              std::uint64_t offset) noexcept {
     ssize_t read;
     do
-        read = preadv(file, vectors.data(), static_cast<int>(std::min<std::size_t>(vectors.size(), IOV_MAX)),
+        read = preadv(file, vectors.data(), static_cast<int>(fu::min_of<std::size_t>(vectors.size(), IOV_MAX)),
                       static_cast<off_t>(offset));
     while (read < 0 && errno == EINTR);
     return read >= 0 ? static_cast<descriptor_t>(read) : -errno;

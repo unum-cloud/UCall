@@ -13,8 +13,8 @@
 extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const* data, std::size_t size) {
     using namespace unum::ucall;
     std::string_view const text {reinterpret_cast<char const*>(data), size};
-    std::size_t const newline = std::min(text.find('\n'), text.size());
-    std::string_view const body = text.substr(std::min(newline + 1, text.size()));
+    std::size_t const newline = fu::min_of(text.find('\n'), text.size());
+    std::string_view const body = text.substr(fu::min_of(newline + 1, text.size()));
     if (test::check_multipart(text.substr(0, newline), byte_span(body))) std::abort();
     return 0;
 }

@@ -95,7 +95,7 @@ static void transfer(ucall_received_http_request_t request, void* context) {
         return;
     if (!source_found || !destination_found)
         return reply_error(service.server, request, ucall_http_status_not_found_k, "Account not found\n");
-    if (source < amount || destination > std::numeric_limits<std::uint64_t>::max() - amount)
+    if (source < amount || destination > (std::numeric_limits<std::uint64_t>::max)() - amount)
         return reply_error(service.server, request, ucall_http_status_conflict_k,
                            "Insufficient funds or unrepresentable balance\n");
     if (reply_error(service.server, request, transaction->upsert({from, source - amount})) ||

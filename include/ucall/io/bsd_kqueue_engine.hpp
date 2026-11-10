@@ -260,8 +260,8 @@ struct kqueue_readiness {
         timespec const duration {static_cast<time_t>(nanoseconds / 1'000'000'000),
                                  static_cast<long>(nanoseconds % 1'000'000'000)};
         int count = kevent(descriptor, nullptr, 0, events.data(),
-                           static_cast<int>(std::min<std::size_t>(events.size(), std::numeric_limits<int>::max())),
-                           nanoseconds == std::numeric_limits<std::uint64_t>::max() ? nullptr : &duration);
+                           static_cast<int>(fu::min_of<std::size_t>(events.size(), (std::numeric_limits<int>::max)())),
+                           nanoseconds == (std::numeric_limits<std::uint64_t>::max)() ? nullptr : &duration);
         if (count < 0) return -errno;
         for (int i = 0; i != count; ++i) {
             auto const index = static_cast<unsigned>(reinterpret_cast<std::uintptr_t>(events[i].udata));
