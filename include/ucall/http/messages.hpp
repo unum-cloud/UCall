@@ -25,6 +25,18 @@
 #if STRINGZILLA_TARGET_NEONAES
 #include <stringzilla/hash/neonaes.h>
 #endif
+#if STRINGZILLA_TARGET_POWERVSX
+#include <stringzilla/compare/powervsx.h>
+#include <stringzilla/find/powervsx.h>
+#include <stringzilla/hash/powervsx.h>
+#include <stringzilla/utf8_uncased_fold/powervsx.h>
+#endif
+#if STRINGZILLA_TARGET_RVV
+#include <stringzilla/compare/rvv.h>
+#include <stringzilla/find/rvv.h>
+#include <stringzilla/hash/rvv.h>
+#include <stringzilla/utf8_uncased_fold/rvv.h>
+#endif
 #if STRINGZILLA_TARGET_HASWELL
 #include <stringzilla/compare/haswell.h>
 #include <stringzilla/find/haswell.h>
@@ -223,6 +235,116 @@ struct neonaes_hash_kit_t {
 };
 #endif // STRINGZILLA_TARGET_NEONAES
 
+#if STRINGZILLA_TARGET_POWERVSX
+
+/** IBM Power VSX, from POWER9. */
+struct powervsx_compare_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto equal = sz_equal_powervsx;
+};
+struct powervsx_find_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto find = sz_find_powervsx;
+    static constexpr auto rfind = sz_rfind_powervsx;
+};
+struct powervsx_byteset_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto find_byteset = sz_find_byteset_powervsx;
+    static constexpr auto rfind_byteset = sz_rfind_byteset_powervsx;
+};
+struct powervsx_hash_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto hash = sz_hash_powervsx;
+};
+struct powervsx_fold_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto uncased_fold = sz_utf8_uncased_fold_powervsx;
+};
+#else
+
+/** The kits this build cannot carry, kept so each ladder stays one list. */
+struct powervsx_compare_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+struct powervsx_find_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+struct powervsx_byteset_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+struct powervsx_hash_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+struct powervsx_fold_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_POWERVSX
+
+#if STRINGZILLA_TARGET_RVV
+
+/** RISC-V Vector 1.0, at any vector length. */
+struct rvv_compare_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto equal = sz_equal_rvv;
+};
+struct rvv_find_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto find = sz_find_rvv;
+    static constexpr auto rfind = sz_rfind_rvv;
+};
+struct rvv_byteset_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto find_byteset = sz_find_byteset_rvv;
+    static constexpr auto rfind_byteset = sz_rfind_byteset_rvv;
+};
+struct rvv_hash_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto hash = sz_hash_rvv;
+};
+struct rvv_fold_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto uncased_fold = sz_utf8_uncased_fold_rvv;
+};
+#else
+
+/** The kits this build cannot carry, kept so each ladder stays one list. */
+struct rvv_compare_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = false;
+};
+struct rvv_find_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = false;
+};
+struct rvv_byteset_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = false;
+};
+struct rvv_hash_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = false;
+};
+struct rvv_fold_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_RVV
+
 #if STRINGZILLA_TARGET_HASWELL
 
 /** Intel Haswell AVX2. */
@@ -307,28 +429,31 @@ struct westmere_hash_kit_t {
 
 /** The widest @c equal kit among the backends @p caps_ admits, newest first. */
 template <sz_capability_t caps_>
-using compare_kit = typename highest_kit<caps_, serial_compare_kit_t, skylake_compare_kit_t, neon_compare_kit_t,
-                                         haswell_compare_kit_t, westmere_compare_kit_t>::type;
+using compare_kit =
+    typename highest_kit<caps_, serial_compare_kit_t, skylake_compare_kit_t, neon_compare_kit_t, powervsx_compare_kit_t,
+                         rvv_compare_kit_t, haswell_compare_kit_t, westmere_compare_kit_t>::type;
 
 /** The widest substring @c find and @c rfind kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using find_kit = typename highest_kit<caps_, serial_find_kit_t, skylake_find_kit_t, neon_find_kit_t, haswell_find_kit_t,
-                                      westmere_find_kit_t>::type;
+using find_kit =
+    typename highest_kit<caps_, serial_find_kit_t, skylake_find_kit_t, neon_find_kit_t, powervsx_find_kit_t,
+                         rvv_find_kit_t, haswell_find_kit_t, westmere_find_kit_t>::type;
 
 /** The widest byte-set search kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
 using byteset_kit = typename highest_kit<caps_, serial_byteset_kit_t, icelake_byteset_kit_t, neon_byteset_kit_t,
-                                         haswell_byteset_kit_t>::type;
+                                         powervsx_byteset_kit_t, rvv_byteset_kit_t, haswell_byteset_kit_t>::type;
 
 /** The widest @c hash kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using hash_kit = typename highest_kit<caps_, serial_hash_kit_t, icelake_hash_kit_t, skylake_hash_kit_t,
-                                      neonaes_hash_kit_t, westmere_hash_kit_t>::type;
+using hash_kit =
+    typename highest_kit<caps_, serial_hash_kit_t, icelake_hash_kit_t, skylake_hash_kit_t, neonaes_hash_kit_t,
+                         powervsx_hash_kit_t, rvv_hash_kit_t, westmere_hash_kit_t>::type;
 
 /** The widest UTF-8 case-folding kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
-using fold_kit =
-    typename highest_kit<caps_, serial_fold_kit_t, icelake_fold_kit_t, neon_fold_kit_t, haswell_fold_kit_t>::type;
+using fold_kit = typename highest_kit<caps_, serial_fold_kit_t, icelake_fold_kit_t, neon_fold_kit_t,
+                                      powervsx_fold_kit_t, rvv_fold_kit_t, haswell_fold_kit_t>::type;
 
 /** Every byte @p predicate admits, as a set built at compile time. */
 template <typename predicate_type_>

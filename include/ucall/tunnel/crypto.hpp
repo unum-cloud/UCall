@@ -32,6 +32,10 @@
 #if STRINGZILLA_TARGET_ICELAKE
 #include <stringzilla/cipher/icelake.h>
 #endif
+#if STRINGZILLA_TARGET_POWERVSX
+#include <stringzilla/hash/powervsx.h>
+#include <stringzilla/cipher/powervsx.h>
+#endif
 
 #include "ucall/tunnel/curve25519.hpp" // `x25519_multiply_serial`, `x25519_derive_public`
 #include "ucall/tunnel/types.hpp"      // `secure_tunnel_fault_t`, `secure_tunnel_key_size_k`, `secure_tunnel_mode_t`
@@ -171,6 +175,36 @@ struct westmere_aes256_gcm_kit_t {
 };
 #endif // STRINGZILLA_TARGET_WESTMERE
 
+#if STRINGZILLA_TARGET_POWERVSX
+
+/** IBM Power VSX with the POWER8 crypto instructions. */
+struct powervsx_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto init = sz_sha256_state_init_powervsx;
+    static constexpr auto update = sz_sha256_state_update_powervsx;
+    static constexpr auto digest = sz_sha256_state_digest_powervsx;
+};
+struct powervsx_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = true;
+    static constexpr auto key_init = sz_aes256_gcm_key_init_powervsx;
+    static constexpr auto encrypt = sz_aes256_gcm_encrypt_powervsx;
+    static constexpr auto decrypt = sz_aes256_gcm_decrypt_powervsx;
+};
+#else
+
+/** The kits this build cannot carry, kept so each ladder stays one list. */
+struct powervsx_sha256_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+struct powervsx_aes256_gcm_kit_t {
+    static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
+    static constexpr bool compiled_k = false;
+};
+#endif // STRINGZILLA_TARGET_POWERVSX
+
 #if STRINGZILLA_TARGET_HASWELL
 
 /** Saturated X25519 over MULX, ADC and SBB chains. */
@@ -207,12 +241,14 @@ struct neon_x25519_kit_t {
 
 /** The widest SHA-256 kit among the backends @p caps_ admits, newest first. */
 template <sz_capability_t caps_>
-using sha256_kit = typename highest_kit<caps_, serial_sha256_kit_t, neonsha_sha256_kit_t, goldmont_sha256_kit_t>::type;
+using sha256_kit = typename highest_kit<caps_, serial_sha256_kit_t, neonsha_sha256_kit_t, powervsx_sha256_kit_t,
+                                        goldmont_sha256_kit_t>::type;
 
 /** The widest AES-256-GCM kit among the backends @p caps_ admits, newest first. */
 template <sz_capability_t caps_>
-using aes256_gcm_kit = typename highest_kit<caps_, serial_aes256_gcm_kit_t, icelake_aes256_gcm_kit_t,
-                                            neonaes_aes256_gcm_kit_t, westmere_aes256_gcm_kit_t>::type;
+using aes256_gcm_kit =
+    typename highest_kit<caps_, serial_aes256_gcm_kit_t, icelake_aes256_gcm_kit_t, neonaes_aes256_gcm_kit_t,
+                         powervsx_aes256_gcm_kit_t, westmere_aes256_gcm_kit_t>::type;
 
 /** The X25519 kit among the backends @p caps_ admits. */
 template <sz_capability_t caps_>
