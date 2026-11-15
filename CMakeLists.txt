@@ -325,6 +325,7 @@ endif ()
 if (UCALL_BUILD_TEST)
     enable_testing()
     add_subdirectory(test)
+    add_subdirectory(c)
 endif ()
 
 include(cmake/ucall_install.cmake)

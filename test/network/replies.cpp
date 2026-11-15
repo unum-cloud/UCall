@@ -1,5 +1,5 @@
 /**
- *  @file test/network/files.cpp
+ *  @file test/network/replies.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
  *  @brief File and path reply parts, mixed streams, Noise record boundaries, stop, linger,
@@ -111,20 +111,19 @@ static std::size_t reply_parts(fixture_t& fixture, ucall_received_http_request_t
  *  concatenated under a measured <tt>content-length</tt>; a @c HEAD request gets the length alone.
  *  Each outcome reads deferred on return and success once sent; the file's descriptor is still open
  *  by then, and the descriptors opened for the paths are not. */
-static case_result_t file_parts_vectored(ucall_security_t security) {
+static std::size_t test_file_parts_vectored(sweep_cell_t const& cell) {
     file_tree_t tree;
-    if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+    if (char const* reason = tree.unusable()) return report("test_file_parts_vectored", reason);
     // The default cap follows the kernel's receive buffer, which BSD and macOS keep below big.bin.
-    fixture_t fixture {{.security = security, .directory = tree.served, .max_response_bytes = std::size_t {128} << 20}};
+    fixture_t fixture {cell, {.directory = tree.served, .max_response_bytes = std::size_t {128} << 20}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
     std::string const hello {file_tree_t::hello_k};
     std::string const expected = fmt::format("head|{}{}|{}{}|tail", hello.substr(7), file_tree_t::big(),
                                              file_tree_t::far_text_k, hello);
     for (ucall_verb_t verb : {ucall_verb_get_k, ucall_verb_head_k}) {
-        announce("{} with every kind of part", verb == ucall_verb_get_k ? "GET" : "HEAD");
         int const file = tree.open("hello.txt");
-        auto* request = hold_call(fixture, verb, security, failures);
+        auto* request = hold_call(fixture, verb, cell.security, failures);
         require(failures, request && file >= 0);
         std::size_t const descriptors = open_descriptors();
         ucall_outcome_t outcome {};
@@ -147,28 +146,21 @@ static case_result_t file_parts_vectored(ucall_security_t security) {
     }
     return failures + fixture.stop();
 }
-static case_result_t test_direct_files_plain() {
-    return keeping_descriptors([] { return file_parts_vectored(ucall_security_none_k); });
-}
-static case_result_t test_direct_files_noise_xx() {
-    return keeping_descriptors([] { return file_parts_vectored(ucall_security_noise_xx_k); });
-}
 
 /** Ranges starting and ending on every side of the unbuffered alignment A and of a window's
  *  capacity C arrive intact from four file sizes, measured from a path and chunked from a
  *  descriptor: each window reads aligned extents covering its slice and sends the slice alone. A
  *  measured range past the end earns @c 416. */
-static case_result_t misaligned_ranges(ucall_security_t security) {
+static std::size_t test_misaligned_ranges(sweep_cell_t const& cell) {
     file_tree_t tree;
-    if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-    fixture_t fixture {{.security = security, .directory = tree.served}};
+    if (char const* reason = tree.unusable()) return report("test_misaligned_ranges", reason);
+    fixture_t fixture {cell, {.directory = tree.served}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
     std::uint64_t const alignment = tree.directory.alignment, capacity = window_capacity_k;
     std::uint64_t const offsets[] {0, 1, alignment - 1, alignment, alignment + 1, capacity - 1, capacity, capacity + 1};
     std::uint64_t const lengths[] {1, alignment - 1, alignment, capacity + 1, 2 * capacity + 3, 0};
     for (std::uint64_t size : {capacity - 1, 2 * capacity, 3 * capacity + alignment + 5, 4 * capacity + 3}) {
-        announce("{} bytes at alignment {}", size, alignment);
         require(failures, tree.write("ranged.bin", file_tree_t::big(0, size)));
         int const file = tree.open("ranged.bin");
         require(failures, file >= 0);
@@ -177,7 +169,7 @@ static case_result_t misaligned_ranges(ucall_security_t security) {
                 std::uint64_t const end = length ? offset + length : size;
                 bool const fits = offset <= size && end <= size;
                 std::string const body = fits ? file_tree_t::big(offset, end - offset) : std::string {};
-                auto* measured = hold_call(fixture, ucall_verb_get_k, security, failures);
+                auto* measured = hold_call(fixture, ucall_verb_get_k, cell.security, failures);
                 require(failures, measured);
                 ucall_outcome_t outcome {};
                 failures += reply_parts(fixture, measured, outcome, {path_part("ranged.bin", offset, length)});
@@ -186,7 +178,7 @@ static case_result_t misaligned_ranges(ucall_security_t security) {
                                          fits ? body : std::string_view {"Range not satisfiable"});
                 failures += expect_outcome(fixture, outcome, fits ? ucall_status_success_k : ucall_status_overflow_k);
                 if (!fits) continue;
-                auto* chunked = hold_call(fixture, ucall_verb_get_k, security, failures);
+                auto* chunked = hold_call(fixture, ucall_verb_get_k, cell.security, failures);
                 require(failures, chunked);
                 ucall_outcome_t begun {}, appended {}, ended {};
                 ucall_server_reply_begin_t begin {fixture.server, &begun, chunked, 0, nullptr, 0};
@@ -202,7 +194,6 @@ static case_result_t misaligned_ranges(ucall_security_t security) {
                 failures += check_answer(fixture.wait(), ucall_http_status_ok_k, body);
                 failures += expect_outcome(fixture, ended, ucall_status_success_k);
                 if (failures) {
-                    announce("first failure at offset {} for {} bytes", offset, length);
                     ::close(file);
                     return failures + fixture.stop();
                 }
@@ -211,22 +202,16 @@ static case_result_t misaligned_ranges(ucall_security_t security) {
     }
     return failures + fixture.stop();
 }
-static case_result_t test_misaligned_ranges_plain() {
-    return keeping_descriptors([] { return misaligned_ranges(ucall_security_none_k); });
-}
-static case_result_t test_misaligned_ranges_noise_xx() {
-    return keeping_descriptors([] { return misaligned_ranges(ucall_security_noise_xx_k); });
-}
 
 /** A path that is missing, unreadable, a FIFO, a directory, or a link out of the directory replaces
  *  the reply with @c 404, without hanging, and a range past the end with @c 416 naming the size;
  *  the outcome turns from deferred to the cause. Paths naming @c .., absolute ones, ones holding a
  *  NUL, a backslash or a colon, and directories past the interface's list are refused at once; the
  *  caller keeps the descriptors. */
-static case_result_t path_refusals(ucall_security_t security) {
+static std::size_t test_path_refusals(sweep_cell_t const& cell) {
     file_tree_t tree;
-    if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-    fixture_t fixture {{.security = security, .directory = tree.served}};
+    if (char const* reason = tree.unusable()) return report("test_path_refusals", reason);
+    fixture_t fixture {cell, {.directory = tree.served}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
     std::uint64_t const size = file_tree_t::hello_k.size();
@@ -247,9 +232,7 @@ static case_result_t path_refusals(ucall_security_t security) {
     if (geteuid()) rows.push_back({"locked.txt", 0, 0, 404, ucall_status_not_found_k});
     for (row_t const& row : rows)
         for (ucall_verb_t verb : {ucall_verb_get_k, ucall_verb_head_k}) {
-            announce("{} {} at {} for {} bytes", verb == ucall_verb_get_k ? "GET" : "HEAD", row.path, row.offset,
-                     row.length);
-            auto* request = hold_call(fixture, verb, security, failures);
+            auto* request = hold_call(fixture, verb, cell.security, failures);
             require(failures, request);
             ucall_outcome_t outcome {};
             failures += reply_parts(fixture, request, outcome,
@@ -277,10 +260,7 @@ static case_result_t path_refusals(ucall_security_t security) {
          {path_part("../hello.txt"), path_part("subdir/../../outside.txt"), path_part("/etc/hostname"),
           path_part("/proc/self/fd/0"), path_part(""), path_part(nul), path_part("..\\hello.txt"),
           path_part("c:hello.txt"), path_part("hello.txt", 0, 0, 1), file_part(-1)}) {
-        announce("refusing {:?}", refused.kind == ucall_reply_part_path_k
-                                      ? uc::text_view(refused.data.path.relative_path)
-                                      : std::string_view {"descriptor -1"});
-        auto* request = hold_call(fixture, ucall_verb_get_k, security, failures);
+        auto* request = hold_call(fixture, ucall_verb_get_k, cell.security, failures);
         require(failures, request);
         ucall_outcome_t outcome {};
         failures += reply_parts(fixture, request, outcome, {file_part(kept), refused}, {},
@@ -294,20 +274,14 @@ static case_result_t path_refusals(ucall_security_t security) {
     ::close(kept);
     return failures + fixture.stop();
 }
-static case_result_t test_path_refusals_plain() {
-    return keeping_descriptors([] { return path_refusals(ucall_security_none_k); });
-}
-static case_result_t test_path_refusals_noise_xx() {
-    return keeping_descriptors([] { return path_refusals(ucall_security_noise_xx_k); });
-}
 
 /** A descriptor that cannot switch to unbuffered reads, such as a socket, is refused on the spot,
  *  vectored or streamed: nothing of its call is queued, and the caller keeps the descriptor. */
-static case_result_t test_unbufferable_descriptor_refused() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_unbufferable_descriptor_refused(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        fixture_t fixture {{.directory = tree.served}};
+        if (char const* reason = tree.unusable()) return report("test_unbufferable_descriptor_refused", reason);
+        fixture_t fixture {cell, {.directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::size_t failures = 0;
         int const socket_descriptor = ::socket(AF_INET, SOCK_STREAM, 0);
@@ -344,10 +318,10 @@ static case_result_t test_unbufferable_descriptor_refused() {
 
 /** A path part answering a request on an interface that registered no directory is refused on the
  *  spot, while one on the interface owning the directory is served. */
-static case_result_t test_path_beyond_interface() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_path_beyond_interface(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        if (char const* reason = tree.unusable()) return report("test_path_beyond_interface", reason);
         struct state_t {
             ucall_server_t server {};
 
@@ -389,8 +363,8 @@ static case_result_t test_path_beyond_interface() {
         ucall_server_options_t config {};
         config.interfaces = interfaces;
         config.interfaces_count = 2;
-        config.backend = backend_under_test;
-        config.cpu_class = cpu_class_under_test;
+        config.backend = cell.backend;
+        config.cpu_class = cell.cpu_class;
         ucall_server_options_t resolved {};
         ucall_outcome_t outcome {};
         ucall_server_init_t init {&state.server, &outcome, &config, &resolved};
@@ -455,9 +429,7 @@ static std::size_t stream_parts(fixture_t& fixture, ucall_received_http_request_
     };
     for (auto const& chunk : chunks) {
         ucall_server_reply_append_t append {fixture.server, &outcome, request, chunk.data(), chunk.size()};
-        for (ucall_server_reply_append(&append); outcome.status == ucall_status_would_block_k;
-             ucall_server_reply_append(&append))
-            std::this_thread::sleep_for(100us);
+        append_when_room(append, steady_clock::now() + 20s);
         failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
     }
     ucall_server_reply_end_t end {fixture.server, &ended, request};
@@ -473,11 +445,11 @@ static std::string streamed_parts_body() {
 
 /** A chunked stream mixing memory, file and path parts, a zero-length range among them, arrives
  *  whole through the library client, and two such replies pipelined on a connection keep order. */
-static case_result_t mixed_stream(ucall_security_t security) {
+static std::size_t test_mixed_stream(sweep_cell_t const& cell) {
     file_tree_t tree;
-    if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-    fixture_t fixture {{.security = security,
-                        .pipelined_requests = 2,
+    if (char const* reason = tree.unusable()) return report("test_mixed_stream", reason);
+    fixture_t fixture {cell,
+                       {.pipelined_requests = 2,
                         .pipelined_calls = 2,
                         .directory = tree.served,
                         .max_response_bytes = std::size_t {128} << 20}};
@@ -492,7 +464,7 @@ static case_result_t mixed_stream(ucall_security_t security) {
         call.url = uc::bytes_view(url);
         call.verb = ucall_verb_get_k;
         call.context = &url;
-        call.options.security = security;
+        call.options.security = cell.security;
         call.options.noise_peer_key = &fixture.server_public;
         ucall_client_call(&call);
         failures += expect(outcome.status == ucall_status_success_k);
@@ -521,21 +493,15 @@ static case_result_t mixed_stream(ucall_security_t security) {
     ::close(file);
     return failures + fixture.stop();
 }
-static case_result_t test_mixed_stream_plain() {
-    return keeping_descriptors([] { return mixed_stream(ucall_security_none_k); });
-}
-static case_result_t test_mixed_stream_noise_xx() {
-    return keeping_descriptors([] { return mixed_stream(ucall_security_noise_xx_k); });
-}
 
 /** The same mixed stream over the wire: chunked with every file chunk framed once sized and no
  *  framing for the zero-length range, identity under a declared <tt>content-length</tt>, which
  *  refuses a part it cannot size, and delimited by the close for an HTTP/1.0 peer. */
-static case_result_t test_mixed_stream_framing() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_mixed_stream_framing(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        fixture_t fixture {{.connections = 3, .directory = tree.served}};
+        if (char const* reason = tree.unusable()) return report("test_mixed_stream_framing", reason);
+        fixture_t fixture {cell, {.connections = 3, .directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         fixture.serve_in_background();
         std::size_t failures = 0;
@@ -555,7 +521,6 @@ static case_result_t test_mixed_stream_framing() {
             failures += expect_outcome(fixture, ended, ucall_status_success_k);
             ::close(file);
         };
-        announce("chunked");
         raw_client_t client;
         require(failures + fixture.stop(), client.connect(fixture.address));
         exchange("GET /gate HTTP/1.1\r\nHost: a\r\n\r\n", {}, client);
@@ -572,7 +537,6 @@ static case_result_t test_mixed_stream_framing() {
         [[maybe_unused]] auto const read = client.read(head + expected_wire.size(), deadline);
         failures += expect(std::string_view {client.received}.substr(head) == expected_wire,
                            "the chunked body differs over {} bytes", client.received.size() - head);
-        announce("identity");
         std::string const length = fmt::format("Content-Length: {}", body.size());
         raw_client_t identity;
         require(failures + fixture.stop(), identity.connect(fixture.address));
@@ -604,7 +568,6 @@ static case_result_t test_mixed_stream_framing() {
                            response.status, response.body.size());
         failures += expect_outcome(fixture, ended, ucall_status_success_k);
         ::close(file);
-        announce("HTTP/1.0");
         raw_client_t legacy;
         require(failures + fixture.stop(), legacy.connect(fixture.address));
         exchange("GET /gate HTTP/1.0\r\nConnection: keep-alive\r\n\r\n", {}, legacy);
@@ -621,12 +584,11 @@ static case_result_t test_mixed_stream_framing() {
 /** Bodies around one and two whole Noise records arrive intact, whether a file read into a window,
  *  an echoed body copied into one segment of records with gaps, or a streamed chunk, so every
  *  record seals in place with no neighbour's bytes saved and restored. */
-static case_result_t test_noise_record_boundaries() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_noise_record_boundaries(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        auto const security = ucall_security_noise_xx_k;
-        fixture_t fixture {{.security = security, .directory = tree.served}};
+        if (char const* reason = tree.unusable()) return report("test_noise_record_boundaries", reason);
+        fixture_t fixture {cell, {.directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::size_t failures = 0;
         // A record's payload is a 16-bit length less its kind byte and its tag.
@@ -638,7 +600,7 @@ static case_result_t test_noise_record_boundaries() {
         for (std::size_t size : sizes) {
             std::string const body = file_tree_t::big(0, size);
             require(failures, tree.write("sized.bin", body));
-            auto* request = hold_call(fixture, ucall_verb_get_k, security, failures);
+            auto* request = hold_call(fixture, ucall_verb_get_k, cell.security, failures);
             require(failures, request);
             ucall_outcome_t outcome {};
             failures += reply_parts(fixture, request, outcome, {path_part("sized.bin")});
@@ -652,11 +614,11 @@ static case_result_t test_noise_record_boundaries() {
             call.url = uc::bytes_view(echo_url);
             call.verb = ucall_verb_post_k;
             call.body = uc::bytes_view(body);
-            call.options.security = security;
+            call.options.security = cell.security;
             call.options.noise_peer_key = &fixture.server_public;
             ucall_client_call(&call);
             failures += check_answer(fixture.wait(), ucall_http_status_ok_k, body);
-            auto* streamed = hold_call(fixture, ucall_verb_get_k, security, failures);
+            auto* streamed = hold_call(fixture, ucall_verb_get_k, cell.security, failures);
             require(failures, streamed);
             ucall_server_reply_begin_t begin {fixture.server, &outcome, streamed, 0, nullptr, 0};
             ucall_server_reply_begin(&begin);
@@ -666,10 +628,7 @@ static case_result_t test_noise_record_boundaries() {
             ucall_server_reply_end_t end {fixture.server, &outcome, streamed};
             ucall_server_reply_end(&end);
             failures += check_answer(fixture.wait(), ucall_http_status_ok_k, body);
-            if (failures) {
-                announce("first failure at {} bytes", size);
-                break;
-            }
+            if (failures) { break; }
         }
         return failures + fixture.stop();
     });
@@ -677,11 +636,11 @@ static case_result_t test_noise_record_boundaries() {
 
 /** A file shrinking under a reply whose head left resets the connection, so the peer never takes
  *  the cut body for a whole one, and the deferred outcome reports @c ucall_status_io_k. */
-static case_result_t test_short_file_reset() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_short_file_reset(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        fixture_t fixture {{.directory = tree.served}};
+        if (char const* reason = tree.unusable()) return report("test_short_file_reset", reason);
+        fixture_t fixture {cell, {.directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         fixture.serve_in_background();
         std::size_t failures = 0;
@@ -700,9 +659,9 @@ static case_result_t test_short_file_reset() {
         while (client.received.find("\r\n\r\n") == std::string::npos &&
                client.read(client.received.size() + 1, deadline) == read_end_t::filled_k) {}
         failures += expect(ftruncate(shrinking, 4096) == 0);
-        failures += expect_outcome(fixture, outcome, ucall_status_io_k);
+        // The server reads on only as its peer takes what was sent, so the peer keeps reading.
         // Darwin may leave the reset unseen until the client writes into the connection it reset.
-        auto end = client.read_until_close(steady_clock::now() + 200ms);
+        auto end = client.read_until_close(steady_clock::now() + 5s);
         if (end != read_end_t::failed_k) {
             char const probe = 0;
             // A send the reset already refused reports it itself.
@@ -713,6 +672,7 @@ static case_result_t test_short_file_reset() {
         int const error = errno;
         failures += expect(end == read_end_t::failed_k && error == ECONNRESET, "the read ended as {} with errno {}",
                            static_cast<int>(end), error);
+        failures += expect_outcome(fixture, outcome, ucall_status_io_k);
         failures += expect(open_descriptor(shrinking), "the borrowed descriptor was closed");
         ::close(shrinking);
         return failures + fixture.stop();
@@ -720,20 +680,18 @@ static case_result_t test_short_file_reset() {
 }
 
 /** Under Noise, the same shrinking file fails the call and reports @c ucall_status_io_k. */
-static case_result_t test_short_file_noise_xx() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_short_file_noise(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        auto const security = ucall_security_noise_xx_k;
+        if (char const* reason = tree.unusable()) return report("test_short_file_noise", reason);
         // The client must take the whole file, past what the kernel's receive buffer would cap.
-        fixture_t fixture {
-            {.security = security, .directory = tree.served, .max_response_bytes = std::size_t {128} << 20}};
+        fixture_t fixture {cell, {.directory = tree.served, .max_response_bytes = std::size_t {128} << 20}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::size_t failures = 0;
         int const shrinking = ::open(tree.name("shrinking.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
         require(failures, shrinking >= 0 && ftruncate(shrinking, off_t {64} << 20) == 0);
         // A lost POST is never retried, so the cut reply ends the call.
-        auto* request = hold_call(fixture, ucall_verb_post_k, security, failures);
+        auto* request = hold_call(fixture, ucall_verb_post_k, cell.security, failures);
         require(failures, request);
         ucall_outcome_t outcome {};
         failures += reply_parts(fixture, request, outcome, {file_part(shrinking)});
@@ -754,11 +712,11 @@ static case_result_t test_short_file_noise_xx() {
 
 /** A peer leaving mid-file makes the deferred outcome @c ucall_status_connection_closed_k, and the
  *  server goes on answering others. */
-static case_result_t test_file_detach() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_file_detach(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        fixture_t fixture {{.connections = 2, .directory = tree.served}};
+        if (char const* reason = tree.unusable()) return report("test_file_detach", reason);
+        fixture_t fixture {cell, {.connections = 2, .directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         fixture.serve_in_background();
         std::size_t failures = 0;
@@ -791,14 +749,14 @@ static case_result_t test_file_detach() {
 
 /** Stopping the server while it opens a reply's many paths still makes the outcome final, and
  *  freeing it leaves no descriptor open. */
-static case_result_t test_stop_while_opening() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_stop_while_opening(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        if (char const* reason = tree.unusable()) return report("test_stop_while_opening", reason);
         ucall_outcome_t outcome {};
         std::size_t failures = 0;
         {
-            fixture_t fixture {{.directory = tree.served}};
+            fixture_t fixture {cell, {.directory = tree.served}};
             require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
             fixture.serve_in_background();
             raw_client_t client;
@@ -820,15 +778,15 @@ static case_result_t test_stop_while_opening() {
 /** Stopping the server while a peer that reads nothing holds a file's windows in its socket ends
  *  within two linger periods: the close lingers for the kernel to let go of the windows, then
  *  resets the peer, and the loop frees its pool only once every window came back. */
-static case_result_t test_stop_while_releasing() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_stop_while_releasing(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        if (char const* reason = tree.unusable()) return report("test_stop_while_releasing", reason);
         ucall_outcome_t outcome {};
         std::size_t failures = 0;
         raw_client_t client;
         {
-            fixture_t fixture {{.directory = tree.served}};
+            fixture_t fixture {cell, {.directory = tree.served}};
             require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
             fixture.serve_in_background();
             int const huge = ::open(tree.name("huge.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
@@ -869,14 +827,14 @@ static case_result_t test_stop_while_releasing() {
 
 /** One stop drains: an idle connection closes in order at once, and a held call still gets its
  *  whole reply, announced as its connection's last, before that connection closes in order. */
-static case_result_t test_stop_drains_held_reply() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_stop_drains_held_reply(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         ucall_outcome_t outcome {};
         std::size_t failures = 0;
         raw_client_t busy, idle;
         read_end_t busy_end {}, idle_end {};
         {
-            fixture_t fixture {{.connections = 2}};
+            fixture_t fixture {cell, {.connections = 2}};
             require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
             fixture.serve_in_background();
             require(failures + fixture.stop(), busy.connect(fixture.address) && idle.connect(fixture.address));
@@ -910,18 +868,109 @@ static case_result_t test_stop_drains_held_reply() {
     });
 }
 
+/** Opens a peer that asks for the gate, is answered a file far larger than the loopback buffers,
+ *  and never reads it, so its reply is whole on the server's side and stalls in the kernel. */
+static std::size_t stall_on_file(fixture_t& fixture, raw_client_t& peer, int file, ucall_outcome_t& outcome) {
+    std::size_t failures = expect(peer.connect(fixture.address), "a stalling peer was not accepted");
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    failures += expect(::send(peer.descriptor, request.data(), request.size(), 0) ==
+                       static_cast<ssize_t>(request.size()));
+    failures += await_held_in_background(fixture, 1);
+    return failures + reply_parts(fixture, fixture.take_held(), outcome, {file_part(file)});
+}
+
+/** Whether the server reset @p peer by @p deadline, learned without reading, since a read would
+ *  let its stalled reply flow again. */
+static bool reset_unread(raw_client_t const& peer, steady_clock::time_point deadline) {
+    auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - steady_clock::now());
+    pollfd watched {peer.descriptor, 0, 0};
+    if (::poll(&watched, 1, static_cast<int>(fu::max_of<long long>(left.count(), 0))) <= 0) return false;
+    int error = 0;
+    socklen_t length = sizeof(error);
+    return getsockopt(peer.descriptor, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == ECONNRESET;
+}
+
+/** At its connection budget, with every connection held by a peer that stopped reading its reply,
+ *  a first arriving peer is parked and a second one's arrival resets a stalled connection for it,
+ *  so peers that never read cannot keep the interface closed to new ones. */
+static std::size_t test_stalled_senders_evicted(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
+        file_tree_t tree;
+        if (char const* reason = tree.unusable()) return report("test_stalled_senders_evicted", reason);
+        fixture_t fixture {cell, {.connections = 2, .directory = tree.served}};
+        require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+        fixture.serve_in_background();
+        std::size_t failures = 0;
+        int const large = ::open(tree.name("large.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        require(failures + fixture.stop(), large >= 0 && ftruncate(large, off_t {256} << 20) == 0);
+        raw_client_t stalled[2], parked, queued;
+        ucall_outcome_t outcomes[2] {};
+        for (std::size_t i = 0; i != 2; ++i) failures += stall_on_file(fixture, stalled[i], large, outcomes[i]);
+        // The kernel buffers fill and the sends stop completing well within this.
+        std::this_thread::sleep_for(200ms);
+        std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
+        require(failures + fixture.stop(), parked.connect(fixture.address));
+        failures += expect(::send(parked.descriptor, echo.data(), echo.size(), 0) == static_cast<ssize_t>(echo.size()));
+        failures += expect(parked.read(1, steady_clock::now() + 300ms) != read_end_t::filled_k,
+                           "a lone arrival was served past a budget of busy connections");
+        require(failures + fixture.stop(), queued.connect(fixture.address));
+        failures += expect(read_response(parked, 0).status == 200, "the parked peer was not served");
+        std::size_t resets = 0;
+        for (raw_client_t const& peer : stalled) resets += reset_unread(peer, steady_clock::now() + 200ms);
+        failures += expect(resets == 1, "{} stalled connections were reset for one admitted peer", resets);
+        ::close(large);
+        return failures + fixture.stop();
+    });
+}
+
+/** A drain cuts a peer that stopped reading its reply once the connections that still progress
+ *  closed, rather than waiting on it for a second stop. */
+static std::size_t test_drain_cuts_stalled_sender(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
+        file_tree_t tree;
+        if (char const* reason = tree.unusable()) return report("test_drain_cuts_stalled_sender", reason);
+        fixture_t fixture {cell, {.connections = 2, .directory = tree.served}};
+        require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+        fixture.serve_in_background();
+        std::size_t failures = 0;
+        int const large = ::open(tree.name("large.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
+        require(failures + fixture.stop(), large >= 0 && ftruncate(large, off_t {256} << 20) == 0);
+        raw_client_t stalled, busy;
+        ucall_outcome_t stalled_outcome {}, busy_outcome {};
+        failures += stall_on_file(fixture, stalled, large, stalled_outcome);
+        require(failures + fixture.stop(), busy.connect(fixture.address));
+        std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+        failures += expect(::send(busy.descriptor, request.data(), request.size(), 0) ==
+                           static_cast<ssize_t>(request.size()));
+        failures += await_held_in_background(fixture, 1);
+        std::this_thread::sleep_for(200ms);
+        ucall_server_stop(fixture.server);
+        // The drain's first pass must see the stalled send before the busy connection closes.
+        std::this_thread::sleep_for(100ms);
+        failures += reply_parts(fixture, fixture.take_held(), busy_outcome, {bytes_part("drained")});
+        failures += expect(busy.read_until_close(steady_clock::now() + 2s) == read_end_t::closed_k &&
+                               busy.received.ends_with("drained"),
+                           "the busy connection lost its drained reply");
+        // The busy connection lingers for its peer's close before its record frees.
+        busy.close();
+        failures += expect(reset_unread(stalled, steady_clock::now() + 3s), "the stalled connection was not reset");
+        ::close(large);
+        return failures + fixture.stop();
+    });
+}
+
 /** A second stop, while a peer that reads slowly holds a path reply cut off past its head, resets
  *  the peer at once, rather than closing in order behind the unsent body or lingering. */
-static case_result_t test_stop_resets_held_replies() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_stop_resets_held_replies(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        if (char const* reason = tree.unusable()) return report("test_stop_resets_held_replies", reason);
         ucall_outcome_t outcome {};
         std::size_t failures = 0;
         raw_client_t client;
         auto stopping = steady_clock::now();
         {
-            fixture_t fixture {{.directory = tree.served}};
+            fixture_t fixture {cell, {.directory = tree.served}};
             require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
             fixture.serve_in_background();
             int const huge = ::open(tree.name("huge.bin").c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
@@ -956,9 +1005,9 @@ static case_result_t test_stop_resets_held_replies() {
 
 /** A client freed on another thread that drives a ring of its own retires its own ring, as a
  *  language runtime's collector may free it anywhere, rather than spinning on the other ring. */
-static case_result_t test_client_free_on_another_ring_thread() {
-    return keeping_descriptors([]() -> case_result_t {
-        fixture_t fixture {{}};
+static std::size_t test_client_free_on_another_ring_thread(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
+        fixture_t fixture {cell, {}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::size_t failures = 0;
         auto completed = call_and_wait(fixture, ucall_verb_get_k, "/echo/1", ucall_security_none_k, failures);
@@ -975,12 +1024,13 @@ static case_result_t test_client_free_on_another_ring_thread() {
         failures += expect(pending.status == ucall_status_success_k, "call: {}", ucall_status_name(pending.status));
         // Shared, so a stuck thread left behind never writes into a finished case.
         auto freed = std::make_shared<std::atomic<int>>(0);
-        std::thread freeing {[freed, client = std::exchange(fixture.client, nullptr)] {
+        std::thread freeing {[freed, cell, client = std::exchange(fixture.client, nullptr)] {
             ucall_client_t own {};
             ucall_outcome_t outcome {};
             ucall_client_options_t config {};
             config.max_concurrent_connections = 1;
-            config.backend = backend_under_test;
+            config.backend = cell.backend;
+            config.cpu_class = cell.cpu_class;
             ucall_client_init_t init {&own, &outcome, &config, nullptr};
             ucall_client_init(&init);
             ucall_client_free(client);
@@ -1000,9 +1050,9 @@ static case_result_t test_client_free_on_another_ring_thread() {
 
 /** A server freed off the thread that polled it, which a single-issuer ring refuses, waits for the
  *  kernel to end that ring instead of leaking what its requests may still reach. */
-static case_result_t test_server_free_off_its_polling_owner() {
-    return keeping_descriptors([]() -> case_result_t {
-        fixture_t fixture {{}};
+static std::size_t test_server_free_off_its_polling_owner(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
+        fixture_t fixture {cell, {}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         std::thread owner {[&] {
             ucall_outcome_t outcome {};
@@ -1019,9 +1069,9 @@ static case_result_t test_server_free_off_its_polling_owner() {
  *  linger periods: the close lingers for the peer's FIN and for the kernel to let go of what it
  *  sent without copying, resets once the deadline passes with the reply still unread, and frees the
  *  one connection slot for the next peer. A copying engine closes in order. */
-static case_result_t test_linger_then_reset() {
+static std::size_t test_linger_then_reset(sweep_cell_t const& cell) {
 #if UCALL_OS_POSIX_
-    fixture_t fixture {{}};
+    fixture_t fixture {cell, {}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;
@@ -1036,8 +1086,7 @@ static case_result_t test_linger_then_reset() {
     failures += await_held_in_background(fixture, 1);
     // Zero-copy engines take one send far past the peer's window, so its release waits on the peer,
     // while a copying engine, POSIX or kqueue, takes only what fits its socket buffer.
-    bool const copies = backend_under_test == ucall_io_backend_posix_k ||
-                        backend_under_test == ucall_io_backend_bsd_kqueue_k;
+    bool const copies = cell.backend == ucall_io_backend_posix_k || cell.backend == ucall_io_backend_bsd_kqueue_k;
     std::string const body(copies ? 12000 : std::size_t {1} << 20, 'l');
     ucall_outcome_t outcome {};
     ucall_server_reply_content_t reply {fixture.server, &outcome, fixture.take_held(), ucall_http_status_ok_k,
@@ -1058,22 +1107,23 @@ static case_result_t test_linger_then_reset() {
     bool const whole = end == read_end_t::closed_k && parse_response(silent.received).body == body;
     failures += expect(copies ? whole : reset, "the read ended as {} with {} bytes", static_cast<int>(end),
                        silent.received.size());
-    announce("{} after {} ms", reset ? "reset" : "closed in order", freed.count());
     return failures + fixture.stop();
 #else
-    return case_result_t::skipped("raw sockets need POSIX");
+    return report("test_linger_then_reset", "raw sockets need POSIX");
 #endif
 }
 
 /** A ring's zero-copy send that would pin past the locked-memory limit falls back to copying, so
  *  a four-mebibyte reply still arrives whole rather than cutting the connection. */
-static case_result_t test_zero_copy_pins_past_memlock(random_generator_t& generator) {
-    bool const ring = backend_under_test == ucall_io_backend_linux_uring612_k ||
-                      backend_under_test == ucall_io_backend_linux_uring618_k;
-    if (!ring) return case_result_t::skipped("only io_uring pins sends against the locked-memory limit");
-    if (::geteuid() == 0) return case_result_t::skipped("root pins without locked-memory accounting");
+static std::size_t test_zero_copy_pins_past_memlock(sweep_cell_t const& cell, random_generator_t& generator) {
+    bool const ring = cell.backend == ucall_io_backend_linux_uring612_k ||
+                      cell.backend == ucall_io_backend_linux_uring618_k;
+    if (!ring)
+        return report("test_zero_copy_pins_past_memlock", "only io_uring pins sends against the locked-memory limit");
+    if (::geteuid() == 0)
+        return report("test_zero_copy_pins_past_memlock", "root pins without locked-memory accounting");
     std::size_t const body_length = std::size_t {4} << 20;
-    fixture_t fixture {{.connections = 2, .max_request_bytes = 2 * body_length}};
+    fixture_t fixture {cell, {.connections = 2, .max_request_bytes = 2 * body_length}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;
@@ -1111,9 +1161,9 @@ static case_result_t test_zero_copy_pins_past_memlock(random_generator_t& genera
 /** Thirty-two peers that each send <tt>connection: close</tt> yet never close fill the whole linger
  *  budget, and all expire oldest first, so a thirty-third peer in the backlog is served within a
  *  couple of linger periods. */
-static case_result_t test_many_lingers_expire(random_generator_t& generator) {
+static std::size_t test_many_lingers_expire(sweep_cell_t const& cell, random_generator_t& generator) {
     std::size_t const lingering = 32;
-    fixture_t fixture {{.connections = lingering}};
+    fixture_t fixture {cell, {.connections = lingering}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;
@@ -1141,11 +1191,11 @@ static case_result_t test_many_lingers_expire(random_generator_t& generator) {
 
 /** A file of eight windows sent to a peer reading slowly reads each window while the one before it
  *  waits or sends, as the loop counts at least six such overlaps, and arrives byte for byte. */
-static case_result_t test_file_window_overlap() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_file_window_overlap(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
-        fixture_t fixture {{.directory = tree.served}};
+        if (char const* reason = tree.unusable()) return report("test_file_window_overlap", reason);
+        fixture_t fixture {cell, {.directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         fixture.serve_in_background();
         std::size_t failures = 0;
@@ -1170,7 +1220,6 @@ static case_result_t test_file_window_overlap() {
         failures += expect_outcome(fixture, outcome, ucall_status_success_k);
         ucall_event_loop_statistics_t const statistics = loop_statistics(fixture);
         std::uint64_t const overlaps = statistics.file_window_overlaps - before;
-        announce("{} zero-copy sends, {} copied anyway", statistics.zero_copy_sends, statistics.zero_copy_fallbacks);
         failures += expect(overlaps >= 6, "{} reads overlapped a send", overlaps);
         return failures + fixture.stop();
     });
@@ -1178,12 +1227,12 @@ static case_result_t test_file_window_overlap() {
 
 /** A peer that never reads takes no more than its windows: eight others fetch four mebibytes each
  *  meanwhile, byte for byte, and the stalled reply ends once its peer leaves. */
-static case_result_t test_file_fairness() {
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_file_fairness(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        if (char const* reason = tree.unusable()) return report("test_file_fairness", reason);
         constexpr std::size_t readers_count = 8;
-        fixture_t fixture {{.connections = readers_count + 1, .directory = tree.served}};
+        fixture_t fixture {cell, {.connections = readers_count + 1, .directory = tree.served}};
         require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
         fixture.serve_in_background();
         std::size_t failures = 0;
@@ -1233,11 +1282,10 @@ static case_result_t test_file_fairness() {
 
 /** Once a keep-alive connection served one request, its second file reply allocates nothing: the
  *  exchange, file segment, window and segments all come back from the first. */
-static case_result_t test_warm_file_reply_allocates_nothing() {
-#if UCALL_WITH_POSIX
-    return keeping_descriptors([]() -> case_result_t {
+static std::size_t test_warm_file_reply_allocates_nothing(sweep_cell_t const& cell) {
+    return keeping_descriptors([&]() -> std::size_t {
         file_tree_t tree;
-        if (char const* reason = tree.unusable()) return case_result_t::skipped(reason);
+        if (char const* reason = tree.unusable()) return report("test_warm_file_reply_allocates_nothing", reason);
         struct route_t {
             ucall_server_t server {};
             std::array<ucall_outcome_t, 3> deferred {};
@@ -1263,7 +1311,7 @@ static case_result_t test_warm_file_reply_allocates_nothing() {
         ucall_server_options_t config {}, resolved {};
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
-        config.backend = ucall_io_backend_posix_k;
+        config.backend = cell.backend;
         ucall_outcome_t outcome {};
         ucall_server_init_t init {&route.server, &outcome, &config, &resolved};
         counted_network_t::server_t::server_init(&init, counting_allocator<uc::byte_t> {counts});
@@ -1306,39 +1354,46 @@ static case_result_t test_warm_file_reply_allocates_nothing() {
         failures += expect(!counts.live(), "{} allocations outlived the server", counts.live());
         return failures;
     });
-#else
-    return case_result_t::skipped("the POSIX backend is not compiled");
-#endif
 }
 
-void run_files(suite_totals_t& totals) {
-    run_test(totals, "test_direct_files_plain", test_direct_files_plain);
-    run_test(totals, "test_direct_files_noise_xx", test_direct_files_noise_xx);
-    run_test(totals, "test_misaligned_ranges_plain", test_misaligned_ranges_plain);
-    run_test(totals, "test_misaligned_ranges_noise_xx", test_misaligned_ranges_noise_xx);
-    run_test(totals, "test_path_refusals_plain", test_path_refusals_plain);
-    run_test(totals, "test_path_refusals_noise_xx", test_path_refusals_noise_xx);
-    run_test(totals, "test_unbufferable_descriptor_refused", test_unbufferable_descriptor_refused);
-    run_test(totals, "test_path_beyond_interface", test_path_beyond_interface);
-    run_test(totals, "test_mixed_stream_plain", test_mixed_stream_plain);
-    run_test(totals, "test_mixed_stream_noise_xx", test_mixed_stream_noise_xx);
-    run_test(totals, "test_mixed_stream_framing", test_mixed_stream_framing);
-    run_test(totals, "test_noise_record_boundaries", test_noise_record_boundaries);
-    run_test(totals, "test_short_file_reset", test_short_file_reset);
-    run_test(totals, "test_short_file_noise_xx", test_short_file_noise_xx);
-    run_test(totals, "test_file_detach", test_file_detach);
-    run_test(totals, "test_stop_while_opening", test_stop_while_opening);
-    run_test(totals, "test_stop_while_releasing", test_stop_while_releasing);
-    run_test(totals, "test_stop_drains_held_reply", test_stop_drains_held_reply);
-    run_test(totals, "test_stop_resets_held_replies", test_stop_resets_held_replies);
-    run_test(totals, "test_client_free_on_another_ring_thread", test_client_free_on_another_ring_thread);
-    run_test(totals, "test_server_free_off_its_polling_owner", test_server_free_off_its_polling_owner);
-    run_test(totals, "test_linger_then_reset", test_linger_then_reset);
-    run_test(totals, "test_many_lingers_expire", test_many_lingers_expire);
-    run_test(totals, "test_zero_copy_pins_past_memlock", test_zero_copy_pins_past_memlock);
-    run_test(totals, "test_file_window_overlap", test_file_window_overlap);
-    run_test(totals, "test_file_fairness", test_file_fairness);
-    run_test(totals, "test_warm_file_reply_allocates_nothing", test_warm_file_reply_allocates_nothing);
+std::size_t check_replies(sweep_cell_t const& cell, settings_t const& settings) {
+    random_generator_t generator {stream_key(settings.seed, name_of(cell))};
+    std::size_t failures = 0;
+    failures += test_file_parts_vectored(cell);
+    failures += test_misaligned_ranges(cell);
+    failures += test_path_refusals(cell);
+    failures += test_mixed_stream(cell);
+    if (cell.security == ucall_security_noise_xx_k) {
+        failures += test_noise_record_boundaries(cell);
+        failures += test_short_file_noise(cell);
+    }
+    if (cell.security == ucall_security_none_k) {
+        failures += test_unbufferable_descriptor_refused(cell);
+        failures += test_path_beyond_interface(cell);
+        failures += test_mixed_stream_framing(cell);
+        failures += test_short_file_reset(cell);
+        failures += test_file_detach(cell);
+        failures += test_stop_while_opening(cell);
+        failures += test_stop_while_releasing(cell);
+        failures += test_stop_drains_held_reply(cell);
+        failures += test_stop_resets_held_replies(cell);
+        failures += test_stalled_senders_evicted(cell);
+        failures += test_drain_cuts_stalled_sender(cell);
+        failures += test_client_free_on_another_ring_thread(cell);
+        failures += test_server_free_off_its_polling_owner(cell);
+        failures += test_linger_then_reset(cell);
+        failures += test_many_lingers_expire(cell, generator);
+        failures += test_file_window_overlap(cell);
+        failures += test_file_fairness(cell);
+    }
+    if (cell.security == ucall_security_none_k &&
+        (cell.backend == ucall_io_backend_linux_uring612_k || cell.backend == ucall_io_backend_linux_uring618_k)) {
+        failures += test_zero_copy_pins_past_memlock(cell, generator);
+    }
+    if (cell.security == ucall_security_none_k && cell.cpu_class == ucall_cpu_class_unknown_k) {
+        failures += test_warm_file_reply_allocates_nothing(cell);
+    }
+    return failures;
 }
 
 #endif // UCALL_OS_POSIX_

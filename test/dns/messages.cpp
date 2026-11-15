@@ -1,9 +1,8 @@
 /**
- *  @file test/dns.cpp
+ *  @file test/dns/messages.cpp
  *  @author Ash Vardanian
  *  @date November 5, 2026
- *  @brief Tests for the stub resolver's query codec, and for how it reads <tt>resolv.conf</tt>
- *      and the hosts file.
+ *  @brief Tests for the stub resolver's query codec.
  *
  *  Every hostile case is a packet a nameserver, or anyone spoofing one, could send: each must be
  *  refused as malformed without reading past its end, never decoded into an address.
@@ -12,14 +11,13 @@
 
 #include <vector> // `std::vector`
 
-#include "ucall/dns/configuration.hpp" // `parse_resolv_conf`, `find_host`
-#include "ucall/dns/messages.hpp"      // `compose_query`, `decode_answer`
-#include "harness.hpp"                 // `expect`, `require`, `run_test`
-#include "properties.hpp"              // `check_dns_answer`
+#include "ucall/dns/messages.hpp" // `compose_query`, `decode_answer`
+#include "harness.hpp"            // `expect`, `require`
+#include "properties.hpp"         // `check_dns_answer`
 
-using namespace unum::ucall;
+namespace unum::ucall::test::dns {
+
 using namespace unum::ucall::dns;
-using namespace unum::ucall::test;
 
 #pragma region Fixtures
 
@@ -72,9 +70,8 @@ wire_name_t spelled(std::string_view name) {
 
 #pragma endregion Fixtures
 
-case_result_t test_dns_queries_unit() {
+static std::size_t test_dns_queries() {
     std::size_t failures = 0;
-    announce("a_query_spells_lowercased_labels");
     byte_t query[query_bytes_k] {};
     std::size_t const length = compose_query(query, 0xBEEF, spelled("Example.COM."), record_type_t::aaaa_k);
     packet_t expected;
@@ -82,7 +79,6 @@ case_result_t test_dns_queries_unit() {
     failures += expect(length == expected.bytes.size() && std::memcmp(query, expected.bytes.data(), length) == 0,
                        "a query of {} bytes differs from the expected {}", length, expected.bytes.size());
 
-    announce("unspellable_names_are_refused");
     wire_name_t wire {};
     failures += expect(!spell_name("", wire) && !spell_name(".", wire) && !spell_name("a..b", wire),
                        "an empty name or label was spelled");
@@ -93,11 +89,10 @@ case_result_t test_dns_queries_unit() {
     return failures;
 }
 
-case_result_t test_dns_answers_unit() {
+static std::size_t test_dns_answers() {
     std::size_t failures = 0;
     byte_t addresses[64] {};
 
-    announce("a_cname_chain_ends_in_addresses_at_its_least_ttl");
     {
         // www.example.com → edge.cdn → origin.cdn, then two addresses.
         packet_t packet;
@@ -124,7 +119,6 @@ case_result_t test_dns_answers_unit() {
                            "the addresses were not copied in order");
     }
 
-    announce("records_of_other_owners_are_ignored");
     {
         packet_t packet;
         packet.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -133,7 +127,6 @@ case_result_t test_dns_answers_unit() {
         failures += expect(decoded.answer == answer_t::empty_k, "another owner's address was taken");
     }
 
-    announce("nxdomain_caches_for_the_least_of_soa_ttl_and_minimum");
     {
         packet_t packet;
         packet.header(2, 3, 0, 1).question("missing.example", record_type_t::aaaa_k);
@@ -150,7 +143,6 @@ case_result_t test_dns_answers_unit() {
                            "NXDOMAIN answered {} for {} s", static_cast<int>(decoded.answer), decoded.ttl_seconds);
     }
 
-    announce("a_ttl_with_its_top_bit_reads_as_zero");
     {
         packet_t packet;
         packet.header(3, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -160,7 +152,6 @@ case_result_t test_dns_answers_unit() {
                            "a negative ttl read as {}", decoded.ttl_seconds);
     }
 
-    announce("truncation_and_server_failure_are_reported");
     {
         packet_t packet;
         packet.header(4, 0, 0, 0, 0x8380).question("a.example", record_type_t::a_k);
@@ -178,14 +169,13 @@ case_result_t test_dns_answers_unit() {
     return failures;
 }
 
-case_result_t test_dns_answers_safety() {
+static std::size_t test_dns_answers_hostile() {
     std::size_t failures = 0;
     byte_t addresses[64] {};
     auto const refused = [&](packet_t const& packet, std::uint16_t id, std::string_view name, record_type_t type) {
         return decode_answer(packet.view(), id, spelled(name), type, addresses).answer == answer_t::malformed_k;
     };
 
-    announce("a_wrong_id_or_question_is_refused");
     {
         packet_t packet;
         packet.header(9, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -195,7 +185,6 @@ case_result_t test_dns_answers_safety() {
         failures += expect(refused(packet, 9, "a.example", record_type_t::aaaa_k), "another type was accepted");
     }
 
-    announce("pointers_forward_or_at_themselves_are_refused");
     {
         packet_t forward;
         forward.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -211,7 +200,6 @@ case_result_t test_dns_answers_safety() {
         failures += expect(refused(outside, 1, "a.example", record_type_t::a_k), "a cut pointer was read");
     }
 
-    announce("a_label_loop_through_backward_pointers_stops_at_255_bytes");
     {
         packet_t packet;
         packet.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -220,7 +208,6 @@ case_result_t test_dns_answers_safety() {
         failures += expect(refused(packet, 1, "a.example", record_type_t::a_k), "a pointer loop was decoded");
     }
 
-    announce("lengths_past_the_packet_are_refused");
     {
         packet_t overrun;
         overrun.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -238,7 +225,6 @@ case_result_t test_dns_answers_safety() {
         failures += expect(refused(label, 1, "a.example", record_type_t::a_k), "a 64-byte label prefix was read");
     }
 
-    announce("every_cut_of_a_valid_answer_is_refused_without_reading_past_it");
     {
         packet_t packet;
         packet.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
@@ -253,9 +239,8 @@ case_result_t test_dns_answers_safety() {
     return failures;
 }
 
-case_result_t test_dns_answers_property(random_generator_t& generator) {
+static std::size_t test_dns_answers_random(random_generator_t& generator) {
     std::size_t failures = 0;
-    announce("mutated_answers_keep_every_decoder_promise");
     packet_t chain;
     chain.header(1, 0, 3, 1).question("a.example", record_type_t::a_k);
     chain.pointer(question_offset_k).u16(5).u16(1).u32(30).u16(5).raw({1, 'b'}).pointer(question_offset_k + 2);
@@ -296,64 +281,15 @@ case_result_t test_dns_answers_property(random_generator_t& generator) {
     return failures;
 }
 
-case_result_t test_dns_configuration_unit() {
+std::size_t check_dns_messages(settings_t const& settings) {
+    if (!settings.filter.selects("dns messages")) return 0;
+    random_generator_t generator {stream_key(settings.seed, "dns messages")};
     std::size_t failures = 0;
-    announce("resolv_conf_keeps_three_nameservers_the_last_search_and_options");
-    {
-        resolver_options_t options {};
-        parse_resolv_conf("# comment\n"                                                 //
-                          "nameserver 10.0.0.1\n"                                       //
-                          "nameserver fe80::1%7\n"                                      //
-                          "domain first.example\n"                                      //
-                          "search svc.cluster.local cluster.local ; trailing comment\n" //
-                          "nameserver 10.0.0.3\n"                                       //
-                          "nameserver 10.0.0.4\n"                                       //
-                          "options ndots:5 timeout:1 attempts:9 rotate\n",
-                          options);
-        failures += expect(options.nameservers_count == 3, "{} nameservers kept", options.nameservers_count);
-        auto const& scoped = reinterpret_cast<sockaddr_in6 const&>(options.nameservers[1]);
-        failures += expect(scoped.sin6_family == AF_INET6 && scoped.sin6_scope_id == 7 && ntohs(scoped.sin6_port) == 53,
-                           "the scoped IPv6 nameserver was not read");
-        std::string_view const search {options.search, options.search_length};
-        failures += expect(search == std::string_view("svc.cluster.local\0cluster.local\0", 32),
-                           "the search list reads `{}`", search);
-        failures += expect(options.ndots == 5 && options.timeout_seconds == 1 && options.attempts == 5,
-                           "options read ndots {} timeout {} attempts {}", options.ndots, options.timeout_seconds,
-                           options.attempts);
-    }
-
-    announce("hosts_lines_match_aliases_by_family_ignoring_case");
-    {
-        std::string_view const hosts = "127.0.0.1 localhost\n"                    //
-                                       "::1 localhost ip6-localhost # loopback\n" //
-                                       "# 10.0.0.9 commented.example\n"           //
-                                       "10.0.0.2\tdb.Internal  db\n";
-        byte_t address[16] {};
-        failures += expect(find_host(hosts, "DB.internal.", record_type_t::a_k, address) == ucall_status_success_k &&
-                               static_cast<unsigned>(address[3]) == 2,
-                           "the alias was not found");
-        failures += expect(find_host(hosts, "localhost", record_type_t::aaaa_k, address) == ucall_status_success_k &&
-                               static_cast<unsigned>(address[15]) == 1,
-                           "the IPv6 line was not found");
-        failures += expect(
-            find_host(hosts, "commented.example", record_type_t::a_k, address) == ucall_status_not_found_k,
-            "a commented line matched");
-        failures += expect(find_host(hosts, "db", record_type_t::aaaa_k, address) == ucall_status_not_found_k,
-                           "an IPv4 line answered AAAA");
-    }
-    return failures;
+    failures += test_dns_queries();
+    failures += test_dns_answers();
+    failures += test_dns_answers_hostile();
+    failures += test_dns_answers_random(generator);
+    return report("dns messages", failures);
 }
 
-int main(int, char** argv) {
-    install_test_signal_handlers();
-    fmt::print("Hi, dear tester! You look nice today!\n");
-    configure_tests();
-
-    suite_totals_t totals {.program = argv[0]};
-    run_test(totals, "test_dns_queries_unit", test_dns_queries_unit);
-    run_test(totals, "test_dns_answers_unit", test_dns_answers_unit);
-    run_test(totals, "test_dns_answers_safety", test_dns_answers_safety);
-    run_test(totals, "test_dns_answers_property", test_dns_answers_property);
-    run_test(totals, "test_dns_configuration_unit", test_dns_configuration_unit);
-    return suite_exit_code(totals);
-}
+} // namespace unum::ucall::test::dns

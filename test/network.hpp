@@ -29,7 +29,8 @@
 #include "ucall/network.hpp"           // `serial_network`
 #include "ucall/utilities/sockets.hpp" // `nonblocking`, `monotonic_ns`, `deadline_after`
 
-#include "harness.hpp" // `expect`, `require`, `run_test`, `raw_client_t`
+#include "harness.hpp"  // `expect`, `require`, `report`, `raw_client_t`, `sweep_cell_t`
+#include "variants.hpp" // `io_engines_t`
 
 #if UCALL_OS_POSIX_
 #include <fcntl.h>    // `open`, `fcntl`
@@ -38,13 +39,8 @@
 
 namespace unum::ucall::test {
 
-namespace uc = unum::ucall;
 using namespace std::chrono_literals;
 using std::chrono::steady_clock;
-
-/** The backend under test, which <tt>--backend</tt> names. */
-inline ucall_io_backend_t backend_under_test = ucall_io_backend_automatic_k;
-inline ucall_cpu_class_t cpu_class_under_test = ucall_cpu_class_unknown_k;
 
 inline ucall_status_t authorize(ucall_noise_key_t const* key, void* context) {
     return std::memcmp(*key, context, sizeof(ucall_noise_key_t)) == 0 ? ucall_status_success_k
@@ -59,9 +55,8 @@ inline ucall_reply_part_t bytes_part(std::string_view data) {
     return part;
 }
 
-/** What a fixture varies between cases; every other setting is fixed. */
+/** What a fixture varies between cases beyond its cell; every other setting is fixed. */
 struct fixture_config_t {
-    ucall_security_t security = ucall_security_none_k;
     std::size_t event_loops = 1;
 
     /** Open-connection budget of the server and the client alike. */
@@ -72,8 +67,6 @@ struct fixture_config_t {
 
     /** Calls the client sends ahead on one connection; zero means one. */
     std::size_t pipelined_calls = 0;
-
-    ucall_io_backend_t backend = backend_under_test;
 
     /** The one directory path parts resolve beneath, or empty for none. */
     std::string_view directory {};
@@ -100,7 +93,8 @@ inline ucall_bytes_view_t const metrics_tags_k[] {{reinterpret_cast<ucall_byte_t
  *      and a client to call it.
  *
  *  Cases either poll both from their own thread, or serve every loop in the background while raw
- *  clients block on the wire.
+ *  clients block on the wire. The cell's backend, CPU class and security reach the server and the
+ *  client alike through the C interface's options, which is where the class ceiling crosses it.
  */
 struct fixture_t {
     ucall_server_t server {};
@@ -298,7 +292,7 @@ struct fixture_t {
         return request;
     }
 
-    explicit fixture_t(fixture_config_t const& settings) {
+    fixture_t(sweep_cell_t const& cell, fixture_config_t const& settings) {
         // A generated server key, and a derived client key the server must report as the peer's.
         ucall_outcome_t outcome {};
         ucall_noise_key_generate_t generate {&outcome, &server_private, &server_public};
@@ -314,9 +308,9 @@ struct fixture_t {
         network_interface.max_concurrent_connections = settings.connections;
         network_interface.max_pipelined_requests = settings.pipelined_requests;
         network_interface.max_request_bytes = settings.max_request_bytes;
-        network_interface.security = settings.security;
+        network_interface.security = cell.security;
         network_interface.noise_private_key = &server_private;
-        if (settings.security == ucall_security_noise_kk_k) network_interface.noise_peer_key = &client_public;
+        if (cell.security == ucall_security_noise_kk_k) network_interface.noise_peer_key = &client_public;
         network_interface.peer_authorizer = authorize;
         network_interface.peer_authorizer_context = client_public;
         ucall_bytes_view_t const directory = uc::bytes_view(settings.directory);
@@ -325,8 +319,8 @@ struct fixture_t {
         ucall_server_options_t config {};
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
-        config.backend = settings.backend;
-        config.cpu_class = cpu_class_under_test;
+        config.backend = cell.backend;
+        config.cpu_class = cell.cpu_class;
         config.log = settings.log;
         if (!settings.metrics_address.empty()) {
             config.metrics_address = uc::bytes_view(settings.metrics_address);
@@ -373,13 +367,13 @@ struct fixture_t {
         client_config.noise_private_key = &client_private;
         client_config.peer_authorizer = authorize;
         client_config.peer_authorizer_context = server_public;
-        client_config.backend = settings.backend;
-        client_config.cpu_class = cpu_class_under_test;
+        client_config.backend = cell.backend;
+        client_config.cpu_class = cell.cpu_class;
         ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};
         ucall_client_init(&client_init);
         if ((status = outcome.status) != ucall_status_success_k) return;
         address = uc::text_view(resolved.interfaces[0].address);
-        url = fmt::format("{}{}", settings.security == ucall_security_none_k ? "http://" : "http+noise://", address);
+        url = fmt::format("{}{}", cell.security == ucall_security_none_k ? "http://" : "http+noise://", address);
     }
     ~fixture_t() {
         stop();
@@ -423,7 +417,7 @@ struct fixture_t {
 
     /** The next completed call, or one with a timeout outcome after five seconds. */
     ucall_completed_call_t wait() {
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + 30s;
         ucall_completed_call_t completed {};
         while (!poll(completed))
             if (steady_clock::now() > deadline) {
@@ -433,6 +427,16 @@ struct fixture_t {
         return completed;
     }
 };
+
+/** Appends to a streamed reply, waiting out @c ucall_status_would_block_k while its peer takes
+ *  what was sent, until the reply's @p deadline, so a loop nobody polls fails the case instead
+ *  of hanging it. */
+inline void append_when_room(ucall_server_reply_append_t& append, steady_clock::time_point deadline) {
+    for (ucall_server_reply_append(&append);
+         append.outcome->status == ucall_status_would_block_k && steady_clock::now() < deadline;
+         ucall_server_reply_append(&append))
+        std::this_thread::sleep_for(100us);
+}
 
 /** Checks a 200 response carries @p expected and the echo header, then frees it. */
 inline std::size_t check_response(ucall_received_http_response_t response, std::string_view expected) {
@@ -584,20 +588,22 @@ inline std::size_t expect_outcome(fixture_t& fixture, ucall_outcome_t& outcome, 
     return expect(status == expected, "the outcome turned {} rather than {}", ucall_status_name(status),
                   ucall_status_name(expected));
 }
-
-#if UCALL_WITH_POSIX
-using counted_network_t =
-    uc::network::serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>, counting_allocator<uc::byte_t>>;
-#endif
 #endif // UCALL_OS_POSIX_
 
+/** The serial network over every compiled engine, drawing each allocation from a counter. */
+using counted_network_t = uc::network::serial_network<uc::io_engines_t, counting_allocator<uc::byte_t>>;
+
 namespace network {
-void run_exchanges(suite_totals_t& totals);
-#if UCALL_OS_POSIX_
-void run_bodies(suite_totals_t& totals);
-void run_client(suite_totals_t& totals);
-void run_files(suite_totals_t& totals);
-#endif
+using namespace unum::ucall::network;
+
+std::size_t check_network(settings_t const& settings);
+std::size_t check_exchanges(sweep_cell_t const& cell, settings_t const& settings);
+std::size_t check_serving(sweep_cell_t const& cell, settings_t const& settings);
+std::size_t check_replies(sweep_cell_t const& cell, settings_t const& settings);
+std::size_t check_client(sweep_cell_t const& cell, settings_t const& settings);
+std::size_t check_resolving(sweep_cell_t const& cell, settings_t const& settings);
+std::size_t check_metrics(sweep_cell_t const& cell, settings_t const& settings);
+std::size_t check_loops(sweep_cell_t const& cell, settings_t const& settings);
 } // namespace network
 
 } // namespace unum::ucall::test

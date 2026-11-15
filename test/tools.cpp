@@ -1,5 +1,5 @@
 /**
- *  @file test/cli.cpp
+ *  @file test/tools.cpp
  *  @author Ash Vardanian
  *  @date November 5, 2026
  *  @brief Drives the <tt>ucall</tt> command-line client, whose path is the first argument, against
@@ -47,8 +47,8 @@ static std::string hexadecimal(ucall_noise_key_t const& key) {
 /** Plaintext calls: a GET to standard output, a POST from a file and from standard input, a header
  *  reaching the handler, <tt>-i</tt> printing the status line and fields before the body, and a 404
  *  exiting with its hundreds digit. */
-static case_result_t test_cli_plaintext() {
-    fixture_t fixture {{.connections = 4}};
+static std::size_t test_cli_plaintext(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {.connections = 4}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     scratch_directory_t scratch;
     require(0, scratch.ready() && scratch.write("body.txt", "from a file"));
@@ -84,8 +84,8 @@ static case_result_t test_cli_plaintext() {
 
 /** An IK call over <tt>http+noise://</tt> with the server's key pinned from a file and the
  *  caller's own. */
-static case_result_t test_cli_noise_ik() {
-    fixture_t fixture {{.security = ucall_security_noise_ik_k}};
+static std::size_t test_cli_noise_ik(sweep_cell_t const& cell) {
+    fixture_t fixture {{cell.backend, cell.cpu_class, ucall_security_noise_ik_k}, {}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     scratch_directory_t scratch;
     require(0, scratch.ready() && scratch.write("server.key", hexadecimal(fixture.server_public) + "\n") &&
@@ -213,7 +213,7 @@ static void spawn_proxy(proxy_run_t& run, std::vector<std::string> arguments) {
 /** A plaintext call through a forward proxy into Noise IK, and through a reverse proxy back to a
  *  plaintext upstream, keeping verb, path, query and fields but the hop-by-hop ones both ways; and
  *  an unreachable upstream answering 502. */
-static case_result_t test_cli_proxy_round_trip() {
+static std::size_t test_cli_proxy_round_trip() {
     echo_upstream_t upstream;
     require(0, upstream.start(), "the upstream failed to start");
     ucall_noise_key_t reverse_private {}, reverse_public {}, forward_private {}, forward_public {};
@@ -257,16 +257,22 @@ static case_result_t test_cli_proxy_round_trip() {
 
 int main(int argc, char** argv) {
     install_test_signal_handlers();
-    fmt::print("Hi, dear tester! You look nice today!\n");
-    configure_tests();
-    if (argc != 2) {
-        fmt::print(stderr, "Usage: {} <path to the ucall tool>\n", argv[0]);
+    test_settings = read_settings(argc, argv, "ucall_test_tools <path to the ucall tool>");
+    settings_t const& settings = test_settings;
+    if (argc < 2 || argv[argc - 1][0] == '-') {
+        fmt::println(stderr, "Usage: {} <path to the ucall tool>", argv[0]);
         return 1;
     }
-    cli_path = argv[1];
-    suite_totals_t totals {.program = argv[0]};
-    run_test(totals, "test_cli_plaintext", test_cli_plaintext);
-    run_test(totals, "test_cli_noise_ik", test_cli_noise_ik);
-    run_test(totals, "test_cli_proxy_round_trip", test_cli_proxy_round_trip);
-    return suite_exit_code(totals);
+    cli_path = argv[argc - 1];
+    print_probe(settings);
+    sweep_cell_t const cell {settings.backend, settings.cpu_class, ucall_security_none_k};
+    std::size_t failures_count = 0;
+    if (settings.filter.selects("tools cli"))
+        failures_count += report("tools cli", keeping_descriptors([&] {
+                                     std::size_t failures = test_cli_plaintext(cell);
+                                     failures += test_cli_noise_ik(cell);
+                                     failures += test_cli_proxy_round_trip();
+                                     return failures;
+                                 }));
+    return report("total", failures_count) ? 1 : 0;
 }

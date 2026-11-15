@@ -1,0 +1,790 @@
+/**
+ *  @file test/io/engines.hpp
+ *  @author Ash Vardanian
+ *  @date October 19, 2026
+ *  @brief The engine cases every engine runs, each templated on the engine, and the sweep that
+ *      runs an engine rebound to every admitted CPU class's atomic reference and row kit.
+ */
+#pragma once
+#include <cstring> // `std::memcmp`
+
+#include <fcntl.h>    // `open`, `O_DIRECT`
+#include <sys/stat.h> // `mkfifo`, `mkdir`
+
+#include <algorithm> // `std::find`, `std::fill`
+#include <array>     // `std::array`
+#include <string>    // `std::string`
+#include <vector>    // `std::vector`
+
+#include "ucall/io/types.hpp"          // `io_request_t`, `io_completion_t`, `io_wait_t`
+#include "ucall/utilities/sockets.hpp" // `nonblocking`, `monotonic_ns`, `deadline_after`
+#if UCALL_WITH_LINUX_URING
+#include "ucall/io/linux_uring612_engine.hpp" // `linux_uring612_engine`
+#include "ucall/io/linux_uring618_engine.hpp" // `linux_uring618_engine`
+#endif
+
+#include "harness.hpp" // `expect`, `require`, `report`, `loopback_pair`, `direct_directory_t`, `file_byte`
+#include "lib.hpp"     // `cpu_class_t`, `atomic_ref_for_cpu_class`, `row_kit_for_cpu_class`
+
+namespace unum::ucall::test::io {
+
+using namespace unum::ucall::io;
+
+#if UCALL_OS_POSIX_
+
+#pragma region Every Engine
+
+/** The engine keeps a mebibyte send and a receive pending on one socket
+ *  at once, and each completes as its own request. */
+template <typename engine_type_>
+std::size_t test_engine_duplex(random_generator_t& generator) {
+    engine_type_ engine;
+    auto const status = engine.open(2, 2);
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
+    // A send buffer far below a mebibyte keeps the send pending until the peer drains it, yet above
+    // a page, as FreeBSD acknowledges each small segment only after its 40 ms delayed-ACK timer.
+    int const send_buffer = static_cast<int>(16 * fixture_buffer_bytes_k);
+    require(failures, uc::utilities::nonblocking(sockets.client) == ucall_status_success_k &&
+                          uc::utilities::nonblocking(sockets.peer) == ucall_status_success_k &&
+                          uc::utilities::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer,
+                                                       sizeof(send_buffer)) == 0);
+    auto const owned = engine.import_socket(std::exchange(sockets.client, -1));
+    require(failures, owned >= 0, "importing ended with {}", owned);
+    int const peer = sockets.peer;
+
+    std::vector<uc::byte_t> payload(std::size_t {1} << 20), drained(payload.size());
+    for (auto& byte : payload) byte = static_cast<uc::byte_t>(generator());
+    uc::span<uc::byte_t const> const message = uc::byte_span("receive");
+    std::array<uc::byte_t, fixture_buffer_bytes_k> buffer {};
+    io_vector_t room {buffer.data(), sizeof(buffer)};
+    io_request_t receiving {.operation = io_operation_t::receive_k,
+                            .descriptor = owned,
+                            .data = reinterpret_cast<uc::byte_t*>(&room),
+                            .length = 1};
+    io_request_t sending {.operation = io_operation_t::send_k,
+                          .descriptor = owned,
+                          .data = payload.data(),
+                          .length = payload.size()};
+    engine.submit(receiving);
+    engine.submit(sending);
+
+    std::size_t received = 0, sent = 0, read = 0;
+    bool written = false;
+    io_completion_t completions[2] {};
+    auto const deadline = uc::utilities::deadline_after(5000000);
+    while (!received || sent != payload.size() || read != payload.size()) {
+        // Nothing drains the peer before the receive completes,
+        // so the send stays pending throughout.
+        auto const wait = written && !received ? io_wait_t::blocking_k : io_wait_t::nonblocking_k;
+        int const count = engine.poll(uc::span<io_completion_t> {completions}, wait, deadline);
+        require(failures, count >= 0, "polling ended with {}", count);
+        for (auto const& completed : uc::span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+            if (completed.request == &sending) {
+                require(failures, completed.result > 0, "sending ended with {}", completed.result);
+                sent += static_cast<std::size_t>(completed.result);
+                sending.data = payload.data() + sent;
+                sending.length = payload.size() - sent;
+                if (sent != payload.size()) engine.submit(sending);
+            }
+            else {
+                require(failures, completed.request == &receiving, "a completion named neither request");
+                require(failures, completed.result > 0, "receiving ended with {}", completed.result);
+                received = static_cast<std::size_t>(completed.result);
+                uc::span<uc::byte_t const> const delivered {completed.data ? completed.data : buffer.data(), received};
+                failures += expect_bytes(delivered, message);
+                failures += expect(sent != payload.size(), "the send finished before the peer read");
+            }
+            engine.release(completed);
+        }
+        if (!written && !count) {
+            require(failures,
+                    ::send(peer, message.data(), message.size(), MSG_NOSIGNAL) == static_cast<ssize_t>(message.size()));
+            written = true;
+        }
+        if (received && read != drained.size()) {
+            auto const length = ::recv(peer, drained.data() + read, drained.size() - read, 0);
+            if (length > 0) read += static_cast<std::size_t>(length);
+            else require(failures, length < 0 && io_pending(-errno), "draining ended with {}", length);
+        }
+        require(failures, uc::utilities::monotonic_ns() < deadline, "{} received, {} sent and {} read of {}", received,
+                sent, read, payload.size());
+    }
+    failures += expect(drained == payload);
+    failures += expect(engine.close_socket(owned) == 0);
+    return failures;
+}
+
+/** One accept of the engine takes every queued connection, each completing with its own peer and
+ *  saying the request stays pending, and exactly one last completion ends it, however many of them
+ *  one poll hands over together. */
+template <typename engine_type_>
+std::size_t test_accept_batch() {
+    constexpr std::size_t connections_k = 8;
+    engine_type_ engine;
+    auto const status = engine.open(64, 64);
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    int const listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    sockaddr_in address {};
+    address.sin_family = AF_INET;
+    address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    socklen_t address_length = sizeof(address);
+    require(failures, listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&address), address_length) == 0 &&
+                          ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0 &&
+                          ::listen(listener, connections_k) == 0 &&
+                          uc::utilities::nonblocking(listener) == ucall_status_success_k);
+    auto const owned = engine.import_socket(listener);
+    require(failures, owned >= 0, "importing the listener ended with {}", owned);
+    std::array<io_peer_address_t, connections_k> peers {};
+    io_request_t accepting {.operation = io_operation_t::accept_k,
+                            .descriptor = owned,
+                            .data = reinterpret_cast<uc::byte_t*>(peers.data()),
+                            .length = connections_k};
+    engine.submit(accepting);
+
+    std::string const target = fmt::format("127.0.0.1:{}", ntohs(address.sin_port));
+    std::array<raw_client_t, connections_k> clients;
+    std::vector<unsigned> ports;
+    for (auto& client : clients) {
+        sockaddr_in local {};
+        socklen_t local_length = sizeof(local);
+        require(failures,
+                client.connect(target) &&
+                    ::getsockname(client.descriptor, reinterpret_cast<sockaddr*>(&local), &local_length) == 0);
+        ports.push_back(ntohs(local.sin_port));
+    }
+    std::vector<uc::descriptor_t> accepted;
+    std::size_t endings = 0;
+    // Room past every connection, so a readiness engine never ends the accept for want of it.
+    io_completion_t completions[4 * connections_k] {};
+    auto const deadline = uc::utilities::deadline_after(5000000);
+    while (!endings) {
+        // Every client connected, so a request still pending afterwards only ends once cancelled.
+        if (accepted.size() == connections_k && accepting.length)
+            require(failures, engine.cancel(accepting) == ucall_status_success_k);
+        int const count = engine.poll(uc::span<io_completion_t> {completions}, io_wait_t::blocking_k, deadline);
+        require(failures, count >= 0, "polling ended with {}", count);
+        for (auto const& completed : uc::span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+            require(failures, completed.request == &accepting, "a completion named another request");
+            failures += expect(!endings, "a completion followed the one that ended the accept");
+            endings += completed.continuation == io_continuation_t::ended_k;
+            if (completed.result < 0) {
+                failures += expect(completed.result == -ECANCELED, "accepting ended with {}", completed.result);
+                continue;
+            }
+            accepted.push_back(completed.result);
+            auto const* written = completed.data ? completed.data : accepting.data;
+            auto const& peer = reinterpret_cast<io_peer_address_t const*>(written)->address;
+            auto const port = ntohs(reinterpret_cast<sockaddr_in const&>(peer).sin_port);
+            auto const found = std::find(ports.begin(), ports.end(), port);
+            failures += expect(peer.ss_family == AF_INET && found != ports.end(), "a peer at port {} connected", port);
+            if (found != ports.end()) ports.erase(found);
+        }
+        require(failures, uc::utilities::monotonic_ns() < deadline, "{} of {} accepted", accepted.size(),
+                connections_k);
+    }
+    failures += expect(accepted.size() == connections_k && ports.empty(), "{} of {} accepted", accepted.size(),
+                       connections_k);
+    failures += expect(endings == 1 && !accepting.length, "{} completions ended the accept", endings);
+    failures += expect(engine.poll(uc::span<io_completion_t> {completions}, io_wait_t::nonblocking_k) == 0,
+                       "the accept completed after it ended");
+    for (auto descriptor : accepted) failures += expect(engine.close_socket(descriptor) == 0);
+    failures += expect(engine.close_socket(owned) == 0);
+    return failures;
+}
+
+/** The status flag @c F_GETFL reads back from a descriptor switched to unbuffered reads: Darwin's
+ *  @c FNOCACHE, which its SDK keeps private, or @c O_DIRECT. */
+#if UCALL_OS_APPLE_
+inline constexpr int direct_flag_k = 0x40000;
+#elif UCALL_OS_POSIX_
+inline constexpr int direct_flag_k = O_DIRECT;
+#endif
+
+/** Polls @p engine until @p request completes, answering its result, or @c -ETIMEDOUT once
+ *  @p deadline passes; other completions are dropped. */
+template <typename engine_type_>
+uc::descriptor_t finish(engine_type_& engine, io_request_t const& request, std::uint64_t deadline) {
+    io_completion_t completed[1] {};
+    while (uc::utilities::monotonic_ns() < deadline)
+        if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+            return completed[0].result;
+    return -ETIMEDOUT;
+}
+template <typename engine_type_>
+uc::descriptor_t await(engine_type_& engine, io_request_t& request, std::uint64_t deadline) {
+    engine.submit(request);
+    return finish(engine, request, deadline);
+}
+
+/** A disk-backed directory holding <tt>data.bin</tt>, 64 alignments and 123 bytes of patterned content,
+ *  beside a FIFO, a subdirectory and a symlink out of it. */
+struct direct_files_t {
+    direct_directory_t directory;
+    std::string content;
+    [[nodiscard]] bool fill() {
+        content.resize(64 * directory.alignment + 123);
+        for (std::size_t i = 0; i != content.size(); ++i) content[i] = static_cast<char>(file_byte(i));
+        return directory.write("data.bin", content) && mkfifo(directory.name("fifo").c_str(), 0600) == 0 &&
+               symlink("/etc/hostname", directory.name("absolute").c_str()) == 0 &&
+               mkdir(directory.name("subdir").c_str(), 0700) == 0;
+    }
+};
+
+/** Opens beneath a directory for unbuffered reads, refusing escapes, FIFOs and directories without
+ *  waiting on a writer; switches a buffered descriptor, twice; then reads aligned extents, a short
+ *  tail and vectors, counting each read as asynchronous or blocking as the engine performed it. */
+template <typename engine_type_>
+std::size_t test_direct_files() {
+    direct_files_t files;
+    if (!files.directory.ready()) return report("test_direct_files", files.directory.reason.c_str());
+    engine_type_ engine;
+    ucall_status_t const opened = engine.open(4, 4);
+    require(0, opened == ucall_status_success_k);
+    std::size_t failures = 0;
+    require(failures, files.fill());
+    std::size_t const alignment = files.directory.alignment;
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected() && uc::utilities::nonblocking(sockets.client) == ucall_status_success_k);
+    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    auto const deadline = uc::utilities::deadline_after(5000000);
+
+    int file = -1;
+    for (std::string_view path : {"data.bin", "fifo", "subdir", "absolute", "../data.bin", "missing"}) {
+        std::string terminated {path};
+        io_request_t opening {.operation = io_operation_t::file_open_k,
+                              .descriptor = socket,
+                              .data = reinterpret_cast<uc::byte_t*>(terminated.data()),
+                              .length = terminated.size() + 1,
+                              .file = {0, files.directory.descriptor}};
+        uc::descriptor_t const opened = await(engine, opening, deadline);
+        if (path == "data.bin") {
+            uc::utilities::file_geometry_t const geometry = opened >= 0 ? uc::utilities::direct_alignment_of(opened)
+                                                                        : uc::utilities::file_geometry_t {};
+            failures += expect(opened >= 0 && !geometry.error && geometry.size == files.content.size(),
+                               "{} opened as {} measuring {}", path, opened, geometry.size);
+            file = static_cast<int>(opened);
+        }
+        else {
+            failures += expect(opened < 0, "{} opened as {}", path, opened);
+            if (opened >= 0) ::close(opened);
+        }
+    }
+    require(failures, file >= 0);
+
+    uc::utilities::native_file_t buffered = ::open(files.directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC);
+    failures += expect(uc::utilities::file_direct_switch(buffered) == ucall_status_success_k &&
+                           uc::utilities::file_direct_switch(buffered) == ucall_status_success_k &&
+                           (fcntl(buffered, F_GETFL) & direct_flag_k),
+                       "the switch left flags {:#x}", fcntl(buffered, F_GETFL));
+    ::close(buffered);
+
+    aligned_bytes_t window {4 * alignment};
+    failures += expect(engine.register_memory(window.bytes()).pinning() == range_pinning_t::unpinned_k);
+    io_request_t reading {.operation = io_operation_t::file_read_k,
+                          .descriptor = socket,
+                          .data = window.data,
+                          .length = 2 * alignment,
+                          .file = {3 * alignment, file}};
+    failures += expect(await(engine, reading, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+                       std::memcmp(window.data, files.content.data() + 3 * alignment, 2 * alignment) == 0);
+    reading.file.offset = 64 * alignment;
+    reading.length = alignment;
+    failures += expect(await(engine, reading, deadline) == 123 &&
+                       std::memcmp(window.data, files.content.data() + 64 * alignment, 123) == 0);
+    uc::utilities::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
+    io_request_t scattering {.operation = io_operation_t::file_read_vectors_k,
+                             .descriptor = socket,
+                             .data = reinterpret_cast<uc::byte_t*>(vectors),
+                             .length = 2,
+                             .file = {5 * alignment, file}};
+    failures += expect(await(engine, scattering, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+                       std::memcmp(window.data, files.content.data() + 5 * alignment, alignment) == 0 &&
+                       std::memcmp(window.data + 2 * alignment, files.content.data() + 6 * alignment, alignment) == 0);
+    failures += expect(engine.statistics.file_reads_asynchronous + engine.statistics.file_reads_blocking == 3);
+    ::close(file);
+    failures += expect(engine.close_socket(socket) == 0);
+    return failures;
+}
+
+#pragma endregion Every Engine
+
+#if UCALL_WITH_LINUX_URING
+#pragma region Rings
+
+using namespace unum::ucall::utilities;
+
+/** Sends all of @p bytes through @p descriptor, blocking. */
+[[nodiscard]] inline bool send_all(int descriptor, span<byte_t const> bytes) noexcept {
+    while (!bytes.empty()) {
+        ssize_t const count = ::send(descriptor, bytes.data(), bytes.size(), MSG_NOSIGNAL);
+        if (count <= 0) return false;
+        bytes = bytes.subspan(static_cast<std::size_t>(count));
+    }
+    return true;
+}
+
+/** Checks the registered socket @p handle has @c TCP_NODELAY, through a descriptor it installs. */
+template <typename engine_type_>
+std::size_t expect_nodelay(engine_type_& engine, descriptor_t handle) {
+    auto* submission = engine.queue.entry();
+    if (expect(submission)) return 1;
+    engine.queue.control.result.reset();
+    io_uring_prep_fixed_fd_install(submission, static_cast<int>(registered_socket_t::index_of(handle)), 0);
+    io_uring_sqe_set_data64(submission, engine.queue.tag(&engine.queue.control, uring_control_tag_k));
+    auto descriptor = engine.wait_control();
+    if (expect(descriptor >= 0, "installing failed with {}", descriptor)) return 1;
+    int enabled {};
+    socket_length_t length = sizeof(enabled);
+    std::size_t failures = expect(getsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, &length) == 0 &&
+                                  enabled == 1);
+    socket_close(descriptor);
+    return failures;
+}
+
+template <typename engine_type_>
+std::size_t test_failed_submission() {
+    engine_type_ engine;
+    auto status = engine.open(8, 4);
+    if (status == ucall_status_unsupported_k)
+        return report("test_failed_submission", "the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    auto direct = engine.open_socket(AF_INET);
+    require(failures, direct >= 0);
+    failures += expect_nodelay(engine, direct);
+    failures += expect(engine.close_socket(direct) == 0);
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
+    auto owned = engine.import_socket(sockets.client);
+    require(failures, owned >= 0);
+    sockets.client = -1;
+    failures += expect_nodelay(engine, owned);
+    byte_t content[1] {byte_t {42}};
+    io_request_t sending {.operation = io_operation_t::send_k,
+                          .descriptor = owned,
+                          .data = content,
+                          .length = sizeof(content)};
+    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = owned};
+    engine.submit(sending);
+    engine.submit(receiving);
+    require(failures, engine.queue.enter(0, 0) >= 0);
+    byte_t received {};
+    failures += expect(recv(sockets.peer, &received, sizeof(received), 0) == 1 && received == content[0]);
+
+    io_request_t unsubmitted {.operation = io_operation_t::send_k,
+                              .descriptor = owned,
+                              .data = content,
+                              .length = sizeof(content)};
+    engine.submit(unsubmitted);
+    auto descriptor = engine.queue.ring.ring_fd;
+    auto enter_descriptor = engine.queue.ring.enter_ring_fd;
+    engine.queue.ring.ring_fd = -1;
+    engine.queue.ring.enter_ring_fd = -1;
+    auto failure = engine.queue.enter(0, 0);
+    failures += expect(failure < 0);
+    engine.queue.ring.ring_fd = descriptor;
+    engine.queue.ring.enter_ring_fd = enter_descriptor;
+    engine.queue.fault = failure;
+    engine.stop();
+
+    failures += expect(!engine.is_open() && engine.queue.file_registration == uring_registration_t::unregistered_k &&
+                       engine.queue.buffer_registration == uring_registration_t::unregistered_k);
+    failures += expect(!engine.queue.provided.receive_ring && engine.queue.storage);
+    failures += expect(!engine.has_kernel_work());
+    failures += expect(recv(sockets.peer, &received, sizeof(received), 0) == 0);
+    return failures;
+}
+
+template <typename engine_type_>
+std::size_t test_streamed_transmit() {
+    engine_type_ engine;
+    auto status = engine.open(1, 1);
+    if (status == ucall_status_unsupported_k)
+        return report("test_streamed_transmit", "the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
+    auto owned = engine.import_socket(sockets.client);
+    require(failures, owned >= 0);
+    sockets.client = -1;
+    require(failures, nonblocking(sockets.peer) == ucall_status_success_k);
+    std::vector<byte_t> payload(65536, byte_t {85}), received(payload.size());
+    std::size_t sent {}, read {};
+    bool pending {};
+    io_request_t sending {.operation = io_operation_t::send_k, .descriptor = owned};
+    auto deadline = deadline_after(1000000);
+    while (sent != payload.size() || read != payload.size()) {
+        if (!pending && sent != payload.size()) {
+            sending.data = payload.data() + sent;
+            sending.length = payload.size() - sent;
+            sending.deadline = deadline;
+            engine.submit(sending);
+            pending = true;
+        }
+        io_completion_t completed {};
+        if (engine.poll(span<io_completion_t> {&completed, &completed + 1}, io_wait_t::nonblocking_k)) {
+            require(failures, completed.request == &sending && completed.result > 0, "sending ended with {}",
+                    completed.result);
+            sent += static_cast<std::size_t>(completed.result);
+            pending = false;
+        }
+        if (read != received.size()) {
+            auto count = recv(sockets.peer, received.data() + read, received.size() - read, 0);
+            if (count > 0) read += static_cast<std::size_t>(count);
+            else require(failures, count < 0 && io_pending(-errno), "receiving ended with {}", count);
+        }
+        require(failures, monotonic_ns() < deadline, "{} sent and {} read of {}", sent, read, payload.size());
+    }
+    failures += expect(received == payload);
+    failures += expect(engine.close_socket(owned) == 0);
+    return failures;
+}
+
+/** A receive on @p handle answering @p expected, leaving its slice lent; @p completed names it. */
+template <typename engine_type_>
+std::size_t expect_slice(engine_type_& engine, io_request_t& receiving, io_completion_t& completed,
+                         span<byte_t const> expected) {
+    engine.submit(receiving);
+    require(0, engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1);
+    std::size_t failures = expect(completed.request == &receiving && completed.result > 0 && completed.lease,
+                                  "receiving ended with {}", completed.result);
+    return failures + expect(completed.result > 0 && static_cast<std::size_t>(completed.result) == expected.size() &&
+                             std::memcmp(completed.data, expected.data(), expected.size()) == 0);
+}
+
+/** An end of stream names the buffer being filled and consumes none of it, so the next socket's
+ *  bytes land right behind the last ones. */
+template <typename engine_type_>
+std::size_t test_end_of_stream() {
+    engine_type_ engine;
+    auto status = engine.open(8, 8);
+    if (status == ucall_status_unsupported_k) return report("test_end_of_stream", "the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t leaving = loopback_pair(), staying = loopback_pair();
+    require(failures, leaving.connected() && staying.connected());
+    auto const first = engine.import_socket(std::exchange(leaving.client, -1));
+    auto const second = engine.import_socket(std::exchange(staying.client, -1));
+    require(failures, first >= 0 && second >= 0);
+    auto& provided = engine.queue.provided;
+    byte_t const bytes[4] {byte_t {1}, byte_t {2}, byte_t {3}, byte_t {4}};
+    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = first};
+    io_request_t other {.operation = io_operation_t::receive_k, .descriptor = second};
+    io_completion_t completed {};
+    require(failures, send_all(leaving.peer, bytes));
+    failures += expect_slice(engine, receiving, completed, bytes);
+    byte_t const* const landed = completed.data;
+    engine.release(completed);
+    unsigned const before = provided.available_buffers;
+
+    require(failures, ::shutdown(leaving.peer, SHUT_WR) == 0);
+    engine.submit(receiving);
+    require(failures, engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1);
+    failures += expect(completed.result == 0 && !completed.lease && !completed.data, "the end answered {}",
+                       completed.result);
+    engine.release(completed);
+    failures += expect(provided.available_buffers == before && provided.newest_buffer != engine.absent_k &&
+                           provided.records[provided.newest_buffer].consumed_bytes == sizeof(bytes),
+                       "{} buffers left of {}", provided.available_buffers, before);
+
+    require(failures, send_all(staying.peer, bytes));
+    failures += expect_slice(engine, other, completed, bytes);
+    failures += expect(completed.data == landed + sizeof(bytes));
+    engine.release(completed);
+    failures += expect(engine.close_socket(first) == 0 && engine.close_socket(second) == 0);
+    return failures;
+}
+
+/** Two sockets take turns in one buffer, and neither slice moves while the other is lent. */
+template <typename engine_type_>
+std::size_t test_sockets_interleave() {
+    engine_type_ engine;
+    auto status = engine.open(8, 8);
+    if (status == ucall_status_unsupported_k)
+        return report("test_sockets_interleave", "the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t left = loopback_pair(), right = loopback_pair();
+    require(failures, left.connected() && right.connected());
+    auto const first = engine.import_socket(std::exchange(left.client, -1));
+    auto const second = engine.import_socket(std::exchange(right.client, -1));
+    require(failures, first >= 0 && second >= 0);
+    byte_t const left_bytes[3] {byte_t {11}, byte_t {12}, byte_t {13}};
+    byte_t const right_bytes[5] {byte_t {21}, byte_t {22}, byte_t {23}, byte_t {24}, byte_t {25}};
+    io_request_t left_receive {.operation = io_operation_t::receive_k, .descriptor = first};
+    io_request_t right_receive {.operation = io_operation_t::receive_k, .descriptor = second};
+    io_completion_t lent[4] {};
+    require(failures, send_all(left.peer, left_bytes));
+    failures += expect_slice(engine, left_receive, lent[0], left_bytes);
+    require(failures, send_all(right.peer, right_bytes));
+    failures += expect_slice(engine, right_receive, lent[1], right_bytes);
+    require(failures, send_all(left.peer, left_bytes));
+    failures += expect_slice(engine, left_receive, lent[2], left_bytes);
+    require(failures, send_all(right.peer, right_bytes));
+    failures += expect_slice(engine, right_receive, lent[3], right_bytes);
+    failures += expect(lent[1].data == lent[0].data + sizeof(left_bytes) &&
+                       lent[2].data == lent[1].data + sizeof(right_bytes) &&
+                       lent[3].data == lent[2].data + sizeof(left_bytes));
+    failures += expect(std::memcmp(lent[0].data, left_bytes, sizeof(left_bytes)) == 0 &&
+                       std::memcmp(lent[1].data, right_bytes, sizeof(right_bytes)) == 0);
+    auto& provided = engine.queue.provided;
+    auto const& record = provided.records[provided.newest_buffer];
+    failures += expect(record.leased_slices == 4 &&
+                       record.consumed_bytes == 2 * sizeof(left_bytes) + 2 * sizeof(right_bytes));
+    for (auto const& completed : lent) engine.release(completed);
+    failures += expect(!record.leased_slices && provided.available_buffers == provided.provided_buffers);
+    failures += expect(engine.close_socket(first) == 0 && engine.close_socket(second) == 0);
+    return failures;
+}
+
+/** Opens beneath a directory with @c OPENAT2 for unbuffered reads, refusing escapes; switches a
+ *  buffered descriptor, twice; then reads aligned extents, a short tail, a registered buffer
+ *  through @c READ_FIXED, and vectors that @c READV or @c READV_FIXED scatter into. */
+template <typename engine_type_>
+std::size_t test_registered_direct_files() {
+    direct_directory_t directory;
+    if (!directory.ready()) return report("test_registered_direct_files", directory.reason.c_str());
+    engine_type_ engine;
+    auto status = engine.open(8, 8);
+    if (status == ucall_status_unsupported_k)
+        return report("test_registered_direct_files", "the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    std::size_t const alignment = directory.alignment;
+    std::string content(64 * alignment + 123, '\0');
+    for (std::size_t i = 0; i != content.size(); ++i) content[i] = static_cast<char>(file_byte(i));
+    require(failures, directory.write("data.bin", content) && mkfifo(directory.name("fifo").c_str(), 0600) == 0 &&
+                          symlink("/etc/hostname", directory.name("absolute").c_str()) == 0 &&
+                          mkdir(directory.name("subdir").c_str(), 0700) == 0);
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected());
+    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    require(failures, socket >= 0);
+    auto const deadline = deadline_after(5000000);
+    io_completion_t completed[1] {};
+    auto await = [&](io_request_t& request) {
+        engine.submit(request);
+        while (monotonic_ns() < deadline)
+            if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+                return completed[0].result;
+        return descriptor_t {-ETIMEDOUT};
+    };
+
+    int file = -1;
+    for (std::string_view path : {"data.bin", "fifo", "subdir", "absolute", "../data.bin", "missing"}) {
+        std::string terminated {path};
+        io_request_t opening {.operation = io_operation_t::file_open_k,
+                              .descriptor = socket,
+                              .data = reinterpret_cast<byte_t*>(terminated.data()),
+                              .length = terminated.size() + 1,
+                              .file = {0, directory.descriptor}};
+        descriptor_t const opened = await(opening);
+        if (path == "data.bin") {
+            file_geometry_t const geometry = opened >= 0 ? direct_alignment_of(opened) : file_geometry_t {};
+            std::size_t const measured = fu::max_of(geometry.memory_alignment, geometry.offset_alignment);
+            failures += expect(
+                opened >= 0 && !geometry.error && geometry.size == content.size() && measured == alignment,
+                "{} opened as {} measuring {} bytes aligned to {}", path, opened, geometry.size, measured);
+            file = static_cast<int>(opened);
+        }
+        else {
+            failures += expect(opened < 0, "{} opened as {}", path, opened);
+            if (opened >= 0) ::close(opened);
+        }
+    }
+    require(failures, file >= 0);
+
+    native_file_t buffered = ::open(directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    failures += expect(file_direct_switch(buffered) == ucall_status_success_k &&
+                           file_direct_switch(buffered) == ucall_status_success_k &&
+                           (fcntl(buffered, F_GETFL) & (O_DIRECT | O_NONBLOCK)) == O_DIRECT,
+                       "the switch left flags {:#x}", fcntl(buffered, F_GETFL));
+    ::close(buffered);
+
+    aligned_bytes_t window {4 * alignment};
+    io_request_t reading {.operation = io_operation_t::file_read_k,
+                          .descriptor = socket,
+                          .data = window.data,
+                          .length = 2 * alignment,
+                          .file = {3 * alignment, file}};
+    failures += expect(await(reading) == static_cast<descriptor_t>(2 * alignment) &&
+                       std::memcmp(window.data, content.data() + 3 * alignment, 2 * alignment) == 0);
+    reading.file.offset = 64 * alignment;
+    reading.length = alignment;
+    failures += expect(await(reading) == 123 && std::memcmp(window.data, content.data() + 64 * alignment, 123) == 0);
+
+    memory_registration_t const registration = engine.register_memory(window.bytes());
+    failures += expect(registration.pinning() == range_pinning_t::pinned_k && registration.index != io_unregistered_k,
+                       "pinning {} bytes was refused", window.size);
+    reading.registered_memory = registration.index;
+    reading.file.offset = 7 * alignment;
+    reading.length = 3 * alignment;
+    failures += expect(await(reading) == static_cast<descriptor_t>(3 * alignment) &&
+                       std::memcmp(window.data, content.data() + 7 * alignment, 3 * alignment) == 0);
+
+    std::memset(window.data, 0, window.size);
+    io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
+    io_request_t scattering {.operation = io_operation_t::file_read_vectors_k,
+                             .registered_memory = registration.index,
+                             .descriptor = socket,
+                             .data = reinterpret_cast<byte_t*>(vectors),
+                             .length = 2,
+                             .file = {5 * alignment, file}};
+    failures += expect(await(scattering) == static_cast<descriptor_t>(2 * alignment) &&
+                       std::memcmp(window.data, content.data() + 5 * alignment, alignment) == 0 &&
+                       std::memcmp(window.data + 2 * alignment, content.data() + 6 * alignment, alignment) == 0);
+    failures += expect(engine.statistics.file_reads_asynchronous == 4 && !engine.statistics.file_reads_blocking);
+    ::close(file);
+    failures += expect(engine.close_socket(socket) == 0);
+    return failures;
+}
+
+/** A zero-copy send completes once the socket took its bytes, and its release only once the
+ *  kernel's notification arrived; loopback copies, so that notification demotes the socket, whose
+ *  next zero-copy send copies and whose next release completes at once. */
+template <typename engine_type_>
+std::size_t test_zero_copy_sends() {
+    engine_type_ engine;
+    auto status = engine.open(8, 8);
+    if (status == ucall_status_unsupported_k) return report("test_zero_copy_sends", "the kernel lacks this generation");
+    require(0, status == ucall_status_success_k, "{}", ucall_status_name(status));
+    std::size_t failures = 0;
+    loopback_pair_t sockets = loopback_pair();
+    require(failures, sockets.connected() && nonblocking(sockets.peer) == ucall_status_success_k);
+    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    require(failures, socket >= 0);
+    aligned_bytes_t window {16384};
+    for (std::size_t i = 0; i != window.size; ++i) window.data[i] = file_byte(i);
+    memory_registration_t const registration = engine.register_memory(window.bytes());
+    auto const deadline = deadline_after(5000000);
+    io_completion_t completed[1] {};
+    auto finish = [&](io_request_t& request) {
+        while (monotonic_ns() < deadline)
+            if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+                return completed[0].result;
+        return descriptor_t {-ETIMEDOUT};
+    };
+    auto await = [&](io_request_t& request) {
+        engine.submit(request);
+        return finish(request);
+    };
+    std::vector<byte_t> received;
+    auto drain = [&](std::size_t expected) {
+        byte_t buffer[16384];
+        while (received.size() < expected && monotonic_ns() < deadline)
+            if (ssize_t const length = recv(sockets.peer, buffer, sizeof(buffer), 0); length > 0)
+                received.insert(received.end(), buffer, buffer + length);
+        return received.size() == expected;
+    };
+
+    engine.reserve_releases(1);
+    io_request_t release {.operation = io_operation_t::zero_copy_release_k};
+    io_request_t sending {.operation = io_operation_t::send_zero_copy_k,
+                          .registered_memory = registration.index,
+                          .descriptor = socket,
+                          .data = window.data,
+                          .length = window.size,
+                          .release_request = &release};
+    descriptor_t const sent = await(sending);
+    failures += expect(sent > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
+                       engine.statistics.zero_copy_sends);
+    engine.submit(release);
+    failures += expect(engine.cancel(release) == ucall_status_success_k);
+    failures += expect(finish(release) == 0 && engine.statistics.zero_copy_fallbacks == 1,
+                       "the release completed with {} fallbacks counted", engine.statistics.zero_copy_fallbacks);
+    failures += expect(drain(static_cast<std::size_t>(sent)) &&
+                       std::memcmp(received.data(), window.data, received.size()) == 0);
+
+    received.clear();
+    descriptor_t const copied = await(sending);
+    failures += expect(copied > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends",
+                       copied, engine.statistics.zero_copy_sends);
+    failures += expect(await(release) == 0);
+    failures += expect(drain(static_cast<std::size_t>(copied)) &&
+                       std::memcmp(received.data(), window.data, received.size()) == 0);
+    failures += expect(engine.close_socket(socket) == 0);
+    return failures;
+}
+
+#pragma endregion Rings
+#endif // UCALL_WITH_LINUX_URING
+
+#endif // UCALL_OS_POSIX_
+
+#pragma region Class Sweep
+
+/** @p engine_type_ rebound to the atomic reference and row kit of @p cpu_class_. */
+template <cpu_class_t cpu_class_, typename engine_type_>
+using rebound_engine_t = typename engine_type_::template rebind<st::default_allocator<byte_t>,
+                                                                atomic_ref_for_cpu_class<cpu_class_>::template type,
+                                                                typename row_kit_for_cpu_class<cpu_class_>::type>;
+
+/** What @p visit answers for @p engine_type_ rebound to the class @p cpu_class names. */
+template <typename engine_type_, typename visit_type_>
+std::size_t visit_rebound(ucall_cpu_class_t cpu_class, visit_type_&& visit) {
+    switch (cpu_class) {
+    case ucall_cpu_class_intel_haswell_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_haswell_k, engine_type_>>();
+    case ucall_cpu_class_intel_skylake_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_skylake_k, engine_type_>>();
+    case ucall_cpu_class_intel_icelake_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_icelake_k, engine_type_>>();
+    case ucall_cpu_class_intel_alder_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_alder_k, engine_type_>>();
+    case ucall_cpu_class_aws_g2_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::aws_g2_k, engine_type_>>();
+    case ucall_cpu_class_aws_g5_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::aws_g5_k, engine_type_>>();
+    case ucall_cpu_class_alibaba_c930_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::alibaba_c930_k, engine_type_>>();
+    case ucall_cpu_class_ibm_power10_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::ibm_power10_k, engine_type_>>();
+    case ucall_cpu_class_monoversioned_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::monoversioned_k, engine_type_>>();
+    default: return visit.template operator()<rebound_engine_t<cpu_class_t::serial_k, engine_type_>>();
+    }
+}
+
+/**
+ *  @brief One verdict per admitted CPU class, named like "io linux-uring618 aws-g2": @p cases over
+ *      @p engine_type_ rebound to that class, or a skip when this host refuses the engine.
+ *
+ *  @p cases is a generic lambda templated on the rebound engine and taking the cell's generator.
+ */
+template <typename engine_type_, typename cases_type_>
+std::size_t check_engine(ucall_io_backend_t backend, settings_t const& settings, cases_type_&& cases) {
+    if (settings.backend != ucall_io_backend_automatic_k && settings.backend != backend) return 0;
+    std::size_t failures_count = 0;
+    for (ucall_cpu_class_t const cpu_class : admitted_classes()) {
+        if (settings.cpu_class != ucall_cpu_class_unknown_k && settings.cpu_class != cpu_class) continue;
+        sz::string_t const name = formatted("io {} {}", ucall_io_backend_name(backend),
+                                            ucall_cpu_class_name(cpu_class));
+        if (!settings.filter.selects(name)) continue;
+        if (engine_type_ {}.open(2, 2) != ucall_status_success_k) {
+            failures_count += report(name.c_str(), "engine refused by this host");
+            continue;
+        }
+        random_generator_t generator {stream_key(settings.seed, name)};
+        failures_count += report(name.c_str(), keeping_descriptors([&] {
+                                     return visit_rebound<engine_type_>(cpu_class, [&]<typename rebound_type_>() {
+                                         return cases.template operator()<rebound_type_>(generator);
+                                     });
+                                 }));
+    }
+    return failures_count;
+}
+
+#pragma endregion Class Sweep
+
+std::size_t check_posix_engine(settings_t const& settings);
+std::size_t check_linux_epollaio_engine(settings_t const& settings);
+std::size_t check_linux_uring612_engine(settings_t const& settings);
+std::size_t check_linux_uring618_engine(settings_t const& settings);
+std::size_t check_bsd_kqueue_engine(settings_t const& settings);
+
+} // namespace unum::ucall::test::io

@@ -1,5 +1,5 @@
 /**
- *  @file test/routes.cpp
+ *  @file test/http/routes.cpp
  *  @author Ash Vardanian
  *  @date November 13, 2025
  *  @brief Tests for the segment-level URI routing trie in @c routes.hpp.
@@ -9,26 +9,19 @@
  */
 #include <cstdint> // `std::uintptr_t`
 
+#include <string>      // `std::string`
 #include <string_view> // `std::string_view`
 
+#include <fmt/ranges.h> // formatting the drawn routes and paths
+
 #include "ucall/http/routes.hpp" // `route_trie_t`, `extract_path_component`
-#include "harness.hpp"           // `expect`, `require`, `run_test`, `scale_iterations`
-
-using namespace unum::ucall;
-using namespace unum::ucall::http;
-using namespace unum::ucall::test;
-
-#pragma region Fixtures
-
-/** Every verb the router distinguishes, so a sweep is a loop rather than seven copies. */
-static constexpr ucall_verb_t routed_verbs_k[] = {ucall_verb_get_k,    ucall_verb_post_k,  ucall_verb_put_k,
-                                                  ucall_verb_delete_k, ucall_verb_patch_k, ucall_verb_head_k,
-                                                  ucall_verb_options_k};
+#include "harness.hpp"           // `expect`, `require`, `scale_iterations`
+#include "properties.hpp"        // `check_route_match`
 
 /**
- *  @brief Lets `{}` name a verb rather than print its ordinal.
+ *  @brief Lets <tt>{}</tt> name a verb rather than print its ordinal.
  *
- *  `ucall_verb_t` is a C enum at global scope, so the overload lives here for ADL to find.
+ *  @c ucall_verb_t is a C enum at global scope, so the overload lives here for ADL to find.
  */
 [[nodiscard]] inline auto format_as(ucall_verb_t verb) noexcept {
     switch (verb) {
@@ -44,16 +37,26 @@ static constexpr ucall_verb_t routed_verbs_k[] = {ucall_verb_get_k,    ucall_ver
     }
 }
 
+namespace unum::ucall::test::http {
+
+using namespace unum::ucall::http;
+
+#pragma region Fixtures
+
+/** Every verb the router distinguishes, so a sweep is a loop rather than seven copies. */
+static constexpr ucall_verb_t routed_verbs_k[] = {ucall_verb_get_k,    ucall_verb_post_k,  ucall_verb_put_k,
+                                                  ucall_verb_delete_k, ucall_verb_patch_k, ucall_verb_head_k,
+                                                  ucall_verb_options_k};
+
 /** A stand-in endpoint, distinguishable by the number it was made from. */
 [[nodiscard]] static void* endpoint_numbered(std::uintptr_t number) noexcept { return reinterpret_cast<void*>(number); }
 
-/** One step's trie, announced as it starts and counting into the failures of its case. */
+/** One step's trie, named in its allocation failure and counting into the failures of its case. */
 struct routing_case_t {
-    route_trie_t trie {};
+    route_trie_t trie {st::default_allocator<byte_t> {}};
     std::size_t& failures;
 
     routing_case_t(std::size_t& case_failures, char const* label) : failures(case_failures) {
-        announce("{}", label);
         failures += expect(trie.init() == ucall_status_success_k, "the trie for `{}` could not allocate", label);
     }
 
@@ -110,7 +113,7 @@ struct path_arena_t {
 
 #pragma region Known Answers
 
-case_result_t test_routes_unit() {
+static std::size_t test_routes() {
     std::size_t failures = 0;
     void* const first = endpoint_numbered(1);
     void* const second = endpoint_numbered(2);
@@ -302,7 +305,7 @@ case_result_t test_routes_unit() {
 
 #pragma region Hostile Input And Sweeps
 
-case_result_t test_routes_safety() {
+static std::size_t test_routes_hostile() {
     std::size_t failures = 0;
     void* const first = endpoint_numbered(1);
     void* const second = endpoint_numbered(2);
@@ -416,7 +419,7 @@ case_result_t test_routes_safety() {
  *  The pools chain rather than reallocate, so a sweep - not one insertion past the boundary - is
  *  what proves every earlier route kept its address.
  */
-case_result_t test_routes_stress() {
+static std::size_t test_routes_sweep() {
     std::size_t failures = 0;
     routing_case_t routes(failures, "pools_grow_and_keep_every_earlier_route");
     std::size_t const routes_count = scale_iterations(500);
@@ -440,59 +443,52 @@ case_result_t test_routes_stress() {
 
 #pragma endregion Hostile Input And Sweeps
 
-#pragma region Percent Codec
+#pragma region Reference Matcher
 
-/** Path and query decoding through the C verb, in place and into a separate buffer. */
-case_result_t test_percent_codec() {
+/** Joins @p count segments drawn from @p vocabulary into a path that starts with a slash. */
+template <std::size_t size_>
+static std::string draw_path(std::string_view const (&vocabulary)[size_], std::size_t count,
+                             random_generator_t& generator) {
+    std::string path;
+    for (std::size_t index = 0; index != count; ++index) path += fmt::format("/{}", vocabulary[generator.below(size_)]);
+    return path.empty() ? "/" : path;
+}
+
+static std::size_t test_route_match(random_generator_t& generator) {
+    static constexpr std::string_view template_segments_k[] {"a", "b", "", "{x}", "{y}", "{*rest}"};
+    static constexpr std::string_view path_segments_k[] {"a", "b", "", "c"};
+    static constexpr ucall_verb_t verbs_k[] {ucall_verb_get_k, ucall_verb_post_k, ucall_verb_head_k, ucall_verb_any_k};
     std::size_t failures = 0;
-    struct decoding_t {
-        ucall_status_t status;
-        std::string_view text;
-    };
-    char buffer[64] {};
-    auto decode = [&](std::string_view encoded, ucall_percent_mode_t mode) noexcept {
-        std::size_t length = 0;
-        ucall_status_t const status = ucall_decode_percent(bytes_view(encoded), reinterpret_cast<ucall_byte_t*>(buffer),
-                                                           &length, mode);
-        return decoding_t {status, {buffer, status == ucall_status_success_k ? length : 0}};
-    };
-    auto decodes = [&](std::string_view encoded, ucall_percent_mode_t mode, std::string_view expected) noexcept {
-        decoding_t const decoded = decode(encoded, mode);
-        return expect(decoded.status == ucall_status_success_k && decoded.text == expected,
-                      "'{}' decoded to '{}' with status {}, not '{}'", encoded, decoded.text,
-                      ucall_status_name(decoded.status), expected);
-    };
-    failures += decodes("a+b%20c", ucall_percent_path_k, "a+b c");
-    failures += decodes("a+b%20c", ucall_percent_query_k, "a b c");
-    failures += decodes("%2B+%2b", ucall_percent_query_k, "+ +");
-    failures += decodes("%E2%9c%93", ucall_percent_path_k, "\xE2\x9C\x93");
-    failures += decodes("", ucall_percent_query_k, "");
-    for (std::string_view malformed : {"100%", "%4", "%zz", "a%+20"})
-        for (ucall_percent_mode_t mode : {ucall_percent_path_k, ucall_percent_query_k})
-            failures += expect(decode(malformed, mode).status == ucall_status_invalid_argument_k,
-                               "'{}' decoded although its escape is malformed", malformed);
-
-    char in_place[] = "name=caf%C3%A9+au+lait&x=%2541";
-    std::size_t length = 0;
-    ucall_byte_t* const bytes = reinterpret_cast<ucall_byte_t*>(in_place);
-    failures += expect(ucall_decode_percent({bytes, sizeof(in_place) - 1}, bytes, &length, ucall_percent_query_k) ==
-                               ucall_status_success_k &&
-                           std::string_view(in_place, length) == "name=caf\xC3\xA9 au lait&x=%41",
-                       "decoding in place gave '{}'", std::string_view(in_place, length));
+    for (std::size_t iteration = 0; iteration != scale_iterations(5000); ++iteration) {
+        std::vector<std::string> templates, paths;
+        std::vector<ucall_verb_t> verbs;
+        for (std::size_t count = generator.below(9); count; --count) {
+            templates.push_back(draw_path(template_segments_k, generator.below(4), generator));
+            verbs.push_back(verbs_k[generator.below(std::size(verbs_k))]);
+        }
+        for (std::size_t count = 1 + generator.below(8); count; --count)
+            paths.push_back(draw_path(path_segments_k, generator.below(5), generator) +
+                            (generator.below(4) ? "" : "?q"));
+        std::vector<std::string_view> template_views {templates.begin(), templates.end()},
+            path_views {paths.begin(), paths.end()};
+        std::size_t const found = check_route_match(template_views, verbs, path_views);
+        failures += expect(!found, "{} disagreements routing {} over {}", found, paths, templates);
+        if (found) break;
+    }
     return failures;
 }
 
-#pragma endregion Percent Codec
+#pragma endregion Reference Matcher
 
-int main(int, char** argv) {
-    install_test_signal_handlers();
-    fmt::print("Hi, dear tester! You look nice today!\n");
-    configure_tests();
-
-    suite_totals_t totals {.program = argv[0]};
-    run_test(totals, "test_routes_unit", test_routes_unit);
-    run_test(totals, "test_routes_safety", test_routes_safety);
-    run_test(totals, "test_routes_stress", test_routes_stress);
-    run_test(totals, "test_percent_codec", test_percent_codec);
-    return suite_exit_code(totals);
+std::size_t check_routes(settings_t const& settings) {
+    if (!settings.filter.selects("http routes")) return 0;
+    random_generator_t generator {stream_key(settings.seed, "http routes")};
+    std::size_t failures = 0;
+    failures += test_routes();
+    failures += test_routes_hostile();
+    failures += test_routes_sweep();
+    failures += test_route_match(generator);
+    return report("http routes", failures);
 }
+
+} // namespace unum::ucall::test::http

@@ -1,8 +1,9 @@
 /**
- *  @file test/x25519.cpp
+ *  @file test/tunnel/crypto.cpp
  *  @author Ash Vardanian
  *  @date August 4, 2026
- *  @brief Tests for the X25519 kits against RFC 7748 §5.2 and Project Wycheproof vectors.
+ *  @brief HMAC, HKDF and entropy vectors, and the X25519 kits against
+ *      RFC 7748 §5.2 and Project Wycheproof vectors.
  *
  *  Vectors come verbatim from RFC 7748 and from Google's Project Wycheproof (`x25519_test.json`,
  *  `XdhComp` group, curve25519); the low-order-point cases are that suite's, not hand-derived.
@@ -14,13 +15,11 @@
 #include <cstring> // `std::memcpy`
 
 #include "crypto_x25519_radix51.hpp" // `field_radix51`, `serial_words`, `scalar_multiply_through`
-#include "harness.hpp"               // `expect`, `run_test`, `from_hex`
+#include "secure_tunnel.hpp"         // `crypto_t`, `hmac_of`, `run_of`, `from_hex`
 
 #include "ucall/tunnel/crypto.hpp" // `serial_x25519_kit_t`, `haswell_x25519_kit_t`, `neon_x25519_kit_t`
 
-using namespace unum::ucall;
-using namespace unum::ucall::tunnel;
-using namespace unum::ucall::test;
+namespace unum::ucall::test::tunnel {
 
 #pragma region Fixtures
 
@@ -159,12 +158,11 @@ static x25519_backend_t const& x25519_reference_k = x25519_backends_k[0];
 
 #pragma region Known Answers
 
-case_result_t test_x25519_unit() {
+static std::size_t test_x25519() {
     std::size_t failures = 0;
 
     // RFC 7748 §5.2: k = u = 9, then k = X25519(k, u). The trip counts are the specification's
     // own, so they are fixed rather than scaled.
-    announce("rfc7748_iterated");
     byte_t scalar[x25519_key_size_k] {}, point[x25519_key_size_k] {};
     scalar[0] = byte_t {9}, point[0] = byte_t {9};
 
@@ -181,7 +179,6 @@ case_result_t test_x25519_unit() {
     failures += expect_hex(scalar, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
 
     // RFC 7748 vector 1 and Wycheproof tcId=100 hold the same key, before and after clamping.
-    announce("clamping_is_idempotent");
     byte_t raw_scalar[x25519_key_size_k], clamped_scalar[x25519_key_size_k], shared_point[x25519_key_size_k];
     failures += expect(from_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
                                 {raw_scalar, raw_scalar + x25519_key_size_k}));
@@ -196,7 +193,6 @@ case_result_t test_x25519_unit() {
     failures += expect_bytes(from_raw, from_clamped);
     failures += expect_hex(from_raw, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
 
-    announce("derive_public_matches_base_point");
     byte_t nine[x25519_key_size_k] {};
     nine[0] = byte_t {9};
     byte_t derived[x25519_key_size_k];
@@ -215,12 +211,11 @@ case_result_t test_x25519_unit() {
  *  The chain matters separately from the vectors: a carry bug a single multiplication hides
  *  compounds once each result feeds the next.
  */
-case_result_t test_x25519_all() {
+static std::size_t test_x25519_kits() {
     std::size_t failures = 0;
 
     for (x25519_backend_t const& backend : x25519_backends_k) {
         if (!runnable_here(backend)) continue;
-        announce("{}", backend.name);
         for (x25519_vector_t const& vector : x25519_vectors_k) {
             decoded_vector_t const decoded(vector, failures);
             byte_t produced[x25519_key_size_k];
@@ -236,7 +231,6 @@ case_result_t test_x25519_all() {
     // backend walks the same dependent chain and must match the reference at every step.
     for (x25519_backend_t const& backend : x25519_backends_k) {
         if (!runnable_here(backend) || &backend == &x25519_reference_k) continue;
-        announce("{} along an iterated chain", backend.name);
 
         byte_t scalar[x25519_key_size_k] {}, point[x25519_key_size_k] {};
         scalar[0] = byte_t {9}, point[0] = byte_t {9};
@@ -257,16 +251,126 @@ case_result_t test_x25519_all() {
 
 #pragma endregion Kit Differential
 
-int main(int, char** argv) {
-    install_test_signal_handlers();
-    fmt::print("Hi, dear tester! You look nice today!\n");
-    for (x25519_backend_t const& backend : x25519_backends_k)
-        fmt::print("  x25519 {:<8} built={} runnable={}\n", backend.name, backend.multiply != nullptr,
-                   runnable_here(backend));
-    configure_tests();
+#pragma region Primitives
 
-    suite_totals_t totals {.program = argv[0]};
-    run_test(totals, "test_x25519_unit", test_x25519_unit);
-    run_test(totals, "test_x25519_all", test_x25519_all);
-    return suite_exit_code(totals);
+static std::size_t test_hmac() {
+    std::size_t failures = 0;
+    byte_t key_storage[131];
+    byte_t data_storage[50];
+    byte_t digest[crypto_t::hash_size_k];
+
+    // RFC 4231 §4.2-§4.7, byte for byte: the named reproducer for `-fno-strict-aliasing`, so a
+    // digest that drifts here is a miscompile rather than a redesign.
+    failures += expect_hex(
+        hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), byte_span("Hi There"), digest),
+        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+
+    failures += expect_hex(hmac_of(byte_span("Jefe"), byte_span("what do ya want for nothing?"), digest),
+                           "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+
+    failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0xaa}),
+                                   run_of({data_storage, data_storage + 50}, byte_t {0xdd}), digest),
+                           "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+
+    failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
+                                   byte_span("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
+                           "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+
+    span<byte_t const> const cached_key = run_of({key_storage, key_storage + 40}, byte_t {0x5a});
+    crypto_t::hmac_sha256_t cached;
+    cached.reset(cached_key);
+    for (char const* message : {"", "a", "the quick brown fox", "0123456789012345678901234567890123456789"}) {
+        span<byte_t const> const data = byte_span(message);
+        byte_t reused[crypto_t::hash_size_k], fresh[crypto_t::hash_size_k];
+        cached.compute(data, {}, reused);
+        crypto_t::hmac_sha256(cached_key, data, fresh);
+        failures += expect_bytes(reused, fresh);
+    }
+
+    byte_t joined[17];
+    std::memcpy(joined, "chaining-material", 17);
+    crypto_t::hmac_sha256_t split_hmac;
+    split_hmac.reset(run_of({key_storage, key_storage + 32}, byte_t {0x0b}));
+    byte_t split[crypto_t::hash_size_k];
+    split_hmac.compute(byte_span("chaining"), byte_span("-material"), split);
+    failures += expect_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
+    return failures;
 }
+
+static std::size_t test_hkdf() {
+    std::size_t failures = 0;
+    byte_t digest[crypto_t::hash_size_k];
+    byte_t material_storage[22];
+    span<byte_t const> const material = run_of({material_storage, material_storage + 22}, byte_t {0x0b});
+
+    // Noise's HKDF is RFC 5869 with an empty info string, so the published key applies unchanged.
+    byte_t const salt_storage[] = {byte_t {0x00}, byte_t {0x01}, byte_t {0x02}, byte_t {0x03}, byte_t {0x04},
+                                   byte_t {0x05}, byte_t {0x06}, byte_t {0x07}, byte_t {0x08}, byte_t {0x09},
+                                   byte_t {0x0a}, byte_t {0x0b}, byte_t {0x0c}};
+    failures += expect_hex(hmac_of(salt_storage, material, digest),
+                           "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+
+    // With an empty info string, RFC 5869's T(1) reduces to HMAC(PRK, 0x01).
+    byte_t chaining_key[crypto_t::hash_size_k];
+    for (std::size_t index = 0; index != crypto_t::hash_size_k; ++index)
+        chaining_key[index] = static_cast<byte_t>(index);
+
+    byte_t outputs[3][crypto_t::hash_size_k];
+    crypto_t::hkdf_sha256(chaining_key, material, 2, outputs);
+
+    byte_t pseudo_random_key[crypto_t::hash_size_k];
+    crypto_t::hmac_sha256(chaining_key, material, pseudo_random_key);
+    byte_t const one = byte_t {0x01};
+    byte_t expected[crypto_t::hash_size_k];
+    crypto_t::hmac_sha256(pseudo_random_key, {&one, &one + 1}, expected);
+    failures += expect_bytes(outputs[0], expected);
+
+    byte_t empty_chaining_key[crypto_t::hash_size_k] {};
+    byte_t chained[3][crypto_t::hash_size_k];
+    crypto_t::hkdf_sha256(empty_chaining_key, {}, 2, chained);
+
+    crypto_t::hmac_sha256(empty_chaining_key, {}, pseudo_random_key);
+    byte_t const two = byte_t {0x02};
+    crypto_t::hmac_sha256_t chaining_hmac;
+    chaining_hmac.reset(pseudo_random_key);
+    chaining_hmac.compute(chained[0], {&two, &two + 1}, expected);
+    failures += expect_bytes(chained[1], expected);
+    failures += expect(!bytes_equal(chained[0], chained[1]));
+
+    byte_t two_outputs[3][crypto_t::hash_size_k] {};
+    byte_t three_outputs[3][crypto_t::hash_size_k] {};
+    crypto_t::hkdf_sha256(empty_chaining_key, {}, 2, two_outputs);
+    crypto_t::hkdf_sha256(empty_chaining_key, {}, 3, three_outputs);
+    failures += expect_bytes(two_outputs[0], three_outputs[0]);
+    failures += expect_bytes(two_outputs[1], three_outputs[1]);
+    failures += expect(all_zero(two_outputs[2]));
+    failures += expect(!all_zero(three_outputs[2]));
+    return failures;
+}
+
+static std::size_t test_entropy() {
+    std::size_t failures = 0;
+    // Not a statistical test - proof the platform call is wired, since zeros here would silently
+    // destroy every ephemeral key.
+    byte_t first[32] {}, second[32] {};
+    failures += expect(crypto_t::secure_random_bytes(first) == secure_tunnel_fault_t::none_k);
+    failures += expect(crypto_t::secure_random_bytes(second) == secure_tunnel_fault_t::none_k);
+    failures += expect(!all_zero(first));
+    failures += expect(!bytes_equal(first, second));
+    return failures;
+}
+
+#pragma endregion Primitives
+
+std::size_t check_crypto(settings_t const& settings) {
+    if (!settings.filter.selects("tunnel crypto")) return 0;
+    std::size_t failures = 0;
+    failures += test_hmac();
+    failures += test_hkdf();
+    failures += test_entropy();
+    failures += test_x25519();
+    failures += test_x25519_kits();
+    return report("tunnel crypto", failures);
+}
+
+} // namespace unum::ucall::test::tunnel

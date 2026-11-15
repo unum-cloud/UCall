@@ -4,34 +4,30 @@
  *  @date August 9, 2026
  *  @brief Shared harness for the C++ test suites: counted checks, scaling, and byte diagnostics.
  *
- *  Every check answers its own failure count, a case adds them up and returns a @c case_result_t,
- *  and @c run_test rolls each result into the @c suite_totals_t the suite's @c main owns, so counts
- *  reach @c suite_exit_code without global mutable state. A failed case prints the command that
- *  reruns only it, under the same seed and multiplier.
+ *  Every check answers its own failure count, a case adds them up and returns them, and each cell
+ *  of a sweep prints one verdict line through @c report, which a failure follows with the command
+ *  that reruns only that cell, under the same seed.
  *
  *  A failed @c expect lets the case go on. Where the next line would dereference what the check
  *  guarded, @c require returns from the case instead, with the failures counted so far.
  *
- *  `-fno-exceptions` rules out a `try` around a test body, and makes `UCALL_FILTER` a substring
- *  rather than a regular expression.
- *
  *  @section Environment Variables
  *
- *  - `UCALL_SEED` : Seed for the deterministic generator. Defaults to a fixed value, and is always
- *    printed at startup, so a run reproduces without being told.
- *  - `UCALL_MULTIPLIER` : Scales every sweep and iteration count. Defaults to 1.0. Use 0.1 for a
- *    quick smoke run, 10 for a thorough one.
- *  - `UCALL_FILTER` : Substring matched against test names; only matching tests run. Unset or empty
- *    runs everything. Honored by @c run_test.
+ *  - <tt>UCALL_SEED</tt> : Seed for the deterministic generator, or <tt>random</tt>. Defaults to
+ *    42, and is always printed at startup, so a run reproduces without being told.
+ *  - <tt>UCALL_MULTIPLIER</tt> : Scales every sweep and iteration count. Defaults to 1.0. Use 0.1
+ *    for a quick smoke run, 10 for a thorough one.
+ *  - <tt>UCALL_FILTER</tt> : Cell names to run, as a regex or else a substring; unset runs
+ *    everything, and a filter selecting nothing runs nothing and passes.
  *
  *  @section Example Usage
  *
  *  @code{.sh}
- * # Only the record-layer tests, at a tenth of the usual depth.
- * UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ./build_test/test_noise
+ *  # Only the 6.18 ring's network cells, at a tenth of the usual depth.
+ *  UCALL_FILTER='network linux-uring618' UCALL_MULTIPLIER=0.1 build_debug_siblings/ucall_test
  *
- * # A thorough sweep, reproducible from a named seed.
- * UCALL_SEED=12345 UCALL_MULTIPLIER=10 ./build_test/test_noise
+ *  # A thorough sweep, reproducible from a named seed.
+ *  UCALL_SEED=12345 UCALL_MULTIPLIER=10 build_debug_siblings/ucall_test
  *  @endcode
  */
 #pragma once
@@ -43,6 +39,7 @@
 #include <cstdlib> // `std::abort`, `std::getenv`, `std::strtod`, `std::strtoull`
 #include <cstring> // `std::strstr`, `std::memcmp`
 
+#include <atomic>      // `std::atomic`
 #include <charconv>    // `std::from_chars`
 #include <chrono>      // `std::chrono::steady_clock`
 #include <filesystem>  // `std::filesystem::remove_all`
@@ -56,9 +53,14 @@
 #include <fmt/color.h>  // `fmt::text_style`, `fmt::fg`, `fmt::emphasis`
 #include <fmt/format.h> // `fmt::formatter`, `fmt::format_to`
 
-#include <forkunion/types.hpp> // `fu::split_mix`
+#include <forkunion/types.hpp>         // `fu::split_mix`
+#include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
+#include "ucall/ucall.h"             // `ucall_client_init`, `ucall_io_backend_name`
 #include "ucall/utilities/types.hpp" // `byte_t`, `span`
+
+#include "arguments.hpp" // `settings_t`, `read_settings`, `filter_t`
+#include "lib.hpp"       // `cpu_classes_k`
 
 #if UCALL_OS_LINUX_ || UCALL_OS_APPLE_
 #include <unistd.h> // `isatty`, `STDERR_FILENO`
@@ -80,6 +82,17 @@
 #include <linux/magic.h> // `TMPFS_MAGIC`
 #include <sys/vfs.h>     // `statfs`
 #endif
+
+namespace sz = ashvardanian::stringzilla;
+namespace uc = unum::ucall;
+
+/** Prints an owning StringZilla string as the text it holds, never as a range of characters. */
+template <>
+struct fmt::formatter<sz::string_t> : fmt::formatter<std::string_view> {
+    fmt::format_context::iterator format(sz::string_t const& text, fmt::format_context& context) const {
+        return fmt::formatter<std::string_view>::format(std::string_view {text}, context);
+    }
+};
 
 namespace unum::ucall::test {
 
@@ -178,6 +191,11 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
     if (shown < bytes.size()) fmt::print(stderr, "... ({} bytes total)", bytes.size());
 }
 
+/** The byte at @p offset of the patterned files the file cases read. */
+[[nodiscard]] inline byte_t file_byte(std::uint64_t offset) noexcept {
+    return static_cast<byte_t>((offset * 2654435761u) >> 13);
+}
+
 #pragma endregion Byte Ranges
 
 #pragma region Diagnostics
@@ -272,15 +290,6 @@ template <typename... argument_types_>
     return 1;
 }
 
-/** Announces the step about to run, so the failures printed after it read as that step's. */
-template <typename... argument_types_>
-inline void announce(fmt::format_string<argument_types_...> format, argument_types_&&... arguments) {
-    fmt::print("  - ");
-    fmt::print(format, std::forward<argument_types_>(arguments)...);
-    fmt::print("\n");
-    std::fflush(stdout);
-}
-
 #pragma endregion Diagnostics
 
 #pragma region Environment
@@ -328,70 +337,43 @@ struct random_generator_t {
 static_assert(std::uniform_random_bit_generator<random_generator_t>,
               "the generator must be usable with `std::shuffle` and friends");
 
-/** Everything the environment configures, established once before any test runs. */
-struct test_environment_t {
+using tools::filter_t;
+using tools::read_settings;
+using tools::settings_t;
 
-    /** `UCALL_SEED`. Fixed by default, so a run reproduces without being told. */
-    std::uint64_t seed {42};
-
-    /** `UCALL_MULTIPLIER`. Scales every sweep and iteration count. */
-    double multiplier {1.0};
-
-    /** `UCALL_FILTER`. Null or empty runs everything. */
-    char const* filter {nullptr};
-};
-
-/*  Constant-initialized, so it carries no thread-safe-static guard on every read and takes no part
- *  in the initialization order across the translation units that include this header. `constinit`
- *  is what makes the compiler enforce both rather than leave them to inspection. */
-constinit inline test_environment_t test_environment {};
-
-/** Aborts with a message, for a malformed environment that no case could run under. */
-[[noreturn]] inline void abort_with_(char const* what, char const* file, int line) {
-    report_failure(what, file, line);
-    std::abort();
-}
-
-/**
- *  @brief Reads and announces the run's configuration. Call once from @c main, before any test.
- *
- *  Reading eagerly and in one place is what lets a malformed value abort here rather than silently
- *  become a zero seed or an unscaled sweep, either of which a run would then report as deliberate.
- */
-inline void configure_tests() {
-    if (char const* const text = std::getenv("UCALL_SEED"); text && text[0] != '\0') {
-        if (std::strcmp(text, "random") == 0) test_environment.seed = std::random_device {}();
-        else {
-            std::uint32_t parsed = 0;
-            auto const [end, error] = std::from_chars(text, text + std::strlen(text), parsed);
-            if (error != std::errc {} || *end != '\0')
-                abort_with_("UCALL_SEED expects an unsigned 32-bit integer or random", __FILE__, __LINE__);
-            test_environment.seed = parsed;
+/** @p text with up to three seeded edits: a byte replaced, inserted, erased or a run repeated. */
+inline std::string mutate(std::string text, random_generator_t& generator) {
+    static constexpr std::string_view alphabet_k = "\r\n:;0123456789abcdefABCDEF -\t\x00\x7f\xff";
+    for (std::size_t edits = generator.below(4); edits; --edits) {
+        std::size_t const at = generator.below(text.size() + 1);
+        switch (generator.below(4)) {
+        case 0:
+            if (at < text.size()) text[at] = alphabet_k[generator.below(alphabet_k.size())];
+            break;
+        case 1: text.insert(at, 1, alphabet_k[generator.below(alphabet_k.size())]); break;
+        case 2:
+            if (at < text.size()) text.erase(at, 1 + generator.below(4));
+            break;
+        default: text.insert(at, text.substr(generator.below(text.size() + 1), generator.below(8))); break;
         }
     }
-    if (char const* const text = std::getenv("UCALL_MULTIPLIER"); text && text[0] != '\0') {
-        char* end = nullptr;
-        double const parsed = std::strtod(text, &end);
-        if (!end || *end != '\0' || !(parsed > 0.0))
-            abort_with_("UCALL_MULTIPLIER is not a positive number", __FILE__, __LINE__);
-        test_environment.multiplier = parsed;
-    }
-    if (char const* const text = std::getenv("UCALL_FILTER"); text && text[0] != '\0') test_environment.filter = text;
-
-    fmt::print("  UCALL_SEED       {}\n", test_environment.seed);
-    fmt::print("  UCALL_MULTIPLIER {:.2f}\n", test_environment.multiplier);
-    fmt::print("  UCALL_FILTER     {}\n", test_environment.filter ? test_environment.filter : "(none)");
-    std::fflush(stdout);
+    return text;
 }
 
-/** A test's seed, from the run's and the name, so a filtered run reproduces an unfiltered one. */
-[[nodiscard]] inline std::uint64_t test_seed_(char const* name) noexcept {
+/** The settings @c main read once, which the scaled loops and the rerun hints consult. */
+inline settings_t test_settings;
+
+[[nodiscard]] inline std::uint64_t settings_seed() noexcept { return test_settings.seed; }
+
+/** A generator seed from the run's and a cell's @p name, so a filtered run reproduces an unfiltered
+ *  one. */
+[[nodiscard]] inline std::uint64_t stream_key(std::uint64_t seed, std::string_view name) noexcept {
     std::uint64_t hashed = 0xCBF29CE484222325ull;
-    for (char const* character = name; *character; ++character) {
-        hashed ^= static_cast<std::uint64_t>(static_cast<unsigned char>(*character));
+    for (char const character : name) {
+        hashed ^= static_cast<std::uint64_t>(static_cast<unsigned char>(character));
         hashed *= 0x100000001B3ull;
     }
-    return test_environment.seed ^ hashed;
+    return seed ^ hashed;
 }
 
 /**
@@ -400,7 +382,7 @@ inline void configure_tests() {
  *  Wrapping every hardcoded trip count is what makes depth an environment variable, not an edit.
  */
 [[nodiscard]] inline std::size_t scale_iterations(std::size_t baseline) noexcept {
-    double const scaled = static_cast<double>(baseline) * test_environment.multiplier;
+    double const scaled = static_cast<double>(baseline) * test_settings.multiplier;
     return scaled < 1.0 ? 1u : static_cast<std::size_t>(scaled);
 }
 
@@ -411,7 +393,7 @@ inline void configure_tests() {
  *  where the interesting offsets sit at the end of a record. Complete at the ten-times point.
  */
 [[nodiscard]] inline std::size_t sweep_stride(std::size_t complete) noexcept {
-    double const coverage = test_environment.multiplier / 10.0;
+    double const coverage = test_settings.multiplier / 10.0;
     if (coverage >= 1.0 || complete == 0) return 1;
     std::size_t const stride = static_cast<std::size_t>(1.0 / coverage);
     return stride ? stride : 1;
@@ -423,10 +405,10 @@ inline void configure_tests() {
 
 /** What a @c counting_allocator saw, and the attempt from which it refuses. */
 struct allocation_counts_t {
-    std::size_t attempts {}, allocations {}, deallocations {}, bytes {};
+    std::atomic<std::size_t> attempts {}, allocations {}, deallocations {}, bytes {};
 
     /** Every attempt from this one onward fails, so a case can starve setup at any step. */
-    std::size_t fail_from {(std::numeric_limits<std::size_t>::max)()};
+    std::atomic<std::size_t> fail_from {(std::numeric_limits<std::size_t>::max)()};
 
     [[nodiscard]] std::size_t live() const noexcept { return allocations - deallocations; }
 };
@@ -473,16 +455,16 @@ struct counting_allocator {
     return count;
 }
 
-/** What @p case_function answers, failing it when it left a descriptor open or closed one it
+/** The failures @p case_function answers, plus one when it left a descriptor open or closed one it
  *  found. */
 template <typename case_type_>
-[[nodiscard]] auto keeping_descriptors(case_type_ case_function) {
+[[nodiscard]] std::size_t keeping_descriptors(case_type_ case_function) {
     std::size_t const before = open_descriptors();
-    auto result = case_function();
+    std::size_t failures = case_function();
     std::size_t const after = open_descriptors();
-    result.failures += expect_(after == before, "after == before", __FILE__, __LINE__,
-                               "{} descriptors open before the case, {} after", before, after);
-    return result;
+    failures += expect_(after == before, "after == before", __FILE__, __LINE__,
+                        "{} descriptors open before the case, {} after", before, after);
+    return failures;
 }
 
 /** A fresh directory under `/tmp` for cases that read files, removed with everything in it. */
@@ -611,6 +593,14 @@ struct aligned_bytes_t {
 
     [[nodiscard]] span<byte_t> bytes() const noexcept { return {data, size}; }
 };
+#else
+
+/** Where descriptors cannot be counted, every case reads as leaving them as it found them. */
+template <typename case_type_>
+[[nodiscard]] std::size_t keeping_descriptors(case_type_ case_function) {
+    return case_function();
+}
+
 #endif // UCALL_OS_POSIX_
 #pragma endregion Scratch Files
 
@@ -860,7 +850,7 @@ struct loopback_pair_t {
  *  @brief Prints a backtrace on abort or a segmentation fault, then re-raises the default action.
  *
  *  A failed check is counted and located by its own message, so this is for the crash a check did
- *  not see coming, which the last announced case and step then name.
+ *  not see coming, which the last verdict line and the backtrace then name.
  */
 inline void install_test_signal_handlers() noexcept {
     auto report = [](int signal_number) noexcept {
@@ -881,130 +871,162 @@ inline void install_test_signal_handlers() noexcept {
     std::signal(SIGSEGV, report);
 }
 
-/** Whether a test named @p name should run, honoring the run's filter. */
-[[nodiscard]] inline bool test_should_run_(char const* name) noexcept {
-    if (!test_environment.filter) return true;
-    return std::strstr(name, test_environment.filter) != nullptr;
+/** One verdict column, whichever way the cell ended; answers the count it was given, so a caller
+ *  accumulates through it. The @c char-pointer overload names a skip. */
+inline std::size_t report(char const* name, std::size_t failures) {
+    fmt::println("{}  {:<44} : {} failures", failures ? "FAILED" : "passed", name, failures);
+    if (failures)
+        fmt::println(stderr, "  rerun: UCALL_SEED={} UCALL_MULTIPLIER={} UCALL_FILTER='{}'", settings_seed(),
+                     test_settings.multiplier, name);
+    std::fflush(stdout);
+    return failures;
 }
 
-/** What one case answers: its failures, and the reason it could not run when it skipped. */
-struct case_result_t {
-
-    /** Checks that failed, which a case skipping past its gate still carries from before it. */
-    std::size_t failures = 0;
-
-    /** Why the case did not run, or null when it ran. */
-    char const* skip_reason = nullptr;
-
-    /** A result of @p counted failures, so a case answering its count reads as one. */
-    constexpr case_result_t(std::size_t counted) noexcept : failures(counted) {}
-
-    /** A result that did not run for @p reason, carrying the @p counted failures from before it. */
-    [[nodiscard]] static constexpr case_result_t skipped(char const* reason, std::size_t counted = 0) noexcept {
-        case_result_t result {counted};
-        result.skip_reason = reason;
-        return result;
-    }
-};
-
-/** Why a case skips @p backend, which an engine set answered unsupported while holding the engine
- *  of @p tried: the kernel lacks it, or the build left its engine out. */
-inline case_result_t skipped_backend(ucall_io_backend_t backend, ucall_io_backend_t tried) noexcept {
-    if (tried == backend) return case_result_t::skipped("the kernel lacks this backend");
-    switch (backend) {
-    case ucall_io_backend_posix_k: return case_result_t::skipped("built without UCALL_WITH_POSIX");
-    case ucall_io_backend_linux_epollaio_k: return case_result_t::skipped("built without UCALL_WITH_LINUX_EPOLLAIO");
-    case ucall_io_backend_linux_uring612_k:
-    case ucall_io_backend_linux_uring618_k: return case_result_t::skipped("built without UCALL_WITH_LINUX_URING");
-    case ucall_io_backend_bsd_kqueue_k: return case_result_t::skipped("built without UCALL_WITH_BSD_KQUEUE");
-    case ucall_io_backend_windows_iocp_k: return case_result_t::skipped("built without UCALL_WITH_WINDOWS_IOCP");
-    case ucall_io_backend_windows_rio_k: return case_result_t::skipped("built without UCALL_WITH_WINDOWS_RIO");
-    default: return case_result_t::skipped("built without any engine");
-    }
-}
-
-/** The counts one suite's @c main owns and every @c run_test rolls into. */
-struct suite_totals_t {
-
-    /** Cases that ran without a failure. */
-    std::size_t passed = 0;
-
-    /** Cases that did not run. */
-    std::size_t skipped = 0;
-
-    /** Cases with at least one failure. */
-    std::size_t failed = 0;
-
-    /** Failed checks across every case. */
-    std::size_t failures = 0;
-
-    /** The binary's @c argv[0], which turns a rerun line into a command. */
-    char const* program = "";
-};
-
-/**
- *  @brief Runs the case @p name unless the filter leaves it out: seeds, times it, and rolls its
- *      result into @p totals.
- *
- *  A case that takes a @c random_generator_t gets one seeded from its name, owned by this call. A
- *  failed case also prints the command that reruns only it, under the same seed and multiplier.
- */
-template <typename case_function_type_>
-inline void run_test(suite_totals_t& totals, char const* name, case_function_type_ case_function) {
-    if (!test_should_run_(name)) {
-        fmt::print("- {} ... skipped (UCALL_FILTER)\n", name);
-        std::fflush(stdout);
-        return;
-    }
-    fmt::print("- {} ...\n", name);
+inline std::size_t report(char const* name, char const* skip_reason) {
+    fmt::println("skipped  {:<44} : {}", name, skip_reason);
     std::fflush(stdout);
-    random_generator_t generator {test_seed_(name)};
-    auto const start = std::chrono::steady_clock::now();
-    case_result_t result {0};
-    if constexpr (std::is_invocable_v<case_function_type_&, random_generator_t&>) result = case_function(generator);
-    else result = case_function();
-    double const seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - start).count();
-
-    totals.failures += result.failures;
-    if (result.failures) {
-        ++totals.failed;
-        fmt::print("- {} ... FAILED with {} failures ({:.2f} s)\n", name, result.failures, seconds);
-        std::fflush(stdout);
-        fmt::print(stderr, "  rerun: UCALL_SEED={} UCALL_MULTIPLIER={} UCALL_FILTER={} {}\n", test_environment.seed,
-                   test_environment.multiplier, name, totals.program);
-    }
-    else if (result.skip_reason) {
-        ++totals.skipped;
-        fmt::print("- {} ... skipped: {}\n", name, result.skip_reason);
-    }
-    else {
-        ++totals.passed;
-        fmt::print("- {} ... ok ({:.2f} s)\n", name, seconds);
-    }
-    std::fflush(stdout);
-}
-
-/**
- *  @brief Prints the totals and answers the exit code: 1 on any failure or on a filter that matched
- *      no case, 77 when every case that ran skipped, 0 otherwise.
- *
- *  A filter that selected nothing fails, since a mistyped one would otherwise read like a green
- *  suite. 77 is the code CTest's `SKIP_RETURN_CODE` names.
- */
-[[nodiscard]] inline int suite_exit_code(suite_totals_t const& totals) {
-    fmt::print("Totals: {} passed, {} skipped, {} failed with {} failures, seed {}\n", totals.passed, totals.skipped,
-               totals.failed, totals.failures, test_environment.seed);
-    std::fflush(stdout);
-    if (totals.failures) return 1;
-    if (test_environment.filter && totals.passed + totals.skipped == 0) {
-        fmt::print(stderr, "UCALL_FILTER={} matched no case, so nothing ran\n", test_environment.filter);
-        return 1;
-    }
-    if (totals.skipped && !totals.passed) return 77;
     return 0;
 }
 
+/** @p format over @p arguments as an owning string, aborting when it cannot be allocated. */
+template <typename... argument_types_>
+sz::string_t formatted(fmt::format_string<argument_types_ const&...> format,
+                       argument_types_ const&... arguments) noexcept {
+    sz::string_t text;
+    if (text.resize(fmt::formatted_size(format, arguments...)) != sz::status_t::success_k) std::abort();
+    fmt::format_to(text.data(), format, arguments...);
+    return text;
+}
+
+/** One cell of a suite's sweep: the engine it runs on, the CPU class it pins, how it encrypts. */
+struct sweep_cell_t {
+    ucall_io_backend_t backend = ucall_io_backend_automatic_k;
+    ucall_cpu_class_t cpu_class = ucall_cpu_class_unknown_k;
+    ucall_security_t security = ucall_security_none_k;
+};
+
+/** Whether a client of @p cell 's backend under its class's ceiling initializes on this host. */
+[[nodiscard]] inline bool opens(sweep_cell_t const& cell) noexcept {
+    ucall_client_t client {};
+    ucall_outcome_t outcome {};
+    ucall_client_options_t config {};
+    config.max_concurrent_connections = 1;
+    config.backend = cell.backend;
+    config.cpu_class = cell.cpu_class;
+    ucall_client_init_t init {&client, &outcome, &config, nullptr};
+    ucall_client_init(&init);
+    ucall_client_free(client);
+    return outcome.status == ucall_status_success_k;
+}
+
+/** The engines this build compiled, in the order of @c ucall_io_backend_t. */
+[[nodiscard]] inline st::vector<ucall_io_backend_t> compiled_backends() noexcept {
+    struct engine_t {
+        ucall_io_backend_t backend;
+        bool compiled;
+    };
+    engine_t const engines[] {
+        {ucall_io_backend_posix_k, UCALL_WITH_POSIX},
+        {ucall_io_backend_linux_epollaio_k, UCALL_WITH_LINUX_EPOLLAIO},
+        {ucall_io_backend_linux_uring612_k, UCALL_WITH_LINUX_URING},
+        {ucall_io_backend_linux_uring618_k, UCALL_WITH_LINUX_URING},
+        {ucall_io_backend_bsd_kqueue_k, UCALL_WITH_BSD_KQUEUE},
+        {ucall_io_backend_windows_iocp_k, UCALL_WITH_WINDOWS_IOCP},
+        {ucall_io_backend_windows_rio_k, UCALL_WITH_WINDOWS_RIO},
+    };
+    st::vector<ucall_io_backend_t> backends;
+    for (engine_t const& engine : engines)
+        if (engine.compiled && st::failed(backends.push_back(ucall_io_backend_t {engine.backend}))) std::abort();
+    return backends;
+}
+
+/** The CPU classes the library accepts as ceilings on this machine, from the portable floor up. */
+[[nodiscard]] inline st::vector<ucall_cpu_class_t> admitted_classes() noexcept {
+    st::vector<ucall_cpu_class_t> classes;
+    for (ucall_cpu_class_t const cpu_class : uc::cpu_classes_k)
+        if (opens({.cpu_class = cpu_class}) && st::failed(classes.push_back(ucall_cpu_class_t {cpu_class})))
+            std::abort();
+    return classes;
+}
+
+/** The diagonal a suite sweeps rather than the full product: every compiled backend at the best
+ *  class in plaintext, every admitted class on the first backend, and every Noise pattern on the
+ *  first backend, each narrowed by the pins of @p settings. */
+[[nodiscard]] inline st::vector<sweep_cell_t> diagonal_sweep(settings_t const& settings) noexcept {
+    st::vector<sweep_cell_t> cells;
+    auto add = [&](sweep_cell_t const& cell) noexcept {
+        if (st::failed(cells.push_back(sweep_cell_t {cell}))) std::abort();
+    };
+    ucall_io_backend_t first = ucall_io_backend_automatic_k;
+    for (ucall_io_backend_t const backend : compiled_backends()) {
+        if (settings.backend != ucall_io_backend_automatic_k && settings.backend != backend) continue;
+        if (first == ucall_io_backend_automatic_k) first = backend;
+        add({backend, settings.cpu_class, ucall_security_none_k});
+    }
+    if (first == ucall_io_backend_automatic_k) return cells;
+    if (settings.cpu_class == ucall_cpu_class_unknown_k)
+        for (ucall_cpu_class_t const cpu_class : admitted_classes()) add({first, cpu_class, ucall_security_none_k});
+    for (ucall_security_t const security :
+         {ucall_security_noise_xx_k, ucall_security_noise_ik_k, ucall_security_noise_kk_k})
+        add({first, settings.cpu_class, security});
+    return cells;
+}
+
+/** How @p security reads in a cell name. */
+[[nodiscard]] inline char const* security_name(ucall_security_t security) noexcept {
+    switch (security) {
+    case ucall_security_noise_xx_k: return "noise-xx";
+    case ucall_security_noise_ik_k: return "noise-ik";
+    case ucall_security_noise_kk_k: return "noise-kk";
+    default: return "plaintext";
+    }
+}
+
+/** The name a filter selects @p cell by, like "linux-uring618 aws-g2 noise-xx". */
+[[nodiscard]] inline sz::string_t name_of(sweep_cell_t const& cell) noexcept {
+    return formatted("{} {} {}", ucall_io_backend_name(cell.backend),
+                     cell.cpu_class ? ucall_cpu_class_name(cell.cpu_class) : "best", security_name(cell.security));
+}
+
+/** The library version, the classes it compiled and admits, the engines it compiled, and the run's
+ *  settings, printed once before any verdict. */
+inline void print_probe(settings_t const& settings) {
+    fmt::println("UCall {}", ucall_version_name());
+    fmt::print("- CPU classes admitted:");
+    for (ucall_cpu_class_t const cpu_class : admitted_classes()) fmt::print(" {}", ucall_cpu_class_name(cpu_class));
+    fmt::print("\n- Backends compiled:");
+    for (ucall_io_backend_t const backend : compiled_backends()) fmt::print(" {}", ucall_io_backend_name(backend));
+    fmt::println("\n- Seed: {}, multiplier: {:.2f}, filter: {}", settings.seed, settings.multiplier,
+                 settings.filter.pattern.empty() ? "none" : settings.filter.pattern);
+    std::fflush(stdout);
+}
+
 #pragma endregion Test Runner
+
+namespace utilities {
+std::size_t check_utilities(settings_t const& settings);
+} // namespace utilities
+
+namespace io {
+std::size_t check_io(settings_t const& settings);
+} // namespace io
+
+namespace http {
+std::size_t check_http_messages(settings_t const& settings);
+std::size_t check_routes(settings_t const& settings);
+std::size_t check_percent(settings_t const& settings);
+std::size_t check_multipart(settings_t const& settings);
+} // namespace http
+
+namespace dns {
+std::size_t check_dns_messages(settings_t const& settings);
+std::size_t check_dns_configuration(settings_t const& settings);
+} // namespace dns
+
+namespace tunnel {
+std::size_t check_crypto(settings_t const& settings);
+std::size_t check_secure_tunnel(settings_t const& settings);
+} // namespace tunnel
 
 } // namespace unum::ucall::test
 
@@ -1018,7 +1040,7 @@ inline void run_test(suite_totals_t& totals, char const* name, case_function_typ
  *
  *  Optional trailing arguments are an @c fmt format string and its operands:
  *  @code{.cpp}
- * failures += expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+ *  failures += expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
  *  @endcode
  */
 #define expect(condition, ...)                                                       \
