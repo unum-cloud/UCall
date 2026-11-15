@@ -12,6 +12,9 @@ set(CMAKE_SYSTEM_PROCESSOR x86_64)
 
 find_program(CMAKE_C_COMPILER clang REQUIRED)
 find_program(CMAKE_CXX_COMPILER clang++ REQUIRED)
+# A host archiver for another architecture writes no index of COFF members, which LLD then cannot find.
+find_program(CMAKE_AR x86_64-w64-mingw32-ar REQUIRED)
+find_program(CMAKE_RANLIB x86_64-w64-mingw32-ranlib REQUIRED)
 
 set(CMAKE_C_COMPILER_TARGET x86_64-w64-windows-gnu)
 set(CMAKE_CXX_COMPILER_TARGET x86_64-w64-windows-gnu)

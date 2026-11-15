@@ -2163,21 +2163,23 @@ check_filesystem_in_harnesses_only() {
         "$staged_path uses std::filesystem in library code - it is allowed only in test/, bench/ and tools/ harnesses:"
 }
 
-# Rejects the standard containers, `std::pair` and `std::tuple` in the library and its bindings, because the
-# containers allocate through the global heap behind the caller's back and throw when it runs out, and a pair
-# or a tuple hides what each member means behind `first` and `get<1>`; only the harnesses may use them.
-check_std_collections_in_harnesses_only() {
+# Rejects the standard containers, owning strings, `std::pair` and `std::tuple` in the library, its bindings
+# and the tools, because the containers and strings allocate through the global heap behind the caller's back
+# and throw when it runs out, and a pair or a tuple hides what each member means behind `first` and `get<1>`;
+# views like `std::string_view` and `std::span` stay, and only the test and benchmark harnesses may use the rest.
+check_std_collections_absent() {
     local reached baseline_path
     for baseline_path in $std_collections_baseline_paths; do
         [ "$staged_path" != "$baseline_path" ] || return 0
     done
     reached=$(printf '%s\n' "$staged_added_text" |
         grep -vE "$added_comment_line_pattern" |
-        grep -E '\bstd::(vector|pair|tuple|deque|list|forward_list|map|multimap|set|multiset|unordered_map|unordered_multimap|unordered_set|unordered_multiset|queue|priority_queue|stack|valarray)\b|#[[:space:]]*include[[:space:]]*<(vector|deque|list|forward_list|map|set|unordered_map|unordered_set|queue|stack|valarray)>' ||
+        grep -E '\bstd::(vector|pair|tuple|deque|list|forward_list|map|multimap|set|multiset|unordered_map|unordered_multimap|unordered_set|unordered_multiset|queue|priority_queue|stack|valarray)\b|\bstd::(basic_|w|u8|u16|u32)?string\b|#[[:space:]]*include[[:space:]]*<(vector|deque|list|forward_list|map|set|unordered_map|unordered_set|queue|stack|valarray)>' ||
         true)
     [ -z "$reached" ] || reject_with_reason "$reached" \
-        "$staged_path uses a standard container, std::pair or std::tuple in library code - name a struct, take" \
-        "            the caller's buffer or allocator, or move the code to a test/, bench/ or tools/ harness:"
+        "$staged_path uses a standard container, an owning std::string, std::pair or std::tuple - name a struct," \
+        "            view the caller's bytes, take st::vector or sz::string_t with their status verbs, or move" \
+        "            the code to a test/ or bench/ harness:"
 }
 
 # `_t` marks a materialized type and `_k` a materialized constant. A concept names a requirement
@@ -3089,7 +3091,7 @@ run_shared_checks() {
         case "$staged_path" in
         *.c | *.h | *.cpp | *.hpp | *.cu | *.cuh | *.hip | *.cc | *.cxx | *.mm)
             check_filesystem_in_harnesses_only
-            check_std_collections_in_harnesses_only
+            check_std_collections_absent
             ;;
         esac
         ;;
@@ -3830,8 +3832,54 @@ check_bench_flat() {
         "bench/ stays flat; name each file by its backend and role instead of nesting it:"
 }
 
+# Inside `unum::ucall::test::<dir>` or `unum::ucall::bench::<dir>` the library's
+# `unum::ucall::<dir>` is already visible through the directive the shared harness header opens,
+# so `ucall::<dir>::` or `uc::<dir>::` there only repeats it; lines past the closing brace, like
+# specializations of library templates, still qualify. The whole staged file, since the namespace is
+# context, reporting only the lines the commit added.
+check_harness_library_qualified() {
+    grep -qE '^namespace unum::ucall::(test|bench)::[a-z_]+ \{' "$staged_text_path" || return 0
+    local spelled
+    spelled=$("$fastest_awk" -v path="$staged_path" '
+        NR == FNR { added[$1 + 0]; next }
+        /^namespace unum::ucall::(test|bench)::[a-z_]+ \{/ {
+            inside = $2; sub(/^unum::ucall::/, "", inside)
+            directory = inside; sub(/^[a-z]+::/, "", directory)
+            next
+        }
+        /^\} \/\/ namespace / { inside = ""; next }
+        inside != "" && (FNR in added) && $0 !~ /^[[:space:]]*(\*|\/\/|\/\*)/ &&
+            (" " $0) ~ ("[^A-Za-z0-9_:](unum::ucall|ucall|uc)::" directory "::") {
+            printf "%s:%d: spells ucall::%s:: inside %s\n", path, FNR, directory, inside
+        }' "$staged_lines_path" "$staged_text_path")
+    local first=${spelled%%$'\n'*}
+    [ -z "$spelled" ] || reject_with_reason "$spelled" "$staged_path ${first#*: }; the library namespace is already visible:"
+}
+
+# Rejects a print to stdout in a test body: the harness owns stdout, and a test only reports
+# failures to stderr, so a passing run reads the same in every sibling.
+check_test_bodies_quiet() {
+    local prints
+    prints=$(printf '%s\n' "$staged_added_text" | blank_c_comments_preserving_columns |
+        grep -nE '\b(print_line|fmt::println|fmt::print|printf|puts)[[:space:]]*\(|\bstd::cout\b|\bfprintf[[:space:]]*\([[:space:]]*stdout\b' |
+        grep -vE '\([[:space:]]*stderr\b' || true)
+    [ -z "$prints" ] || reject_with_reason "$prints" \
+        "$staged_path prints to stdout from a test body; report failures to stderr and leave progress" \
+        "            to the harness:"
+}
+
 # Routes one staged file through the checks only UCall has.
 run_project_checks() {
+    case "$staged_path" in
+    tools/*.hpp | tools/*.cpp | cli/*.hpp | cli/*.cpp) check_std_collections_absent ;;
+    esac
+    case "$staged_path" in
+    test/*.hpp | test/*.cpp | bench/*.hpp | bench/*.cpp) check_harness_library_qualified ;;
+    esac
+    case "$staged_path" in
+    test/harness.hpp | test/main.cpp | test/header_only.cpp) ;;
+    test/*.cpp | test/*.hpp) check_test_bodies_quiet ;;
+    esac
     case "$staged_path" in
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx)
         check_ids_capitalized

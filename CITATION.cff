@@ -11,7 +11,7 @@ abstract: >-
   SIMD. Application handlers stay synchronous while caller-owned polling drives
   connection state machines that overlap network I/O and retain request batches, with HTTP and Noise
   clients and servers on capability-specialized I/O backends, exposed through a C ABI with C++,
-  Python, and Rust bindings.
+  Python, Rust and Mojo bindings.
 keywords:
   - client-server communication
   - network protocol

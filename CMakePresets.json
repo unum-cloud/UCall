@@ -94,7 +94,7 @@
       "name": "android_arm64",
       "inherits": "base",
       "displayName": "Android ARM64 - compile only",
-      "description": "The library over the epoll backend, through the NDK's own toolchain from ANDROID_NDK_ROOT.",
+      "description": "The library over the `linux-epollaio` backend, through the NDK's own toolchain from ANDROID_NDK_ROOT.",
       "toolchainFile": "$env{ANDROID_NDK_ROOT}/build/cmake/android.toolchain.cmake",
       "cacheVariables": {
         "CMAKE_BUILD_TYPE": "Release",
@@ -122,13 +122,13 @@
       "name": "machine",
       "hidden": true,
       "inherits": ["base", "linux", "clang"],
-      "description": "One machine: its CPU floor, every kernel-library capability spelled as 1 or 0, and its one GPU code.",
+      "description": "One machine: its CPU floor, every kernel-library capability spelled as 1 or 0.",
       "cacheVariables": { "CMAKE_BUILD_TYPE": "Release", "UCALL_BUILD_TEST": "OFF", "UCALL_MULTIVERSIONED": "OFF" }
     },
     {
-      "name": "xeon4_hopper",
+      "name": "xeon4",
       "inherits": "machine",
-      "displayName": "Xeon 4 with Hopper - compile only",
+      "displayName": "Xeon 4 - compile only",
       "cacheVariables": {
         "UCALL_MARCH": "sapphirerapids",
         "STRINGZILLA_TARGET_WESTMERE": "1",
@@ -144,9 +144,9 @@
       }
     },
     {
-      "name": "xeon6_blackwell",
+      "name": "xeon6",
       "inherits": "machine",
-      "displayName": "Xeon 6 with Blackwell - compile only",
+      "displayName": "Xeon 6 - compile only",
       "cacheVariables": {
         "UCALL_MARCH": "graniterapids",
         "STRINGZILLA_TARGET_WESTMERE": "1",
@@ -162,9 +162,9 @@
       }
     },
     {
-      "name": "grace_hopper",
+      "name": "grace",
       "inherits": "machine",
-      "displayName": "Grace with Hopper - compile only",
+      "displayName": "Grace - compile only",
       "description": "Grace's 128-bit SVE gains nothing over NEON, so every SVE capability is off.",
       "cacheVariables": {
         "UCALL_MARCH": "grace",
@@ -183,10 +183,10 @@
       }
     },
     {
-      "name": "vera_rubin",
+      "name": "vera",
       "inherits": "machine",
-      "displayName": "Vera with Rubin - compile only",
-      "description": "Olympus cores need Clang 22 or GCC 15 and CUDA 13.4 names no Rubin code, so it compiles 100f; WFET is on, as no compiler macro reports it, and SVE off, as on Grace.",
+      "displayName": "Vera - compile only",
+      "description": "Olympus cores need Clang 22 or GCC 15; WFET is on, as no compiler macro reports it, and SVE off, as on Grace.",
       "cacheVariables": {
         "UCALL_MARCH": "olympus",
         "STRINGZILLA_TARGET_NEON": "1",
@@ -204,10 +204,10 @@
       }
     },
     {
-      "name": "venice_mi450",
+      "name": "venice",
       "inherits": "machine",
-      "displayName": "EPYC Venice with MI450 - compile only",
-      "description": "Clang 22 names no Zen 6 core, so it compiles at znver5 and spells the rows GCC 16's znver6 implies; gfx1250 covers MI450X and MI455X.",
+      "displayName": "EPYC Venice - compile only",
+      "description": "Clang 22 names no Zen 6 core, so it compiles at znver5 and spells the rows GCC 16's znver6 implies.",
       "cacheVariables": {
         "UCALL_MARCH": "znver5",
         "STRINGZILLA_TARGET_WESTMERE": "1",
@@ -235,35 +235,36 @@
     { "name": "android_arm64", "configurePreset": "android_arm64" },
     { "name": "linux_riscv64", "configurePreset": "linux_riscv64" },
     { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le" },
-    { "name": "xeon4_hopper", "configurePreset": "xeon4_hopper" },
-    { "name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell" },
-    { "name": "grace_hopper", "configurePreset": "grace_hopper" },
-    { "name": "vera_rubin", "configurePreset": "vera_rubin" },
-    { "name": "venice_mi450", "configurePreset": "venice_mi450" }
+    { "name": "xeon4", "configurePreset": "xeon4" },
+    { "name": "xeon6", "configurePreset": "xeon6" },
+    { "name": "grace", "configurePreset": "grace" },
+    { "name": "vera", "configurePreset": "vera" },
+    { "name": "venice", "configurePreset": "venice" }
   ],
   "testPresets": [
-    { "name": "debug", "configurePreset": "debug", "output": { "outputOnFailure": true } },
-    { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo", "output": { "outputOnFailure": true } },
-    { "name": "release", "configurePreset": "release", "output": { "outputOnFailure": true } },
+    {
+      "name": "base",
+      "hidden": true,
+      "output": { "outputOnFailure": true },
+      "execution": { "stopOnFailure": true }
+    },
+    { "name": "debug", "inherits": "base", "configurePreset": "debug" },
+    { "name": "relwithdebinfo", "inherits": "base", "configurePreset": "relwithdebinfo" },
+    { "name": "release", "inherits": "base", "configurePreset": "release" },
     {
       "name": "asan",
+      "inherits": "base",
       "configurePreset": "asan",
-      "output": { "outputOnFailure": true },
       "environment": { "UBSAN_OPTIONS": "halt_on_error=1 print_stacktrace=1" }
     },
     {
       "name": "tsan",
+      "inherits": "base",
       "configurePreset": "tsan",
-      "output": { "outputOnFailure": true },
       "environment": { "TSAN_OPTIONS": "halt_on_error=1" }
     },
-    {
-      "name": "msvc2026_x64",
-      "configurePreset": "msvc2026_x64",
-      "configuration": "Release",
-      "output": { "outputOnFailure": true }
-    },
-    { "name": "linux_riscv64", "configurePreset": "linux_riscv64", "output": { "outputOnFailure": true } },
-    { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le", "output": { "outputOnFailure": true } }
+    { "name": "msvc2026_x64", "inherits": "base", "configurePreset": "msvc2026_x64", "configuration": "Release" },
+    { "name": "linux_riscv64", "inherits": "base", "configurePreset": "linux_riscv64" },
+    { "name": "linux_ppc64le", "inherits": "base", "configurePreset": "linux_ppc64le" }
   ]
 }

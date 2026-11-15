@@ -2474,17 +2474,46 @@ assert_accepts "filesystem include in a test harness" test/probe.cpp <<'FIXTURE'
 #include <filesystem>
 FIXTURE
 
-assert_rejects "vector in the library" "uses a standard container, std::pair or std::tuple" include/$project_directory/probe.hpp <<'FIXTURE'
+assert_rejects "vector in the library" "uses a standard container, an owning std::string, std::pair or std::tuple" include/$project_directory/probe.hpp <<'FIXTURE'
 #include <vector>
 FIXTURE
 
-assert_rejects "pair in a binding" "uses a standard container, std::pair or std::tuple" python/probe.cpp <<'FIXTURE'
+assert_rejects "pair in a binding" "uses a standard container, an owning std::string, std::pair or std::tuple" python/probe.cpp <<'FIXTURE'
 std::pair<int, int> probe_bounds(void);
 FIXTURE
 
 assert_accepts "containers in a test harness" test/probe.cpp <<'FIXTURE'
 #include <vector>
 std::vector<std::pair<int, int>> probe_pairs;
+FIXTURE
+
+assert_rejects "owning string in a tool" "an owning std::string" tools/probe.hpp <<'FIXTURE'
+std::string probe_name;
+FIXTURE
+
+assert_accepts "views and sibling containers in a tool" tools/probe.cpp <<'FIXTURE'
+std::string_view probe_name;
+st::vector<int> probe_items;
+FIXTURE
+
+assert_rejects "harness qualifying the visible library namespace" "the library namespace is already visible" test/network/probe.cpp <<'FIXTURE'
+namespace unum::ucall::test::network {
+uc::network::transport_stage_t stage;
+} // namespace unum::ucall::test::network
+FIXTURE
+
+assert_accepts "harness naming the library type bare" test/network/probe.cpp <<'FIXTURE'
+namespace unum::ucall::test::network {
+transport_stage_t stage;
+} // namespace unum::ucall::test::network
+FIXTURE
+
+assert_rejects "test body printing to stdout" "prints to stdout from a test body" test/probe.cpp <<'FIXTURE'
+void test_probe() { fmt::println("probe passed"); }
+FIXTURE
+
+assert_accepts "test body failing on stderr" test/probe.cpp <<'FIXTURE'
+void test_probe() { fmt::println(stderr, "probe failed"); }
 FIXTURE
 
 assert_accepts "move and tuple traits in the library" include/$project_directory/probe.hpp <<'FIXTURE'

@@ -28,7 +28,7 @@ UCall is a ¹ performance-oriented, ² portable, and ³ compact client-server co
 How ¹ fast?
 About 291,000 1 KB echoes per second from one server thread natively, about 278,000 through its Rust bindings and about 268,000 through its Python bindings, against about 83,000 for gRPC on tonic, 21,000 for FastAPI and 15,000 for Python gRPC, in the [framework comparison](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison).
 How ² portable?
-A C ABI fronts a C++20 core with POSIX, Linux epoll with AIO and io_uring, macOS and FreeBSD kqueue, and Windows IOCP backends.
+A C ABI fronts a C++20 core with POSIX, Linux epoll with AIO and io_uring, macOS and FreeBSD kqueue, and Windows IOCP and Registered I/O backends.
 IOCP runs one event loop per interface.
 Python and Rust bindings wrap that ABI directly, with the same caller-owned polling threads.
 How ³ compact?
@@ -256,7 +256,9 @@ Each loop has one application owner, and `ucall_server_stop()` can wake it from 
 The first stop drains: listeners close, idle connections close, and every request already held gets its reply, announced as its connection's last.
 A second stop cuts the replies still in flight; there is no drain timeout.
 An interface takes a `listen_descriptor` in place of an address, accepting on a socket systemd or a supervisor passed in, TCP or AF_UNIX, and never closing it.
-Once an interface holds its whole connection budget, a new peer evicts the idle keep-alive connection that progressed least recently, and slow peers holding requests are never cut by a deadline.
+Once an interface holds its whole connection budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+With none idle, that peer parks, and a second arrival evicts a connection whose finished reply sent nothing since the parking; connections waiting on a handler are never cut, and nothing is cut by a deadline.
+A server sets no deadlines on its peers; a client bounds its own calls with `timeout_microseconds`.
 
 `ucall_client_call()` submits an exchange and returns its acceptance result.
 Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
@@ -413,7 +415,7 @@ Only the Noise transport and application peer-authorization callbacks are implem
 
 ### Engineered for Performance
 
-The shared connection automata consume completions and emit I/O requests for POSIX, Linux epoll with AIO, Linux io_uring 6.12 or 6.18, kqueue, and IOCP.
+The shared connection automata consume completions and emit I/O requests for POSIX, Linux epoll with AIO, Linux io_uring 6.12 or 6.18, kqueue, IOCP, and Registered I/O.
 HTTP framing, routing, and Noise stay in templated headers under `include/ucall/`.
 One library exposes the C ABI once; server and client configuration select the backend and a compiled CPU class.
 Per-CPU instantiation units specialize every enabled native engine, while ordinary C calls use their handle's fixed operation table.

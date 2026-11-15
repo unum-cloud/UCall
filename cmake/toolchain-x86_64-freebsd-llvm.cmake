@@ -26,6 +26,8 @@ find_program(CMAKE_CXX_COMPILER clang++ REQUIRED)
 
 set(CMAKE_C_COMPILER_TARGET x86_64-unknown-freebsd14.5)
 set(CMAKE_CXX_COMPILER_TARGET x86_64-unknown-freebsd14.5)
+# The sysroot's libc++ headers, not the host Clang's newer ones, which name symbols FreeBSD's libc++ lacks.
+set(CMAKE_CXX_FLAGS_INIT "-nostdinc++ -isystem ${UCALL_FREEBSD_SYSROOT}/usr/include/c++/v1")
 set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld")
 set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
 set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld")

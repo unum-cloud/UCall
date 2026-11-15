@@ -34,10 +34,10 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset debug --config Debug --parallel 4
       - name: Test C and C++
-        run: ctest --preset debug --build-config Debug --no-tests=error | tee ctest.log
+        run: ctest --preset debug --build-config Debug --no-tests=error --verbose | tee ctest.log
       - name: Require Every Linux Backend
         run: |
-          if grep -E '^[[:space:]]+[0-9]+ - (epollaio|uring612|uring618) \(Skipped\)' ctest.log; then
+          if grep -E '^[0-9]+: skipped +(io|network) (linux-epollaio|linux-uring612|linux-uring618)' ctest.log; then
             echo "A Linux backend suite skipped, so its engine went untested"
             exit 1
           fi
@@ -69,10 +69,10 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset relwithdebinfo --config RelWithDebInfo --parallel 4
       - name: Test C and C++
-        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo --no-tests=error | tee ctest.log
+        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo --no-tests=error --verbose | tee ctest.log
       - name: Require Every Linux Backend
         run: |
-          if grep -E '^[[:space:]]+[0-9]+ - (epollaio|uring612|uring618) \(Skipped\)' ctest.log; then
+          if grep -E '^[0-9]+: skipped +(io|network) (linux-epollaio|linux-uring612|linux-uring618)' ctest.log; then
             echo "A Linux backend suite skipped, so its engine went untested"
             exit 1
           fi
@@ -111,10 +111,10 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset ${{ matrix.preset }} --parallel 4
       - name: Test C and C++
-        run: ctest --preset ${{ matrix.preset }} --no-tests=error | tee ctest.log
+        run: ctest --preset ${{ matrix.preset }} --no-tests=error --verbose | tee ctest.log
       - name: Require Every Linux Backend
         run: |
-          if grep -E '^[[:space:]]+[0-9]+ - (epollaio|uring612|uring618) \(Skipped\)' ctest.log; then
+          if grep -E '^[0-9]+: skipped +(io|network) (linux-epollaio|linux-uring612|linux-uring618)' ctest.log; then
             echo "A Linux backend suite skipped, so its engine went untested"
             exit 1
           fi
@@ -142,10 +142,10 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset relwithdebinfo --config RelWithDebInfo --parallel 4
       - name: Test C and C++
-        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo --no-tests=error | tee ctest.log
+        run: ctest --preset relwithdebinfo --build-config RelWithDebInfo --no-tests=error --verbose | tee ctest.log
       - name: Require the Kqueue Backend
         run: |
-          if grep -E '^[[:space:]]+[0-9]+ - kqueue \(Skipped\)' ctest.log; then
+          if grep -E '^[0-9]+: skipped +(io|network) bsd-kqueue' ctest.log; then
             echo "The kqueue suite skipped, so its engine went untested"
             exit 1
           fi
@@ -173,10 +173,10 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset msvc2026_x64 --config Release --parallel 4
       - name: Test C and C++
-        run: ctest --preset msvc2026_x64 --build-config Release --no-tests=error | tee ctest.log
+        run: ctest --preset msvc2026_x64 --build-config Release --no-tests=error --verbose | tee ctest.log
       - name: Require the IOCP Backend
         run: |
-          if grep -E '^[[:space:]]+[0-9]+ - iocp \(Skipped\)' ctest.log; then
+          if grep -E '^[0-9]+: skipped +network windows-iocp' ctest.log; then
             echo "The IOCP suite skipped, so its engine went untested"
             exit 1
           fi
@@ -209,7 +209,13 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset linux_riscv64 --parallel 4
       - name: Test C and C++
-        run: ctest --preset linux_riscv64 --no-tests=error
+        run: ctest --preset linux_riscv64 --no-tests=error --verbose | tee ctest.log
+      - name: Require the RISC-V Class
+        run: |
+          if ! grep -qE '^[0-9]+: passed +(io|network) posix alibaba-c930' ctest.log; then
+            echo "No suite ran the alibaba_c930 class, so its kits and atomics went untested"
+            exit 1
+          fi
 
   # The toolchain file runs each suite on an emulated POWER10, which admits the `ibm_power10` class.
   test_qemu_power:
@@ -239,7 +245,13 @@ jobs:
       - name: Build C and C++
         run: cmake --build --preset linux_ppc64le --parallel 4
       - name: Test C and C++
-        run: ctest --preset linux_ppc64le --no-tests=error
+        run: ctest --preset linux_ppc64le --no-tests=error --verbose | tee ctest.log
+      - name: Require the POWER10 Class
+        run: |
+          if ! grep -qE '^[0-9]+: passed +(io|network) posix ibm-power10' ctest.log; then
+            echo "No suite ran the ibm_power10 class, so its kits and atomics went untested"
+            exit 1
+          fi
 
   # Every target at -O0 with warnings as errors, so a warning any example or benchmark raises fails here.
   check_ubuntu:
@@ -376,12 +388,12 @@ jobs:
   # it, as older compilers predate Olympus.
   build_machine_profile:
     name: Build Machine Profile ${{ matrix.preset }}
-    runs-on: ${{ contains(fromJSON('["grace_hopper", "vera_rubin"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
+    runs-on: ${{ contains(fromJSON('["grace", "vera"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
     strategy:
       fail-fast: false
       matrix:
-        preset: [xeon4_hopper, xeon6_blackwell, venice_mi450, grace_hopper, vera_rubin]
+        preset: [xeon4, xeon6, venice, grace, vera]
     env:
       CC: clang-22
       CXX: clang++-22
@@ -397,7 +409,7 @@ jobs:
           cmake --preset ${{ matrix.preset }} -DCMAKE_C_COMPILER="$CC" -DCMAKE_CXX_COMPILER="$CXX"
           cmake --build --preset ${{ matrix.preset }} --parallel 4
 
-  # The NDK's own toolchain builds the library over the epoll backend; nothing runs it.
+  # The NDK's own toolchain builds the library over the `linux-epollaio` backend; nothing runs it.
   build_android:
     name: Build for Android ARM64
     runs-on: ubuntu-26.04

@@ -55,27 +55,12 @@ minimum-version = "build-system.requires"
 sdist.exclude = [
   "/build*/**",
   "/target/**",
-  "/TODO*.md",
   "/numkong/**",
   "/stringzilla/**",
   "/smashtable/**",
   "/forkunion/**",
 ]
 sdist.include = [
-  "/CMakeLists.txt",
-  "/CMakePresets.json",
-  "/cmake/ucall_*.cmake",
-  "/VERSION",
-  "/c/ucall/**",
-  "/include/ucall/**",
-  "/src/**",
-  "/python/CMakeLists.txt",
-  "/python/README.md",
-  "/python/*.c",
-  "/python/*.h",
-  "/python/ucall/*.py",
-  "/python/ucall/*.pyi",
-  "/python/ucall/py.typed",
   "/stringzilla/CMakeLists.txt",
   "/stringzilla/VERSION",
   "/stringzilla/cmake/**",
@@ -108,7 +93,7 @@ lint = ["ruff>=0.15.8", "clang-format==22.*", "cmakelang>=0.6"]
 test = ["pytest>=8"]
 
 [tool.pytest.ini_options]
-addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config"]
+addopts = ["-ra", "--showlocals", "--strict-markers", "--strict-config", "-p", "no:randomly"]
 filterwarnings = ["error"]
 minversion = "8.0"
 python_files = ["*.py"]

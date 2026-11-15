@@ -17,7 +17,7 @@ ctest --preset debug
 ```
 
 The `relwithdebinfo` and `release` presets build the same suites with optimization, `asan` and `tsan` build them under a sanitizer, and `check` builds every target with Clang and `UCALL_WERROR=ON`.
-Tests, tools and benchmarks are off unless a preset or a `-D` switch asks for them.
+Tests, examples and benchmarks are off unless a preset or a `-D` switch asks for them.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
 The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, and `ucall::header`, the C headers alone.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each engine where the target operating system has it, and the header refuses one forced on elsewhere.
@@ -28,16 +28,16 @@ Each class unit compiles when StringZilla and ForkUnion enable every capability 
 `UCALL_MULTIVERSIONED`, on by default, compiles every class that exists, `serial` included, and picks among them at run time.
 Off, it builds for one machine and compiles only the `monoversioned` class, over every capability the libraries enabled: what the floor implies and what a preset vouches for with `-D <LIBRARY>_TARGET_<CAPABILITY>=1`.
 A pinned class or ceiling below that class then fails as unsupported rather than running it.
-The machine profiles `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper` and `vera_rubin` set both, and CI compiles each of them, beside `android_arm64` over the epoll backend and `msvc2026_x64` with Visual Studio.
+The machine profiles `xeon4`, `xeon6`, `venice`, `grace` and `vera` set both, and CI compiles each of them, beside `android_arm64` over the `linux-epollaio` backend and `msvc2026_x64` with Visual Studio.
 `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 
 `UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_hello`, `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
-`ucall_cli`, the `ucall` command-line client in `cli/`, builds with the examples and with any install, and `ucall_test_cli` drives it against an in-process server.
+`ucall_cli`, the `ucall` command-line client in `cli/`, builds with the examples and with any install, and `ucall_test_tools` drives it against an in-process server.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust) describe.
 
-`cmake --install` installs `ucall::static`, the C headers, a CMake package and the license.
+`cmake --install` installs `ucall::static`, the `ucall` command-line client, the C headers, a CMake package and the license.
 `UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build, and installs it beside the archive with a `ucall.pc`.
 The shared library exports the `ucall_*` C interface alone, and the `release` preset remaps the source directory out of every binary.
 A C program links either library, as CI's install job does with `examples/hello.c` through `find_package(ucall)` and through `pkg-config`.
@@ -51,19 +51,25 @@ cpack --config build_release/CPackConfig.cmake
 
 ## Running Tests
 
-Native suites live in `test/`, the C caller in `c/test.c`, and benchmark clients in `bench/`.
-`UCALL_SEED` selects an unsigned 32-bit seed or `random`, `UCALL_FILTER` selects cases, and `UCALL_MULTIPLIER` scales native sweeps.
+Native suites live in `test/`, mirroring `include/ucall/`, the C caller in `c/test.c`, and benchmark clients in `bench/`.
+`ucall_test` runs the outcome word, every engine and the network cells, `ucall_test_header_only` the parsers and the tunnel, and `ucall_test_tools` the command-line client; each ctest is named after its executable.
+`ucall_test` sweeps a diagonal of cells: every compiled backend at the best CPU class in plaintext, every admitted class on the first backend, and each Noise pattern on the first backend.
+Each cell prints one verdict line, such as `passed  network linux-uring618 best plaintext`, and a host refusing an engine reads as `skipped`.
+`UCALL_SEED` selects an unsigned seed or `random`, `UCALL_FILTER` selects cells as a regex or else a substring, and `UCALL_MULTIPLIER` scales native sweeps.
+`--backend` and `--cpu-class` pin the sweep to one backend or class.
 
 ```bash
-UCALL_FILTER=records UCALL_MULTIPLIER=0.1 ctest --preset debug
+UCALL_FILTER='network linux-uring618' UCALL_MULTIPLIER=0.1 build_debug/ucall_test
+UCALL_FILTER='tunnel' ctest --preset debug
 ```
 
-Python suites sit beside them as `test/server.py` and `test/client.py`, and Rust tests sit in each module of `rust/`.
+Python suites sit beside them as `test/server.py` and `test/client.py`, with pytest's hooks in `test/conftest.py` and the settings, backends and fixtures in `test/base.py`; they honour `UCALL_SEED` and filter node IDs by `UCALL_FILTER`.
+Rust tests sit in each module of `rust/`.
 
 ### Fuzzing
 
 `test/properties.hpp` holds one oracle per parser that reads untrusted bytes, each copying its input into a heap block of exactly its size so AddressSanitizer catches a read past it.
-`ucall_test_properties` drives them from seeded mutations of valid inputs, and the `fuzz` preset builds a libFuzzer harness over each with Clang, AddressSanitizer and UndefinedBehaviorSanitizer:
+`ucall_test_header_only` drives them from seeded mutations of valid inputs, and the `fuzz` preset builds a libFuzzer harness over each with Clang, AddressSanitizer and UndefinedBehaviorSanitizer:
 
 - `ucall_fuzz_http`: request and response framing, whole against cut into pieces and streamed.
 - `ucall_fuzz_multipart`: `multipart/form-data` splitting against a linear reference.
@@ -73,7 +79,7 @@ Python suites sit beside them as `test/server.py` and `test/client.py`, and Rust
 - `ucall_fuzz_tunnel`: Noise responders fed hostile first messages, and records whose flipped bytes must never open.
 
 ```bash
-cmake --preset fuzz -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
+cmake --preset fuzz
 cmake --build --preset fuzz
 mkdir -p corpus && build_fuzz/ucall_fuzz_routes -max_total_time=60 corpus
 ```
@@ -84,13 +90,13 @@ CI runs each harness for five minutes with the run number as its seed and keeps 
 
 `cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
 `--cpu-class` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
-QEMU's user mode has neither io_uring nor Linux AIO, so those suites skip.
+QEMU's user mode has neither io_uring nor Linux AIO, so those cells skip.
 
 ```bash
 cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
 cmake --build build_aarch64
 ctest --test-dir build_aarch64
-qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class aws-g2
+qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test --backend posix --cpu-class aws-g2
 ```
 
 ### RISC-V and Power on an x86 Host
@@ -102,7 +108,7 @@ RISC-V needs GCC 16, as GCC 15 crashes on StringZilla's RVV kernels, and Power n
 cmake --preset linux_ppc64le
 cmake --build --preset linux_ppc64le
 ctest --preset linux_ppc64le
-qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test_network --backend posix --cpu-class ibm-power10
+qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test --backend posix --cpu-class ibm-power10
 ```
 
 ### Windows, FreeBSD and macOS on a Linux Host
@@ -135,7 +141,7 @@ git submodule update --init forkunion
 ## Python
 
 `pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `UCALL_BUILD_PYTHON=ON` and installs the `ucall_python` target, the extension `ucall.lib`, into the `python/ucall/` package.
-`python/lib.c` holds the module and the shared argument parsing, while `types.c`, `server.c`, and `client.c` wrap the types, the server, and the client.
+`python/lib.c` holds the module and the shared argument parsing, `json.c` turns JSON bodies into Python objects, and `types.c`, `server.c`, and `client.c` wrap the types, the server, and the client.
 The build tree lives in `build_python/<wheel_tag>`, and an editable install recompiles only when the install command runs again.
 
 ```sh

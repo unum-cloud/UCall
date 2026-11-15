@@ -21,13 +21,6 @@
       "cppAttachName": "(GDB) Attach Python",
     },
     {
-      "name": "GoLang: Current File",
-      "type": "go",
-      "request": "launch",
-      "mode": "debug",
-      "program": "${file}"
-    },
-    {
       "name": "Python: Current File",
       "type": "python",
       "request": "launch",
@@ -48,7 +41,7 @@
       "name": "C++: Echo Example",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug_siblings/ucall_example_echo",
+      "program": "${workspaceFolder}/build_debug/ucall_example_echo",
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,
@@ -62,7 +55,7 @@
       "name": "C++: Network Suite",
       "type": "cppdbg",
       "request": "launch",
-      "program": "${workspaceFolder}/build_debug_siblings/ucall_test_network",
+      "program": "${workspaceFolder}/build_debug/ucall_test_network",
       "cwd": "${workspaceFolder}",
       "environment": [],
       "showDisplayString": true,

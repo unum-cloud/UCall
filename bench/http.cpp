@@ -140,13 +140,11 @@ static constexpr std::array flags_k {
             [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.bytes); }},
     flag_t {"--backend", "name", "automatic, posix, linux-epollaio, linux-uring612, linux-uring618, ... (automatic)",
             [](std::string_view text, settings_t& settings) noexcept {
-                settings.backend = ucall_io_backend_from_name(bytes_view(text));
-                return text == ucall_io_backend_name(settings.backend);
+                return tools::parse_backend(text, settings.backend);
             }},
-    flag_t {"--cpu-class", "name", "automatic, serial, intel-haswell, apple-m2, aws-g5, ... (automatic)",
+    flag_t {"--cpu-class", "name", "unknown, serial, intel-haswell, aws-g2, aws-g5, ... (unknown)",
             [](std::string_view text, settings_t& settings) noexcept {
-                settings.cpu_class = ucall_cpu_class_from_name(bytes_view(text));
-                return text == ucall_cpu_class_name(settings.cpu_class);
+                return tools::parse_cpu_class(text, settings.cpu_class);
             }},
     flag_t {"--verb", "name", "post, get or put (post)",
             [](std::string_view text, settings_t& settings) noexcept {

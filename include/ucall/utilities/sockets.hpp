@@ -366,8 +366,8 @@ inline descriptor_t accepted_socket(descriptor_t descriptor, int family) noexcep
     return descriptor;
 }
 
-/** What a failed accept means: its peer or route failed, the host ran short, or
- * its listener broke. */
+/** What a failed accept means: its peer or route failed, the host ran short, or its listener
+ *  broke. */
 enum class accept_failure_t : std::uint8_t { peer_k, exhausted_k, broken_k };
 inline accept_failure_t accept_failure(int error) noexcept {
     switch (error) {

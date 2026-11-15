@@ -29,13 +29,13 @@
 
 #include <limits> // `std::numeric_limits`
 #include <span>   // `std::span`
-#include <string> // `std::string`
-#include <vector> // `std::vector`
 
 #include "ucall/ucall.h"
-#include "arguments.hpp" // `parse_key`, `parse_duration`
+#include "ucall/utilities/types.hpp" // `st::vector`, `st::failed`
+#include "arguments.hpp"             // `parse_key`, `parse_duration`
 
 namespace tools = unum::ucall::tools;
+namespace st = unum::ucall::st;
 
 enum exit_code_t : int { exit_success_k = 0, exit_failure_k = 1, exit_usage_k = 2 };
 
@@ -53,34 +53,50 @@ static int usage() {
     return exit_usage_k;
 }
 
+/** Appends @p text to @p bytes, answering whether memory allowed it. */
+static bool append(st::vector<char>& bytes, std::string_view text) {
+    std::size_t const previous = bytes.size();
+    if (st::failed(bytes.resize(st::assume_uninitialized, previous + text.size()))) return false;
+    std::memcpy(bytes.data() + previous, text.data(), text.size());
+    return true;
+}
+
 /** Reads all of @p path, or of standard input for <tt>-</tt>, appending it to @p bytes. */
-static bool read_all(char const* path, std::vector<char>& bytes) {
+static bool read_all(char const* path, st::vector<char>& bytes) {
     bool const standard = std::strcmp(path, "-") == 0;
     std::FILE* file = standard ? stdin : std::fopen(path, "rb");
     if (!file) return false;
     char chunk[64 * 1024];
-    for (std::size_t read; (read = std::fread(chunk, 1, sizeof(chunk), file)) != 0;)
-        bytes.insert(bytes.end(), chunk, chunk + read);
-    bool const complete = !std::ferror(file);
+    bool complete = true;
+    for (std::size_t read; complete && (read = std::fread(chunk, 1, sizeof(chunk), file)) != 0;)
+        complete = append(bytes, {chunk, read});
+    complete = complete && !std::ferror(file);
     if (!standard) std::fclose(file);
     return complete;
 }
 
 /** A Noise key from a file holding 64 hexadecimal digits, trailing whitespace allowed. */
 static bool read_key(char const* path, ucall_noise_key_t& key) {
-    std::vector<char> text;
+    st::vector<char> text;
     if (!read_all(path, text)) return false;
-    while (!text.empty() && (text.back() == '\n' || text.back() == '\r' || text.back() == ' ')) text.pop_back();
-    return tools::parse_key(std::string_view {text.begin(), text.end()}, key);
+    std::size_t length = text.size();
+    while (length && (text[length - 1] == '\n' || text[length - 1] == '\r' || text[length - 1] == ' ')) --length;
+    return tools::parse_key(std::string_view {text.data(), length}, key);
 }
 
+/** One verb as a command line spells it. */
+struct verb_spelling_t {
+    std::string_view spelling;
+    ucall_verb_t verb;
+};
+
 static bool parse_verb(std::string_view name, ucall_verb_t& verb) {
-    constexpr std::pair<std::string_view, ucall_verb_t> verbs[] {
-        {"GET", ucall_verb_get_k},        {"POST", ucall_verb_post_k},   {"PUT", ucall_verb_put_k},
-        {"DELETE", ucall_verb_delete_k},  {"PATCH", ucall_verb_patch_k}, {"HEAD", ucall_verb_head_k},
-        {"OPTIONS", ucall_verb_options_k}};
-    for (auto const& [spelling, value] : verbs)
-        if (spelling == name) return verb = value, true;
+    constexpr verb_spelling_t verbs[] {{"GET", ucall_verb_get_k},        {"POST", ucall_verb_post_k},
+                                       {"PUT", ucall_verb_put_k},        {"DELETE", ucall_verb_delete_k},
+                                       {"PATCH", ucall_verb_patch_k},    {"HEAD", ucall_verb_head_k},
+                                       {"OPTIONS", ucall_verb_options_k}};
+    for (verb_spelling_t const& known : verbs)
+        if (known.spelling == name) return verb = known.verb, true;
     return false;
 }
 
@@ -88,8 +104,10 @@ static bool parse_verb(std::string_view name, ucall_verb_t& verb) {
 struct call_plan_t {
     ucall_verb_t verb {ucall_verb_unknown_k};
     std::string_view url {};
-    std::vector<std::string_view> headers {};
-    std::vector<char> body {};
+
+    /** Each views its command-line argument, which outlives the call. */
+    st::vector<ucall_bytes_view_t> headers {};
+    st::vector<char> body {};
     ucall_noise_key_t private_key {}, server_key {};
 
     /** Each names its key above once a file supplied it. */
@@ -109,12 +127,12 @@ static bool parse_call(std::span<char*> arguments, call_plan_t& plan) {
         if (flag == "-X") {
             if (!parse_verb(value, plan.verb)) return false;
         }
-        else if (flag == "-H") plan.headers.emplace_back(value);
+        else if (flag == "-H") {
+            ucall_bytes_view_t header {reinterpret_cast<ucall_byte_t const*>(value), std::strlen(value)};
+            if (st::failed(plan.headers.push_back(std::move(header)))) return false;
+        }
         else if (flag == "-d") {
-            if (value[0] == '@') {
-                if (!read_all(value + 1, plan.body)) return false;
-            }
-            else plan.body.insert(plan.body.end(), value, value + std::strlen(value));
+            if (value[0] == '@' ? !read_all(value + 1, plan.body) : !append(plan.body, value)) return false;
         }
         else if (flag == "-o") plan.output_path = value;
         else if (flag == "-i") plan.head = head_output_t::included_k;
@@ -183,14 +201,11 @@ static int call(std::span<char*> arguments) {
     ucall_client_init(&init);
     if (outcome.status != ucall_status_success_k) return report("client init", outcome);
 
-    std::vector<ucall_bytes_view_t> headers;
-    for (auto header : plan.headers)
-        headers.push_back({reinterpret_cast<ucall_byte_t const*>(header.data()), header.size()});
     ucall_client_call_t request {};
     request.client = client, request.outcome = &outcome;
     request.url = {reinterpret_cast<ucall_byte_t const*>(plan.url.data()), plan.url.size()};
     request.verb = plan.verb;
-    request.headers = headers.data(), request.headers_count = headers.size();
+    request.headers = plan.headers.data(), request.headers_count = plan.headers.size();
     request.body = {reinterpret_cast<ucall_byte_t const*>(plan.body.data()), plan.body.size()};
     request.options.timeout_microseconds = static_cast<std::size_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(plan.timeout).count());
@@ -265,19 +280,13 @@ static bool listed_in(std::string_view connection, std::string_view name) {
     return false;
 }
 
-static std::string_view text(ucall_bytes_view_t view) {
-    return {reinterpret_cast<char const*>(view.data), view.length};
-}
-static ucall_bytes_view_t view(std::string_view text) {
-    return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
-}
-
 /** A request the proxy forwards: the one it answers and the head it sends on, reused after. */
 struct forward_t {
     ucall_received_http_request_t request {};
-    std::string url {};
-    std::vector<std::string> lines {};
-    std::vector<ucall_bytes_view_t> views {};
+
+    /** The upstream URL, then every field line forwarded, in one run @c lines views. */
+    st::vector<char> head {};
+    st::vector<ucall_bytes_view_t> lines {};
     forward_t* next_free {};
 };
 
@@ -291,16 +300,13 @@ struct proxy_t {
     ucall_security_t security {ucall_security_none_k};
     ucall_noise_key_t key {}, server_key {};
     ucall_noise_key_t const *key_read {}, *server_key_read {};
-    std::vector<peer_key_t> peer_keys {};
+    st::vector<peer_key_t> peer_keys {};
     ucall_server_t server {};
     ucall_client_t client {};
-    std::vector<forward_t> forwards {};
+    st::vector<forward_t> forwards {};
     forward_t* free_forwards {};
 
-    /** The fields of the head being forwarded, in arrival order. */
-    std::vector<std::pair<std::string_view, std::string_view>> fields {};
-
-    /** Where replies report, as nothing reads it. */
+    /** Where replies report; read when one could not be queued. */
     ucall_outcome_t reply_outcome {};
 
     static ucall_status_t authorize(ucall_noise_key_t const* peer_static_key, void* context) {
@@ -318,7 +324,7 @@ struct proxy_t {
     bool open() {
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = view(listen);
+        network_interface.address = uc::bytes_view(listen);
         network_interface.event_loops = 1;
         network_interface.max_concurrent_connections = proxy_connections_k;
         network_interface.security = security;
@@ -333,7 +339,8 @@ struct proxy_t {
         if (outcome.status != ucall_status_success_k) return report("server init", outcome), false;
         // A greedy wildcard takes at least one segment, so the root has its own route.
         for (std::string_view const route : {"/", "/{*path}"}) {
-            ucall_server_add_http_endpoint_t add {server, &outcome, view(route), ucall_verb_any_k, forward, this};
+            ucall_server_add_http_endpoint_t add {server,           &outcome, uc::bytes_view(route),
+                                                  ucall_verb_any_k, forward,  this};
             ucall_server_add_http_endpoint(&add);
             if (outcome.status != ucall_status_success_k) return report("endpoint", outcome), false;
         }
@@ -345,12 +352,60 @@ struct proxy_t {
         ucall_client_init_t bind {&client, &outcome, &client_config, &client_resolved};
         ucall_client_init(&bind);
         if (outcome.status != ucall_status_success_k) return report("client init", outcome), false;
-        forwards.resize(client_resolved.max_concurrent_calls);
-        for (auto& slot : forwards) slot.next_free = std::exchange(free_forwards, &slot);
+        // Calls and the free list hold the slots' addresses, so they are all made here, once.
+        if (st::failed(forwards.reserve(client_resolved.max_concurrent_calls))) return false;
+        for (std::size_t made = 0; made != client_resolved.max_concurrent_calls; ++made) {
+            [[maybe_unused]] st::status_t const placed = forwards.emplace_back(st::assume_reserved);
+            forwards.back().next_free = std::exchange(free_forwards, &forwards.back());
+        }
         std::printf("Proxying %.*s to %.*s\n", static_cast<int>(resolved.interfaces[0].address.length),
                     reinterpret_cast<char const*>(resolved.interfaces[0].address.data), static_cast<int>(to.size()),
                     to.data());
         std::fflush(stdout);
+        return true;
+    }
+
+    /**
+     *  @brief Appends to @p slot's head a line for each of the @p count fields @p read answers,
+     *      but the hop-by-hop ones, those <tt>connection</tt> lists and the @p written ones, each
+     *      viewed by one of its lines; false once memory ran out.
+     *
+     *  A first pass sizes the lines, so the head grows once and no view of it moves.
+     */
+    template <typename read_type_>
+    bool forward_fields(forward_t& slot, std::size_t count, read_type_ const& read,
+                        std::span<std::string_view const> written) {
+        std::string_view connection {};
+        std::size_t kept = 0, bytes = 0;
+        auto const forwarded = [&](std::string_view name) {
+            return !among(hop_by_hop_k, name) && !among(written, name) && !listed_in(connection, name);
+        };
+        for (std::size_t index = 0; index != count; ++index) {
+            ucall_bytes_view_t name {}, value {};
+            read(index, name, value);
+            if (uc::text_view(name) == "connection") connection = uc::text_view(value);
+        }
+        for (std::size_t index = 0; index != count; ++index) {
+            ucall_bytes_view_t name {}, value {};
+            read(index, name, value);
+            if (!forwarded(uc::text_view(name))) continue;
+            ++kept;
+            bytes += name.length + 2 + value.length;
+        }
+        slot.lines.clear();
+        if (st::failed(slot.head.reserve(slot.head.size() + bytes)) || st::failed(slot.lines.reserve(kept)))
+            return false;
+        for (std::size_t index = 0; index != count; ++index) {
+            ucall_bytes_view_t name {}, value {};
+            read(index, name, value);
+            if (!forwarded(uc::text_view(name))) continue;
+            std::size_t const start = slot.head.size();
+            if (!append(slot.head, uc::text_view(name)) || !append(slot.head, ": ") ||
+                !append(slot.head, uc::text_view(value)))
+                return false;
+            [[maybe_unused]] st::status_t const viewed = slot.lines.push_back(
+                st::assume_reserved, uc::bytes_view({slot.head.data() + start, slot.head.size() - start}));
+        }
         return true;
     }
 
@@ -370,36 +425,26 @@ struct proxy_t {
         if (outcome.status != ucall_status_success_k) return false;
         std::string_view base = to;
         if (base.ends_with('/')) base.remove_suffix(1);
-        slot->url.assign(base);
-        slot->url.append(text(path));
-        if (query.length) slot->url.append("?").append(text(query));
+        slot->head.clear();
+        if (!append(slot->head, base) || !append(slot->head, uc::text_view(path)) ||
+            (query.length && (!append(slot->head, "?") || !append(slot->head, uc::text_view(query)))))
+            return false;
+        std::size_t const url_length = slot->head.size();
         std::size_t count = 0;
         ucall_server_request_fields_count_t counting {server, &outcome, request, &count};
         ucall_server_request_fields_count(&counting);
-        std::string_view connection {};
-        fields.resize(count);
-        for (std::size_t index = 0; index != count; ++index) {
-            ucall_bytes_view_t name {}, value {};
+        auto const read = [&](std::size_t index, ucall_bytes_view_t& name, ucall_bytes_view_t& value) {
             ucall_server_request_field_t field {server, &outcome, request, index, &name, &value};
             ucall_server_request_field(&field);
-            fields[index] = {text(name), text(value)};
-            if (text(name) == "connection") connection = text(value);
-        }
-        slot->lines.resize(count);
-        slot->views.clear();
-        for (std::size_t index = 0; index != count; ++index) {
-            auto const [name, value] = fields[index];
-            if (among(hop_by_hop_k, name) || among(request_written_k, name) || listed_in(connection, name)) continue;
-            slot->lines[index].assign(name).append(": ").append(value);
-            slot->views.push_back(view(slot->lines[index]));
-        }
+        };
+        if (!forward_fields(*slot, count, read, request_written_k)) return false;
         ucall_client_call_t call {};
         call.client = client;
         call.outcome = &outcome;
-        call.url = view(slot->url);
+        call.url = uc::bytes_view({slot->head.data(), url_length});
         call.verb = ucall_server_request_verb(server, request);
-        call.headers = slot->views.data();
-        call.headers_count = slot->views.size();
+        call.headers = slot->lines.data();
+        call.headers_count = slot->lines.size();
         call.body = body;
         call.context = slot;
         if (to.starts_with("http+noise://")) {
@@ -415,7 +460,7 @@ struct proxy_t {
 
     void reply_failure(ucall_received_http_request_t request, std::string_view message) {
         ucall_server_reply_error_t reply {server, &reply_outcome, request, ucall_http_status_bad_gateway_k,
-                                          view(message)};
+                                          uc::bytes_view(message)};
         ucall_server_reply_error(&reply);
     }
 
@@ -439,34 +484,23 @@ struct proxy_t {
             std::size_t count = 0;
             ucall_client_response_fields_count_t counting {response, &outcome, &count};
             ucall_client_response_fields_count(&counting);
-            std::string_view connection {};
-            fields.resize(count);
-            for (std::size_t index = 0; index != count; ++index) {
-                ucall_bytes_view_t name {}, value {};
+            auto const read = [&](std::size_t index, ucall_bytes_view_t& name, ucall_bytes_view_t& value) {
                 ucall_client_response_field_t field {response, &outcome, index, &name, &value};
                 ucall_client_response_field(&field);
-                fields[index] = {text(name), text(value)};
-                if (text(name) == "connection") connection = text(value);
-            }
-            slot.lines.resize(count);
-            slot.views.clear();
-            for (std::size_t index = 0; index != count; ++index) {
-                auto const [name, value] = fields[index];
-                if (among(hop_by_hop_k, name) || among(reply_written_k, name) || listed_in(connection, name)) continue;
-                slot.lines[index].assign(name).append(": ").append(value);
-                slot.views.push_back(view(slot.lines[index]));
-            }
+            };
+            slot.head.clear();
             ucall_bytes_view_t body {};
-            ucall_client_response_body_t read {response, &outcome, &body};
-            ucall_client_response_body(&read);
-            ucall_server_reply_content_t reply {server,
-                                                &reply_outcome,
-                                                slot.request,
-                                                ucall_client_response_status(response),
-                                                slot.views.data(),
-                                                slot.views.size(),
-                                                body};
-            ucall_server_reply_content(&reply);
+            ucall_client_response_body_t read_body {response, &outcome, &body};
+            ucall_client_response_body(&read_body);
+            ucall_server_reply_content_t reply {
+                server, &reply_outcome, slot.request, ucall_client_response_status(response), slot.lines.data(), 0,
+                body};
+            if (!forward_fields(slot, count, read, reply_written_k))
+                reply_outcome.status = ucall_status_out_of_memory_k;
+            else {
+                reply.headers = slot.lines.data(), reply.headers_count = slot.lines.size();
+                ucall_server_reply_content(&reply);
+            }
             if (reply_outcome.status != ucall_status_success_k && reply_outcome.status != ucall_status_deferred_k)
                 reply_failure(slot.request, ucall_status_name(reply_outcome.status));
         }
@@ -495,7 +529,9 @@ static bool parse_proxy(std::span<char*> arguments, proxy_t& proxy) {
             proxy.server_key_read = &proxy.server_key;
         }
         else if (flag == "--peer-key") {
-            if (!read_key(value, proxy.peer_keys.emplace_back().key)) return false;
+            peer_key_t admitted {};
+            if (!read_key(value, admitted.key) || st::failed(proxy.peer_keys.push_back(std::move(admitted))))
+                return false;
         }
         else if (flag == "--security") {
             std::string_view const security = value;
@@ -556,11 +592,9 @@ static int keygen(std::span<char*> arguments) {
         std::fprintf(stderr, "ucall: cannot create %s, or it already exists\n", arguments[0]);
         return exit_failure_k;
     }
-    for (auto byte : private_key) std::fprintf(file, "%02x", static_cast<unsigned>(byte));
-    std::fputc('\n', file);
+    tools::print_key(file, private_key);
     std::fclose(file);
-    for (auto byte : public_key) std::printf("%02x", static_cast<unsigned>(byte));
-    std::putchar('\n');
+    tools::print_key(stdout, public_key);
     return exit_success_k;
 }
 
