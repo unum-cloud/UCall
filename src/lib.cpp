@@ -115,8 +115,21 @@ void ucall_client_init(ucall_client_init_t* arguments) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    // A bound client takes its server's network, whose engine it shares.
-    if (arguments->options->server) return arguments->options->server->api->bind_client(arguments);
+    // A bound client takes its server's network, whose engine it shares, so a class it pins is
+    // named as the class a network would be built for, which its server compares with its own.
+    if (arguments->options->server) {
+        ucall_client_options_t options = *arguments->options;
+        cpu_ceiling_t ceiling;
+        if (options.cpu_class != ucall_cpu_class_unknown_k) {
+            if (ucall_status_t const picked = pick_cpu_ceiling(options.cpu_class, ceiling);
+                picked != ucall_status_success_k)
+                return publish(arguments->outcome, picked);
+            options.cpu_class = static_cast<ucall_cpu_class_t>(built_class(cpu_ladder_t {}, ceiling));
+        }
+        ucall_client_init_t bound = *arguments;
+        bound.options = &options;
+        return options.server->api->bind_client(&bound);
+    }
     init_network(arguments);
 }
 

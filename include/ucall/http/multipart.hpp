@@ -22,6 +22,11 @@ std::string_view header_parameter(std::string_view value, std::string_view name)
         auto rest = value.substr(cursor + 1);
         auto const equals = search_type_::find(rest, '=');
         if (equals == std::string_view::npos) return {};
+        // A parameter without a value ends at its own semicolon, never inside the next one's name.
+        if (auto const bare = search_type_::find(rest, ';'); bare < equals) {
+            cursor += 1 + bare;
+            continue;
+        }
         auto const key = search_type_::trim_http(rest.substr(0, equals));
         rest = search_type_::trim_http(rest.substr(equals + 1));
         std::string_view found;

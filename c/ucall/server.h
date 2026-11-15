@@ -280,11 +280,14 @@ typedef struct ucall_event_loop_statistics_t {
     /** System calls: io_uring enters, or other backends' waits, registrations and socket calls. */
     uint64_t kernel_enters;
 
-    /** Operations queued: io_uring submission entries, or requests another backend accepted. */
+    /** Operations the loop asked of its engine. */
     uint64_t submissions;
 
-    /** Results taken: io_uring completion entries, or operations another backend finished. */
+    /** Results the loop took from its engine, each connection of an accept among them. */
     uint64_t completions;
+
+    /** Submission entries io_uring filled and completion entries it reaped; zero elsewhere. */
+    uint64_t kernel_entries;
 
     /** Pending operations, or io_uring multishot receives, the engine asked to cancel. */
     uint64_t cancellations;

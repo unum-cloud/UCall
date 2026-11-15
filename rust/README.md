@@ -55,7 +55,7 @@ use ucall::*;
 let public = Interface::new("0.0.0.0:8545").event_loops(4).connections(16_384).pipelined_requests(16);
 let health = Interface::new("127.0.0.1:8546").connections(4);
 let log = Log { callback: Arc::new(|level: LogLevel, line: &[u8]| eprintln!("{level:?} {}", String::from_utf8_lossy(line))), format: LogFormat::Human, level: LogLevel::Warning };
-let metrics = Metrics { address: "127.0.0.1:8125".into(), prefix: "rpc".into(), ..Default::default() };
+let metrics = Metrics { address: "127.0.0.1:8125".into(), prefix: "myapp".into(), ..Default::default() };
 let options = ServerOptions { cpu_class: Some(CPUClass::Serial), log: Some(log), metrics: Some(metrics), ..Default::default() };
 let mut server = Server::with_options(&[public, health], options)?;
 println!("{} event loops on {} with {} kernels", server.event_loops(), server.backend(), server.cpu_class());

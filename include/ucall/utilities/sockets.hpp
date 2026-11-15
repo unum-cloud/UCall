@@ -226,7 +226,7 @@ inline descriptor_t socket_open(int family) noexcept {
         return -1;
     }
     int enabled = 1;
-    // Fragmented RPC writes must not wait for delayed ACKs before releasing TX credits.
+    // Fragmented writes must not wait for delayed ACKs before releasing TX credits.
     if ((family == AF_INET || family == AF_INET6) &&
         socket_option(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) != 0) {
         socket_close(descriptor);

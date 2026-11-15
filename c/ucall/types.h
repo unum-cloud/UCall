@@ -302,19 +302,19 @@ typedef struct ucall_server_handle_t* ucall_server_t;
  *  At a high level, a @b client is responsible for:
  *
  *  - Establishing connections to one or more servers, reusing encryption keys between requests.
- *  - Following redirects chains automatically, unless disabled.
+ *  - Following redirect chains automatically, up to @c max_redirects, five by default.
  *  - Driving accepted calls when the application polls for completions.
  */
 typedef struct ucall_client_handle_t* ucall_client_t;
 
-/** Opaque handle for a single Remote Procedure Call on the @b server side. */
+/** Opaque handle for a single HTTP request received on the @b server side. */
 typedef struct ucall_received_http_request_handle_t* ucall_received_http_request_t;
 
 /** One batch endpoint of a server, drained by one application thread; lives until
  *  @c ucall_server_free(). */
 typedef struct ucall_http_batch_endpoint_handle_t* ucall_http_batch_endpoint_t;
 
-/** Opaque handle for a single Remote Procedure Call reply on the @b client side. */
+/** Opaque handle for a single HTTP response received on the @b client side. */
 typedef struct ucall_received_http_response_handle_t* ucall_received_http_response_t;
 
 /** When an endpoint's callback runs: once the body is buffered, or at headers time with the body
@@ -336,7 +336,7 @@ typedef enum ucall_body_delivery_t {
  *  - @c IK: Client knows server's public key in advance (Identity Known).
  *  - @c KK: Both parties know each other's public keys (Known Known).
  *
- *  @note Use @c http+noise:// or @c ws+noise:// URL schemes to enable Noise transport.
+ *  @note Use the @c http+noise:// URL scheme to enable Noise transport.
  *  @see https://noiseprotocol.org/noise.html for pattern specifications.
  */
 typedef enum ucall_security_t {

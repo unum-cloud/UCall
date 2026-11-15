@@ -264,11 +264,6 @@ struct cpu_traits {
         (waiter_t::capability_k | atomic_ref<std::uint32_t>::capabilities_k) & ~baseline_hints_k);
 };
 
-template <cpu_class_t cpu_class_>
-constexpr fu::capabilities_t forkunion_capabilities_of() noexcept {
-    return cpu_traits<cpu_class_>::forkunion_capabilities_k;
-}
-
 constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
     switch (cpu) {
 #if UCALL_TARGET_SERIAL
@@ -329,16 +324,16 @@ constexpr bool rung_advances() noexcept {
 /** ForkUnion's mask for a class named at run time, as a pinned class names it. */
 constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept {
     switch (cpu) {
-    case cpu_class_t::intel_haswell_k: return forkunion_capabilities_of<cpu_class_t::intel_haswell_k>();
-    case cpu_class_t::intel_skylake_k: return forkunion_capabilities_of<cpu_class_t::intel_skylake_k>();
-    case cpu_class_t::intel_icelake_k: return forkunion_capabilities_of<cpu_class_t::intel_icelake_k>();
-    case cpu_class_t::intel_alder_k: return forkunion_capabilities_of<cpu_class_t::intel_alder_k>();
-    case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
-    case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
-    case cpu_class_t::alibaba_c930_k: return forkunion_capabilities_of<cpu_class_t::alibaba_c930_k>();
-    case cpu_class_t::ibm_power10_k: return forkunion_capabilities_of<cpu_class_t::ibm_power10_k>();
-    case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
-    default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
+    case cpu_class_t::intel_haswell_k: return cpu_traits<cpu_class_t::intel_haswell_k>::forkunion_capabilities_k;
+    case cpu_class_t::intel_skylake_k: return cpu_traits<cpu_class_t::intel_skylake_k>::forkunion_capabilities_k;
+    case cpu_class_t::intel_icelake_k: return cpu_traits<cpu_class_t::intel_icelake_k>::forkunion_capabilities_k;
+    case cpu_class_t::intel_alder_k: return cpu_traits<cpu_class_t::intel_alder_k>::forkunion_capabilities_k;
+    case cpu_class_t::aws_g2_k: return cpu_traits<cpu_class_t::aws_g2_k>::forkunion_capabilities_k;
+    case cpu_class_t::aws_g5_k: return cpu_traits<cpu_class_t::aws_g5_k>::forkunion_capabilities_k;
+    case cpu_class_t::alibaba_c930_k: return cpu_traits<cpu_class_t::alibaba_c930_k>::forkunion_capabilities_k;
+    case cpu_class_t::ibm_power10_k: return cpu_traits<cpu_class_t::ibm_power10_k>::forkunion_capabilities_k;
+    case cpu_class_t::monoversioned_k: return cpu_traits<cpu_class_t::monoversioned_k>::forkunion_capabilities_k;
+    default: return cpu_traits<cpu_class_t::serial_k>::forkunion_capabilities_k;
     }
 }
 
@@ -392,6 +387,19 @@ using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel
                                 cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k,
                                 cpu_class_t::alibaba_c930_k, cpu_class_t::ibm_power10_k, cpu_class_t::serial_k>;
 #endif
+
+/** The class @ref make_network builds for @p ceiling on @p ladder. */
+template <cpu_class_t... classes_>
+cpu_class_t built_class(cpu_ladder<classes_...>, cpu_ceiling_t ceiling) noexcept {
+    cpu_class_t built = cpu_class_t::serial_k;
+    bool picked = false;
+    auto rung = [&]<cpu_class_t class_>() noexcept {
+        if constexpr (cpu_class_compiled(class_) && rung_advances<class_>())
+            if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, built = class_;
+    };
+    (rung.template operator()<classes_>(), ...);
+    return built;
+}
 
 /** Builds the network on the newest rung of @p ladder the build compiled and @p ceiling fits, one
  *  of which @ref pick_cpu_ceiling made sure of, and a class picking its parent's kits and atomics

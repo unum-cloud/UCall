@@ -60,44 +60,67 @@ struct server_connection {
     template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
 
-    explicit server_connection(allocator_t const& allocator = {}) noexcept : transport(allocator) {
+    explicit server_connection(allocator_t const& allocator) noexcept : transport(allocator) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(server_connection) == 2408);
+            static_assert(sizeof(server_connection) == 2240);
     }
     server_connection(server_connection const&) = delete;
     server_connection& operator=(server_connection const&) = delete;
     server_connection(server_connection&&) = delete;
     server_connection& operator=(server_connection&&) = delete;
 
+    /** Its socket, tunnel, parser and buffers; first, so a completion's context reads its role. */
     transport_t transport;
 
-    /** Reads the files a reply streams. */
+    /** Opens and reads the files a reply streams, one operation at a time. */
     io_request_t file_read_request {};
-    operation_state_t file_read_operation {};
+
+    /** The address its socket was accepted from. */
+    ucall_peer_address_t peer_address {};
+
+    /** What its file side does for the reply streaming a file; idle between files. */
     file_read_state_t file_reading {};
+
+    /** Whether the engine holds @c file_read_request, which @c advance and a close wait out. */
+    bool file_request_in_flight() const noexcept {
+        return file_reading == file_read_state_t::opening_file_k || file_reading == file_read_state_t::reading_file_k;
+    }
+
+    /** Zero-copy from admission until a release reports the kernel copied, then copying. */
     send_mode_t send_mode {};
+
+    /** Whether the request being parsed is owed the interim @c 100, set as its head arrives. */
     continue_state_t continuing {};
+
+    /** Which of its loop's orders holds it through @c order_link. */
     connection_order_t order {};
 
     /** The verbs the path being parsed takes, as a miss reports them in @c allow. */
     verb_set_t routed_verbs {};
 
-    /** @c SO_SNDBUF read once, bounding what the kernel holds for it. */
-    std::size_t send_buffer_bytes {};
+    /** The first of the stream's windows in file order, linked through theirs, or @c absent_k. */
+    std::uint32_t oldest_window {absent_k};
 
-    /** The stream's windows in file order. */
-    std::uint32_t oldest_window {absent_k}, newest_window {absent_k};
+    /** The last of the stream's windows, which a file read fills, or @c absent_k. */
+    std::uint32_t newest_window {absent_k};
 
-    /** Releases the close waits for. */
-    std::uint32_t releasing_windows {}, releasing_exchanges {};
+    /** Sent windows whose release is in the engine; a close waits for them. */
+    std::uint32_t releasing_windows {};
+
+    /** Exchange releases in the engine; a close waits for them. */
+    std::uint32_t releasing_exchanges {};
 
     /** Links the order @c order names. */
     order_link_t order_link {};
+
+    /** Slots a record stride apart in a window, which a sealed stream's file read scatters into. */
     io_vector_t file_read_vectors[file_window_records_k] {};
 
     /** Links the loop's FIFO of streams waiting for a window. */
     connection_t* next_waiting_connection {};
+
+    /** The interface whose listener accepted it, for its limits, orders and logs. */
     network_interface_t* network_interface {};
 
     /** Matched once the head of the request being parsed arrived. */
@@ -108,7 +131,11 @@ struct server_connection {
 
     /** Replies leave in this order. */
     server_exchange_t* oldest_exchange {};
+
+    /** The request dispatched last, which the next one follows through @c next_queued. */
     server_exchange_t* newest_exchange {};
+
+    /** Requests from @c oldest_exchange to @c newest_exchange, bounded by pipelining. */
     std::uint32_t outstanding_exchanges {};
 
     /** In its event loop's connections, as windows and orders name it. */
@@ -119,7 +146,6 @@ struct server_connection {
 
     ucall_status_t configure(secure_tunnel_config_t const& config) noexcept {
         file_read_request = {.context = this};
-        file_read_operation = operation_state_t::idle_k;
         file_reading = file_read_state_t::idle_k;
         send_mode = send_mode_t::zero_copy_k;
         continuing = continue_state_t::none_k;
@@ -131,9 +157,12 @@ struct server_connection {
     /** Records one completion as @c transport_t::complete does, and a file operation's, whose
      *  outcome belongs to the segment it served, which the server lands. */
     void complete(io_completion_t const& completion) noexcept {
-        if (completion.request != &file_read_request)
-            return transport.complete(completion, network_interface->config.max_request_bytes);
-        file_read_operation = operation_state_t::idle_k;
+        if (completion.request != &file_read_request) {
+            transport.complete(completion, network_interface->config.max_request_bytes);
+            if (transport.stage == transport_stage_t::closed_k && outstanding_releases())
+                transport.stage = transport_stage_t::closed_holding_k;
+            return;
+        }
         if (transport.statistics && completion.result > 0 &&
             completion.request->operation != io_operation_t::file_open_k)
             tally<atomic_ref>(transport.statistics->bytes_read, static_cast<std::uint64_t>(completion.result));
@@ -142,8 +171,9 @@ struct server_connection {
     /** The transport's next request, after any file operation, holding a close back while the
      *  kernel still holds what it sent. */
     io_request_t* advance() noexcept {
-        if (file_read_operation == operation_state_t::submitted_k) return nullptr;
-        io_request_t* next_request = transport.advance();
+        if (file_request_in_flight()) return nullptr;
+        io_request_t* next_request = transport.advance(network_interface->config.peer_authorizer,
+                                                       network_interface->config.peer_authorizer_context);
         // A close sends what the kernel still holds, unless it resets, which purges it.
         if (!next_request || next_request->operation != io_operation_t::close_k || !outstanding_releases() ||
             transport.close_mode != close_mode_t::orderly_k)
@@ -155,8 +185,7 @@ struct server_connection {
 
     /** Marks @p request, one of its three, in flight once the engine took it. */
     void submitted(io_request_t const& request) noexcept {
-        if (&request == &file_read_request) file_read_operation = operation_state_t::submitted_k;
-        else transport.submitted(request);
+        if (&request != &file_read_request) transport.submitted(request);
     }
 
     /** Whether the kernel still holds memory this connection sent without copying. */
@@ -207,9 +236,9 @@ struct serving {
         exchange.end_segment.bytes.clear();
         exchange.connection = nullptr;
         // A replier listing an ended reply late finds a free exchange nothing recycles twice.
-        exchange.stage = exchange_stage_t::dispatched_k;
+        exchange.stage = exchange_stage_t::free_k;
         crypto_t::secure_zero(exchange.peer_static_key);
-        exchange.replied_next = event_loop.free_exchanges;
+        exchange.next_queued = event_loop.free_exchanges;
         event_loop.free_exchanges = &exchange;
     }
     static void mark_ready(event_loop_t& event_loop, connection_t& connection) noexcept {
@@ -301,7 +330,7 @@ struct serving {
      *  or null once the connection failed for memory. */
     static server_exchange_t* enqueue_exchange(event_loop_t& event_loop, connection_t& connection) noexcept {
         auto* exchange = event_loop.free_exchanges;
-        if (exchange) event_loop.free_exchanges = exchange->replied_next;
+        if (exchange) event_loop.free_exchanges = std::exchange(exchange->next_queued, nullptr);
         else if ((exchange =
                       allocate_unique<server_exchange_t>(event_loop.allocator, event_loop.allocator).release())) {
             exchange->next = event_loop.exchanges;
@@ -314,6 +343,9 @@ struct serving {
         // A late listing of the last life stays queued for this one, so its link queues once.
         atomic_ref<std::uint32_t> {exchange->shared.state}.clear_bits(~std::uint32_t {listed_k},
                                                                       std::memory_order_relaxed);
+        assert(exchange->stage == exchange_stage_t::free_k && !exchange->oldest_segment && !exchange->parked_segment &&
+               !exchange->oldest_file_segment && !exchange->parked_file_segment && !exchange->releasing() &&
+               "the last life let go of every segment and release");
         exchange->stage = exchange_stage_t::dispatched_k;
         exchange->shared.unsent_bytes = 0;
         exchange->shared.unsent_file_segments = 0;
@@ -322,6 +354,7 @@ struct serving {
         exchange->outcome = nullptr;
         exchange->pull_outcome = nullptr;
         exchange->pulled_view = nullptr;
+        exchange->body_pull = body_pull_t::unpulled_k;
         exchange->shared.pushed_segments = exchange->pushed_tail = exchange->newest_segment = nullptr;
         exchange->shared.pushed_file_segments = exchange->pushed_file_tail = exchange->newest_file_segment = nullptr;
         exchange->parts_state = parts_state_t::unlocated_k;
@@ -337,9 +370,10 @@ struct serving {
         exchange->endpoint = nullptr;
         exchange->network_interface = connection.network_interface;
         exchange->geometry = connection.transport.tunnel.geometry();
-        std::memcpy(exchange->peer_static_key, connection.transport.peer_static_key, sizeof(exchange->peer_static_key));
-        exchange->peer_address = connection.transport.peer_address;
-        if (connection.newest_exchange) connection.newest_exchange->connection_next = exchange;
+        [[maybe_unused]] bool const keyed = connection.transport.tunnel.peer_key(
+            std::as_writable_bytes(std::span {exchange->peer_static_key}));
+        exchange->peer_address = connection.peer_address;
+        if (connection.newest_exchange) connection.newest_exchange->next_queued = exchange;
         else connection.oldest_exchange = exchange;
         connection.newest_exchange = exchange;
         ++connection.outstanding_exchanges;
@@ -452,7 +486,7 @@ struct serving {
             exchange.body_chunk.clear();
             *exchange.pulled_view = bytes_view(text_view(exchange.pulled_chunk));
         }
-        publish(outcome, status);
+        publish<atomic_ref>(outcome, status);
     }
 
     /** Whether a waiting pull of @p exchange can take bytes or the end now. */
@@ -588,12 +622,12 @@ struct serving {
     static io_request_t* serve_open(server_t& server, event_loop_t& event_loop, connection_t& connection) noexcept {
         if (connection.transport.transmit_operation == operation_state_t::idle_k && !connection.transport.sending)
             if (io_request_t* release = replies_t::retire_sent_segments(event_loop, connection)) return release;
-        if (connection.transport.stage != transport_stage_t::open_k) return connection.advance();
+        if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         connection.transport.open_records();
         auto depth = connection.network_interface->config.max_pipelined_requests;
         auto const cap = connection.network_interface->config.max_request_bytes;
-        // Requests dispatched this round, erased from `input` once after it rather than one by one.
-        std::size_t consumed = 0;
+        // Requests dispatched so far, which leave `input` together rather than one by one.
+        std::size_t consumed = std::exchange(connection.transport.parsed, 0);
         while (connection.transport.stage == transport_stage_t::open_k &&
                connection.transport.receiving == receive_state_t::reading_k) {
             // A streamed body is a barrier: nothing behind it parses until it ended.
@@ -663,18 +697,21 @@ struct serving {
             dispatch(server, event_loop, connection, consumed);
             consumed = connection.transport.input.empty() ? 0 : consumed + wire;
         }
-        if (consumed) http_t::drop_bytes(connection.transport.input, consumed);
+        // The dispatched front leaves once it outweighs the rest, so a burst moves each byte once.
+        if (consumed >= connection.transport.input.size() - consumed)
+            http_t::drop_bytes(connection.transport.input, consumed);
+        else connection.transport.parsed = consumed;
         connection.transport.aim_receive();
-        if (connection.transport.stage != transport_stage_t::open_k) return connection.advance();
+        if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         if (auto* oldest = connection.oldest_exchange) replies_t::adopt_segments(*oldest);
-        if (connection.file_read_operation == operation_state_t::idle_k) {
+        if (!connection.file_request_in_flight()) {
             if (auto* next = replies_t::read_reply(event_loop, connection)) return next;
-            if (connection.transport.stage != transport_stage_t::open_k) return connection.advance();
+            if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         }
         if (connection.transport.transmit_operation == operation_state_t::idle_k) {
             if (auto* next = continue_request(connection)) return next;
             if (auto* next = replies_t::transmit_reply(event_loop, connection)) return next;
-            if (connection.transport.stage != transport_stage_t::open_k) return connection.advance();
+            if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         }
         // A streamed body reads on only once its last chunk was pulled.
         if (connection.transport.receiving == receive_state_t::reading_k &&
@@ -690,7 +727,6 @@ struct serving {
                 connection.transport.stage = transport_stage_t::lingering_k;
                 connection.transport.deadline = deadline_after(linger_microseconds_k);
             }
-            return connection.advance();
         }
         return nullptr;
     }
@@ -704,7 +740,10 @@ struct serving {
 
     /** The order links of a loop's connections by index, as its intrusive lists walk them. */
     struct order_links_t {
+
+        /** The loop whose connections the indices name. */
         event_loop_t& event_loop;
+
         order_link_t& operator[](std::uint32_t index) const noexcept {
             return event_loop.connections[index]->order_link;
         }
@@ -767,33 +806,35 @@ struct serving {
             else if (!connection.streaming) connection.transport.receiving = receive_state_t::ended_k;
         }
         if (server_stage == server_stage_t::cutting_k && connection.transport.stage != transport_stage_t::closing_k &&
+            connection.transport.stage != transport_stage_t::closing_socket_k &&
+            connection.transport.stage != transport_stage_t::closed_holding_k &&
             connection.transport.stage != transport_stage_t::closed_k) {
             // A reply cut off at stop must not read as whole; a linger would only delay the peer.
             if (connection.oldest_exchange || connection.transport.stage == transport_stage_t::releasing_k)
                 connection.transport.close_mode = close_mode_t::reset_k;
             connection.transport.fail(ucall_status_connection_closed_k);
         }
-        if (connection.transport.stage == transport_stage_t::closing_k &&
-            connection.file_reading == file_read_state_t::waiting_window_k)
-            leave_window_queue(event_loop, connection);
         for (;;) {
-            io_request_t* next = connection.transport.stage == transport_stage_t::closing_k
-                                     ? replies_t::drain_releases(event_loop, connection)
-                                     : nullptr;
+            io_request_t* next = nullptr;
+            if (connection.transport.stage == transport_stage_t::closing_k ||
+                connection.transport.stage == transport_stage_t::closing_socket_k) {
+                if (connection.file_reading == file_read_state_t::waiting_window_k)
+                    leave_window_queue(event_loop, connection);
+                next = replies_t::drain_releases(event_loop, connection);
+            }
             if (!next) next = connection.advance();
-            if (!next && connection.transport.stage == transport_stage_t::open_k)
+            if (!next && connection.transport.stage == transport_stage_t::open_k) {
                 next = serve_open(server, event_loop, connection);
+                // A stage serve_open left takes its releases and its close from the top.
+                if (!next && connection.transport.stage != transport_stage_t::open_k) continue;
+            }
             if (!next) break;
             if (next->operation == io_operation_t::close_k &&
                 connection.transport.close_mode == close_mode_t::reset_k) {
                 [[maybe_unused]] ucall_status_t const reset = engine.reset_on_close(connection.transport.descriptor);
                 connection.transport.close_mode = close_mode_t::orderly_k;
             }
-            // A failed submission is retried on the loop's next round rather than this one.
-            if (engine.submit(*next) != ucall_status_success_k) {
-                mark_ready(event_loop, connection);
-                return;
-            }
+            engine.submit(*next);
             if (next->operation == io_operation_t::zero_copy_release_k)
                 replies_t::release_submitted(event_loop, connection, *next);
             else connection.submitted(*next);
@@ -806,27 +847,27 @@ struct serving {
             (!oldest || (oldest == connection.streaming && oldest->stage == exchange_stage_t::dispatched_k &&
                          oldest->body_chunk.empty()))) {
             relist(event_loop, connection, connection_order_t::keepalive_k);
-            // A peer parked while every connection was busy evicts the first to turn idle.
-            evict(event_loop, interface_order(server, event_loop, *connection.network_interface));
+            // A peer parked while every connection was busy evicts the first to turn idle, never
+            // the one just admitted, whose request may still be on its way in.
+            if (entered != transport_stage_t::handshake_k)
+                evict(event_loop, *connection.network_interface,
+                      interface_order(server, event_loop, *connection.network_interface));
         }
         // Lingers and releases all wait linger_microseconds_k from their start, so appending
         // keeps deadline order.
-        else if ((stage == transport_stage_t::releasing_k || stage == transport_stage_t::lingering_k) &&
-                 stage != entered)
+        else if (lingers(stage) ? !lingers(entered) : stage == transport_stage_t::releasing_k && stage != entered)
             relist(event_loop, connection, connection_order_t::expiring_k);
         else if (connection.order == connection_order_t::keepalive_k) unlist(event_loop, connection);
         // The close waits until the other operations complete or are cancelled.
         if (connection.transport.stage == transport_stage_t::closing_k) {
-            if (connection.transport.receive_operation == operation_state_t::submitted_k &&
-                connection.transport.receive_request.operation != io_operation_t::close_k)
+            if (connection.transport.receive_operation == operation_state_t::submitted_k)
                 engine.cancel(connection.transport.receive_request);
             if (connection.transport.transmit_operation == operation_state_t::submitted_k)
                 engine.cancel(connection.transport.transmit_request);
-            if (connection.file_read_operation == operation_state_t::submitted_k)
-                engine.cancel(connection.file_read_request);
+            if (connection.file_request_in_flight()) engine.cancel(connection.file_read_request);
         }
         // A reset close purges what the kernel held, whose releases still arrive after it.
-        if (connection.transport.stage == transport_stage_t::closed_k && !connection.outstanding_releases()) {
+        if (connection.transport.stage == transport_stage_t::closed_k) {
             replies_t::detach(event_loop, connection);
             unlist(event_loop, connection);
             // A descriptor just came free, so the reserves the residue held closed reopen now.
@@ -843,8 +884,8 @@ struct serving {
                      {"address", text_view(connection.network_interface->config.address)}});
             connection.transport.tunnel.clear();
             connection.transport.input.clear();
+            connection.transport.parsed = 0;
             connection.transport.encrypted.clear();
-            connection.transport.output.clear();
             connection.transport.sending = nullptr;
             connection.transport.output_offset = 0;
             connection.transport.peer_stream = peer_stream_t::writing_k;
@@ -854,11 +895,30 @@ struct serving {
             --event_loop.open_connections;
             // Admission passes straight to a peer an eviction parked, on the record just freed.
             auto& network_interface = *connection.network_interface;
-            if (auto& order = interface_order(server, event_loop, network_interface); order.evicting >= 0) {
-                order.evicted = absent_k;
-                admit(server, event_loop, network_interface, std::exchange(order.evicting, -1), order.evicting_peer);
+            if (auto& order = interface_order(server, event_loop, network_interface); order.parked >= 0) {
+                order.eviction = eviction_t::none_k;
+                admit(server, event_loop, network_interface, std::exchange(order.parked, -1), order.parked_peer);
+                if (order.queued >= 0) {
+                    park(event_loop, network_interface, order, std::exchange(order.queued, -1), order.queued_peer);
+                    evict(event_loop, network_interface, order);
+                }
             }
             else release_admission(server, network_interface);
+            // A drain no arrival paces asks at each close whether only stalled peers are left.
+            if (event_loop.stage == event_loop_stage_t::draining_k) cut_stalled(event_loop);
+        }
+    }
+
+    /** Resets every connection of a draining loop once all that are left stalled since the last
+     *  close, and counts sends as progress from here on. */
+    static void cut_stalled(event_loop_t& event_loop) noexcept {
+        bool only_stalled = true;
+        for (auto& connection : event_loop.connections)
+            only_stalled = only_stalled &&
+                           (connection->transport.stage == transport_stage_t::idle_k || stalled(*connection));
+        for (auto& connection : event_loop.connections) {
+            if (only_stalled && connection->transport.stage != transport_stage_t::idle_k) cut(event_loop, *connection);
+            connection->transport.progress = transmit_progress_t::stalled_k;
         }
     }
 
@@ -871,8 +931,7 @@ struct serving {
             auto& connection = *event_loop.connections[event_loop.expiring.oldest];
             if (connection.transport.deadline > now) return;
             unlist(event_loop, connection);
-            if (connection.transport.stage == transport_stage_t::lingering_k)
-                connection.transport.fail(ucall_status_success_k);
+            if (lingers(connection.transport.stage)) connection.transport.fail(ucall_status_success_k);
             else if (connection.transport.stage == transport_stage_t::releasing_k) {
                 connection.transport.close_mode = close_mode_t::reset_k;
                 tally<atomic_ref>(event_loop.statistics.linger_resets);
@@ -889,7 +948,12 @@ struct serving {
     static std::uint64_t release_deadline(event_loop_t const& event_loop) noexcept {
         return event_loop.expiring.empty() ? 0 : event_loop.connections[event_loop.expiring.oldest]->transport.deadline;
     }
-    static ucall_status_t server_progress(server_t& server, event_loop_t& event_loop) noexcept {
+
+    /** Whether @p stage waits out the linger after a last reply, before or after its FIN. */
+    static bool lingers(transport_stage_t stage) noexcept {
+        return stage == transport_stage_t::lingering_k || stage == transport_stage_t::discarding_k;
+    }
+    static void server_progress(server_t& server, event_loop_t& event_loop) noexcept {
         auto& engine = event_loop.engine;
         auto stage = server_stage(server);
         for (auto& acceptor : event_loop.interface_acceptors) {
@@ -897,15 +961,16 @@ struct serving {
             auto& order = interface_order(server, event_loop, network_interface);
             if (stage != server_stage_t::serving_k) {
                 // An open listener keeps completing handshakes that no loop will accept.
-                if (acceptor.stage == acceptor_stage_t::submitted_k || acceptor.stage == acceptor_stage_t::probing_k ||
-                    (acceptor.stage == acceptor_stage_t::shedding_k && acceptor.shed_request.descriptor < 0))
+                if (acceptor.stage == acceptor_stage_t::accepting_k || acceptor.stage == acceptor_stage_t::probing_k ||
+                    acceptor.stage == acceptor_stage_t::shedding_accept_k)
                     engine.cancel(acceptor.request);
                 else if (acceptor.request.descriptor >= 0) {
                     engine.close_socket(acceptor.request.descriptor);
                     acceptor.request.descriptor = -1;
                 }
-                if (order.evicting >= 0) engine.close_socket(std::exchange(order.evicting, -1));
-                order.evicted = absent_k;
+                if (order.parked >= 0) engine.close_socket(std::exchange(order.parked, -1));
+                if (order.queued >= 0) engine.close_socket(std::exchange(order.queued, -1));
+                order.eviction = eviction_t::none_k;
                 continue;
             }
             // Nothing accepts without a reserve, which the residue holds closed until its deadline.
@@ -916,8 +981,11 @@ struct serving {
                 if (acceptor.reserve_descriptor < 0) continue;
             }
             // A pending accept reads its budget at each attempt, so every round renews it.
-            if (acceptor.stage == acceptor_stage_t::submitted_k) aim_accept(event_loop, acceptor);
-            if (acceptor.stage != acceptor_stage_t::idle_k || order.evicting >= 0) continue;
+            if (acceptor.stage == acceptor_stage_t::accepting_k) aim_accept(event_loop, acceptor);
+            // One peer queues behind a parked one that nothing closes for yet.
+            if (acceptor.stage != acceptor_stage_t::idle_k || order.queued >= 0 ||
+                (order.parked >= 0 && order.eviction != eviction_t::none_k))
+                continue;
             auto active = atomic_ref<std::size_t> {network_interface.active};
             auto const limit = network_interface.config.max_concurrent_connections;
             bool const admitted = event_loop.idle &&
@@ -925,19 +993,12 @@ struct serving {
             auto accepting = atomic_ref<std::size_t> {network_interface.accepting};
             // Saturated by connections, not by other loops' pending accepts, an accept probes for a
             // peer to evict for.
-            if (!admitted &&
-                (order.keepalive.empty() ||
-                 active.load(std::memory_order_relaxed) - accepting.load(std::memory_order_relaxed) < limit))
+            if (!admitted && active.load(std::memory_order_relaxed) - accepting.load(std::memory_order_relaxed) < limit)
                 continue;
-            acceptor.stage = admitted ? acceptor_stage_t::submitted_k : acceptor_stage_t::probing_k;
+            acceptor.stage = admitted ? acceptor_stage_t::accepting_k : acceptor_stage_t::probing_k;
             if (admitted) accepting.store_add(1, std::memory_order_relaxed);
             aim_accept(event_loop, acceptor);
-            if (engine.submit(acceptor.request) == ucall_status_success_k) continue;
-            acceptor.stage = acceptor_stage_t::idle_k;
-            if (admitted) {
-                accepting.store_sub(1, std::memory_order_relaxed);
-                active.store_sub(1, std::memory_order_relaxed);
-            }
+            engine.submit(acceptor.request);
         }
         collect_replies(event_loop);
         expire_releases(event_loop);
@@ -947,18 +1008,37 @@ struct serving {
                                                                    : event_loop_stage_t::draining_k;
         if (stage != server_stage_t::serving_k && event_loop.stage < loop_stage) {
             // Each connection sees every new stage once; later passes move what completions mark.
-            for (auto& connection : event_loop.connections)
+            for (auto& connection : event_loop.connections) {
                 if (connection->transport.stage != transport_stage_t::idle_k) mark_ready(event_loop, *connection);
+                connection->transport.progress = transmit_progress_t::stalled_k;
+            }
             event_loop.stage = loop_stage;
         }
         do {
             for (auto* connection = std::exchange(event_loop.ready, nullptr); connection;) {
                 auto& current = *connection;
                 connection = current.next;
+                // A handshake waits its turn behind the open connections, still listed as ready.
+                if (stage == server_stage_t::serving_k && current.transport.stage == transport_stage_t::handshake_k) {
+                    current.next = nullptr;
+                    (event_loop.newest_handshake ? event_loop.newest_handshake->next
+                                                 : event_loop.oldest_handshake) = &current;
+                    event_loop.newest_handshake = &current;
+                    continue;
+                }
                 current.transport.readiness = listing_t::unlisted_k;
                 advance_connection(server, event_loop, current, stage);
             }
         } while (collect_replies(event_loop) == ucall_status_success_k);
+        // One handshake step a pass; a stop, or a connection that left its handshake, costs none.
+        for (bool stepped = false; event_loop.oldest_handshake && !stepped;) {
+            auto& current = *event_loop.oldest_handshake;
+            event_loop.oldest_handshake = current.next;
+            if (!event_loop.oldest_handshake) event_loop.newest_handshake = nullptr;
+            stepped = stage == server_stage_t::serving_k && current.transport.stage == transport_stage_t::handshake_k;
+            current.transport.readiness = listing_t::unlisted_k;
+            advance_connection(server, event_loop, current, stage);
+        }
         if (stage != server_stage_t::serving_k) {
             bool busy = event_loop.open_connections != 0 || event_loop.metrics.state == metrics_state_t::sending_k;
             for (auto& acceptor : event_loop.interface_acceptors) busy |= acceptor.stage != acceptor_stage_t::idle_k;
@@ -973,7 +1053,6 @@ struct serving {
                 retire_event_loop(server, event_loop);
             }
         }
-        return ucall_status_success_k;
     }
 
     /** Retires @p event_loop for good, and once every loop is retired, wakes the batch polling
@@ -992,7 +1071,7 @@ struct serving {
      *  the loop's idle connections still admit beside it; a probe takes one. */
     static void aim_accept(event_loop_t const& event_loop, interface_acceptor_t& acceptor) noexcept {
         std::size_t headroom = 0;
-        if (acceptor.stage == acceptor_stage_t::submitted_k) {
+        if (acceptor.stage == acceptor_stage_t::accepting_k) {
             std::size_t const limit = acceptor.network_interface->config.max_concurrent_connections;
             std::size_t const active = atomic_ref<std::size_t> {acceptor.network_interface->active}.load(
                 std::memory_order_relaxed);
@@ -1010,16 +1089,14 @@ struct serving {
      *  close frees a descriptor or @c accept_deadline passes. */
     static void shed_accept(event_loop_t& event_loop, interface_acceptor_t& acceptor,
                             acceptor_stage_t failed) noexcept {
-        if (failed == acceptor_stage_t::shedding_k || acceptor.reserve_descriptor < 0) {
+        if (failed == acceptor_stage_t::shedding_accept_k || acceptor.reserve_descriptor < 0) {
             if (!event_loop.accept_deadline) event_loop.accept_deadline = deadline_after(linger_microseconds_k);
             return;
         }
         socket_close(std::exchange(acceptor.reserve_descriptor, -1));
-        acceptor.stage = acceptor_stage_t::shedding_k;
+        acceptor.stage = acceptor_stage_t::shedding_accept_k;
         aim_accept(event_loop, acceptor);
-        if (event_loop.engine.submit(acceptor.request) == ucall_status_success_k) return;
-        acceptor.stage = acceptor_stage_t::idle_k;
-        reopen_reserve(event_loop, acceptor);
+        event_loop.engine.submit(acceptor.request);
     }
 
     /** Closes the shed peer once its refusal is done, counts it, and reopens the reserve. */
@@ -1047,21 +1124,21 @@ struct serving {
     }
 
     /** Takes one connection an accept completed with, or its failure. An accept stays pending while
-     *  its request keeps a @c length, each further connection then taking an admission of its own,
-     *  and ends, cancelled, once none is left. */
+     *  its completions say so, each further connection then taking an admission of its own, and
+     *  ends, cancelled, once none is left. */
     static void accepted(io_completion_t const& completion) noexcept {
         auto& acceptor = *static_cast<interface_acceptor_t*>(completion.request->context);
         auto& event_loop = *acceptor.event_loop;
         auto& server = *event_loop.server;
         auto& network_interface = *acceptor.network_interface;
-        bool const pending = completion.request->length != 0;
+        bool const pending = completion.continuation == io::io_continuation_t::pending_k;
         auto const stage = pending ? acceptor.stage : std::exchange(acceptor.stage, acceptor_stage_t::idle_k);
-        if (stage == acceptor_stage_t::submitted_k && !pending)
+        if (stage == acceptor_stage_t::accepting_k && !pending)
             atomic_ref<std::size_t> {network_interface.accepting}.store_sub(1, std::memory_order_relaxed);
         if (completion.result < 0) {
-            if (stage == acceptor_stage_t::submitted_k) release_admission(server, network_interface);
+            if (stage == acceptor_stage_t::accepting_k) release_admission(server, network_interface);
             auto const failure = utilities::accept_failure(static_cast<int>(-completion.result));
-            if (stage == acceptor_stage_t::shedding_k && failure != accept_failure_t::exhausted_k)
+            if (stage == acceptor_stage_t::shedding_accept_k && failure != accept_failure_t::exhausted_k)
                 reopen_reserve(event_loop, acceptor);
             if (failure == accept_failure_t::peer_k) return;
             char digits[std::numeric_limits<int>::digits10 + 1];
@@ -1084,7 +1161,7 @@ struct serving {
         auto const peer = formatting_t::peer_address(reinterpret_cast<io_peer_address_t const*>(written)->address);
         auto active = atomic_ref<std::size_t> {network_interface.active};
         auto const limit = network_interface.config.max_concurrent_connections;
-        if (stage == acceptor_stage_t::submitted_k) {
+        if (stage == acceptor_stage_t::accepting_k) {
             admit(server, event_loop, network_interface, descriptor, peer);
             if (!pending) return;
             // The accept still pending holds an admission of its own, or, saturated, ends.
@@ -1094,12 +1171,13 @@ struct serving {
             event_loop.engine.cancel(*completion.request);
             return;
         }
-        if (stage == acceptor_stage_t::shedding_k) acceptor.reserve_descriptor = socket_open(network_interface.family);
+        if (stage == acceptor_stage_t::shedding_accept_k)
+            acceptor.reserve_descriptor = socket_open(network_interface.family);
         // A reserve that reopens shows the descriptor freed for a shed peer was not the last, so
         // only a peer that took the last is refused: a plaintext one reads `shed_reply_k` before
         // the close, and a Noise one, which no plaintext reaches, takes a reset.
-        if (stage == acceptor_stage_t::shedding_k && acceptor.reserve_descriptor < 0) {
-            acceptor.stage = acceptor_stage_t::shedding_k;
+        if (stage == acceptor_stage_t::shedding_accept_k && acceptor.reserve_descriptor < 0) {
+            acceptor.stage = acceptor_stage_t::shedding_refusal_k;
             acceptor.shed_request = {.operation = io_operation_t::send_k,
                                      .descriptor = descriptor,
                                      .context = &acceptor};
@@ -1113,8 +1191,7 @@ struct serving {
             std::memcpy(reply, shed_reply_k.data(), shed_reply_k.size());
             acceptor.shed_request.data = reply;
             acceptor.shed_request.length = shed_reply_k.size();
-            if (event_loop.engine.submit(acceptor.shed_request) != ucall_status_success_k)
-                shed_sent(event_loop, acceptor);
+            event_loop.engine.submit(acceptor.shed_request);
             return;
         }
         // A probe or a shed accept took no admission, so it admits only what a close freed
@@ -1122,26 +1199,66 @@ struct serving {
         if (event_loop.idle && active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit)
             return admit(server, event_loop, network_interface, descriptor, peer);
         auto& order = interface_order(server, event_loop, network_interface);
-        // One peer waits for an eviction at a time; a saturated accept's later ones are refused.
-        if (server_stage(server) != server_stage_t::serving_k || order.evicting >= 0) {
+        if (server_stage(server) != server_stage_t::serving_k || order.queued >= 0) {
             event_loop.engine.close_socket(descriptor);
             return;
         }
-        // The next close passes its slot to this peer, so admission never passes its budget.
-        order.evicting = descriptor;
-        order.evicting_peer = peer;
-        evict(event_loop, order);
+        // The next close passes its slot to the parked peer, so admission never passes its budget.
+        if (order.parked < 0) park(event_loop, network_interface, order, descriptor, peer);
+        else {
+            order.queued = descriptor;
+            order.queued_peer = peer;
+        }
+        evict(event_loop, network_interface, order);
     }
 
-    /** Closes the longest-idle connection for the peer parked in @p order, unless one already
-     *  closes for it or every connection holds a request. */
-    static void evict(event_loop_t& event_loop, interface_order_t& order) noexcept {
-        if (order.evicting < 0 || order.evicted != absent_k || order.keepalive.empty()) return;
-        auto& evicted = *event_loop.connections[order.keepalive.oldest];
-        unlist(event_loop, evicted);
-        evicted.transport.fail(ucall_status_connection_closed_k);
-        mark_ready(event_loop, evicted);
-        order.evicted = evicted.index;
+    /** Whether @p connection only waits for its peer to take a reply the application finished,
+     *  with a send the socket took nothing of since the loop last asked. */
+    static bool stalled(connection_t const& connection) noexcept {
+        return connection.transport.stage == transport_stage_t::open_k && connection.oldest_exchange &&
+               connection.oldest_exchange->stage == exchange_stage_t::ended_k &&
+               connection.transport.transmit_operation == operation_state_t::submitted_k &&
+               connection.transport.progress == transmit_progress_t::stalled_k;
+    }
+
+    /** Resets @p connection, whose peer must not read its cut reply as whole. */
+    static void cut(event_loop_t& event_loop, connection_t& connection) noexcept {
+        connection.transport.close_mode = close_mode_t::reset_k;
+        connection.transport.fail(ucall_status_connection_closed_k);
+        mark_ready(event_loop, connection);
+    }
+
+    /** Parks the peer @p descriptor in @p order; every send from here on counts as progress. */
+    static void park(event_loop_t& event_loop, network_interface_t const& network_interface, interface_order_t& order,
+                     descriptor_t descriptor, ucall_peer_address_t const& peer) noexcept {
+        order.parked = descriptor;
+        order.parked_peer = peer;
+        for (auto& connection : event_loop.connections)
+            if (connection->network_interface == &network_interface)
+                connection->transport.progress = transmit_progress_t::stalled_k;
+    }
+
+    /** Closes a connection for the peer parked in @p order, unless one already closes for it: the
+     *  longest-idle one, or, once a second peer queued behind the parked one, a busy one that sent
+     *  its peer nothing since the parking. Connections waiting on a handler are never chosen. */
+    static void evict(event_loop_t& event_loop, network_interface_t const& network_interface,
+                      interface_order_t& order) noexcept {
+        if (order.parked < 0 || order.eviction != eviction_t::none_k) return;
+        if (!order.keepalive.empty()) {
+            auto& evicted = *event_loop.connections[order.keepalive.oldest];
+            unlist(event_loop, evicted);
+            evicted.transport.fail(ucall_status_connection_closed_k);
+            mark_ready(event_loop, evicted);
+            order.eviction = eviction_t::closing_k;
+            return;
+        }
+        if (order.queued < 0) return;
+        for (auto& connection : event_loop.connections)
+            if (connection->network_interface == &network_interface && stalled(*connection)) {
+                cut(event_loop, *connection);
+                order.eviction = eviction_t::closing_k;
+                return;
+            }
     }
 
     /** Starts serving @p descriptor on an idle connection of @p event_loop under an admission it
@@ -1159,17 +1276,15 @@ struct serving {
         ++event_loop.open_connections;
         chosen->transport.descriptor = descriptor;
         chosen->transport.receive_memory = event_loop.engine.receive_memory();
-        chosen->transport.peer_address = peer;
+        chosen->peer_address = peer;
         chosen->network_interface = &network_interface;
-        chosen->send_buffer_bytes = network_interface.send_buffer_bytes;
         chosen->transport.stage = transport_stage_t::handshake_k;
+        chosen->transport.progress = transmit_progress_t::progressed_k;
         chosen->transport.status = ucall_status_success_k;
-        chosen->transport.authorizer = network_interface.config.peer_authorizer;
         chosen->transport.interface_statistics =
             &event_loop
                  .interface_statistics[static_cast<std::size_t>(&network_interface - server.network_interfaces.data())];
         tally<atomic_ref>(chosen->transport.interface_statistics->connections);
-        chosen->transport.authorizer_context = network_interface.config.peer_authorizer_context;
         auto result = chosen->configure(
             formatting_t::tunnel_config(network_interface.config.security, secure_tunnel_role_t::responder_k,
                                         network_interface.config.noise_private_key, network_interface.public_key,

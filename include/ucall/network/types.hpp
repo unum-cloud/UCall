@@ -23,6 +23,7 @@ struct ucall_server_handle_t {
     /** Stopping runs on any thread, so it touches only this CPU-independent word. */
     std::uint32_t stage {};
 
+    /** The server verbs of one network instantiation, which the exported functions forward to. */
     struct api_t {
         void (*free)(ucall_server_t);
         void (*stop)(ucall_server_t);
@@ -57,6 +58,8 @@ struct ucall_server_handle_t {
         void (*request_part)(ucall_server_request_part_t*);
         void (*bind_client)(ucall_client_init_t*);
     };
+
+    /** The verbs of the instantiation that created this server, set once at initialization. */
     api_t const* api {};
 };
 struct ucall_client_handle_t {
@@ -66,11 +69,14 @@ struct ucall_client_handle_t {
     ucall_client_handle_t(ucall_client_handle_t&&) = delete;
     ucall_client_handle_t& operator=(ucall_client_handle_t&&) = delete;
 
+    /** The client verbs of one network instantiation, which the exported functions forward to. */
     struct api_t {
         void (*free)(ucall_client_t);
         void (*call)(ucall_client_call_t*);
         void (*take_completed)(ucall_client_take_completed_t*);
     };
+
+    /** The verbs of the instantiation that created this client, set once at initialization. */
     api_t const* api {};
 };
 
@@ -85,15 +91,23 @@ using client_api_t = ucall_client_handle_t::api_t;
 /** Serving until the first stop, draining the replies in flight after it, and cutting them after
  *  any later stop; the server's @c stage word holds it. */
 enum class server_stage_t : std::uint32_t { serving_k, draining_k, cutting_k };
+
+/** Where a socket is: none yet, a client's connect in flight, the Noise handshake and the
+ *  authorizer, which plaintext passes at once, or open for requests and replies. Closing, which any
+ *  failure enters, cancels what is in flight and sends the close on the receive request; once
+ *  closed, a server connection waits for its releases before it is idle again. */
 enum class transport_stage_t : std::uint8_t {
-    idle_k,
-    connecting_k,
-    handshake_k,
-    open_k,
-    lingering_k, // Half-closed after the last reply, discarding what the peer still sends.
-    releasing_k, // Closing once the kernel lets go of zero-copy sends, or resetting at the linger deadline.
-    closing_k,
-    closed_k
+    idle_k,           // On its owner's idle list, holding no socket.
+    connecting_k,     // A client's connect is in flight.
+    handshake_k,      // The Noise handshake, or its plaintext no-op, still runs.
+    open_k,           // Serving exchanges.
+    lingering_k,      // After the last reply: the close record and the FIN are still to send.
+    discarding_k,     // FIN sent: reads are dropped until the peer closes or the linger deadline.
+    releasing_k,      // An orderly close waits for the kernel to let go of zero-copy sends.
+    closing_k,        // Cancelling what is in flight, then closing.
+    closing_socket_k, // The close is submitted and owns the descriptor.
+    closed_holding_k, // A reset close is done while releases of what it sent still arrive.
+    closed_k          // Closed with nothing held; the next pass makes it idle.
 };
 
 /** RFC 6298's initial retransmission timeout bounds the round trip a peer's last bytes take. */
@@ -114,6 +128,10 @@ enum class receive_state_t : std::uint8_t { reading_k, full_k, ended_k };
  *  newest request. */
 enum class transmit_state_t : std::uint8_t { idle_k, sending_k };
 
+/** Whether the socket took a send since its loop last parked an arriving peer or drained a
+ *  connection, which tells a peer taking its reply slowly from one that stopped reading. */
+enum class transmit_progress_t : std::uint8_t { stalled_k, progressed_k };
+
 /** How the socket's sends reach the wire: pinned until the kernel reports a copied send, which
  *  demotes the socket for good, as the rulings say; a demoted socket names no releases. */
 enum class send_mode_t : std::uint8_t { zero_copy_k, copying_k };
@@ -121,14 +139,20 @@ enum class send_mode_t : std::uint8_t { zero_copy_k, copying_k };
 /** Whether a request expecting <tt>100-continue</tt> is still owed its interim response. */
 enum class continue_state_t : std::uint8_t { none_k, owed_k };
 
-/** Whether the event loop adopted any segment of an exchange's reply yet, whether the last one,
- *  and whether its connection let go of it while the kernel still holds its segments; only the
- *  loop writes this. */
-enum class exchange_stage_t : std::uint8_t { dispatched_k, collected_k, ended_k, releasing_k };
+/** Whether a connection is closing to make room for an interface's parked peer. */
+enum class eviction_t : std::uint8_t { none_k, closing_k };
+
+/** Whether an exchange waits on the loop's free list, whether the loop adopted any segment of its
+ *  reply yet, whether the last one, and whether its connection let go of it while the kernel
+ *  still holds its segments; only the loop writes this. */
+enum class exchange_stage_t : std::uint8_t { free_k, dispatched_k, collected_k, ended_k, releasing_k };
 
 /** Whether a request's body was buffered before dispatch, is still streaming in through
  *  pulls, or streamed to its end; only the loop writes this once dispatched. */
 enum class body_stage_t : std::uint8_t { buffered_k, streaming_k, ended_k };
+
+/** Whether a buffered request's whole body was handed out by a pull already. */
+enum class body_pull_t : std::uint8_t { unpulled_k, pulled_k };
 
 /** Whether a request's multipart parts were looked for yet, and whether its body held them. */
 enum class parts_state_t : std::uint8_t { unlocated_k, located_k, malformed_k };
@@ -136,7 +160,12 @@ enum class parts_state_t : std::uint8_t { unlocated_k, located_k, malformed_k };
 /** One multipart part's headers and payload, @c offset to <tt>offset + length</tt> of its
  *  input. */
 struct request_part_t {
-    std::uint64_t offset {}, length {};
+
+    /** Where the part's headers start in its exchange's @c input. */
+    std::uint64_t offset {};
+
+    /** Bytes of the part's headers and payload, up to the line break before the next delimiter. */
+    std::uint64_t length {};
 };
 
 /** Whether zero-copy sends named a release request since it last completed, and whether it is
@@ -171,7 +200,7 @@ struct reply_segment {
     template <typename value_type_>
     using vector = typename network_t::template vector<value_type_>;
 
-    explicit reply_segment(allocator_t const& allocator = {}) noexcept : bytes(rebound_allocator<byte_t> {allocator}) {}
+    explicit reply_segment(allocator_t const& allocator) noexcept : bytes(rebound_allocator<byte_t> {allocator}) {}
     reply_segment(reply_segment const&) = delete;
     reply_segment& operator=(reply_segment const&) = delete;
     reply_segment(reply_segment&&) = delete;
@@ -179,11 +208,14 @@ struct reply_segment {
 
     /** Framed bytes between the tunnel's headroom and tailroom. */
     vector<byte_t> bytes {};
+
+    /** The next segment of whichever pushed stack, send queue or free list holds this one. */
     reply_segment_t* next {};
 };
 
 /** How far a file segment got: a path to open, a descriptor to measure, a range ready to read,
- *  or why it cannot be sent. */
+ *  or why it cannot be sent. Its reply answers a missing path or file with 404, a range past
+ *  the file's end with 416, and any other failure with 500. */
 enum class file_segment_stage_t : std::uint8_t {
     unopened_k,
     opened_k,
@@ -206,7 +238,7 @@ struct file_segment {
     using reply_segment_t = typename network_t::reply_segment_t;
     using file_segment_t = typename network_t::file_segment_t;
 
-    explicit file_segment(allocator_t const& allocator = {}) noexcept : segment(allocator) {
+    explicit file_segment(allocator_t const& allocator) noexcept : segment(allocator) {
         // A Windows handle takes 8 bytes where a descriptor takes 4, which pads the record by 8.
         static_assert(sizeof(file_segment_t) == sizeof(reply_segment_t) + (UCALL_OS_WINDOWS_ ? 40 : 32));
         static_assert(!std::is_empty_v<allocator_t> || sizeof(reply_segment_t) == 32,
@@ -217,7 +249,11 @@ struct file_segment {
     file_segment(file_segment&&) = delete;
     file_segment& operator=(file_segment&&) = delete;
 
+    /** Linked into the exchange's stacks and send queue in the file segment's place: the path
+     *  while unopened, then the chunk framing around the range, or nothing. */
     reply_segment_t segment;
+
+    /** The next file segment of the stack, queue, release or free list holding this one. */
     file_segment_t* next {};
 
     /** The next byte to read. */
@@ -226,9 +262,13 @@ struct file_segment {
     /** Still unread; the file's size, once out of range. */
     std::uint64_t remaining_bytes {};
 
-    /** The directory while unopened, then the file. */
+    /** The directory while unopened, or on Windows the caller's handle to reopen, then the file. */
     native_file_t file {utilities::invalid_native_file_k};
+
+    /** How far the loop got, @c opened_k or @c unopened_k as the replier queues it. */
     file_segment_stage_t stage {};
+
+    /** Whether the loop closes @c file once it opened it, set as the replier queues it. */
     file_origin_t file_origin {};
 
     /** Framing bytes of @c segment ahead of the range. */
@@ -264,9 +304,6 @@ enum class file_read_state_t : std::uint8_t { idle_k, opening_file_k, reading_fi
 /** One window of an event loop's pool: an aligned read of a file segment and its slice. */
 struct file_window_t {
 
-    /** Aligned file offset the read started at. */
-    std::uint64_t extent_offset {};
-
     /** Bytes of the requested range in this window. */
     std::uint32_t slice_bytes {};
 
@@ -281,19 +318,19 @@ struct file_window_t {
 
     /** Read ahead of the range, below the alignment. */
     std::uint16_t skipped {};
+
+    /** Where the window is in its borrow, from the read until the kernel let go of its sends. */
     file_window_stage_t stage {};
 };
-static_assert(sizeof(file_window_t) == 32);
-
-/** Whether the peer's static key passed the authorizer, once, before the connection opens. */
-enum class peer_verdict_t : std::uint8_t { unverified_k, authorized_k };
+static_assert(sizeof(file_window_t) == 20);
 
 /** Whether the peer still writes, or sent its FIN or Noise close record. */
 enum class peer_stream_t : std::uint8_t { writing_k, closed_k };
 
-/** Whether a client polls its own engine, is advanced by the server event loop it is bound to, or
- *  was freed while bound and waits for that loop to end its connections. */
-enum class client_binding_t : std::uint8_t { owned_k, bound_k, retiring_k };
+/** Whether a client polls its own engine, is advanced by the server event loop it is bound to,
+ *  was freed while bound, by any thread, or waits for that loop to end the connections it then
+ *  failed; only the free and the loop write it once bound. */
+enum class client_binding_t : std::uint8_t { owned_k, bound_k, freed_k, retiring_k };
 
 /** Whether an event loop, or a batch endpoint's polling owner, runs, sleeps on its wake channel,
  *  or was notified since it last did either; only waking a sleeper writes the channel. */
@@ -311,14 +348,58 @@ enum class connection_order_t : std::uint8_t { unlisted_k, keepalive_k, expiring
 
 /** A connection's place on its order, by indices into its loop's connections. */
 struct order_link_t {
-    std::uint32_t next {absent_k}, previous {absent_k};
+
+    /** The connection after this one on its order, or @c absent_k. */
+    std::uint32_t next {absent_k};
+
+    /** The connection before this one on its order, or @c absent_k. */
+    std::uint32_t previous {absent_k};
 };
 
 /** The event loop's own counters beside its engine's, on lines no other thread writes. */
 struct alignas(fu::default_alignment_k) event_loop_statistics_t {
-    std::uint64_t polls {}, empty_polls {}, accepts {}, requests {}, bytes_received {}, bytes_sent {}, bytes_copied {},
-        bytes_read {}, file_window_overlaps {}, linger_resets {}, ready_passes {}, replied_dequeues {},
-        shed_connections {}, windows_unpinned {};
+
+    /** Engine polls the loop issued, each taking zero or more completions. */
+    std::uint64_t polls {};
+
+    /** Engine polls that took no completion. */
+    std::uint64_t empty_polls {};
+
+    /** Peers admitted to one of the loop's idle connections. */
+    std::uint64_t accepts {};
+
+    /** Requests handed to an exchange, whether an endpoint or a refusal answers them. */
+    std::uint64_t requests {};
+
+    /** Bytes the engine received for the loop's sockets and bound clients, lingers included. */
+    std::uint64_t bytes_received {};
+
+    /** Bytes the engine sent from the loop's connections and bound clients. */
+    std::uint64_t bytes_sent {};
+
+    /** Bytes the loop copied: engine-held receives, handshakes, requests, reply bodies. */
+    std::uint64_t bytes_copied {};
+
+    /** Bytes the engine read from files into the loop's file windows. */
+    std::uint64_t bytes_read {};
+
+    /** File reads submitted while an earlier window of the stream waited to send or sent. */
+    std::uint64_t file_window_overlaps {};
+
+    /** Releasing closes reset at their deadline because the kernel still held what they sent. */
+    std::uint64_t linger_resets {};
+
+    /** Passes over a connection that is not idle, each advancing it as far as it goes. */
+    std::uint64_t ready_passes {};
+
+    /** Exchanges taken from the replied queue to adopt their pushed segments. */
+    std::uint64_t replied_dequeues {};
+
+    /** Peers refused while the process was out of descriptors, once their refusal is done. */
+    std::uint64_t shed_connections {};
+
+    /** Windows added unpinned, as the engine pins none or declined to pin their run. */
+    std::uint64_t windows_unpinned {};
 };
 
 /** The statuses the loop answers itself with, in @c interface_statistics_t::refused order. */
@@ -327,8 +408,18 @@ inline constexpr unsigned refused_statuses_k[] {400, 404, 405, 413, 501, 503, 50
 /** One event loop's refusals, handshake failures and live connections on one interface, in whole
  *  lines so neighbours in the loop's vector never share one. */
 struct alignas(fu::default_alignment_k) interface_statistics_t {
+
+    /** Requests the loop answered itself, one counter per status of @c refused_statuses_k. */
     std::uint64_t refused[std::size(refused_statuses_k)] {};
-    std::uint64_t handshake_failures {}, authorizer_refusals {}, connections {};
+
+    /** Connections failed by a broken handshake, or by a record that failed to seal or open. */
+    std::uint64_t handshake_failures {};
+
+    /** Connections whose authenticated peer key the interface's authorizer refused. */
+    std::uint64_t authorizer_refusals {};
+
+    /** Connections admitted and not yet closed, a gauge rather than a counter. */
+    std::uint64_t connections {};
 };
 static_assert(sizeof(interface_statistics_t) % fu::default_alignment_k == 0);
 

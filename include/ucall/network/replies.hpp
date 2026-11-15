@@ -66,11 +66,26 @@ struct replies {
     /** The records one call queues, each list newest first as the pushed stacks hold them, so they
      *  are published together or handed back together. */
     struct reply_batch_t {
-        reply_segment_t *newest_segment {}, *oldest_segment {};
-        file_segment_t *newest_file_segment {}, *oldest_file_segment {};
 
-        /** Framed bytes the socket will take, and body bytes copied. */
-        std::size_t bytes {}, copied {};
+        /** The segment queued last, a file segment's own included, linking to the older ones. */
+        reply_segment_t* newest_segment {};
+
+        /** The segment queued first, whose @c next the push links; null in an empty batch. */
+        reply_segment_t* oldest_segment {};
+
+        /** The file segment queued last, linking to the older ones. */
+        file_segment_t* newest_file_segment {};
+
+        /** The file segment queued first, whose @c next the push links; null without file parts. */
+        file_segment_t* oldest_file_segment {};
+
+        /** Framed bytes of its memory segments, which the socket will take. */
+        std::size_t bytes {};
+
+        /** Body bytes copied into them, which the loop counts as the exchange recycles. */
+        std::size_t copied {};
+
+        /** File segments queued, which @c shared.unsent_file_segments grows by. */
         std::uint32_t file_segments {};
     };
 
@@ -238,7 +253,7 @@ struct replies {
             discard_reply_batch(exchange, batch);
             return result;
         }
-        publish(outcome, ucall_status_deferred_k);
+        publish<atomic_ref>(outcome, ucall_status_deferred_k);
         exchange.outcome = outcome;
         exchange.end_segment.bytes.clear();
         atomic_ref<std::uint32_t> {exchange.shared.state}.set_bits(replied_k, std::memory_order_release);
@@ -408,9 +423,11 @@ struct replies {
             end_segment.bytes.clear();
             exchange.message.connection = http_connection_t::close_k;
         }
-        // The loop may still read a borrowed descriptor, so the loop reports how the reply ended.
-        if (atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.load(std::memory_order_acquire)) {
-            publish(outcome, ucall_status_deferred_k);
+        // The loop may still read a borrowed descriptor, so the loop reports how the reply ended,
+        // unless the peer left, when the loop reads none and may have retired.
+        if (!(state.load(std::memory_order_acquire) & detached_k) &&
+            atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.load(std::memory_order_acquire)) {
+            publish<atomic_ref>(outcome, ucall_status_deferred_k);
             exchange.outcome = outcome;
             result = ucall_status_deferred_k;
         }
@@ -634,14 +651,14 @@ struct replies {
 
     /** Makes a reply's deferred outcome final with @p status, once. */
     static void publish_reply_outcome(server_exchange_t& exchange, ucall_status_t status) noexcept {
-        if (exchange.outcome) publish(std::exchange(exchange.outcome, nullptr), status);
+        if (exchange.outcome) publish<atomic_ref>(std::exchange(exchange.outcome, nullptr), status);
     }
 
     /** Unlinks every exchange of a closed connection: ended ones recycle now, the rest once their
      *  reply or the stop path ends them. */
     static void detach(event_loop_t& event_loop, connection_t& connection) noexcept {
         for (auto* exchange = connection.oldest_exchange; exchange;) {
-            auto* next = std::exchange(exchange->connection_next, nullptr);
+            auto* next = std::exchange(exchange->next_queued, nullptr);
             exchange->connection = nullptr;
             if (exchange->body_stage == body_stage_t::streaming_k) {
                 exchange->body_stage = body_stage_t::ended_k;
@@ -701,7 +718,7 @@ struct replies {
             if (oldest->stage != exchange_stage_t::ended_k || oldest == connection.streaming) return nullptr;
             for (exchange_release_t& release : oldest->releases)
                 if (release.state == release_state_t::named_k) return &release.request;
-            connection.oldest_exchange = std::exchange(oldest->connection_next, nullptr);
+            connection.oldest_exchange = std::exchange(oldest->next_queued, nullptr);
             if (!connection.oldest_exchange) connection.newest_exchange = nullptr;
             --connection.outstanding_exchanges;
             bool const closes = !oldest->message.keep_alive();
@@ -961,7 +978,7 @@ struct replies {
             granularity = fu::max_of<std::size_t>(pages.default_page_size(), page_bytes_k);
         std::size_t const window_bytes = file_window_pool_t::window_bytes;
         std::size_t const run_windows = fu::min_of<std::size_t>(fu::max_of<std::size_t>(granularity / window_bytes, 1),
-                                                                pool.max_windows - pool.allocated_windows);
+                                                                pool.max_windows - pool.windows.size());
         std::size_t const run_bytes = (run_windows * window_bytes + granularity - 1) / granularity * granularity;
         page_t* const run = pages.allocate(run_bytes / page_bytes_k);
         if (!run) return ucall_status_out_of_memory_k;
@@ -975,8 +992,8 @@ struct replies {
                 pages.deallocate(run, run_bytes / page_bytes_k);
                 return registration.status;
             }
-            pool.pinning = registration.pinning;
-            if (registration.pinning == range_pinning_t::pinned_k) release.registered_memory = registration.index;
+            pool.pinning = registration.pinning();
+            release.registered_memory = registration.index;
         }
         if (release.registered_memory == io_unregistered_k)
             tally<atomic_ref>(event_loop.statistics.windows_unpinned, run_windows);
@@ -986,11 +1003,11 @@ struct replies {
             offset -= window_bytes;
             [[maybe_unused]] st::status_t const listed = pool.window_memory.push_back(st::assume_reserved,
                                                                                       base + offset);
+            auto const grown = static_cast<std::uint32_t>(pool.windows.size());
             [[maybe_unused]] st::status_t const added = pool.windows.push_back(
-                st::assume_reserved, file_window_t {.next = std::exchange(pool.free_windows, pool.allocated_windows)});
+                st::assume_reserved, file_window_t {.next = std::exchange(pool.free_windows, grown)});
             [[maybe_unused]] st::status_t const named = pool.release_requests.push_back(st::assume_reserved,
                                                                                         io_request_t {release});
-            ++pool.allocated_windows;
         }
         return ucall_status_success_k;
     }
@@ -999,7 +1016,7 @@ struct replies {
      *  below its limit, else none, queuing the stream for the next release. */
     static std::uint32_t borrow_window(event_loop_t& event_loop, connection_t& connection) noexcept {
         auto& pool = event_loop.file_windows;
-        if (pool.free_windows == absent_k && pool.allocated_windows != pool.max_windows &&
+        if (pool.free_windows == absent_k && pool.windows.size() != pool.max_windows &&
             grow_windows(event_loop) != ucall_status_success_k)
             return absent_k;
         std::uint32_t const window = pool.free_windows;
@@ -1032,8 +1049,8 @@ struct replies {
         bool const sealed = connection.transport.tunnel.encrypts();
         std::size_t const payload = sealed ? window_record_payload(connection.transport.tunnel.geometry(), file_segment)
                                            : file_record_stride_k;
-        record.extent_offset = file_segment.file_offset / alignment * alignment;
-        record.skipped = static_cast<std::uint16_t>(file_segment.file_offset - record.extent_offset);
+        std::uint64_t const extent_offset = file_segment.file_offset / alignment * alignment;
+        record.skipped = static_cast<std::uint16_t>(file_segment.file_offset - extent_offset);
         record.slice_bytes = static_cast<std::uint32_t>(
             fu::min_of<std::uint64_t>(file_segment.remaining_bytes, file_window_records_k * payload - record.skipped));
         record.sent_bytes = 0;
@@ -1057,7 +1074,7 @@ struct replies {
         }
         request->deadline = 0;
         request->registered_memory = pool.registered_memory(window);
-        request->file = {.offset = record.extent_offset, .file = file_segment.file};
+        request->file = {.offset = extent_offset, .file = file_segment.file};
         return request;
     }
 
@@ -1116,7 +1133,7 @@ struct replies {
         for (std::uint32_t window = connection.oldest_window; window != absent_k;
              window = event_loop.file_windows.windows[window].next)
             ++held;
-        if (held >= stream_windows_limit(connection.send_buffer_bytes)) return nullptr;
+        if (held >= stream_windows_limit(connection.network_interface->send_buffer_bytes)) return nullptr;
         std::uint32_t const window = borrow_window(event_loop, connection);
         if (window == absent_k) {
             if (connection.file_reading != file_read_state_t::waiting_window_k)
@@ -1136,9 +1153,8 @@ struct replies {
         // only while that one is still released, so both together hold what a copying send would.
         exchange_release_t& named = exchange.releases[exchange.naming];
         exchange_release_t& other = exchange.releases[exchange.naming ^ 1];
-        // A full release whose submission failed is offered again before anything else is sent.
-        if (other.state == release_state_t::named_k) return &other.request;
-        if (named.state == release_state_t::named_k && named.held_bytes >= connection.send_buffer_bytes / 2) {
+        if (named.state == release_state_t::named_k &&
+            named.held_bytes >= connection.network_interface->send_buffer_bytes / 2) {
             if (other.state == release_state_t::releasing_k) return nullptr;
             exchange.naming ^= 1;
             return &named.request;
@@ -1249,7 +1265,6 @@ struct replies {
         }
         [[maybe_unused]] std::uint32_t const oldest = unlink_oldest_window(event_loop, connection);
         pool.windows[window].stage = file_window_stage_t::releasing_k;
-        ++pool.releasing_windows;
         ++connection.releasing_windows;
     }
 
@@ -1263,7 +1278,6 @@ struct replies {
         connection_t* connection;
         if (window != absent_k) {
             connection = event_loop.connections[pool.windows[window].connection].get();
-            --pool.releasing_windows;
             --connection->releasing_windows;
             vacate_window(event_loop, window);
         }
@@ -1276,8 +1290,12 @@ struct replies {
                 serving_t::free_exchange(event_loop, exchange);
         }
         if (completion.result > 0) connection->send_mode = send_mode_t::copying_k;
-        if (connection->transport.stage == transport_stage_t::releasing_k && !connection->outstanding_releases())
-            connection->transport.stage = transport_stage_t::closing_k;
+        if (!connection->outstanding_releases()) {
+            if (connection->transport.stage == transport_stage_t::releasing_k)
+                connection->transport.stage = transport_stage_t::closing_k;
+            else if (connection->transport.stage == transport_stage_t::closed_holding_k)
+                connection->transport.stage = transport_stage_t::closed_k;
+        }
         serving_t::mark_ready(event_loop, *connection);
     }
 
@@ -1286,7 +1304,7 @@ struct replies {
      *  named a release submit it. Null once nothing is left to release. */
     static io_request_t* drain_releases(event_loop_t& event_loop, connection_t& connection) noexcept {
         if (connection.transport.transmit_operation == operation_state_t::submitted_k ||
-            connection.file_read_operation == operation_state_t::submitted_k)
+            connection.file_request_in_flight())
             return nullptr;
         auto& pool = event_loop.file_windows;
         while (connection.oldest_window != absent_k) {
@@ -1294,7 +1312,7 @@ struct replies {
             if (pool.windows[window].stage == file_window_stage_t::sending_k) return &pool.release_requests[window];
             vacate_window(event_loop, unlink_oldest_window(event_loop, connection));
         }
-        for (auto* exchange = connection.oldest_exchange; exchange; exchange = exchange->connection_next)
+        for (auto* exchange = connection.oldest_exchange; exchange; exchange = exchange->next_queued)
             for (exchange_release_t& release : exchange->releases)
                 if (release.state == release_state_t::named_k) return &release.request;
         return nullptr;

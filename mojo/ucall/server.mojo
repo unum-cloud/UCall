@@ -559,6 +559,8 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
     """Operations queued."""
     var completions: UInt64
     """Results taken."""
+    var kernel_entries: UInt64
+    """Submission and completion entries of io_uring; zero elsewhere."""
     var cancellations: UInt64
     """Pending operations, or io_uring multishot receives, the engine asked to cancel."""
     var accepts: UInt64

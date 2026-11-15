@@ -171,7 +171,7 @@ class route_trie {
   public:
     using allocator_t = allocator_type_;
 
-    explicit route_trie(allocator_t const& allocator = {}) noexcept
+    explicit route_trie(allocator_t const& allocator) noexcept
         : allocator_(allocator), nodes_(allocator_), edges_(allocator_), endpoints_(allocator_) {}
     route_trie(route_trie const&) = delete;
     route_trie& operator=(route_trie const&) = delete;

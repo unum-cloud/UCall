@@ -13,7 +13,7 @@ Pin a commit, not a version, when building on them.
 ## Folders
 
 - `utilities/`, in `unum::ucall::utilities`:
-  - `types.hpp`: platform and compiler detection, byte and text views, descriptors and polling threads, `allocated_ptr`, `highest_kit` and `successive_pools`, and the `fu`, `st` and `uc` aliases.
+  - `types.hpp`: `publish` for outcomes, byte and text views, descriptors and polling threads, `allocated_ptr`, `highest_kit`, `cpu_ceiling_t`, and the `fu`, `st` and `uc` aliases.
     The names every folder and the C entry points share are re-exported into `unum::ucall`.
   - `sockets.hpp`: the clock, socket and file calls each operating system spells its own way, from nonblocking sockets to unbuffered reads opened beneath a directory.
 - `io/`, in `unum::ucall::io`:
@@ -24,6 +24,7 @@ Pin a commit, not a version, when building on them.
   - `linux_uring612_engine.hpp`: the io_uring components both kernel versions compose, and `linux_uring612_engine` with single-shot buffer-select receives.
   - `linux_uring618_engine.hpp`: `linux_uring618_engine`, with multishot receive streams over the same components.
   - `windows_iocp_engine.hpp`: `windows_iocp_engine`, overlapped sockets and files on an I/O completion port.
+  - `windows_rio_engine.hpp`: `windows_rio_engine`, Registered I/O sockets beside overlapped accepts, connects and files on one port.
 - `http/`, in `unum::ucall::http`:
   - `messages.hpp`: the string kits and their ladders, incremental HTTP framing over borrowed views in `messages`, and the received response handle.
   - `routes.hpp`: immutable URI routing with literal, parameter and trailing wildcard precedence.

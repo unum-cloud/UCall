@@ -64,7 +64,8 @@ typedef struct ucall_client_options_t {
     size_t max_response_bytes;
 
     /** A server whose event loop drives this client, or NULL for a client with its own engine. A
-     *  bound client shares that loop's engine and backend, is made before the loop's first poll,
+     *  bound client shares that loop's engine, backend and CPU class, so a @c backend or
+     *  @c cpu_class naming another is an invalid argument; it is made before the loop's first poll,
      *  and is used only on its polling thread, whose take_call advances it; its take_completed only
      *  pops finished calls. @c ucall_server_free() returns without freeing while one lives. */
     ucall_server_t server;

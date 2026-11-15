@@ -52,43 +52,76 @@ struct transport {
     template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
 
-    explicit transport(allocator_t const& allocator = {}) noexcept
+    explicit transport(allocator_t const& allocator) noexcept
         : input(rebound_allocator<byte_t> {allocator}), encrypted(rebound_allocator<byte_t> {allocator}),
-          output(rebound_allocator<byte_t> {allocator}), record(rebound_allocator<byte_t> {allocator}) {
+          record(rebound_allocator<byte_t> {allocator}) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(transport) == 2176);
+            static_assert(sizeof(transport) == 1992);
     }
     transport(transport const&) = delete;
     transport& operator=(transport const&) = delete;
     transport(transport&&) = delete;
     transport& operator=(transport&&) = delete;
 
-    /** One engine request per direction; @c receive_request also closes. */
-    io_request_t receive_request {}, transmit_request {};
-    operation_state_t receive_operation {}, transmit_operation {};
+    /** The receive direction's one engine request: receives, and the close. */
+    io_request_t receive_request {};
+
+    /** The transmit direction's one engine request: a connect, sends, the linger's shutdown. */
+    io_request_t transmit_request {};
+
+    /** Whether @c receive_request is with the engine; only submission and completion write it. */
+    operation_state_t receive_operation {};
+
+    /** Whether @c transmit_request is with the engine; only submission and completion write it. */
+    operation_state_t transmit_operation {};
+
+    /** The socket, or -1 before one is accepted or opened and once its close is submitted. */
     descriptor_t descriptor {-1};
+
+    /** Where the socket is in its life, from idle through the handshake and open to closed. */
     transport_stage_t stage {transport_stage_t::idle_k};
+
+    /** Whether more messages are read; @c full_k only on a server at its pipelining budget. */
     receive_state_t receiving {};
+
+    /** Whether the open stage sends a reply segment, a window, or a client's request. */
     transmit_state_t transmitting {};
+
+    /** Whether a server's close resets the peer: cut, broken off, or past its release deadline. */
     close_mode_t close_mode {};
+
+    /** Why the transport closes, as the last @c fail set it; success until then. */
     ucall_status_t status {ucall_status_success_k};
+
+    /** When the requests it emits time out, or zero: a client's connect or oldest call, a server's
+     *  linger or release. */
     std::uint64_t deadline {};
+
+    /** The Noise or plaintext session, made anew by @c configure for each socket. */
     tunnel_t tunnel {};
-    vector<byte_t> input {}, encrypted {}, output {};
+
+    /** Plaintext received, parsed in place; under Noise, what @c open_records opened. */
+    vector<byte_t> input {};
+
+    /** Ciphertext received and not yet opened; stays empty on plaintext connections. */
+    vector<byte_t> encrypted {};
+
+    /** The message being parsed from @c input: a server's request, handed to its exchange at
+     *  dispatch, or a client's response. */
     http_message_t message {};
-    ucall_peer_authorizer_t authorizer {};
-    void* authorizer_context {};
 
-    /** Authenticated at handshake; zero on plaintext connections. */
-    ucall_noise_key_t peer_static_key {};
-
-    /** As accepted; unknown on client connections. */
-    ucall_peer_address_t peer_address {};
-    peer_verdict_t peer_verdict {};
+    /** Whether the peer still writes, until a receive of no bytes or a Noise close record. */
     peer_stream_t peer_stream {};
+
+    /** Whether the socket sits on its loop's or its client's ready list. */
     listing_t readiness {};
+
+    /** Which record holds it; a client connection sets @c client_k, servers keep the default. */
     transport_role_t role {};
+
+    /** Whether it took a send since the loop last marked it stalled; only a server reads it. */
+    transmit_progress_t progress {};
 
     /** Where its engine lands receives, set with its socket. */
     io_receive_memory_t receive_memory {};
@@ -96,18 +129,29 @@ struct transport {
     /** The tail of the receive's destination, which @c receive_request names. */
     io_vector_t receive_vector {};
 
-    /** @c record holds handshake messages only. */
+    /** Handshake messages, and once a server connection is open, its interim <tt>100 Continue</tt>. */
     vector<byte_t> record {};
-    byte_t* sending {};
-    std::size_t sending_length {}, sending_offset {};
 
-    /** Bytes of the segment in front that sends took. */
+    /** The first byte of the send in flight or partly taken; null while no send is pending. */
+    byte_t* sending {};
+
+    /** Bytes from @c sending that the pending send covers. */
+    std::size_t sending_length {};
+
+    /** Of those, the bytes the socket already took. */
+    std::size_t sending_offset {};
+
+    /** Bytes of a server's front segment, or of a client's composed requests, that sends took. */
     std::size_t output_offset {};
+
+    /** Bytes in front of @c input a server already dispatched, which leave once they outweigh
+     *  what follows or a receive needs their room, so a pipelined burst moves each byte once. */
+    std::size_t parsed {};
 
     /** Bytes read and dropped while lingering. */
     std::size_t lingered_bytes {};
 
-    /** The owning event loop's counters; null on client connections, which have no loop. */
+    /** The counters of the loop that advances it; null on a client with its own engine. */
     event_loop_statistics_t* statistics {};
 
     /** The counters of its interface on its event loop; null on client connections. */
@@ -123,18 +167,15 @@ struct transport {
         close_mode = close_mode_t::orderly_k;
         message = {};
         input.clear();
+        parsed = 0;
         encrypted.clear();
         sending = nullptr;
         sending_length = sending_offset = output_offset = lingered_bytes = 0;
         deadline = 0;
-        peer_verdict = peer_verdict_t::unverified_k;
         peer_stream = peer_stream_t::writing_k;
-        crypto_t::secure_zero(peer_static_key);
         auto fault = tunnel.make(config);
         if (fault != secure_tunnel_fault_t::none_k) return ucall_status_handshake_failed_k;
         if (!page_size()) return ucall_status_io_k;
-        peer_verdict = config.mode == secure_tunnel_mode_t::plain_k ? peer_verdict_t::authorized_k
-                                                                    : peer_verdict_t::unverified_k;
         return ucall_status_success_k;
     }
 
@@ -165,7 +206,7 @@ struct transport {
                 output_offset += sending_length;
             sending = nullptr;
         }
-        else if (stage == transport_stage_t::lingering_k) {
+        else if (stage == transport_stage_t::lingering_k || stage == transport_stage_t::discarding_k) {
             if (completed.operation == io_operation_t::shutdown_k) return;
             lingered_bytes += static_cast<std::size_t>(result);
             if (statistics) tally<atomic_ref>(statistics->bytes_received, static_cast<std::uint64_t>(result));
@@ -192,7 +233,7 @@ struct transport {
 
     /** The next engine request of every stage but open,
      *  which @c serve_open and @c call_open step. */
-    io_request_t* advance() noexcept {
+    io_request_t* advance(ucall_peer_authorizer_t authorizer, void* authorizer_context) noexcept {
         for (;;) {
             if (stage == transport_stage_t::closing_k) {
                 if (in_flight()) return nullptr;
@@ -203,10 +244,12 @@ struct transport {
                 return emit(receive_request, io_operation_t::close_k, {});
             }
             if (stage == transport_stage_t::closed_k || stage == transport_stage_t::idle_k ||
-                stage == transport_stage_t::open_k || stage == transport_stage_t::releasing_k)
+                stage == transport_stage_t::open_k || stage == transport_stage_t::releasing_k ||
+                stage == transport_stage_t::closing_socket_k || stage == transport_stage_t::closed_holding_k)
                 return nullptr;
             // The handshake takes turns between the two directions, and so does lingering.
             if (in_flight()) return nullptr;
+            if (stage == transport_stage_t::discarding_k) return emit_receive();
             if (stage == transport_stage_t::connecting_k) return &transmit_request;
             if (sending)
                 return emit(transmit_request, io_operation_t::send_k,
@@ -235,10 +278,10 @@ struct transport {
                 continue;
             }
             // The FIN follows any Noise close record, then receives drain the peer.
-            if (stage == transport_stage_t::lingering_k)
-                return transmit_request.operation == io_operation_t::shutdown_k
-                           ? emit_receive()
-                           : emit(transmit_request, io_operation_t::shutdown_k, {});
+            if (stage == transport_stage_t::lingering_k) {
+                stage = transport_stage_t::discarding_k;
+                return emit(transmit_request, io_operation_t::shutdown_k, {});
+            }
             if (step.state != secure_tunnel_state_t::ready_k) {
                 if (peer_stream == peer_stream_t::closed_k) {
                     fail(ucall_status_connection_closed_k);
@@ -246,18 +289,20 @@ struct transport {
                 }
                 return emit_receive();
             }
-            if (peer_verdict == peer_verdict_t::unverified_k) {
-                if (!tunnel.peer_key(std::as_writable_bytes(std::span {peer_static_key}))) {
+            // A ready Noise handshake is authorized once, here, on its way to open.
+            if (tunnel.encrypts()) {
+                ucall_noise_key_t peer_key {};
+                if (!tunnel.peer_key(std::as_writable_bytes(std::span {peer_key}))) {
                     fail(ucall_status_handshake_failed_k);
                     continue;
                 }
-                auto verdict = authorizer ? authorizer(&peer_static_key, authorizer_context) : ucall_status_success_k;
+                auto verdict = authorizer ? authorizer(&peer_key, authorizer_context) : ucall_status_success_k;
+                crypto_t::secure_zero(peer_key);
                 if (verdict != ucall_status_success_k) {
                     if (interface_statistics) tally<atomic_ref>(interface_statistics->authorizer_refusals);
                     fail(verdict);
                     continue;
                 }
-                peer_verdict = peer_verdict_t::authorized_k;
             }
             stage = transport_stage_t::open_k;
             return nullptr;
@@ -281,6 +326,8 @@ struct transport {
     void aim_receive() noexcept {
         if (receive_memory == io_receive_memory_t::submitter_k) {
             vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
+            if (destination.size() == destination.capacity() && &destination == &input && parsed)
+                http_t::drop_bytes(input, std::exchange(parsed, 0));
             // A receive of no bytes would read as a peer close.
             if (destination.size() == destination.capacity() &&
                 st::failed(destination.reserve(destination.size() + page_size())))
@@ -292,7 +339,8 @@ struct transport {
     /** Starts a receive, or steps the close of a transport that could not grow its room. */
     io_request_t* emit_receive() noexcept {
         aim_receive();
-        if (stage == transport_stage_t::closing_k) return advance();
+        // A closing transport is past its handshake, so it asks no authorizer.
+        if (stage == transport_stage_t::closing_k) return advance(nullptr, nullptr);
         return emit(receive_request, io_operation_t::receive_k, {reinterpret_cast<byte_t*>(&receive_vector), 1});
     }
 
@@ -312,6 +360,7 @@ struct transport {
         sending = bytes.data();
         sending_length = bytes.size();
         sending_offset = 0;
+        progress = transmit_progress_t::progressed_k;
         return emit(transmit_request, io_operation_t::send_k, bytes);
     }
 
@@ -321,12 +370,17 @@ struct transport {
         transmit_request.data = sending + sending_offset;
         transmit_request.length = sending_length - sending_offset;
         transmit_request.deadline = deadline;
+        progress = transmit_progress_t::progressed_k;
         return &transmit_request;
     }
 
-    /** Marks @p request, one of its two, in flight once the engine took it. */
+    /** Marks @p request, one of its two, in flight once the engine took it, and with a close its
+     *  descriptor too. */
     void submitted(io_request_t const& request) noexcept {
         (&request == &receive_request ? receive_operation : transmit_operation) = operation_state_t::submitted_k;
+        if (request.operation != io_operation_t::close_k) return;
+        descriptor = -1;
+        stage = transport_stage_t::closing_socket_k;
     }
     bool in_flight() const noexcept {
         return receive_operation == operation_state_t::submitted_k ||
@@ -381,8 +435,10 @@ struct transport {
         if (interface_statistics && error == ucall_status_handshake_failed_k)
             tally<atomic_ref>(interface_statistics->handshake_failures);
         status = error;
-        stage = transport_stage_t::closing_k;
-        crypto_t::secure_zero(peer_static_key);
+        // A close already submitted or done keeps its stage, and only the status is newer.
+        if (stage != transport_stage_t::closing_socket_k && stage != transport_stage_t::closed_holding_k &&
+            stage != transport_stage_t::closed_k)
+            stage = transport_stage_t::closing_k;
     }
     std::string_view text() const noexcept { return text_view(input); }
 

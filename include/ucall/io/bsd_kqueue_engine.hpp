@@ -50,16 +50,28 @@ struct bsd_kqueue_engine {
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     struct operation_t {
+
+        /** The request the record carries, or null while it is free. */
         io_request_t* request {};
+
+        /** The next record on the free, fresh, ready or landed list holding this one. */
         unsigned next {absent_k};
+
+        /** Whether the request is untouched, has started connecting, or was cancelled. */
         operation_stage_t stage {operation_stage_t::fresh_k};
+
+        /** Whether the record waits on readiness or on its AIO read, or was woken to retry. */
         io_interest_t interest {io_interest_t::unarmed_k};
     };
     static_assert(sizeof(operation_t) == 16);
 
-    /** Touched only by timed operations and landed reads. */
+    /** The deadline position and landed result of each record, read at every attempt and finish. */
     struct operation_cold_t {
+
+        /** The record's position in @c timed while its request has a deadline, else @c absent_k. */
         unsigned timed {absent_k};
+
+        /** What a landed file read, or a refused registration, completes with. */
         descriptor_t result {};
     };
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
@@ -86,12 +98,39 @@ struct bsd_kqueue_engine {
     bsd_kqueue_engine& operator=(bsd_kqueue_engine const&) = delete;
     bsd_kqueue_engine(bsd_kqueue_engine&&) = delete;
     bsd_kqueue_engine& operator=(bsd_kqueue_engine&&) = delete;
+
+    /** Records indexed by @c operation_index, each free or carrying one submitted request. */
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+
+    /** The cold half of each record, parallel to @c operations. */
     st::vector<operation_cold_t, rebound_allocator<operation_cold_t>> cold {};
+
+    /** The records whose request has a deadline, which every poll scans. */
     st::vector<unsigned, rebound_allocator<unsigned>> timed {};
+
+    /** The kqueue, and on FreeBSD the AIO blocks of file reads. */
     kqueue_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness {};
-    operation_list_t free_operations, fresh_operations, ready_operations, landed_operations;
-    std::size_t active {};
+
+    /** Records carrying no request. */
+    operation_list_t free_operations;
+
+    /** Records submitted and not yet attempted. */
+    operation_list_t fresh_operations;
+
+    /** Records woken by readiness, a cancel or a deadline, awaiting their next attempt. */
+    operation_list_t ready_operations;
+
+    /** Records whose file read or refused registration landed, awaiting collection. */
+    operation_list_t completed_operations;
+
+    /** Records carrying a request, from its submit to its completion. */
+    std::size_t taken_operations {};
+
+    /** What every poll answers once a submit found no record free, which the loops' budgets rule
+     *  out; zero otherwise. */
+    int fault {};
+
+    /** The counters the engine advances for its polling owner. */
     io_statistics_t statistics {};
     operation_list_t& free_list(unsigned) noexcept { return free_operations; }
     operation_cold_t& cold_fields(unsigned index) noexcept { return cold[index]; }
@@ -105,9 +144,12 @@ struct bsd_kqueue_engine {
         stop();
         return readiness.open(capacity);
     }
-    ucall_status_t submit(io_request_t& request) noexcept {
+    void submit(io_request_t& request) noexcept {
         auto index = free_operations.pop(operations);
-        if (index == absent_k) return ucall_status_contended_k;
+        if (index == absent_k) {
+            fault = -ENOBUFS;
+            return;
+        }
         auto& operation = operations[index];
         operation = {};
         cold[index] = {};
@@ -118,9 +160,8 @@ struct bsd_kqueue_engine {
             cold[index].timed = static_cast<unsigned>(timed.size());
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
-        ++active;
+        ++taken_operations;
         tally<atomic_ref_template_>(statistics.submissions);
-        return ucall_status_success_k;
     }
     descriptor_t attempt(unsigned index) noexcept {
         auto& operation = operations[index];
@@ -144,16 +185,11 @@ struct bsd_kqueue_engine {
         return readiness_poll<atomic_ref_template_>(*this, completions, wait_policy, deadline);
     }
     void stop() noexcept {
+        fault = 0;
         // File reads still in the kernel write into their buffers until they land.
         readiness.drain_files([&](unsigned, descriptor_t) noexcept {});
-        free_operations = fresh_operations = ready_operations = landed_operations = {};
-        timed.clear();
-        active = 0;
-        for (unsigned i = 0; i != operations.size(); ++i) {
-            operations[i] = {};
-            cold[i] = {};
-            free_operations.push(operations, i);
-        }
+        readiness_close_unattempted(*this);
+        readiness_reset(*this);
     }
     ~bsd_kqueue_engine() noexcept { stop(); }
 };
@@ -178,12 +214,18 @@ struct kqueue_readiness {
     kqueue_readiness& operator=(kqueue_readiness const&) = delete;
     kqueue_readiness(kqueue_readiness&&) = delete;
     kqueue_readiness& operator=(kqueue_readiness&&) = delete;
+
+    /** The kqueue, or -1 before @c open. */
     int descriptor {-1};
+
+    /** Where @c wait collects the kernel's events, one per record. */
     st::vector<struct kevent, rebound_allocator<struct kevent>> events {};
 #if UCALL_OS_FREEBSD_
 
     /** One per operation, read by the kernel. */
     st::vector<aiocb, rebound_allocator<aiocb>> file_reads {};
+
+    /** File reads the kernel accepted and has not landed, which @c stop waits for. */
     std::size_t file_reads_in_flight {};
 #endif
     ucall_status_t open(std::size_t capacity) noexcept {
@@ -304,7 +346,6 @@ struct kqueue_readiness {
         if (descriptor >= 0) close(descriptor);
     }
 };
-using kqueue_readiness_t = kqueue_readiness<>;
 using bsd_kqueue_engine_t = bsd_kqueue_engine<>;
 
 } // namespace unum::ucall::io

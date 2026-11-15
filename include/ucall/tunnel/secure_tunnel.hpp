@@ -263,10 +263,11 @@ class secure_tunnel {
      *  dynamic span, because a parameter can carry one and a struct member cannot - so the width is
      *  checked by the compiler here and by @c make there, and neither is assumed. A key merely
      *  supplied by configuration - as @c IK and @c KK both do - is assumed, not proven, and is not
-     *  reported here until the exchange completes.
+     *  reported here until the exchange completes. Nor is one a handshake that later broke sent:
+     *  its tag proves only that the sender held the handshake key, not the key's private half.
      */
     [[nodiscard]] bool peer_key(span<byte_t, secure_tunnel_key_size_k> out) const noexcept {
-        if (!encrypts()) return false;
+        if (!encrypts() || state_ != secure_tunnel_state_t::ready_k) return false;
         auto const& noise = crypto_t::noise_of(storage_);
         if (noise.remote_static_state != remote_static_t::authenticated_k) return false;
         std::memcpy(out.data(), noise.remote_static, out.size_bytes());

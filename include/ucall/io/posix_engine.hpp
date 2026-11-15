@@ -42,7 +42,11 @@ struct poll_readiness {
 
     /** The operations waiting on one polled descriptor, one per direction. */
     struct waiters_t {
+
+        /** The record waiting to receive on the descriptor, or @c absent_k. */
         unsigned receive_operation {absent_k};
+
+        /** The record waiting to transmit on the descriptor, or @c absent_k. */
         unsigned transmit_operation {absent_k};
     };
 
@@ -55,7 +59,11 @@ struct poll_readiness {
 
     /** Parallel to @c waiters, as @c poll reads them. */
     st::vector<pollfd, rebound_allocator<pollfd>> polled {};
+
+    /** The records waiting on each polled descriptor, parallel to @c polled. */
     st::vector<waiters_t, rebound_allocator<waiters_t>> waiters {};
+
+    /** Each polled descriptor's position in @c polled and @c waiters. */
     position_index_t positions {};
 
     ucall_status_t open(std::size_t capacity) noexcept {
@@ -165,16 +173,28 @@ struct posix_engine {
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     struct operation_t {
+
+        /** The request the record carries, or null while it is free. */
         io_request_t* request {};
+
+        /** The next record on the free, fresh, ready or landed list holding this one. */
         unsigned next {absent_k};
+
+        /** Whether the request is untouched, has started connecting, or was cancelled. */
         operation_stage_t stage {operation_stage_t::fresh_k};
+
+        /** Whether the record waits on readiness, or was woken to retry. */
         io_interest_t interest {io_interest_t::unarmed_k};
     };
     static_assert(sizeof(operation_t) == 16);
 
-    /** Touched only by timed operations. */
+    /** The deadline position and landed result of each record, read at every attempt and finish. */
     struct operation_cold_t {
+
+        /** The record's position in @c timed while its request has a deadline, else @c absent_k. */
         unsigned timed {absent_k};
+
+        /** Always zero, as nothing lands here; the shared readiness collect names it. */
         descriptor_t result {};
     };
     explicit posix_engine(allocator_t const& allocator = {}) noexcept
@@ -185,12 +205,39 @@ struct posix_engine {
     posix_engine(posix_engine&&) = delete;
     posix_engine& operator=(posix_engine&&) = delete;
     ~posix_engine() noexcept { stop(); }
+
+    /** Records indexed by @c operation_index, each free or carrying one submitted request. */
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+
+    /** The cold half of each record, parallel to @c operations. */
     st::vector<operation_cold_t, rebound_allocator<operation_cold_t>> cold {};
+
+    /** The records whose request has a deadline, which every poll scans. */
     st::vector<unsigned, rebound_allocator<unsigned>> timed {};
+
+    /** The poll set, naming the record waiting in each direction of each descriptor. */
     poll_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness {};
-    operation_list_t free_operations, fresh_operations, ready_operations, landed_operations;
-    std::size_t active {};
+
+    /** Records carrying no request. */
+    operation_list_t free_operations;
+
+    /** Records submitted and not yet attempted. */
+    operation_list_t fresh_operations;
+
+    /** Records woken by readiness, a cancel or a deadline, awaiting their next attempt. */
+    operation_list_t ready_operations;
+
+    /** Always empty, as nothing lands here; the shared readiness helpers name it. */
+    operation_list_t completed_operations;
+
+    /** Records carrying a request, from its submit to its completion. */
+    std::size_t taken_operations {};
+
+    /** What every poll answers once a submit found no record free, which the loops' budgets rule
+     *  out; zero otherwise. */
+    int fault {};
+
+    /** The counters the engine advances for its polling owner. */
     io_statistics_t statistics {};
     operation_list_t& free_list(unsigned) noexcept { return free_operations; }
     operation_cold_t& cold_fields(unsigned index) noexcept { return cold[index]; }
@@ -224,19 +271,17 @@ struct posix_engine {
         return readiness.open(capacity);
     }
     void stop() noexcept {
-        free_operations = fresh_operations = ready_operations = landed_operations = {};
-        timed.clear();
-        active = 0;
-        for (unsigned i = 0; i != operations.size(); ++i) {
-            operations[i] = {};
-            cold[i] = {};
-            free_operations.push(operations, i);
-        }
+        fault = 0;
+        readiness_close_unattempted(*this);
+        readiness_reset(*this);
         readiness.clear();
     }
-    ucall_status_t submit(io_request_t& request) noexcept {
+    void submit(io_request_t& request) noexcept {
         auto index = free_operations.pop(operations);
-        if (index == absent_k) return ucall_status_contended_k;
+        if (index == absent_k) {
+            fault = -ENOBUFS;
+            return;
+        }
         operations[index] = {};
         cold[index] = {};
         operations[index].request = &request;
@@ -246,9 +291,8 @@ struct posix_engine {
             cold[index].timed = static_cast<unsigned>(timed.size());
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
-        ++active;
+        ++taken_operations;
         tally<atomic_ref_template_>(statistics.submissions);
-        return ucall_status_success_k;
     }
     descriptor_t attempt(unsigned index) noexcept {
         auto& operation = operations[index];

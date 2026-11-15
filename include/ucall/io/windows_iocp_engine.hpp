@@ -45,7 +45,23 @@ using utilities::span;
 /** Where an overlapped operation is: in the kernel, finished at submission and queued for the next
  *  poll, being cancelled or timed out, or an accept's first record whose own accept finished while
  *  others of its request still wait, kept for their count. */
-enum class windows_operation_stage_t : std::uint8_t { pending_k, immediate_k, cancelling_k, timing_out_k, parked_k };
+enum class windows_operation_stage_t : std::uint8_t {
+
+    /** Issued to the kernel, or about to be. */
+    pending_k,
+
+    /** Answered at submission, queued on the immediate list for the next poll. */
+    immediate_k,
+
+    /** Cancelled by the submitter or by @c stop. */
+    cancelling_k,
+
+    /** Cancelled by its deadline, so the cancellation completes as @c -ETIMEDOUT. */
+    timing_out_k,
+
+    /** An accept's first record whose own accept finished while others of its request wait. */
+    parked_k,
+};
 
 /** Bytes @c AcceptEx writes per address, which it asks to exceed the largest by 16. */
 inline constexpr DWORD windows_accept_address_bytes_k = sizeof(sockaddr_storage) + 16;
@@ -59,8 +75,14 @@ inline constexpr ULONG_PTR windows_timer_key_k = 2;
 
 /** The Winsock extensions accepts and connects go through, loaded once per engine. */
 struct windows_extensions_t {
+
+    /** @c AcceptEx, which arms one accept into a socket created beforehand. */
     LPFN_ACCEPTEX accept {};
+
+    /** @c ConnectEx, which connects a bound socket overlapped. */
     LPFN_CONNECTEX connect {};
+
+    /** @c GetAcceptExSockaddrs, which finds the peer in what @c AcceptEx wrote. */
     LPFN_GETACCEPTEXSOCKADDRS addresses {};
 
     /** Loads every extension through one probe socket of the TCP provider, which serves both
@@ -100,7 +122,10 @@ struct windows_scatter_pages {
     windows_scatter_pages(windows_scatter_pages&&) = delete;
     windows_scatter_pages& operator=(windows_scatter_pages&&) = delete;
 
+    /** @c windows_scatter_pages_k elements per record, listing the pages of its vectored read. */
     st::vector<FILE_SEGMENT_ELEMENT, elements_allocator_t> elements {};
+
+    /** The system page size, which every element spans. */
     std::size_t page_bytes {};
 
     [[nodiscard]] ucall_status_t open(std::size_t capacity) noexcept {
@@ -130,16 +155,35 @@ struct windows_scatter_pages {
 /** One overlapped operation: the request it carries, the socket or file it was issued on, and an
  *  accept's socket and the addresses @c AcceptEx writes. */
 struct windows_operation_t {
+
+    /** What the kernel tracks the operation by, first so a packet's pointer names the record. */
     OVERLAPPED overlapped {};
+
+    /** The request the record carries, or null while it is free; an accept's records share one. */
     io_request_t* request {};
+
+    /** The socket or file the operation was issued on; an accept's records name the listener. */
     HANDLE handle {};
+
+    /** The socket an accept record's @c AcceptEx accepts into, until adopted or closed. */
     SOCKET accepted {INVALID_SOCKET};
+
+    /** The result of an operation that finished at submission, answered at the next poll. */
     descriptor_t immediate {};
+
+    /** Where the operation is, from issued to cancelled, timed out or parked. */
     windows_operation_stage_t stage {windows_operation_stage_t::pending_k};
-    unsigned next {operation_list_t::absent_k}, timed {operation_list_t::absent_k};
+
+    /** The next record on the free or immediate list holding this one. */
+    unsigned next {operation_list_t::absent_k};
+
+    /** The record's position in @c timed while its deadline is checked, else @c absent_k. */
+    unsigned timed {operation_list_t::absent_k};
 
     /** On an accept's first record, its request's records still owed, its own until it parks. */
     unsigned accepting {};
+
+    /** Where @c AcceptEx writes the local and remote addresses of an accept record's connection. */
     byte_t addresses[2 * windows_accept_address_bytes_k] {};
 };
 
@@ -178,18 +222,35 @@ struct windows_overlapped {
         if (port) CloseHandle(port);
     }
 
+    /** The completion port every handle of the engine is bound to. */
     HANDLE port {};
-    HANDLE timer {}, timer_packet {};
+
+    /** The high-resolution timer a blocking poll sets for its nearest deadline. */
+    HANDLE timer {};
+
+    /** The wait completion packet that posts the timer's firing to the port. */
+    HANDLE timer_packet {};
 
     /** The moment the timer's packet is armed for, or zero while none is. */
     std::uint64_t timer_due {};
+
+    /** Records indexed by @c operation_index, each free or carrying a request. */
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
+
+    /** The records whose request has a deadline, which every poll scans. */
     st::vector<unsigned, rebound_allocator<unsigned>> timed {};
+
+    /** Where @c GetQueuedCompletionStatusEx dequeues packets, one per record. */
     st::vector<OVERLAPPED_ENTRY, rebound_allocator<OVERLAPPED_ENTRY>> entries {};
-    operation_list_t free_operations, immediate_operations;
+
+    /** Records carrying no request. */
+    operation_list_t free_operations;
+
+    /** Records answered at submission, by the call itself or without one, for the next poll. */
+    operation_list_t immediate_operations;
 
     /** Records the kernel or the immediate list still owes a completion. */
-    std::size_t active {};
+    std::size_t taken_operations {};
 
     /** Packets armed on the port, by other components or the timer, and not yet received. */
     std::size_t foreign {};
@@ -304,7 +365,7 @@ struct windows_overlapped {
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline,
              windows_extensions_t const& extensions, io_statistics_t& statistics, std::size_t& notifications) noexcept {
         std::size_t count {};
-        while (count < completions.size() && (active || foreign) && !notifications) {
+        while (count < completions.size() && (taken_operations || foreign) && !notifications) {
             std::uint64_t const now = monotonic_ns();
             std::uint64_t nearest = deadline ? deadline : ~std::uint64_t {0};
             DWORD const wait = wait_policy == io_wait_t::blocking_k && !count && nearest > now ? INFINITE : DWORD {0};
@@ -360,7 +421,7 @@ struct windows_overlapped {
                 CancelIoEx(operation.handle, &operation.overlapped);
             }
         io_completion_t discarded[32];
-        while (active) {
+        while (taken_operations) {
             std::size_t notifications {};
             int const count = poll(discarded, io_wait_t::blocking_k, 0, extensions, statistics, notifications);
             if (count < 0) break;
@@ -398,7 +459,7 @@ struct windows_overlapped {
         operation.request = &request;
         operation.handle = reinterpret_cast<HANDLE>(socket);
         request.operation_index = index;
-        ++active;
+        ++taken_operations;
         tally<atomic_ref_template_>(statistics.submissions);
         return index;
     }
@@ -511,7 +572,7 @@ struct windows_overlapped {
                     return settle_now(index, -socket_error(static_cast<int>(error)));
                 }
                 release(member);
-                --active;
+                --taken_operations;
                 break;
             }
             ++first.accepting;
@@ -522,7 +583,7 @@ struct windows_overlapped {
             operations[member] = {};
             operations[member].request = &request;
             operations[member].handle = first.handle;
-            ++active;
+            ++taken_operations;
         }
         return ucall_status_success_k;
     }
@@ -601,12 +662,12 @@ struct windows_overlapped {
                 if (request.length > 1) --request.length;
                 else cancel(request, statistics);
                 tally<atomic_ref_template_>(statistics.completions);
-                completions[count++] = {&request, result, peer};
+                completions[count++] = {&request, result, peer, 0, io_continuation_t::pending_k};
             }
             if (index != first) release(index);
             // A cancel already asked of the request must not be asked again.
             else if (operation.stage != operation_stage_t::cancelling_k) operation.stage = operation_stage_t::parked_k;
-            --active;
+            --taken_operations;
             return count;
         }
         if (index != first) release(first);
@@ -637,12 +698,13 @@ struct windows_overlapped {
             setsockopt(reinterpret_cast<SOCKET>(operation.handle), SOL_SOCKET, SO_UPDATE_CONNECT_CONTEXT, nullptr, 0) !=
                 0)
             result = -socket_last_error();
-        if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
         if (request.operation == io_operation_t::accept_k) request.length = 0;
         request.operation_index = io_unindexed_k;
         release(index);
-        --active;
+        --taken_operations;
         tally<atomic_ref_template_>(statistics.completions);
+        if (request.operation == io_operation_t::send_k && result >= 0)
+            tally<atomic_ref_template_>(statistics.copying_sends);
         return {&request, result};
     }
 };
@@ -672,9 +734,16 @@ struct windows_iocp_engine {
     windows_iocp_engine& operator=(windows_iocp_engine&&) = delete;
     ~windows_iocp_engine() noexcept { stop(); }
 
+    /** The port, its records and its timer. */
     windows_overlapped<allocator_t, atomic_ref_template_> overlapped;
+
+    /** The Winsock extensions accepts and connects call. */
     windows_extensions_t extensions {};
+
+    /** The page lists vectored file reads scatter through. */
     windows_scatter_pages<allocator_t> scatter;
+
+    /** The counters the engine advances for its polling owner. */
     io_statistics_t statistics {};
 
     ucall_status_t open(std::size_t, std::size_t capacity,
@@ -698,15 +767,26 @@ struct windows_iocp_engine {
     }
     memory_registration_t register_memory(span<byte_t>) noexcept { return {}; }
     void release(io_completion_t const&) noexcept {}
-    ucall_status_t submit(io_request_t& request) noexcept {
-        return overlapped.submit(request, static_cast<SOCKET>(request.descriptor), extensions, scatter, statistics);
+
+    /** Why the engine ended, which every later poll answers; zero while it runs. */
+    int fault {};
+
+    void submit(io_request_t& request) noexcept {
+        // The records cover what the loops hold at once, so only a miscount ends the engine here.
+        if (overlapped.submit(request, static_cast<SOCKET>(request.descriptor), extensions, scatter, statistics) !=
+            ucall_status_success_k)
+            fault = -ENOBUFS;
     }
     ucall_status_t cancel(io_request_t& request) noexcept { return overlapped.cancel(request, statistics); }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
+        if (fault) return fault;
         std::size_t notifications {};
         return overlapped.poll(completions, wait_policy, deadline, extensions, statistics, notifications);
     }
-    void stop() noexcept { overlapped.stop(extensions, statistics); }
+    void stop() noexcept {
+        overlapped.stop(extensions, statistics);
+        fault = 0;
+    }
 };
 using windows_iocp_engine_t = windows_iocp_engine<>;
 

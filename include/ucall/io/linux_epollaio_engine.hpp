@@ -28,7 +28,6 @@ namespace unum::ucall::io {
 
 using utilities::byte_t;
 using utilities::descriptor_t;
-using utilities::monotonic_ns;
 using utilities::socket_close;
 using utilities::socket_open;
 using utilities::socket_option;
@@ -48,34 +47,64 @@ using utilities::span;
 
 /** Whether a watched socket is open, or closed by its owner and kept until the kernel let go of its
  *  zero-copy bytes. */
-enum class watch_stage_t : std::uint8_t { open_k, closing_k };
+enum class watch_stage_t : std::uint8_t {
+
+    /** The owner still holds the descriptor. */
+    open_k,
+
+    /** Closed by its owner, kept until the last notification due arrived. */
+    closing_k,
+};
 
 /** One registered descriptor, the operation waiting in each direction, and its zero-copy sends
  *  whose notifications are still due, as runs in send order. */
 struct readiness_watch_t {
+
+    /** The registered descriptor, or -1 while the watch is free. */
     std::int32_t descriptor {-1};
 
     /** Rides in the event, so stale events never wake a reused watch. */
     std::uint32_t generation {};
 
+    /** The record last armed to receive, which may have ended since; @c absent_k once closing. */
     std::uint32_t receive_operation {operation_list_t::absent_k};
 
-    /** Or the close of a closing watch. */
+    /** The record last armed to transmit, or the close a closing watch lands, or @c absent_k. */
     std::uint32_t transmit_operation {operation_list_t::absent_k};
 
+    /** The notification ID the socket's next zero-copy send takes, counted as the kernel does. */
     std::uint32_t next_zero_copy_id {};
-    std::uint32_t oldest_run {operation_list_t::absent_k}, newest_run {operation_list_t::absent_k};
+
+    /** The run whose notifications are due first, or @c absent_k once none is due. */
+    std::uint32_t oldest_run {operation_list_t::absent_k};
+
+    /** The run the next zero-copy send may extend, or @c absent_k once none is due. */
+    std::uint32_t newest_run {operation_list_t::absent_k};
+
+    /** Whether the socket's sends try zero-copy, decided at its first zero-copy send. */
     zero_copy_stage_t zero_copy {zero_copy_stage_t::untried_k};
+
+    /** Whether the owner still holds the descriptor, or closed it while notifications are due. */
     watch_stage_t stage {watch_stage_t::open_k};
 };
 static_assert(sizeof(readiness_watch_t) == 32);
 
 /** Consecutive zero-copy sends of one socket naming one release, by their notification IDs. */
 struct zero_copy_run_t {
+
+    /** The notification ID of the run's first send. */
     std::uint32_t first_id {};
+
+    /** The record of the release every send of the run names. */
     std::uint32_t release_operation {operation_list_t::absent_k};
+
+    /** The socket's next run in send order, or the next free run, or @c absent_k. */
     std::uint32_t next {operation_list_t::absent_k};
+
+    /** Sends in the run, whose IDs follow @c first_id without a gap. */
     std::uint16_t sends {};
+
+    /** Sends of the run already notified; the run frees once it reaches @c sends. */
     std::uint16_t notified {};
 };
 static_assert(sizeof(zero_copy_run_t) == 16);
@@ -102,9 +131,17 @@ struct epoll_readiness {
     epoll_readiness& operator=(epoll_readiness const&) = delete;
     epoll_readiness(epoll_readiness&&) = delete;
     epoll_readiness& operator=(epoll_readiness&&) = delete;
+
+    /** The epoll set, kept across reopens, or -1 before the first @c open. */
     int descriptor {-1};
+
+    /** Where @c wait collects the kernel's events, one per record. */
     st::vector<epoll_event, rebound_allocator<epoll_event>> events {};
+
+    /** One watch per registered descriptor, whose handle each of its events carries. */
     watches_t watches {};
+
+    /** The watch of each registered descriptor. */
     watch_index_t watch_index {};
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(events.resize(capacity))) return ucall_status_out_of_memory_k;
@@ -206,7 +243,6 @@ struct epoll_readiness {
         if (descriptor >= 0) close(descriptor);
     }
 };
-using epoll_readiness_t = epoll_readiness<>;
 
 /** AIO events one engine keeps in flight; <tt>fs.aio-max-nr</tt>, 65536 by default, bounds the sum
  *  on a host, so a 64-loop server reserves 4096 of them. */
@@ -214,13 +250,18 @@ inline constexpr std::uint32_t linux_aio_depth_k = 64;
 
 /** One Linux AIO context, through raw syscalls, completing into an eventfd an epoll set watches. */
 struct linux_aio_t {
+
+    /** The kernel's AIO context, or zero while closed. */
     aio_context_t context {};
+
+    /** The eventfd every read completes into, which the epoll set watches, or -1 while closed. */
     int signal_descriptor {-1};
 
     /** The first @c open tries, halved while the host limit refuses. */
     std::uint32_t depth {linux_aio_depth_k};
 
-    std::uint32_t in_flight {};
+    /** Reads submitted and not yet drained, at most @c depth. */
+    std::uint32_t file_reads_in_flight {};
     linux_aio_t() noexcept = default;
     linux_aio_t(linux_aio_t const&) = delete;
     linux_aio_t& operator=(linux_aio_t const&) = delete;
@@ -247,13 +288,13 @@ struct linux_aio_t {
         if (signal_descriptor >= 0) ::close(signal_descriptor);
         context = 0;
         signal_descriptor = -1;
-        in_flight = 0;
+        file_reads_in_flight = 0;
     }
 
     /** Starts @p request's file read as operation @p index: zero, or a negated errno, @c -EAGAIN
      *  while every event is taken. */
     int submit(unsigned index, io_request_t const& request) noexcept {
-        if (in_flight == depth) return -EAGAIN;
+        if (file_reads_in_flight == depth) return -EAGAIN;
         iocb block {};
         block.aio_data = index;
         block.aio_lio_opcode = request.operation == io_operation_t::file_read_k ? IOCB_CMD_PREAD : IOCB_CMD_PREADV;
@@ -266,7 +307,7 @@ struct linux_aio_t {
         iocb* blocks[1] {&block};
         long const submitted = syscall(SYS_io_submit, context, 1, blocks);
         if (submitted == 1) {
-            ++in_flight;
+            ++file_reads_in_flight;
             return 0;
         }
         return submitted < 0 ? -errno : -EAGAIN;
@@ -282,7 +323,7 @@ struct linux_aio_t {
             timespec none {};
             count = syscall(SYS_io_getevents, context, 0, long {linux_aio_depth_k}, landed_events, &none);
             for (long i = 0; i < count; ++i) {
-                --in_flight;
+                --file_reads_in_flight;
                 landed(static_cast<unsigned>(landed_events[i].data), static_cast<descriptor_t>(landed_events[i].res));
             }
         }
@@ -316,8 +357,15 @@ struct linux_epollaio_engine {
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_epollaio_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     struct operation_t {
+
+        /** The request the record carries, or null while it is free. */
         io_request_t* request {};
-        unsigned next {absent_k}, timed {absent_k};
+
+        /** The next record on whichever free, ready, landed or waiting list holds this one. */
+        unsigned next {absent_k};
+
+        /** The record's position in @c timed while its deadline is checked, else @c absent_k. */
+        unsigned timed {absent_k};
 
         /** A release's zero-copy sends not yet notified. */
         std::uint32_t outstanding_notifications {};
@@ -325,30 +373,67 @@ struct linux_epollaio_engine {
         /** What a landed operation completes with. */
         descriptor_t result {};
 
+        /** Whether the request is untouched, has started connecting, or was cancelled. */
         operation_stage_t stage {operation_stage_t::fresh_k};
+
+        /** Whether the record waits on readiness, AIO, notifications or its close, or retries. */
         io_interest_t interest {io_interest_t::unarmed_k};
     };
     static_assert(sizeof(operation_t) == 32);
     using operation_cold_t = operation_t;
     operation_cold_t& cold_fields(unsigned index) noexcept { return operations[index]; }
 
+    /** Records by @c operation_index; those from @c first_release on serve named releases. */
     vector<operation_t> operations;
+
+    /** Records whose deadline every poll checks; file reads and releases never join. */
     vector<unsigned> timed;
+
+    /** Zero-copy runs, one per record, linked per socket or from @c free_runs. */
     vector<zero_copy_run_t> runs;
+
+    /** The epoll set and the watch of every registered descriptor. */
     epoll_readiness<allocator_t, atomic_ref_template_, row_kit_type_> readiness;
+
+    /** The AIO context file reads go through. */
     linux_aio_t files;
-    operation_list_t free_operations, free_releases, fresh_operations, ready_operations, landed_operations,
-        waiting_files;
+
+    /** Free records before @c first_release, for any request. */
+    operation_list_t free_operations;
+
+    /** Free records from @c first_release on, for releases a send names. */
+    operation_list_t free_releases;
+
+    /** Records submitted, or handed back by a cancel or a freed AIO event, not yet attempted. */
+    operation_list_t fresh_operations;
+
+    /** Records woken by readiness, a cancel or a deadline, awaiting their next attempt. */
+    operation_list_t ready_operations;
+
+    /** Records whose result landed, awaiting collection. */
+    operation_list_t completed_operations;
+
+    /** File reads waiting for a free AIO event, restarted as reads land. */
+    operation_list_t waiting_files;
 
     /** Records from here on serve releases a send named, so the kernel holding those for as long
      *  as it likes never drains what connections need. */
     unsigned first_release {};
+
+    /** The first free run, linked through @c next, or @c absent_k. */
     unsigned free_runs {absent_k};
-    std::size_t active {};
+
+    /** Submitted requests not yet completed, a release counted from its own submit. */
+    std::size_t taken_operations {};
+
+    /** What every poll answers once a submit found no record free, which the loops' budgets rule
+     *  out; zero otherwise. */
+    int fault {};
 
     /** Why @c open answered @c ucall_status_unsupported_k, naming the setting to raise. */
     char const* refusal {};
 
+    /** The counters the engine advances for its polling owner. */
     io_statistics_t statistics {};
 
     explicit linux_epollaio_engine(allocator_t const& allocator = {}) noexcept
@@ -400,12 +485,15 @@ struct linux_epollaio_engine {
         return index < operations.size() && operations[index].request == &request ? index : absent_k;
     }
 
-    ucall_status_t submit(io_request_t& request) noexcept {
+    void submit(io_request_t& request) noexcept {
         // A release some send already named holds its record since that send.
         unsigned index = request.operation == io_operation_t::zero_copy_release_k ? carrying(request) : absent_k;
         if (index == absent_k) {
             index = free_operations.pop(operations);
-            if (index == absent_k) return ucall_status_contended_k;
+            if (index == absent_k) {
+                fault = -ENOBUFS;
+                return;
+            }
             operations[index] = {};
             operations[index].request = &request;
             request.operation_index = index;
@@ -419,9 +507,8 @@ struct linux_epollaio_engine {
             operation.timed = static_cast<unsigned>(timed.size());
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, unsigned {index});
         }
-        ++active;
+        ++taken_operations;
         tally<atomic_ref_template_>(statistics.submissions);
-        return ucall_status_success_k;
     }
 
     ucall_status_t cancel(io_request_t& request) noexcept {
@@ -435,8 +522,8 @@ struct linux_epollaio_engine {
         tally<atomic_ref_template_>(statistics.cancellations);
         operation.stage = operation_stage_t::cancelled_k;
         if (operation.interest == io_interest_t::armed_k) readiness_wake(*this, index);
-        else if (operation.interest == io_interest_t::landing_k &&
-                 waiting_files.erase(operations, index) == st::success_k) {
+        else if (operation.interest == io_interest_t::queued_k) {
+            [[maybe_unused]] st::status_t const erased = waiting_files.erase(operations, index);
             operation.interest = io_interest_t::unarmed_k;
             fresh_operations.push(operations, index);
         }
@@ -449,9 +536,13 @@ struct linux_epollaio_engine {
         if (operation.stage == operation_stage_t::cancelled_k) return -ECANCELED;
         tally<atomic_ref_template_>(statistics.kernel_enters);
         int const started = files.submit(index, *operation.request);
-        if (started == -EAGAIN) waiting_files.push(operations, index);
-        else if (started < 0) return started;
-        else tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
+        if (started == -EAGAIN) {
+            waiting_files.push(operations, index);
+            operation.interest = io_interest_t::queued_k;
+            return 0;
+        }
+        if (started < 0) return started;
+        tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
         operation.interest = io_interest_t::landing_k;
         return 0;
     }
@@ -459,9 +550,10 @@ struct linux_epollaio_engine {
     /** Sends copying, as a socket does once zero-copy is refused or reported copied. */
     descriptor_t send_copying(io_request_t const& request) noexcept {
         auto const length = fu::min_of<std::size_t>(request.length, (std::numeric_limits<int>::max)());
-        tally<atomic_ref_template_>(statistics.copying_sends);
         ssize_t const sent = send(static_cast<int>(request.descriptor), request.data, length, MSG_NOSIGNAL);
-        return sent >= 0 ? static_cast<descriptor_t>(sent) : -errno;
+        if (sent < 0) return -errno;
+        tally<atomic_ref_template_>(statistics.copying_sends);
+        return static_cast<descriptor_t>(sent);
     }
 
     /** Sends with @c MSG_ZEROCOPY, counting the send against its release under the socket's next
@@ -627,7 +719,7 @@ struct linux_epollaio_engine {
     /** Hands landed AIO reads on, then starts the reads that waited for their events. */
     void drain_files() noexcept {
         files.drain([&](unsigned index, descriptor_t result) noexcept { readiness_land(*this, index, result); });
-        while (files.in_flight != files.depth) {
+        while (files.file_reads_in_flight != files.depth) {
             unsigned const index = waiting_files.pop(operations);
             if (index == absent_k) break;
             operations[index].interest = io_interest_t::unarmed_k;
@@ -644,7 +736,6 @@ struct linux_epollaio_engine {
         case io_operation_t::send_zero_copy_k: return send_zero_copy(index);
         case io_operation_t::zero_copy_release_k: return release_zero_copy(index);
         case io_operation_t::close_k: return close_watched(request.descriptor, index);
-        case io_operation_t::send_k: tally<atomic_ref_template_>(statistics.copying_sends); [[fallthrough]];
         default: return attempt_io<atomic_ref_template_>(request, operation.stage, operation.interest, statistics);
         }
     }
@@ -669,6 +760,7 @@ struct linux_epollaio_engine {
     /** Waits for every AIO read, then resets each socket the kernel still sends zero-copy bytes
      *  from and waits for its notifications, so no buffer stays in the kernel's hands. */
     void stop() noexcept {
+        fault = 0;
         files.close();
         for (auto const& watch : readiness.watches.records())
             if (watch.oldest_run != absent_k) {
@@ -690,9 +782,10 @@ struct linux_epollaio_engine {
                 readiness.remove(descriptor);
                 socket_close(descriptor);
             }
-        fresh_operations = ready_operations = landed_operations = waiting_files = {};
+        readiness_close_unattempted(*this);
+        fresh_operations = ready_operations = completed_operations = waiting_files = {};
         timed.clear();
-        active = 0;
+        taken_operations = 0;
         refusal = nullptr;
         for (unsigned i = 0; i != operations.size(); ++i) operations[i] = {};
         reserve_releases(0);

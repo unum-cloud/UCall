@@ -10,7 +10,7 @@
 #include <cassert> // `assert`
 #include <cstring> // `std::memset`, `std::memcpy`
 
-#include <atomic>      // `std::atomic`
+#include <atomic>      // `std::memory_order`
 #include <limits>      // `std::numeric_limits`
 #include <memory>      // `std::uninitialized_default_construct`, `std::destroy_n`
 #include <span>        // `std::span`, `std::as_bytes`
@@ -36,7 +36,7 @@
 #include <smashtable/basic_vector.hpp>
 #include <stringzilla/capabilities.h>
 
-#include "ucall/ucall.h" // `ucall_callback_t`
+#include "ucall/ucall.h" // `ucall_status_t`, `ucall_outcome_t`, `ucall_bytes_view_t`
 
 namespace unum::ucall {
 namespace fu = ashvardanian::forkunion;
@@ -65,17 +65,6 @@ struct cpu_ceiling_t {
     sz_capability_t compute = sz_cap_serial_k;
     fu::capabilities_t sync = fu::capabilities_unknown_k;
 };
-
-inline void publish(ucall_outcome_t* outcome, ucall_status_t status, char const* message) noexcept {
-    if (!outcome) return;
-    outcome->message = status == ucall_status_success_k ? nullptr : message;
-    std::atomic_ref<ucall_status_t> word {outcome->status};
-    word.store(status, std::memory_order_release);
-    word.notify_all();
-}
-inline void publish(ucall_outcome_t* outcome, ucall_status_t status) noexcept {
-    publish(outcome, status, ucall_status_name(status));
-}
 
 /** The one final write to @p outcome: the message, then the status its waiters acquire; waiters
  *  watch the address, so the store notifies nothing. */

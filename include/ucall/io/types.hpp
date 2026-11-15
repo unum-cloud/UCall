@@ -6,6 +6,7 @@
  */
 #pragma once
 
+#include <cassert> // `assert`
 #include <cerrno>
 #include <climits> // `CHAR_BIT`
 
@@ -35,22 +36,57 @@ using utilities::socket_open;
 using utilities::socket_option;
 using utilities::span;
 
-enum class io_wait_t { blocking_k, nonblocking_k };
+enum class io_wait_t {
+
+    /** Waits for a completion, the deadline or a wakeup when none is ready. */
+    blocking_k,
+
+    /** Answers what already completed and returns at once. */
+    nonblocking_k,
+};
 
 /** How a socket's close ends its stream: a FIN after what it sent, or a reset that purges what the
  *  kernel still holds, as a connection whose reply broke off past its head needs. */
-enum class close_mode_t : std::uint8_t { orderly_k, reset_k };
+enum class close_mode_t : std::uint8_t {
+
+    /** Ends the stream with a FIN after the bytes it sent. */
+    orderly_k,
+
+    /** Ends the stream with a reset, purging what the kernel still holds. */
+    reset_k,
+};
 
 /** Whether a record is linked on a list that steps or reaps it, such as a ready queue. */
-enum class listing_t : std::uint8_t { unlisted_k, listed_k };
+enum class listing_t : std::uint8_t {
+
+    /** On no list of that kind. */
+    unlisted_k,
+
+    /** Linked on the list the member names. */
+    listed_k,
+};
 
 /** Which threads may enter an engine: the first one for good, or one at a time in any order, so
  *  a runtime's collector may free what another thread polled. */
-enum class io_issuer_scope_t : std::uint8_t { one_thread_k, any_thread_k };
+enum class io_issuer_scope_t : std::uint8_t {
+
+    /** The first thread to enter stays the only one. */
+    one_thread_k,
+
+    /** Any thread may enter, one at a time. */
+    any_thread_k,
+};
 
 /** Where a server's listeners come from: created through its engines, or handed over by the caller
  *  as some are. */
-enum class io_listeners_t : std::uint8_t { created_k, borrowed_k };
+enum class io_listeners_t : std::uint8_t {
+
+    /** Every listener is created through the server's engines. */
+    created_k,
+
+    /** Some listeners are sockets the caller handed over. */
+    borrowed_k,
+};
 
 /** What a request asks of its socket or of a file; file operations keep @c descriptor as the
  *  socket they serve, so its close waits for them, and their offsets, lengths and buffers meet the
@@ -110,7 +146,14 @@ enum class io_operation_t : std::uint8_t {
 };
 
 /** Where an engine lands a receive: the submitter's vector, or memory of its own it lends. */
-enum class io_receive_memory_t : std::uint8_t { submitter_k, engine_k };
+enum class io_receive_memory_t : std::uint8_t {
+
+    /** Into the vector the request's @c data names. */
+    submitter_k,
+
+    /** Into engine memory, lent through the completion until @c release. */
+    engine_k,
+};
 
 /** The engine buffer index a request's memory lies in, scoped so no descriptor binds to it. */
 enum class registered_memory_t : std::uint16_t {};
@@ -124,31 +167,55 @@ inline constexpr std::uint32_t io_unindexed_k = (std::numeric_limits<std::uint32
 /** The file a read reads, or the directory a @c file_open_k opens beneath, borrowed from the
  *  submitter. */
 struct io_file_t {
+
+    /** Where in the file a read starts; an open ignores it. */
     std::uint64_t offset {};
+
+    /** The file a read reads, or the directory an open resolves its path beneath. */
     native_file_t file {invalid_native_file_k};
 };
 static_assert(sizeof(io_file_t) == 16);
 
 /** Where an accept writes its peer's address, kept by the submitter with the request. */
 struct io_peer_address_t {
+
+    /** The peer's address, once the accept's connection completed. */
     sockaddr_storage address {};
+
+    /** Bytes of @c address the accept wrote. */
     socket_length_t length {};
 };
 
 /** The submitter keeps this request, its buffers and the requests it names alive until its
  *  completion is polled. */
 struct io_request_t {
+
+    /** What the engine does; it stays as set after the completion, so the submitter may read it. */
     io_operation_t operation {io_operation_t::receive_k};
+
+    /** The registered range @c data lies in, as sends and file reads may name, or unregistered. */
     registered_memory_t registered_memory {io_unregistered_k};
 
     /** The engine record carrying this request while it is submitted, which the engine sets, so a
      *  cancel or a release finds it without a search; @c io_unindexed_k otherwise. */
     std::uint32_t operation_index {io_unindexed_k};
 
+    /** The socket, the listener of an accept, or for a file operation the socket it serves; a
+     *  successful close sets it to -1. */
     descriptor_t descriptor {-1};
+
+    /** Bytes of a send or a read, the vectors of a receive, the address of a connect, the peer
+     *  addresses of an accept, which the engine walks, or the path of a file open. */
     byte_t* data {};
+
+    /** Bytes, vectors or address bytes of @c data; the connections an accept still takes, which the
+     *  engine counts down. */
     std::size_t length {};
+
+    /** The monotonic nanosecond the operation times out at, or zero for none. */
     std::uint64_t deadline {};
+
+    /** The submitter's own; engines never read it. */
     void* context {};
     union {
 
@@ -169,15 +236,30 @@ enum class range_pinning_t : std::uint8_t {
 
 /** What @c register_memory made of a range. */
 struct memory_registration_t {
+
+    /** What requests in the range pass as @c registered_memory once pinned, or unregistered. */
     registered_memory_t index {io_unregistered_k};
-    range_pinning_t pinning {range_pinning_t::unpinned_k};
+
+    /** Success for a pinned range or a soft refusal, else why the engine failed the range. */
     ucall_status_t status {ucall_status_success_k};
+
+    /** Whether the engine holds the range pinned, as a range with an index is. */
+    range_pinning_t pinning() const noexcept {
+        return index == io_unregistered_k ? range_pinning_t::unpinned_k : range_pinning_t::pinned_k;
+    }
 };
 static_assert(sizeof(memory_registration_t) == 8);
 
 /** The readiness an operation waits for; a socket keeps at most one pending operation per
  *  direction, and file operations wait on no socket at all. */
-enum class io_direction_t : std::uint8_t { receive_k, transmit_k };
+enum class io_direction_t : std::uint8_t {
+
+    /** Readable, for every operation but connects, sends and shutdowns. */
+    receive_k,
+
+    /** Writable, for connects, sends and shutdowns. */
+    transmit_k,
+};
 inline io_direction_t io_direction(io_operation_t operation) noexcept {
     return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ||
                    operation == io_operation_t::send_zero_copy_k || operation == io_operation_t::shutdown_k
@@ -185,23 +267,78 @@ inline io_direction_t io_direction(io_operation_t operation) noexcept {
                : io_direction_t::receive_k;
 }
 
-/** A byte count, accepted descriptor, or negated errno for exactly one submitted request; a receive
- *  into engine memory names the @c data it filled and the @c lease that @c release returns. */
+/** Whether the request a completion answers stays submitted, as an accept taking more does. */
+enum class io_continuation_t : std::uint8_t {
+
+    /** The request ended with this completion and is the submitter's again. */
+    ended_k,
+
+    /** The request stays submitted, as an accept taking more connections does. */
+    pending_k,
+};
+
+/** A byte count, accepted descriptor, or negated errno for one submitted request, or for one
+ *  connection of an accept that takes several. */
 struct io_completion_t {
+
+    /** The request this answers. */
     io_request_t* request {};
+
+    /** Bytes moved, an accepted or opened descriptor, a release's verdict, or a negated errno. */
     descriptor_t result {};
+
+    /** The peer address an accept wrote, or the slice a receive into engine memory filled. */
     byte_t* data {};
-    std::uintptr_t lease {};
+
+    /** What @c release takes back for a receive into engine memory; zero when nothing is lent. */
+    std::uint32_t lease {};
+
+    /** Whether the request stays submitted, read here as an accept's @c length keeps moving while
+     *  later ones land. */
+    io_continuation_t continuation {io_continuation_t::ended_k};
 };
 static_assert(sizeof(io_completion_t) == 32);
 
-/** Counters an engine advances for its one polling owner, on lines no other thread writes.
- *  @c zero_copy_fallbacks counts sends the kernel copied anyway or refused to pin, and
- *  @c zero_copy_sends plus @c copying_sends is every send. */
+/** Counters an engine advances for its one polling owner, on lines no other thread writes. Every
+ *  engine counts a request at its submit and an answer when the submitter collects it, and every
+ *  send that left in exactly one of @c zero_copy_sends and @c copying_sends. */
 struct alignas(fu::default_alignment_k) io_statistics_t {
-    std::uint64_t submissions {}, completions {}, kernel_enters {}, cancellations {}, receive_rearms {},
-        bytes_copied {}, zero_copy_sends {}, zero_copy_fallbacks {}, copying_sends {}, file_reads_asynchronous {},
-        file_reads_blocking {};
+
+    /** Requests the engine took. */
+    std::uint64_t submissions {};
+
+    /** Completions the submitter collected, an accept's every connection among them. */
+    std::uint64_t completions {};
+
+    /** Submission entries io_uring filled and completion entries it reaped; zero elsewhere. */
+    std::uint64_t kernel_entries {};
+
+    /** System calls: ring enters, waits, registrations and the socket and file calls themselves. */
+    std::uint64_t kernel_enters {};
+
+    /** Cancels asked of pending operations, and on io_uring 6.18 of receive streams. */
+    std::uint64_t cancellations {};
+
+    /** Receive streams armed again on a socket that already streamed, only on io_uring 6.18. */
+    std::uint64_t receive_rearms {};
+
+    /** Bytes io_uring 6.18 copied into socket backlogs or slid within them. */
+    std::uint64_t bytes_copied {};
+
+    /** Sends that left without a copy: @c MSG_ZEROCOPY, @c SEND_ZC, or a registered RIO range. */
+    std::uint64_t zero_copy_sends {};
+
+    /** Zero-copy sends the kernel reported copied, refused to pin, or ran out of buffers for. */
+    std::uint64_t zero_copy_fallbacks {};
+
+    /** Sends that copied on epoll, io_uring and Registered I/O, demoted zero-copy ones included. */
+    std::uint64_t copying_sends {};
+
+    /** File reads the kernel finishes later: io_uring, Linux or FreeBSD AIO, or overlapped I/O. */
+    std::uint64_t file_reads_asynchronous {};
+
+    /** File reads the engine issued itself and blocked on: posix, macOS, or a full AIO queue. */
+    std::uint64_t file_reads_blocking {};
 };
 
 /** Advances a counter only its owner writes, through @p atomic_ref_template_, so other threads may
@@ -219,8 +356,15 @@ struct wake_channel_t {
     wake_channel_t& operator=(wake_channel_t const&) = delete;
     wake_channel_t(wake_channel_t&&) = delete;
     wake_channel_t& operator=(wake_channel_t&&) = delete;
+
+    /** The read end, -1 once an engine imported it, and the write end @c notify sends on. */
     descriptor_t descriptors[2] {-1, -1};
+
+    /** Where the read request lands notifications, and where @c wait drains them. */
     byte_t bytes[sizeof(std::uint64_t)] {};
+
+    /** The read of the read end, or of the engine's handle for it once imported, resubmitted after
+     *  each completion. */
     io_request_t request {};
 #if UCALL_OS_APPLE_
 
@@ -228,9 +372,11 @@ struct wake_channel_t {
     int queue {-1};
 #elif UCALL_OS_WINDOWS_
 
-    /** An event the read end signals and a high-resolution timer, as @c WSAPoll waits in whole
-     *  scheduler ticks. */
-    HANDLE readable {}, timer {};
+    /** An event the read end signals, as @c WSAPoll waits in whole scheduler ticks. */
+    HANDLE readable {};
+
+    /** A high-resolution timer that ends a @c wait at its deadline. */
+    HANDLE timer {};
 #endif // UCALL_OS_APPLE_
     ~wake_channel_t() noexcept {
         for (auto descriptor : descriptors)
@@ -332,6 +478,8 @@ struct wake_channel_t {
 /** A socket an engine registered in a table of its own, named by its index under a high bit that
  *  separates it from process descriptors and socket handles. */
 struct registered_socket_t {
+
+    /** The engine's table index the handle carries. */
     unsigned index {};
     static constexpr descriptor_t tag_k = descriptor_t {1} << (sizeof(descriptor_t) * CHAR_BIT - 2);
     descriptor_t handle() const noexcept { return tag_k | static_cast<descriptor_t>(index); }
@@ -348,16 +496,42 @@ inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
 }
 
 /** Whether a polled operation is untouched, has started connecting, or was cancelled. */
-enum class operation_stage_t : std::uint8_t { fresh_k, started_k, cancelled_k };
+enum class operation_stage_t : std::uint8_t {
+
+    /** Never attempted. */
+    fresh_k,
+
+    /** A connect already issued, whose outcome the next attempt reads. */
+    started_k,
+
+    /** Cancelled, completing with @c -ECANCELED at its next attempt or collection. */
+    cancelled_k,
+};
 
 #if UCALL_OS_POSIX_
 inline short io_events(io_operation_t operation) noexcept {
     return io_direction(operation) == io_direction_t::transmit_k ? POLLOUT : POLLIN;
 }
 
-/** Where an operation waits: nowhere yet, on its socket's readiness, retrying once that fired, or
- *  in a kernel queue that completes it without readiness. */
-enum class io_interest_t : std::uint8_t { unarmed_k, armed_k, ready_k, landing_k };
+/** Where an operation waits: nowhere yet, on its socket's readiness, retrying once that fired, in
+ *  a kernel queue that completes it without readiness, or on the engine's list for a place. */
+enum class io_interest_t : std::uint8_t {
+
+    /** Waiting on nothing yet. */
+    unarmed_k,
+
+    /** Waiting for its socket's readiness in its direction. */
+    armed_k,
+
+    /** Woken by readiness, a cancel or a deadline, so the next progress pass retries it. */
+    ready_k,
+
+    /** Handed to a kernel queue or held back by the engine, which lands its result. */
+    landing_k,
+
+    /** On the engine's list until a kernel queue has room, then attempted again. */
+    queued_k,
+};
 
 /** Performs the request's syscall, blocking for file work and copying for zero-copy sends, and
  *  probes a pending connect only once @p interest reports readiness. */
@@ -432,7 +606,7 @@ void readiness_wake(engine_type_& engine, unsigned index) noexcept {
 template <typename engine_type_>
 void readiness_land(engine_type_& engine, unsigned index, descriptor_t result) noexcept {
     engine.cold_fields(index).result = result;
-    engine.landed_operations.push(engine.operations, index);
+    engine.completed_operations.push(engine.operations, index);
 }
 
 /** Wakes operation @p index of a readiness engine for @p events that @p descriptor reported, unless
@@ -443,6 +617,29 @@ void readiness_fire(engine_type_& engine, unsigned index, descriptor_t descripto
     if (operation.interest == io_interest_t::armed_k && operation.request->descriptor == descriptor &&
         (events & io_events(operation.request->operation)))
         readiness_wake(engine, index);
+}
+
+/** Closes the sockets of closes a readiness engine took but never attempted, as its stop owes
+ *  their submitters. */
+template <typename engine_type_>
+void readiness_close_unattempted(engine_type_& engine) noexcept {
+    for (unsigned index = engine.fresh_operations.oldest; index != operation_list_t::absent_k;
+         index = engine.operations[index].next)
+        if (engine.operations[index].request->operation == io_operation_t::close_k)
+            socket_close(engine.operations[index].request->descriptor);
+}
+
+/** Empties a stopped readiness engine's lists and frees every operation record. */
+template <typename engine_type_>
+void readiness_reset(engine_type_& engine) noexcept {
+    engine.free_operations = engine.fresh_operations = engine.ready_operations = engine.completed_operations = {};
+    engine.timed.clear();
+    engine.taken_operations = 0;
+    for (unsigned index = 0; index != engine.operations.size(); ++index) {
+        engine.operations[index] = {};
+        engine.cold[index] = {};
+        engine.free_operations.push(engine.operations, index);
+    }
 }
 
 /** Returns a readiness engine's operation to its free list, answering its completion; an accept
@@ -461,14 +658,15 @@ io_completion_t readiness_finish(engine_type_& engine, unsigned index, descripto
     if constexpr (requires { engine.readiness.disarm(request.descriptor, io_direction_t::receive_k, index); })
         if (operation.interest == io_interest_t::armed_k || operation.interest == io_interest_t::ready_k)
             engine.readiness.disarm(request.descriptor, io_direction(request.operation), index);
-    if (request.operation == io_operation_t::close_k && result >= 0) request.descriptor = -1;
     if (request.operation == io_operation_t::accept_k) request.length = 0;
     request.operation_index = io_unindexed_k;
     operation = {};
     cold = {};
     engine.free_list(index).push(engine.operations, index);
-    --engine.active;
+    --engine.taken_operations;
     tally<atomic_ref_template_>(engine.statistics.completions);
+    if (request.operation == io_operation_t::send_k && result >= 0)
+        tally<atomic_ref_template_>(engine.statistics.copying_sends);
     return {&request, result};
 }
 
@@ -480,14 +678,14 @@ io_completion_t readiness_yield(engine_type_& engine, io_request_t& request, des
     if (peer) request.data = peer + sizeof(io_peer_address_t);
     --request.length;
     tally<atomic_ref_template_>(engine.statistics.completions);
-    return {&request, accepted, peer};
+    return {&request, accepted, peer, 0, io_continuation_t::pending_k};
 }
 
 /** Answers the landed operations of a readiness engine into @p completions from @p count on. */
 template <template <typename> class atomic_ref_template_, typename engine_type_>
 std::size_t readiness_collect(engine_type_& engine, span<io_completion_t> completions, std::size_t count) noexcept {
     while (count != completions.size()) {
-        auto index = engine.landed_operations.pop(engine.operations);
+        auto index = engine.completed_operations.pop(engine.operations);
         if (index == engine_type_::absent_k) break;
         descriptor_t const result = engine.operations[index].stage == operation_stage_t::cancelled_k
                                         ? -ECANCELED
@@ -514,7 +712,7 @@ std::size_t readiness_progress(engine_type_& engine, operation_list_t& list, spa
             do result = engine.attempt(index);
             while (fired && result == -EINTR);
         }
-        if (operation.interest == io_interest_t::landing_k) continue;
+        if (operation.interest == io_interest_t::landing_k || operation.interest == io_interest_t::queued_k) continue;
         while (request.operation == io_operation_t::accept_k && result >= 0 && request.length > 1 &&
                count + 1 != completions.size()) {
             completions[count++] = readiness_yield<atomic_ref_template_>(engine, request, result);
@@ -538,6 +736,7 @@ std::size_t readiness_progress(engine_type_& engine, operation_list_t& list, spa
 template <template <typename> class atomic_ref_template_, typename engine_type_>
 int readiness_poll(engine_type_& engine, span<io_completion_t> completions, io_wait_t wait_policy,
                    std::uint64_t deadline) noexcept {
+    if (engine.fault) return engine.fault;
     if (!completions.size()) return 0;
     std::size_t count {};
     for (unsigned round = 0; round != 2; ++round) {
@@ -552,7 +751,7 @@ int readiness_poll(engine_type_& engine, span<io_completion_t> completions, io_w
         count = readiness_collect<atomic_ref_template_>(engine, completions, count);
         count = readiness_progress<atomic_ref_template_>(engine, engine.fresh_operations, completions, count, now);
         count = readiness_progress<atomic_ref_template_>(engine, engine.ready_operations, completions, count, now);
-        if (count || round || !engine.active) break;
+        if (count || round || !engine.taken_operations) break;
         int const result = engine.wait(wait);
         // A signal, or poll(2) short of kernel memory, ends the wait with nothing landed.
         if (result < 0 && result != -EINTR && result != -EAGAIN && result != -ENOMEM) return result;
@@ -563,7 +762,17 @@ int readiness_poll(engine_type_& engine, span<io_completion_t> completions, io_w
 #endif // UCALL_OS_POSIX_
 
 /** Whether a socket's sends still try zero-copy, which ends once the kernel reports it copied. */
-enum class zero_copy_stage_t : std::uint8_t { untried_k, enabled_k, copying_k };
+enum class zero_copy_stage_t : std::uint8_t {
+
+    /** No zero-copy send tried yet, or not yet reported copied. */
+    untried_k,
+
+    /** The socket took @c SO_ZEROCOPY, so its sends pin their bytes. */
+    enabled_k,
+
+    /** Sends copy for the socket's lifetime. */
+    copying_k,
+};
 
 /**
  *  @brief Several engines behind one type: @c open picks one at runtime, and every engine verb
@@ -609,6 +818,7 @@ class io_engine_variant {
     ucall_status_t open(ucall_io_backend_t backend, std::size_t depth, std::size_t capacity,
                         io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k,
                         io_listeners_t listeners = io_listeners_t::created_k) noexcept {
+        depth_ = depth, scope_ = scope, listeners_ = listeners;
         return open_<0>(backend, depth, capacity, scope, listeners, ucall_status_unsupported_k);
     }
 
@@ -645,7 +855,7 @@ class io_engine_variant {
                 else return false;
             },
             engines_);
-        return in_place ? grown : open(backend(), capacity, capacity);
+        return in_place ? grown : open(backend(), depth_, capacity, scope_, listeners_);
     }
 
     /** Sets aside the last @p count records for the releases sends name, where the engine keeps
@@ -668,8 +878,8 @@ class io_engine_variant {
             engines_);
     }
 
-    ucall_status_t submit(io_request_t& request) noexcept {
-        return std::visit([&](auto& engine) noexcept { return engine.submit(request); }, engines_);
+    void submit(io_request_t& request) noexcept {
+        std::visit([&](auto& engine) noexcept { engine.submit(request); }, engines_);
     }
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
         return std::visit([&](auto& engine) noexcept { return engine.poll(completions, wait_policy, deadline); },
@@ -739,8 +949,20 @@ class io_engine_variant {
         }
     }
 
+    /** The engine @c open picked, or the one it tried last. */
     engines_t engines_;
+
+    /** What every engine @c open emplaces is constructed with. */
     [[no_unique_address]] allocator_t allocator_;
+
+    /** The depth @c open was last given, which a reopen in @c grow repeats. */
+    std::size_t depth_ {};
+
+    /** The issuer scope @c open was last given, which a reopen in @c grow repeats. */
+    io_issuer_scope_t scope_ {io_issuer_scope_t::one_thread_k};
+
+    /** The listeners' origin @c open was last given, which a reopen in @c grow repeats. */
+    io_listeners_t listeners_ {io_listeners_t::created_k};
 };
 
 } // namespace unum::ucall::io

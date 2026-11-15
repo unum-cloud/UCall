@@ -1332,7 +1332,7 @@ class Server:
 
         Returns:
           dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,
-            `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,
+            `kernel_entries`, `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,
             `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,
             `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,
             `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,

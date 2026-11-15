@@ -53,7 +53,12 @@ inline constexpr std::string_view shed_reply_k =
 
 /** One field of a log line: its name and its already formatted value. */
 struct log_field_t {
-    std::string_view name, value;
+
+    /** The field's key, a literal written as is. */
+    std::string_view name;
+
+    /** The field's text, which may quote a peer; JSON escapes it, text writes it as is. */
+    std::string_view value;
 };
 
 /** Configuration checks, socket binding, and the text of reply heads, records and log lines. */
@@ -299,18 +304,45 @@ struct formatting {
                 length += fits;
             }
         };
+        // A value may quote what a peer sent, which must not end its string or forge a field.
+        auto put_escaped = [&](std::string_view text) noexcept {
+            constexpr char digits_k[] = "0123456789abcdef";
+            for (char const symbol : text) {
+                auto const byte = static_cast<unsigned char>(symbol);
+                char const escaped[6] {'\\', byte < 0x20 ? 'u' : symbol, '0',
+                                       '0',  digits_k[byte >> 4],        digits_k[byte & 15]};
+                if (byte < 0x20) put(std::string_view {escaped, 6});
+                else if (symbol == '"' || symbol == '\\') put(std::string_view {escaped, 2});
+                else put(std::string_view {&symbol, 1});
+            }
+        };
         std::string_view const level_name = level_names_k[static_cast<std::size_t>(level)];
         if (log.format == ucall_log_format_json_k) {
             put("{\"level\":\"", level_name, "\",\"event\":\"", event, "\"");
-            for (log_field_t const& field : fields) put(",\"", field.name, "\":\"", field.value, "\"");
+            for (log_field_t const& field : fields) {
+                put(",\"", field.name, "\":\"");
+                put_escaped(field.value);
+                put("\"");
+            }
             put("}");
         }
         else {
             put(level_name, " ", event);
-            for (log_field_t const& field : fields) put(" ", field.name, "=", field.value);
+            // A value holding a space, a quote or an equals sign is quoted, so it stays one field.
+            for (log_field_t const& field : fields) {
+                bool plain = true;
+                for (char const symbol : field.value)
+                    plain &= static_cast<unsigned char>(symbol) > 0x20 && symbol != '"' && symbol != '=' &&
+                             symbol != '\\';
+                put(" ", field.name, plain ? "=" : "=\"");
+                if (plain) put(field.value);
+                else put_escaped(field.value), put("\"");
+            }
         }
         log.callback(level, {reinterpret_cast<ucall_byte_t const*>(line), length}, log.context);
     }
+
+    /** Characters of an IMF-fixdate, the form of every @c date header a reply carries. */
     static constexpr std::size_t http_date_length_k = sizeof("Sun, 06 Nov 1994 08:49:37 GMT") - 1;
 
     /** Formats the RFC 9110 IMF-fixdate through the calendar types, without allocating. */

@@ -4,7 +4,9 @@
  *  @date August 9, 2026
  *  @brief Key generation shared by the tunnel's capability specializations.
  */
-#include "ucall/tunnel/crypto.hpp" // `secure_tunnel_crypto`, `secure_tunnel_generate_keypair`, `x25519_derive_public`
+#include "ucall/tunnel/crypto.hpp" // `secure_tunnel_crypto`, `secure_tunnel_generate_keypair`
+
+#include "lib.hpp" // `host_verbs`
 
 namespace unum::ucall {
 
@@ -14,7 +16,7 @@ tunnel::secure_tunnel_fault_t tunnel::secure_tunnel_generate_keypair(
             serial_sha256_kit_t, serial_aes256_gcm_kit_t, serial_x25519_kit_t>::secure_random_bytes(private_half);
         fault != secure_tunnel_fault_t::none_k)
         return fault;
-    x25519_derive_public<serial_x25519_kit_t>(public_half, private_half);
+    host_verbs().derive_public(public_half, private_half);
     return secure_tunnel_fault_t::none_k;
 }
 

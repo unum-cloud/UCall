@@ -43,10 +43,6 @@
 
 #include "ucall/tunnel/curve25519.hpp"
 
-#if defined(_MSC_VER) && !defined(__clang__)
-#include <intrin.h> // `__umulh`, `_addcarry_u64`, `_subborrow_u64`
-#endif
-
 namespace unum::ucall {
 
 using tunnel::x25519_key_size_k;
@@ -57,6 +53,13 @@ using utilities::span;
 
 using fiat_25519_uint1_t = unsigned char;
 using fiat_25519_int1_t = signed char;
+
+/** Zeroes @p secret through a volatile pointer, so the store survives on storage about to die. */
+template <typename secret_type_>
+inline static void wipe(secret_type_& secret) noexcept {
+    std::uint8_t volatile* const cursor = reinterpret_cast<std::uint8_t volatile*>(&secret);
+    for (std::size_t index = 0; index != sizeof(secret); ++index) cursor[index] = 0;
+}
 
 /**
  *  @brief Returns @p value while hiding everything the optimizer knows about it.
@@ -558,6 +561,9 @@ inline static void montgomery_ladder(typename field_type_::element_t& output_u,
     element_t x3 = x1;
     element_t z3 = field_type_::one();
     std::uint64_t swap = 0;
+    // Declared out here so one wipe after the ladder covers every step's intermediates.
+    element_t a, aa, b, bb, e, c, d, da, cb, sum_da_cb, difference_da_cb, difference_squared, scaled_e,
+        bb_plus_scaled_e;
 
     for (int bit_index = 254; bit_index >= 0; --bit_index) {
         std::uint64_t const scalar_bit = (clamped_scalar[bit_index / 8] >> (bit_index % 8)) & 1u;
@@ -566,7 +572,6 @@ inline static void montgomery_ladder(typename field_type_::element_t& output_u,
         field_type_::conditional_swap(z2, z3, swap);
         swap = scalar_bit;
 
-        element_t a, aa, b, bb, e, c, d, da, cb;
         field_type_::add(a, x2, z2);
         field_type_::square(aa, a);
         field_type_::subtract(b, x2, z2);
@@ -577,7 +582,6 @@ inline static void montgomery_ladder(typename field_type_::element_t& output_u,
         field_type_::multiply(da, d, a);
         field_type_::multiply(cb, c, b);
 
-        element_t sum_da_cb, difference_da_cb, difference_squared;
         field_type_::add(sum_da_cb, da, cb);
         field_type_::square(x3, sum_da_cb);
         field_type_::subtract(difference_da_cb, da, cb);
@@ -585,7 +589,6 @@ inline static void montgomery_ladder(typename field_type_::element_t& output_u,
         field_type_::multiply(z3, x1, difference_squared);
 
         // RFC 7748's AA + 121665 × E is BB + 121666 × E, as E = AA - BB; fiat proves that scale.
-        element_t scaled_e, bb_plus_scaled_e;
         field_type_::multiply(x2, aa, bb);
         field_type_::multiply_121666(scaled_e, e);
         field_type_::add(bb_plus_scaled_e, bb, scaled_e);
@@ -597,6 +600,9 @@ inline static void montgomery_ladder(typename field_type_::element_t& output_u,
     typename field_type_::element_t z2_inverted;
     field_invert<field_type_>(z2_inverted, z2);
     field_type_::multiply(output_u, x2, z2_inverted);
+    for (element_t* secret : {&x2, &z2, &x3, &z3, &z2_inverted, &a, &aa, &b, &bb, &e, &c, &d, &da, &cb, &sum_da_cb,
+                              &difference_da_cb, &difference_squared, &scaled_e, &bb_plus_scaled_e})
+        wipe(*secret);
 }
 
 /** Clamps, runs the ladder over @p field_type_, and applies RFC 7748 §6.1's small-order check. */
@@ -623,6 +629,8 @@ template <typename field_type_>
     // A constant-time OR-reduction: which byte is nonzero must not be observable either.
     std::uint8_t difference_from_zero = 0;
     for (std::size_t index = 0; index != x25519_key_size_k; ++index) difference_from_zero |= out_bytes[index];
+    wipe(clamped_scalar);
+    wipe(output_u);
     return difference_from_zero != 0;
 }
 

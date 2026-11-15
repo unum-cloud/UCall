@@ -1077,10 +1077,12 @@ pub struct EventLoopStatistics {
     pub empty_polls: u64,
     /// System calls: io_uring enters, or other backends' waits, registrations and socket calls.
     pub kernel_enters: u64,
-    /// Operations queued: io_uring submission entries, or requests another backend accepted.
+    /// Operations the loop asked of its engine.
     pub submissions: u64,
-    /// Results taken: io_uring completion entries, or operations another backend finished.
+    /// Results the loop took from its engine, each connection of an accept among them.
     pub completions: u64,
+    /// Submission entries io_uring filled and completion entries it reaped; zero elsewhere.
+    pub kernel_entries: u64,
     /// Pending operations, or io_uring multishot receives, the engine asked to cancel.
     pub cancellations: u64,
     /// Connections accepted and handed to this loop.

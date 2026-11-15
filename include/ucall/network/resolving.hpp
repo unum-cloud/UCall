@@ -44,8 +44,7 @@ struct client_lookup {
     template <typename value_type_>
     using vector = typename network_t::template vector<value_type_>;
 
-    explicit client_lookup(allocator_t const& allocator = {}) noexcept
-        : stream(rebound_allocator<byte_t> {allocator}) {}
+    explicit client_lookup(allocator_t const& allocator) noexcept : stream(rebound_allocator<byte_t> {allocator}) {}
     client_lookup(client_lookup const&) = delete;
     client_lookup& operator=(client_lookup const&) = delete;
     client_lookup(client_lookup&&) = delete;
@@ -54,20 +53,47 @@ struct client_lookup {
     /** Unasked, waiting for its UDP answer, carried over TCP after a truncated one, or done. */
     enum class question_stage_t : std::uint8_t { idle_k, asking_k, streaming_k, answered_k };
     struct question_t {
-        io_request_t send_request {}, receive_request {};
+
+        /** The query's send, or over TCP the connect to the nameserver and then the send. */
+        io_request_t send_request {};
+
+        /** Reads an answer into @c answer, again after a forged datagram or a partial TCP one. */
+        io_request_t receive_request {};
+
+        /** Its UDP or TCP socket to the nameserver asked, or negative while none is open. */
         descriptor_t descriptor {-1};
-        std::uint16_t id {}, query_length {};
+
+        /** The random ID of the query in flight, which its answer must echo. */
+        std::uint16_t id {};
+
+        /** Bytes of the query behind the length prefix in @c query. */
+        std::uint16_t query_length {};
+
+        /** AAAA for the first question and A for the second, set as each search name is asked. */
         dns::record_type_t type {};
+
+        /** Its progress; streaming with no socket, it waits for the other question's stream. */
         question_stage_t stage {};
 
         /** One operation runs at a time, so a socket closes or moves on with nothing in flight. */
         operation_state_t operation {};
+
+        /** What this search name earned: failed until an answer decodes, then that answer. */
         dns::answer_t verdict {};
-        std::uint8_t attempt {}, nameserver {};
+
+        /** Rounds through the nameservers this search name took, up to @c attempts. */
+        std::uint8_t attempt {};
+
+        /** The index of the nameserver asked, rotating on each retry. */
+        std::uint8_t nameserver {};
+
+        /** The decoded answer's TTL, for its addresses or their absence; zero until one decodes. */
         std::uint32_t ttl_seconds {};
 
         /** A TCP length prefix, then the query. */
         byte_t query[2 + dns::query_bytes_k] {};
+
+        /** One UDP answer, or the bytes of one TCP receive that @c stream gathers. */
         byte_t answer[dns::udp_answer_bytes_k] {};
     };
 
@@ -76,14 +102,23 @@ struct client_lookup {
 
     /** A TCP answer across receives, kept warm; one question streams at a time. */
     vector<byte_t> stream {};
+
+    /** The search name @c candidate spells in wire form, which both questions ask. */
     dns::wire_name_t name {};
+
+    /** The origin being resolved, or null while the lookup is free. */
     client_origin_t* origin {};
 
     /** RFC 8305 §3: once an A answered first, when to dial it without the AAAA. */
     std::uint64_t settle_deadline {};
 
-    /** The search name being asked, and the least negative TTL the names before it earned. */
-    std::uint32_t candidate {}, ttl_seconds {};
+    /** The index of the search name being asked, in @c candidate_name's order. */
+    std::uint32_t candidate {};
+
+    /** The least negative TTL the names before @c candidate earned, zero once one failed. */
+    std::uint32_t ttl_seconds {};
+
+    /** Links the client's free lookups; null while one resolves. */
     client_lookup_t* next {};
 };
 
@@ -180,12 +215,12 @@ struct resolving {
                                      .length = std::size_t {2} + question.query_length,
                                      .deadline = question.send_request.deadline,
                                      .context = &lookup};
-            return submit(client, lookup, question, question.send_request);
+            return submit(client, question, question.send_request);
         }
         if (sent) {
             if (result != static_cast<descriptor_t>(question.send_request.length))
                 return retry(client, lookup, question);
-            return submit(client, lookup, question, question.receive_request);
+            return submit(client, question, question.receive_request);
         }
         if (result <= 0) return retry(client, lookup, question);
         std::size_t const length = static_cast<std::size_t>(result);
@@ -199,7 +234,7 @@ struct resolving {
                                                        : std::to_integer<std::size_t>(stream[0]) << 8 |
                                                              std::to_integer<std::size_t>(stream[1]);
         if (stream.size() < 2 || stream.size() < 2 + declared)
-            return submit(client, lookup, question, question.receive_request);
+            return submit(client, question, question.receive_request);
         decided(client, lookup, question, {stream.data() + 2, declared});
     }
 
@@ -278,7 +313,9 @@ struct resolving {
             if (spelled == ucall_status_not_found_k) return finish(client, lookup, resolution_t::refused_k);
         }
         dns::record_type_t const types[2] {dns::record_type_t::aaaa_k, dns::record_type_t::a_k};
-        for (std::size_t index = 0; index != 2; ++index) {
+        for (question_t& question : lookup.questions) question.stage = question_stage_t::idle_k;
+        // A question answering at once may end the lookup, which then asks nothing more.
+        for (std::size_t index = 0; index != 2 && lookup.origin; ++index) {
             question_t& question = lookup.questions[index];
             question.type = types[index];
             question.attempt = question.nameserver = 0;
@@ -300,7 +337,11 @@ struct resolving {
         question.descriptor = opened < 0 ? opened : client.engine->import_socket(opened);
         if (question.descriptor < 0) return retry(client, lookup, question);
         byte_t id[2] {};
-        [[maybe_unused]] auto const fault = crypto_t::secure_random_bytes(id);
+        // An ID nobody can guess is what tells the nameserver's answer from a forged one.
+        if (crypto_t::secure_random_bytes(id) != tunnel::secure_tunnel_fault_t::none_k) {
+            question.attempt = settings.attempts;
+            return retry(client, lookup, question);
+        }
         question.id = static_cast<std::uint16_t>(std::to_integer<unsigned>(id[0]) << 8 |
                                                  std::to_integer<unsigned>(id[1]));
         question.query_length = static_cast<std::uint16_t>(
@@ -321,7 +362,7 @@ struct resolving {
                                     .length = sizeof(question.answer),
                                     .deadline = deadline,
                                     .context = &lookup};
-        submit(client, lookup, question, question.send_request);
+        submit(client, question, question.send_request);
     }
 
     /** Carries @p question over TCP to the same nameserver, once no other question streams. */
@@ -347,16 +388,12 @@ struct resolving {
                                     .length = sizeof(question.answer),
                                     .deadline = deadline,
                                     .context = &lookup};
-        submit(client, lookup, question, question.send_request);
+        submit(client, question, question.send_request);
     }
 
-    static void submit(client_t& client, client_lookup_t& lookup, question_t& question,
-                       io_request_t& request) noexcept {
-        if (client.engine->submit(request) == ucall_status_success_k) {
-            question.operation = operation_state_t::submitted_k;
-            return;
-        }
-        retry(client, lookup, question);
+    static void submit(client_t& client, question_t& question, io_request_t& request) noexcept {
+        client.engine->submit(request);
+        question.operation = operation_state_t::submitted_k;
     }
 
     static void close(client_t& client, question_t& question) noexcept {
@@ -394,8 +431,12 @@ struct resolving {
             if (streamed) return retry(client, lookup, question);
             close(client, question);
             return stream(client, lookup, question);
-        case dns::answer_t::failed_k:
-        case dns::answer_t::malformed_k: return retry(client, lookup, question);
+        case dns::answer_t::failed_k: return retry(client, lookup, question);
+        case dns::answer_t::malformed_k:
+            // A datagram that is not this question's answer, as a forged one is, changes nothing:
+            // the socket keeps waiting for the nameserver's own until the deadline.
+            if (streamed) return retry(client, lookup, question);
+            return submit(client, question, question.receive_request);
         default: break;
         }
         close(client, question);

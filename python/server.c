@@ -3435,7 +3435,8 @@ static char const doc_Server_event_loop_statistics[] =                          
     "\n"                                                                                            //
     "Returns:\n"                                                                                    //
     "  dict[str, int]: `polls`, `empty_polls`, `kernel_enters`, `submissions`, `completions`,\n"    //
-    "    `cancellations`, `accepts`, `requests`, `receive_rearms`, `bytes_received`,\n"             //
+    "    `kernel_entries`, `cancellations`, `accepts`, `requests`, `receive_rearms`,\n"             //
+    "    `bytes_received`,\n"                                                                       //
     "    `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,\n"                 //
     "    `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,\n"        //
     "    `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,\n"            //
@@ -3462,12 +3463,13 @@ static PyObject* Server_event_loop_statistics(Server* self, PyObject* const* val
     ucall_server_event_loop_statistics_t query = {self->handle, &outcome, index, &counters};
     ucall_server_event_loop_statistics(&query);
     if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
-    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                      //
+    return Py_BuildValue("{sKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsKsK}",                    //
                          "polls", (unsigned long long)counters.polls,                                     //
                          "empty_polls", (unsigned long long)counters.empty_polls,                         //
                          "kernel_enters", (unsigned long long)counters.kernel_enters,                     //
                          "submissions", (unsigned long long)counters.submissions,                         //
                          "completions", (unsigned long long)counters.completions,                         //
+                         "kernel_entries", (unsigned long long)counters.kernel_entries,                   //
                          "cancellations", (unsigned long long)counters.cancellations,                     //
                          "accepts", (unsigned long long)counters.accepts,                                 //
                          "requests", (unsigned long long)counters.requests,                               //

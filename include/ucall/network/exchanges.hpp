@@ -39,7 +39,7 @@ struct batch_endpoint : ucall_http_batch_endpoint_handle_t {
     template <typename value_type_>
     using vector = typename network_t::template vector<value_type_>;
 
-    explicit batch_endpoint(allocator_t const& allocator = {}) noexcept
+    explicit batch_endpoint(allocator_t const& allocator) noexcept
         : slots(rebound_allocator<server_exchange_t*> {allocator}),
           collected(rebound_allocator<ucall_received_http_request_t> {allocator}) {}
     batch_endpoint(batch_endpoint const&) = delete;
@@ -47,21 +47,39 @@ struct batch_endpoint : ucall_http_batch_endpoint_handle_t {
     batch_endpoint(batch_endpoint&&) = delete;
     batch_endpoint& operator=(batch_endpoint&&) = delete;
 
-    /** A power of two above the request budget plus one per event loop. */
+    /** The ring of deposited exchanges, a power of two above the request budget plus one per event
+     *  loop; a slot is null once the polling owner took it. */
     vector<server_exchange_t*> slots {};
 
-    /** Event loops @c fetch_add it. */
+    /** Deposits claimed so far, which event loops @c fetch_add to take a slot. */
     alignas(fu::default_alignment_k) std::uint64_t tail {};
 
-    /** Written by the polling owner only. */
+    /** Deposits the polling owner moved out of @c slots; written by the polling owner only. */
     alignas(fu::default_alignment_k) std::uint64_t head {};
-    wake_state_t wake_state {wake_state_t::awake_k};
-    wake_channel_t wake {};
-    ucall_received_http_batch_callback_t callback {};
-    std::size_t min_batch_size {}, max_batch_size {}, max_latency_microseconds {};
 
-    /** Owned by the polling owner, reserved to @c max_batch_size. */
+    /** Whether the polling owner sleeps on @c wake, so a depositor knows to notify it. */
+    wake_state_t wake_state {wake_state_t::awake_k};
+
+    /** What a deposit or a stop notifies to wake a sleeping polling owner. */
+    wake_channel_t wake {};
+
+    /** Takes each batch of @c collected on the polling owner's thread. */
+    ucall_received_http_batch_callback_t callback {};
+
+    /** Collected requests that fire a batch at once; one unless the caller set more. */
+    std::size_t min_batch_size {};
+
+    /** The most requests one batch holds, 32 unless set; collecting that many fires it. */
+    std::size_t max_batch_size {};
+
+    /** How long the oldest collected request waits for a smaller batch, 10 ms unless set. */
+    std::size_t max_latency_microseconds {};
+
+    /** Requests taken from @c slots and not yet handed to @c callback, reserved to
+     *  @c max_batch_size; owned by the polling owner. */
     vector<ucall_received_http_request_t> collected {};
+
+    /** Passed to @c callback unchanged. */
     void* context {};
 
     /** Advanced by the polling owner, loaded relaxed by any thread. */
@@ -81,21 +99,34 @@ struct endpoint {
     template <typename value_type_>
     using owner = typename network_t::template owner<value_type_>;
 
-    explicit endpoint(allocator_t const& allocator = {}) noexcept : storage(rebound_allocator<char> {allocator}) {}
+    explicit endpoint(allocator_t const& allocator) noexcept : storage(rebound_allocator<char> {allocator}) {}
     endpoint(endpoint const&) = delete;
     endpoint& operator=(endpoint const&) = delete;
     endpoint(endpoint&&) = delete;
     endpoint& operator=(endpoint&&) = delete;
 
+    /** The path template, NUL-terminated, which @c path and the routing trie view. */
     vector<char> storage {};
+
+    /** The path template without its terminator, starting with a slash. */
     std::string_view path {};
+
+    /** The method a request needs to route here, keyed with @c path in the routing trie. */
     ucall_verb_t verb {};
+
+    /** Takes each request; null on a batch endpoint or a refused template. */
     ucall_received_http_request_callback_t callback {};
+
+    /** Whether a single-request endpoint gets its body buffered before dispatch or streamed. */
     ucall_body_delivery_t body_delivery {};
 
     /** Apart, so deposits never contend with routing reads of this endpoint. */
     owner<batch_endpoint_t> batch {};
+
+    /** Passed to @c callback unchanged; a batch endpoint keeps its own in @c batch. */
     void* context {};
+
+    /** The endpoint registered before this one, as the server lists them newest first. */
     endpoint_t* next {};
 };
 
@@ -121,10 +152,20 @@ struct exchange_release {
     using reply_segment_t = typename network_t::reply_segment_t;
     using file_segment_t = typename network_t::file_segment_t;
 
+    /** The release on the connection's socket, aimed when a send first names it; its context is
+     *  the exchange. */
     io_request_t request {};
+
+    /** Retired segments whose sends named it, newest first, held until it completes. */
     reply_segment_t* sent_segments {};
+
+    /** Retired file segments whose framing sends named it, newest first, until it completes. */
     file_segment_t* sent_file_segments {};
+
+    /** Bytes the socket took from sends naming it; at half the send buffer, it is submitted. */
     std::size_t held_bytes {};
+
+    /** Whether sends named it, and whether it is with the engine. */
     release_state_t state {};
 };
 
@@ -136,7 +177,10 @@ struct replied_link {
     using replied_link_t = typename network_t::replied_link_t;
     using server_exchange_t = typename network_t::server_exchange_t;
 
+    /** The link queued behind this one, null while it is the tail or not queued. */
     replied_link_t* next {};
+
+    /** The exchange embedding this link, set once at construction; null for the stub. */
     server_exchange_t* exchange {};
 };
 
@@ -162,7 +206,7 @@ struct server_exchange : ucall_received_http_request_handle_t {
     template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
 
-    explicit server_exchange(allocator_t const& allocator = {}) noexcept
+    explicit server_exchange(allocator_t const& allocator) noexcept
         : input(rebound_allocator<byte_t> {allocator}), head_segment(allocator), end_segment(allocator),
           body_chunk(rebound_allocator<byte_t> {allocator}), pulled_chunk(rebound_allocator<byte_t> {allocator}),
           parts(rebound_allocator<request_part_t> {allocator}) {
@@ -191,8 +235,8 @@ struct server_exchange : ucall_received_http_request_handle_t {
                 file_segment = next;
             }
         // The server is going away, so a reply still in flight never reaches its peer.
-        if (outcome) publish(outcome, ucall_status_connection_closed_k);
-        if (pull_outcome) publish(pull_outcome, ucall_status_connection_closed_k);
+        if (outcome) publish<atomic_ref>(outcome, ucall_status_connection_closed_k);
+        if (pull_outcome) publish<atomic_ref>(pull_outcome, ucall_status_connection_closed_k);
     }
 
     /** The first segment not handed back: parked, adopted unsent, or linked past a cursor that
@@ -216,15 +260,22 @@ struct server_exchange : ucall_received_http_request_handle_t {
         return false;
     }
 
+    /** The loop that allocated it and serves its request, whose allocator its segments take. */
     event_loop_t* event_loop {};
 
     /** Kept while the kernel holds its segments, past its reply. */
     connection_t* connection {};
+
+    /** The endpoint routed at dispatch; null when the loop refuses the request itself. */
     endpoint_t* endpoint {};
 
     /** Copied at dispatch, as a batch can outlive its connection. */
     network_interface_t* network_interface {};
+
+    /** The peer's authenticated key, copied at dispatch, zeroed once freed; zero for plaintext. */
     ucall_noise_key_t peer_static_key {};
+
+    /** The connection's peer address, copied at dispatch. */
     ucall_peer_address_t peer_address {};
 
     /** Copied at dispatch; zero headroom and tailroom for plaintext. */
@@ -233,13 +284,16 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** Links every exchange the event loop owns, until the loop is freed. */
     server_exchange_t* next {};
 
-    /** Links the event loop's free list once recycled. */
-    server_exchange_t* replied_next {};
+    /** Links its connection's exchanges in request order, or the loop's free list once recycled. */
+    server_exchange_t* next_queued {};
 
-    /** Links its connection's exchanges in request order. */
-    server_exchange_t* connection_next {};
+    /** How far the loop got with the reply; only the loop writes it. */
     exchange_stage_t stage {};
+
+    /** The parsed request, moved from the connection at dispatch; its views index @c input. */
     http_message_t message {};
+
+    /** The request's bytes: all of it when buffered, only its head when the body streams. */
     vector<byte_t> input {};
 
     /** When the request was dispatched, for batch expiry and latency lines. */
@@ -251,10 +305,14 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** Reply body bytes, counted later by the event loop, as any thread may reply. */
     std::size_t copied {};
 
-    /** A stream's status line and headers, and the segment ending every reply: a whole one, or
-     *  a stream's last chunk. The loop learns a reply ended by adopting @c end_segment, and
-     *  only the chunks between the two ever allocate. */
-    reply_segment_t head_segment, end_segment;
+    /** A stream's status line and headers, or a measured reply's head, which a refusal replaces
+     *  whole. The loop learns a reply ended by adopting @c end_segment, and only the chunks between
+     *  the two ever allocate. */
+    reply_segment_t head_segment;
+
+    /** The segment ending every reply: a whole one, a stream's last chunk, or empty after a
+     *  measured or abandoned reply. */
+    reply_segment_t end_segment;
 
     /** The replier's newest, whose @c next the next chain lands in. */
     reply_segment_t* pushed_tail {};
@@ -291,8 +349,11 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** A reply's deferred outcome, which the loop makes final. */
     ucall_outcome_t* outcome {};
 
-    /** A streamed body's @c content-length and bytes so far. */
-    std::uint64_t declared {}, streamed {};
+    /** The reply's declared @c content-length, or a held head's measured one; zero without one. */
+    std::uint64_t declared {};
+
+    /** Reply body bytes queued so far, which a length-framed reply checks against @c declared. */
+    std::uint64_t streamed {};
 
     /** How the replier frames its chunks. */
     reply_framing_t framing {};
@@ -303,6 +364,8 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** Sends name <tt>releases[naming]</tt>, each release holding at most half the socket's
      *  send buffer, so the next one fills while the other is in the kernel's hands. */
     exchange_release_t releases[2] {};
+
+    /** Which of @c releases sends name, flipped once it holds half the send buffer. */
     std::uint8_t naming {};
     bool releasing() const noexcept {
         return releases[0].state == release_state_t::releasing_k || releases[1].state == release_state_t::releasing_k;
@@ -316,13 +379,21 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** A streamed request body: the loop decodes into @c body_chunk, and a pull swaps it with
      *  @c pulled_chunk, which the application views until its next pull. Only the loop touches
      *  either; a pull from another thread only raises @c shared.pull_requested. */
-    vector<byte_t> body_chunk {}, pulled_chunk {};
+    vector<byte_t> body_chunk {};
+
+    /** The chunk the last pull handed out, which the application views until its next pull. */
+    vector<byte_t> pulled_chunk {};
 
     /** A waiting pull's output, written as the loop finishes it. */
     ucall_bytes_view_t* pulled_view {};
 
+    /** Whether a pull took a buffered body, which the next one then ends. */
+    body_pull_t body_pull {};
+
     /** A waiting pull's outcome, which the loop makes final. */
     ucall_outcome_t* pull_outcome {};
+
+    /** Whether the request's body was buffered, still streams in, or streamed to its end. */
     body_stage_t body_stage {};
 
     /** How a streamed body ended, which pulls past its bytes report. */
@@ -338,6 +409,8 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** Words a replier or puller writes while the loop reads the cursors above, on lines of
      *  their own: the reply's state bits, its hold on the socket, and the stacks both link. */
     struct alignas(fu::default_alignment_k) shared_t {
+
+        /** The @c exchange_state_t bits; all but @c listed_k clear as it takes its next request. */
         std::uint32_t state {};
 
         /** A @c pull_request_t, raised by a pull from any thread, lowered by the loop. */

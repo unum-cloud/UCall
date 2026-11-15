@@ -74,8 +74,14 @@ struct response {
 
     /** First, so the handle the C face hands out converts back by its address. */
     received_response_t received;
+
+    /** The response's bytes, head then body, which @c received.content views; kept warm. */
     vector<byte_t> storage;
+
+    /** Links the client's free responses, or the pool's stack of returned ones. */
     response_t* next {};
+
+    /** The pool it returns to when freed. */
     response_pool_t* pool {};
 
     static void release(received_response_t* response) noexcept {
@@ -99,8 +105,13 @@ struct response_pool {
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
     explicit response_pool(allocator_t const& allocator) noexcept : allocator(allocator) {}
 
+    /** Responses callers freed, pushed from any thread, which the client takes back to reuse. */
     st::atomic_intrusive_stack<response_t, atomic_ref> returned {};
+
+    /** Responses in callers' hands plus the client's reference; the last to drop frees the pool. */
     std::size_t outside {1};
+
+    /** Allocates the responses and frees them and the pool, even after the client is gone. */
     allocator_t allocator;
 };
 
@@ -114,7 +125,7 @@ struct client_exchange {
     using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
     template <typename value_type_>
     using vector = typename network_t::template vector<value_type_>;
-    explicit client_exchange(allocator_t const& allocator = {}) noexcept
+    explicit client_exchange(allocator_t const& allocator) noexcept
         : authority(rebound_allocator<char> {allocator}), target(rebound_allocator<char> {allocator}),
           host(rebound_allocator<char> {allocator}), redirect(rebound_allocator<char> {allocator}),
           redirect_headers(rebound_allocator<ucall_bytes_view_t> {allocator}) {}
@@ -123,16 +134,43 @@ struct client_exchange {
     client_exchange(client_exchange&&) = delete;
     client_exchange& operator=(client_exchange&&) = delete;
 
+    /** The call as submitted, its URL, verb, body and headers rewritten by each redirect. */
     ucall_client_call_t arguments {};
+
+    /** Whether the call is idle, waits on its origin, or rides a connection's pipeline. */
     client_exchange_stage_t stage {};
+
+    /** When the call times out, by its own timeout or the client's; set on submission. */
     std::uint64_t deadline {};
 
     /** The next of its origin's addresses to dial, in RFC 8305 order: AAAA and A alternating. */
     std::uint32_t address_index {};
+
+    /** The port the URL names, 80 by default, which a new origin takes. */
     std::uint16_t port {};
-    vector<char> authority {}, target {}, host {}, redirect {};
+
+    /** The URL's authority, NUL-terminated, which the @c host header sends and origins intern. */
+    vector<char> authority {};
+
+    /** The path and query the request line asks for, with a leading slash. */
+    vector<char> target {};
+
+    /** The host part of @c authority, NUL-terminated and unbracketed, which a new origin takes. */
+    vector<char> host {};
+
+    /** The URL a redirect led to, which @c arguments.url views; empty until one does. */
+    vector<char> redirect {};
+
+    /** The caller's headers less credentials once redirected, which @c arguments.headers views. */
     vector<ucall_bytes_view_t> redirect_headers {};
-    std::size_t attempts {}, redirects {};
+
+    /** Retries the call took against its retry budget, reset as a redirect queues it again. */
+    std::size_t attempts {};
+
+    /** Redirects the call followed, up to its @c max_redirects. */
+    std::size_t redirects {};
+
+    /** The hash of @c authority, which finds the call's origin. */
     std::uint64_t authority_hash {};
 
     /** Close, when the caller's own @c connection header asks to. */
@@ -159,20 +197,35 @@ struct client_origin {
     using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
     template <typename value_type_>
     using vector = typename network_t::template vector<value_type_>;
-    explicit client_origin(allocator_t const& allocator = {}) noexcept
+    explicit client_origin(allocator_t const& allocator) noexcept
         : authority(rebound_allocator<char> {allocator}), host(rebound_allocator<char> {allocator}) {}
     client_origin(client_origin const&) = delete;
     client_origin& operator=(client_origin const&) = delete;
     client_origin(client_origin&&) = delete;
     client_origin& operator=(client_origin&&) = delete;
 
+    /** Its authority, NUL-terminated, which tells it apart; empty until first interned. */
     vector<char> authority {};
+
+    /** The hash of @c authority, which @c origin_index keys it by. */
     std::uint64_t authority_hash {};
+
+    /** The tunnel its calls ask for, which tells it apart. */
     ucall_security_t security {};
 
-    /** Zeroed when the calls name none. */
-    ucall_noise_key_t private_key {}, peer_key {};
-    client_exchange_t *waiting_head {}, *waiting_tail {};
+    /** The Noise private key its calls name, which tells it apart; zeroed when they name none. */
+    ucall_noise_key_t private_key {};
+
+    /** The Noise peer key its calls name, which tells it apart; zeroed when they name none. */
+    ucall_noise_key_t peer_key {};
+
+    /** The waiting call due first; waiting calls link through @c next by deadline. */
+    client_exchange_t* waiting_head {};
+
+    /** The waiting call due last, which a call due no earlier joins behind. */
+    client_exchange_t* waiting_tail {};
+
+    /** Calls from @c waiting_head to @c waiting_tail, which dials weigh against @c room. */
     std::size_t waiting {};
 
     /** Calls its connections could still take, the sum of their credited shares. */
@@ -184,20 +237,37 @@ struct client_origin {
     /** Open connections with room and nothing to send, stepped when a call queues. */
     client_connection_t* accepting_connections {};
 
-    /** Live origins of the client, or free ones oldest first, keeping their
-     * answers until reused. */
-    client_origin_t *previous {}, *next {};
+    /** Links the client's live origins toward the newest, or its free ones toward the oldest. */
+    client_origin_t* previous {};
+
+    /** Links the client's live origins toward the oldest, or its free ones toward the newest. */
+    client_origin_t* next {};
+
+    /** Which of the client's lists links it; a free origin keeps its answers until reused. */
     origin_list_t list {};
 
-    /** Its host, NUL-terminated, and its port, as the lookup asks and the dials target them. */
+    /** Its host, NUL-terminated, as the lookup asks it. */
     vector<char> host {};
+
+    /** Its port, which the dials target. */
     std::uint16_t port {};
+
+    /** Whether its addresses are unknown, being asked, known or refused, until @c expires. */
     resolution_t resolution {};
 
     /** When its answers or its refusal go stale; zero for a numeric host or a hosts-file entry. */
     std::uint64_t expires {};
-    std::uint32_t ipv6_count {}, ipv4_count {};
+
+    /** Leading @c ipv6_addresses an answer, the hosts file or a numeric host filled. */
+    std::uint32_t ipv6_count {};
+
+    /** Leading @c ipv4_addresses an answer, the hosts file or a numeric host filled. */
+    std::uint32_t ipv4_count {};
+
+    /** AAAA addresses in network order, the first @c ipv6_count valid. */
     byte_t ipv6_addresses[origin_addresses_k][16] {};
+
+    /** A addresses in network order, the first @c ipv4_count valid. */
     byte_t ipv4_addresses[origin_addresses_k][4] {};
 
     /** Asking for its addresses now, or null. */
@@ -209,28 +279,37 @@ template <typename network_type_>
 struct client_connection {
     using network_t = network_type_;
     using allocator_t = typename network_t::allocator_t;
+    template <typename value_type_>
+    using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
+    template <typename value_type_>
+    using vector = typename network_t::template vector<value_type_>;
     using transport_t = typename network_t::transport_t;
     using client_exchange_t = typename network_t::client_exchange_t;
     using client_origin_t = typename network_t::client_origin_t;
     using client_connection_t = typename network_t::client_connection_t;
     using client_t = typename network_t::client_t;
-    explicit client_connection(allocator_t const& allocator = {}) noexcept : transport(allocator) {
+    explicit client_connection(allocator_t const& allocator) noexcept
+        : transport(allocator), requests(rebound_allocator<byte_t> {allocator}) {
         transport.role = transport_role_t::client_k;
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(client_connection) == 2416);
+            static_assert(sizeof(client_connection) == 2256);
     }
     client_connection(client_connection const&) = delete;
     client_connection& operator=(client_connection const&) = delete;
     client_connection(client_connection&&) = delete;
     client_connection& operator=(client_connection&&) = delete;
 
+    /** Its socket, tunnel, parser and buffers; first, so a completion's context reads its role. */
     transport_t transport;
+
+    /** Its composed requests, sent from @c transport.output_offset. */
+    vector<byte_t> requests;
 
     /** Responses arrive in this order. */
     client_exchange_t* oldest_exchange {};
 
-    /** While sending, its request is the one in @c transport.output. */
+    /** While sending, its request is the one in @c requests. */
     client_exchange_t* newest_exchange {};
 
     /** Whose connection it is, for a loop routing a bound client's completions. */
@@ -245,15 +324,22 @@ struct client_connection {
     /** Its share of its origin's room, as of its last step. */
     std::size_t room {};
 
-    /** The client's connections free to dial. */
-    client_connection_t *previous_vacant {}, *next_vacant {};
+    /** Links the client's vacant connections toward their head; null at the head or unlisted. */
+    client_connection_t* previous_vacant {};
 
-    /** Its origin's connections a queued call steps. */
-    client_connection_t *previous_accepting {}, *next_accepting {};
+    /** Links the client's vacant connections, free to dial or to take a call of any origin. */
+    client_connection_t* next_vacant {};
+
+    /** Links its origin's accepting connections toward their head; null at the head or unlisted. */
+    client_connection_t* previous_accepting {};
+
+    /** Links its origin's accepting connections, which a queued call readies. */
+    client_connection_t* next_accepting {};
 
     /** The address its connect dials. */
     sockaddr_storage target {};
-    utilities::socket_length_t target_length {};
+
+    /** Calls from @c oldest_exchange to @c newest_exchange, up to the pipeline depth. */
     std::uint32_t outstanding_exchanges {};
 
     /** The other connection racing it for one call, the first to open taking the call, or null. */
@@ -296,8 +382,11 @@ struct client : ucall_client_handle_t {
     using completed_ring_t = st::basic_ring<ucall_completed_call_t, rebound_allocator<ucall_completed_call_t>>;
     using origin_index_t =
         st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t, rebound_allocator<byte_t>, row_kit_t>;
+
+    /** Allocates the client's records, their buffers and its responses. */
     allocator_t allocator;
-    explicit client(allocator_t const& allocator = {}) noexcept
+
+    explicit client(allocator_t const& allocator) noexcept
         : allocator(allocator), owned_engine(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
           completed(rebound_allocator<ucall_completed_call_t> {allocator}),
           connections(rebound_allocator<owner<client_connection_t>> {allocator}),
@@ -307,20 +396,37 @@ struct client : ucall_client_handle_t {
     client(client&&) = delete;
     client& operator=(client&&) = delete;
 
+    /** The engine it polls when it runs on its own; never opened for a bound client. */
     engine_t owned_engine {};
 
     /** Its own engine, or the one of the server event loop it is bound to. */
     engine_t* engine {&owned_engine};
+
+    /** How it is driven; once bound, only its free and that loop write it. */
     client_binding_t binding {};
 
     /** Links its loop's bound clients. */
     client_t* next_bound {};
+
+    /** Where a poll of @c owned_engine lands, one per engine slot. */
     vector<io_completion_t> completions {};
+
+    /** Finished calls waiting for the caller to take them, room for every admitted call. */
     completed_ring_t completed {};
+
+    /** Success until its engine fails or its loop retires it, then what every call ends with. */
     ucall_status_t failure {ucall_status_success_k};
+
+    /** The options with defaults filled, as @c client_init reports them. */
     ucall_client_options_t config {};
+
+    /** A copy of the configured Noise private key, which @c config points at; else zeroed. */
     ucall_noise_key_t private_key {};
+
+    /** Every connection, @c max_concurrent_connections of them, allocated at init. */
     vector<owner<client_connection_t>> connections {};
+
+    /** Every call record, @c max_concurrent_calls of them; the idle ones link from @c idle. */
     span<client_exchange_t> exchanges {};
 
     /** One per call, per connection and per lookup, so interning never runs out. */
@@ -328,10 +434,14 @@ struct client : ucall_client_handle_t {
 
     /** One per connection, cold, and the free ones; their requests lie in this span alone. */
     span<client_lookup_t> lookups {};
+
+    /** Lookups no origin holds, linked through their @c next. */
     client_lookup_t* free_lookups {};
 
-    /** The nameservers, search names and pacing, and the hosts file, both read once at init. */
+    /** The nameservers, search names and pacing, read once at init. */
     dns::resolver_options_t resolver {};
+
+    /** The hosts file, read once at init, with the names Windows answers itself appended there. */
     vector<char> hosts {};
 
     /** Calls free to submit. */
@@ -345,14 +455,26 @@ struct client : ucall_client_handle_t {
 
     /** At most the earliest deadline of a connection carrying calls. */
     std::uint64_t earliest_connection_deadline {};
-    client_origin_t *live {}, *free_origins {}, *newest_free_origin {};
+
+    /** The newest live origin, which a call waits on, a connection serves or a lookup asks for. */
+    client_origin_t* live {};
+
+    /** The oldest free origin, which an authority not indexed takes over. */
+    client_origin_t* free_origins {};
+
+    /** The newest free origin, behind which a retired origin joins. */
+    client_origin_t* newest_free_origin {};
 
     /** Live origins by @c authority_hash, confirmed against the origin itself. */
     origin_index_t origin_index {};
+
+    /** Calls submitted and not yet taken back completed, at most as many as @c exchanges. */
     std::size_t admitted {};
 
-    /** Where freed responses return, and those taken back from it for the next answers. */
+    /** Where freed responses return; it outlives the client while callers hold any. */
     response_pool_t* responses {};
+
+    /** Responses taken back from @c responses for the next answers, linked through @c next. */
     response_t* free_responses {};
     ~client() noexcept {
         owned_engine.stop();
@@ -360,10 +482,7 @@ struct client : ucall_client_handle_t {
         for (auto& connection : connections)
             if (connection) {
                 auto& transport = connection->transport;
-                if (transport.descriptor >= 0 && !(transport.receive_operation == operation_state_t::submitted_k &&
-                                                   transport.receive_request.operation == io_operation_t::close_k &&
-                                                   transport.receive_request.descriptor < 0))
-                    engine->close_socket(transport.descriptor);
+                if (transport.descriptor >= 0) engine->close_socket(transport.descriptor);
             }
         for (auto& lookup : lookups)
             for (auto& question : lookup.questions)
@@ -601,7 +720,7 @@ struct client : ucall_client_handle_t {
         auto& transport = connection.transport;
         client_origin_t const& origin = *connection.origin;
         while (exchange.address_index < resolving_t::addresses_count(origin)) {
-            connection.target_length = resolving_t::target(origin, exchange.address_index, connection.target);
+            auto const target_length = resolving_t::target(origin, exchange.address_index, connection.target);
             auto descriptor = client.engine->open_socket(connection.target.ss_family);
             if (descriptor < 0) {
                 ++exchange.address_index;
@@ -626,14 +745,12 @@ struct client : ucall_client_handle_t {
             transport.stage = transport_stage_t::connecting_k;
             transport.transmitting = transmit_state_t::sending_k;
             transport.status = ucall_status_success_k;
-            transport.authorizer = client.config.peer_authorizer;
-            transport.authorizer_context = client.config.peer_authorizer_context;
             transport.deadline = fu::min_of(exchange.deadline,
                                             deadline_after(client.config.connect_timeout_microseconds));
             transport.transmit_request = {.operation = io_operation_t::connect_k,
                                           .descriptor = descriptor,
                                           .data = reinterpret_cast<byte_t*>(&connection.target),
-                                          .length = static_cast<std::size_t>(connection.target_length),
+                                          .length = static_cast<std::size_t>(target_length),
                                           .deadline = transport.deadline,
                                           .context = &connection};
             // A later address, even one answered after this dial, races a connect past
@@ -670,8 +787,8 @@ struct client : ucall_client_handle_t {
             appended = http_t::append_text(next, {previous.substr(0, origin_end), directory, location});
         }
         if (appended != ucall_status_success_k) return appended;
-        if (exchange.arguments.options.security != ucall_security_none_k &&
-            !text_view(next).starts_with("http+noise://"))
+        if ((exchange.arguments.options.security != ucall_security_none_k) !=
+            text_view(next).starts_with("http+noise://"))
             return ucall_status_peer_rejected_k;
         exchange.redirect = std::move(next);
         exchange.arguments.url = bytes_view(text_view(exchange.redirect));
@@ -900,8 +1017,7 @@ struct client : ucall_client_handle_t {
         if (!rival || exchange.address_index + 1 >= resolving_t::addresses_count(origin)) return;
         assign_origin(client, *rival, origin);
         ++exchange.address_index;
-        if (compose_request(rival->transport.output, exchange, request_geometry(origin.security)) !=
-                ucall_status_success_k ||
+        if (compose_request(rival->requests, exchange, request_geometry(origin.security)) != ucall_status_success_k ||
             dial_connection(client, *rival, exchange) != ucall_status_success_k)
             return;
         rival->rival = &connection;
@@ -934,8 +1050,7 @@ struct client : ucall_client_handle_t {
         assign_origin(client, connection, origin);
         client_exchange_t& exchange = unqueue_call(origin);
         mark_ready(client, connection);
-        ucall_status_t result = compose_request(connection.transport.output, exchange,
-                                                request_geometry(origin.security));
+        ucall_status_t result = compose_request(connection.requests, exchange, request_geometry(origin.security));
         if (result == ucall_status_success_k) {
             push_call(connection, exchange);
             result = dial_connection(client, connection, exchange);
@@ -1025,7 +1140,7 @@ struct client : ucall_client_handle_t {
         auto& input = transport.input;
         if (transport.transmitting == transmit_state_t::sending_k &&
             transport.transmit_operation == operation_state_t::idle_k && !transport.sending &&
-            transport.output_offset == transport.output.size())
+            transport.output_offset == connection.requests.size())
             transport.transmitting = transmit_state_t::idle_k;
         transport.open_records();
         // Responses answered this round, erased from `input` once after it rather than one by one.
@@ -1078,7 +1193,8 @@ struct client : ucall_client_handle_t {
         }
         if (consumed) http_t::drop_bytes(input, consumed);
         transport.aim_receive();
-        if (transport.stage != transport_stage_t::open_k) return transport.advance();
+        if (transport.stage != transport_stage_t::open_k)
+            return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
         if (transport.peer_stream == peer_stream_t::closed_k || (!connection.oldest_exchange && !input.empty()))
             transport.receiving = receive_state_t::ended_k;
         if (transport.receiving == receive_state_t::reading_k) {
@@ -1086,7 +1202,7 @@ struct client : ucall_client_handle_t {
             if (transport.transmitting == transmit_state_t::idle_k && origin.waiting_head &&
                 accepts_another_exchange(client, connection)) {
                 secure_tunnel_geometry_t const geometry = request_geometry(origin.security);
-                auto& output = transport.output;
+                auto& output = connection.requests;
                 output.clear();
                 if (st::failed(output.resize(geometry.headroom))) transport.fail(ucall_status_out_of_memory_k);
                 client_exchange_t* const newest = connection.newest_exchange;
@@ -1105,19 +1221,20 @@ struct client : ucall_client_handle_t {
                     transport.transmitting = transmit_state_t::sending_k;
                     transport.output_offset = 0;
                 }
-                if (transport.stage != transport_stage_t::open_k) return transport.advance();
+                if (transport.stage != transport_stage_t::open_k)
+                    return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
             }
             if (transport.transmitting == transmit_state_t::sending_k &&
                 transport.transmit_operation == operation_state_t::idle_k) {
-                if (auto* next = transport.transmit_from(transport.output)) return next;
+                if (auto* next = transport.transmit_from(connection.requests)) return next;
                 // Sealing failed the connection.
-                return transport.advance();
+                return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
             }
             if (transport.receive_operation == operation_state_t::idle_k) return transport.emit_receive();
             return nullptr;
         }
         transport.fail(connection.oldest_exchange ? ucall_status_connection_closed_k : ucall_status_success_k);
-        return transport.advance();
+        return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
     }
 
     /** Settles the calls of @p connection's closed connection at @p now, rule C5 of @c call_open:
@@ -1189,23 +1306,18 @@ struct client : ucall_client_handle_t {
             connection.race_deadline && now >= connection.race_deadline)
             start_rival(client, connection);
         for (;;) {
-            auto* next = transport.advance();
+            auto* next = transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
             if (!next && transport.stage == transport_stage_t::open_k) {
                 if (connection.rival) settle_race(client, connection);
                 next = call_open(client, connection);
             }
             if (!next) break;
-            // A failed submission is retried on the next pass rather than this one.
-            if (client.engine->submit(*next) != ucall_status_success_k) {
-                mark_ready(client, connection);
-                break;
-            }
+            client.engine->submit(*next);
             transport.submitted(*next);
         }
         // The close waits until the other direction's operation completes or is cancelled.
         if (transport.stage == transport_stage_t::closing_k) {
-            if (transport.receive_operation == operation_state_t::submitted_k &&
-                transport.receive_request.operation != io_operation_t::close_k)
+            if (transport.receive_operation == operation_state_t::submitted_k)
                 client.engine->cancel(transport.receive_request);
             if (transport.transmit_operation == operation_state_t::submitted_k)
                 client.engine->cancel(transport.transmit_request);
@@ -1317,17 +1429,17 @@ struct client : ucall_client_handle_t {
         if (arguments->client) *arguments->client = nullptr;
         if (!arguments->client || !arguments->outcome || !arguments->options ||
             !arguments->options->max_concurrent_connections) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto client = allocate_unique<client_t>(allocator, allocator);
         if (!client) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         client->responses = allocate_unique<response_pool_t>(allocator, allocator).release();
         if (!client->responses) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         client->config = *arguments->options;
@@ -1336,7 +1448,7 @@ struct client : ucall_client_handle_t {
         if (!config.call_timeout_microseconds) config.call_timeout_microseconds = 30'000'000;
         if (!config.max_response_bytes) {
             if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) {
-                publish(arguments->outcome, started);
+                publish<atomic_ref>(arguments->outcome, started);
                 return;
             }
             config.max_response_bytes = largest_receive_buffer(AF_INET, max_unsent_bytes_k);
@@ -1346,7 +1458,7 @@ struct client : ucall_client_handle_t {
             // Every connection may carry its full pipeline at once.
             if (config.max_concurrent_connections >
                 (std::numeric_limits<std::size_t>::max)() / config.max_pipelined_calls) {
-                publish(arguments->outcome, ucall_status_invalid_argument_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
                 return;
             }
             config.max_concurrent_calls = config.max_concurrent_connections * config.max_pipelined_calls;
@@ -1356,7 +1468,7 @@ struct client : ucall_client_handle_t {
         if (config.max_pipelined_calls > (std::numeric_limits<std::uint32_t>::max)() ||
             config.max_concurrent_connections > (std::numeric_limits<std::uint32_t>::max)() / 4 ||
             config.max_concurrent_calls > (std::numeric_limits<std::uint32_t>::max)() / 4) {
-            publish(arguments->outcome, ucall_status_overflow_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
             return;
         }
         auto slots = engine_slots(config);
@@ -1368,14 +1480,14 @@ struct client : ucall_client_handle_t {
             std::bit_ceil(config.max_concurrent_calls), rebound_allocator<ucall_completed_call_t> {allocator});
         if (!completed || st::failed(client->completions.resize(slots)) ||
             st::failed(client->connections.resize(config.max_concurrent_connections))) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         client->completed = std::move(*completed);
         rebound_allocator<client_exchange_t> exchange_allocator {allocator};
         auto* exchanges = exchange_allocator.allocate(config.max_concurrent_calls);
         if (!exchanges) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         for (std::size_t i = config.max_concurrent_calls; i != 0; --i)
@@ -1384,7 +1496,7 @@ struct client : ucall_client_handle_t {
         std::size_t const origins_count = config.max_concurrent_calls + 2 * config.max_concurrent_connections;
         auto* origins = rebound_allocator<client_origin_t> {allocator}.allocate(origins_count);
         if (!origins) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         for (std::size_t i = 0; i != origins_count; ++i) {
@@ -1395,7 +1507,7 @@ struct client : ucall_client_handle_t {
         client->origins = {origins, origins_count};
         auto* lookups = rebound_allocator<client_lookup_t> {allocator}.allocate(config.max_concurrent_connections);
         if (!lookups) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         for (std::size_t i = config.max_concurrent_connections; i != 0; --i)
@@ -1410,14 +1522,14 @@ struct client : ucall_client_handle_t {
             if (ucall_status_t const copied = http_t::append_text(client->hosts,
                                                                   {std::string_view {hosts, length}, implied});
                 copied != ucall_status_success_k) {
-                publish(arguments->outcome, copied);
+                publish<atomic_ref>(arguments->outcome, copied);
                 return;
             }
         }
         st::expected<origin_index_t> origin_index = origin_index_t::make(origins_count, {},
                                                                          rebound_allocator<byte_t> {allocator});
         if (!origin_index) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         client->origin_index = std::move(*origin_index);
@@ -1430,14 +1542,14 @@ struct client : ucall_client_handle_t {
                  status != ucall_status_success_k) {
             // An engine refused by a host setting names the setting to raise.
             char const* refusal = client->owned_engine.refusal();
-            publish(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
+            publish<atomic_ref>(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
             return;
         }
         else config.backend = client->owned_engine.backend();
         for (auto& connection : client->connections) {
             connection = allocate_unique<client_connection_t>(allocator, allocator);
             if (!connection) {
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
             connection->client = client.get();
@@ -1447,21 +1559,26 @@ struct client : ucall_client_handle_t {
         if (arguments->resolved) *arguments->resolved = config;
         client->api = &client_api_k;
         *arguments->client = client.release();
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void client_free(ucall_client_t handle) noexcept {
         auto* client = static_cast<client_t*>(handle);
         if (client->binding == client_binding_t::owned_k)
             return allocator_delete<client_t, allocator_t> {client->allocator}(client);
-        // The loop deletes it once the engine they share holds nothing of it.
-        client->binding = client_binding_t::retiring_k;
-        if (client->failure == ucall_status_success_k) client->failure = ucall_status_connection_closed_k;
-        abandon_calls(*client);
-        for (auto& connection : client->connections) {
+        // Only its loop touches what they share, so the loop ends its calls and deletes it.
+        atomic_ref<client_binding_t> {client->binding}.store(client_binding_t::freed_k, std::memory_order_release);
+    }
+
+    /** Ends the calls and connections of a bound @p client its owner freed, on its loop. */
+    static void retire(client_t& client) noexcept {
+        client.binding = client_binding_t::retiring_k;
+        if (client.failure == ucall_status_success_k) client.failure = ucall_status_connection_closed_k;
+        abandon_calls(client);
+        for (auto& connection : client.connections) {
             auto const stage = connection->transport.stage;
             if (stage == transport_stage_t::idle_k || stage == transport_stage_t::closed_k) continue;
             connection->transport.fail(ucall_status_success_k);
-            mark_ready(*client, *connection);
+            mark_ready(client, *connection);
         }
     }
 
@@ -1508,7 +1625,7 @@ struct client : ucall_client_handle_t {
         if (!arguments->outcome || !http_t::valid_view(arguments->url) || !http_t::valid_view(arguments->body) ||
             !http_t::http_verb_name(arguments->verb) || !formatting_t::security_valid(arguments->options.security) ||
             (arguments->headers_count && !arguments->headers)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& client = *static_cast<client_t*>(arguments->client);
@@ -1520,15 +1637,15 @@ struct client : ucall_client_handle_t {
             (security == ucall_security_noise_xx_k && !client.config.peer_authorizer) ||
             ((security == ucall_security_noise_ik_k || security == ucall_security_noise_kk_k) &&
              !options.noise_peer_key)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         if (client.failure != ucall_status_success_k) {
-            publish(arguments->outcome, client.failure);
+            publish<atomic_ref>(arguments->outcome, client.failure);
             return;
         }
         if (client.admitted == client.exchanges.size()) {
-            publish(arguments->outcome, ucall_status_contended_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_contended_k);
             return;
         }
         auto timeout = options.timeout_microseconds ? options.timeout_microseconds
@@ -1539,12 +1656,12 @@ struct client : ucall_client_handle_t {
         exchange.arguments.outcome = nullptr;
         auto result = parse_url(exchange);
         if (result != ucall_status_success_k) {
-            publish(arguments->outcome, result);
+            publish<atomic_ref>(arguments->outcome, result);
             return;
         }
         exchange.origin = intern_origin(client, exchange);
         if (!exchange.origin) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         client.idle = exchange.next;
@@ -1553,12 +1670,12 @@ struct client : ucall_client_handle_t {
         exchange.attempts = exchange.redirects = 0;
         queue_call(client, exchange);
         ++client.admitted;
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void client_take_completed(ucall_client_take_completed_t* arguments) noexcept {
         if (arguments->count) *arguments->count = 0;
         if (!arguments->count || (arguments->capacity && !arguments->calls)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& client = *static_cast<client_t*>(arguments->client);
@@ -1589,9 +1706,10 @@ struct client : ucall_client_handle_t {
         std::size_t const count = client.completed.pop_many({arguments->calls, arguments->capacity});
         client.admitted -= count;
         *arguments->count = count;
-        publish(arguments->outcome, count ? ucall_status_success_k : client.failure);
+        publish<atomic_ref>(arguments->outcome, count ? ucall_status_success_k : client.failure);
     }
 
+    /** The C entry points every client handle dispatches through. */
     inline static client_api_t const client_api_k {&client_free, &client_call, &client_take_completed};
 };
 

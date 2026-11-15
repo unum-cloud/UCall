@@ -459,6 +459,7 @@ struct secure_tunnel_crypto {
                 sha_init(&shrink, nullptr);
                 sha_update(&shrink, reinterpret_cast<sz_cptr_t>(key.data()), key.size(), nullptr);
                 sha_digest(&shrink, reinterpret_cast<sz_u8_t*>(padded), nullptr);
+                secure_zero(shrink);
             }
             else if (key.size()) { std::memcpy(padded, key.data(), key.size()); }
 
@@ -488,6 +489,14 @@ struct secure_tunnel_crypto {
             sha_update(&outer, reinterpret_cast<sz_cptr_t>(digest), sizeof(digest), nullptr);
             sha_digest(&outer, reinterpret_cast<sz_u8_t*>(output.data()), nullptr);
             secure_zero(digest);
+            secure_zero(inner);
+            secure_zero(outer);
+        }
+
+        /** The midstates stand in for the key, so they leave with it. */
+        ~hmac_sha256_t() noexcept {
+            secure_zero(inner_);
+            secure_zero(outer_);
         }
     };
 
@@ -533,7 +542,6 @@ struct secure_tunnel_crypto {
     class secure_tunnel_cipher_t {
 
         sz_aes256_gcm_key_t schedule_ {};
-        byte_t key_[secure_tunnel_key_size_k] {};
         std::uint64_t nonce_ {};
         cipher_key_t key_state_ {cipher_key_t::empty_k};
 
@@ -551,15 +559,13 @@ struct secure_tunnel_crypto {
         [[nodiscard]] bool exhausted() const noexcept { return has_key() && nonce_ == nonce_exhausted_k; }
 
         void initialize(span<byte_t const, secure_tunnel_key_size_k> key) noexcept {
-            std::memcpy(key_, key.data(), key.size_bytes());
-            aes_init(&schedule_, reinterpret_cast<sz_u8_t const*>(key_), nullptr);
+            aes_init(&schedule_, reinterpret_cast<sz_u8_t const*>(key.data()), nullptr);
             nonce_ = 0;
             key_state_ = cipher_key_t::keyed_k;
         }
 
         void clear() noexcept {
             secure_zero(schedule_);
-            secure_zero(key_);
             nonce_ = 0;
             key_state_ = cipher_key_t::empty_k;
         }
@@ -1209,12 +1215,18 @@ struct secure_tunnel_crypto {
                                                                                  : secure_tunnel_key_size_k;
                 if (consumed + expected > length) return secure_tunnel_fault_t::malformed_k;
                 std::size_t produced = 0;
+                byte_t sent[secure_tunnel_key_size_k];
                 if (secure_tunnel_fault_t const fault = noise.transcript.open_and_hash(
-                        {body.data() + consumed, body.data() + consumed + expected},
-                        {noise.remote_static, noise.remote_static + secure_tunnel_key_size_k}, produced);
+                        {body.data() + consumed, body.data() + consumed + expected}, {sent, sent + sizeof(sent)},
+                        produced);
                     fault != secure_tunnel_fault_t::none_k)
                     return fault;
                 if (produced != secure_tunnel_key_size_k) return secure_tunnel_fault_t::malformed_k;
+                // A key the configuration pinned admits no other, whichever pattern sends one.
+                if (noise.remote_static_state == remote_static_t::configured_k &&
+                    std::memcmp(sent, noise.remote_static, sizeof(sent)) != 0)
+                    return secure_tunnel_fault_t::authentication_failed_k;
+                std::memcpy(noise.remote_static, sent, sizeof(sent));
                 // The tag verified against the transcript, so this key is proven rather than
                 // assumed.
                 noise.remote_static_state = remote_static_t::authenticated_k;
@@ -1238,7 +1250,7 @@ struct secure_tunnel_crypto {
                 {body.data() + consumed, body.data() + length}, {payload, payload + sizeof(payload)}, produced);
             fault != secure_tunnel_fault_t::none_k)
             return fault;
-        secure_zero(payload);
+        secure_zero({payload, payload + produced});
 
         ++noise.message_index;
         if (noise.handshake_complete()) finish_handshake(noise);

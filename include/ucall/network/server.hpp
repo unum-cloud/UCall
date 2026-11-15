@@ -82,8 +82,10 @@ struct server : ucall_server_handle_t {
     template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
 
+    /** Allocates the server's interfaces, loops, routes, endpoints and their buffers. */
     allocator_t allocator;
-    explicit server(allocator_t const& allocator = {}) noexcept
+
+    explicit server(allocator_t const& allocator) noexcept
         : allocator(allocator), resolved(rebound_allocator<ucall_network_interface_t> {allocator}),
           event_loops(rebound_allocator<owner<event_loop_t>> {allocator}), routes(allocator),
           batch_endpoints(rebound_allocator<batch_endpoint_t*> {allocator}),
@@ -94,34 +96,55 @@ struct server : ucall_server_handle_t {
     server(server&&) = delete;
     server& operator=(server&&) = delete;
 
+    /** Success until an engine or a listener breaks and cuts the server, then the I/O fault. */
     ucall_status_t failure {ucall_status_success_k};
+
+    /** The options with defaults filled, viewing @c resolved and the metrics copies. */
     ucall_server_options_t config {};
+
+    /** One per interface, indexed alike by each loop's acceptors, orders and statistics. */
     span<network_interface_t> network_interfaces {};
+
+    /** Each interface's options as validated, which @c config.interfaces points at. */
     vector<ucall_network_interface_t> resolved {};
+
+    /** Every event loop, at the index its polls name. */
     vector<owner<event_loop_t>> event_loops {};
+
+    /** Matches request paths and verbs to @c endpoints; filled before polling starts. */
     route_trie<http_t, allocator_t> routes {};
+
+    /** Every registered endpoint, newest first through @c next, which the server frees. */
     endpoint_t* endpoints {};
 
     /** Every batch endpoint, whose polling owner @c server_stop must wake. */
     vector<batch_endpoint_t*> batch_endpoints;
+
+    /** Requests admitted at once, connections times pipeline depth; bounds batch queues. */
     std::size_t requests_budget {};
 
     /** Event loops retired for good; once all are, a drained server takes no more deposits. */
     std::uint32_t retired_event_loops {};
 
-    /** Read by registrations, apart from what dispatch reads. */
+    /** Set by the first poll, after which registrations refuse; apart from what dispatch reads. */
     alignas(fu::default_alignment_k) std::uint32_t polling_started {};
 
     /** The metric prefix then every tag, back to back, as the resolved configuration views. */
     vector<char> metrics_text {};
+
+    /** Each tag within @c metrics_text, which @c config.metrics_tags points at. */
     vector<ucall_bytes_view_t> metrics_tag_views {};
+
+    /** The prefix at the front of @c metrics_text, @c ucall unless configured. */
     ucall_bytes_view_t metrics_prefix {};
+
+    /** The resolved StatsD address each loop's metrics socket connects to. */
     sockaddr_storage metrics_destination {};
 
-    /** Zero when metrics are off. */
+    /** Bytes of @c metrics_destination; zero when metrics are off. */
     socket_length_t metrics_destination_length {};
 
-    /** The path MTU less the IP and UDP headers. */
+    /** The path MTU less the IP and UDP headers, or 548 where it is unknown; caps each datagram. */
     std::size_t metrics_datagram_bytes {};
     ~server() noexcept {
         event_loops.clear();
@@ -242,41 +265,45 @@ struct server : ucall_server_handle_t {
         socket_close(probe);
         return ucall_status_success_k;
     }
+
+    /** Builds the server @p arguments describes. Every thread that replies calls @p allocator,
+     *  since a reply takes its segments from it, so it must be safe to call from all of them. */
     static void server_init(ucall_server_init_t* arguments, allocator_t const& allocator = {}) noexcept {
         if (!arguments) return;
         if (arguments->server) *arguments->server = nullptr;
-        auto* config = arguments->options;
-        if (!arguments->outcome || !arguments->server || !config || !config->interfaces || !config->interfaces_count) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+        auto* requested = arguments->options;
+        if (!arguments->outcome || !arguments->server || !requested || !requested->interfaces ||
+            !requested->interfaces_count) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto server = allocate_unique<server_t>(allocator, allocator);
-        if (!server || st::failed(server->resolved.resize(config->interfaces_count))) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+        if (!server || st::failed(server->resolved.resize(requested->interfaces_count))) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
-        if (ucall_status_t const resolved = resolve_metrics(*server, *config); resolved != ucall_status_success_k) {
-            publish(arguments->outcome, resolved);
+        if (ucall_status_t const resolved = resolve_metrics(*server, *requested); resolved != ucall_status_success_k) {
+            publish<atomic_ref>(arguments->outcome, resolved);
             return;
         }
         if (ucall_status_t const routed = server->routes.init(); routed != ucall_status_success_k) {
-            publish(arguments->outcome, routed);
+            publish<atomic_ref>(arguments->outcome, routed);
             return;
         }
         rebound_allocator<network_interface_t> network_interface_allocator {allocator};
-        auto* network_interfaces = network_interface_allocator.allocate(config->interfaces_count);
+        auto* network_interfaces = network_interface_allocator.allocate(requested->interfaces_count);
         if (!network_interfaces) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
-        for (std::size_t i = 0; i != config->interfaces_count; ++i)
+        for (std::size_t i = 0; i != requested->interfaces_count; ++i)
             std::construct_at(network_interfaces + i, allocator);
-        server->network_interfaces = {network_interfaces, config->interfaces_count};
+        server->network_interfaces = {network_interfaces, requested->interfaces_count};
         std::size_t event_loops_count = 1;
         io::io_listeners_t listeners = io::io_listeners_t::created_k;
-        for (std::size_t i = 0; i != config->interfaces_count; ++i) {
+        for (std::size_t i = 0; i != requested->interfaces_count; ++i) {
             auto& network_interface = server->network_interfaces[i];
-            network_interface.config = config->interfaces[i];
+            network_interface.config = requested->interfaces[i];
             if (network_interface.config.noise_private_key) {
                 std::memcpy(network_interface.private_key, *network_interface.config.noise_private_key,
                             sizeof(network_interface.private_key));
@@ -291,13 +318,13 @@ struct server : ucall_server_handle_t {
             std::string_view const device = text_view(settings.device_name);
             if (!http_t::valid_view(settings.address) || !http_t::valid_view(settings.device_name) ||
                 http_t::find(device, '\0') != std::string_view::npos) {
-                publish(arguments->outcome, ucall_status_invalid_argument_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
                 return;
             }
             if (!device.empty()) {
                 if (ucall_status_t const copied = formatting_t::copy_text(network_interface.device, device);
                     copied != ucall_status_success_k) {
-                    publish(arguments->outcome, copied);
+                    publish<atomic_ref>(arguments->outcome, copied);
                     return;
                 }
                 settings.device_name = bytes_view({network_interface.device.data(), device.size()});
@@ -307,27 +334,27 @@ struct server : ucall_server_handle_t {
                 (settings.security != ucall_security_none_k && !settings.noise_private_key) ||
                 (settings.security == ucall_security_noise_xx_k && !settings.peer_authorizer) ||
                 (settings.security == ucall_security_noise_kk_k && !settings.noise_peer_key)) {
-                publish(arguments->outcome, ucall_status_invalid_argument_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
                 return;
             }
 #if !UCALL_OS_LINUX_
             if (settings.device_name.length) {
-                publish(arguments->outcome, ucall_status_unsupported_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_unsupported_k);
                 return;
             }
 #endif
             if (!settings.max_concurrent_connections) {
-                publish(arguments->outcome, ucall_status_invalid_argument_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
                 return;
             }
             if (ucall_status_t const opened = open_reply_directories(network_interface);
                 opened != ucall_status_success_k) {
-                publish(arguments->outcome, opened);
+                publish<atomic_ref>(arguments->outcome, opened);
                 return;
             }
             if (!settings.event_loops) settings.event_loops = formatting_t::interface_event_loops(device);
             if (!settings.event_loops) {
-                publish(arguments->outcome, ucall_status_invalid_argument_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
                 return;
             }
             if (settings.event_loops > settings.max_concurrent_connections)
@@ -338,13 +365,13 @@ struct server : ucall_server_handle_t {
                     (std::numeric_limits<std::size_t>::max)() / settings.max_pipelined_requests ||
                 settings.max_concurrent_connections * settings.max_pipelined_requests >
                     (std::numeric_limits<std::size_t>::max)() - server->requests_budget) {
-                publish(arguments->outcome, ucall_status_overflow_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
                 return;
             }
             server->requests_budget += settings.max_concurrent_connections * settings.max_pipelined_requests;
 #if UCALL_OS_WINDOWS_
             if (settings.event_loops > 1) {
-                publish(arguments->outcome, ucall_status_unsupported_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_unsupported_k);
                 return;
             }
 #endif
@@ -356,25 +383,25 @@ struct server : ucall_server_handle_t {
                     network_interface.public_key, std::as_bytes(std::span {*settings.noise_private_key}));
         }
         if (st::failed(server->event_loops.resize(event_loops_count))) {
-            publish(arguments->outcome, ucall_status_out_of_memory_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
         for (std::size_t event_loop_index = 0; event_loop_index != event_loops_count; ++event_loop_index) {
             server->event_loops[event_loop_index] = allocate_unique<event_loop_t>(allocator, allocator);
             if (!server->event_loops[event_loop_index]) {
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
             auto& event_loop = *server->event_loops[event_loop_index];
             event_loop.server = server.get();
             event_loop.index = static_cast<std::uint32_t>(event_loop_index);
-            if (st::failed(event_loop.interface_statistics.resize(config->interfaces_count)) ||
-                st::failed(event_loop.interface_orders.resize(config->interfaces_count))) {
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+            if (st::failed(event_loop.interface_statistics.resize(requested->interfaces_count)) ||
+                st::failed(event_loop.interface_orders.resize(requested->interfaces_count))) {
+                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
             if (ucall_status_t const opened = event_loop.wake.open(); opened != ucall_status_success_k) {
-                publish(arguments->outcome, opened);
+                publish<atomic_ref>(arguments->outcome, opened);
                 return;
             }
             std::size_t connections_count = 0, acceptors_count = 0;
@@ -382,7 +409,7 @@ struct server : ucall_server_handle_t {
                 if (event_loop_index < network_interface.config.event_loops) {
                     std::size_t const quota = network_interface.quota(event_loop_index);
                     if (quota > (std::numeric_limits<std::size_t>::max)() - connections_count) {
-                        publish(arguments->outcome, ucall_status_overflow_k);
+                        publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
                         return;
                     }
                     connections_count += quota;
@@ -390,13 +417,13 @@ struct server : ucall_server_handle_t {
                     ++acceptors_count;
                 }
             if (st::failed(event_loop.connections.resize(connections_count))) {
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
             rebound_allocator<interface_acceptor_t> acceptor_allocator {allocator};
             auto* acceptors = acceptor_allocator.allocate(acceptors_count);
             if (!acceptors) {
-                publish(arguments->outcome, ucall_status_out_of_memory_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
             }
             for (std::size_t i = 0; i != acceptors_count; ++i) std::construct_at(acceptors + i, allocator);
@@ -404,7 +431,7 @@ struct server : ucall_server_handle_t {
             for (auto& connection : event_loop.connections) {
                 connection = allocate_unique<connection_t>(allocator, allocator);
                 if (!connection) {
-                    publish(arguments->outcome, ucall_status_out_of_memory_k);
+                    publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                     return;
                 }
                 connection->index = static_cast<std::uint32_t>(&connection - event_loop.connections.data());
@@ -420,7 +447,7 @@ struct server : ucall_server_handle_t {
                     acceptor.network_interface = &network_interface;
                     if (st::failed(acceptor.peer_addresses.resize(
                             fu::max_of<std::size_t>(network_interface.quota(event_loop_index), 1)))) {
-                        publish(arguments->outcome, ucall_status_out_of_memory_k);
+                        publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                         return;
                     }
                 }
@@ -429,7 +456,7 @@ struct server : ucall_server_handle_t {
         // one resolved, so loop zero's listeners and the sockets they accept carry its engine's
         // flags, and the later loops accept on duplicates of them; a ring serves the thread that
         // first polls it.
-        ucall_io_backend_t backend = config->backend;
+        ucall_io_backend_t backend = requested->backend;
         for (auto& event_loop : server->event_loops) {
             std::size_t windows = 0, slots = 0;
             ucall_status_t status = event_loop_slots(*event_loop, windows, slots);
@@ -438,7 +465,7 @@ struct server : ucall_server_handle_t {
             if (status != ucall_status_success_k) {
                 // An engine refused by a host setting or a borrowed listener names what to change.
                 char const* refusal = event_loop->engine.refusal();
-                publish(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
+                publish<atomic_ref>(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
                 return;
             }
             reserve_releases(*event_loop, windows);
@@ -461,15 +488,14 @@ struct server : ucall_server_handle_t {
                 else result = ucall_status_unsupported_k;
 #endif
                 if (result != ucall_status_success_k) {
-                    publish(arguments->outcome, result);
+                    publish<atomic_ref>(arguments->outcome, result);
                     return;
                 }
-                acceptor.descriptor = acceptor.request.descriptor;
             }
         }
-        server->config = *config;
+        server->config = *requested;
         server->config.backend = backend;
-        for (std::size_t i = 0; i != config->interfaces_count; ++i)
+        for (std::size_t i = 0; i != requested->interfaces_count; ++i)
             server->resolved[i] = server->network_interfaces[i].config;
         server->config.interfaces = server->resolved.data();
         server->config.metrics_prefix = server->metrics_prefix;
@@ -477,6 +503,10 @@ struct server : ucall_server_handle_t {
         if (!server->config.metrics_sample_rate) server->config.metrics_sample_rate = 1.f;
         if (!server->config.metrics_interval_microseconds) server->config.metrics_interval_microseconds = 1'000'000;
         if (arguments->resolved) *arguments->resolved = server->config;
+        // The caller's own views end with this call, so the kept copies let go of them.
+        server->config.metrics_address = {};
+        for (std::size_t i = 0; i != requested->interfaces_count; ++i)
+            server->resolved[i].listen_descriptor = server->network_interfaces[i].config.listen_descriptor = nullptr;
         server->api = &server_api_k;
         char digits[std::numeric_limits<std::size_t>::digits10 + 1];
         for (auto const& network_interface : server->network_interfaces)
@@ -485,7 +515,7 @@ struct server : ucall_server_handle_t {
                                     {"backend", ucall_io_backend_name(server->config.backend)},
                                     {"event_loops", formatting_t::format_decimal(digits, server->event_loops.size())}});
         *arguments->server = server.release();
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
 
     /** The first stop drains, letting the replies in flight finish; any later one cuts them. */
@@ -569,9 +599,12 @@ struct server : ucall_server_handle_t {
     static void bind_client(ucall_client_init_t* arguments) noexcept {
         auto options = *arguments->options;
         auto& server = *static_cast<server_t*>(options.server);
+        // A bound client runs on its loop's engine and kits, so a pin naming others is refused.
         if (options.event_loop >= server.event_loops.size() ||
-            server.event_loops[options.event_loop]->stage != event_loop_stage_t::unopened_k) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            server.event_loops[options.event_loop]->stage != event_loop_stage_t::unopened_k ||
+            (options.backend != ucall_io_backend_automatic_k && options.backend != server.config.backend) ||
+            (options.cpu_class != ucall_cpu_class_unknown_k && options.cpu_class != server.config.cpu_class)) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& event_loop = *server.event_loops[options.event_loop];
@@ -588,12 +621,15 @@ struct server : ucall_server_handle_t {
             event_loop.bound_slots -= slots;
             allocator_delete<client_t, allocator_t> {client->allocator}(client);
             *arguments->client = nullptr;
+            // The refusal of the attempt whose status is published, read before the next one.
+            char const* refusal = event_loop.engine.refusal();
             // The loop keeps serving at its former size, or reports why not from its first poll.
             event_loop.setup_status = grow_engine(event_loop);
-            char const* refusal = event_loop.engine.refusal();
-            publish(arguments->outcome, grown, refusal ? refusal : ucall_status_name(grown));
+            publish<atomic_ref>(arguments->outcome, grown, refusal ? refusal : ucall_status_name(grown));
             return;
         }
+        // Its traffic runs through the loop's engine, so it counts into the loop's counters too.
+        for (auto& connection : client->connections) connection->transport.statistics = &event_loop.statistics;
         client->next_bound = std::exchange(event_loop.bound_clients, client);
     }
 
@@ -615,6 +651,9 @@ struct server : ucall_server_handle_t {
         std::uint64_t deadline = 0;
         for (client_t** link = &event_loop.bound_clients; *link;) {
             client_t& client = **link;
+            if (atomic_ref<client_binding_t> {client.binding}.load(std::memory_order_acquire) ==
+                client_binding_t::freed_k)
+                client_t::retire(client);
             std::uint64_t const due = client_t::client_progress(client);
             if (client.binding == client_binding_t::retiring_k && client_t::retired(client)) {
                 *link = client.next_bound;
@@ -640,19 +679,17 @@ struct server : ucall_server_handle_t {
             return ucall_status_out_of_memory_k;
         event_loop.stage = event_loop_stage_t::serving_k;
         if (st::failed(event_loop.completions.resize(slots))) return ucall_status_out_of_memory_k;
-        auto descriptor = event_loop.engine.import_socket(event_loop.wake.descriptors[0]);
+        auto descriptor = event_loop.engine.import_socket(std::exchange(event_loop.wake.descriptors[0], -1));
         if (descriptor < 0) return ucall_status_io_k;
-        event_loop.wake.descriptors[0] = -1;
         event_loop.wake.request.descriptor = descriptor;
-        if (event_loop.engine.submit(event_loop.wake.request) != ucall_status_success_k) return ucall_status_io_k;
+        event_loop.engine.submit(event_loop.wake.request);
         if (ucall_status_t const opened = open_metrics(*event_loop.server, event_loop);
             opened != ucall_status_success_k)
             return opened;
         for (auto& acceptor : event_loop.interface_acceptors) {
-            auto imported = event_loop.engine.import_socket(acceptor.request.descriptor);
-            if (imported < 0) return ucall_status_io_k;
-            acceptor.request.descriptor = imported;
-            acceptor.descriptor = -1;
+            acceptor.request.descriptor = event_loop.engine.import_socket(acceptor.request.descriptor);
+            if (acceptor.request.descriptor < 0) return ucall_status_io_k;
+            acceptor.stage = interface_acceptor_t::stage_t::idle_k;
             acceptor.reserve_descriptor = socket_open(acceptor.network_interface->family);
             if (acceptor.reserve_descriptor < 0) return ucall_status_io_k;
         }
@@ -687,6 +724,8 @@ struct server : ucall_server_handle_t {
         for (std::uint64_t const due : {serving_t::release_deadline(event_loop), event_loop.metrics.due,
                                         event_loop.accept_deadline, bound_progress(event_loop)})
             if (due && (!deadline || due < deadline)) deadline = due;
+        // Handshakes waiting their turn, and connections their step readied, take the next pass.
+        if (event_loop.oldest_handshake || event_loop.ready) wait = io_wait_t::nonblocking_k;
         // A notify that landed while the loop ran may have listed what the rounds above missed.
         auto wake_state = atomic_ref<wake_state_t> {event_loop.wake_state};
         if (wait == io_wait_t::blocking_k &&
@@ -710,10 +749,7 @@ struct server : ucall_server_handle_t {
             auto& completion = event_loop.completions[static_cast<std::size_t>(i)];
             if (completion.request == &event_loop.wake.request) {
                 event_loop.engine.release(completion);
-                if (event_loop.engine.submit(event_loop.wake.request) != ucall_status_success_k) {
-                    atomic_ref<ucall_status_t> {server.failure}.store(ucall_status_io_k, std::memory_order_release);
-                    server_cut(server);
-                }
+                event_loop.engine.submit(event_loop.wake.request);
             }
             else if (completion.request == &event_loop.metrics.send_request) {
                 metrics_t::complete_metrics(event_loop, completion);
@@ -753,7 +789,7 @@ struct server : ucall_server_handle_t {
     static void server_take_call(ucall_server_take_call_t* arguments) noexcept {
         auto& server = *static_cast<server_t*>(arguments->server);
         if (arguments->event_loop_index >= server.event_loops.size()) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto wait = arguments->timeout_microseconds ? io_wait_t::blocking_k : io_wait_t::nonblocking_k;
@@ -766,12 +802,12 @@ struct server : ucall_server_handle_t {
         if (status == ucall_status_success_k && event_loop.stage == event_loop_stage_t::retired_k)
             status = ucall_status_connection_closed_k;
         polling_thread.store({}, std::memory_order_relaxed);
-        publish(arguments->outcome, status);
+        publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_take_calls(ucall_server_take_calls_t* arguments) noexcept {
         auto& server = *static_cast<server_t*>(arguments->server);
         if (arguments->event_loop_index >= server.event_loops.size()) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& event_loop = *server.event_loops[arguments->event_loop_index];
@@ -781,7 +817,7 @@ struct server : ucall_server_handle_t {
         while (event_loop.stage != event_loop_stage_t::retired_k && status == ucall_status_success_k)
             status = server_poll(server, event_loop, io_wait_t::blocking_k);
         polling_thread.store({}, std::memory_order_relaxed);
-        publish(arguments->outcome, status);
+        publish<atomic_ref>(arguments->outcome, status);
     }
 
     /** Every counter of @p event_loop, as any thread may read them while the loop runs. */
@@ -796,6 +832,7 @@ struct server : ucall_server_handle_t {
                                               .kernel_enters = read(engine.kernel_enters),
                                               .submissions = read(engine.submissions),
                                               .completions = read(engine.completions),
+                                              .kernel_entries = read(engine.kernel_entries),
                                               .cancellations = read(engine.cancellations),
                                               .accepts = read(loop.accepts),
                                               .requests = read(loop.requests),
@@ -825,11 +862,11 @@ struct server : ucall_server_handle_t {
     static void server_event_loop_statistics(ucall_server_event_loop_statistics_t* arguments) noexcept {
         auto& server = *static_cast<server_t*>(arguments->server);
         if (!arguments->statistics || arguments->event_loop_index >= server.event_loops.size()) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         *arguments->statistics = loop_totals(*server.event_loops[arguments->event_loop_index]);
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
 
     /** Hands the pending batch to its callback and counts it under @p trigger, the counter of why
@@ -838,12 +875,7 @@ struct server : ucall_server_handle_t {
                                           std::uint64_t& trigger) noexcept {
         if (endpoint.collected.empty()) return ucall_status_would_block_k;
         if (stage == server_stage_t::cutting_k)
-            for (auto handle : endpoint.collected) {
-                auto& exchange = *static_cast<server_exchange_t*>(handle);
-                atomic_ref<std::uint32_t> {exchange.shared.state}.set_bits(claimed_k | replied_k | detached_k,
-                                                                           std::memory_order_release);
-                replies_t::abandon_reply(exchange);
-            }
+            for (auto handle : endpoint.collected) abandon(*static_cast<server_exchange_t*>(handle));
         else {
             tally<atomic_ref>(endpoint.statistics.batches);
             tally<atomic_ref>(endpoint.statistics.requests, endpoint.collected.size());
@@ -854,6 +886,22 @@ struct server : ucall_server_handle_t {
         return stage != server_stage_t::cutting_k ? ucall_status_success_k : ucall_status_would_block_k;
     }
 
+    /** Ends @p exchange unanswered, as a batch never handed to the application must. */
+    static void abandon(server_exchange_t& exchange) noexcept {
+        atomic_ref<std::uint32_t> {exchange.shared.state}.set_bits(claimed_k | replied_k | detached_k,
+                                                                   std::memory_order_release);
+        replies_t::abandon_reply(exchange);
+    }
+
+    /** Whether the peer of @p exchange left before its batch fired; such a request ends here, so
+     *  batches spend no work on requests nobody waits for. */
+    static bool abandoned(server_exchange_t& exchange) noexcept {
+        if (!(atomic_ref<std::uint32_t> {exchange.shared.state}.load(std::memory_order_acquire) & detached_k))
+            return false;
+        abandon(exchange);
+        return true;
+    }
+
     /** One round of one batch endpoint: moves its deposits to @c collected, invokes the batch
      *  if due, and sets @p expiry to when the waiting remainder falls due, or zero when nothing
      *  waits. Succeeds when the callback fired, or reports @c ucall_status_would_block_k. */
@@ -861,6 +909,10 @@ struct server : ucall_server_handle_t {
                                            std::uint64_t& expiry) noexcept {
         auto tail = atomic_ref<std::uint64_t> {endpoint.tail}.load(std::memory_order_acquire);
         ucall_status_t flushed = ucall_status_would_block_k;
+        std::size_t kept = 0;
+        for (auto handle : endpoint.collected)
+            if (!abandoned(*static_cast<server_exchange_t*>(handle))) endpoint.collected[kept++] = handle;
+        [[maybe_unused]] st::status_t const shrunk = endpoint.collected.resize(kept);
         auto head = endpoint.head;
         for (; head != tail; ++head) {
             server_exchange_t*& word = endpoint.slots[head & (endpoint.slots.size() - 1)];
@@ -872,6 +924,7 @@ struct server : ucall_server_handle_t {
                 exchange = slot.load(std::memory_order_acquire);
             }
             slot.store(nullptr, std::memory_order_relaxed);
+            if (abandoned(*exchange)) continue;
             [[maybe_unused]] st::status_t const queued = endpoint.collected.push_back(st::assume_reserved, exchange);
             if (endpoint.collected.size() == endpoint.max_batch_size &&
                 flush_collected(endpoint, stage, endpoint.statistics.filled_batches) == ucall_status_success_k)
@@ -915,7 +968,7 @@ struct server : ucall_server_handle_t {
     }
     static void server_take_batch(ucall_server_take_batch_t* arguments) noexcept {
         if (!arguments->endpoint) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& server = *static_cast<server_t*>(arguments->server);
@@ -929,11 +982,12 @@ struct server : ucall_server_handle_t {
                 break;
             wait_for_deposits(server, endpoint, expiry ? fu::min_of(expiry, deadline) : deadline);
         }
-        publish(arguments->outcome, atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
+        publish<atomic_ref>(arguments->outcome,
+                            atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
     }
     static void server_take_batches(ucall_server_take_batches_t* arguments) noexcept {
         if (!arguments->endpoint) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& server = *static_cast<server_t*>(arguments->server);
@@ -945,11 +999,12 @@ struct server : ucall_server_handle_t {
             if (batches_ended(server, stage)) break;
             wait_for_deposits(server, endpoint, expiry);
         }
-        publish(arguments->outcome, atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
+        publish<atomic_ref>(arguments->outcome,
+                            atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
     }
     static void server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments) noexcept {
         if (!arguments->endpoint || !arguments->statistics) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& counters = static_cast<batch_endpoint_t*>(arguments->endpoint)->statistics;
@@ -961,7 +1016,7 @@ struct server : ucall_server_handle_t {
                                   .filled_batches = read(counters.filled_batches),
                                   .ready_batches = read(counters.ready_batches),
                                   .expired_batches = read(counters.expired_batches)};
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_free(ucall_server_t handle) noexcept {
         if (!handle) return;
@@ -991,24 +1046,24 @@ struct server : ucall_server_handle_t {
     static void add_endpoint(arguments_type_* arguments) noexcept {
         if (!arguments->callback || !http_t::valid_view(arguments->uri_template) ||
             (!http_t::http_verb_name(arguments->verb) && arguments->verb != ucall_verb_any_k)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& server = *static_cast<server_t*>(arguments->server);
         if (atomic_ref<std::uint32_t> {server.polling_started}.load(std::memory_order_acquire)) {
-            publish(arguments->outcome, ucall_status_contended_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_contended_k);
             return;
         }
         auto path = text_view(arguments->uri_template);
         if (path.empty() || path.front() != '/' || http_t::find(path, '?') != std::string_view::npos ||
             http_t::find(path, '#') != std::string_view::npos) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         for (auto* existing = server.endpoints; existing; existing = existing->next)
             if ((existing->callback || (existing->batch && existing->batch->callback)) &&
                 existing->verb == arguments->verb && http_t::equal(existing->path, path)) {
-                publish(arguments->outcome, ucall_status_already_exists_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_already_exists_k);
                 return;
             }
         auto* endpoint = allocate_unique<endpoint_t>(server.allocator, server.allocator).release();
@@ -1016,7 +1071,7 @@ struct server : ucall_server_handle_t {
                                                : ucall_status_out_of_memory_k;
         if (copied != ucall_status_success_k) {
             allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
-            publish(arguments->outcome, copied);
+            publish<atomic_ref>(arguments->outcome, copied);
             return;
         }
         endpoint->path = {endpoint->storage.data(), path.size()};
@@ -1033,7 +1088,7 @@ struct server : ucall_server_handle_t {
                 prepared = batch->wake.open();
             if (prepared != ucall_status_success_k) {
                 allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
-                publish(arguments->outcome, prepared);
+                publish<atomic_ref>(arguments->outcome, prepared);
                 return;
             }
             batch->min_batch_size = arguments->min_batch_size ? arguments->min_batch_size : 1;
@@ -1044,10 +1099,12 @@ struct server : ucall_server_handle_t {
         }
         endpoint->next = server.endpoints;
         server.endpoints = endpoint;
-        // Trie edges may already borrow template segments when an allocation fails.
+        // Trie edges may already borrow the path of a refused template, so the endpoint stays
+        // listed, but it is no batch endpoint: nothing deposits into it and nothing reports it.
         if (auto status = server.routes.insert(endpoint->path, endpoint->verb, endpoint);
             status != ucall_status_success_k) {
-            publish(arguments->outcome, status);
+            if constexpr (requires { arguments->min_batch_size; }) endpoint->batch.reset();
+            publish<atomic_ref>(arguments->outcome, status);
             return;
         }
         if constexpr (requires { arguments->min_batch_size; }) {
@@ -1062,7 +1119,7 @@ struct server : ucall_server_handle_t {
             endpoint->body_delivery = arguments->body_delivery;
             endpoint->context = arguments->context;
         }
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments) noexcept {
         add_endpoint(arguments);
@@ -1071,7 +1128,7 @@ struct server : ucall_server_handle_t {
         auto minimum = arguments->min_batch_size ? arguments->min_batch_size : 1;
         auto maximum = arguments->max_batch_size ? arguments->max_batch_size : 32;
         if (!arguments->endpoint || minimum > maximum) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         add_endpoint(arguments);
@@ -1082,12 +1139,12 @@ struct server : ucall_server_handle_t {
     static void server_request_path(ucall_server_request_path_t* arguments) noexcept {
         if (arguments->path) *arguments->path = {};
         if (!arguments->request || !arguments->path) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         *arguments->path = bytes_view(extract_path_component<http_t>(exchange.message.target(exchange.text())));
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static std::string_view path_segment(std::string_view path, std::size_t index) noexcept {
         path_cursor<http_t> cursor {path};
@@ -1104,19 +1161,19 @@ struct server : ucall_server_handle_t {
     static void server_request_path_segment(ucall_server_request_path_segment_t* arguments) noexcept {
         if (arguments->segment) *arguments->segment = {};
         if (!arguments->request || !arguments->segment) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         auto value = path_segment(extract_path_component<http_t>(exchange.message.target(exchange.text())),
                                   arguments->index);
         *arguments->segment = bytes_view(value);
-        publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
+        publish<atomic_ref>(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
     }
     static void server_request_path_parameter(ucall_server_request_path_parameter_t* arguments) noexcept {
         if (arguments->value) *arguments->value = {};
         if (!arguments->request || !arguments->value || !http_t::valid_view(arguments->name)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
@@ -1134,16 +1191,16 @@ struct server : ucall_server_handle_t {
                 if (parsed.type == segment_type_t::wildcard_k)
                     value = path.substr(static_cast<std::size_t>(value.data() - path.data()));
                 *arguments->value = bytes_view(value);
-                publish(arguments->outcome, ucall_status_success_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
                 return;
             }
         }
-        publish(arguments->outcome, ucall_status_not_found_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_not_found_k);
     }
     static void server_request_query_parameter(ucall_server_request_query_parameter_t* arguments) noexcept {
         if (arguments->value) *arguments->value = {};
         if (!arguments->request || !arguments->value || !http_t::valid_view(arguments->name)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
@@ -1157,64 +1214,64 @@ struct server : ucall_server_handle_t {
             if (http_t::equal(field.substr(0, equals), text_view(arguments->name))) {
                 *arguments->value = bytes_view(equals == std::string_view::npos ? std::string_view {}
                                                                                 : field.substr(equals + 1));
-                publish(arguments->outcome, ucall_status_success_k);
+                publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
                 return;
             }
             if (end == std::string_view::npos) break;
             query.remove_prefix(end + 1);
         }
-        publish(arguments->outcome, ucall_status_not_found_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_not_found_k);
     }
     static void server_request_header(ucall_server_request_header_t* arguments) noexcept {
         if (arguments->value) *arguments->value = {};
         if (!arguments->request || !arguments->value || !http_t::valid_view(arguments->name) ||
             !http_t::http_token(text_view(arguments->name))) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         auto value = exchange.message.header(exchange.text(), text_view(arguments->name));
         *arguments->value = bytes_view(value);
-        publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
+        publish<atomic_ref>(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
     }
     static void server_request_fields_count(ucall_server_request_fields_count_t* arguments) noexcept {
         if (arguments->count) *arguments->count = 0;
         if (!arguments->request || !arguments->count) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         *arguments->count = exchange.message.fields_count(exchange.text());
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_request_field(ucall_server_request_field_t* arguments) noexcept {
         if (arguments->name) *arguments->name = {};
         if (arguments->value) *arguments->value = {};
         if (!arguments->request || !arguments->name || !arguments->value) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         std::string_view name, value;
         if (!exchange.message.field(exchange.text(), arguments->index, name, value)) {
-            publish(arguments->outcome, ucall_status_not_found_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_not_found_k);
             return;
         }
         *arguments->name = bytes_view(name);
         *arguments->value = bytes_view(value);
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_request_query(ucall_server_request_query_t* arguments) noexcept {
         if (arguments->query) *arguments->query = {};
         if (!arguments->request || !arguments->query) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         auto target = exchange.message.target(exchange.text());
         auto query_at = http_t::find(target, '?');
         if (query_at != std::string_view::npos) *arguments->query = bytes_view(target.substr(query_at + 1));
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_request_peer(ucall_server_request_peer_t* arguments) noexcept {
         if (arguments->network_interface_index) *arguments->network_interface_index = 0;
@@ -1222,7 +1279,7 @@ struct server : ucall_server_handle_t {
         if (arguments->address) *arguments->address = {};
         if (!arguments->request || !arguments->network_interface_index || !arguments->static_key ||
             !arguments->address) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& server = *static_cast<server_t*>(arguments->server);
@@ -1231,21 +1288,21 @@ struct server : ucall_server_handle_t {
                                                                        server.network_interfaces.data());
         std::memcpy(*arguments->static_key, exchange.peer_static_key, sizeof(ucall_noise_key_t));
         *arguments->address = exchange.peer_address;
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_request_body(ucall_server_request_body_t* arguments) noexcept {
         if (arguments->body) *arguments->body = {};
         if (!arguments->request || !arguments->body) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         if (streams(exchange)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         *arguments->body = bytes_view(exchange.message.body(exchange.text()));
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
 
     /** Whether @p exchange's body streams in through pulls, as its endpoint fixed at dispatch, so
@@ -1276,17 +1333,17 @@ struct server : ucall_server_handle_t {
         for (ucall_bytes_view_t* output : {arguments->name, arguments->content_type, arguments->data})
             if (output) *output = {};
         if (!arguments->request || !arguments->name || !arguments->content_type || !arguments->data) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         locate_parts(exchange);
         if (exchange.parts_state != parts_state_t::located_k) {
-            publish(arguments->outcome, ucall_status_malformed_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_malformed_k);
             return;
         }
         if (arguments->index >= exchange.parts.size()) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto const& located = exchange.parts[arguments->index];
@@ -1294,7 +1351,7 @@ struct server : ucall_server_handle_t {
         // A part without headers opens with the CRLF that ends its empty header block.
         std::size_t const blank = part.substr(0, 2) == "\r\n" ? 0 : http_t::find(part, "\r\n\r\n");
         if (blank == std::string_view::npos) {
-            publish(arguments->outcome, ucall_status_malformed_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_malformed_k);
             return;
         }
         auto const block = part.substr(0, blank);
@@ -1302,25 +1359,32 @@ struct server : ucall_server_handle_t {
             http::header_parameter<http_t>(http::part_header<http_t>(block, "content-disposition"), "name"));
         *arguments->content_type = bytes_view(http::part_header<http_t>(block, "content-type"));
         *arguments->data = bytes_view(part.substr(blank ? blank + 4 : 2));
-        publish(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
     static void server_request_body_chunk(ucall_server_request_body_chunk_t* arguments) noexcept {
         if (arguments->data) *arguments->data = {};
         if (!arguments->request || !arguments->data) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
         if (!streams(exchange)) {
-            // The whole body once, then the end; `pulled_view` remembers that it was pulled.
-            if (!exchange.pulled_view) *arguments->data = bytes_view(exchange.message.body(exchange.text()));
-            exchange.pulled_view = arguments->data;
-            publish(arguments->outcome, ucall_status_success_k);
+            // The whole body once, then the end.
+            if (exchange.body_pull == body_pull_t::unpulled_k)
+                *arguments->data = bytes_view(exchange.message.body(exchange.text()));
+            exchange.body_pull = body_pull_t::pulled_k;
+            publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
             return;
         }
+        // A peer that left sends no more, and its loop may have retired, so nothing would end a
+        // wait: the pull reports how the body ended, which the loop wrote before it let go.
+        if (atomic_ref<std::uint32_t> {exchange.shared.state}.load(std::memory_order_acquire) & detached_k)
+            return publish<atomic_ref>(arguments->outcome, exchange.body_status != ucall_status_success_k
+                                                               ? exchange.body_status
+                                                               : ucall_status_connection_closed_k);
         exchange.pulled_view = arguments->data;
         exchange.pull_outcome = arguments->outcome;
-        publish(arguments->outcome, ucall_status_deferred_k);
+        publish<atomic_ref>(arguments->outcome, ucall_status_deferred_k);
         // Only the loop touches the chunks, so a pull on the polling thread can finish at once.
         if (exchange.event_loop->polled_by_this_thread()) {
             auto requested = atomic_ref<std::uint32_t> {exchange.shared.pull_requested};
@@ -1333,7 +1397,7 @@ struct server : ucall_server_handle_t {
             exchange.pulled_view = nullptr;
             requested.store(pull_more_k, std::memory_order_relaxed);
             if (auto* connection = exchange.connection) serving_t::mark_ready(*exchange.event_loop, *connection);
-            return publish(arguments->outcome, ucall_status_would_block_k);
+            return publish<atomic_ref>(arguments->outcome, ucall_status_would_block_k);
         }
         atomic_ref<std::uint32_t> {exchange.shared.pull_requested}.store(pull_waiting_k, std::memory_order_release);
         // The loop reads on and finishes the pull as bytes arrive.
@@ -1342,30 +1406,32 @@ struct server : ucall_server_handle_t {
     static void server_reply_content(ucall_server_reply_content_t* arguments) noexcept {
         if (!arguments->request || !http_t::valid_view(arguments->body) ||
             (arguments->headers_count && !arguments->headers)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         ucall_reply_part_t part {};
         part.data.bytes = arguments->body;
-        publish(arguments->outcome, replies_t::reply(*static_cast<server_exchange_t*>(arguments->request), nullptr,
-                                                     arguments->http_status ? arguments->http_status : 200,
-                                                     {arguments->headers, arguments->headers_count}, {&part, 1}));
+        publish<atomic_ref>(arguments->outcome,
+                            replies_t::reply(*static_cast<server_exchange_t*>(arguments->request), nullptr,
+                                             arguments->http_status ? arguments->http_status : 200,
+                                             {arguments->headers, arguments->headers_count}, {&part, 1}));
     }
     static void server_reply_error(ucall_server_reply_error_t* arguments) noexcept {
         if (!arguments->request || !http_t::valid_view(arguments->message) || arguments->http_status < 400) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         ucall_bytes_view_t const header = bytes_view("content-type: text/plain");
         ucall_reply_part_t part {};
         part.data.bytes = arguments->message;
-        publish(arguments->outcome, replies_t::reply(*static_cast<server_exchange_t*>(arguments->request), nullptr,
-                                                     arguments->http_status, {&header, 1}, {&part, 1}));
+        publish<atomic_ref>(arguments->outcome,
+                            replies_t::reply(*static_cast<server_exchange_t*>(arguments->request), nullptr,
+                                             arguments->http_status, {&header, 1}, {&part, 1}));
     }
     static void server_reply_vectored(ucall_server_reply_vectored_t* arguments) noexcept {
         if (!arguments->request || (arguments->headers_count && !arguments->headers) ||
             (arguments->parts_count && !arguments->parts)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         // A deferred outcome was published before the loop could see the reply, which owns it now.
@@ -1373,35 +1439,38 @@ struct server : ucall_server_handle_t {
             *static_cast<server_exchange_t*>(arguments->request), arguments->outcome,
             arguments->http_status ? arguments->http_status : 200, {arguments->headers, arguments->headers_count},
             {arguments->parts, arguments->parts_count});
-        if (status != ucall_status_deferred_k) publish(arguments->outcome, status);
+        if (status != ucall_status_deferred_k) publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_reply_begin(ucall_server_reply_begin_t* arguments) noexcept {
         if (!arguments->request || (arguments->headers_count && !arguments->headers)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        publish(arguments->outcome, replies_t::begin_reply(*static_cast<server_exchange_t*>(arguments->request),
-                                                           arguments->http_status ? arguments->http_status : 200,
-                                                           {arguments->headers, arguments->headers_count}));
+        publish<atomic_ref>(arguments->outcome,
+                            replies_t::begin_reply(*static_cast<server_exchange_t*>(arguments->request),
+                                                   arguments->http_status ? arguments->http_status : 200,
+                                                   {arguments->headers, arguments->headers_count}));
     }
     static void server_reply_append(ucall_server_reply_append_t* arguments) noexcept {
         if (!arguments->request || (arguments->parts_count && !arguments->parts)) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        publish(arguments->outcome, replies_t::append_reply_parts(*static_cast<server_exchange_t*>(arguments->request),
-                                                                  {arguments->parts, arguments->parts_count}));
+        publish<atomic_ref>(arguments->outcome,
+                            replies_t::append_reply_parts(*static_cast<server_exchange_t*>(arguments->request),
+                                                          {arguments->parts, arguments->parts_count}));
     }
     static void server_reply_end(ucall_server_reply_end_t* arguments) noexcept {
         if (!arguments->request) {
-            publish(arguments->outcome, ucall_status_invalid_argument_k);
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         ucall_status_t const status = replies_t::end_reply(*static_cast<server_exchange_t*>(arguments->request),
                                                            arguments->outcome);
-        if (status != ucall_status_deferred_k) publish(arguments->outcome, status);
+        if (status != ucall_status_deferred_k) publish<atomic_ref>(arguments->outcome, status);
     }
 
+    /** The C entry points every server handle dispatches through. */
     inline static server_api_t const server_api_k {&server_free,
                                                    &server_stop,
                                                    &server_take_call,

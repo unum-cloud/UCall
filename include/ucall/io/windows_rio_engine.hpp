@@ -51,45 +51,97 @@ inline constexpr GUID windows_rio_extensions_id_k {
 
 /** @c RIO_BUF, a span of a registered range. */
 struct windows_rio_span_t {
+
+    /** The registered range the span lies in. */
     windows_rio_buffer_t buffer {};
-    ULONG offset {}, length {};
+
+    /** Where the span starts in the range. */
+    ULONG offset {};
+
+    /** Bytes in the span. */
+    ULONG length {};
 };
 static_assert(sizeof(windows_rio_span_t) == sizeof(void*) + 8);
 
 /** @c RIORESULT. */
 struct windows_rio_result_t {
+
+    /** Zero, or the Winsock error that ended the operation. */
     LONG status {};
+
+    /** Bytes the operation moved. */
     ULONG bytes {};
-    ULONGLONG socket_context {}, request_context {};
+
+    /** What the request queue was created with, the engine's socket index. */
+    ULONGLONG socket_context {};
+
+    /** What the operation was posted with, its direction. */
+    ULONGLONG request_context {};
 };
 static_assert(sizeof(windows_rio_result_t) == 24);
 
 /** @c RIO_NOTIFICATION_COMPLETION, in its port form. */
 struct windows_rio_notification_t {
+
+    /** How the queue notifies, @c windows_rio_port_notification_k here. */
     int type {};
+
+    /** The completion port the notification posts to. */
     HANDLE port {};
+
+    /** The completion key the notification posts with. */
     void* key {};
+
+    /** The @c OVERLAPPED the notification posts. */
     void* overlapped {};
 };
 static_assert(sizeof(windows_rio_notification_t) == 4 * sizeof(void*));
 
 /** @c RIO_EXTENSION_FUNCTION_TABLE, in its order; the extended and resizing calls go unused. */
 struct windows_rio_functions_t {
+
+    /** The table's size in bytes, which the loading call reads. */
     DWORD size {};
+
+    /** @c RIOReceive. */
     BOOL(WINAPI* receive)(windows_rio_request_queue_t, windows_rio_span_t*, ULONG, DWORD, void*) {};
+
+    /** @c RIOReceiveEx, unused. */
     void* receive_extended {};
+
+    /** @c RIOSend. */
     BOOL(WINAPI* send)(windows_rio_request_queue_t, windows_rio_span_t*, ULONG, DWORD, void*) {};
+
+    /** @c RIOSendEx, unused. */
     void* send_extended {};
+
+    /** @c RIOCloseCompletionQueue. */
     void(WINAPI* close_completion_queue)(windows_rio_completion_queue_t) {};
+
+    /** @c RIOCreateCompletionQueue. */
     windows_rio_completion_queue_t(WINAPI* create_completion_queue)(DWORD, windows_rio_notification_t*) {};
+
+    /** @c RIOCreateRequestQueue. */
     windows_rio_request_queue_t(WINAPI* create_request_queue)(SOCKET, ULONG, ULONG, ULONG, ULONG,
                                                               windows_rio_completion_queue_t,
                                                               windows_rio_completion_queue_t, void*) {};
+
+    /** @c RIODequeueCompletion. */
     ULONG(WINAPI* dequeue_completion)(windows_rio_completion_queue_t, windows_rio_result_t*, ULONG) {};
+
+    /** @c RIODeregisterBuffer. */
     void(WINAPI* deregister_buffer)(windows_rio_buffer_t) {};
+
+    /** @c RIONotify. */
     int(WINAPI* notify)(windows_rio_completion_queue_t) {};
+
+    /** @c RIORegisterBuffer. */
     windows_rio_buffer_t(WINAPI* register_buffer)(char*, DWORD) {};
+
+    /** @c RIOResizeCompletionQueue, unused. */
     void* resize_completion_queue {};
+
+    /** @c RIOResizeRequestQueue, unused. */
     void* resize_request_queue {};
 };
 static_assert(sizeof(windows_rio_functions_t) == 14 * sizeof(void*));
@@ -109,33 +161,72 @@ inline constexpr std::size_t windows_rio_slice_pages_k = 16, windows_rio_range_s
 /** Where a socket of the engine is: free, open, closed by a cancel or a timeout while the network
  *  still holds it, or let go by the network with Registered I/O results still due, so its index
  *  waits for them before any reuse. */
-enum class windows_rio_socket_stage_t : std::uint8_t { vacant_k, open_k, aborted_k, draining_k };
+enum class windows_rio_socket_stage_t : std::uint8_t {
+
+    /** Free, on the free list. */
+    vacant_k,
+
+    /** Open and serving. */
+    open_k,
+
+    /** Closed by a cancel or a timeout while the network still holds its handle. */
+    aborted_k,
+
+    /** Let go by the network, freed once its due results arrived. */
+    draining_k,
+};
 
 /** One direction of a socket in Registered I/O: its request, its place on the timed list, and
  *  whether it was cancelled or timed out. */
 struct windows_rio_operation_t {
+
+    /** The request of this direction, or null while none is in flight. */
     io_request_t* request {};
+
+    /** Its position in the engine's @c timed while its deadline is checked, else @c absent_k. */
     unsigned timed {operation_list_t::absent_k};
+
+    /** Pending, or cancelling or timing out once its socket was closed for it. */
     windows_operation_stage_t stage {windows_operation_stage_t::pending_k};
 };
 
 /** A stream socket the engine opened or accepted: its request queue where Registered I/O took
  *  it, its receive and send there, the slice each direction holds, and the results still due. */
 struct windows_rio_socket_t {
+
+    /** The socket, or @c INVALID_SOCKET once the engine closed it. */
     SOCKET socket {INVALID_SOCKET};
+
+    /** Its request queue, or invalid where its family keeps it out of Registered I/O. */
     windows_rio_request_queue_t request_queue {};
+
+    /** The receive and the send in Registered I/O, by direction. */
     windows_rio_operation_t directions[2] {};
+
+    /** The slice each direction holds, or @c absent_k. */
     unsigned slices[2] {operation_list_t::absent_k, operation_list_t::absent_k};
+
+    /** The next free socket record while this one is free. */
     unsigned next {operation_list_t::absent_k};
+
+    /** Registered I/O results still due, at most one per direction. */
     std::uint8_t outstanding {};
+
+    /** Whether the record is free, open, aborted or draining. */
     windows_rio_socket_stage_t stage {windows_rio_socket_stage_t::vacant_k};
 };
 static_assert(sizeof(windows_rio_socket_t) == 64);
 
 /** A range @c register_memory registered, which sends find their offsets in. */
 struct windows_rio_range_t {
+
+    /** The range's registration. */
     windows_rio_buffer_t buffer {};
+
+    /** The range's first byte. */
     byte_t* base {};
+
+    /** Bytes in the range. */
     std::size_t size {};
 };
 
@@ -145,6 +236,8 @@ struct windows_rio_range_t {
 template <typename allocator_type_>
 struct windows_rio_slices {
     struct alignas(4096) page_t {
+
+        /** One page of a range. */
         byte_t bytes[4096];
     };
     static constexpr std::size_t slice_bytes_k = windows_rio_slice_pages_k * sizeof(page_t);
@@ -160,9 +253,16 @@ struct windows_rio_slices {
     windows_rio_slices(windows_rio_slices&&) = delete;
     windows_rio_slices& operator=(windows_rio_slices&&) = delete;
 
+    /** The first page of each registered range of slices. */
     st::vector<page_t*, rebound_allocator<page_t*>> ranges {};
+
+    /** Each range's registration, parallel to @c ranges. */
     st::vector<windows_rio_buffer_t, rebound_allocator<windows_rio_buffer_t>> buffers {};
+
+    /** Slices no operation holds, taken from the back. */
     st::vector<unsigned, rebound_allocator<unsigned>> free_slices {};
+
+    /** What ranges allocate from. */
     allocator_type_ allocator;
 
     /** Reserves the bookkeeping for @p slices lent at once, so growing allocates only ranges. */
@@ -284,28 +384,53 @@ struct windows_rio_engine {
         slices.close(rio);
     }
 
+    /** The port and the overlapped records of accepts, connects, files and sockets outside RIO. */
     windows_overlapped<allocator_t, atomic_ref_template_> overlapped;
+
+    /** The Winsock extensions accepts and connects call. */
     windows_extensions_t extensions {};
+
+    /** The page lists vectored file reads scatter through. */
     windows_scatter_pages<allocator_t> scatter;
+
+    /** The Registered I/O functions @c open loads. */
     windows_rio_functions_t rio {};
+
+    /** The completion queue every request queue posts to, invalid until @c open made it. */
     windows_rio_completion_queue_t completion_queue {windows_rio_invalid_completion_queue_k};
+
+    /** The @c OVERLAPPED the queue's notification posts to the port. */
     OVERLAPPED notification {};
+
+    /** Whether the queue's notification is armed and has not reached a poll yet. */
     listing_t notifying {listing_t::unlisted_k};
+
+    /** Where @c dequeue reads results, two per socket. */
     st::vector<windows_rio_result_t, rebound_allocator<windows_rio_result_t>> results;
+
+    /** Socket records, indexed by the index their handles carry. */
     st::vector<windows_rio_socket_t, rebound_allocator<windows_rio_socket_t>> sockets;
+
+    /** Socket records holding no socket. */
     operation_list_t free_sockets;
+
+    /** The ranges @c register_memory registered, indexed by @c registered_memory. */
     st::vector<windows_rio_range_t, rebound_allocator<windows_rio_range_t>> ranges;
 
     /** Socket directions with a deadline, each as its socket's index twice plus its direction. */
     st::vector<unsigned, rebound_allocator<unsigned>> timed;
+
+    /** The slices receives land in and copied sends leave from. */
     windows_rio_slices<allocator_t> slices;
+
+    /** The counters the engine advances for its polling owner. */
     io_statistics_t statistics {};
 
     /** Why the engine was refused, naming what to change, or null. */
     char const* refusal {};
 
     /** Registered I/O operations whose results are still due. */
-    std::size_t active {};
+    std::size_t registered_operations {};
 
     /** Loads Registered I/O through a probe socket, answering @c unsupported_k where the host
      *  refuses it, so an automatic open falls to the plain port. */
@@ -348,7 +473,7 @@ struct windows_rio_engine {
         if (socket == INVALID_SOCKET) return -1;
         descriptor_t const descriptor = static_cast<descriptor_t>(socket);
         int enabled = 1;
-        // Fragmented RPC writes must not wait for delayed ACKs before releasing TX credits.
+        // Fragmented writes must not wait for delayed ACKs before releasing TX credits.
         if (nonblocking(descriptor) == ucall_status_success_k &&
             (!internet || socket_option(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, sizeof(enabled)) == 0))
             return descriptor;
@@ -392,13 +517,12 @@ struct windows_rio_engine {
         windows_rio_buffer_t const buffer = rio.register_buffer(reinterpret_cast<char*>(memory.data()),
                                                                 static_cast<DWORD>(memory.size()));
         if (buffer == windows_rio_invalid_buffer_k)
-            return {io_unregistered_k, range_pinning_t::unpinned_k,
-                    WSAGetLastError() == WSAENOBUFS ? ucall_status_success_k : ucall_status_io_k};
+            return {io_unregistered_k, WSAGetLastError() == WSAENOBUFS ? ucall_status_success_k : ucall_status_io_k};
         if (st::failed(ranges.push_back({buffer, memory.data(), memory.size()}))) {
             rio.deregister_buffer(buffer);
             return {};
         }
-        return {static_cast<registered_memory_t>(ranges.size() - 1), range_pinning_t::pinned_k};
+        return {static_cast<registered_memory_t>(ranges.size() - 1)};
     }
 
     /** Takes back the receive slice a completion lent. */
@@ -406,7 +530,14 @@ struct windows_rio_engine {
         if (completion.lease) slices.release(static_cast<unsigned>(completion.lease - 1));
     }
 
-    ucall_status_t submit(io_request_t& request) noexcept {
+    /** Why the engine ended, which every later poll answers; zero while it runs. */
+    int fault {};
+
+    void submit(io_request_t& request) noexcept {
+        // The records cover what the loops hold at once, so only a miscount ends the engine here.
+        if (start(request) != ucall_status_success_k) fault = -ENOBUFS;
+    }
+    ucall_status_t start(io_request_t& request) noexcept {
         if (!registered_socket_t::contains(request.descriptor))
             return overlapped.submit(request, static_cast<SOCKET>(request.descriptor), extensions, scatter, statistics);
         unsigned const index = registered_socket_t::index_of(request.descriptor);
@@ -453,6 +584,7 @@ struct windows_rio_engine {
     }
 
     int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
+        if (fault) return fault;
         std::size_t count {};
         if (!dequeue(completions, count)) return -EIO;
         std::uint64_t const earliest = expire(monotonic_ns());
@@ -460,7 +592,7 @@ struct windows_rio_engine {
         if (count == completions.size()) return static_cast<int>(count);
         io_wait_t const waiting = count ? io_wait_t::nonblocking_k : wait_policy;
         // Only a poll about to sleep asks the queue to post its next result to the port.
-        if (waiting == io_wait_t::blocking_k && active && notifying == listing_t::unlisted_k &&
+        if (waiting == io_wait_t::blocking_k && registered_operations && notifying == listing_t::unlisted_k &&
             rio.notify(completion_queue) == 0) {
             notifying = listing_t::listed_k;
             ++overlapped.foreign;
@@ -479,10 +611,11 @@ struct windows_rio_engine {
 
     /** Closes every socket with results due, collects them all, then stops the port. */
     void stop() noexcept {
+        fault = 0;
         for (unsigned index = 0; index != sockets.size(); ++index)
             if (sockets[index].outstanding) abort(index, receive_direction_k);
         io_completion_t discarded[32];
-        while (active) {
+        while (registered_operations) {
             int const count = poll(discarded, io_wait_t::blocking_k);
             if (count < 0) break;
             for (int i = 0; i != count; ++i) {
@@ -539,7 +672,7 @@ struct windows_rio_engine {
 
     void lend(io_completion_t& completion, unsigned slice) noexcept {
         completion.data = slices.data(slice);
-        completion.lease = std::uintptr_t {slice} + 1;
+        completion.lease = slice + 1;
     }
 
     ucall_status_t receive(unsigned index, io_request_t& request) noexcept {
@@ -601,7 +734,7 @@ struct windows_rio_engine {
             [[maybe_unused]] st::status_t const tracked = timed.push_back(st::assume_reserved, index << 1 | direction);
         }
         ++socket.outstanding;
-        ++active;
+        ++registered_operations;
         tally<atomic_ref_template_>(statistics.submissions);
     }
 
@@ -666,7 +799,7 @@ struct windows_rio_engine {
     /** Answers the results the completion queue holds into @p completions from @p count on, false
      *  once the kernel found the queue corrupt. */
     bool dequeue(span<io_completion_t> completions, std::size_t& count) noexcept {
-        if (!active || count == completions.size()) return true;
+        if (!registered_operations || count == completions.size()) return true;
         ULONG const limit = static_cast<ULONG>(fu::min_of(completions.size() - count, results.size()));
         ULONG const dequeued = rio.dequeue_completion(completion_queue, results.data(), limit);
         if (dequeued == windows_rio_corrupt_queue_k) return false;
@@ -688,7 +821,7 @@ struct windows_rio_engine {
             if (operation.timed != absent_k) untime(index, direction);
             operation = {};
             request.operation_index = io_unindexed_k;
-            --active;
+            --registered_operations;
             if (!--socket.outstanding && socket.stage == windows_rio_socket_stage_t::draining_k) vacate(index);
             tally<atomic_ref_template_>(statistics.completions);
             completions[count++] = completion;

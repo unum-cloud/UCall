@@ -23,7 +23,11 @@ using utilities::text_view;
 /** A statistics counter and the metric name it is reported under. */
 template <typename counter_pointer_type_>
 struct counter_name {
+
+    /** The metric's name, written after the server's prefix. */
     std::string_view name;
+
+    /** The member of a statistics record that holds the count. */
     counter_pointer_type_ counter;
 };
 
@@ -94,9 +98,8 @@ struct metrics {
         metrics.composing.clear();
         metrics.send_request.data = metrics.sending.data();
         metrics.send_request.length = metrics.sending.size();
-        if (event_loop.engine.submit(metrics.send_request) == ucall_status_success_k)
-            metrics.state = metrics_state_t::sending_k;
-        else metrics.sending.clear();
+        event_loop.engine.submit(metrics.send_request);
+        metrics.state = metrics_state_t::sending_k;
     }
 
     /** Starts the next datagram's counters from what the last delivered one reported. */
@@ -176,6 +179,7 @@ struct metrics {
             {"kernel_enters", &ucall_event_loop_statistics_t::kernel_enters},
             {"submissions", &ucall_event_loop_statistics_t::submissions},
             {"completions", &ucall_event_loop_statistics_t::completions},
+            {"kernel_entries", &ucall_event_loop_statistics_t::kernel_entries},
             {"cancellations", &ucall_event_loop_statistics_t::cancellations},
             {"accepts", &ucall_event_loop_statistics_t::accepts},
             {"requests", &ucall_event_loop_statistics_t::requests},
