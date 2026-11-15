@@ -181,6 +181,66 @@ jobs:
             exit 1
           fi
 
+  # The toolchain file runs each suite on an emulated RVA23 core with Zacas, which admits the `alibaba_c930` class.
+  test_qemu_riscv:
+    name: Test RISC-V under QEMU
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.15t"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install GCC 16 for RISC-V and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-16-riscv64-linux-gnu g++-16-riscv64-linux-gnu libc6-dev-riscv64-cross qemu-user
+      - name: Configure C and C++
+        run: cmake --preset linux_riscv64
+      - name: Build C and C++
+        run: cmake --build --preset linux_riscv64 --parallel 4
+      - name: Test C and C++
+        run: ctest --preset linux_riscv64 --no-tests=error
+
+  # The toolchain file runs each suite on an emulated POWER10, which admits the `ibm_power10` class.
+  test_qemu_power:
+    name: Test POWER10 under QEMU
+    runs-on: ubuntu-26.04
+    timeout-minutes: 60
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.15t"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install GCC 15 for POWER and QEMU
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-powerpc64le-linux-gnu g++-powerpc64le-linux-gnu libc6-dev-ppc64el-cross qemu-user
+      - name: Configure C and C++
+        run: cmake --preset linux_ppc64le
+      - name: Build C and C++
+        run: cmake --build --preset linux_ppc64le --parallel 4
+      - name: Test C and C++
+        run: ctest --preset linux_ppc64le --no-tests=error
+
   # Every target at -O0 with warnings as errors, so a warning any example or benchmark raises fails here.
   check_ubuntu:
     name: Check Every Target on Ubuntu with Clang 22

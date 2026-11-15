@@ -219,29 +219,45 @@ typedef enum ucall_cpu_class_t {
     /** No class requested: initialization picks the best class this machine runs. */
     ucall_cpu_class_unknown_k = 0,
 
+    // Portable
+
     /** Portable kernels with no SIMD, which every machine runs. */
-    ucall_cpu_class_serial_k,
-
-    /** AVX2 kernels, as on Intel Haswell. */
-    ucall_cpu_class_intel_haswell_k,
-
-    /** Adds AVX-512 kernels, as on Intel Skylake-X. */
-    ucall_cpu_class_intel_skylake_k,
-
-    /** Adds Ice Lake's AVX-512 extensions and SHA, as on Intel Ice Lake. */
-    ucall_cpu_class_intel_icelake_k,
-
-    /** AVX2 kernels with SHA and no AVX-512, as on Intel Alder Lake. */
-    ucall_cpu_class_intel_alder_k,
-
-    /** NEON kernels with the AES and SHA extensions, as on AWS Graviton2. */
-    ucall_cpu_class_aws_g2_k,
-
-    /** As on AWS Graviton5, running the kernels of @c ucall_cpu_class_aws_g2_k. */
-    ucall_cpu_class_aws_g5_k,
+    ucall_cpu_class_serial_k = 1,
 
     /** The one class a monoversioned build compiles, over every capability it targets. */
-    ucall_cpu_class_monoversioned_k
+    ucall_cpu_class_monoversioned_k = 2,
+
+    // x86
+
+    /** AVX2 kernels, as on Intel Haswell. */
+    ucall_cpu_class_intel_haswell_k = 3,
+
+    /** Adds AVX-512 kernels, as on Intel Skylake-X. */
+    ucall_cpu_class_intel_skylake_k = 5,
+
+    /** Adds Ice Lake's AVX-512 extensions and SHA, as on Intel Ice Lake. */
+    ucall_cpu_class_intel_icelake_k = 6,
+
+    /** AVX2 kernels with SHA and no AVX-512, as on Intel Alder Lake. */
+    ucall_cpu_class_intel_alder_k = 11,
+
+    // Arm
+
+    /** NEON kernels with the AES and SHA extensions, as on AWS Graviton2. */
+    ucall_cpu_class_aws_g2_k = 12,
+
+    /** As on AWS Graviton5, running the kernels of @c ucall_cpu_class_aws_g2_k. */
+    ucall_cpu_class_aws_g5_k = 15,
+
+    // RISC-V
+
+    /** RVV kernels with Zawrs waits and Zacas compare-and-swap, as on Alibaba XuanTie C930. */
+    ucall_cpu_class_alibaba_c930_k = 17,
+
+    // Power
+
+    /** VSX kernels with @c pause_short waits and ISA 3.0 store atomics, as on IBM POWER10. */
+    ucall_cpu_class_ibm_power10_k = 18
 } ucall_cpu_class_t;
 
 /** Returns the stable name of an I/O backend. */

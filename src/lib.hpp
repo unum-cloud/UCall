@@ -21,15 +21,28 @@ namespace unum::ucall {
 
 /** Classes name distinct kernel bundles rather than every combination of feature flags. */
 enum class cpu_class_t : std::uint32_t {
-    unknown_k,
-    serial_k,
-    intel_haswell_k,
-    intel_skylake_k,
-    intel_icelake_k,
-    intel_alder_k,
-    aws_g2_k,
-    aws_g5_k,
-    monoversioned_k,
+    unknown_k = ucall_cpu_class_unknown_k,
+    serial_k = ucall_cpu_class_serial_k,
+    monoversioned_k = ucall_cpu_class_monoversioned_k,
+    intel_haswell_k = ucall_cpu_class_intel_haswell_k,
+    intel_skylake_k = ucall_cpu_class_intel_skylake_k,
+    intel_icelake_k = ucall_cpu_class_intel_icelake_k,
+    intel_alder_k = ucall_cpu_class_intel_alder_k,
+    aws_g2_k = ucall_cpu_class_aws_g2_k,
+    aws_g5_k = ucall_cpu_class_aws_g5_k,
+    alibaba_c930_k = ucall_cpu_class_alibaba_c930_k,
+    ibm_power10_k = ucall_cpu_class_ibm_power10_k,
+};
+
+static_assert(ucall_cpu_class_serial_k == 1 && ucall_cpu_class_monoversioned_k == 2 &&
+              ucall_cpu_class_ibm_power10_k == 18);
+
+/** Every class the C enum names, in value order: the one table its names and pins check against. */
+constexpr ucall_cpu_class_t cpu_classes_k[] {
+    ucall_cpu_class_serial_k,        ucall_cpu_class_monoversioned_k, ucall_cpu_class_intel_haswell_k,
+    ucall_cpu_class_intel_skylake_k, ucall_cpu_class_intel_icelake_k, ucall_cpu_class_intel_alder_k,
+    ucall_cpu_class_aws_g2_k,        ucall_cpu_class_aws_g5_k,        ucall_cpu_class_alibaba_c930_k,
+    ucall_cpu_class_ibm_power10_k,
 };
 
 constexpr cpu_class_t parent_class_of(cpu_class_t cpu) noexcept {
@@ -53,6 +66,8 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu) noexcept 
         return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_goldmont_k;
     case cpu_class_t::aws_g2_k:
     case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
+    case cpu_class_t::alibaba_c930_k: return sz_cap_serial_k | sz_cap_rvv_k;
+    case cpu_class_t::ibm_power10_k: return sz_cap_serial_k | sz_cap_powervsx_k;
     case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
     default: return sz_cap_serial_k;
     }
@@ -81,6 +96,20 @@ template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
     template <typename value_type_>
     using type = fu::arm64_lse_atomic_ref<value_type_>;
+};
+#endif
+#if FORKUNION_TARGET_RISCV64_ZACAS
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    template <typename value_type_>
+    using type = fu::riscv64_zacas_atomic_ref<value_type_>;
+};
+#endif
+#if FORKUNION_TARGET_PPC64_AMO
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::ibm_power10_k> {
+    template <typename value_type_>
+    using type = fu::ppc64_amo_atomic_ref<value_type_>;
 };
 #endif
 #if UCALL_TARGET_MONOVERSIONED
@@ -129,6 +158,18 @@ struct row_kit_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = st::neon_row_kit_t;
 };
 #endif
+#if SMASHTABLE_TARGET_RVV
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    using type = st::rvv_row_kit_t;
+};
+#endif
+#if SMASHTABLE_TARGET_POWERVSX
+template <>
+struct row_kit_for_cpu_class<cpu_class_t::ibm_power10_k> {
+    using type = st::powervsx_row_kit_t;
+};
+#endif
 #if UCALL_TARGET_MONOVERSIONED
 template <>
 struct row_kit_for_cpu_class<cpu_class_t::monoversioned_k> {
@@ -136,10 +177,10 @@ struct row_kit_for_cpu_class<cpu_class_t::monoversioned_k> {
 };
 #endif
 
-/** The wait instruction one CPU class pairs: x86 spins on PAUSE, the Graviton2 class spins on YIELD
- *  and the Graviton5 class sleeps in WFE, a monoversioned build takes its target's pick, and
- *  everything else yields, as does any class whose @c FORKUNION_TARGET_<BIT> is off, such as in
- *  builds under ThreadSanitizer. */
+/** The wait instruction one CPU class pairs: x86 spins on PAUSE, the Graviton2 class on YIELD, the
+ *  Graviton5 class sleeps in WFE, the C930 class in WRS.NTO, the POWER10 class spins on
+ *  @c pause_short, and a monoversioned build takes its target's pick. Everything else yields, as
+ *  does a class whose @c FORKUNION_TARGET_<BIT> is off, such as under ThreadSanitizer. */
 template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
@@ -174,12 +215,29 @@ struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = fu::arm64_wfe_t;
 };
 #endif
+#if FORKUNION_TARGET_RISCV64_WRS
+template <>
+struct waiter_for_cpu_class<cpu_class_t::alibaba_c930_k> {
+    using type = fu::riscv64_wrs_t;
+};
+#endif
+#if FORKUNION_TARGET_PPC64_PAUSE
+template <>
+struct waiter_for_cpu_class<cpu_class_t::ibm_power10_k> {
+    using type = fu::ppc64_pause_t;
+};
+#endif
 #if UCALL_TARGET_MONOVERSIONED
 template <>
 struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
     using type = fu::preferred_yield_t;
 };
 #endif
+
+/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause and Power's
+ *  priority nops: the runtime confirms nothing about them. */
+inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
+                                                       fu::capability_riscv64_pause_k | fu::capability_ppc64_yield_k;
 
 /** The kits, atomic reference and waiter one CPU class builds its network from. */
 template <cpu_class_t cpu_class_>
@@ -201,7 +259,9 @@ struct cpu_traits {
     template <typename value_type_>
     using atomic_ref = typename atomic_ref_for_cpu_class<cpu_class_>::template type<value_type_>;
 
-    static constexpr fu::capabilities_t forkunion_capabilities_k = atomic_ref<std::uint32_t>::capabilities_k;
+    /** The bits the runtime must confirm before the waiter and atomic reference are trusted. */
+    static constexpr fu::capabilities_t forkunion_capabilities_k = static_cast<fu::capabilities_t>(
+        (waiter_t::capability_k | atomic_ref<std::uint32_t>::capabilities_k) & ~baseline_hints_k);
 };
 
 template <cpu_class_t cpu_class_>
@@ -231,6 +291,12 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
 #endif
 #if UCALL_TARGET_AWS_G5
     case cpu_class_t::aws_g5_k: return true;
+#endif
+#if UCALL_TARGET_ALIBABA_C930
+    case cpu_class_t::alibaba_c930_k: return true;
+#endif
+#if UCALL_TARGET_IBM_POWER10
+    case cpu_class_t::ibm_power10_k: return true;
 #endif
 #if UCALL_TARGET_MONOVERSIONED
     case cpu_class_t::monoversioned_k: return true;
@@ -269,13 +335,15 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept
     case cpu_class_t::intel_alder_k: return forkunion_capabilities_of<cpu_class_t::intel_alder_k>();
     case cpu_class_t::aws_g2_k: return forkunion_capabilities_of<cpu_class_t::aws_g2_k>();
     case cpu_class_t::aws_g5_k: return forkunion_capabilities_of<cpu_class_t::aws_g5_k>();
+    case cpu_class_t::alibaba_c930_k: return forkunion_capabilities_of<cpu_class_t::alibaba_c930_k>();
+    case cpu_class_t::ibm_power10_k: return forkunion_capabilities_of<cpu_class_t::ibm_power10_k>();
     case cpu_class_t::monoversioned_k: return forkunion_capabilities_of<cpu_class_t::monoversioned_k>();
     default: return forkunion_capabilities_of<cpu_class_t::serial_k>();
     }
 }
 
-/** Whether @p rung fits under @p ceiling: its compiled string kernels and its atomic reference's
- *  entire mask, so RCpc with LSE, need nothing the ceiling lacks. */
+/** Whether @p rung fits under @p ceiling: its compiled string kernels, its waiter's mask and its
+ *  atomic reference's entire mask, so RCpc with LSE, need nothing the ceiling lacks. */
 constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
     sz_capability_t const strings = stringzilla_capabilities_of(rung) & sz_capabilities_compiled_cpu_mask();
     return (strings & ~ceiling.compute) == 0 && (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
@@ -290,15 +358,16 @@ inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t pinned, cpu_ceiling_t& 
     if (sz_capabilities_detected_cpu(&picked.compute) != sz_success_k) picked.compute = sz_cap_serial_k;
     picked.sync = fu::cpu_capabilities();
     if (pinned != ucall_cpu_class_unknown_k) {
-        if (pinned > ucall_cpu_class_monoversioned_k) return ucall_status_unsupported_k;
+        bool known = false;
+        for (ucall_cpu_class_t const cpu_class : cpu_classes_k) known |= cpu_class == pinned;
+        if (!known) return ucall_status_unsupported_k;
         cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
         cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
         if ((picked.compute & wanted.compute) != wanted.compute || (picked.sync & wanted.sync) != wanted.sync)
             return ucall_status_unsupported_k;
         picked = wanted;
     }
-    for (auto rung = ucall_cpu_class_serial_k; rung <= ucall_cpu_class_monoversioned_k;
-         rung = static_cast<ucall_cpu_class_t>(rung + 1))
+    for (ucall_cpu_class_t const rung : cpu_classes_k)
         if (cpu_class_compiled(static_cast<cpu_class_t>(rung)) &&
             cpu_rung_fits(static_cast<cpu_class_t>(rung), picked)) {
             ceiling = picked;
@@ -319,9 +388,9 @@ struct cpu_ladder {};
 #if UCALL_TARGET_MONOVERSIONED
 using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
 #else
-using cpu_ladder_t =
-    cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_alder_k,
-               cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k, cpu_class_t::serial_k>;
+using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_alder_k,
+                                cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k,
+                                cpu_class_t::alibaba_c930_k, cpu_class_t::ibm_power10_k, cpu_class_t::serial_k>;
 #endif
 
 /** Builds the network on the newest rung of @p ladder the build compiled and @p ceiling fits, one

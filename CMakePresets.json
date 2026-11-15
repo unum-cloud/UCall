@@ -105,6 +105,20 @@
       }
     },
     {
+      "name": "linux_riscv64",
+      "inherits": ["base", "linux"],
+      "displayName": "Linux RISC-V 64 under QEMU through GCC 16",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-riscv64-gnu.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "linux_ppc64le",
+      "inherits": ["base", "linux"],
+      "displayName": "Linux POWER under QEMU through GCC 15",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-ppc64le-gnu.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
       "name": "machine",
       "hidden": true,
       "inherits": ["base", "linux", "clang"],
@@ -219,6 +233,8 @@
     { "name": "tsan", "configurePreset": "tsan" },
     { "name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release" },
     { "name": "android_arm64", "configurePreset": "android_arm64" },
+    { "name": "linux_riscv64", "configurePreset": "linux_riscv64" },
+    { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le" },
     { "name": "xeon4_hopper", "configurePreset": "xeon4_hopper" },
     { "name": "xeon6_blackwell", "configurePreset": "xeon6_blackwell" },
     { "name": "grace_hopper", "configurePreset": "grace_hopper" },
@@ -246,6 +262,8 @@
       "configurePreset": "msvc2026_x64",
       "configuration": "Release",
       "output": { "outputOnFailure": true }
-    }
+    },
+    { "name": "linux_riscv64", "configurePreset": "linux_riscv64", "output": { "outputOnFailure": true } },
+    { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le", "output": { "outputOnFailure": true } }
   ]
 }

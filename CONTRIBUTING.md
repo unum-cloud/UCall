@@ -93,6 +93,18 @@ ctest --test-dir build_aarch64
 qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test_network --backend posix --cpu-class aws-g2
 ```
 
+### RISC-V and Power on an x86 Host
+
+The `linux_riscv64` and `linux_ppc64le` presets cross-compile with GCC, and `ctest` runs each suite under QEMU on a core that admits the `alibaba_c930` or `ibm_power10` class.
+RISC-V needs GCC 16, as GCC 15 crashes on StringZilla's RVV kernels, and Power needs GCC 15.
+
+```bash
+cmake --preset linux_ppc64le
+cmake --build --preset linux_ppc64le
+ctest --preset linux_ppc64le
+qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test_network --backend posix --cpu-class ibm-power10
+```
+
 ### Windows, FreeBSD and macOS on a Linux Host
 
 The IOCP and kqueue backends compile on Linux with the host's Clang through one toolchain file each, which name a sysroot and nothing else; their suites run on the platforms themselves.

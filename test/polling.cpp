@@ -349,8 +349,7 @@ static case_result_t test_ring_refused_at_init_falls_back() {
 static case_result_t test_cpu_class_ceiling_unit() {
     std::size_t failures = 0;
     bool refused = false;
-    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_aws_g5_k;
-         cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1)) {
+    for (ucall_cpu_class_t const cpu_class : uc::cpu_classes_k) {
         ucall_client_t handle {};
         ucall_outcome_t outcome {};
         ucall_client_options_t config {};
@@ -358,7 +357,7 @@ static case_result_t test_cpu_class_ceiling_unit() {
         config.max_concurrent_connections = 1;
         ucall_client_init_t init {&handle, &outcome, &config, nullptr};
         ucall_client_init(&init);
-        // No CPU runs both the x86 and the Arm classes, so a pin past what this one runs must fail.
+        // No CPU runs the classes of two architectures, so a pin past what this one runs must fail.
         refused |= outcome.status == ucall_status_unsupported_k && !handle;
         failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_unsupported_k);
         failures += expect(cpu_class != ucall_cpu_class_serial_k || !UCALL_TARGET_SERIAL ||

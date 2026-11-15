@@ -20,8 +20,9 @@ elseif (UCALL_MARCH AND MSVC)
         endif ()
     endforeach ()
     target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_arch_flags_}>")
-elseif (UCALL_MARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64")
-    # AArch64 names CPUs through `-mcpu`, like `neoverse-v2`, as `-march` takes only architecture versions.
+elseif (UCALL_MARCH AND CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|AARCH64|arm64|ARM64|ppc64|powerpc64")
+    # AArch64 names CPUs through `-mcpu`, like `neoverse-v2`, as `-march` takes only architecture versions, and Power
+    # compilers have no `-march`.
     target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=${UCALL_MARCH}>")
 elseif (UCALL_MARCH)
     target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=${UCALL_MARCH}>")
@@ -33,4 +34,6 @@ elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "x86_64|AMD64")
     target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=x86-64>")
 elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "riscv64")
     target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-march=rv64gc>")
+elseif (CMAKE_SYSTEM_PROCESSOR MATCHES "ppc64|powerpc64")
+    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-mcpu=power8>")
 endif ()

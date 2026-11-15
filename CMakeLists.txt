@@ -242,6 +242,17 @@ ucall_cpu_variant(
 )
 ucall_cpu_variant(intel_alder INTEL_ALDER westmere goldmont haswell)
 ucall_cpu_variant(aws_g2 AWS_G2 neon neonaes neonsha arm64_lse)
+ucall_cpu_variant(
+    aws_g5
+    AWS_G5
+    neon
+    neonaes
+    neonsha
+    arm64_lse
+    arm64_rcpc
+)
+ucall_cpu_variant(alibaba_c930 ALIBABA_C930 rvv riscv64_wrs riscv64_zacas)
+ucall_cpu_variant(ibm_power10 IBM_POWER10 powervsx ppc64_pause ppc64_amo)
 
 # One unit per X25519 kit, apart from class units, keeps throughput flags off constant-time kernels.
 function (ucall_x25519_unit capability_)

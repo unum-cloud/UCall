@@ -200,7 +200,8 @@ typedef struct ucall_py_enum_mirror_t {
     /** The smallest enumerator. */
     int first;
 
-    /** The largest enumerator; values in between without a spelling have no member. */
+    /** The largest enumerator, or the largest byte for classes, whose registry leaves holes;
+     *  values in between without a spelling have no member. */
     int last;
 
     /** Spells one value, answering "unrecognized" for a gap. */

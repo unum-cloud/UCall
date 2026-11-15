@@ -147,13 +147,15 @@ class CPUClass(enum.IntEnum):
 
     UNKNOWN = 0
     SERIAL = 1
-    INTEL_HASWELL = 2
-    INTEL_SKYLAKE = 3
-    INTEL_ICELAKE = 4
-    INTEL_ALDER = 5
-    AWS_G2 = 6
-    AWS_G5 = 7
-    MONOVERSIONED = 8
+    MONOVERSIONED = 2
+    INTEL_HASWELL = 3
+    INTEL_SKYLAKE = 5
+    INTEL_ICELAKE = 6
+    INTEL_ALDER = 11
+    AWS_G2 = 12
+    AWS_G5 = 15
+    ALIBABA_C930 = 17
+    IBM_POWER10 = 18
 
 class Security(enum.IntEnum):
     """Transport encryption of an `Interface` or a client call: plaintext or a Noise pattern.

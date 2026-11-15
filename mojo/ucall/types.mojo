@@ -371,20 +371,24 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """No class requested: initialization picks the best class this machine runs."""
     comptime SERIAL = Self(1)
     """Portable kernels with no SIMD, which every machine runs."""
-    comptime INTEL_HASWELL = Self(2)
-    """AVX2 kernels, as on Intel Haswell."""
-    comptime INTEL_SKYLAKE = Self(3)
-    """Adds AVX-512 kernels, as on Intel Skylake-X."""
-    comptime INTEL_ICELAKE = Self(4)
-    """Adds Ice Lake's AVX-512 extensions and SHA."""
-    comptime INTEL_ALDER = Self(5)
-    """AVX2 kernels with SHA and no AVX-512, as on Intel Alder Lake."""
-    comptime AWS_G2 = Self(6)
-    """NEON kernels with the AES and SHA extensions, as on AWS Graviton2."""
-    comptime AWS_G5 = Self(7)
-    """As on AWS Graviton5, running the kernels of `AWS_G2`."""
-    comptime MONOVERSIONED = Self(8)
+    comptime MONOVERSIONED = Self(2)
     """The one class a monoversioned build compiles, over every capability it targets."""
+    comptime INTEL_HASWELL = Self(3)
+    """AVX2 kernels, as on Intel Haswell."""
+    comptime INTEL_SKYLAKE = Self(5)
+    """Adds AVX-512 kernels, as on Intel Skylake-X."""
+    comptime INTEL_ICELAKE = Self(6)
+    """Adds Ice Lake's AVX-512 extensions and SHA."""
+    comptime INTEL_ALDER = Self(11)
+    """AVX2 kernels with SHA and no AVX-512, as on Intel Alder Lake."""
+    comptime AWS_G2 = Self(12)
+    """NEON kernels with the AES and SHA extensions, as on AWS Graviton2."""
+    comptime AWS_G5 = Self(15)
+    """As on AWS Graviton5, running the kernels of `AWS_G2`."""
+    comptime ALIBABA_C930 = Self(17)
+    """RVV kernels with Zawrs waits and Zacas compare-and-swap, as on Alibaba XuanTie C930."""
+    comptime IBM_POWER10 = Self(18)
+    """VSX kernels with `pause_short` waits and ISA 3.0 store atomics, as on IBM POWER10."""
 
 
 @fieldwise_init

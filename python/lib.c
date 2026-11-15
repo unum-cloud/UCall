@@ -156,11 +156,13 @@ PyObject* ucall_py_get_optional(PyObject* self, void* closure) {
 
 #pragma region Enums and Errors
 
-/** The C spelling of @p value, or NULL when the gap between named values has no member. */
+/** The C spelling of @p value, or NULL for a gap between named values, which spells "unrecognized"
+ *  or, past the first value, "unknown". */
 static char const* enum_spelling(ucall_py_enum_mirror_t const* mirror, long value) {
     if (value < mirror->first || value > mirror->last) return NULL;
     char const* const spelled = mirror->spell((int)value);
-    return strcmp(spelled, "unrecognized") == 0 ? NULL : spelled;
+    int const gap = strcmp(spelled, "unrecognized") == 0 || (value != mirror->first && strcmp(spelled, "unknown") == 0);
+    return gap ? NULL : spelled;
 }
 
 /** Writes the member name of @p spelled to @p member, "out-of-memory" becoming "OUT_OF_MEMORY". */

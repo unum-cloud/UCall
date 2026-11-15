@@ -756,20 +756,24 @@ impl FromStr for Backend {
 pub enum CPUClass {
     /// Portable kernels that run on any CPU.
     Serial = 1,
-    /// x86 cores from Intel Haswell on.
-    IntelHaswell = 2,
-    /// x86 server cores from Intel Skylake on.
-    IntelSkylake = 3,
-    /// x86 server cores from Intel Ice Lake on.
-    IntelIcelake = 4,
-    /// x86 hybrid cores from Intel Alder Lake on.
-    IntelAlder = 5,
-    /// Arm cores from AWS Graviton 2 on.
-    AWSG2 = 6,
-    /// Arm server cores from AWS Graviton 5 on.
-    AWSG5 = 7,
     /// The one class of a monoversioned build, with every capability it compiled.
-    Monoversioned = 8,
+    Monoversioned = 2,
+    /// x86 cores from Intel Haswell on.
+    IntelHaswell = 3,
+    /// x86 server cores from Intel Skylake on.
+    IntelSkylake = 5,
+    /// x86 server cores from Intel Ice Lake on.
+    IntelIcelake = 6,
+    /// x86 hybrid cores from Intel Alder Lake on.
+    IntelAlder = 11,
+    /// Arm cores from AWS Graviton 2 on.
+    AWSG2 = 12,
+    /// Arm server cores from AWS Graviton 5 on.
+    AWSG5 = 15,
+    /// RISC-V cores from Alibaba XuanTie C930 on, with RVV, Zawrs and Zacas.
+    AlibabaC930 = 17,
+    /// Power cores from IBM POWER10 on.
+    IBMPower10 = 18,
 }
 
 impl CPUClass {
@@ -781,13 +785,15 @@ impl CPUClass {
     pub(crate) fn from_raw(value: ucall_cpu_class_t) -> Option<Self> {
         match value {
             1 => Some(CPUClass::Serial),
-            2 => Some(CPUClass::IntelHaswell),
-            3 => Some(CPUClass::IntelSkylake),
-            4 => Some(CPUClass::IntelIcelake),
-            5 => Some(CPUClass::IntelAlder),
-            6 => Some(CPUClass::AWSG2),
-            7 => Some(CPUClass::AWSG5),
-            8 => Some(CPUClass::Monoversioned),
+            2 => Some(CPUClass::Monoversioned),
+            3 => Some(CPUClass::IntelHaswell),
+            5 => Some(CPUClass::IntelSkylake),
+            6 => Some(CPUClass::IntelIcelake),
+            11 => Some(CPUClass::IntelAlder),
+            12 => Some(CPUClass::AWSG2),
+            15 => Some(CPUClass::AWSG5),
+            17 => Some(CPUClass::AlibabaC930),
+            18 => Some(CPUClass::IBMPower10),
             _ => None,
         }
     }

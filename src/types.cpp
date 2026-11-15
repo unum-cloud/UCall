@@ -10,6 +10,10 @@
 
 #include "ucall/types.h"
 
+#include "lib.hpp" // `cpu_classes_k`
+
+using namespace unum::ucall;
+
 static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept {
     return spelling == std::string_view {reinterpret_cast<char const*>(name.data), name.length};
 }
@@ -78,13 +82,15 @@ char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
     switch (cpu_class) {
     case ucall_cpu_class_unknown_k: return "unknown";
     case ucall_cpu_class_serial_k: return "serial";
+    case ucall_cpu_class_monoversioned_k: return "monoversioned";
     case ucall_cpu_class_intel_haswell_k: return "intel-haswell";
     case ucall_cpu_class_intel_skylake_k: return "intel-skylake";
     case ucall_cpu_class_intel_icelake_k: return "intel-icelake";
     case ucall_cpu_class_intel_alder_k: return "intel-alder";
     case ucall_cpu_class_aws_g2_k: return "aws-g2";
     case ucall_cpu_class_aws_g5_k: return "aws-g5";
-    case ucall_cpu_class_monoversioned_k: return "monoversioned";
+    case ucall_cpu_class_alibaba_c930_k: return "alibaba-c930";
+    case ucall_cpu_class_ibm_power10_k: return "ibm-power10";
     }
     return "unknown";
 }
@@ -97,8 +103,7 @@ ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name) {
 }
 
 ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name) {
-    for (auto cpu_class = ucall_cpu_class_serial_k; cpu_class <= ucall_cpu_class_monoversioned_k;
-         cpu_class = static_cast<ucall_cpu_class_t>(cpu_class + 1))
+    for (ucall_cpu_class_t const cpu_class : cpu_classes_k)
         if (named(ucall_cpu_class_name(cpu_class), name)) return cpu_class;
     return ucall_cpu_class_unknown_k;
 }
