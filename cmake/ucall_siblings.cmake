@@ -36,7 +36,7 @@ ucall_sibling(
 )
 ucall_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
-    ce67be6511ce8cfc4b139b3e7266ec0e5edc372c
+    625811b9446897342126a01674f5d548c6de7110
 )
 ucall_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
