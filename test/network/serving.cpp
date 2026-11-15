@@ -113,9 +113,10 @@ struct polling_fixture_t {
         return count;
     }
 
-    /** The next call @p client completes, or one with a timeout outcome after five seconds. */
+    /** The next call @p client completes, or one with a timeout outcome once @c wait_limit_k
+     *  passes. */
     ucall_completed_call_t wait(std::size_t client) {
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         ucall_completed_call_t completed {};
         do {
             serve();
@@ -125,9 +126,9 @@ struct polling_fixture_t {
         return completed;
     }
 
-    /** Polls until <tt>/hold</tt> retains a request, answering whether one came within five seconds. */
+    /** Polls until <tt>/hold</tt> retains a request, answering whether one came within @c wait_limit_k. */
     [[nodiscard]] bool await_held(std::size_t client) {
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         while (!held) {
             serve();
             take(client);
@@ -198,7 +199,7 @@ static std::size_t test_completion_credits(sweep_cell_t const& cell) {
     second.submit(fixture);
     failures += expect(first.outcome.status == ucall_status_success_k &&
                        second.outcome.status == ucall_status_success_k);
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (fixture.echoes != 2) {
         fixture.serve();
         fixture.take(0);
@@ -261,7 +262,7 @@ static std::size_t test_take_call_reports_retired(sweep_cell_t const& cell) {
     ucall_server_stop(fixture.server);
     ucall_outcome_t outcome {};
     ucall_server_take_call_t serving {fixture.server, &outcome, 0, 1000};
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     do ucall_server_take_call(&serving);
     while (outcome.status == ucall_status_success_k && steady_clock::now() <= deadline);
     failures += expect(outcome.status == ucall_status_connection_closed_k, "the drained loop answered {}",
@@ -301,9 +302,10 @@ struct batch_context_t {
         state.completed.store(completed + 1, std::memory_order_release);
     }
 
-    /** Polls until @p count batches have fired, answering whether they did in five seconds. */
+    /** Polls until @p count batches have fired, answering whether they did within
+     *  @c wait_limit_k. */
     [[nodiscard]] bool wait(std::size_t count) {
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         while (completed.load(std::memory_order_acquire) != count) {
             for (std::size_t i = 0; i != fixture->clients.size(); ++i) fixture->take(i);
             fixture->serve(200000);
@@ -367,7 +369,7 @@ static std::size_t test_application_batches(sweep_cell_t const& cell) {
         fixture.reply(batches.requests[0]);
         failures += first.success(fixture.wait(0));
         failures += second.success(fixture.wait(1));
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         partial.submit(fixture, 0, "/prompt");
         while (batches.completed.load(std::memory_order_acquire) != 2 && steady_clock::now() <= deadline) {
             fixture.take(0);
@@ -448,7 +450,7 @@ static std::size_t test_batches_across_loops(sweep_cell_t const& cell) {
     }
     std::array<ucall_completed_call_t, 4> completed {};
     std::size_t received {};
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     auto progress = [&] {
         for (std::size_t loop = 0; loop != 2; ++loop) {
             ucall_server_take_call_t serving {server, &outcome, loop, 0};
@@ -561,7 +563,7 @@ struct relay_t {
     static void first(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
         auto& relay = *static_cast<relay_t*>(context);
         relay.requests[0].store(requests[0], std::memory_order_release);
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         while (!relay.requests[1].load(std::memory_order_acquire) && steady_clock::now() <= deadline)
             std::this_thread::yield();
         relay.failures += expect(count == 1 && relay.requests[1].load(std::memory_order_acquire),
@@ -600,7 +602,7 @@ static std::size_t test_batch_endpoints_poll_apart(sweep_cell_t const& cell) {
     }
     auto first_poller = poll_batches(fixture.server, relay.failures, endpoints[0]);
     auto second_poller = poll_batches(fixture.server, relay.failures, endpoints[1]);
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     auto serve_until = [&](std::size_t endpoint) {
         while (!relay.requests[endpoint].load(std::memory_order_acquire) && steady_clock::now() <= deadline) {
             for (std::size_t client = 0; client != fixture.clients.size(); ++client) fixture.take(client);
@@ -718,9 +720,10 @@ static std::size_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const& c
         burst += fmt::format("POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n{}", i);
     raw_client_t client;
     bool const written = client.connect(uc::text_view(resolved.interfaces[0].address)) &&
-                         client.write(uc::byte_span(burst), burst.size(), generator, steady_clock::now() + 5s);
+                         client.write(uc::byte_span(burst), burst.size(), generator,
+                                      steady_clock::now() + wait_limit_k);
     failures += expect(written, "the burst was not written");
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (written && !batches.completed.load(std::memory_order_acquire) && steady_clock::now() <= deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds {1});
     bool const fired = batches.completed.load(std::memory_order_acquire) == 1 && batches.sizes[0] == 4;
@@ -800,9 +803,10 @@ static std::size_t test_batches_skip_abandoned([[maybe_unused]] sweep_cell_t con
     std::string_view const request = "POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx";
     raw_client_t leaving;
     bool const written = leaving.connect(uc::text_view(resolved.interfaces[0].address)) &&
-                         leaving.write(uc::byte_span(request), request.size(), generator, steady_clock::now() + 5s);
+                         leaving.write(uc::byte_span(request), request.size(), generator,
+                                       steady_clock::now() + wait_limit_k);
     failures += expect(written, "the request was not written");
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (written && !dispatched() && steady_clock::now() <= deadline)
         std::this_thread::sleep_for(std::chrono::milliseconds {1});
     linger const reset {1, 0};
@@ -841,7 +845,7 @@ static std::size_t test_keepalive_eviction(sweep_cell_t const& cell, random_gene
     std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
     std::string_view const gate = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
     auto send = [&](raw_client_t& client, std::string_view bytes) {
-        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + 5s));
+        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
     };
     {
         raw_client_t first, second, third;
@@ -896,7 +900,7 @@ static std::size_t test_stalled_stream_eviction(sweep_cell_t const& cell, random
     std::string_view const stalled = "POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n";
     std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
     auto send = [&](raw_client_t& client, std::string_view bytes) {
-        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + 5s));
+        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
     };
     raw_client_t dribbler, idle, waiting;
     require(failures + fixture.stop(), dribbler.connect(fixture.address));

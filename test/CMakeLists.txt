@@ -71,7 +71,10 @@ if (UNIX AND TARGET ucall_cli)
         ucall_test_tools PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tools"
     )
     target_link_libraries(ucall_test_tools PRIVATE ucall_static ucall_sanitizers ucall_warnings fmt::fmt)
-    add_test(NAME ucall_test_tools COMMAND ucall_test_tools $<TARGET_FILE:ucall_cli>)
+    # A cross build runs this suite through its emulator, and the suite must run the tool the same way.
+    add_test(NAME ucall_test_tools COMMAND ucall_test_tools -- ${CMAKE_CROSSCOMPILING_EMULATOR}
+                                           $<TARGET_FILE:ucall_cli>
+    )
 endif ()
 
 # The kernel ABI mirrors match the kernel's own spelling, checked at compile time against the build's headers.

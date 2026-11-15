@@ -40,7 +40,7 @@ inline void write_u16(byte_t* bytes, std::uint16_t value) noexcept {
 }
 inline byte_t lowercase(byte_t byte) noexcept {
     auto const value = static_cast<unsigned char>(byte);
-    return value - 'A' < 26u ? static_cast<byte_t>(value + ('a' - 'A')) : byte;
+    return static_cast<unsigned>(value - 'A') < 26u ? static_cast<byte_t>(value + ('a' - 'A')) : byte;
 }
 
 /** Spells dotted @p name on the wire, lowercased; a trailing dot is allowed. Answers false for an

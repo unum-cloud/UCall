@@ -2,8 +2,8 @@
  *  @file test/tools.cpp
  *  @author Ash Vardanian
  *  @date November 5, 2026
- *  @brief Drives the <tt>ucall</tt> command-line client, whose path is the first argument, against
- *      an in-process fixture server.
+ *  @brief Drives the <tt>ucall</tt> command-line client, which the arguments after <tt>--</tt> run,
+ *      against an in-process fixture server.
  */
 #include <poll.h>     // `poll`
 #include <signal.h>   // `kill`, `SIGINT`
@@ -14,8 +14,9 @@
 
 using namespace unum::ucall::test;
 
-/** The command line under test, set once from the arguments. */
-static std::string cli_path;
+/** The words of the command that runs the tool, an emulator and its options first in a cross
+ *  build, set once from the arguments after <tt>--</tt>. */
+static std::vector<std::string> cli_words;
 
 /** What one run of the tool printed to its standard output, and how it exited. */
 struct cli_run_t {
@@ -27,7 +28,9 @@ struct cli_run_t {
  *  input. */
 static cli_run_t run_cli(scratch_directory_t const& scratch, std::string_view arguments) {
     std::string const output_path = scratch.name("stdout");
-    int const status = std::system(fmt::format("{} {} > {}", cli_path, arguments, output_path).c_str());
+    std::string command;
+    for (std::string const& word : cli_words) command += fmt::format("'{}' ", word);
+    int const status = std::system(fmt::format("{}{} > {}", command, arguments, output_path).c_str());
     cli_run_t run;
     run.exit_code = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
     if (std::FILE* file = std::fopen(output_path.c_str(), "rb")) {
@@ -186,7 +189,8 @@ struct proxy_run_t {
 static void spawn_proxy(proxy_run_t& run, std::vector<std::string> arguments) {
     int channel[2];
     if (::pipe(channel) != 0) return;
-    arguments.insert(arguments.begin(), {cli_path, "proxy"});
+    arguments.insert(arguments.begin(), "proxy");
+    arguments.insert(arguments.begin(), cli_words.begin(), cli_words.end());
     std::vector<char*> argv;
     for (auto& argument : arguments) argv.push_back(argument.data());
     argv.push_back(nullptr);
@@ -257,13 +261,17 @@ static std::size_t test_cli_proxy_round_trip() {
 
 int main(int argc, char** argv) {
     install_test_signal_handlers();
-    test_settings = read_settings(argc, argv, "ucall_test_tools <path to the ucall tool>");
+    test_settings = read_settings(argc, argv, "ucall_test_tools -- <command that runs the ucall tool>");
     settings_t const& settings = test_settings;
-    if (argc < 2 || argv[argc - 1][0] == '-') {
-        fmt::println(stderr, "Usage: {} <path to the ucall tool>", argv[0]);
+    for (int index = 1; index < argc; ++index)
+        if (std::string_view {argv[index]} == "--") {
+            cli_words.assign(argv + index + 1, argv + argc);
+            break;
+        }
+    if (cli_words.empty()) {
+        fmt::println(stderr, "Usage: {} -- <command that runs the ucall tool>", argv[0]);
         return 1;
     }
-    cli_path = argv[argc - 1];
     print_probe(settings);
     sweep_cell_t const cell {settings.backend, settings.cpu_class, ucall_security_none_k};
     std::size_t failures_count = 0;

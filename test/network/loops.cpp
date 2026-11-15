@@ -268,7 +268,7 @@ static std::size_t test_backend_parity(sweep_cell_t const& cell, random_generato
         for (std::string_view request : {"GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n",
                                          "POST /echo/2 HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\nposted",
                                          "GET /missing HTTP/1.1\r\nHost: a\r\n\r\n"}) {
-            failures += expect(client.write(uc::byte_span(request), 16, generator, steady_clock::now() + 5s));
+            failures += expect(client.write(uc::byte_span(request), 16, generator, steady_clock::now() + wait_limit_k));
             offset += read_response(client, offset).length;
         }
         exchange_until_close(client,
@@ -302,7 +302,7 @@ static std::size_t test_admission_across_loops(sweep_cell_t const& cell, random_
     raw_client_t clients[3];
     for (std::size_t i = 0; i != 3; ++i) {
         require(failures, clients[i].connect(fixture.address), "client {} could not connect", i);
-        failures += expect(clients[i].write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
+        failures += expect(clients[i].write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
         if (i != 2) failures += expect(read_response(clients[i], 0).status == 200, "client {} was not served", i);
     }
     failures += expect(read_response(clients[2], 0).status == 200, "the third client was not served");
@@ -326,7 +326,7 @@ static std::size_t test_accept_exhaustion_sheds(sweep_cell_t const& cell, random
     // A served request proves the loop opened its engine, which needs descriptors of its own.
     raw_client_t fresh;
     require(failures + fixture.stop(), fresh.connect(fixture.address));
-    failures += expect(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
+    failures += expect(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
     failures += expect(read_response(fresh, 0).status == 200, "the first client was not served");
     sockaddr_in target {};
     target.sin_family = AF_INET;
@@ -367,7 +367,7 @@ static std::size_t test_accept_exhaustion_sheds(sweep_cell_t const& cell, random
     }
     fresh.received.clear();
     require(failures + fixture.stop(), fresh.connect(fixture.address));
-    failures += expect(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
+    failures += expect(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
     failures += expect(read_response(fresh, 0).status == 200, "a fresh client was not served");
     bool const rings = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
                        fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
@@ -472,7 +472,7 @@ static std::size_t test_allocator_propagation(sweep_cell_t const& cell) {
     call.body = uc::bytes_view(payload);
     ucall_client_call(&call);
     failures += expect(outcome.status == ucall_status_success_k);
-    auto completed = complete_call(route, client, steady_clock::now() + 5s);
+    auto completed = complete_call(route, client, steady_clock::now() + wait_limit_k);
     failures += expect(completed.outcome.status == ucall_status_success_k, "{}",
                        ucall_status_name(completed.outcome.status));
     ucall_bytes_view_t body {};
@@ -598,7 +598,7 @@ static std::size_t test_engine_faults([[maybe_unused]] random_generator_t& gener
             std::string const request = fmt::format("POST /echo/{} HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}",
                                                     round, body.size(), body);
             bool const written = client.write(uc::byte_span(request), request.size(), generator,
-                                              steady_clock::now() + 5s);
+                                              steady_clock::now() + wait_limit_k);
             auto const response = written ? read_response(client, offset) : wire_response_t {};
             if (response.status == 200 && response.body == body) {
                 ++answered;
@@ -664,7 +664,7 @@ static std::size_t test_bound_client_counts_into_its_loop() {
     failures += expect(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     ucall_completed_call_t completed {};
     std::size_t count = 0;
-    for (auto const deadline = steady_clock::now() + 5s; !count && steady_clock::now() < deadline;) {
+    for (auto const deadline = steady_clock::now() + wait_limit_k; !count && steady_clock::now() < deadline;) {
         ucall_server_take_call_t serve {route.server, &outcome, 0, 1000};
         ucall_server_take_call(&serve);
         ucall_client_take_completed_t take {client, &outcome, &completed, 1, &count, 0};

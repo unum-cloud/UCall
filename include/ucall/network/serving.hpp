@@ -1047,7 +1047,7 @@ struct serving {
                     engine.close_socket(event_loop.metrics.send_request.descriptor);
                     event_loop.metrics.state = metrics_state_t::closed_k;
                 }
-                for (auto const& acceptor : event_loop.interface_acceptors)
+                for ([[maybe_unused]] auto const& acceptor : event_loop.interface_acceptors)
                     assert((acceptor.reserve_descriptor >= 0 || event_loop.accept_deadline) &&
                            "an idle loop's reserves are open unless the residue holds them closed");
                 retire_event_loop(server, event_loop);

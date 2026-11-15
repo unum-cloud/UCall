@@ -369,6 +369,8 @@ struct fixture_t {
         client_config.peer_authorizer_context = server_public;
         client_config.backend = cell.backend;
         client_config.cpu_class = cell.cpu_class;
+        client_config.connect_timeout_microseconds = client_config.call_timeout_microseconds = static_cast<std::size_t>(
+            std::chrono::microseconds {wait_limit_k}.count());
         ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};
         ucall_client_init(&client_init);
         if ((status = outcome.status) != ucall_status_success_k) return;
@@ -415,9 +417,9 @@ struct fixture_t {
         return count;
     }
 
-    /** The next completed call, or one with a timeout outcome after five seconds. */
+    /** The next completed call, or one with a timeout outcome once @c wait_limit_k passes. */
     ucall_completed_call_t wait() {
-        steady_clock::time_point const deadline = steady_clock::now() + 30s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         ucall_completed_call_t completed {};
         while (!poll(completed))
             if (steady_clock::now() > deadline) {
@@ -461,7 +463,7 @@ inline std::size_t check_response(ucall_received_http_response_t response, std::
 /** Polls until the @c /gate route holds @p count requests, with no call completing meanwhile. */
 inline std::size_t await_held(fixture_t& fixture, std::size_t count) {
     std::size_t failures = 0;
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (fixture.held_count() != count && !failures) {
         ucall_completed_call_t completed {};
         failures += expect(!fixture.poll(completed), "a call completed early");
@@ -533,7 +535,7 @@ inline ucall_event_loop_statistics_t loop_statistics(fixture_t& fixture) {
  *  answers the first response. */
 inline wire_response_t exchange_until_close(raw_client_t& client, std::string_view request, std::size_t max_chunk,
                                             random_generator_t& generator, std::size_t& failures) {
-    steady_clock::time_point const deadline = steady_clock::now() + 10s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     failures += expect(client.write(uc::byte_span(request), max_chunk, generator, deadline),
                        "the server stopped reading");
     auto const end = client.read_until_close(deadline);
@@ -546,7 +548,7 @@ inline wire_response_t exchange_until_close(raw_client_t& client, std::string_vi
 
 /** Waits until the background loops hold @p count requests at @c /gate. */
 inline std::size_t await_held_in_background(fixture_t& fixture, std::size_t count) {
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (fixture.held_count() != count && steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
     return expect(fixture.held_count() == count, "the server holds {} of {} requests", fixture.held_count(), count);
 }
@@ -569,10 +571,10 @@ inline ucall_received_http_request_t hold_call(fixture_t& fixture, ucall_verb_t 
     return fixture.take_held();
 }
 
-/** Polls the server until @p outcome is final, answering its status, or deferred after five
- *  seconds. */
+/** Polls the server until @p outcome is final, answering its status, or deferred once
+ *  @c wait_limit_k passes. */
 inline ucall_status_t await_outcome(fixture_t& fixture, ucall_outcome_t& outcome) {
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (ucall_outcome_status(&outcome) == ucall_status_deferred_k && steady_clock::now() < deadline) {
         ucall_outcome_t polled {};
         ucall_server_take_call_t serving {fixture.server, &polled, 0, 0};

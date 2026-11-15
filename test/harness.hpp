@@ -99,6 +99,10 @@ namespace unum::ucall::test {
 /** Scratch extent shared by buffer and record fixtures. */
 inline constexpr std::size_t fixture_buffer_bytes_k = 4096;
 
+/** How long a check waits for what it expects to happen. A passing case never waits it out, so it
+ *  bounds hangs rather than speed, and leaves room for sanitizers and emulated CPUs. */
+inline constexpr std::chrono::seconds wait_limit_k {120};
+
 #pragma region Byte Ranges
 
 /** Fills a range with one repeated value, keeping its pointer and length together. */
@@ -755,7 +759,7 @@ inline wire_response_t parse_response(std::string_view wire) {
 
 /** Reads until a whole response follows @p offset, or answers a partial one on close or timeout. */
 inline wire_response_t read_response(raw_client_t& client, std::size_t offset) {
-    auto const deadline = std::chrono::steady_clock::now() + std::chrono::seconds {5};
+    auto const deadline = std::chrono::steady_clock::now() + wait_limit_k;
     for (;;) {
         auto response = parse_response(std::string_view {client.received}.substr(offset));
         if (response.length) return response;

@@ -213,7 +213,7 @@ static ucall_client_t resolving_client(sweep_cell_t const& cell, uc::dns::resolv
 }
 
 /** Calls @p url once on @p client over a connection of its own, which it closes, and waits up to
- *  five seconds for it, freeing any response and answering its outcome. */
+ *  @c wait_limit_k for it, freeing any response and answering its outcome. */
 static ucall_status_t resolved_call(ucall_client_t client, std::string const& url) {
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
@@ -228,7 +228,7 @@ static ucall_status_t resolved_call(ucall_client_t client, std::string const& ur
     if (outcome.status != ucall_status_success_k) return outcome.status;
     ucall_completed_call_t completed {};
     std::size_t count = 0;
-    for (auto const deadline = steady_clock::now() + 5s; !count && steady_clock::now() < deadline;) {
+    for (auto const deadline = steady_clock::now() + wait_limit_k; !count && steady_clock::now() < deadline;) {
         ucall_client_take_completed_t take {client, &outcome, &completed, 1, &count, 100'000};
         ucall_client_take_completed(&take);
     }

@@ -164,6 +164,8 @@ inline settings_t read_settings(int argc, char const* const* argv, std::string_v
     }
     for (int index = 1; index < argc; ++index) {
         std::string_view const flag = argv[index];
+        // What follows `--` belongs to the program, never to these flags.
+        if (flag == "--") break;
         if (flag.empty() || flag[0] != '-') continue;
         std::string_view const value = index + 1 < argc ? argv[index + 1] : "";
         bool const parsed = flag == "--backend"     ? parse_backend(value, settings.backend)

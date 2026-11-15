@@ -179,7 +179,7 @@ static std::size_t test_multiloop_retention(sweep_cell_t const& cell) {
     call.context = &gate_url;
     ucall_client_call(&call);
     failures += expect(outcome.status == ucall_status_success_k);
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     ucall_received_http_request_t held {};
     while (!(held = fixture.take_held())) {
         ucall_completed_call_t completed {};
@@ -437,7 +437,7 @@ static std::size_t stream_reply(ucall_server_t server, ucall_received_http_reque
     ucall_server_reply_begin_t begin {server, &outcome, request, 0, headers.data(), headers.size()};
     ucall_server_reply_begin(&begin);
     failures += expect(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
-    steady_clock::time_point const deadline = steady_clock::now() + 20s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     for (auto const& chunk : chunks) {
         ucall_reply_part_t const part = bytes_part(chunk);
         ucall_server_reply_append_t append {server, &outcome, request, &part, 1};
@@ -648,7 +648,7 @@ static std::size_t test_pipelined_delivery(sweep_cell_t const& cell) {
     // One send, so the server has read the third request before it closes,
     // and the close is no reset.
     failures += expect(::send(client.descriptor, burst.data(), burst.size(), 0) == static_cast<ssize_t>(burst.size()));
-    auto const end = client.read_until_close(steady_clock::now() + 10s);
+    auto const end = client.read_until_close(steady_clock::now() + wait_limit_k);
     failures += expect(end == read_end_t::closed_k, "the read ended as {}", static_cast<int>(end));
     auto const first = parse_response(client.received);
     auto const second = parse_response(std::string_view {client.received}.substr(first.length));
@@ -737,7 +737,7 @@ static std::size_t test_smuggling(sweep_cell_t const& cell, random_generator_t& 
         auto const dispatched = fixture.dispatched.load();
         raw_client_t client;
         require(failures, client.connect(fixture.address));
-        failures += expect(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + 5s),
+        failures += expect(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + wait_limit_k),
                            "{} was cut short", row.name);
         auto const response = exchange_until_close(client, unread, 4096, generator, failures);
         failures += expect(response.status == row.expected_status && response.length == client.received.size(),
@@ -809,7 +809,7 @@ static std::size_t test_method_routing(sweep_cell_t const& cell, random_generato
     };
     for (auto const& row : rows) {
         std::size_t const offset = client.received.size();
-        failures += expect(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + 5s));
+        failures += expect(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + wait_limit_k));
         auto const response = read_response(client, offset);
         std::string_view const head = std::string_view {client.received}.substr(offset, response.length);
         failures += expect(response.status == row.status && head.find(row.header) != std::string_view::npos &&
@@ -944,7 +944,7 @@ static std::size_t test_cross_thread_teardown_delivery(sweep_cell_t const& cell,
     raw_client_t client;
     require(failures, client.connect(fixture.address));
     std::string_view const request = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-    failures += expect(client.write(uc::byte_span(request), 0, generator, steady_clock::now() + 5s));
+    failures += expect(client.write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
     failures += expect(read_response(client, 0).status == 200, "the keep-alive request was not served");
     failures += fixture.stop();
     // A hang here is the failure, so a stuck free ends the process instead of the case.
@@ -954,7 +954,7 @@ static std::size_t test_cross_thread_teardown_delivery(sweep_cell_t const& cell,
         ucall_server_free(server);
         freed.set_value();
     }}.detach();
-    if (finished.wait_for(std::chrono::seconds {5}) != std::future_status::ready) {
+    if (finished.wait_for(wait_limit_k) != std::future_status::ready) {
         std::fputs("ucall_server_free blocked on a ring its poller had issued\n", stderr);
         std::quick_exit(EXIT_FAILURE);
     }
@@ -980,7 +980,7 @@ static std::size_t test_pipelined_burst(sweep_cell_t const& cell, random_generat
         bool written = false;
         std::thread writer {[&] {
             random_generator_t chunks {generator};
-            written = client.write(uc::byte_span(burst), burst.size(), chunks, steady_clock::now() + 20s);
+            written = client.write(uc::byte_span(burst), burst.size(), chunks, steady_clock::now() + wait_limit_k);
         }};
         std::size_t offset = 0, answered = 0;
         for (; answered != count; ++answered) {
@@ -1008,7 +1008,7 @@ static std::size_t test_orphaned_exchanges_bounded(sweep_cell_t const& cell, ran
         raw_client_t leaving;
         require(failures + fixture.stop(), leaving.connect(fixture.address));
         std::string_view const gate = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
-        failures += expect(leaving.write(uc::byte_span(gate), 0, generator, steady_clock::now() + 5s));
+        failures += expect(leaving.write(uc::byte_span(gate), 0, generator, steady_clock::now() + wait_limit_k));
         failures += await_held_in_background(fixture, left + 1);
         // A reset rather than a FIN, which the server would answer on the half-closed connection.
         linger const abrupt {1, 0};
@@ -1017,7 +1017,7 @@ static std::size_t test_orphaned_exchanges_bounded(sweep_cell_t const& cell, ran
     raw_client_t next;
     require(failures + fixture.stop(), next.connect(fixture.address));
     std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-    failures += expect(next.write(uc::byte_span(echo), 0, generator, steady_clock::now() + 5s));
+    failures += expect(next.write(uc::byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
     auto const refused = read_response(next, 0);
     failures += expect(refused.status == 503, "a request past the abandoned budget answered {}", refused.status);
     ucall_outcome_t outcome {};
@@ -1026,7 +1026,7 @@ static std::size_t test_orphaned_exchanges_bounded(sweep_cell_t const& cell, ran
     ucall_server_reply_content(&reply);
     failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_connection_closed_k,
                        "the abandoned reply answered {}", ucall_status_name(outcome.status));
-    failures += expect(next.write(uc::byte_span(echo), 0, generator, steady_clock::now() + 5s));
+    failures += expect(next.write(uc::byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
     auto const served = read_response(next, refused.length);
     failures += expect(served.status == 200, "a request after the abandoned one was answered got {}", served.status);
     reply.request = fixture.take_held();
@@ -1171,7 +1171,7 @@ static std::size_t test_interface_listen_descriptor(sweep_cell_t const& cell, ra
         std::string const request = fmt::format("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}",
                                                 body.size(), body);
         std::size_t const offset = client.received.size();
-        failures += expect(client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s));
+        failures += expect(client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k));
         auto const response = read_response(client, offset);
         failures += expect(response.status == 200 && response.body == body, "echoed {} with {} of {} bytes",
                            response.status, response.body.size(), body.size());
@@ -1301,7 +1301,7 @@ static std::size_t test_log_lines(sweep_cell_t const& cell) {
         std::string_view const request = "GET /missing HTTP/1.1\r\nHost: a\r\n\r\n";
         failures += expect(::send(client.descriptor, request.data(), request.size(), 0) ==
                            static_cast<ssize_t>(request.size()));
-        auto const deadline = steady_clock::now() + 5s;
+        auto const deadline = steady_clock::now() + wait_limit_k;
         while (client.received.find("Not found") == std::string::npos &&
                client.read(client.received.size() + 1, deadline) == read_end_t::filled_k) {}
         failures += fixture.stop();
@@ -1373,7 +1373,7 @@ static std::size_t test_streamed_reply_would_block(sweep_cell_t const& cell) {
         fill(queued);
         ucall_reply_part_t const part = bytes_part(chunk);
         ucall_server_reply_append_t append {fixture.server, &outcome, held, &part, 1};
-        append_when_room(append, steady_clock::now() + 20s);
+        append_when_room(append, steady_clock::now() + wait_limit_k);
         failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
     }
     ucall_server_reply_end_t end {fixture.server, &outcome, held};
@@ -1408,7 +1408,7 @@ static std::size_t test_streamed_reply_detach(sweep_cell_t const& cell) {
     ucall_server_reply_append(&append);
     failures += expect(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
     client.close();
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     do {
         std::this_thread::sleep_for(1ms);
         ucall_server_reply_append(&append);
@@ -1445,7 +1445,7 @@ static std::size_t test_streamed_reply_http10(sweep_cell_t const& cell) {
     require(failures + fixture.stop(), held);
     auto const chunks = stream_chunks(50, 'c');
     failures += stream_reply(fixture.server, held, chunks);
-    auto const end = client.read_until_close(steady_clock::now() + 5s);
+    auto const end = client.read_until_close(steady_clock::now() + wait_limit_k);
     failures += expect(end == read_end_t::closed_k, "the read ended as {}", static_cast<int>(end));
     std::string_view const wire = client.received;
     auto const headers_end = wire.find("\r\n\r\n");
@@ -1508,7 +1508,7 @@ static std::size_t test_streamed_reply_identity(sweep_cell_t const& cell) {
     ucall_server_reply_end(&end);
     failures += expect(outcome.status == ucall_status_malformed_k, "a short end: {}",
                        ucall_status_name(outcome.status));
-    auto const closed = client.read_until_close(steady_clock::now() + 5s);
+    auto const closed = client.read_until_close(steady_clock::now() + wait_limit_k);
     failures += expect(closed == read_end_t::closed_k, "the read ended as {}", static_cast<int>(closed));
     failures += expect(std::string_view {client.received}.substr(response.length).ends_with("\r\n\r\nshort"),
                        "the cut reply: {}", std::string_view {client.received}.substr(response.length));
@@ -1629,8 +1629,9 @@ static std::size_t test_streamed_body(sweep_cell_t const& cell, random_generator
         raw_client_t client;
         require(failures + fixture.stop(), client.connect(fixture.address));
         bool written = false;
-        std::thread writer {
-            [&] { written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        std::thread writer {[&] {
+            written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k);
+        }};
         failures += await_held_in_background(fixture, 1);
         auto* held = fixture.take_held();
         if (!held) {
@@ -1659,9 +1660,9 @@ static std::size_t test_streamed_body(sweep_cell_t const& cell, random_generator
 }
 
 /** The next completed call of the fixture's client alone, for cases whose server loops run in the
- *  background, or one with a timeout outcome after five seconds. */
+ *  background, or one with a timeout outcome once @c wait_limit_k passes. */
 static ucall_completed_call_t client_wait(fixture_t& fixture) {
-    steady_clock::time_point const deadline = steady_clock::now() + 5s;
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     ucall_completed_call_t completed {};
     std::size_t count = 0;
     while (!count && steady_clock::now() < deadline) {
@@ -1741,7 +1742,7 @@ static std::size_t test_streamed_body_slow_puller(sweep_cell_t const& cell, rand
     require(failures + fixture.stop(), slow.connect(fixture.address) && quick.connect(fixture.address));
     bool written = false;
     std::thread writer {
-        [&] { written = slow.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        [&] { written = slow.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k); }};
     failures += await_held_in_background(fixture, 1);
     auto* held = fixture.take_held();
     std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
@@ -1785,7 +1786,7 @@ static std::size_t test_body_chunk_would_block_on_polling_thread(sweep_cell_t co
                        ucall_status_name(answered));
     bool written = false;
     std::thread writer {
-        [&] { written = client.write(uc::byte_span(body), 65536, generator, steady_clock::now() + 5s); }};
+        [&] { written = client.write(uc::byte_span(body), 65536, generator, steady_clock::now() + wait_limit_k); }};
     std::size_t pulls = 0;
     std::string const received = pull_body(fixture, held, failures, pulls);
     writer.join();
@@ -1814,8 +1815,9 @@ static std::size_t test_streamed_body_barrier(sweep_cell_t const& cell, random_g
         raw_client_t client;
         require(failures + fixture.stop(), client.connect(fixture.address));
         bool written = false;
-        std::thread writer {
-            [&] { written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        std::thread writer {[&] {
+            written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k);
+        }};
         failures += await_held_in_background(fixture, 1);
         auto* held = fixture.take_held();
         std::this_thread::sleep_for(20ms);
@@ -1861,7 +1863,7 @@ static std::size_t test_streamed_body_malformed(sweep_cell_t const& cell) {
     }
     failures += expect(status == ucall_status_malformed_k, "the bad chunk ended the pull with {}",
                        ucall_status_name(status));
-    failures += expect(client.read_until_close(steady_clock::now() + 5s) == read_end_t::closed_k,
+    failures += expect(client.read_until_close(steady_clock::now() + wait_limit_k) == read_end_t::closed_k,
                        "the connection stayed open");
     return failures + fixture.stop();
 }
@@ -1879,7 +1881,7 @@ static std::size_t test_streamed_chunk_line_bounded(sweep_cell_t const& cell, ra
     require(failures + fixture.stop(), client.connect(fixture.address));
     std::thread writer {[&] {
         [[maybe_unused]] bool const written = client.write(uc::byte_span(request), 65536, generator,
-                                                           steady_clock::now() + 5s);
+                                                           steady_clock::now() + wait_limit_k);
     }};
     failures += await_held_in_background(fixture, 1);
     auto* held = fixture.take_held();
@@ -1891,7 +1893,7 @@ static std::size_t test_streamed_chunk_line_bounded(sweep_cell_t const& cell, ra
         ucall_status_t const status = await_outcome(fixture, outcome);
         failures += expect(status == ucall_status_overflow_k, "the endless size line ended the pull with {}",
                            ucall_status_name(status));
-        auto const end = client.read_until_close(steady_clock::now() + 5s);
+        auto const end = client.read_until_close(steady_clock::now() + wait_limit_k);
         failures += expect(end == read_end_t::closed_k || end == read_end_t::failed_k, "the connection ended as {}",
                            static_cast<int>(end));
         // The connection is gone, so the reply only releases the request.
@@ -1912,7 +1914,7 @@ static std::size_t test_expect_continue(sweep_cell_t const& cell, random_generat
     std::size_t failures = 0;
     std::string_view const interim = "HTTP/1.1 100 Continue\r\n\r\n";
     auto send = [&](raw_client_t& client, std::string_view bytes) {
-        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + 5s));
+        failures += expect(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
     };
     auto await_interim = [&](raw_client_t& client) {
         auto const end = client.read(interim.size(), steady_clock::now() + 500ms);
@@ -1980,11 +1982,12 @@ static std::size_t test_oversized_request_refused(sweep_cell_t const& cell, rand
         raw_client_t client;
         require(failures + fixture.stop(), client.connect(fixture.address));
         bool written = false;
-        std::thread writer {
-            [&] { written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + 5s); }};
+        std::thread writer {[&] {
+            written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k);
+        }};
         auto const response = read_response(client, 0);
         failures += expect(response.status == 413, "answered {}", response.status);
-        failures += expect(client.read_until_close(steady_clock::now() + 5s) == read_end_t::closed_k,
+        failures += expect(client.read_until_close(steady_clock::now() + wait_limit_k) == read_end_t::closed_k,
                            "the refusal did not end in an orderly close");
         writer.join();
     }

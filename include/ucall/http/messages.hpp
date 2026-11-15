@@ -532,8 +532,8 @@ struct messages {
         if (left.size() != right.size()) return false;
         for (std::size_t i = 0; i != left.size(); ++i) {
             unsigned char first = static_cast<unsigned char>(left[i]), second = static_cast<unsigned char>(right[i]);
-            if (first - 'A' < 26u) first += 'a' - 'A';
-            if (second - 'A' < 26u) second += 'a' - 'A';
+            if (static_cast<unsigned>(first - 'A') < 26u) first += 'a' - 'A';
+            if (static_cast<unsigned>(second - 'A') < 26u) second += 'a' - 'A';
             if (first != second) return false;
         }
         return true;

@@ -33,8 +33,13 @@ static std::size_t test_framing_fragmentation(random_generator_t& generator) {
                                         generator);
         std::size_t cuts[8];
         std::size_t const count = generator.below(9);
-        for (std::size_t index = 0; index != count; ++index) cuts[index] = generator.below(wire.size() + 1);
-        std::sort(cuts, cuts + count);
+        // Cuts slide into place as drawn; `std::sort` over this array trips GCC's bounds analysis.
+        for (std::size_t index = 0; index != count; ++index) {
+            std::size_t const cut = generator.below(wire.size() + 1);
+            std::size_t slot = index;
+            for (; slot && cuts[slot - 1] > cut; --slot) cuts[slot] = cuts[slot - 1];
+            cuts[slot] = cut;
+        }
         std::size_t const found = check_http_fragmentation(byte_span(wire), {cuts, count}, http_role_t::request_k);
         failures += expect(!found, "{} disagreements framing {:?} cut at {} points", found, wire, count);
         if (found) break;

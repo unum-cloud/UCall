@@ -113,10 +113,10 @@ struct scripted_server_t {
                     answered_bytes += length;
                     if (!answer.bytes.empty())
                         open = peer.write(uc::byte_span(answer.bytes), answer.bytes.size(), generator,
-                                          steady_clock::now() + 5s);
+                                          steady_clock::now() + wait_limit_k);
                     if (answer.after != after_answer_t::close_k) continue;
                     ::shutdown(peer.descriptor, SHUT_WR);
-                    for (auto const until = steady_clock::now() + 5s;
+                    for (auto const until = steady_clock::now() + wait_limit_k;
                          running() && steady_clock::now() < until &&
                          peer.read_until_close(steady_clock::now() + 20ms) == read_end_t::timed_out_k;) {}
                     open = false;
@@ -395,7 +395,7 @@ static std::size_t test_client_log_lines(sweep_cell_t const& cell) {
     std::size_t failures = expect(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     ucall_completed_call_t completed {};
     std::size_t count = 0;
-    for (auto const deadline = steady_clock::now() + 10s; !count && steady_clock::now() < deadline;) {
+    for (auto const deadline = steady_clock::now() + wait_limit_k; !count && steady_clock::now() < deadline;) {
         ucall_client_take_completed_t take {client, &outcome, &completed, 1, &count, 100'000};
         ucall_client_take_completed(&take);
     }
@@ -523,7 +523,7 @@ static std::size_t test_receive_follows_early_response(sweep_cell_t const& cell,
     std::string const url = fmt::format("http://{}/long", listener.address);
     std::thread peer_thread {[&, seed = generator()] {
         random_generator_t peer_generator {seed};
-        auto const deadline = steady_clock::now() + 10s;
+        auto const deadline = steady_clock::now() + wait_limit_k;
         raw_client_t peer;
         if (!listener.accept(peer, deadline)) return;
         auto read_head = [&](std::size_t from) {
@@ -582,7 +582,7 @@ static ucall_client_t counted_client(allocation_counts_t& counts, sweep_cell_t c
     return outcome.status == ucall_status_success_k ? client : nullptr;
 }
 
-/** Calls @p url on @p client and waits up to five seconds for the call to complete. */
+/** Calls @p url on @p client and waits up to @c wait_limit_k for the call to complete. */
 static ucall_completed_call_t counted_call(ucall_client_t client, std::string const& url) {
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
@@ -672,7 +672,7 @@ static std::size_t test_bound_client_calls_from_handler(sweep_cell_t const& cell
         call.verb = ucall_verb_get_k;
         ucall_client_call(&call);
         failures += expect(outcome.status == ucall_status_success_k);
-        steady_clock::time_point const deadline = steady_clock::now() + 5s;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
         ucall_completed_call_t answered {};
         while (steady_clock::now() < deadline && !upstream.poll(answered)) {
             ucall_server_take_call_t serving {front.server, &outcome, 0, 0};
