@@ -131,6 +131,10 @@ add_library(ucall::header ALIAS ucall_header)
 set_target_properties(ucall_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ucall_shared PROPERTIES EXPORT_NAME shared)
 set_target_properties(ucall_header PROPERTIES EXPORT_NAME header)
+# MSVC reads BOM-less UTF-8 in the system code page, so consumers of these Unicode-commented headers need `/utf-8`.
+target_compile_options(
+    ucall_header INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+)
 target_include_directories(
     ucall_header INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c>
                            $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
