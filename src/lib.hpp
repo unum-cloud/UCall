@@ -303,7 +303,7 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
 /** Only a different picked kit, atomic reference or waiter earns another instantiation, or a parent
  *  the build left out, as a monoversioned build leaves serial. */
 template <cpu_class_t cpu_class_>
-constexpr bool rung_advances() noexcept {
+consteval bool class_advances() noexcept {
     using own_t = cpu_traits<cpu_class_>;
     using parent_t = cpu_traits<parent_class_of(cpu_class_)>;
     return cpu_class_ == cpu_class_t::serial_k || !cpu_class_compiled(parent_class_of(cpu_class_)) ||
@@ -341,24 +341,25 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept
  *  atomic reference's entire mask, so RCpc with LSE, need nothing the ceiling lacks. */
 constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
     sz_capability_t const strings = stringzilla_capabilities_of(rung) & sz_capabilities_compiled_cpu_mask();
-    return (strings & ~ceiling.compute) == 0 && (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
+    return (strings & ~ceiling.strings) == 0 && (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
 }
 
 /** What one server or client may use: the masks this machine runs when nothing is pinned, the
- *  pinned class's masks when it runs them, refusing a class it does not and a ceiling no compiled
- *  class fits, like one below a monoversioned build's masks. The one caller of StringZilla's and
- *  ForkUnion's detection. */
+ *  pinned class's masks when it runs them, refusing a value no class takes with
+ *  @c ucall_status_invalid_argument_k, and a class the machine does not run or a ceiling no
+ *  compiled class fits, like one below a monoversioned build's masks, with
+ *  @c ucall_status_unsupported_k. The one caller of StringZilla's and ForkUnion's detection. */
 inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t pinned, cpu_ceiling_t& ceiling) noexcept {
+    bool known = pinned == ucall_cpu_class_unknown_k;
+    for (ucall_cpu_class_t const cpu_class : cpu_classes_k) known |= cpu_class == pinned;
+    if (!known) return ucall_status_invalid_argument_k;
     cpu_ceiling_t picked;
-    if (sz_capabilities_detected_cpu(&picked.compute) != sz_success_k) picked.compute = sz_cap_serial_k;
+    if (sz_capabilities_detected_cpu(&picked.strings) != sz_success_k) picked.strings = sz_cap_serial_k;
     picked.sync = fu::cpu_capabilities();
     if (pinned != ucall_cpu_class_unknown_k) {
-        bool known = false;
-        for (ucall_cpu_class_t const cpu_class : cpu_classes_k) known |= cpu_class == pinned;
-        if (!known) return ucall_status_unsupported_k;
         cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
         cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
-        if ((picked.compute & wanted.compute) != wanted.compute || (picked.sync & wanted.sync) != wanted.sync)
+        if ((picked.strings & wanted.strings) != wanted.strings || (picked.sync & wanted.sync) != wanted.sync)
             return ucall_status_unsupported_k;
         picked = wanted;
     }
@@ -378,14 +379,23 @@ void make_network_variant(init_type_* arguments) noexcept;
 template <cpu_class_t... classes_>
 struct cpu_ladder {};
 
-/** The classes carrying variants, each lineage newest first and the serial floor last; a rung the
- *  build left out is skipped by the walk, never by the list. A monoversioned build carries one. */
+/** Rungs of a ladder this build compiled; a monoversioned build compiles at most one. */
+template <cpu_class_t... classes_>
+consteval std::size_t compiled_rungs(cpu_ladder<classes_...>) noexcept {
+    return (std::size_t {cpu_class_compiled(classes_)} + ... + 0);
+}
+
+/** The classes carrying variants, each lineage newest first and the serial floor last, or the one
+ *  class of a monoversioned build; the walk skips a rung the build left out, the list keeps it. */
 #if UCALL_TARGET_MONOVERSIONED
 using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
+inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::monoversioned_k;
+static_assert(compiled_rungs(cpu_ladder_t {}) <= 1);
 #else
 using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_alder_k,
                                 cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k,
                                 cpu_class_t::alibaba_c930_k, cpu_class_t::ibm_power10_k, cpu_class_t::serial_k>;
+inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::serial_k;
 #endif
 
 /** The class @ref make_network builds for @p ceiling on @p ladder. */
@@ -394,7 +404,7 @@ cpu_class_t built_class(cpu_ladder<classes_...>, cpu_ceiling_t ceiling) noexcept
     cpu_class_t built = cpu_class_t::serial_k;
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
-        if constexpr (cpu_class_compiled(class_) && rung_advances<class_>())
+        if constexpr (cpu_class_compiled(class_) && class_advances<class_>())
             if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, built = class_;
     };
     (rung.template operator()<classes_>(), ...);
@@ -402,14 +412,15 @@ cpu_class_t built_class(cpu_ladder<classes_...>, cpu_ceiling_t ceiling) noexcept
 }
 
 /** Builds the network on the newest rung of @p ladder the build compiled and @p ceiling fits, one
- *  of which @ref pick_cpu_ceiling made sure of, and a class picking its parent's kits and atomics
- *  is skipped without instantiating its variant. */
+ *  of which @ref pick_cpu_ceiling made sure of; a compiled class must advance past its parent. */
 template <cpu_class_t... classes_, typename init_type_>
 void make_network(cpu_ladder<classes_...>, init_type_* arguments, cpu_ceiling_t ceiling) noexcept {
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
-        if constexpr (cpu_class_compiled(class_) && rung_advances<class_>())
+        if constexpr (cpu_class_compiled(class_) && class_advances<class_>()) {
             if (!picked && cpu_rung_fits(class_, ceiling)) picked = true, make_network_variant<class_>(arguments);
+        }
+        else static_assert(!cpu_class_compiled(class_), "A compiled class no longer advances past the one below");
     };
     (rung.template operator()<classes_>(), ...);
 }
@@ -459,7 +470,7 @@ inline host_verbs_t const& host_verbs() noexcept {
     static host_verbs_t const picked = []<cpu_class_t... classes_>(cpu_ladder<classes_...>) noexcept {
         cpu_ceiling_t ceiling {};
         if (pick_cpu_ceiling(ucall_cpu_class_unknown_k, ceiling) != ucall_status_success_k) ceiling = {};
-        host_verbs_t row = host_verbs_of<cpu_class_t::serial_k>();
+        host_verbs_t row = host_verbs_of<cpu_ladder_floor_k>();
         bool found = false;
         auto rung = [&]<cpu_class_t class_>() noexcept {
             if constexpr (cpu_class_compiled(class_))

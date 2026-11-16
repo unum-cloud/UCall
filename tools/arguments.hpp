@@ -73,16 +73,14 @@ inline void print_key(std::FILE* file, ucall_noise_key_t const& key) noexcept {
     std::fputc('\n', file);
 }
 
-/** An engine name as @c ucall_io_backend_name spells it, left as automatic when it names none. */
+/** An engine name as @c ucall_io_backend_name spells it, left untouched when it names none. */
 inline bool parse_backend(std::string_view text, ucall_io_backend_t& backend) noexcept {
-    backend = ucall_io_backend_from_name(bytes_view(text));
-    return text == ucall_io_backend_name(backend);
+    return ucall_io_backend_from_name(bytes_view(text), &backend) == ucall_status_success_k;
 }
 
-/** A CPU class name as @c ucall_cpu_class_name spells it, left as unknown when it names none. */
+/** A CPU class name as @c ucall_cpu_class_name spells it, left untouched when it names none. */
 inline bool parse_cpu_class(std::string_view text, ucall_cpu_class_t& cpu_class) noexcept {
-    cpu_class = ucall_cpu_class_from_name(bytes_view(text));
-    return text == ucall_cpu_class_name(cpu_class);
+    return ucall_cpu_class_from_name(bytes_view(text), &cpu_class) == ucall_status_success_k;
 }
 
 /** Which named checks run: every one for an empty pattern, else those the pattern finds as an

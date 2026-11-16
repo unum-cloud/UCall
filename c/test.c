@@ -16,24 +16,35 @@
 int main(void) {
     uint8_t const text[] = {'x', 'd', 'e', 'f', 'e', 'r', 'r', 'e', 'd', 'x'};
     ucall_bytes_view_t name = {text + 1, sizeof(text) - 2};
-    assert(ucall_status_from_name(name) == ucall_status_deferred_k);
+    ucall_status_t read_status = ucall_status_success_k;
+    assert(ucall_status_from_name(name, &read_status) == ucall_status_success_k);
+    assert(read_status == ucall_status_deferred_k);
     assert(strcmp(ucall_status_name(ucall_status_deferred_k), "deferred") == 0);
     assert(strcmp(ucall_status_name((ucall_status_t)-1), "unrecognized") == 0);
     name.length = sizeof(text) - 1;
-    assert(ucall_status_from_name(name) == ucall_status_invalid_argument_k);
+    assert(ucall_status_from_name(name, &read_status) == ucall_status_invalid_argument_k);
     name.data = NULL;
     name.length = 0;
-    assert(ucall_status_from_name(name) == ucall_status_invalid_argument_k);
+    assert(ucall_status_from_name(name, &read_status) == ucall_status_invalid_argument_k);
+    assert(read_status == ucall_status_deferred_k);
 
     ucall_bytes_view_t backend = {(ucall_byte_t const*)"linux-epollaio", 14};
-    assert(ucall_io_backend_from_name(backend) == ucall_io_backend_linux_epollaio_k);
+    ucall_io_backend_t read_backend = ucall_io_backend_automatic_k;
+    assert(ucall_io_backend_from_name(backend, &read_backend) == ucall_status_success_k);
+    assert(read_backend == ucall_io_backend_linux_epollaio_k);
     backend.length = 5;
-    assert(ucall_io_backend_from_name(backend) == ucall_io_backend_automatic_k);
+    assert(ucall_io_backend_from_name(backend, &read_backend) == ucall_status_invalid_argument_k);
+    assert(read_backend == ucall_io_backend_linux_epollaio_k);
     ucall_bytes_view_t cpu_class = {(ucall_byte_t const*)"aws-g2", 6};
-    assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_aws_g2_k);
-    cpu_class.data = NULL;
-    cpu_class.length = 0;
-    assert(ucall_cpu_class_from_name(cpu_class) == ucall_cpu_class_unknown_k);
+    ucall_cpu_class_t read_cpu_class = ucall_cpu_class_unknown_k;
+    assert(ucall_cpu_class_from_name(cpu_class, &read_cpu_class) == ucall_status_success_k);
+    assert(read_cpu_class == ucall_cpu_class_aws_g2_k);
+    cpu_class.length = 5;
+    assert(ucall_cpu_class_from_name(cpu_class, &read_cpu_class) == ucall_status_invalid_argument_k);
+    assert(read_cpu_class == ucall_cpu_class_aws_g2_k);
+    cpu_class = (ucall_bytes_view_t) {(ucall_byte_t const*)"unknown", 7};
+    assert(ucall_cpu_class_from_name(cpu_class, &read_cpu_class) == ucall_status_success_k);
+    assert(read_cpu_class == ucall_cpu_class_unknown_k);
 
     int major = -1, minor = -1, patch = -1;
     ucall_version(&major, &minor, &patch);

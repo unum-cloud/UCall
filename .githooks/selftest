@@ -1617,6 +1617,23 @@ git -C "$fixture_directory" add -- include/probe.hpp
 run_precommit
 expect_rejection "changed template header with unchanged class name" "suffixes a class template"
 
+stage_fixture_with_header include/probe.hpp <<'FIXTURE'
+template <typename type_>
+struct hip_warp {
+    inline static constexpr u32_t width_k = hip_wave_lanes(type_::value);
+};
+FIXTURE
+git -C "$fixture_directory" commit --quiet -m "Chore: Seed the fixture"
+sed -e 's/typename type_/typename value_type_/' -e 's/type_::value/value_type_::value/' -e 's/width_k = /width_k = 1 + /' "$fixture_directory/include/probe.hpp" > "$fixture_directory/edited"
+mv "$fixture_directory/edited" "$fixture_directory/include/probe.hpp"
+git -C "$fixture_directory" add -- include/probe.hpp
+run_precommit
+expect_acceptance "static member edited below an unchanged class template brace"
+
+assert_rejects "new one-line suffixed variable template" "suffixes a variable template" include/probe.hpp <<'FIXTURE'
+template <typename type_> constexpr bool bounded_k = true;
+FIXTURE
+
 assert_accepts "qualified memcpy, and prose naming the bare forms" include/probe.hpp <<'FIXTURE'
 /** Copies eight bytes with @c std::memcpy, never an unqualified memcpy or a pragma mark. */
 inline void probe(char *to, char const *from) { std::memcpy(to, from, 8); }
@@ -3192,14 +3209,6 @@ assert_accepts "ForkUnion atomic reference" include/ucall/probe.hpp <<'FIXTURE'
 inline int probe(int *word) { return atomic_ref_t {*word}.load(std::memory_order_acquire); }
 FIXTURE
 
-assert_rejects "CMake string surgery" "derives a name or flag by editing a string" CMakeLists.txt <<'FIXTURE'
-string(REPLACE "a" "b" probe_name_ "${probe_source_}")
-FIXTURE
-
-assert_accepts "CMake names spelled at the call" CMakeLists.txt <<'FIXTURE'
-ucall_dense_dtype_sources(probe BF16 probe_bf16.cpp F16 probe_f16.cpp)
-FIXTURE
-
 assert_rejects "sys.version parsed" "parses \`sys.version\`" python/probe.py <<'FIXTURE'
 import sys
 
@@ -3375,6 +3384,32 @@ assert_accepts "docblock above a single-macro conditional, plain comment above a
 #pragma clang diagnostic push
 #define PROBE_FIRST_ 1
 #endif
+FIXTURE
+
+assert_rejects "library ARCH flag" "names a NumKong or StringZilla _ARCH_ flag" include/$project_directory/probe.hpp <<'FIXTURE'
+inline static constexpr bool compiled_k = NUMKONG_ARCH_CUDA_AMPERE_;
+FIXTURE
+
+assert_accepts "library public TARGET switch" include/$project_directory/probe.hpp <<'FIXTURE'
+#if NUMKONG_TARGET_HASWELL
+inline static constexpr bool compiled_k = true;
+#endif
+FIXTURE
+
+assert_rejects "library GPU generation target raised" "sets a library GPU generation target" CMakeLists.txt <<'FIXTURE'
+target_compile_definitions(probe PRIVATE NUMKONG_TARGET_CDNA3=1)
+FIXTURE
+
+assert_accepts "library GPU floor target lowered" CMakeLists.txt <<'FIXTURE'
+target_compile_definitions(probe PRIVATE NUMKONG_TARGET_ROCM=0 STRINGZILLA_TARGET_ROCM=0)
+FIXTURE
+
+assert_rejects "CMake string surgery" "derives a name or flag by editing a string" CMakeLists.txt <<'FIXTURE'
+string(REPLACE "a" "b" probe_name_ "${probe_source_}")
+FIXTURE
+
+assert_accepts "CMake names spelled at the call" CMakeLists.txt <<'FIXTURE'
+ucall_network_case(probe ON automatic)
 FIXTURE
 
 # endregion UCall Fixtures

@@ -111,7 +111,7 @@ endif ()
 if (NOT UCALL_BUILD_SHARED)
     set(ucall_library_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
-set(ucall_sources_ src/lib.cpp src/types.cpp src/secure_tunnel.cpp src/crypto_x25519_serial.cpp)
+set(ucall_sources_ src/lib.cpp src/types.cpp src/secure_tunnel.cpp)
 add_library(ucall_static STATIC ${ucall_sources_})
 add_library(ucall_shared SHARED ${ucall_library_exclusion_} ${ucall_sources_})
 add_library(ucall::static ALIAS ucall_static)
@@ -196,26 +196,41 @@ endif ()
 set_target_properties(ucall_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 
 # One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
-# kits and atomics use, oldest first, `serial` over none. A class exists when each of them is enabled. Its unit compiles
-# at the floor: StringZilla's kernels are archive symbols carrying their own targets and ForkUnion spells its
+# kits and atomics use, oldest first, `serial` over none. A class exists when each of them is compiled. Its unit
+# compiles at the floor: StringZilla's kernels are archive symbols carrying their own targets and ForkUnion spells its
 # instructions in assembly, so no shared inline function is emitted with a class's instruction set. A multiversioned
 # build keeps every class that exists. A monoversioned one keeps none of them, serial included, and compiles the
-# `monoversioned` class instead, over every capability the libraries enabled. Every gate is `UCALL_TARGET_<CLASS>`.
+# `monoversioned` class instead, over every capability the libraries enabled. Every gate is `UCALL_TARGET_<CLASS>`. A
+# kept class also keeps its X25519 kit: the last of Haswell and NEON among its capabilities, else serial.
 function (ucall_cpu_variant class_ target_macro_)
     set(kept_ FALSE)
     if (UCALL_MULTIVERSIONED OR class_ STREQUAL "monoversioned")
         set(kept_ TRUE)
     endif ()
     foreach (capability_ IN LISTS ARGN)
-        if (NOT stringzilla_target_${capability_}_enabled AND NOT forkunion_target_${capability_}_enabled)
+        if (NOT stringzilla_target_${capability_}_compiled AND NOT forkunion_target_${capability_}_compiled)
             set(kept_ FALSE)
         endif ()
     endforeach ()
+    set(ucall_class_${class_}_kept_
+        ${kept_}
+        PARENT_SCOPE
+    )
     if (kept_)
         target_compile_definitions(ucall_static PRIVATE UCALL_TARGET_${target_macro_}=1)
         target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_${target_macro_}=1)
         target_sources(ucall_static PRIVATE src/variants_${class_}.cpp)
         target_sources(ucall_shared PRIVATE src/variants_${class_}.cpp)
+        set(x25519_ serial)
+        foreach (kit_ haswell neon)
+            if (kit_ IN_LIST ARGN OR (class_ STREQUAL "monoversioned" AND stringzilla_target_${kit_}_compiled))
+                set(x25519_ ${kit_})
+            endif ()
+        endforeach ()
+        set(ucall_x25519_${x25519_}_kept_
+            TRUE
+            PARENT_SCOPE
+        )
     else ()
         target_compile_definitions(ucall_static PRIVATE UCALL_TARGET_${target_macro_}=0)
         target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_${target_macro_}=0)
@@ -248,23 +263,6 @@ ucall_cpu_variant(
 ucall_cpu_variant(alibaba_c930 ALIBABA_C930 rvv riscv64_wrs riscv64_zacas)
 ucall_cpu_variant(ibm_power10 IBM_POWER10 powervsx ppc64_pause ppc64_amo)
 
-# One unit per X25519 kit, apart from class units, keeps throughput flags off constant-time kernels.
-function (ucall_x25519_unit capability_)
-    if (NOT stringzilla_target_${capability_}_enabled)
-        return()
-    endif ()
-    target_sources(ucall_static PRIVATE src/crypto_x25519_${capability_}.cpp)
-    target_sources(ucall_shared PRIVATE src/crypto_x25519_${capability_}.cpp)
-    if (NOT stringzilla_target_${capability_}_implied)
-        set_source_files_properties(
-            src/crypto_x25519_${capability_}.cpp PROPERTIES COMPILE_OPTIONS
-                                                            "${stringzilla_target_${capability_}_flags}"
-        )
-    endif ()
-endfunction ()
-ucall_x25519_unit(haswell)
-ucall_x25519_unit(neon)
-
 if (UCALL_MARCH)
     set(ucall_floor_ "${UCALL_MARCH}")
 else ()
@@ -275,12 +273,28 @@ if (UCALL_MULTIVERSIONED)
     target_compile_definitions(ucall_shared PRIVATE UCALL_TARGET_MONOVERSIONED=0)
     message(STATUS "UCall: multiversioned above ${ucall_floor_}")
 else ()
-    get_property(ucall_capabilities_enabled_ GLOBAL PROPERTY stringzilla_capabilities_enabled)
-    get_property(forkunion_capabilities_enabled_ GLOBAL PROPERTY forkunion_capabilities_enabled)
-    list(APPEND ucall_capabilities_enabled_ ${forkunion_capabilities_enabled_})
-    message(STATUS "UCall: monoversioned for ${ucall_floor_}: ${ucall_capabilities_enabled_}")
+    get_property(stringzilla_capabilities_compiled_ GLOBAL PROPERTY stringzilla_capabilities_compiled)
+    get_property(forkunion_capabilities_compiled_ GLOBAL PROPERTY forkunion_capabilities_compiled)
+    message(
+        STATUS
+            "UCall: monoversioned for ${ucall_floor_}: ${stringzilla_capabilities_compiled_};${forkunion_capabilities_compiled_}"
+    )
     ucall_cpu_variant(monoversioned MONOVERSIONED)
 endif ()
+
+# One unit per X25519 kit a kept class runs, apart from class units, keeps throughput flags off constant-time kernels.
+foreach (kit_ serial haswell neon)
+    if (NOT ucall_x25519_${kit_}_kept_)
+        continue()
+    endif ()
+    target_sources(ucall_static PRIVATE src/crypto_x25519_${kit_}.cpp)
+    target_sources(ucall_shared PRIVATE src/crypto_x25519_${kit_}.cpp)
+    if (NOT kit_ STREQUAL "serial" AND NOT stringzilla_target_${kit_}_implied)
+        set_source_files_properties(
+            src/crypto_x25519_${kit_}.cpp PROPERTIES COMPILE_OPTIONS "${stringzilla_target_${kit_}_flags}"
+        )
+    endif ()
+endforeach ()
 
 if (UCALL_BUILD_EXAMPLES)
     foreach (example_ echo ledger redis inference)

@@ -23,7 +23,7 @@ The build exposes `ucall::static`, which the tests, tools, bindings and the Rust
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each engine where the target operating system has it, and the header refuses one forced on elsewhere.
 `UCALL_WITH_LINUX_URING`, on for Linux, also links liburing, and a library or subproject build serves whichever compiled engine the host admits first.
 CPU probes select separate instantiation units, each compiled at the floor like the dispatch code.
-Each class unit compiles when StringZilla and ForkUnion enable every capability it uses.
+Each class unit compiles when StringZilla compiles and ForkUnion enables every capability it uses.
 `UCALL_MARCH` raises the floor of UCall's own units to an ISA level, `native` or a CPU name like `graniterapids`, and hands the same value to the siblings.
 `UCALL_MULTIVERSIONED`, on by default, compiles every class that exists, `serial` included, and picks among them at run time.
 Off, it builds for one machine and compiles only the `monoversioned` class, over every capability the libraries enabled: what the floor implies and what a preset vouches for with `-D <LIBRARY>_TARGET_<CAPABILITY>=1`.
@@ -48,6 +48,33 @@ cmake --preset release
 cmake --build --preset release
 cpack --config build_release/CPackConfig.cmake
 ```
+
+### CPU Classes
+
+Each class names one bundle of StringZilla kits, SmashTable row kit, ForkUnion waiter and atomic reference, with the values USearch, UStore and UForm give the same hardware.
+
+| Value | Name            | What it adds                                                                         |
+| ----: | --------------- | ------------------------------------------------------------------------------------ |
+|     0 | `unknown`       | Picks the newest class this machine runs                                             |
+|     1 | `serial`        | Portable kits, standard atomics, yielding waits                                      |
+|     2 | `monoversioned` | Whatever the floor and the preset compiled, the one class of a monoversioned build   |
+|     3 | `intel-haswell` | AVX2 string kits and row scans, `PAUSE` waits                                        |
+|     5 | `intel-skylake` | AVX-512 string kits and row scans over `intel-haswell`                               |
+|     6 | `intel-icelake` | Ice Lake's AVX-512 extensions, SHA and its row scans over `intel-skylake`            |
+|    11 | `intel-alder`   | SHA over `intel-haswell`, without AVX-512                                            |
+|    12 | `aws-g2`        | NEON string kits with AES and SHA, NEON row scans, `YIELD` waits, LSE atomics        |
+|    15 | `aws-g5`        | `WFE` waits and RCpc atomics over `aws-g2`                                           |
+|    17 | `alibaba-c930`  | RVV string kits and row scans, `WRS` waits, Zacas atomics                            |
+|    18 | `ibm-power10`   | VSX string kits and row scans, `pause_short` waits, ISA 3.0 store atomics            |
+
+`aws-g2` keeps LSE atomics, since every Graviton2 has them and UCall's hot path is atomics.
+A compiled class must differ from its parent in a kit, waiter or atomic reference, and a `static_assert` in `make_network` refuses one that does not.
+UCall has no GPU classes.
+
+The pick reads StringZilla's and ForkUnion's detected masks, never their enabled ones, since UCall's class units compile their own kits.
+A value no class takes fails with `invalid_argument`, as a misspelled name does in `ucall_cpu_class_from_name`.
+A pinned class the machine does not run fails with `unsupported`, and otherwise its masks become the ceiling.
+Construction takes the newest compiled class on the ladder whose masks fit the ceiling, and fails with `unsupported` when none does, as a monoversioned build does on an older machine.
 
 ## Running Tests
 

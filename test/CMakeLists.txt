@@ -9,6 +9,11 @@ function (ucall_engine_sources target_ facility_)
     endif ()
 endfunction ()
 
+# The suites drive the serial kits directly, so they compile the serial X25519 unit when no kept class runs it.
+if (NOT ucall_x25519_serial_kept_)
+    set(ucall_serial_x25519_sources_ "${PROJECT_SOURCE_DIR}/src/crypto_x25519_serial.cpp")
+endif ()
+
 # The library suite: the outcome word, every engine under every admitted CPU class, and the network cells of every
 # compiled backend, admitted class and security mode, each passing its class through the C interface's ceiling.
 add_executable(
@@ -24,6 +29,7 @@ add_executable(
     network/resolving.cpp
     network/metrics.cpp
     network/loops.cpp
+    ${ucall_serial_x25519_sources_}
 )
 ucall_engine_sources(ucall_test LINUX io/linux_epollaio_engine.cpp)
 ucall_engine_sources(ucall_test LINUX_URING io/linux_uring612_engine.cpp io/linux_uring618_engine.cpp)
@@ -53,6 +59,7 @@ add_executable(
     dns/configuration.cpp
     tunnel/crypto.cpp
     tunnel/secure_tunnel.cpp
+    ${ucall_serial_x25519_sources_}
 )
 target_include_directories(
     ucall_test_header_only PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/src"
@@ -86,7 +93,7 @@ endif ()
 # libFuzzer drives each parser's oracle from `properties.hpp`, under the sanitizers the `fuzz` preset inherits.
 if (UCALL_BUILD_FUZZ)
     foreach (harness_ dns http multipart routes tunnel url)
-        add_executable(ucall_fuzz_${harness_} fuzz/${harness_}.cpp)
+        add_executable(ucall_fuzz_${harness_} fuzz/${harness_}.cpp ${ucall_serial_x25519_sources_})
         target_include_directories(
             ucall_fuzz_${harness_} PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/tools"
         )

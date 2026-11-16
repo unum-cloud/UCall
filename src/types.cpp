@@ -18,6 +18,36 @@ static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept {
     return spelling == std::string_view {reinterpret_cast<char const*>(name.data), name.length};
 }
 
+/** Writes the entry of @p values that @p name_of spells as @p name into @p value, else nothing. */
+template <typename value_type_, std::size_t count_>
+static ucall_status_t read_name(ucall_bytes_view_t name, value_type_ const (&values)[count_],
+                                char const* (*name_of)(value_type_), value_type_* value) noexcept {
+    for (value_type_ const candidate : values)
+        if (named(name_of(candidate), name)) return *value = candidate, ucall_status_success_k;
+    return ucall_status_invalid_argument_k;
+}
+
+/** Every status the C enum names. */
+constexpr ucall_status_t statuses_k[] {
+    ucall_status_success_k,           ucall_status_deferred_k,
+    ucall_status_out_of_memory_k,     ucall_status_io_k,
+    ucall_status_malformed_k,         ucall_status_internal_k,
+    ucall_status_overflow_k,          ucall_status_uninitialized_k,
+    ucall_status_contended_k,         ucall_status_unsupported_k,
+    ucall_status_invalid_argument_k,  ucall_status_not_found_k,
+    ucall_status_already_exists_k,    ucall_status_connection_failed_k,
+    ucall_status_connection_closed_k, ucall_status_timeout_k,
+    ucall_status_handshake_failed_k,  ucall_status_peer_rejected_k,
+    ucall_status_would_block_k,
+};
+
+/** Every I/O backend the C enum names, "automatic" first. */
+constexpr ucall_io_backend_t backends_k[] {
+    ucall_io_backend_automatic_k,      ucall_io_backend_posix_k,          ucall_io_backend_linux_epollaio_k,
+    ucall_io_backend_linux_uring612_k, ucall_io_backend_linux_uring618_k, ucall_io_backend_bsd_kqueue_k,
+    ucall_io_backend_windows_iocp_k,   ucall_io_backend_windows_rio_k,
+};
+
 extern "C" {
 
 char const* ucall_status_name(ucall_status_t status) {
@@ -45,23 +75,8 @@ char const* ucall_status_name(ucall_status_t status) {
     }
 }
 
-ucall_status_t ucall_status_from_name(ucall_bytes_view_t name) {
-    if (!name.data || !name.length) return ucall_status_invalid_argument_k;
-    std::string_view const text {reinterpret_cast<char const*>(name.data), name.length};
-    ucall_status_t const statuses[] = {ucall_status_success_k,           ucall_status_deferred_k,
-                                       ucall_status_out_of_memory_k,     ucall_status_io_k,
-                                       ucall_status_malformed_k,         ucall_status_internal_k,
-                                       ucall_status_overflow_k,          ucall_status_uninitialized_k,
-                                       ucall_status_contended_k,         ucall_status_unsupported_k,
-                                       ucall_status_invalid_argument_k,  ucall_status_not_found_k,
-                                       ucall_status_already_exists_k,    ucall_status_connection_failed_k,
-                                       ucall_status_connection_closed_k, ucall_status_timeout_k,
-                                       ucall_status_handshake_failed_k,  ucall_status_peer_rejected_k,
-                                       ucall_status_would_block_k};
-    for (ucall_status_t status : statuses) {
-        if (std::string_view {ucall_status_name(status)} == text) return status;
-    }
-    return ucall_status_invalid_argument_k;
+ucall_status_t ucall_status_from_name(ucall_bytes_view_t name, ucall_status_t* status) {
+    return read_name(name, statuses_k, ucall_status_name, status);
 }
 
 char const* ucall_io_backend_name(ucall_io_backend_t backend) {
@@ -75,7 +90,7 @@ char const* ucall_io_backend_name(ucall_io_backend_t backend) {
     case ucall_io_backend_windows_iocp_k: return "windows-iocp";
     case ucall_io_backend_windows_rio_k: return "windows-rio";
     }
-    return "unknown";
+    return "unrecognized";
 }
 
 char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
@@ -92,20 +107,17 @@ char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
     case ucall_cpu_class_alibaba_c930_k: return "alibaba-c930";
     case ucall_cpu_class_ibm_power10_k: return "ibm-power10";
     }
-    return "unknown";
+    return "unrecognized";
 }
 
-ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name) {
-    for (auto backend = ucall_io_backend_posix_k; backend <= ucall_io_backend_windows_rio_k;
-         backend = static_cast<ucall_io_backend_t>(backend + 1))
-        if (named(ucall_io_backend_name(backend), name)) return backend;
-    return ucall_io_backend_automatic_k;
+ucall_status_t ucall_io_backend_from_name(ucall_bytes_view_t name, ucall_io_backend_t* backend) {
+    return read_name(name, backends_k, ucall_io_backend_name, backend);
 }
 
-ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name) {
-    for (ucall_cpu_class_t const cpu_class : cpu_classes_k)
-        if (named(ucall_cpu_class_name(cpu_class), name)) return cpu_class;
-    return ucall_cpu_class_unknown_k;
+ucall_status_t ucall_cpu_class_from_name(ucall_bytes_view_t name, ucall_cpu_class_t* cpu_class) {
+    if (named(ucall_cpu_class_name(ucall_cpu_class_unknown_k), name))
+        return *cpu_class = ucall_cpu_class_unknown_k, ucall_status_success_k;
+    return read_name(name, cpu_classes_k, ucall_cpu_class_name, cpu_class);
 }
 
 void ucall_version(int* major, int* minor, int* patch) {

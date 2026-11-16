@@ -2222,13 +2222,13 @@ check_type_suffixes() {
         }' "$staged_code_path" || true)
     [ -z "$templates" ] || reject_with_reason "$templates" \
         "$staged_path suffixes a class template with '_t' - the template stays bare and the alias that materializes it carries the suffix:"
-    variables=$(printf '%s\n' "$staged_added_text" | "$fastest_awk" '
+    variables=$(scan_staged_file_marking_added_lines '
         function suffixed(line) { return line ~ /constexpr[[:space:]][^=(]*[[:space:]][A-Za-z0-9_]*_[kt][[:space:]]*=/ }
-        /^\+[[:space:]]*template[[:space:]]*</ { if (suffixed($0)) print; else pending = 1; next }
-        pending && suffixed($0) { print; pending = 0; next }
+        /^[[:space:]]*template[[:space:]]*</ { opened = FNR in added; if (suffixed($0)) { if (opened) printf "line %d: %s\n", FNR, $0 } else pending = 1; next }
+        pending && suffixed($0) { if (opened || FNR in added) printf "line %d: %s\n", FNR, $0; pending = 0; next }
         pending && /\{[[:space:]]*$/ { pending = 0; next }
-        pending && /^\+[[:space:]]*(typename|class |std::|requires|[A-Za-z_]+ [A-Za-z_]+_|>)/ { next }
-        { pending = 0 }')
+        pending && /^[[:space:]]*(typename|class |std::|requires|[A-Za-z_]+ [A-Za-z_]+_|>)/ { next }
+        { pending = 0 }' "$staged_code_path")
     [ -z "$variables" ] || reject_with_reason "$variables" \
         "$staged_path suffixes a variable template with '_k' or '_t' - the template stays bare, like \`template <typename type_> constexpr bool bounded\`:"
 }
@@ -3714,21 +3714,6 @@ check_gcc_atomics() {
         "            naming the memory order at every access:"
 }
 
-# CMake spells every target, source and flag it means at the call that means it. Deriving one by
-# replacing, slicing or matching out part of another string, or by editing a list in place, hides
-# what the build compiles: pass each name as an argument instead, under a keyword where several
-# kinds travel together. Building a list with `list(APPEND)` and testing a value with
-# `if (... MATCHES ...)` stay free.
-check_cmake_string_surgery() {
-    local surgery
-    surgery=$(printf '%s\n' "$staged_added_text" | grep -vE '^[[:space:]]*#' |
-        grep -iE '(^|[^A-Za-z0-9_])(string[[:space:]]*\([[:space:]]*(REPLACE|REGEX|SUBSTRING|STRIP|TOLOWER|TOUPPER)[[:space:]]|list[[:space:]]*\([[:space:]]*(TRANSFORM|FILTER|REMOVE_ITEM|REMOVE_AT|REMOVE_DUPLICATES|SUBLIST|POP_BACK|POP_FRONT|INSERT|JOIN|SORT|REVERSE)[[:space:]]|(get_filename_component|cmake_path)[[:space:]]*\()' ||
-        true)
-    [ -z "$surgery" ] || reject_with_reason "$surgery" \
-        "$staged_path derives a name or flag by editing a string or a list - spell each one out at its call and pass it as" \
-        "            an argument, as \`ucall_dense_dtype_sources(target BF16 a_bf16.cpp F16 a_f16.cpp)\` does:"
-}
-
 # `sys.version` is a display string whose shape is not contractual; every question about the running
 # interpreter has a structured answer.
 check_python_version_probe() {
@@ -3868,6 +3853,43 @@ check_test_bodies_quiet() {
         "            to the harness:"
 }
 
+# CMake spells every target, source and flag it means at the call that means it. Deriving one by
+# replacing, slicing or matching out part of another string, or by editing a list in place, hides
+# what the build compiles: pass each name as an argument instead, under a keyword where several
+# kinds travel together. Building a list with `list(APPEND)` and testing a value with
+# `if (... MATCHES ...)` stay free.
+check_cmake_string_surgery() {
+    local surgery
+    surgery=$(printf '%s\n' "$staged_added_text" | grep -vE '^\+[[:space:]]*#' |
+        grep -iE '(^|[^A-Za-z0-9_])(string[[:space:]]*\([[:space:]]*(REPLACE|REGEX|SUBSTRING|STRIP|TOLOWER|TOUPPER)[[:space:]]|list[[:space:]]*\([[:space:]]*(TRANSFORM|FILTER|REMOVE_ITEM|REMOVE_AT|REMOVE_DUPLICATES|SUBLIST|POP_BACK|POP_FRONT|INSERT|JOIN|SORT|REVERSE)[[:space:]]|(get_filename_component|cmake_path)[[:space:]]*\()' ||
+        true)
+    [ -z "$surgery" ] || reject_with_reason "$surgery" \
+        "$staged_path derives a name or flag by editing a string or a list; spell each one out at its call and pass it as" \
+        "            an argument, under a keyword where several kinds travel together:"
+}
+
+# Rejects a NumKong or StringZilla `_ARCH_` flag, which says what compiles inside that library's own build; the
+# product reads the libraries' public `_TARGET_` switches and names its GPU class through
+# `${macro_prefix}_TARGET_<VENDOR>_<CLASS>`.
+check_library_arch_flags_unnamed() {
+    local named
+    named=$(printf '%s\n' "$staged_added_text" | grep -E "^\+.*(NUMKONG|STRINGZILLA)_ARCH_[A-Z0-9_]+" || true)
+    [ -z "$named" ] || reject_with_reason "$named" \
+        "$staged_path names a NumKong or StringZilla _ARCH_ flag, which only that library's own build may read;" \
+        "            test its public _TARGET_ switch, or ${macro_prefix}_TARGET_<VENDOR>_<CLASS> for a GPU class:"
+}
+
+# Rejects a CMake line raising a NumKong or StringZilla GPU generation target, because a class unit lowers the
+# library's floor target and names its own class through its product's `_TARGET_<VENDOR>_<CLASS>` switch instead.
+check_library_gpu_targets_unset() {
+    local raised
+    raised=$(printf '%s\n' "$staged_added_text" | grep -vE '^\+?[[:space:]]*#' |
+        grep -E '(NUMKONG|STRINGZILLA)_TARGET_(AMPERE|ADA|HOPPER|BLACKWELL[A-Z]*|CDNA[0-9])=1' || true)
+    [ -z "$raised" ] || reject_with_reason "$raised" \
+        "$staged_path sets a library GPU generation target; class units write the floor target to 0 and name" \
+        "            their class with ${macro_prefix}_TARGET_<VENDOR>_<CLASS>:"
+}
+
 # Routes one staged file through the checks only UCall has.
 run_project_checks() {
     case "$staged_path" in
@@ -3879,6 +3901,9 @@ run_project_checks() {
     case "$staged_path" in
     test/harness.hpp | test/main.cpp | test/header_only.cpp) ;;
     test/*.cpp | test/*.hpp) check_test_bodies_quiet ;;
+    esac
+    case "$staged_path" in
+    *.c | *.h | *.hpp | *.cpp | *.cc | *.cu | *.cuh | *.hip | *.metal) check_library_arch_flags_unnamed ;;
     esac
     case "$staged_path" in
     *.c | *.h | *.hpp | *.cpp | *.cc | *.cxx)
@@ -3932,7 +3957,10 @@ run_project_checks() {
         check_python_array_annotations
         check_substring_assertions
         ;;
-    CMakeLists.txt | */CMakeLists.txt | *.cmake) check_cmake_string_surgery ;;
+    CMakeLists.txt | */CMakeLists.txt | *.cmake)
+        check_cmake_string_surgery
+        check_library_gpu_targets_unset
+        ;;
     *.rs)
         check_ids_capitalized
         check_rust_modules

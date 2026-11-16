@@ -170,8 +170,8 @@ typedef struct ucall_server_init_t {
  *
  *  @par Statuses:
  *  - @c ucall_status_invalid_argument_k An output, the configuration or its interfaces are missing,
- *    or a metrics setting, an address, a device name, a security mode with the key or authorizer it
- *    needs, a connection budget or the reply directories are unusable.
+ *    or the CPU class, a metrics setting, an address, a device name, a security mode with the key
+ *    or authorizer it needs, a connection budget or the reply directories are unusable.
  *  - @c ucall_status_unsupported_k This machine does not run the requested CPU class, no I/O
  *    backend serves the configuration on it, a device is named outside Linux, or an interface asks
  *    Windows for several loops.

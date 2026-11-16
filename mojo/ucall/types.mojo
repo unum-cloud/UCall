@@ -368,7 +368,7 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     var code: c_int
     """The raw `ucall_cpu_class_t` value the ABI exchanges."""
     comptime UNKNOWN = Self(0)
-    """No class requested: initialization picks the best class this machine runs."""
+    """Picks the newest class this machine runs."""
     comptime SERIAL = Self(1)
     """Portable kernels with no SIMD, which every machine runs."""
     comptime MONOVERSIONED = Self(2)
@@ -668,8 +668,8 @@ comptime OutcomeStatus = def(Pointer[Outcome, MutAnyOrigin]) thin abi("C") -> c_
 comptime NameOf = def(c_int) thin abi("C") -> Optional[CString]
 """The `_name` family: an enumerator's static spelling."""
 
-comptime FromName = def(BytesView[ImmUntrackedOrigin]) thin abi("C") -> c_int
-"""The `_from_name` family: reads a spelling back into its enumerator."""
+comptime FromName = def(BytesView[ImmUntrackedOrigin], Pointer[c_int, MutAnyOrigin]) thin abi("C") -> c_int
+"""The `_from_name` family: reads a spelling back into its enumerator, or fails with `INVALID_ARGUMENT`."""
 
 comptime DecodePercent = def(
     BytesView[ImmUntrackedOrigin], Pointer[Byte, MutAnyOrigin], Pointer[c_size_t, MutAnyOrigin], c_int

@@ -156,13 +156,11 @@ PyObject* ucall_py_get_optional(PyObject* self, void* closure) {
 
 #pragma region Enums and Errors
 
-/** The C spelling of @p value, or NULL for a gap between named values, which spells "unrecognized"
- *  or, past the first value, "unknown". */
+/** The C spelling of @p value, or NULL for a gap between named values, spelled "unrecognized". */
 static char const* enum_spelling(ucall_py_enum_mirror_t const* mirror, long value) {
     if (value < mirror->first || value > mirror->last) return NULL;
     char const* const spelled = mirror->spell((int)value);
-    int const gap = strcmp(spelled, "unrecognized") == 0 || (value != mirror->first && strcmp(spelled, "unknown") == 0);
-    return gap ? NULL : spelled;
+    return strcmp(spelled, "unrecognized") == 0 ? NULL : spelled;
 }
 
 /** Writes the member name of @p spelled to @p member, "out-of-memory" becoming "OUT_OF_MEMORY". */
@@ -332,11 +330,9 @@ static PyObject* api_status_from_name([[maybe_unused]] PyObject* type, PyObject*
     Py_ssize_t length = 0;
     char const* const spelled = PyUnicode_AsUTF8AndSize(name, &length);
     if (!spelled) return NULL;
-    ucall_status_t const status = ucall_status_from_name(
-        (ucall_bytes_view_t) {(ucall_byte_t const*)spelled, (size_t)length});
-    // An unrecognized name reads as invalid-argument, so only its own spelling may answer it.
-    char const* const canonical = ucall_status_name(status);
-    if (strlen(canonical) != (size_t)length || memcmp(canonical, spelled, (size_t)length) != 0)
+    ucall_status_t status = ucall_status_success_k;
+    if (ucall_status_from_name((ucall_bytes_view_t) {(ucall_byte_t const*)spelled, (size_t)length}, &status) !=
+        ucall_status_success_k)
         return PyErr_Format(PyExc_ValueError, "no ucall.Status is spelled %R", name);
     return ucall_py_enum_to_object(&ucall_py_status_enum, (long)status);
 }

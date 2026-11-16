@@ -62,7 +62,7 @@ namespace unum::ucall::utilities {
 /** What one server or client may use: the StringZilla kernels its kits run and the ForkUnion
  *  atomics it synchronizes with, picked once at init. */
 struct cpu_ceiling_t {
-    sz_capability_t compute = sz_cap_serial_k;
+    sz_capability_t strings = sz_cap_serial_k;
     fu::capabilities_t sync = fu::capabilities_unknown_k;
 };
 

@@ -216,7 +216,7 @@ typedef enum ucall_io_backend_t {
 /** A CPU kernel bundle, named with the same native classes as the sibling libraries. */
 typedef enum ucall_cpu_class_t {
 
-    /** No class requested: initialization picks the best class this machine runs. */
+    /** Picks the newest class this machine runs. */
     ucall_cpu_class_unknown_k = 0,
 
     // Portable
@@ -260,30 +260,11 @@ typedef enum ucall_cpu_class_t {
     ucall_cpu_class_ibm_power10_k = 18
 } ucall_cpu_class_t;
 
-/** Returns the stable name of an I/O backend. */
+/** Returns the stable name of an I/O backend, or "unrecognized" for a value no backend takes. */
 UCALL_EXPORT char const* ucall_io_backend_name(ucall_io_backend_t backend);
 
-/** Returns the stable name of a CPU kernel class. */
+/** Returns the stable name of a CPU kernel class, or "unrecognized" for a value no class takes. */
 UCALL_EXPORT char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class);
-
-/**
- *  @brief Reads an I/O backend back from its stable name.
- *  @param[in] name The counted spelling @c ucall_io_backend_name() returns.
- *  @return The named backend, or @c ucall_io_backend_automatic_k for an unrecognized name, which
- *      callers tell from "automatic" by naming the result back.
- *
- *  @note @b Thread-safe.
- */
-UCALL_EXPORT ucall_io_backend_t ucall_io_backend_from_name(ucall_bytes_view_t name);
-
-/**
- *  @brief Reads a CPU kernel class back from its stable name.
- *  @param[in] name The counted spelling @c ucall_cpu_class_name() returns.
- *  @return The named class, or @c ucall_cpu_class_unknown_k for an unrecognized name.
- *
- *  @note @b Thread-safe.
- */
-UCALL_EXPORT ucall_cpu_class_t ucall_cpu_class_from_name(ucall_bytes_view_t name);
 
 /**
  *  @brief Opaque server handle.
@@ -761,14 +742,38 @@ UCALL_EXPORT char const* ucall_status_name(ucall_status_t status);
 /**
  *  @brief Reads a status back from its canonical spelling.
  *  @param[in] name The counted spelling @c ucall_status_name() returns.
- *  @return The named status.
+ *  @param[out] status The named status, untouched on failure.
  *
  *  @note @b Thread-safe.
  *
  *  @par Statuses:
  *  - @c ucall_status_invalid_argument_k An unrecognized name.
  */
-UCALL_EXPORT ucall_status_t ucall_status_from_name(ucall_bytes_view_t name);
+UCALL_EXPORT ucall_status_t ucall_status_from_name(ucall_bytes_view_t name, ucall_status_t* status);
+
+/**
+ *  @brief Reads an I/O backend back from its stable name, "automatic" included.
+ *  @param[in] name The counted spelling @c ucall_io_backend_name() returns.
+ *  @param[out] backend The named backend, untouched on failure.
+ *
+ *  @note @b Thread-safe.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k An unrecognized name.
+ */
+UCALL_EXPORT ucall_status_t ucall_io_backend_from_name(ucall_bytes_view_t name, ucall_io_backend_t* backend);
+
+/**
+ *  @brief Reads a CPU kernel class back from its stable name, "unknown" included.
+ *  @param[in] name The counted spelling @c ucall_cpu_class_name() returns.
+ *  @param[out] cpu_class The named class, untouched on failure.
+ *
+ *  @note @b Thread-safe.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_invalid_argument_k An unrecognized name.
+ */
+UCALL_EXPORT ucall_status_t ucall_cpu_class_from_name(ucall_bytes_view_t name, ucall_cpu_class_t* cpu_class);
 
 /** Which part of a URL @c ucall_decode_percent() reads, as only a query spells a space '+'. */
 typedef enum ucall_percent_mode_t {

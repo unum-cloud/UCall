@@ -118,6 +118,23 @@ cmake --install build_release --prefix ~/.local
 
 `pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](https://github.com/unum-cloud/UCall/blob/main/CONTRIBUTING.md) lists the presets, tests and cross builds.
 
+## Multiversioned and Monoversioned Builds
+
+UCall compiles in one of two shapes, picked by `UCALL_MULTIVERSIONED`.
+
+- __Multiversioned builds are for distribution.__
+  One binary runs well across diverse machines, because each CPU picks its own class at runtime.
+  This is the default, and the shape of the Python wheels and the Rust crate.
+- __Monoversioned builds are for throughput.__
+  For common hardware and data-center deployments, the binary carries only the best code for one machine.
+  These are the leanest binaries: they start fast and take little memory and disk.
+  Outside that machine they refuse cleanly with `ucall_status_unsupported_k`, never crashing and never falling back to slower code in silence.
+- __The switches.__
+  `UCALL_MULTIVERSIONED=OFF` picks the second shape and `UCALL_MARCH` names its CPU floor.
+  The `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper`, `vera_rubin` and `venice_mi450` presets spell whole machines.
+
+A monoversioned build compiles the single `monoversioned` CPU class in place of the ladder of named ones.
+
 ## C Quickstart
 
 One callback reads a request's body and replies with it, and `main` initializes the server, registers the route, and polls its one loop on the calling thread.

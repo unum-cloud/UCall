@@ -127,10 +127,19 @@ struct ucall_noise_key_derive_t {
 extern "C" {
     fn ucall_io_backend_name(backend: ucall_io_backend_t) -> *const c_char;
     fn ucall_cpu_class_name(cpu_class: ucall_cpu_class_t) -> *const c_char;
-    fn ucall_io_backend_from_name(name: ucall_bytes_view_t) -> ucall_io_backend_t;
-    fn ucall_cpu_class_from_name(name: ucall_bytes_view_t) -> ucall_cpu_class_t;
+    fn ucall_io_backend_from_name(
+        name: ucall_bytes_view_t,
+        backend: *mut ucall_io_backend_t,
+    ) -> ucall_status_t;
+    fn ucall_cpu_class_from_name(
+        name: ucall_bytes_view_t,
+        cpu_class: *mut ucall_cpu_class_t,
+    ) -> ucall_status_t;
     fn ucall_status_name(status: ucall_status_t) -> *const c_char;
-    fn ucall_status_from_name(name: ucall_bytes_view_t) -> ucall_status_t;
+    fn ucall_status_from_name(
+        name: ucall_bytes_view_t,
+        status: *mut ucall_status_t,
+    ) -> ucall_status_t;
     fn ucall_version_name() -> *const c_char;
     fn ucall_decode_percent(
         encoded: ucall_bytes_view_t,
@@ -222,10 +231,11 @@ impl Status {
     /// Reads a status back from its stable spelling, like "out-of-memory", or `None` for a name
     /// no failure has, "success" among them.
     pub fn from_name(name: &str) -> Option<Self> {
-        let raw = unsafe { ucall_status_from_name(view(name.as_bytes())) };
-        Status::from_raw(raw)
-            .err()
-            .filter(|status| status.to_string() == name)
+        let mut raw: ucall_status_t = 0;
+        match unsafe { ucall_status_from_name(view(name.as_bytes()), &mut raw) } {
+            0 => Status::from_raw(raw).err(),
+            _ => None,
+        }
     }
 }
 
@@ -733,11 +743,10 @@ impl FromStr for Backend {
 
     /// Reads a stable name back, failing with [`Status::InvalidArgument`] on one no backend has.
     fn from_str(name: &str) -> Result<Self> {
-        let backend =
-            Backend::from_raw(unsafe { ucall_io_backend_from_name(view(name.as_bytes())) });
-        match backend != Backend::Automatic || name == Backend::Automatic.to_string() {
-            true => Ok(backend),
-            false => Err(fail(
+        let mut raw: ucall_io_backend_t = 0;
+        match unsafe { ucall_io_backend_from_name(view(name.as_bytes()), &mut raw) } {
+            0 => Ok(Backend::from_raw(raw)),
+            _ => Err(fail(
                 Status::InvalidArgument,
                 "no I/O backend has that name",
             )),
@@ -811,7 +820,10 @@ impl FromStr for CPUClass {
 
     /// Reads a stable name back, failing with [`Status::InvalidArgument`] on one no class has.
     fn from_str(name: &str) -> Result<Self> {
-        CPUClass::from_raw(unsafe { ucall_cpu_class_from_name(view(name.as_bytes())) })
+        let mut raw: ucall_cpu_class_t = 0;
+        let read = unsafe { ucall_cpu_class_from_name(view(name.as_bytes()), &mut raw) };
+        CPUClass::from_raw(raw)
+            .filter(|_| read == 0)
             .ok_or_else(|| fail(Status::InvalidArgument, "no CPU class has that name"))
     }
 }

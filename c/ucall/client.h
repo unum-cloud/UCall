@@ -97,8 +97,8 @@ typedef struct ucall_client_init_t {
  *  @note One owner at a time may submit, poll, or free the client, on any thread.
  *
  *  @par Statuses:
- *  - @c ucall_status_invalid_argument_k An output or the configuration is missing, the connection
- *    budget is zero, or the default call budget overflows.
+ *  - @c ucall_status_invalid_argument_k An output or the configuration is missing, the CPU class is
+ *    a value no class takes, the connection budget is zero, or the default call budget overflows.
  *  - @c ucall_status_unsupported_k This machine does not run the requested CPU class, or no I/O
  *    backend serves the configuration on it.
  *  - @c ucall_status_overflow_k The connection, pipelining and call budgets overflow a counter.

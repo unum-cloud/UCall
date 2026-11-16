@@ -399,26 +399,50 @@ struct Library(ImplicitlyCopyable):
         Calls `ucall_status_name`."""
         return text_at(self.symbols().status_name(c_int(status.code)))
 
-    def status_from_name(self, name: StringSlice) -> Status:
-        """Reads a spelling back; `INVALID_ARGUMENT` when unrecognized. Calls `ucall_status_from_name`."""
-        return Status.of(self.symbols().status_from_name(BytesView.of(name).arguments()))
+    def status_from_name(self, name: StringSlice) raises Error -> Status:
+        """Reads a spelling back. Calls `ucall_status_from_name`.
+
+        Raises:
+            `Error` with `INVALID_ARGUMENT` on a spelling no status has.
+        """
+        var read = stack_allocation[1, c_int]().unsafe_origin_cast[MutAnyOrigin]()
+        var status = self.symbols().status_from_name(BytesView.of(name).arguments(), read)
+        if status != c_int(0):
+            raise Error(Status.of(status), "ucall_status_from_name")
+        return Status.of(read[unsafe_offset=0])
 
     def io_backend_name(self, backend: Backend) -> String:
         """The library's spelling of an I/O backend, as `LINUX_URING618` spells "linux-uring618".
         Calls `ucall_io_backend_name`."""
         return text_at(self.symbols().io_backend_name(backend.code))
 
-    def io_backend_from_name(self, name: StringSlice) -> Backend:
-        """Reads a spelling back; `AUTOMATIC` when unrecognized. Calls `ucall_io_backend_from_name`."""
-        return Backend(self.symbols().io_backend_from_name(BytesView.of(name).arguments()))
+    def io_backend_from_name(self, name: StringSlice) raises Error -> Backend:
+        """Reads a spelling back. Calls `ucall_io_backend_from_name`.
+
+        Raises:
+            `Error` with `INVALID_ARGUMENT` on a spelling no backend has.
+        """
+        var read = stack_allocation[1, c_int]().unsafe_origin_cast[MutAnyOrigin]()
+        var status = self.symbols().io_backend_from_name(BytesView.of(name).arguments(), read)
+        if status != c_int(0):
+            raise Error(Status.of(status), "ucall_io_backend_from_name")
+        return Backend(read[unsafe_offset=0])
 
     def cpu_class_name(self, cpu_class: CPUClass) -> String:
         """The library's spelling of a CPU class, as `AWS_G5` spells "aws-g5". Calls `ucall_cpu_class_name`."""
         return text_at(self.symbols().cpu_class_name(cpu_class.code))
 
-    def cpu_class_from_name(self, name: StringSlice) -> CPUClass:
-        """Reads a spelling back; `UNKNOWN` when unrecognized. Calls `ucall_cpu_class_from_name`."""
-        return CPUClass(self.symbols().cpu_class_from_name(BytesView.of(name).arguments()))
+    def cpu_class_from_name(self, name: StringSlice) raises Error -> CPUClass:
+        """Reads a spelling back. Calls `ucall_cpu_class_from_name`.
+
+        Raises:
+            `Error` with `INVALID_ARGUMENT` on a spelling no CPU class has.
+        """
+        var read = stack_allocation[1, c_int]().unsafe_origin_cast[MutAnyOrigin]()
+        var status = self.symbols().cpu_class_from_name(BytesView.of(name).arguments(), read)
+        if status != c_int(0):
+            raise Error(Status.of(status), "ucall_cpu_class_from_name")
+        return CPUClass(read[unsafe_offset=0])
 
     def decode_percent(self, encoded: Span[Byte, _], mode: PercentMode) raises Error -> List[Byte]:
         """Decodes the `%XX` escapes of `encoded`, like a query value, and '+' as a space in `QUERY`
