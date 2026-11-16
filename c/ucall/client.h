@@ -53,10 +53,11 @@ typedef struct ucall_client_options_t {
     /** Requested I/O backend; automatic chooses an available native backend. */
     ucall_io_backend_t backend;
 
-    /** Ceiling on the CPU class: the newest compiled class under it runs, and unknown takes the
-     *  initialization thread's capabilities. Callers must stay on compatible CPUs after first use.
-     *  Serial is the conservative choice. */
-    ucall_cpu_class_t cpu_class;
+    /** Ceiling on the CPU class, intersected with the initialization thread's capabilities: the
+     *  newest compiled class fitting both runs, and unknown sets no ceiling. A class this machine
+     *  lacks still caps it, so serial is the conservative choice. Resolved options report the class
+     *  picked, and callers must stay on CPUs running it after first use. */
+    ucall_cpu_class_t cpu_class_ceiling;
 
     /** Largest response a call buffers, head and body, past which it fails with
      *  @c ucall_status_overflow_k, as @c max_request_bytes bounds a server's requests. Zero takes
@@ -64,10 +65,11 @@ typedef struct ucall_client_options_t {
     size_t max_response_bytes;
 
     /** A server whose event loop drives this client, or NULL for a client with its own engine. A
-     *  bound client shares that loop's engine, backend and CPU class, so a @c backend or
-     *  @c cpu_class naming another is an invalid argument; it is made before the loop's first poll,
-     *  and is used only on its polling thread, whose take_call advances it; its take_completed only
-     *  pops finished calls. @c ucall_server_free() returns without freeing while one lives. */
+     *  bound client shares that loop's engine, backend and CPU class, so a @c backend naming
+     *  another or a @c cpu_class_ceiling picking another is an invalid argument; it is made before
+     *  the loop's first poll, and is used only on its polling thread, whose take_call advances it;
+     *  its take_completed only pops finished calls. @c ucall_server_free() returns without freeing
+     *  while one lives. */
     ucall_server_t server;
 
     /** Which of @c server's event loops; ignored without @c server. */
@@ -97,10 +99,12 @@ typedef struct ucall_client_init_t {
  *  @note One owner at a time may submit, poll, or free the client, on any thread.
  *
  *  @par Statuses:
- *  - @c ucall_status_invalid_argument_k An output or the configuration is missing, the CPU class is
- *    a value no class takes, the connection budget is zero, or the default call budget overflows.
- *  - @c ucall_status_unsupported_k This machine does not run the requested CPU class, or no I/O
- *    backend serves the configuration on it.
+ *  - @c ucall_status_invalid_argument_k An output or the configuration is missing, the CPU class
+ *    ceiling is a value no class takes, the connection budget is zero, or the default call budget
+ *    overflows.
+ *  - @c ucall_status_unsupported_k No compiled CPU class fits under the ceiling on this machine,
+ *    as when a monoversioned build targets a newer CPU, or no I/O backend serves the
+ *    configuration on it.
  *  - @c ucall_status_overflow_k The connection, pipelining and call budgets overflow a counter.
  */
 UCALL_EXPORT void ucall_client_init(ucall_client_init_t* arguments);

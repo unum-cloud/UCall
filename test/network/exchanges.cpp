@@ -136,7 +136,7 @@ static std::size_t test_echo_completions(sweep_cell_t const& cell) {
 
 /** A KK interface refuses an initiator whose static key is not the one it names. */
 static std::size_t test_server_kk_wrong_initiator(sweep_cell_t const& cell) {
-    fixture_t fixture {{cell.backend, cell.cpu_class, ucall_security_noise_kk_k}, {}};
+    fixture_t fixture {{cell.backend, cell.cpu_class_ceiling, ucall_security_noise_kk_k}, {}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     std::size_t failures = 0;
     ucall_noise_key_t stranger {}, stranger_public {};
@@ -606,7 +606,7 @@ static std::size_t test_borrowed_listener_backend(sweep_cell_t const& cell) {
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     ucall_server_t server {};
     ucall_server_options_t resolved {};
     ucall_outcome_t outcome {};
@@ -1047,7 +1047,7 @@ static std::size_t test_request_peer_ipv6(sweep_cell_t const& cell) {
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     ucall_outcome_t outcome {};
     ucall_server_init_t init {&captured.server, &outcome, &config, &resolved};
     ucall_server_init(&init);
@@ -1138,7 +1138,7 @@ static std::size_t test_interface_listen_descriptor(sweep_cell_t const& cell, ra
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
         config.backend = cell.backend;
-        config.cpu_class = cell.cpu_class;
+        config.cpu_class_ceiling = cell.cpu_class_ceiling;
         ucall_outcome_t outcome {};
         ucall_server_init_t init {&served.server, &outcome, &config, &served.resolved};
         ucall_server_init(&init);
@@ -1533,7 +1533,7 @@ static std::size_t test_configuration_byte_views(sweep_cell_t const& cell) {
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
         config.backend = cell.backend;
-        config.cpu_class = cell.cpu_class;
+        config.cpu_class_ceiling = cell.cpu_class_ceiling;
         ucall_server_t server {};
         ucall_outcome_t outcome {};
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
@@ -1677,7 +1677,7 @@ static ucall_completed_call_t client_wait(fixture_t& fixture) {
 /** Over Noise XX, a mebibyte the library client sends arrives through pulls byte for byte, and a
  *  multipart body splits into its parts. */
 static std::size_t test_streamed_body_noise(sweep_cell_t const& cell) {
-    fixture_t fixture {{cell.backend, cell.cpu_class, ucall_security_noise_xx_k}, {}};
+    fixture_t fixture {{cell.backend, cell.cpu_class_ceiling, ucall_security_noise_xx_k}, {}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     fixture.serve_in_background();
     std::size_t failures = 0;

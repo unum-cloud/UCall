@@ -80,7 +80,8 @@ jobs:
           submodules: recursive
       - name: Build
         run: |
-          cmake --preset ${{ matrix.preset }} -DUCALL_INSTALL=ON -DUCALL_BUILD_TEST=OFF -DUCALL_BUILD_SHARED=ON
+          cmake --preset ${{ matrix.preset }} -DUCALL_INSTALL=ON -DUCALL_BUILD_TEST=OFF -DUCALL_BUILD_SHARED=ON \
+            -DUCALL_BUILD_TOOLS=ON
           cmake --build --preset ${{ matrix.preset }} --config Release
       - name: Archive the Headers, Libraries and CMake Package
         run: |

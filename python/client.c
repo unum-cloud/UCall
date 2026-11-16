@@ -282,8 +282,8 @@ static char const doc_Client[] =                                                
     "Client(*, connections, pipelined_calls=0, calls=0, connect_timeout_microseconds=0,\n"              //
     "    call_timeout_microseconds=0,\n"                                                                //
     "    noise_private_key=None, peer_authorizer=None, backend=Backend.AUTOMATIC,\n"                    //
-    "    cpu_class=CPUClass.UNKNOWN, log=None, log_level=LogLevel.DEBUG, log_format=LogFormat.HUMAN,\n" //
-    "    max_response_bytes=0, server=None, event_loop=0)\n"                                            //
+    "    cpu_class_ceiling=CPUClass.UNKNOWN, log=None, log_level=LogLevel.DEBUG,\n"                     //
+    "    log_format=LogFormat.HUMAN, max_response_bytes=0, server=None, event_loop=0)\n"                //
     "\n"                                                                                                //
     "An HTTP client that belongs to the thread creating it, which alone may submit and poll.\n"         //
     "\n"                                                                                                //
@@ -300,7 +300,8 @@ static char const doc_Client[] =                                                
     "  peer_authorizer (Callable[[bytes], bool], optional): Admits a Noise server by its 32-byte\n"     //
     "    static key, required to call under `Security.NOISE_XX`.\n"                                     //
     "  backend (Backend, optional): The I/O implementation. Defaults to `Backend.AUTOMATIC`.\n"         //
-    "  cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.UNKNOWN`.\n"              //
+    "  cpu_class_ceiling (CPUClass, optional): The newest CPU kernels to use; the newest compiled\n"    //
+    "    class fitting both it and this machine runs. Defaults to `CPUClass.UNKNOWN`, no ceiling.\n"    //
     "  log (Callable[[LogLevel, str], object], optional): Receives every line the client writes,\n"     //
     "    such as a dial that failed every address; None writes nothing.\n"                              //
     "  log_level (LogLevel, optional): The least severe line `log` receives. Defaults to DEBUG.\n"      //
@@ -323,8 +324,9 @@ static char const doc_Client[] =                                                
 
 static PyObject* Client_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
     PyObject *connections = NULL, *pipelined_calls = NULL, *calls = NULL, *connect_timeout = NULL, *call_timeout = NULL,
-             *noise_private_key = NULL, *peer_authorizer = NULL, *backend = NULL, *cpu_class = NULL, *log = NULL,
-             *log_level = NULL, *log_format = NULL, *max_response_bytes = NULL, *server = NULL, *event_loop = NULL;
+             *noise_private_key = NULL, *peer_authorizer = NULL, *backend = NULL, *cpu_class_ceiling = NULL,
+             *log = NULL, *log_level = NULL, *log_format = NULL, *max_response_bytes = NULL, *server = NULL,
+             *event_loop = NULL;
     ucall_py_argument_t const arguments[] = {
         {"connections", &connections},
         {"pipelined_calls", &pipelined_calls},
@@ -334,7 +336,7 @@ static PyObject* Client_new(PyTypeObject* type, PyObject* positional, PyObject* 
         {"noise_private_key", &noise_private_key},
         {"peer_authorizer", &peer_authorizer},
         {"backend", &backend},
-        {"cpu_class", &cpu_class},
+        {"cpu_class_ceiling", &cpu_class_ceiling},
         {"log", &log},
         {"log_level", &log_level},
         {"log_format", &log_format},
@@ -357,10 +359,11 @@ static PyObject* Client_new(PyTypeObject* type, PyObject* positional, PyObject* 
         ucall_py_size_from_object(max_response_bytes, "max_response_bytes", &config.max_response_bytes) != 0 ||
         ucall_py_size_from_object(event_loop, "event_loop", &config.event_loop) != 0 ||
         ucall_py_enum_from_object(backend, "backend", &ucall_py_backend_enum, &backend_value) != 0 ||
-        ucall_py_enum_from_object(cpu_class, "cpu_class", &ucall_py_cpu_class_enum, &cpu_class_value) != 0)
+        ucall_py_enum_from_object(cpu_class_ceiling, "cpu_class_ceiling", &ucall_py_cpu_class_enum, &cpu_class_value) !=
+            0)
         return NULL;
     config.backend = (ucall_io_backend_t)backend_value;
-    config.cpu_class = (ucall_cpu_class_t)cpu_class_value;
+    config.cpu_class_ceiling = (ucall_cpu_class_t)cpu_class_value;
     if (ucall_py_log_from_objects(log, log_level, log_format, &config.log) != 0) return NULL;
     if (log == Py_None) log = NULL;
     if (noise_private_key == Py_None) noise_private_key = NULL;

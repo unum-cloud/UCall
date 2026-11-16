@@ -74,7 +74,7 @@ struct ClientOptionsArguments(ImplicitlyCopyable):
     var log: Log
     var max_concurrent_calls: c_size_t
     var backend: Backend
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
     var max_response_bytes: c_size_t
     var server: Address
     var event_loop: c_size_t
@@ -206,8 +206,9 @@ struct ClientOptions(Copyable, Movable):
     """Vets each server's authenticated static key; required for Noise XX calls."""
     var backend: Backend
     """The requested I/O backend."""
-    var cpu_class: CPUClass
-    """A ceiling on the CPU class; `UNKNOWN` takes what the CPU offers."""
+    var cpu_class_ceiling: CPUClass
+    """A ceiling on the CPU class, intersected with what the constructing thread's CPU runs: the
+    newest compiled class fitting both runs, and `UNKNOWN` sets no ceiling."""
     var log: Log
     """Where log lines go; the default keeps the client silent."""
     var max_response_bytes: Int
@@ -391,7 +392,7 @@ struct Client(Movable):
             options.log,
             c_size_t(options.calls),
             options.backend,
-            options.cpu_class,
+            options.cpu_class_ceiling,
             c_size_t(options.max_response_bytes),
             server.value()[].handle if server else NULL_ADDRESS,
             c_size_t(event_loop),

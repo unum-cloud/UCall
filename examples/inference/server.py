@@ -100,7 +100,7 @@ def main() -> None:
     for thread in threads:
         thread.start()
     print(
-        f"Listening on {server.addresses[0]} using {server.backend.name}, {server.cpu_class.name}, "
+        f"Listening on {server.addresses[0]} using {server.backend.name}, {server.cpu_class_ceiling.name}, "
         f"{server.event_loops} application-owned serving loops"
     )
     stopping.wait()

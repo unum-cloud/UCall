@@ -709,3 +709,19 @@ def test_handlers_on_four_loops_from_four_threads(backend, loopback, serving):
     assert len(loop_threads) >= 2
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
         assert not sys._is_gil_enabled()
+
+
+def test_cpu_class_ceiling_caps_rather_than_refuses(loopback):
+    picked = {}
+    for ceiling in ucall.CPUClass:
+        if ceiling == ucall.CPUClass.UNKNOWN:
+            continue
+        ucall.Client(connections=1, cpu_class_ceiling=ceiling)
+        server = ucall.Server(loopback(), cpu_class_ceiling=ceiling)
+        picked[ceiling] = server.cpu_class_ceiling
+        # The class a ceiling resolves to is one this machine runs, so it picks itself again.
+        assert ucall.Server(loopback(), cpu_class_ceiling=picked[ceiling]).cpu_class_ceiling == picked[ceiling]
+    # No CPU runs the classes of two architectures, so another one's ceiling lands on serial.
+    assert any(
+        ceiling != ucall.CPUClass.SERIAL and class_ == ucall.CPUClass.SERIAL for ceiling, class_ in picked.items()
+    )

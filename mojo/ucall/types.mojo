@@ -368,7 +368,7 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     var code: c_int
     """The raw `ucall_cpu_class_t` value the ABI exchanges."""
     comptime UNKNOWN = Self(0)
-    """Picks the newest class this machine runs."""
+    """Sets no ceiling, picking the newest class this machine runs."""
     comptime SERIAL = Self(1)
     """Portable kernels with no SIMD, which every machine runs."""
     comptime MONOVERSIONED = Self(2)
@@ -383,6 +383,8 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """AVX2 kernels with SHA and no AVX-512, as on Intel Alder Lake."""
     comptime AWS_G2 = Self(12)
     """NEON kernels with the AES and SHA extensions, as on AWS Graviton2."""
+    comptime APPLE_M4 = Self(14)
+    """Adds WFET timed waits to the kernels of `AWS_G5`, as on Apple M4."""
     comptime AWS_G5 = Self(15)
     """As on AWS Graviton5, running the kernels of `AWS_G2`."""
     comptime ALIBABA_C930 = Self(17)

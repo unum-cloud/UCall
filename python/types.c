@@ -56,13 +56,13 @@ static char const doc_Backend[] =                                               
     "  >>> ucall.Server(ucall.Interface(\"127.0.0.1:0\"), backend=ucall.Backend.POSIX).backend\n"  //
     "  <Backend.POSIX: 1>";
 
-static char const doc_CPUClass[] =                                                                    //
-    "CPUClass(value)\n"                                                                               //
-    "\n"                                                                                              //
-    "A bundle of CPU kernels for `Server` and `Client`; `UNKNOWN` picks the initializing thread's.\n" //
-    "\n"                                                                                              //
-    "Example:\n"                                                                                      //
-    "  >>> ucall.Server(ucall.Interface(\"127.0.0.1:0\"), cpu_class=\"serial\").cpu_class\n"          //
+static char const doc_CPUClass[] =                                                                           //
+    "CPUClass(value)\n"                                                                                      //
+    "\n"                                                                                                     //
+    "A bundle of CPU kernels for `Server` and `Client`, named as a ceiling; `UNKNOWN` sets none.\n"          //
+    "\n"                                                                                                     //
+    "Example:\n"                                                                                             //
+    "  >>> ucall.Server(ucall.Interface(\"127.0.0.1:0\"), cpu_class_ceiling=\"serial\").cpu_class_ceiling\n" //
     "  <CPUClass.SERIAL: 1>";
 
 static char const doc_Security[] =                                                             //

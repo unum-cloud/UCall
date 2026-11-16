@@ -46,13 +46,13 @@ Each class unit compiles when StringZilla compiles and ForkUnion enables every c
 `UCALL_MARCH` raises the floor of UCall's own units to an ISA level, `native` or a CPU name like `graniterapids`, and hands the same value to the siblings.
 `UCALL_MULTIVERSIONED`, on by default, compiles every class that exists, `serial` included, and picks among them at run time.
 Off, it builds for one machine and compiles only the `monoversioned` class, over every capability the libraries enabled: what the floor implies and what a preset vouches for with `-D <LIBRARY>_TARGET_<CAPABILITY>=1`.
-A pinned class or ceiling below that class then fails as unsupported rather than running it.
+A `cpu_class_ceiling` below that class, or a machine below it, then fails as unsupported rather than running it.
 The machine profiles `xeon4`, `xeon6`, `venice`, `grace` and `vera` set both, and CI compiles each of them, beside `android_arm64` over the `linux-epollaio` backend and `msvc2026_x64` with Visual Studio.
 `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 
 `UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_hello`, `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
-`ucall_cli`, the `ucall` command-line client in `cli/`, builds with the examples and with any install, and `ucall_test_tools` drives it against an in-process server.
+`ucall_cli`, the `ucall` command-line client in `tools/`, builds with `UCALL_BUILD_TOOLS` and with any install, and `ucall_test_tools` drives it against an in-process server.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust) describe.
 
@@ -74,7 +74,7 @@ Each class names one bundle of StringZilla kits, SmashTable row kit, ForkUnion w
 
 | Value | Name            | What it adds                                                                         |
 | ----: | --------------- | ------------------------------------------------------------------------------------ |
-|     0 | `unknown`       | Picks the newest class this machine runs                                             |
+|     0 | `unknown`       | No ceiling: the newest class this machine runs                                       |
 |     1 | `serial`        | Portable kits, standard atomics, yielding waits                                      |
 |     2 | `monoversioned` | Whatever the floor and the preset compiled, the one class of a monoversioned build   |
 |     3 | `intel-haswell` | AVX2 string kits and row scans, `PAUSE` waits                                        |
@@ -82,6 +82,7 @@ Each class names one bundle of StringZilla kits, SmashTable row kit, ForkUnion w
 |     6 | `intel-icelake` | Ice Lake's AVX-512 extensions, SHA and its row scans over `intel-skylake`            |
 |    11 | `intel-alder`   | SHA over `intel-haswell`, without AVX-512                                            |
 |    12 | `aws-g2`        | NEON string kits with AES and SHA, NEON row scans, `YIELD` waits, LSE atomics        |
+|    14 | `apple-m4`      | `WFET` timed waits over `aws-g5`; earlier Apple cores dispatch as `aws-g5`           |
 |    15 | `aws-g5`        | `WFE` waits and RCpc atomics over `aws-g2`                                           |
 |    17 | `alibaba-c930`  | RVV string kits and row scans, `WRS` waits, Zacas atomics                            |
 |    18 | `ibm-power10`   | VSX string kits and row scans, `pause_short` waits, ISA 3.0 store atomics            |
@@ -92,8 +93,9 @@ UCall has no GPU classes.
 
 The pick reads StringZilla's and ForkUnion's detected masks, never their enabled ones, since UCall's class units compile their own kits.
 A value no class takes fails with `invalid_argument`, as a misspelled name does in `ucall_cpu_class_from_name`.
-A pinned class the machine does not run fails with `unsupported`, and otherwise its masks become the ceiling.
-Construction takes the newest compiled class on the ladder whose masks fit the ceiling, and fails with `unsupported` when none does, as a monoversioned build does on an older machine.
+A `cpu_class_ceiling` intersects the named class's masks with the detected ones, so a class the machine lacks caps the pick rather than refusing it, and `unknown` leaves the detected masks alone.
+Construction takes the newest compiled class on the ladder whose masks fit that intersection, and fails with `unsupported` when none does, as a monoversioned build does on an older machine.
+Resolved options report the class picked in the same `cpu_class_ceiling` field.
 
 ## Code Rules
 
@@ -158,7 +160,7 @@ Statuses 0 to 19 carry the same numbers and meanings in every Unum library: succ
 A library leaves out the ones it cannot answer but never renumbers the rest, and numbers its own statuses from 20.
 Every enum the C interface names, statuses included, has a `ucall_*_name` answering "unrecognized" for a value it does not know and a `ucall_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
 CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
-`ucall_version_name` answers the full version, pre-release suffix included.
+`ucall_version_name` answers the full version, pre-release suffix included, in the engine and in the stub alike.
 
 ### Refusals
 
@@ -171,7 +173,7 @@ A well-formed case nothing implements yet, like several event loops on one IOCP 
 An option the library cannot honour is refused with `unsupported`, never ignored.
 A handle another call holds answers `contended` rather than waiting, and a size past its counter answers `overflow`.
 A refusal moves nothing: every output and handle reads as it did before the call.
-Each header lists a verb's refusals under `@par Statuses` in this order and in these words.
+Each header lists a verb's refusals under `@par Statuses` in this order and in these words, and the stub library answers every one of them.
 
 ### Query Views
 
@@ -306,10 +308,11 @@ Traced timings explain costs and are not throughput measurements.
 
 Native suites live in `test/`, mirroring `include/ucall/`, the C caller in `c/test.c`, and benchmark clients in `bench/`.
 `ucall_test` runs the outcome word, every engine and the network cells, `ucall_test_header_only` the parsers and the tunnel, and `ucall_test_tools` the command-line client; each ctest is named after its executable.
-`ucall_test` sweeps a diagonal of cells: every compiled backend at the best CPU class in plaintext, every admitted class on the first backend, and each Noise pattern on the first backend.
+`UCALL_BUILD_STUB=ON` builds `src_stub/`, a stand-in for the C interface that validates every call and serves no network, and `ucall_test_c_stub`, the same `c/test.c` linked against it; the stand-in runs only the serial CPU class.
+`ucall_test` sweeps a diagonal of cells: every compiled backend at the best CPU class in plaintext, every class the machine runs on the first backend, and each Noise pattern on the first backend.
 Each cell prints one verdict line, such as `passed  network linux-uring618 best plaintext`, and a host refusing an engine reads as `skipped`.
 `UCALL_SEED` selects an unsigned seed or `random`, `UCALL_FILTER` selects cells as a regex or else a substring, and `UCALL_MULTIPLIER` scales native sweeps.
-`--backend` and `--cpu-class` pin the sweep to one backend or class.
+`--backend` and `--cpu-class-ceiling` narrow the sweep to one backend or class, and a ceiling above what the host runs reads as `skipped` rather than sweeping the lower class it resolves to.
 
 ```bash
 UCALL_FILTER='network linux-uring618' UCALL_MULTIPLIER=0.1 build_debug/ucall_test
@@ -342,14 +345,14 @@ CI runs each harness for five minutes with the run number as its seed and keeps 
 ### Arm on an x86 Host
 
 `cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
-`--cpu-class` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
+`--cpu-class-ceiling` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
 QEMU's user mode has neither io_uring nor Linux AIO, so those cells skip.
 
 ```bash
 cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
 cmake --build build_aarch64
 ctest --test-dir build_aarch64
-qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test --backend posix --cpu-class aws-g2
+qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test --backend posix --cpu-class-ceiling aws-g2
 ```
 
 ### RISC-V and Power on an x86 Host
@@ -361,7 +364,7 @@ RISC-V needs GCC 16, as GCC 15 crashes on StringZilla's RVV kernels, and Power n
 cmake --preset linux_ppc64le
 cmake --build --preset linux_ppc64le
 ctest --preset linux_ppc64le
-qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test --backend posix --cpu-class ibm-power10
+qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test --backend posix --cpu-class-ceiling ibm-power10
 ```
 
 ### Windows, FreeBSD and macOS on a Linux Host

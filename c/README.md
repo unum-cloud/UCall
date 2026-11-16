@@ -338,8 +338,8 @@ Each loop has one application polling owner, and endpoint callbacks execute sync
 Each batch endpoint has one polling owner, and its callbacks execute on the thread calling `ucall_server_take_batch()` or `ucall_server_take_batches()` with the handle its registration returned.
 A deadline cannot preempt a callback.
 One owner at a time may submit, poll, or free a client, on any thread.
-CPU classes select compiled string, cryptographic, and atomic kernels once, at initialization, under the requested class or the initialization thread's capabilities.
-The application keeps those threads on CPUs supporting the selected class; `serial` is the conservative choice for differing capabilities.
+CPU classes select compiled string, cryptographic, and atomic kernels once, at initialization, under the `cpu_class_ceiling` intersected with the initialization thread's capabilities.
+The application keeps those threads on CPUs supporting the picked class; `serial` is the conservative choice for differing capabilities.
 Server shutdown uses baseline atomics and native wakeups, so another thread can stop it without entering CPU-specific code.
 
 ## Design

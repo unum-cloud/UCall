@@ -31,6 +31,9 @@
 
 namespace unum::ucall::tools {
 
+/** The exit status of a run a signal stopped, as shells report a command SIGINT ended. */
+inline constexpr int exit_stopped_k = 130;
+
 /** A whole decimal @p text of at least @p minimum, left unchanged in @p value when it fails. */
 inline bool parse_count(std::string_view text, std::size_t& value, std::size_t minimum = 0) noexcept {
     std::size_t parsed {};
@@ -131,8 +134,9 @@ struct settings_t {
     /** The one engine a sweep keeps; automatic keeps every compiled one. Override: @c --backend. */
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
 
-    /** The one CPU class a sweep keeps; unknown keeps all admitted. Override: @c --cpu-class. */
-    ucall_cpu_class_t cpu_class = ucall_cpu_class_unknown_k;
+    /** The one CPU class ceiling a sweep keeps; unknown keeps every class this machine runs, as
+     *  @c --cpu-class-ceiling overrides. */
+    ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
 };
 
 /** Prints why @p value of @p name does not parse, then exits with status 1. */
@@ -141,9 +145,9 @@ struct settings_t {
     std::exit(1);
 }
 
-/** Reads the environment, then the @c --backend and @c --cpu-class pins of @p argv, leaving every
- *  argument without a leading dash to the binary. On @c --help prints the usage and exits with
- *  status 0; on a setting that does not parse prints one line and exits with 1. */
+/** Reads the environment, then the @c --backend and @c --cpu-class-ceiling choices of @p argv,
+ *  leaving every argument without a leading dash to the binary. On @c --help prints the usage and
+ *  exits with status 0; on a setting that does not parse prints one line and exits with 1. */
 inline settings_t read_settings(int argc, char const* const* argv, std::string_view synopsis) {
     settings_t settings;
     auto environment = [](char const* name) noexcept {
@@ -167,15 +171,15 @@ inline settings_t read_settings(int argc, char const* const* argv, std::string_v
         if (flag == "--") break;
         if (flag.empty() || flag[0] != '-') continue;
         std::string_view const value = index + 1 < argc ? argv[index + 1] : "";
-        bool const parsed = flag == "--backend"     ? parse_backend(value, settings.backend)
-                            : flag == "--cpu-class" ? parse_cpu_class(value, settings.cpu_class)
-                                                    : false;
+        bool const parsed = flag == "--backend"             ? parse_backend(value, settings.backend)
+                            : flag == "--cpu-class-ceiling" ? parse_cpu_class(value, settings.cpu_class_ceiling)
+                                                            : false;
         if (parsed) {
             ++index;
             continue;
         }
         if (flag != "--help") exit_unparsed(flag, value, "a flag of the usage below");
-        fmt::print("Usage: {} [--backend name] [--cpu-class name]\n", synopsis);
+        fmt::print("Usage: {} [--backend name] [--cpu-class-ceiling name]\n", synopsis);
         std::exit(0);
     }
     return settings;

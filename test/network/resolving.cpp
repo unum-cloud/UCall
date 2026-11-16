@@ -203,7 +203,7 @@ static ucall_client_t resolving_client(sweep_cell_t const& cell, uc::dns::resolv
     ucall_client_options_t config {};
     config.max_concurrent_connections = connections;
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     ucall_client_init_t init {&client, &outcome, &config, nullptr};
     network_t::client_t::client_init(&init);
     if (outcome.status != ucall_status_success_k) return nullptr;

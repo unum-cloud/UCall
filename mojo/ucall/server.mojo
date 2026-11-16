@@ -135,7 +135,7 @@ struct ServerOptionsArguments(ImplicitlyCopyable):
     var metrics_tags_count: c_size_t
     var metrics_interval_microseconds: c_size_t
     var backend: Backend
-    var cpu_class: CPUClass
+    var cpu_class_ceiling: CPUClass
 
 
 @fieldwise_init
@@ -501,8 +501,9 @@ struct ServerOptions(Copyable, Defaultable, Movable):
 
     var backend: Backend
     """The requested I/O backend, failing rather than substituting when it is unavailable."""
-    var cpu_class: CPUClass
-    """A ceiling on the CPU class; `UNKNOWN` takes what the constructing thread's CPU offers."""
+    var cpu_class_ceiling: CPUClass
+    """A ceiling on the CPU class, intersected with what the constructing thread's CPU runs: the
+    newest compiled class fitting both runs, and `UNKNOWN` sets no ceiling."""
     var log: Log
     """Where log lines go; the default keeps the server silent."""
     var metrics: Metrics
@@ -773,7 +774,7 @@ struct Server:
             c_size_t(len(tags)),
             c_size_t(options.metrics.interval_microseconds),
             options.backend,
-            options.cpu_class,
+            options.cpu_class_ceiling,
         )
         config[unsafe_offset=1] = config[unsafe_offset=0]
         var created = stack_allocation[1, Address]().unsafe_origin_cast[MutAnyOrigin]()
@@ -814,9 +815,9 @@ struct Server:
         """The I/O backend the server resolved to. Binding-only."""
         return self.shared[].resolved.backend
 
-    def cpu_class(self) -> CPUClass:
-        """The CPU class the server resolved to. Binding-only."""
-        return self.shared[].resolved.cpu_class
+    def cpu_class_ceiling(self) -> CPUClass:
+        """The CPU class the server resolved to under its ceiling. Binding-only."""
+        return self.shared[].resolved.cpu_class_ceiling
 
     def address(self, index: Int) -> Optional[String]:
         """The numeric address interface `index` listens on, with the port it bound. Binding-only.

@@ -599,17 +599,19 @@ struct server : ucall_server_handle_t {
     static void bind_client(ucall_client_init_t* arguments) noexcept {
         auto options = *arguments->options;
         auto& server = *static_cast<server_t*>(options.server);
-        // A bound client runs on its loop's engine and kits, so a pin naming others is refused.
+        // A bound client runs on its loop's engine and kits, so a backend naming another or a
+        // ceiling picking another class is refused.
         if (options.event_loop >= server.event_loops.size() ||
             server.event_loops[options.event_loop]->stage != event_loop_stage_t::unopened_k ||
             (options.backend != ucall_io_backend_automatic_k && options.backend != server.config.backend) ||
-            (options.cpu_class != ucall_cpu_class_unknown_k && options.cpu_class != server.config.cpu_class)) {
+            (options.cpu_class_ceiling != ucall_cpu_class_unknown_k &&
+             options.cpu_class_ceiling != server.config.cpu_class_ceiling)) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         auto& event_loop = *server.event_loops[options.event_loop];
         options.backend = server.config.backend;
-        options.cpu_class = server.config.cpu_class;
+        options.cpu_class_ceiling = server.config.cpu_class_ceiling;
         ucall_client_init_t bound = *arguments;
         bound.options = &options;
         client_t::client_init(&bound, server.allocator, &event_loop.engine);

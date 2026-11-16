@@ -71,7 +71,7 @@ struct settings_t {
     std::chrono::nanoseconds warmup {}, time_limit {};
     std::uint64_t seed = 42;
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
-    ucall_cpu_class_t cpu_class = ucall_cpu_class_unknown_k;
+    ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
     ucall_verb_t verb = ucall_verb_post_k;
     body_check_t body_check = body_check_t::none_k;
     std::string client_key, server_key; // Hexadecimal, validated while parsing and decoded once per run.
@@ -143,9 +143,9 @@ static constexpr std::array flags_k {
             [](std::string_view text, settings_t& settings) noexcept {
                 return tools::parse_backend(text, settings.backend);
             }},
-    flag_t {"--cpu-class", "name", "unknown, serial, intel-haswell, aws-g2, aws-g5, ... (unknown)",
+    flag_t {"--cpu-class-ceiling", "name", "unknown, serial, intel-haswell, aws-g2, aws-g5, ... (unknown)",
             [](std::string_view text, settings_t& settings) noexcept {
-                return tools::parse_cpu_class(text, settings.cpu_class);
+                return tools::parse_cpu_class(text, settings.cpu_class_ceiling);
             }},
     flag_t {"--verb", "name", "post, get or put (post)",
             [](std::string_view text, settings_t& settings) noexcept {
@@ -598,7 +598,7 @@ struct run_t {
         config.max_concurrent_calls = worker.capacity;
         config.max_pipelined_calls = run.settings.pipeline_depth;
         config.backend = run.settings.backend;
-        config.cpu_class = run.settings.cpu_class;
+        config.cpu_class_ceiling = run.settings.cpu_class_ceiling;
         config.noise_private_key = run.client_key;
         if (run.client_key) config.peer_authorizer = admit_any_peer;
         ucall_outcome_t outcome {};
@@ -837,7 +837,7 @@ static int run(settings_t const& settings) {
                            "{{\"row\":\"worker\",\"index\":{},\"backend\":\"{}\",\"cpu_class\":\"{}\"," //
                            "\"successful_requests\":{},\"failed_requests\":{}}}\n",
                            i, ucall_io_backend_name(workers[i].resolved.backend),
-                           ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
+                           ucall_cpu_class_name(workers[i].resolved.cpu_class_ceiling), workers[i].successful,
                            workers[i].failures);
             emit(stdout);
         }
@@ -900,7 +900,7 @@ static int run(settings_t const& settings) {
         for (std::size_t i = 0; i != workers.size(); ++i) {
             fmt::format_to(out, "  Worker {}: {}, {}, {} successful requests, {} failed requests\n", i,
                            ucall_io_backend_name(workers[i].resolved.backend),
-                           ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
+                           ucall_cpu_class_name(workers[i].resolved.cpu_class_ceiling), workers[i].successful,
                            workers[i].failures);
             emit(stdout);
         }

@@ -82,7 +82,7 @@ void make_network_variant(init_type_* arguments) noexcept {
         typename traits_t::aes256_gcm_kit_t, typename traits_t::x25519_kit_t, typename traits_t::row_search_kit_t>;
     // The network reports the class it was built for, which only this layer names.
     auto options = *arguments->options;
-    options.cpu_class = static_cast<ucall_cpu_class_t>(cpu_class_);
+    options.cpu_class_ceiling = static_cast<ucall_cpu_class_t>(cpu_class_);
     auto forwarded = *arguments;
     forwarded.options = &options;
     if constexpr (std::is_same_v<init_type_, ucall_server_init_t>) network_t::server_t::server_init(&forwarded);

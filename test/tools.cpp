@@ -7,6 +7,7 @@
  */
 #include <poll.h>     // `poll`
 #include <signal.h>   // `kill`, `SIGINT`
+#include <sys/stat.h> // `stat`, `lstat`
 #include <sys/wait.h> // `WIFEXITED`, `WEXITSTATUS`, `waitpid`
 #include <unistd.h>   // `fork`, `execv`, `pipe`
 
@@ -85,10 +86,67 @@ static std::size_t test_cli_plaintext(sweep_cell_t const& cell) {
     return failures + fixture.stop();
 }
 
+/** Everything a file under @p scratch holds, or empty when it won't open. */
+static std::string read_file(scratch_directory_t const& scratch, std::string_view relative) {
+    std::string text;
+    if (std::FILE* file = std::fopen(scratch.name(relative).c_str(), "rb")) {
+        char chunk[4096];
+        for (std::size_t read; (read = std::fread(chunk, 1, sizeof(chunk), file)) != 0;) text.append(chunk, read);
+        std::fclose(file);
+    }
+    return text;
+}
+
+/** Files the tool writes land whole through a temporary: <tt>-o</tt> replaces an earlier answer,
+ *  a stale or linked temporary refuses the write and leaves the target alone, and
+ *  <tt>keygen</tt> writes an owner-only key and never replaces an existing one. */
+static std::size_t test_cli_landing(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {.connections = 4}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    scratch_directory_t scratch;
+    require(0, scratch.ready() && scratch.write("out.txt", "earlier"));
+    fixture.serve_in_background();
+    std::size_t failures = 0;
+    std::string const output = scratch.name("out.txt"), temporary = scratch.name("out.txt.tmp");
+
+    auto const landed = run_cli(scratch, fmt::format("-o {} -d landed {}/echo/6", output, fixture.url));
+    failures += expect(landed.exit_code == 0 && read_file(scratch, "out.txt") == "landed", "-o exited {} leaving {:?}",
+                       landed.exit_code, read_file(scratch, "out.txt"));
+
+    require(0, scratch.write("out.txt.tmp", "stale"));
+    auto const stale = run_cli(scratch, fmt::format("-o {} -d lost {}/echo/7 2>/dev/null", output, fixture.url));
+    failures += expect(stale.exit_code == 1 && read_file(scratch, "out.txt") == "landed" &&
+                           read_file(scratch, "out.txt.tmp") == "stale",
+                       "a stale temporary exited {} leaving {:?}", stale.exit_code, read_file(scratch, "out.txt"));
+    std::remove(temporary.c_str());
+
+    require(
+        0, scratch.write("aside.txt", "aside") && ::symlink(scratch.name("aside.txt").c_str(), temporary.c_str()) == 0);
+    auto const linked = run_cli(scratch, fmt::format("-o {} -d lost {}/echo/8 2>/dev/null", output, fixture.url));
+    failures += expect(linked.exit_code == 1 && read_file(scratch, "out.txt") == "landed" &&
+                           read_file(scratch, "aside.txt") == "aside",
+                       "a linked temporary exited {}", linked.exit_code);
+    std::remove(temporary.c_str());
+
+    std::string const key = scratch.name("own.key");
+    auto const generated = run_cli(scratch, fmt::format("keygen {}", key));
+    struct stat key_stat {};
+    bool const owner_only = ::stat(key.c_str(), &key_stat) == 0 && (key_stat.st_mode & 0777) == 0600;
+    failures += expect(generated.exit_code == 0 && owner_only, "keygen exited {} with mode {:o}", generated.exit_code,
+                       key_stat.st_mode & 0777);
+    std::string const first_key = read_file(scratch, "own.key");
+    auto const again = run_cli(scratch, fmt::format("keygen {} 2>/dev/null", key));
+    struct stat temporary_stat {};
+    failures += expect(again.exit_code == 1 && read_file(scratch, "own.key") == first_key &&
+                           ::lstat(scratch.name("own.key.tmp").c_str(), &temporary_stat) != 0,
+                       "a second keygen exited {}", again.exit_code);
+    return failures + fixture.stop();
+}
+
 /** An IK call over <tt>http+noise://</tt> with the server's key pinned from a file and the
  *  caller's own. */
 static std::size_t test_cli_noise_ik(sweep_cell_t const& cell) {
-    fixture_t fixture {{cell.backend, cell.cpu_class, ucall_security_noise_ik_k}, {}};
+    fixture_t fixture {{cell.backend, cell.cpu_class_ceiling, ucall_security_noise_ik_k}, {}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     scratch_directory_t scratch;
     require(0, scratch.ready() && scratch.write("server.key", hexadecimal(fixture.server_public) + "\n") &&
@@ -254,8 +312,9 @@ static std::size_t test_cli_proxy_round_trip() {
     require(failures, !broken.address.empty(), "the broken proxy printed no address");
     auto const refused = run_cli(scratch, fmt::format("http://{}/ 2>/dev/null", broken.address));
     failures += expect(refused.exit_code == 5, "an unreachable upstream exited {}", refused.exit_code);
-    failures += expect(forward.stop() == 0 && reverse.stop() == 0 && broken.stop() == 0,
-                       "a proxy did not stop cleanly");
+    failures += expect(
+        forward.stop() == exit_stopped_k && reverse.stop() == exit_stopped_k && broken.stop() == exit_stopped_k,
+        "a proxy did not stop as a signal stops a command");
     return failures;
 }
 
@@ -273,11 +332,12 @@ int main(int argc, char** argv) {
         return 1;
     }
     print_probe(settings);
-    sweep_cell_t const cell {settings.backend, settings.cpu_class, ucall_security_none_k};
+    sweep_cell_t const cell {settings.backend, settings.cpu_class_ceiling, ucall_security_none_k};
     std::size_t failures_count = 0;
     if (settings.filter.selects("tools cli"))
         failures_count += report("tools cli", keeping_descriptors([&] {
                                      std::size_t failures = test_cli_plaintext(cell);
+                                     failures += test_cli_landing(cell);
                                      failures += test_cli_noise_ik(cell);
                                      failures += test_cli_proxy_round_trip();
                                      return failures;

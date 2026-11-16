@@ -15,7 +15,7 @@ std::size_t check_network(settings_t const& settings) {
         sz::string_t const name = formatted("network {}", name_of(cell));
         if (!settings.filter.selects(name)) continue;
         if (!opens(cell)) {
-            failures_count += report(name.c_str(), "engine refused by this host");
+            failures_count += report(name.c_str(), "this host lacks the engine or the class");
             continue;
         }
         failures_count += report(name.c_str(), keeping_descriptors([&] {

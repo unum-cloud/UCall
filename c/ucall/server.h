@@ -138,10 +138,11 @@ typedef struct ucall_server_options_t {
     /** Requested I/O backend; automatic chooses an available native backend. */
     ucall_io_backend_t backend;
 
-    /** Ceiling on the CPU class: the newest compiled class under it runs, and unknown takes the
-     *  initialization thread's capabilities. Callers must stay on compatible CPUs after first use.
-     *  Serial is the conservative choice. */
-    ucall_cpu_class_t cpu_class;
+    /** Ceiling on the CPU class, intersected with the initialization thread's capabilities: the
+     *  newest compiled class fitting both runs, and unknown sets no ceiling. A class this machine
+     *  lacks still caps it, so serial is the conservative choice. Resolved options report the class
+     *  picked, and callers must stay on CPUs running it after first use. */
+    ucall_cpu_class_t cpu_class_ceiling;
 
 } ucall_server_options_t;
 
@@ -170,11 +171,11 @@ typedef struct ucall_server_init_t {
  *
  *  @par Statuses:
  *  - @c ucall_status_invalid_argument_k An output, the configuration or its interfaces are missing,
- *    or the CPU class, a metrics setting, an address, a device name, a security mode with the key
- *    or authorizer it needs, a connection budget or the reply directories are unusable.
- *  - @c ucall_status_unsupported_k This machine does not run the requested CPU class, no I/O
- *    backend serves the configuration on it, a device is named outside Linux, or an interface asks
- *    Windows for several loops.
+ *    or the CPU class ceiling, a metrics setting, an address, a device name, a security mode with
+ *    the key or authorizer it needs, a connection budget or the reply directories are unusable.
+ *  - @c ucall_status_unsupported_k No compiled CPU class fits under the ceiling on this machine,
+ *    as when a monoversioned build targets a newer CPU, no I/O backend serves the configuration
+ *    on it, a device is named outside Linux, or an interface asks Windows for several loops.
  *  - @c ucall_status_connection_failed_k The metrics address or a listening address does not
  *    resolve, or no socket binds to it.
  *  - @c ucall_status_not_found_k A reply directory does not exist.

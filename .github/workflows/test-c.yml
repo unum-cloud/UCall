@@ -372,6 +372,32 @@ jobs:
           LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" "$RUNNER_TEMP/consumer/build/hello_shared"
           LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" "$RUNNER_TEMP/hello_pkg_config"
 
+  # The C suite against the stand-in in `src_stub/`, which validates every call as the headers document and serves no
+  # network, so the same `c/test.c` holds both libraries to one list of refusals.
+  test_c_ubuntu_clang_stub:
+    name: Test the C Stub on Ubuntu with Clang 22
+    runs-on: ubuntu-26.04
+    timeout-minutes: 15
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Set Up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: "3.15t"
+      - name: Install CMake
+        run: python -m pip install "cmake>=3.28"
+      - name: Install Clang 22
+        run: sudo apt-get update && sudo apt-get install -y clang-22
+      - name: Build the Engine and the Stub
+        run: |
+          cmake --preset debug -DCMAKE_C_COMPILER=clang-22 -DCMAKE_CXX_COMPILER=clang++-22 -DUCALL_BUILD_STUB=ON
+          cmake --build --preset debug --target ucall_test_c ucall_test_c_stub --parallel 4
+      - name: Test the C Interface on Both
+        run: ctest --preset debug -R '^ucall_test_c' --no-tests=error --verbose
+
   # AlmaLinux 8 carries Linux 4.18 headers, so the build proves the kernel mirrors suffice and the test checks them.
   test_c_manylinux_gcc:
     name: Build C Library on Old Kernel Headers

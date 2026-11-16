@@ -184,8 +184,8 @@ With `max_pipelined_requests` on an interface and `max_pipelined_calls` on a cli
 
 ### Caller-Owned Polling
 
-Select the backend and CPU class in the server or client configuration.
-The polling threads must support the selected CPU class; `serial` is a conservative choice when their capabilities differ from the initialization thread's.
+Select the backend and a CPU class ceiling in the server or client configuration; the newest compiled class fitting both the ceiling and the machine runs, and the resolved options name it.
+The polling threads must support the picked CPU class; `serial` is a conservative choice when their capabilities differ from the initialization thread's.
 UCall creates no threads.
 
 Register server routes before polling.
@@ -774,8 +774,7 @@ A monoversioned build compiles the single `monoversioned` CPU class in place of 
 | `include/ucall/`            | The C++ 20 core: HTTP, DNS, the Noise tunnel, I/O engines and the network loops   |
 | `src/`                      | The library exporting the C ABI, one unit per compiled CPU class                  |
 | `python/`, `rust/`, `mojo/` | The bindings, each with its own guide                                             |
-| `cli/`                      | The `ucall` command-line client                                                   |
-| `tools/`                    | The server shared by examples and benchmarks                                      |
+| `tools/`                    | The `ucall` command-line client and the server shared by examples and benchmarks  |
 | `examples/`                 | `hello.c`, and echo, key-value, ledger and inference servers                      |
 | `bench/`                    | The benchmark driver and the framework comparison                                 |
 | `test/`                     | Native, Python and fuzzing suites                                                 |

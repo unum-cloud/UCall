@@ -138,10 +138,10 @@ class Backend(enum.IntEnum):
     WINDOWS_RIO = 7
 
 class CPUClass(enum.IntEnum):
-    """A bundle of CPU kernels for `Server` and `Client`; `UNKNOWN` picks the initializing thread's.
+    """A bundle of CPU kernels for `Server` and `Client`, named as a ceiling; `UNKNOWN` sets none.
 
     Example:
-      >>> ucall.Server(ucall.Interface("127.0.0.1:0"), cpu_class="serial").cpu_class
+      >>> ucall.Server(ucall.Interface("127.0.0.1:0"), cpu_class_ceiling="serial").cpu_class_ceiling
       <CPUClass.SERIAL: 1>
     """
 
@@ -153,6 +153,7 @@ class CPUClass(enum.IntEnum):
     INTEL_ICELAKE = 6
     INTEL_ALDER = 11
     AWS_G2 = 12
+    APPLE_M4 = 14
     AWS_G5 = 15
     ALIBABA_C930 = 17
     IBM_POWER10 = 18
@@ -1014,7 +1015,8 @@ class Server:
     Args:
       *interfaces (Interface): Where to answer; none answers on `DEFAULT_ADDRESS`.
       backend (Backend, optional): The I/O implementation. Defaults to `Backend.AUTOMATIC`.
-      cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.UNKNOWN`.
+      cpu_class_ceiling (CPUClass, optional): The newest CPU kernels to use; the newest compiled
+        class fitting both it and this machine runs. Defaults to `CPUClass.UNKNOWN`, no ceiling.
       log (Callable[[LogLevel, str], object], optional): Receives every line the server writes,
         on whichever thread wrote it, holding the interpreter lock; None writes nothing.
       log_level (LogLevel, optional): The least severe line `log` receives. Defaults to DEBUG.
@@ -1034,7 +1036,7 @@ class Server:
         cls,
         *interfaces: Interface,
         backend: Backend | str = Backend.AUTOMATIC,
-        cpu_class: CPUClass | str = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass | str = CPUClass.UNKNOWN,
         log: Callable[[LogLevel, str], object] | None = None,
         log_level: LogLevel | str = LogLevel.DEBUG,
         log_format: LogFormat | str = LogFormat.HUMAN,
@@ -1047,8 +1049,8 @@ class Server:
     def backend(self) -> Backend:
         """The I/O implementation initialization chose."""
     @property
-    def cpu_class(self) -> CPUClass:
-        """The CPU kernels initialization chose."""
+    def cpu_class_ceiling(self) -> CPUClass:
+        """The CPU kernels initialization chose under the ceiling."""
     @property
     def addresses(self) -> tuple[str, ...]:
         """The resolved "host:port" of each interface."""
@@ -1430,7 +1432,8 @@ class Client:
       peer_authorizer (Callable[[bytes], bool], optional): Admits a Noise server by its 32-byte
         static key, required to call under `Security.NOISE_XX`.
       backend (Backend, optional): The I/O implementation. Defaults to `Backend.AUTOMATIC`.
-      cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.UNKNOWN`.
+      cpu_class_ceiling (CPUClass, optional): The newest CPU kernels to use; the newest compiled
+        class fitting both it and this machine runs. Defaults to `CPUClass.UNKNOWN`, no ceiling.
       log (Callable[[LogLevel, str], object], optional): Receives every line the client writes,
         such as a dial that failed every address; None writes nothing.
       log_level (LogLevel, optional): The least severe line `log` receives. Defaults to DEBUG.
@@ -1462,7 +1465,7 @@ class Client:
         noise_private_key: bytes | None = None,
         peer_authorizer: Callable[[bytes], bool] | None = None,
         backend: Backend | str = Backend.AUTOMATIC,
-        cpu_class: CPUClass | str = CPUClass.UNKNOWN,
+        cpu_class_ceiling: CPUClass | str = CPUClass.UNKNOWN,
         log: Callable[[LogLevel, str], object] | None = None,
         log_level: LogLevel | str = LogLevel.DEBUG,
         log_format: LogFormat | str = LogFormat.HUMAN,

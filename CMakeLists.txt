@@ -37,9 +37,11 @@ option(UCALL_WITH_LINUX_URING "Include Linux io_uring 6.12 and 6.18 backends" ${
 option(UCALL_BUILD_PYTHON "Build the CPython extension; `pyproject.toml` switches it on" OFF)
 option(UCALL_BUILD_EXAMPLES "Build the hello, echo, ledger, key-value, and inference examples" OFF)
 option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
+option(UCALL_BUILD_TOOLS "Build the `ucall` command-line client in tools/" OFF)
 option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" OFF)
 option(UCALL_BUILD_FUZZ "Build libFuzzer harnesses for the parsers; needs Clang" OFF)
 option(UCALL_BUILD_SHARED "Compile ucall_shared in the default build and install both libraries" OFF)
+option(UCALL_BUILD_STUB "Compile a stand-in for the C interface that serves no network" OFF)
 option(UCALL_INSTALL "Install the C headers, libraries and CMake package" ${PROJECT_IS_TOP_LEVEL})
 option(UCALL_WERROR "Treat compiler warnings as errors" OFF)
 set(UCALL_BUILD_SANITIZERS
@@ -108,6 +110,7 @@ endif ()
 if (UCALL_BUILD_TEST
     OR UCALL_BUILD_BENCH
     OR UCALL_BUILD_EXAMPLES
+    OR UCALL_BUILD_TOOLS
     OR UCALL_INSTALL
 )
     include(cmake/fmt.cmake)
@@ -203,7 +206,7 @@ set_target_properties(ucall_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSI
 
 # One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
 # kits and atomics use, oldest first, `serial` over none. A class exists when each of them is compiled. Its unit
-# compiles at the floor: StringZilla's kernels are archive symbols carrying their own targets and ForkUnion spells its
+# compiles at the floor: StringZilla's header-only kernels carry their own target pragmas and ForkUnion spells its
 # instructions in assembly, so no shared inline function is emitted with a class's instruction set. A multiversioned
 # build keeps every class that exists. A monoversioned one keeps none of them, serial included, and compiles the
 # `monoversioned` class instead, over every capability the libraries enabled. Every gate is `UCALL_TARGET_<CLASS>`. A
@@ -266,6 +269,16 @@ ucall_cpu_variant(
     arm64_lse
     arm64_rcpc
 )
+ucall_cpu_variant(
+    apple_m4
+    APPLE_M4
+    neon
+    neonaes
+    neonsha
+    arm64_lse
+    arm64_rcpc
+    arm64_wfet
+)
 ucall_cpu_variant(alibaba_c930 ALIBABA_C930 rvv riscv64_wrs riscv64_zacas)
 ucall_cpu_variant(ibm_power10 IBM_POWER10 powervsx ppc64_pause ppc64_amo)
 
@@ -312,9 +325,9 @@ if (UCALL_BUILD_EXAMPLES)
     add_executable(ucall_example_hello examples/hello.c)
     target_link_libraries(ucall_example_hello PRIVATE ucall_static ucall_warnings)
 endif ()
-# The command-line client builds with the examples and with anything installed, where it joins the SDK.
-if (UCALL_BUILD_EXAMPLES OR UCALL_INSTALL)
-    add_executable(ucall_cli cli/ucall.cpp)
+# The command-line client builds on request and with anything installed, where it joins the SDK.
+if (UCALL_BUILD_TOOLS OR UCALL_INSTALL)
+    add_executable(ucall_cli tools/ucall.cpp)
     set_target_properties(ucall_cli PROPERTIES OUTPUT_NAME ucall)
     target_include_directories(ucall_cli PRIVATE tools)
     target_link_libraries(ucall_cli PRIVATE ucall_static fmt::fmt ucall_warnings)
@@ -332,6 +345,9 @@ if (UCALL_BUILD_PYTHON)
     add_subdirectory(python)
 endif ()
 
+if (UCALL_BUILD_STUB)
+    add_subdirectory(src_stub)
+endif ()
 if (UCALL_BUILD_TEST)
     enable_testing()
     add_subdirectory(test)

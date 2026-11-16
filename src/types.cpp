@@ -103,6 +103,7 @@ char const* ucall_cpu_class_name(ucall_cpu_class_t cpu_class) {
     case ucall_cpu_class_intel_icelake_k: return "intel-icelake";
     case ucall_cpu_class_intel_alder_k: return "intel-alder";
     case ucall_cpu_class_aws_g2_k: return "aws-g2";
+    case ucall_cpu_class_apple_m4_k: return "apple-m4";
     case ucall_cpu_class_aws_g5_k: return "aws-g5";
     case ucall_cpu_class_alibaba_c930_k: return "alibaba-c930";
     case ucall_cpu_class_ibm_power10_k: return "ibm-power10";

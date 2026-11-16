@@ -320,7 +320,7 @@ struct fixture_t {
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
         config.backend = cell.backend;
-        config.cpu_class = cell.cpu_class;
+        config.cpu_class_ceiling = cell.cpu_class_ceiling;
         config.log = settings.log;
         if (!settings.metrics_address.empty()) {
             config.metrics_address = uc::bytes_view(settings.metrics_address);
@@ -368,7 +368,7 @@ struct fixture_t {
         client_config.peer_authorizer = authorize;
         client_config.peer_authorizer_context = server_public;
         client_config.backend = cell.backend;
-        client_config.cpu_class = cell.cpu_class;
+        client_config.cpu_class_ceiling = cell.cpu_class_ceiling;
         client_config.connect_timeout_microseconds = client_config.call_timeout_microseconds = static_cast<std::size_t>(
             std::chrono::microseconds {wait_limit_k}.count());
         ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};

@@ -1,8 +1,8 @@
 # UCall Examples
 
 The native examples use the public C ABI and run with any compiled transport backend.
-They bind loopback unless `--host` names another address, and accept `--backend`, `--cpu-class`, `--threads`, `--port`, and the pipelining, Noise, batch-budget, and `--stats` flags the [benchmark guide](../bench/README.md) lists.
-The backend defaults to automatic, the CPU class to serial, and the application polling thread count to one; the port defaults to 8545.
+They bind loopback unless `--host` names another address, and accept `--backend`, `--cpu-class-ceiling`, `--threads`, `--port`, and the pipelining, Noise, batch-budget, and `--stats` flags the [benchmark guide](../bench/README.md) lists.
+The backend defaults to automatic, the CPU class ceiling to serial, and the application polling thread count to one; the port defaults to 8545.
 
 | Example                            | Individual endpoints                                | Batched endpoint                        |
 | :--------------------------------- | :-------------------------------------------------- | :-------------------------------------- |
@@ -26,5 +26,5 @@ Each executable selects among the backends compiled into the single UCall librar
 `--connections` supplies the admission budget, and `--threads` selects the application-owned polling loops.
 The application dispatches those loops through its ForkUnion pool; UCall creates no threads.
 Individual callbacks run on the polling caller.
-`SIGINT` or `SIGTERM` sets a flag the main thread checks every 100 ms, after which the examples stop and join their threads.
+`SIGINT` or `SIGTERM` sets a flag the main thread checks every 100 ms, after which the examples drain, join their threads and exit with 130; a second signal ends them at once.
 The [benchmarks](../bench/README.md) run their own servers, so these stay applications rather than measurement fixtures.

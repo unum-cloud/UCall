@@ -2703,8 +2703,8 @@ PyTypeObject BatchEndpointType = {
 #pragma region Server
 
 static char const doc_Server[] =                                                                     //
-    "Server(*interfaces, backend=Backend.AUTOMATIC, cpu_class=CPUClass.UNKNOWN, log=None,\n"         //
-    "    log_level=LogLevel.DEBUG, log_format=LogFormat.HUMAN, metrics=None)\n"                      //
+    "Server(*interfaces, backend=Backend.AUTOMATIC, cpu_class_ceiling=CPUClass.UNKNOWN,\n"           //
+    "    log=None, log_level=LogLevel.DEBUG, log_format=LogFormat.HUMAN, metrics=None)\n"            //
     "\n"                                                                                             //
     "An HTTP server over one or more interfaces, polled by threads the application starts.\n"        //
     "\n"                                                                                             //
@@ -2715,7 +2715,8 @@ static char const doc_Server[] =                                                
     "Args:\n"                                                                                        //
     "  *interfaces (Interface): Where to answer; none answers on `DEFAULT_ADDRESS`.\n"               //
     "  backend (Backend, optional): The I/O implementation. Defaults to `Backend.AUTOMATIC`.\n"      //
-    "  cpu_class (CPUClass, optional): The CPU kernels. Defaults to `CPUClass.UNKNOWN`.\n"           //
+    "  cpu_class_ceiling (CPUClass, optional): The newest CPU kernels to use; the newest compiled\n" //
+    "    class fitting both it and this machine runs. Defaults to `CPUClass.UNKNOWN`, no ceiling.\n" //
     "  log (Callable[[LogLevel, str], object], optional): Receives every line the server writes,\n"  //
     "    on whichever thread wrote it, holding the interpreter lock; None writes nothing.\n"         //
     "  log_level (LogLevel, optional): The least severe line `log` receives. Defaults to DEBUG.\n"   //
@@ -2764,19 +2765,24 @@ static int server_metrics(PyObject* metrics, ucall_server_options_t* config, uca
 }
 
 static PyObject* Server_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
-    PyObject *backend = NULL, *cpu_class = NULL, *log = NULL, *log_level = NULL, *log_format = NULL, *metrics = NULL;
-    ucall_py_argument_t const arguments[] = {
-        {"backend", &backend},     {"cpu_class", &cpu_class},   {"log", &log},
-        {"log_level", &log_level}, {"log_format", &log_format}, {"metrics", &metrics}};
+    PyObject *backend = NULL, *cpu_class_ceiling = NULL, *log = NULL, *log_level = NULL, *log_format = NULL,
+             *metrics = NULL;
+    ucall_py_argument_t const arguments[] = {{"backend", &backend},
+                                             {"cpu_class_ceiling", &cpu_class_ceiling},
+                                             {"log", &log},
+                                             {"log_level", &log_level},
+                                             {"log_format", &log_format},
+                                             {"metrics", &metrics}};
     if (ucall_py_parse_tuple("Server", NULL, keywords, 0, 0, arguments, sizeof(arguments) / sizeof(arguments[0])) != 0)
         return NULL;
     ucall_server_options_t config = {0};
     int backend_value = ucall_io_backend_automatic_k, cpu_class_value = ucall_cpu_class_unknown_k;
     if (ucall_py_enum_from_object(backend, "backend", &ucall_py_backend_enum, &backend_value) != 0 ||
-        ucall_py_enum_from_object(cpu_class, "cpu_class", &ucall_py_cpu_class_enum, &cpu_class_value) != 0)
+        ucall_py_enum_from_object(cpu_class_ceiling, "cpu_class_ceiling", &ucall_py_cpu_class_enum, &cpu_class_value) !=
+            0)
         return NULL;
     config.backend = (ucall_io_backend_t)backend_value;
-    config.cpu_class = (ucall_cpu_class_t)cpu_class_value;
+    config.cpu_class_ceiling = (ucall_cpu_class_t)cpu_class_value;
     if (ucall_py_log_from_objects(log, log_level, log_format, &config.log) != 0) return NULL;
     if (log == Py_None) log = NULL;
     if (metrics == Py_None) metrics = NULL;
@@ -3522,8 +3528,8 @@ static PyObject* Server_get_backend(Server* self, [[maybe_unused]] void* closure
     return ucall_py_enum_to_object(&ucall_py_backend_enum, self->resolved.backend);
 }
 
-static PyObject* Server_get_cpu_class(Server* self, [[maybe_unused]] void* closure) {
-    return ucall_py_enum_to_object(&ucall_py_cpu_class_enum, self->resolved.cpu_class);
+static PyObject* Server_get_cpu_class_ceiling(Server* self, [[maybe_unused]] void* closure) {
+    return ucall_py_enum_to_object(&ucall_py_cpu_class_enum, self->resolved.cpu_class_ceiling);
 }
 
 static PyObject* Server_get_addresses(Server* self, [[maybe_unused]] void* closure) {
@@ -3574,7 +3580,8 @@ static PyMethodDef Server_methods[] = {
 static PyGetSetDef Server_getset[] = {
     {"event_loops", (getter)Server_get_event_loops, NULL, "Resolved loops, each needing one polling thread.", NULL},
     {"backend", (getter)Server_get_backend, NULL, "The I/O implementation initialization chose.", NULL},
-    {"cpu_class", (getter)Server_get_cpu_class, NULL, "The CPU kernels initialization chose.", NULL},
+    {"cpu_class_ceiling", (getter)Server_get_cpu_class_ceiling, NULL,
+     "The CPU kernels initialization chose under the ceiling.", NULL},
     {"addresses", (getter)Server_get_addresses, NULL, "The resolved \"host:port\" of each interface.", NULL},
     {"batch_endpoints", (getter)Server_get_batch_endpoints, NULL, "Batch endpoints, each needing a polling owner.",
      NULL},

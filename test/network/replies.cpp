@@ -364,7 +364,7 @@ static std::size_t test_path_beyond_interface(sweep_cell_t const& cell) {
         config.interfaces = interfaces;
         config.interfaces_count = 2;
         config.backend = cell.backend;
-        config.cpu_class = cell.cpu_class;
+        config.cpu_class_ceiling = cell.cpu_class_ceiling;
         ucall_server_options_t resolved {};
         ucall_outcome_t outcome {};
         ucall_server_init_t init {&state.server, &outcome, &config, &resolved};
@@ -1030,7 +1030,7 @@ static std::size_t test_client_free_on_another_ring_thread(sweep_cell_t const& c
             ucall_client_options_t config {};
             config.max_concurrent_connections = 1;
             config.backend = cell.backend;
-            config.cpu_class = cell.cpu_class;
+            config.cpu_class_ceiling = cell.cpu_class_ceiling;
             ucall_client_init_t init {&own, &outcome, &config, nullptr};
             ucall_client_init(&init);
             ucall_client_free(client);
@@ -1390,7 +1390,7 @@ std::size_t check_replies(sweep_cell_t const& cell, settings_t const& settings) 
         (cell.backend == ucall_io_backend_linux_uring612_k || cell.backend == ucall_io_backend_linux_uring618_k)) {
         failures += test_zero_copy_pins_past_memlock(cell, generator);
     }
-    if (cell.security == ucall_security_none_k && cell.cpu_class == ucall_cpu_class_unknown_k) {
+    if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k) {
         failures += test_warm_file_reply_allocates_nothing(cell);
     }
     return failures;

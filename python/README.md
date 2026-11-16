@@ -39,7 +39,8 @@ assert bytes(response.body) == b"Hello, world"
 
 ## Serving
 
-`ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
+`ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class_ceiling` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
+The ceiling caps the CPU class rather than demanding it: the newest compiled class fitting both it and the machine runs, and `server.cpu_class_ceiling` reports that class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, evicting the idle keep-alive connection that progressed least recently for a new peer, and reads one request per connection at a time unless `pipelined_requests` allows more, while replies still leave in request order.
 `max_request_bytes=` answers 413 past its size, `reply_directories=` names the directories a `ucall.Path` part resolves beneath, and `descriptor=` takes a listening socket that systemd or a supervisor opened in place of an address, which the server never closes.
@@ -50,8 +51,8 @@ import ucall
 
 public = ucall.Interface("0.0.0.0:0", event_loops=4, connections=16_384, pipelined_requests=16)
 health = ucall.Interface("127.0.0.1:0", connections=4)
-server = ucall.Server(public, health, backend="automatic", cpu_class=ucall.CPUClass.SERIAL)
-print(f"{server.event_loops} event loops on {server.backend.name} with {server.cpu_class.name} kernels")
+server = ucall.Server(public, health, backend="automatic", cpu_class_ceiling=ucall.CPUClass.SERIAL)
+print(f"{server.event_loops} event loops on {server.backend.name} with {server.cpu_class_ceiling.name} kernels")
 
 
 @server.get("/users/{user}/files/{*path}")

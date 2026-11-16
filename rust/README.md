@@ -39,7 +39,7 @@ The polling thread runs the handler, the client blocks in `get` until its respon
 
 ## Serving
 
-`Server::new` takes the interfaces to answer on, and `Server::with_options` also takes `ServerOptions`: the `Backend`, an optional `CPUClass` ceiling, a `Log` sink and a StatsD endpoint in `Metrics`.
+`Server::new` takes the interfaces to answer on, and `Server::with_options` also takes `ServerOptions`: the `Backend`, an optional `CPUClass` ceiling that caps the picked class rather than demanding one the machine lacks, a `Log` sink and a StatsD endpoint in `Metrics`.
 It fails rather than substituting when the backend is unavailable or the CPU does not run the class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
@@ -56,9 +56,9 @@ let public = Interface::new("0.0.0.0:8545").event_loops(4).connections(16_384).p
 let health = Interface::new("127.0.0.1:8546").connections(4);
 let log = Log { callback: Arc::new(|level: LogLevel, line: &[u8]| eprintln!("{level:?} {}", String::from_utf8_lossy(line))), format: LogFormat::Human, level: LogLevel::Warning };
 let metrics = Metrics { address: "127.0.0.1:8125".into(), prefix: "myapp".into(), ..Default::default() };
-let options = ServerOptions { cpu_class: Some(CPUClass::Serial), log: Some(log), metrics: Some(metrics), ..Default::default() };
+let options = ServerOptions { cpu_class_ceiling: Some(CPUClass::Serial), log: Some(log), metrics: Some(metrics), ..Default::default() };
 let mut server = Server::with_options(&[public, health], options)?;
-println!("{} event loops on {} with {} kernels", server.event_loops(), server.backend(), server.cpu_class());
+println!("{} event loops on {} with {} kernels", server.event_loops(), server.backend(), server.cpu_class_ceiling());
 
 server.get("/users/{user}/files/{*path}", |request: Request| {
     let user = request.path_parameter("user").unwrap_or_default();

@@ -20,6 +20,7 @@ Pin a commit, not a version, when building on them.
   - `types.hpp`: `io_request_t` and the operations it asks for, `io_completion_t`, `io_statistics_t`, `wake_channel_t`, and the readiness helpers the polling engines share.
   - `posix_engine.hpp`: `posix_engine`, nonblocking POSIX syscalls completed through poll readiness.
   - `bsd_kqueue_engine.hpp`: `bsd_kqueue_engine` over `kqueue_readiness`, for Apple and FreeBSD.
+  - `polled_file_reads.hpp`: `polled_file_reads`, POSIX AIO control blocks the poll thread reaps between waits, for macOS `kqueue`, which reports no AIO completion.
   - `linux_epollaio_engine.hpp`: `epoll_readiness`, `linux_aio_t` and `linux_epollaio_engine`, with zero-copy sends released from the error queue.
   - `linux_uring612_engine.hpp`: the io_uring components both kernel versions compose, and `linux_uring612_engine` with single-shot buffer-select receives.
   - `linux_uring618_engine.hpp`: `linux_uring618_engine`, with multishot receive streams over the same components.
@@ -54,7 +55,7 @@ Pin a commit, not a version, when building on them.
 
 `network.hpp` is the umbrella, holding `network_variant`, the alias-only descriptor every `network/` template takes, and `serial_network`.
 
-Outside `include/`, `cli/ucall.cpp` is the `ucall` command-line client, one HTTP or Noise call over the C ABI, and `test/properties.hpp` holds the oracles over these parsers that the seeded suite cases and the libFuzzer harnesses in `test/fuzz/` share.
+Outside `include/`, `tools/ucall.cpp` is the `ucall` command-line client, one HTTP or Noise call over the C ABI, and `test/properties.hpp` holds the oracles over these parsers that the seeded suite cases and the libFuzzer harnesses in `test/fuzz/` share.
 
 ## I/O Engines
 
@@ -65,6 +66,6 @@ Every engine answers the same requests, and each spends what its kernel offers:
   The 6.18 variant adds multishot receive and vectored `READV_FIXED` file reads.
 - __Readiness and completion ports.__
   `linux-epollaio` reads files through Linux AIO completing into its epoll set, sends with `MSG_ZEROCOPY`, and refuses to start where `io_setup` is refused, naming `fs.aio-max-nr`.
-  `posix` and macOS `kqueue` read files blocking, FreeBSD `kqueue` through `aio_read`, and IOCP through overlapped unbuffered reads; these send by copying.
+  `posix` reads files blocking; FreeBSD `kqueue` reads them through `aio_read` landing as `EVFILT_AIO` events, and macOS `kqueue` through `aio_read`, a vectored read as `lio_listio` batches, polled with `aio_error` while its wait shrinks from 1 µs to 1 ms; IOCP reads through overlapped unbuffered reads. These send by copying, and a kernel refusing to queue a read has it read blocking.
 - __Credit-limited accepts.__
   Accepts remain one-shot operations: multishot direct accept can consume more connections than a finite file table can install before userspace observes a completion.

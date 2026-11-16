@@ -452,7 +452,7 @@ The total row's `driver_cpu_us_per_request` divides the driver's user and system
 Its `driver_busy_fraction` divides the same time by the elapsed time of every client, so a fraction near 1 means the driver, not the server, bounded the run.
 Rejected submissions, failed exchanges, and incorrect echo bytes are counted and produce a nonzero exit status.
 
-`--backend` and `--cpu-class` select the implementation and kernel bundle, and the report prints each active worker's resolved choices.
+`--backend` and `--cpu-class-ceiling` select the implementation and kernel bundle, and the report prints each active worker's resolved choices.
 Explicit unsupported selections fail instead of silently changing the experiment.
 `--help` lists every flag; each one also reads its default from a `UCALL_BENCH_` variable named after it, so `UCALL_BENCH_TIME_LIMIT=10s` stands in for `--time-limit 10s` and the command line overrides it.
 `--pin` lets the ForkUnion pool pin each worker to its own core where the operating system allows, and the report says whether it did.
@@ -483,7 +483,7 @@ build_release/ucall_bench_http --url http://127.0.0.1:8545/echo --bytes 1024 --v
 ## Server Counters
 
 The driver reads no counters from the server, so it prints where they come from instead.
-The native server and every native example print their counters when stopped with `SIGINT` or `SIGTERM`: one line per event loop from `ucall_server_event_loop_statistics()` and one per batch endpoint from `ucall_server_batch_endpoint_statistics()`:
+The native server and every native example print their counters when stopped with `SIGINT` or `SIGTERM`, then exit with 130, as shells report a command `SIGINT` ended: one line per event loop from `ucall_server_event_loop_statistics()` and one per batch endpoint from `ucall_server_batch_endpoint_statistics()`:
 
 ```text
 Event loop 0: 41068 polls, 0 empty polls, 41065 kernel enters, 40242 submissions, 80241 completions, 1 cancellations, 79 accepts, 40000 requests, 0 receive re-arms, 44440000 bytes received, 45640000 bytes sent, 85400000 bytes copied, 79 zero-copy sends, 79 zero-copy fallbacks, 39921 copying sends, 0 asynchronous file reads, 0 blocking file reads, 0 bytes read, 0 file window overlaps, 0 linger resets, 120000 ready passes, 40000 replied dequeues, 0 refused requests, 0 handshake failures, 0 authorizer refusals

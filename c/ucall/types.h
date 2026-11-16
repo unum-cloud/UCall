@@ -216,7 +216,7 @@ typedef enum ucall_io_backend_t {
 /** A CPU kernel bundle, named with the same native classes as the sibling libraries. */
 typedef enum ucall_cpu_class_t {
 
-    /** Picks the newest class this machine runs. */
+    /** Sets no ceiling, picking the newest class this machine runs. */
     ucall_cpu_class_unknown_k = 0,
 
     // Portable
@@ -245,6 +245,11 @@ typedef enum ucall_cpu_class_t {
 
     /** NEON kernels with the AES and SHA extensions, as on AWS Graviton2. */
     ucall_cpu_class_aws_g2_k = 12,
+
+    /** Adds WFET timed waits to the kernels and atomics of @c ucall_cpu_class_aws_g5_k, as on
+     *  Apple M4. Earlier Apple cores dispatch exactly as Graviton5 and run that class, so 13, the
+     *  Apple M2 value other Unum libraries use, names nothing here. */
+    ucall_cpu_class_apple_m4_k = 14,
 
     /** As on AWS Graviton5, running the kernels of @c ucall_cpu_class_aws_g2_k. */
     ucall_cpu_class_aws_g5_k = 15,

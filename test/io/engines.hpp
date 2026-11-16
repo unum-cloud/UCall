@@ -740,6 +740,8 @@ std::size_t visit_rebound(ucall_cpu_class_t cpu_class, visit_type_&& visit) {
         return visit.template operator()<rebound_engine_t<cpu_class_t::aws_g2_k, engine_type_>>();
     case ucall_cpu_class_aws_g5_k:
         return visit.template operator()<rebound_engine_t<cpu_class_t::aws_g5_k, engine_type_>>();
+    case ucall_cpu_class_apple_m4_k:
+        return visit.template operator()<rebound_engine_t<cpu_class_t::apple_m4_k, engine_type_>>();
     case ucall_cpu_class_alibaba_c930_k:
         return visit.template operator()<rebound_engine_t<cpu_class_t::alibaba_c930_k, engine_type_>>();
     case ucall_cpu_class_ibm_power10_k:
@@ -761,7 +763,8 @@ std::size_t check_engine(ucall_io_backend_t backend, settings_t const& settings,
     if (settings.backend != ucall_io_backend_automatic_k && settings.backend != backend) return 0;
     std::size_t failures_count = 0;
     for (ucall_cpu_class_t const cpu_class : admitted_classes()) {
-        if (settings.cpu_class != ucall_cpu_class_unknown_k && settings.cpu_class != cpu_class) continue;
+        if (settings.cpu_class_ceiling != ucall_cpu_class_unknown_k && settings.cpu_class_ceiling != cpu_class)
+            continue;
         sz::string_t const name = formatted("io {} {}", ucall_io_backend_name(backend),
                                             ucall_cpu_class_name(cpu_class));
         if (!settings.filter.selects(name)) continue;

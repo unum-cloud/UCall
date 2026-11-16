@@ -30,6 +30,7 @@ enum class cpu_class_t : std::uint32_t {
     intel_alder_k = ucall_cpu_class_intel_alder_k,
     aws_g2_k = ucall_cpu_class_aws_g2_k,
     aws_g5_k = ucall_cpu_class_aws_g5_k,
+    apple_m4_k = ucall_cpu_class_apple_m4_k,
     alibaba_c930_k = ucall_cpu_class_alibaba_c930_k,
     ibm_power10_k = ucall_cpu_class_ibm_power10_k,
 };
@@ -37,12 +38,12 @@ enum class cpu_class_t : std::uint32_t {
 static_assert(ucall_cpu_class_serial_k == 1 && ucall_cpu_class_monoversioned_k == 2 &&
               ucall_cpu_class_ibm_power10_k == 18);
 
-/** Every class the C enum names, in value order: the one table its names and pins check against. */
+/** Every class the C enum names, in value order: the one table names and ceilings check against. */
 constexpr ucall_cpu_class_t cpu_classes_k[] {
     ucall_cpu_class_serial_k,        ucall_cpu_class_monoversioned_k, ucall_cpu_class_intel_haswell_k,
     ucall_cpu_class_intel_skylake_k, ucall_cpu_class_intel_icelake_k, ucall_cpu_class_intel_alder_k,
-    ucall_cpu_class_aws_g2_k,        ucall_cpu_class_aws_g5_k,        ucall_cpu_class_alibaba_c930_k,
-    ucall_cpu_class_ibm_power10_k,
+    ucall_cpu_class_aws_g2_k,        ucall_cpu_class_apple_m4_k,      ucall_cpu_class_aws_g5_k,
+    ucall_cpu_class_alibaba_c930_k,  ucall_cpu_class_ibm_power10_k,
 };
 
 constexpr cpu_class_t parent_class_of(cpu_class_t cpu) noexcept {
@@ -51,6 +52,7 @@ constexpr cpu_class_t parent_class_of(cpu_class_t cpu) noexcept {
     case cpu_class_t::intel_icelake_k: return cpu_class_t::intel_skylake_k;
     case cpu_class_t::intel_skylake_k: return cpu_class_t::intel_haswell_k;
     case cpu_class_t::aws_g5_k: return cpu_class_t::aws_g2_k;
+    case cpu_class_t::apple_m4_k: return cpu_class_t::aws_g5_k;
     default: return cpu_class_t::serial_k;
     }
 }
@@ -65,7 +67,8 @@ constexpr sz_capability_t stringzilla_capabilities_of(cpu_class_t cpu) noexcept 
     case cpu_class_t::intel_alder_k:
         return stringzilla_capabilities_of(cpu_class_t::intel_haswell_k) | sz_cap_goldmont_k;
     case cpu_class_t::aws_g2_k:
-    case cpu_class_t::aws_g5_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
+    case cpu_class_t::aws_g5_k:
+    case cpu_class_t::apple_m4_k: return sz_cap_serial_k | sz_cap_neon_k | sz_cap_neonaes_k | sz_cap_neonsha_k;
     case cpu_class_t::alibaba_c930_k: return sz_cap_serial_k | sz_cap_rvv_k;
     case cpu_class_t::ibm_power10_k: return sz_cap_serial_k | sz_cap_powervsx_k;
     case cpu_class_t::monoversioned_k: return sz_capabilities_compiled_cpu_mask();
@@ -88,6 +91,11 @@ struct atomic_ref_for_cpu_class<cpu_class_t::aws_g2_k> {
 #if FORKUNION_TARGET_ARM64_RCPC
 template <>
 struct atomic_ref_for_cpu_class<cpu_class_t::aws_g5_k> {
+    template <typename value_type_>
+    using type = fu::arm64_rcpc_atomic_ref<value_type_>;
+};
+template <>
+struct atomic_ref_for_cpu_class<cpu_class_t::apple_m4_k> {
     template <typename value_type_>
     using type = fu::arm64_rcpc_atomic_ref<value_type_>;
 };
@@ -154,6 +162,10 @@ struct row_kit_for_cpu_class<cpu_class_t::aws_g2_k> {
     using type = st::neon_row_kit_t;
 };
 template <>
+struct row_kit_for_cpu_class<cpu_class_t::apple_m4_k> {
+    using type = st::neon_row_kit_t;
+};
+template <>
 struct row_kit_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = st::neon_row_kit_t;
 };
@@ -178,9 +190,10 @@ struct row_kit_for_cpu_class<cpu_class_t::monoversioned_k> {
 #endif
 
 /** The wait instruction one CPU class pairs: x86 spins on PAUSE, the Graviton2 class on YIELD, the
- *  Graviton5 class sleeps in WFE, the C930 class in WRS.NTO, the POWER10 class spins on
- *  @c pause_short, and a monoversioned build takes its target's pick. Everything else yields, as
- *  does a class whose @c FORKUNION_TARGET_<BIT> is off, such as under ThreadSanitizer. */
+ *  Graviton5 class sleeps in WFE, the Apple M4 class in WFET, the C930 class in WRS.NTO, the
+ *  POWER10 class spins on @c pause_short, and a monoversioned build takes its target's pick.
+ *  Everything else yields, as does a class whose @c FORKUNION_TARGET_<BIT> is off, such as one
+ *  compiled under ThreadSanitizer, which turns the assembly waits off. */
 template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
@@ -213,6 +226,12 @@ struct waiter_for_cpu_class<cpu_class_t::aws_g2_k> {
 template <>
 struct waiter_for_cpu_class<cpu_class_t::aws_g5_k> {
     using type = fu::arm64_wfe_t;
+};
+#endif
+#if FORKUNION_TARGET_ARM64_WFET
+template <>
+struct waiter_for_cpu_class<cpu_class_t::apple_m4_k> {
+    using type = fu::arm64_wfet_t;
 };
 #endif
 #if FORKUNION_TARGET_RISCV64_WRS
@@ -287,6 +306,9 @@ constexpr bool cpu_class_compiled(cpu_class_t cpu) noexcept {
 #if UCALL_TARGET_AWS_G5
     case cpu_class_t::aws_g5_k: return true;
 #endif
+#if UCALL_TARGET_APPLE_M4
+    case cpu_class_t::apple_m4_k: return true;
+#endif
 #if UCALL_TARGET_ALIBABA_C930
     case cpu_class_t::alibaba_c930_k: return true;
 #endif
@@ -321,7 +343,7 @@ consteval bool class_advances() noexcept {
                            typename parent_t::template atomic_ref<std::uint32_t>>;
 }
 
-/** ForkUnion's mask for a class named at run time, as a pinned class names it. */
+/** ForkUnion's mask for a class named at run time, as a ceiling names it. */
 constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept {
     switch (cpu) {
     case cpu_class_t::intel_haswell_k: return cpu_traits<cpu_class_t::intel_haswell_k>::forkunion_capabilities_k;
@@ -330,6 +352,7 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept
     case cpu_class_t::intel_alder_k: return cpu_traits<cpu_class_t::intel_alder_k>::forkunion_capabilities_k;
     case cpu_class_t::aws_g2_k: return cpu_traits<cpu_class_t::aws_g2_k>::forkunion_capabilities_k;
     case cpu_class_t::aws_g5_k: return cpu_traits<cpu_class_t::aws_g5_k>::forkunion_capabilities_k;
+    case cpu_class_t::apple_m4_k: return cpu_traits<cpu_class_t::apple_m4_k>::forkunion_capabilities_k;
     case cpu_class_t::alibaba_c930_k: return cpu_traits<cpu_class_t::alibaba_c930_k>::forkunion_capabilities_k;
     case cpu_class_t::ibm_power10_k: return cpu_traits<cpu_class_t::ibm_power10_k>::forkunion_capabilities_k;
     case cpu_class_t::monoversioned_k: return cpu_traits<cpu_class_t::monoversioned_k>::forkunion_capabilities_k;
@@ -344,24 +367,22 @@ constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
     return (strings & ~ceiling.strings) == 0 && (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
 }
 
-/** What one server or client may use: the masks this machine runs when nothing is pinned, the
- *  pinned class's masks when it runs them, refusing a value no class takes with
- *  @c ucall_status_invalid_argument_k, and a class the machine does not run or a ceiling no
- *  compiled class fits, like one below a monoversioned build's masks, with
+/** What one server or client may use: the masks this machine runs, intersected with the masks of
+ *  @p class_ceiling unless it is unknown, so a class the machine lacks caps rather than refuses.
+ *  A value no class takes answers @c ucall_status_invalid_argument_k, and an intersection no
+ *  compiled class fits, like one below a monoversioned build's masks, answers
  *  @c ucall_status_unsupported_k. The one caller of StringZilla's and ForkUnion's detection. */
-inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t pinned, cpu_ceiling_t& ceiling) noexcept {
-    bool known = pinned == ucall_cpu_class_unknown_k;
-    for (ucall_cpu_class_t const cpu_class : cpu_classes_k) known |= cpu_class == pinned;
+inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t class_ceiling, cpu_ceiling_t& ceiling) noexcept {
+    bool known = class_ceiling == ucall_cpu_class_unknown_k;
+    for (ucall_cpu_class_t const cpu_class : cpu_classes_k) known |= cpu_class == class_ceiling;
     if (!known) return ucall_status_invalid_argument_k;
     cpu_ceiling_t picked;
     if (sz_capabilities_detected_cpu(&picked.strings) != sz_success_k) picked.strings = sz_cap_serial_k;
     picked.sync = fu::cpu_capabilities();
-    if (pinned != ucall_cpu_class_unknown_k) {
-        cpu_class_t const pinned_class = static_cast<cpu_class_t>(pinned);
-        cpu_ceiling_t const wanted {stringzilla_capabilities_of(pinned_class), forkunion_capabilities_of(pinned_class)};
-        if ((picked.strings & wanted.strings) != wanted.strings || (picked.sync & wanted.sync) != wanted.sync)
-            return ucall_status_unsupported_k;
-        picked = wanted;
+    if (class_ceiling != ucall_cpu_class_unknown_k) {
+        cpu_class_t const capped = static_cast<cpu_class_t>(class_ceiling);
+        picked.strings &= stringzilla_capabilities_of(capped);
+        picked.sync = static_cast<fu::capabilities_t>(picked.sync & forkunion_capabilities_of(capped));
     }
     for (ucall_cpu_class_t const rung : cpu_classes_k)
         if (cpu_class_compiled(static_cast<cpu_class_t>(rung)) &&
@@ -392,9 +413,10 @@ using cpu_ladder_t = cpu_ladder<cpu_class_t::monoversioned_k>;
 inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::monoversioned_k;
 static_assert(compiled_rungs(cpu_ladder_t {}) <= 1);
 #else
-using cpu_ladder_t = cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_alder_k,
-                                cpu_class_t::intel_haswell_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k,
-                                cpu_class_t::alibaba_c930_k, cpu_class_t::ibm_power10_k, cpu_class_t::serial_k>;
+using cpu_ladder_t =
+    cpu_ladder<cpu_class_t::intel_icelake_k, cpu_class_t::intel_skylake_k, cpu_class_t::intel_alder_k,
+               cpu_class_t::intel_haswell_k, cpu_class_t::apple_m4_k, cpu_class_t::aws_g5_k, cpu_class_t::aws_g2_k,
+               cpu_class_t::alibaba_c930_k, cpu_class_t::ibm_power10_k, cpu_class_t::serial_k>;
 inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::serial_k;
 #endif
 

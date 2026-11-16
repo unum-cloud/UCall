@@ -73,7 +73,7 @@ struct ucall_server_options_t {
     metrics_tags_count: usize,
     metrics_interval_microseconds: usize,
     backend: ucall_io_backend_t,
-    cpu_class: ucall_cpu_class_t,
+    cpu_class_ceiling: ucall_cpu_class_t,
 }
 
 #[repr(C)]
@@ -541,9 +541,9 @@ impl Interface {
 pub struct ServerOptions {
     /// The requested I/O backend, failing rather than substituting when it is unavailable.
     pub backend: Backend,
-    /// A ceiling on the CPU class, failing where the CPU does not run it; `None` takes what the
-    /// constructing thread's CPU offers.
-    pub cpu_class: Option<CPUClass>,
+    /// A ceiling on the CPU class, intersected with what the constructing thread's CPU runs: the
+    /// newest compiled class fitting both runs, and `None` sets no ceiling.
+    pub cpu_class_ceiling: Option<CPUClass>,
     /// Where log lines go; `None` keeps the server silent.
     pub log: Option<Log>,
     /// Where StatsD datagrams go; `None` sends none.
@@ -743,7 +743,7 @@ impl Server {
             metrics_tags_count: tags.len(),
             metrics_interval_microseconds: microseconds(metrics.interval),
             backend: options.backend.to_raw(),
-            cpu_class: CPUClass::to_raw(options.cpu_class),
+            cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
         };
         let mut raw: ucall_server_t = ptr::null_mut();
         let mut resolved = config;
@@ -772,9 +772,9 @@ impl Server {
         Backend::from_raw(self.core.resolved.backend)
     }
 
-    /// The CPU class the server resolved to.
-    pub fn cpu_class(&self) -> CPUClass {
-        CPUClass::from_raw(self.core.resolved.cpu_class).unwrap_or(CPUClass::Serial)
+    /// The CPU class the server resolved to under its ceiling.
+    pub fn cpu_class_ceiling(&self) -> CPUClass {
+        CPUClass::from_raw(self.core.resolved.cpu_class_ceiling).unwrap_or(CPUClass::Serial)
     }
 
     /// The numeric address interface `index` listens on, with the port it bound.
@@ -2015,6 +2015,37 @@ mod tests {
         Stopping, client, detaching, direct_directory, loopback, next_detached, open_direct, pattern, serving,
     };
     use crate::types::{derive_noise_public_key, generate_noise_keypair};
+
+    #[test]
+    fn cpu_class_ceiling_caps_rather_than_refuses() {
+        let open = |ceiling| {
+            let options = ServerOptions { cpu_class_ceiling: Some(ceiling), ..Default::default() };
+            Server::with_options(&[loopback(1)], options).unwrap().cpu_class_ceiling()
+        };
+        let mut capped = false;
+        for ceiling in [
+            CPUClass::Serial,
+            CPUClass::Monoversioned,
+            CPUClass::IntelHaswell,
+            CPUClass::IntelSkylake,
+            CPUClass::IntelIcelake,
+            CPUClass::IntelAlder,
+            CPUClass::AWSG2,
+            CPUClass::AppleM4,
+            CPUClass::AWSG5,
+            CPUClass::AlibabaC930,
+            CPUClass::IBMPower10,
+        ] {
+            Client::new(ClientOptions { connections: 1, cpu_class_ceiling: Some(ceiling), ..Default::default() })
+                .unwrap();
+            let picked = open(ceiling);
+            // The class a ceiling resolves to is one this machine runs, so it picks itself again.
+            assert_eq!(open(picked), picked);
+            // No CPU runs two architectures' classes, so another one's ceiling lands on serial.
+            capped |= ceiling != CPUClass::Serial && picked == CPUClass::Serial;
+        }
+        assert!(capped);
+    }
 
     #[test]
     fn get_reads_path_and_query_parameters() {

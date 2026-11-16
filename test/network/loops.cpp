@@ -82,25 +82,46 @@ static std::size_t test_ring_refused_at_init_falls_back() {
 #endif
 }
 
+/** The class a client under @p ceiling resolves to, or unknown when it does not initialize. */
+static ucall_cpu_class_t resolved_class(ucall_cpu_class_t ceiling, ucall_status_t& status) {
+    ucall_client_t handle {};
+    ucall_outcome_t outcome {};
+    ucall_client_options_t config {}, resolved {};
+    config.cpu_class_ceiling = ceiling;
+    config.max_concurrent_connections = 1;
+    ucall_client_init_t init {&handle, &outcome, &config, &resolved};
+    ucall_client_init(&init);
+    ucall_client_free(handle);
+    status = outcome.status;
+    return status == ucall_status_success_k ? resolved.cpu_class_ceiling : ucall_cpu_class_unknown_k;
+}
+
 static std::size_t test_cpu_class_ceiling() {
     std::size_t failures = 0;
-    bool refused = false;
+    bool capped = false;
     for (ucall_cpu_class_t const cpu_class : uc::cpu_classes_k) {
-        ucall_client_t handle {};
-        ucall_outcome_t outcome {};
-        ucall_client_options_t config {};
-        config.cpu_class = cpu_class;
-        config.max_concurrent_connections = 1;
-        ucall_client_init_t init {&handle, &outcome, &config, nullptr};
-        ucall_client_init(&init);
-        // No CPU runs the classes of two architectures, so a pin past what this one runs must fail.
-        refused |= outcome.status == ucall_status_unsupported_k && !handle;
-        failures += expect(outcome.status == ucall_status_success_k || outcome.status == ucall_status_unsupported_k);
-        failures += expect(cpu_class != ucall_cpu_class_serial_k || !UCALL_TARGET_SERIAL ||
-                           outcome.status == ucall_status_success_k);
-        ucall_client_free(handle);
+        ucall_status_t status;
+        ucall_cpu_class_t const picked = resolved_class(cpu_class, status);
+        // A monoversioned build fits under no ceiling below its one class's capabilities.
+        if (UCALL_TARGET_MONOVERSIONED) {
+            failures += expect(status == ucall_status_success_k || status == ucall_status_unsupported_k);
+            continue;
+        }
+        // The ceiling intersects with this CPU, so every class, another architecture's included,
+        // lands on one the machine runs, which as a ceiling picks itself again.
+        char const* const name = ucall_cpu_class_name(cpu_class);
+        failures += expect(status == ucall_status_success_k, "the {} ceiling initializes", name);
+        failures += expect(picked != ucall_cpu_class_unknown_k, "the {} ceiling names its pick", name);
+        ucall_status_t again;
+        failures += expect(resolved_class(picked, again) == picked, "{} under the {} ceiling picks itself",
+                           ucall_cpu_class_name(picked), name);
+        // No CPU runs the classes of two architectures, so some ceiling lands on serial.
+        capped |= cpu_class != ucall_cpu_class_serial_k && picked == ucall_cpu_class_serial_k;
     }
-    failures += expect(refused);
+    failures += expect(UCALL_TARGET_MONOVERSIONED || capped, "a foreign ceiling resolves to serial");
+    ucall_status_t status;
+    resolved_class(static_cast<ucall_cpu_class_t>(4), status);
+    failures += expect(status == ucall_status_invalid_argument_k, "a value no class takes is refused");
     return failures;
 }
 
@@ -113,7 +134,7 @@ static std::size_t test_origin_reuse_and_fairness() {
     ucall_outcome_t outcome {};
     ucall_client_options_t config {};
     config.backend = ucall_io_backend_posix_k;
-    config.cpu_class = ucall_cpu_class_serial_k;
+    config.cpu_class_ceiling = ucall_cpu_class_serial_k;
     config.max_concurrent_connections = 3;
     config.max_concurrent_calls = 4;
     ucall_client_init_t init {&handle, &outcome, &config, nullptr};
@@ -189,7 +210,7 @@ static std::size_t test_client_batches_sends() {
     ucall_outcome_t outcome {};
     ucall_client_options_t config {};
     config.backend = ucall_io_backend_posix_k;
-    config.cpu_class = ucall_cpu_class_serial_k;
+    config.cpu_class_ceiling = ucall_cpu_class_serial_k;
     config.max_concurrent_connections = 1;
     config.max_pipelined_calls = 16;
     ucall_client_init_t init {&handle, &outcome, &config, nullptr};
@@ -256,7 +277,7 @@ static std::size_t test_backend_parity(sweep_cell_t const& cell, random_generato
     std::string reference;
     char const* reference_name = "";
     for (auto backend : backends_k) {
-        fixture_t fixture {{backend, cell.cpu_class, ucall_security_none_k}, {}};
+        fixture_t fixture {{backend, cell.cpu_class_ceiling, ucall_security_none_k}, {}};
         if (fixture.status == ucall_status_unsupported_k) continue;
         char const* name = ucall_io_backend_name(backend);
         require(failures, fixture.status == ucall_status_success_k, "{} setup: {}", name,
@@ -695,7 +716,7 @@ static std::size_t test_bound_client_counts_into_its_loop() {
 std::size_t check_loops(sweep_cell_t const& cell, settings_t const& settings) {
     random_generator_t generator {stream_key(settings.seed, name_of(cell))};
     std::size_t failures = 0;
-    if (cell.security == ucall_security_none_k && cell.cpu_class == ucall_cpu_class_unknown_k) {
+    if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k) {
         failures += test_allocator_propagation(cell);
         failures += test_allocation_failure(cell);
     }
@@ -705,7 +726,7 @@ std::size_t check_loops(sweep_cell_t const& cell, settings_t const& settings) {
         failures += test_accept_exhaustion_sheds(cell, generator);
     }
 #endif
-    if (cell.security == ucall_security_none_k && cell.cpu_class == ucall_cpu_class_unknown_k &&
+    if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k &&
         cell.backend == ucall_io_backend_posix_k) {
         failures += test_ring_refused_at_init_falls_back();
         failures += test_cpu_class_ceiling();
@@ -715,7 +736,7 @@ std::size_t check_loops(sweep_cell_t const& cell, settings_t const& settings) {
         failures += test_bound_client_counts_into_its_loop();
     }
 #if UCALL_OS_POSIX_
-    if (cell.security == ucall_security_none_k && cell.cpu_class == ucall_cpu_class_unknown_k &&
+    if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k &&
         cell.backend == ucall_io_backend_posix_k) {
         failures += test_backend_parity(cell, generator);
     }

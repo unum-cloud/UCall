@@ -1,5 +1,5 @@
 """The Mojo binding's tests: the library's name tables and helpers, then a server on a loopback port
-driven by a client bound to its event loop, all on one thread.
+driven by a client bound to its event loop, all on one thread, and the README's Quickstart.
 
 Mojo has no test discovery, so every check below is registered in `main`, and one that is not
 silently never runs.
@@ -55,6 +55,7 @@ def test_names_come_from_the_library() raises:
     assert_equal(library.io_backend_name(Backend.LINUX_URING618), "linux-uring618")
     assert_true(library.io_backend_from_name("linux-epollaio") == Backend.LINUX_EPOLLAIO, "a backend reads back")
     assert_equal(library.cpu_class_name(CPUClass.AWS_G5), "aws-g5")
+    assert_equal(library.cpu_class_name(CPUClass.APPLE_M4), "apple-m4")
     assert_true(library.cpu_class_from_name("serial") == CPUClass.SERIAL, "a CPU class reads back")
     assert_equal(library.version()[0], 1, "the binding loads only its own major")
     assert_true(library.version_name().startswith("1."), "the version name carries the major")
@@ -147,6 +148,34 @@ def score(batch: Batch) raises:
 def count_line(level: LogLevel, line: StringSlice[ImmUntrackedOrigin], mut lines: Int):
     """Counts the server's log lines."""
     lines += 1
+
+
+def test_cpu_class_ceiling_caps_rather_than_refuses() raises:
+    """A ceiling naming a class this machine lacks initializes on a class it runs, which as a
+    ceiling picks itself again, and another architecture's ceiling lands on serial."""
+    var library = Library()
+    var capped = False
+    for ceiling in [
+        CPUClass.SERIAL,
+        CPUClass.MONOVERSIONED,
+        CPUClass.INTEL_HASWELL,
+        CPUClass.INTEL_SKYLAKE,
+        CPUClass.INTEL_ICELAKE,
+        CPUClass.INTEL_ALDER,
+        CPUClass.AWS_G2,
+        CPUClass.APPLE_M4,
+        CPUClass.AWS_G5,
+        CPUClass.ALIBABA_C930,
+        CPUClass.IBM_POWER10,
+    ]:
+        var options = ServerOptions()
+        options.cpu_class_ceiling = ceiling
+        var picked = Server(library, [Interface("127.0.0.1:0", connections=1)], options).cpu_class_ceiling()
+        options.cpu_class_ceiling = picked
+        var again = Server(library, [Interface("127.0.0.1:0", connections=1)], options).cpu_class_ceiling()
+        assert_true(again == picked, "the resolved class picks itself")
+        capped = capped or (ceiling != CPUClass.SERIAL and picked == CPUClass.SERIAL)
+    assert_true(capped, "another architecture's ceiling lands on serial")
 
 
 def test_server_answers_a_bound_client() raises:
@@ -267,11 +296,47 @@ def test_noise_authorizers_admit_and_reject() raises:
 # endregion Server and Client
 
 
+# region Quickstart
+
+
+def say_hello(var request: Request) raises:
+    """Greets the name its route captures."""
+    var greeting = List[Byte](capacity=64)
+    greeting.extend("Hello, ".as_bytes())
+    greeting.extend(request.path_parameter("name").value())  # copied, as the reply consumes the request
+    request^.reply(HTTPStatus.OK, greeting)
+
+
+def test_quickstart() raises:
+    """Mirrors the Quickstart of `mojo/README.md`, held equal by `test/quickstart.py`: the docstrings
+    are added, and `main` is named as a test.
+    """
+    var server = Server(Library(), [Interface("127.0.0.1:0")])
+    server.get["/hello/{name}", say_hello]()
+    var client = Client(server, ClientOptions(connections=1))  # advanced by the server's event loop
+    client.submit(ClientCall.get(String("http://", server.address(0).value(), "/hello/world")))
+    var completed = List[Completed]()
+    while len(completed) == 0:
+        _ = server.take_call(0, 1_000)
+        client.take_completed(completed)
+    var body = String(unsafe_from_utf8=completed[0].response.value().body())
+    print(body)
+    assert_equal(body, "Hello, world")
+    _ = completed^
+    _ = client^  # a bound client goes before its server
+    server.stop()
+
+
+# endregion Quickstart
+
+
 def main() raises:
     var suite = TestSuite()
     suite.test[test_names_come_from_the_library]()
     suite.test[test_percent_escapes_decode_by_mode]()
     suite.test[test_generated_noise_keys_derive_back]()
+    suite.test[test_cpu_class_ceiling_caps_rather_than_refuses]()
     suite.test[test_server_answers_a_bound_client]()
     suite.test[test_noise_authorizers_admit_and_reject]()
+    suite.test[test_quickstart]()
     suite^.run()

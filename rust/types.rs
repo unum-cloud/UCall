@@ -742,10 +742,11 @@ impl FromStr for Backend {
 /// The CPU kernels a server or client runs, from the portable `Serial` up, where `None` takes what the
 /// constructing thread's CPU offers.
 ///
-/// A class is a ceiling: the newest compiled class under it runs, failing with
-/// [`Status::Unsupported`] where the CPU does not run it. Every thread that later polls, replies, or
-/// reads must run on a CPU supporting the class resolved at construction, and `Serial` is the
-/// conservative choice where they differ. Prints and parses its stable name, like "intel-icelake".
+/// A class is a ceiling intersected with what the CPU runs: the newest compiled class fitting both
+/// runs, so a class the CPU lacks caps the pick rather than failing. Every thread that later polls,
+/// replies, or reads must run on a CPU supporting the class resolved at construction, and `Serial`
+/// is the conservative choice where they differ. Prints and parses its stable name, like
+/// "intel-icelake".
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum CPUClass {
     /// Portable kernels that run on any CPU.
@@ -762,6 +763,8 @@ pub enum CPUClass {
     IntelAlder = 11,
     /// Arm cores from AWS Graviton 2 on.
     AWSG2 = 12,
+    /// Apple cores from M4 on, adding WFET timed waits to the Graviton 5 kernels.
+    AppleM4 = 14,
     /// Arm server cores from AWS Graviton 5 on.
     AWSG5 = 15,
     /// RISC-V cores from Alibaba XuanTie C930 on, with RVV, Zawrs and Zacas.
@@ -785,6 +788,7 @@ impl CPUClass {
             6 => Some(CPUClass::IntelIcelake),
             11 => Some(CPUClass::IntelAlder),
             12 => Some(CPUClass::AWSG2),
+            14 => Some(CPUClass::AppleM4),
             15 => Some(CPUClass::AWSG5),
             17 => Some(CPUClass::AlibabaC930),
             18 => Some(CPUClass::IBMPower10),
@@ -960,6 +964,7 @@ mod tests {
         assert_eq!(Status::OutOfMemory.to_string(), "out-of-memory");
         assert_eq!(Backend::LinuxURing618.to_string(), "linux-uring618");
         assert_eq!(CPUClass::AWSG5.to_string(), "aws-g5");
+        assert_eq!(CPUClass::AppleM4.to_string(), "apple-m4");
         assert_eq!(version(), env!("CARGO_PKG_VERSION"));
     }
 

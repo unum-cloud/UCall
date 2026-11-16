@@ -84,6 +84,14 @@ if (UNIX AND TARGET ucall_cli)
     )
 endif ()
 
+# Each CPU class unit defines its own class's variants and keeps every library kernel local, compiled with its own
+# targets, so the linker never keeps one class's copy for every class.
+if (CMAKE_NM AND NOT MSVC)
+    add_test(NAME ucall_test_class_units COMMAND bash ${CMAKE_CURRENT_SOURCE_DIR}/class_units.sh ${CMAKE_NM}
+                                                 ${PROJECT_SOURCE_DIR}/c/ucall/types.h $<TARGET_OBJECTS:ucall_static>
+    )
+endif ()
+
 # The kernel ABI mirrors match the kernel's own spelling, checked at compile time against the build's headers.
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_library(ucall_test_kernel_abi OBJECT kernel_abi.cpp)

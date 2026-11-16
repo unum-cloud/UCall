@@ -27,10 +27,16 @@
 
 namespace unum::ucall::tools {
 
-/** Set by SIGINT, SIGTERM or a failing loop; the main thread checks it every 100 ms. */
+/** Set by the first SIGINT or SIGTERM, or by a failing loop; the main thread checks it every
+ *  100 ms, and the server answers what it holds before the process exits. */
 inline volatile std::sig_atomic_t stop_requested {0};
 
-inline void request_stop(int) noexcept { stop_requested = 1; }
+/** Asks the server to stop, and leaves a second signal its default action, ending the process. */
+inline void request_stop(int) noexcept {
+    stop_requested = 1;
+    std::signal(SIGINT, SIG_DFL);
+    std::signal(SIGTERM, SIG_DFL);
+}
 
 /** Answers @p request with an error @p status and @p message as its body. */
 inline void reply_error(ucall_server_t server, ucall_received_http_request_t request, ucall_http_status_t status,
@@ -98,7 +104,7 @@ struct server_t {
     }
     int init(int argc, char** argv, std::initializer_list<count_flag_t> counts = {}) {
         ucall_server_options_t config {};
-        config.cpu_class = ucall_cpu_class_serial_k;
+        config.cpu_class_ceiling = ucall_cpu_class_serial_k;
         std::size_t threads = 1;
         std::size_t port = 8545;
         std::string_view host {"127.0.0.1"};
@@ -107,11 +113,11 @@ struct server_t {
             std::string_view flag {argv[i]};
             if (flag == "--help") {
                 fmt::print(
-                    "Usage: {} [--backend name] [--cpu-class name] [--threads N] [--host IP] [--port N]\n"           //
+                    "Usage: {} [--backend name] [--cpu-class-ceiling name] [--threads N] [--host IP] [--port N]\n"   //
                     "       [--connections N] [--pipelined-requests N] [--security none|xx|ik] [--key HEX]\n"        //
                     "       [--batch-min N] [--batch-max N] [--batch-latency-us N] [--stats human|json]\n"           //
                     "       [--reply-directory PATH]\n"                                                              //
-                    "Backend defaults to automatic, CPU class to serial, and threads to 1.\n"                        //
+                    "Backend defaults to automatic, the CPU class ceiling to serial, and threads to 1.\n"            //
                     "The host defaults to 127.0.0.1 and the port to 8545; pass 0.0.0.0 or :: to accept every NIC.\n" //
                     "Admission defaults to 1024 connections of 1 request each.\n"                                    //
                     "Noise needs the 64-digit hex server private key; without --key one is generated.\n"             //
@@ -166,7 +172,7 @@ struct server_t {
                 statistics_format = value == "json" ? statistics_format_t::json_k : statistics_format_t::human_k;
             }
             else if (flag == "--backend") valid = parse_backend(value, config.backend);
-            else if (flag == "--cpu-class") valid = parse_cpu_class(value, config.cpu_class);
+            else if (flag == "--cpu-class-ceiling") valid = parse_cpu_class(value, config.cpu_class_ceiling);
             else if (extra != counts.end()) valid = parse_count(value, extra->value);
             if (!valid) {
                 fmt::print(stderr, "Invalid argument: {}={}\n", flag, value);
@@ -220,7 +226,8 @@ struct server_t {
         event_loops = resolved.interfaces[0].event_loops;
         std::string_view const bound = text_view(resolved.interfaces[0].address);
         fmt::print("Listening on {} using {}, {}, {} application-owned serving loops\n", bound,
-                   ucall_io_backend_name(resolved.backend), ucall_cpu_class_name(resolved.cpu_class), event_loops);
+                   ucall_io_backend_name(resolved.backend), ucall_cpu_class_name(resolved.cpu_class_ceiling),
+                   event_loops);
         std::fflush(stdout); // Scripts read the public key and the address before the server exits.
         return 0;
     }
@@ -289,7 +296,8 @@ struct server_t {
         while (!stop_requested) std::this_thread::sleep_for(std::chrono::milliseconds {100});
         ucall_server_stop(server);
         fu_pool_unsafe_join(pool, generation);
-        int result = 0;
+        // Every loop drained cleanly only when a signal, not a failure, stopped them.
+        int result = exit_stopped_k;
         for (ucall_outcome_t const& outcome : outcomes)
             if (!succeeded(outcome)) result = 1;
         return report() ? result : 1;

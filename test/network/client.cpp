@@ -380,7 +380,7 @@ static std::size_t test_client_log_lines(sweep_cell_t const& cell) {
     ucall_client_options_t config {};
     config.max_concurrent_connections = 1;
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     config.log = {collect, &collected, ucall_log_format_human_k, ucall_log_level_info_k};
     ucall_client_init_t init {&client, &outcome, &config, nullptr};
     ucall_client_init(&init);
@@ -639,7 +639,7 @@ static std::size_t test_bound_client_calls_from_handler(sweep_cell_t const& cell
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     ucall_server_init_t init {&front.server, &outcome, &config, &resolved};
     ucall_server_init(&init);
     require(0, outcome.status == ucall_status_success_k, "front: {}", ucall_status_name(outcome.status));
@@ -651,14 +651,14 @@ static std::size_t test_bound_client_calls_from_handler(sweep_cell_t const& cell
     bound_config.max_concurrent_connections = 1;
     bound_config.server = front.server;
     ucall_client_init_t bind {&front.bound, &outcome, &bound_config, nullptr};
-    // A pin naming another backend than the loop's is refused, and the cell's own pins bind.
+    // A backend other than the loop's is refused, and the cell's own backend and ceiling bind.
     bound_config.backend = resolved.backend == ucall_io_backend_posix_k ? ucall_io_backend_linux_epollaio_k
                                                                         : ucall_io_backend_posix_k;
     ucall_client_init(&bind);
     failures += expect(outcome.status == ucall_status_invalid_argument_k && !front.bound,
                        "a bound client pinned to another backend turned {}", ucall_status_name(outcome.status));
     bound_config.backend = resolved.backend;
-    bound_config.cpu_class = cell.cpu_class;
+    bound_config.cpu_class_ceiling = cell.cpu_class_ceiling;
     ucall_client_init(&bind);
     failures += expect(outcome.status == ucall_status_success_k, "bind: {}", ucall_status_name(outcome.status));
     ucall_server_free(front.server);
@@ -780,7 +780,7 @@ std::size_t check_client(sweep_cell_t const& cell, settings_t const& settings) {
         failures += test_client_log_lines(cell);
         failures += test_bound_client_calls_from_handler(cell);
     }
-    if (cell.security == ucall_security_none_k && cell.cpu_class == ucall_cpu_class_unknown_k) {
+    if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k) {
         failures += test_client_responses_outlive_free(cell);
         failures += test_warm_client_allocates_nothing(cell);
     }

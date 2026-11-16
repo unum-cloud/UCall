@@ -75,7 +75,7 @@ def main() raises:
     public.pipelined_requests = 16
     var health = Interface("127.0.0.1:0", connections=4)
     var options = ServerOptions()
-    options.cpu_class = CPUClass.SERIAL
+    options.cpu_class_ceiling = CPUClass.SERIAL
     var server = Server(library, [public^, health^], options)
     print(server.event_loops(), "event loops on", library.io_backend_name(server.backend()))
     server.get["/users/{user}/files/{*path}", listing]()

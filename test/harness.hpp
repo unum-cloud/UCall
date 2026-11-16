@@ -341,6 +341,7 @@ struct random_generator_t {
 static_assert(std::uniform_random_bit_generator<random_generator_t>,
               "the generator must be usable with `std::shuffle` and friends");
 
+using tools::exit_stopped_k;
 using tools::filter_t;
 using tools::read_settings;
 using tools::settings_t;
@@ -902,25 +903,28 @@ sz::string_t formatted(fmt::format_string<argument_types_ const&...> format,
     return text;
 }
 
-/** One cell of a suite's sweep: the engine it runs on, the CPU class it pins, how it encrypts. */
+/** One cell of a suite's sweep: the engine it runs on, the CPU class ceiling, how it encrypts. */
 struct sweep_cell_t {
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
-    ucall_cpu_class_t cpu_class = ucall_cpu_class_unknown_k;
+    ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
     ucall_security_t security = ucall_security_none_k;
 };
 
-/** Whether a client of @p cell 's backend under its class's ceiling initializes on this host. */
+/** Whether a client of @p cell 's backend under its ceiling initializes on this host and runs the
+ *  class the ceiling names, as a ceiling above what the machine runs resolves lower and would
+ *  sweep that lower class again under another name. */
 [[nodiscard]] inline bool opens(sweep_cell_t const& cell) noexcept {
     ucall_client_t client {};
     ucall_outcome_t outcome {};
-    ucall_client_options_t config {};
+    ucall_client_options_t config {}, resolved {};
     config.max_concurrent_connections = 1;
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
-    ucall_client_init_t init {&client, &outcome, &config, nullptr};
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
+    ucall_client_init_t init {&client, &outcome, &config, &resolved};
     ucall_client_init(&init);
     ucall_client_free(client);
-    return outcome.status == ucall_status_success_k;
+    return outcome.status == ucall_status_success_k && (cell.cpu_class_ceiling == ucall_cpu_class_unknown_k ||
+                                                        resolved.cpu_class_ceiling == cell.cpu_class_ceiling);
 }
 
 /** The engines this build compiled, in the order of @c ucall_io_backend_t. */
@@ -944,18 +948,18 @@ struct sweep_cell_t {
     return backends;
 }
 
-/** The CPU classes the library accepts as ceilings on this machine, from the portable floor up. */
+/** The CPU classes this machine runs under a ceiling naming each, from the portable floor up. */
 [[nodiscard]] inline st::vector<ucall_cpu_class_t> admitted_classes() noexcept {
     st::vector<ucall_cpu_class_t> classes;
     for (ucall_cpu_class_t const cpu_class : uc::cpu_classes_k)
-        if (opens({.cpu_class = cpu_class}) && st::failed(classes.push_back(ucall_cpu_class_t {cpu_class})))
+        if (opens({.cpu_class_ceiling = cpu_class}) && st::failed(classes.push_back(ucall_cpu_class_t {cpu_class})))
             std::abort();
     return classes;
 }
 
 /** The diagonal a suite sweeps rather than the full product: every compiled backend at the best
  *  class in plaintext, every admitted class on the first backend, and every Noise pattern on the
- *  first backend, each narrowed by the pins of @p settings. */
+ *  first backend, each narrowed by the backend and ceiling of @p settings. */
 [[nodiscard]] inline st::vector<sweep_cell_t> diagonal_sweep(settings_t const& settings) noexcept {
     st::vector<sweep_cell_t> cells;
     auto add = [&](sweep_cell_t const& cell) noexcept {
@@ -965,14 +969,14 @@ struct sweep_cell_t {
     for (ucall_io_backend_t const backend : compiled_backends()) {
         if (settings.backend != ucall_io_backend_automatic_k && settings.backend != backend) continue;
         if (first == ucall_io_backend_automatic_k) first = backend;
-        add({backend, settings.cpu_class, ucall_security_none_k});
+        add({backend, settings.cpu_class_ceiling, ucall_security_none_k});
     }
     if (first == ucall_io_backend_automatic_k) return cells;
-    if (settings.cpu_class == ucall_cpu_class_unknown_k)
+    if (settings.cpu_class_ceiling == ucall_cpu_class_unknown_k)
         for (ucall_cpu_class_t const cpu_class : admitted_classes()) add({first, cpu_class, ucall_security_none_k});
     for (ucall_security_t const security :
          {ucall_security_noise_xx_k, ucall_security_noise_ik_k, ucall_security_noise_kk_k})
-        add({first, settings.cpu_class, security});
+        add({first, settings.cpu_class_ceiling, security});
     return cells;
 }
 
@@ -989,7 +993,8 @@ struct sweep_cell_t {
 /** The name a filter selects @p cell by, like "linux-uring618 aws-g2 noise-xx". */
 [[nodiscard]] inline sz::string_t name_of(sweep_cell_t const& cell) noexcept {
     return formatted("{} {} {}", ucall_io_backend_name(cell.backend),
-                     cell.cpu_class ? ucall_cpu_class_name(cell.cpu_class) : "best", security_name(cell.security));
+                     cell.cpu_class_ceiling ? ucall_cpu_class_name(cell.cpu_class_ceiling) : "best",
+                     security_name(cell.security));
 }
 
 /** The library version, the classes it compiled and admits, the engines it compiled, and the run's

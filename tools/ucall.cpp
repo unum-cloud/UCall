@@ -1,5 +1,5 @@
 /**
- *  @file cli/ucall.cpp
+ *  @file tools/ucall.cpp
  *  @author Ash Vardanian
  *  @date November 5, 2026
  *  @brief One HTTP or Noise call from the command line, a proxy between plaintext and Noise, and
@@ -16,7 +16,7 @@
  *  The proxy is one server event loop with a client bound to it: every request goes on with its
  *  verb, target and fields but the hop-by-hop ones, and an upstream failure answers 502. It
  *  prints the address it listens on, and on SIGINT or SIGTERM stops once it answered every
- *  request in flight.
+ *  request in flight, exiting 130; a second signal ends it at once.
  *
  *  An <tt>http+noise://</tt> URL needs <tt>--server-key</tt> and dials IK, so the tool never trusts a server it
  *  was not told about; without <tt>--key</tt> it calls under a fresh identity. It exits 0 for a 2xx
@@ -35,6 +35,7 @@
 #include "ucall/ucall.h"
 #include "ucall/utilities/types.hpp" // `st::vector`, `st::failed`
 #include "arguments.hpp"             // `parse_key`, `parse_duration`
+#include "landing.hpp"               // `landed_file_t`
 
 namespace tools = unum::ucall::tools;
 namespace st = unum::ucall::st;
@@ -239,14 +240,17 @@ static int call(std::span<char*> arguments) {
         ucall_bytes_view_t body {};
         ucall_client_response_body_t read {completed.response, &outcome, &body};
         ucall_client_response_body(&read);
-        std::FILE* output = plan.output_path ? std::fopen(plan.output_path, "wb") : stdout;
-        if (!output) fmt::print(stderr, "ucall: cannot write {}\n", plan.output_path);
-        else {
-            if (plan.head == head_output_t::included_k) write_head(output, completed.response, status);
-            std::fwrite(body.data, 1, body.length, output);
-            if (output != stdout) std::fclose(output);
-            code = status / 100 == 2 ? exit_success_k : status / 100;
-        }
+        // A file output lands whole or not at all, so a failed write keeps an earlier answer.
+        tools::landed_file_t landed;
+        std::FILE* output = stdout;
+        if (plan.output_path && landed.open(plan.output_path, tools::readers_t::shared_k)) output = landed.stream();
+        else if (plan.output_path) output = nullptr;
+        if (output && plan.head == head_output_t::included_k) write_head(output, completed.response, status);
+        bool written = output && std::fwrite(body.data, 1, body.length, output) == body.length;
+        written = written && (plan.output_path ? landed.land(tools::landing_t::replace_k) : std::fflush(stdout) == 0);
+        if (written) code = status / 100 == 2 ? exit_success_k : status / 100;
+        else if (plan.output_path) fmt::print(stderr, "ucall: cannot write {}\n", plan.output_path);
+        else fmt::print(stderr, "ucall: cannot write the body to standard output\n");
         ucall_client_response_free(completed.response);
     }
     ucall_client_free(client);
@@ -557,7 +561,12 @@ static int proxy(std::span<char*> arguments) {
     int code = exit_failure_k;
     if (proxy.open()) {
         stopping_server = proxy.server;
-        auto const stop = [](int) { ucall_server_stop(stopping_server); };
+        // The first signal drains the proxy; a second takes its default action and ends it at once.
+        auto const stop = [](int) {
+            ucall_server_stop(stopping_server);
+            std::signal(SIGINT, SIG_DFL);
+            std::signal(SIGTERM, SIG_DFL);
+        };
         std::signal(SIGINT, stop);
         std::signal(SIGTERM, stop);
         for (;;) {
@@ -566,8 +575,9 @@ static int proxy(std::span<char*> arguments) {
             ucall_server_take_call_t take {proxy.server, &outcome, 0, (std::numeric_limits<std::uint32_t>::max)()};
             ucall_server_take_call(&take);
             proxy.answer_completed();
+            // Only a signal stops the loop, so a drained loop exits as a stopped command does.
             if (outcome.status == ucall_status_connection_closed_k) {
-                code = exit_success_k;
+                code = tools::exit_stopped_k;
                 break;
             }
             if (outcome.status != ucall_status_success_k) {
@@ -589,13 +599,14 @@ static int keygen(std::span<char*> arguments) {
     ucall_noise_key_generate_t generate {&outcome, &private_key, &public_key};
     ucall_noise_key_generate(&generate);
     if (outcome.status != ucall_status_success_k) return report("key generation", outcome);
-    std::FILE* file = std::fopen(arguments[0], "wx");
-    if (!file) {
+    // The private key is its owner's alone, and lands whole without replacing a key already there.
+    tools::landed_file_t landed;
+    bool const opened = landed.open(arguments[0], tools::readers_t::owner_only_k);
+    if (opened) tools::print_key(landed.stream(), private_key);
+    if (!opened || !landed.land(tools::landing_t::create_k)) {
         fmt::print(stderr, "ucall: cannot create {}, or it already exists\n", arguments[0]);
         return exit_failure_k;
     }
-    tools::print_key(file, private_key);
-    std::fclose(file);
     tools::print_key(stdout, public_key);
     return exit_success_k;
 }

@@ -63,7 +63,7 @@ struct polling_fixture_t {
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
         config.backend = cell.backend;
-        config.cpu_class = cell.cpu_class;
+        config.cpu_class_ceiling = cell.cpu_class_ceiling;
         ucall_server_options_t resolved {};
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
@@ -81,7 +81,7 @@ struct polling_fixture_t {
             client_config.max_concurrent_connections = 1;
             client_config.max_concurrent_calls = 2;
             client_config.backend = cell.backend;
-            client_config.cpu_class = cell.cpu_class;
+            client_config.cpu_class_ceiling = cell.cpu_class_ceiling;
             ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
             ucall_client_init(&client_init);
             if ((status = outcome.status) != ucall_status_success_k) return;
@@ -414,7 +414,7 @@ static std::size_t test_batches_across_loops(sweep_cell_t const& cell) {
     network_interface.event_loops = 2;
     ucall_server_options_t config {}, resolved {};
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     ucall_server_init_t init {&server, &outcome, &config, &resolved};
@@ -430,7 +430,7 @@ static std::size_t test_batches_across_loops(sweep_cell_t const& cell) {
     failures += expect(outcome.status == ucall_status_success_k);
     ucall_client_options_t client_config {};
     client_config.backend = cell.backend;
-    client_config.cpu_class = cell.cpu_class;
+    client_config.cpu_class_ceiling = cell.cpu_class_ceiling;
     client_config.max_concurrent_connections = 4;
     ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
     ucall_client_init(&client_init);
@@ -694,7 +694,7 @@ static std::size_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const& c
     network_interface.max_pipelined_requests = 4;
     ucall_server_options_t config {}, resolved {};
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     ucall_server_init_t init {&server, &outcome, &config, &resolved};
@@ -774,7 +774,7 @@ static std::size_t test_batches_skip_abandoned([[maybe_unused]] sweep_cell_t con
     network_interface.max_pipelined_requests = 2;
     ucall_server_options_t config {}, resolved {};
     config.backend = cell.backend;
-    config.cpu_class = cell.cpu_class;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
     config.interfaces = &network_interface;
     config.interfaces_count = 1;
     ucall_server_init_t init {&server, &outcome, &config, &resolved};

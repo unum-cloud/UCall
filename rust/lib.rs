@@ -5,35 +5,22 @@
 //! client on its own thread with [`Client::take_completed`].
 //!
 //! ```
-//! use std::time::Duration;
 //! use ucall::*;
 //!
-//! let interface = Interface::new("127.0.0.1:0").pipelined_requests(16);
-//! let mut server = Server::new(&[interface])?;
-//! server.post("/sum", |request: Request| {
-//!     let sum: u64 = request.body().iter().map(|&byte| u64::from(byte)).sum();
-//!     let _ = request.reply(HTTPStatus::OK, &[], sum.to_string().as_bytes());
-//! })?;
-//! let batching = Batching { min_size: 8, max_size: 64, max_latency: Duration::from_micros(500) };
-//! let infer = server.batch("/infer", Verb::Post, batching, |batch: Batch| {
-//!     for request in batch {
-//!         let _ = request.reply(HTTPStatus::OK, &[], b"scored");
-//!     }
+//! let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
+//! server.get("/hello/{name}", |request: Request| {
+//!     let name = request.path_parameter("name").unwrap_or_default();
+//!     let greeting = [b"Hello, ", name].concat();
+//!     let _ = request.reply(HTTPStatus::OK, &["content-type: text/plain".into()], &greeting);
 //! })?;
 //! let address = server.address(0).unwrap().to_owned();
 //!
-//! let mut client = Client::new(ClientOptions { connections: 4, ..Default::default() })?;
+//! let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
 //! std::thread::scope(|scope| {
-//!     for event_loop in 0..server.event_loops() {
-//!         let server = &server;
-//!         scope.spawn(move || server.take_calls(event_loop));
-//!     }
-//!     scope.spawn(|| infer.take_batches());
-//!     let sum = client.post(format!("http://{address}/sum"), vec![1, 2, 3]);
-//!     let scored = client.post(format!("http://{address}/infer"), b"pixels".as_slice());
+//!     scope.spawn(|| server.take_calls(0));
+//!     let response = client.get(format!("http://{address}/hello/world"));
 //!     server.stop();
-//!     assert_eq!(sum?.body(), b"6");
-//!     assert_eq!(scored?.body(), b"scored");
+//!     assert_eq!(response?.body(), b"Hello, world");
 //!     Ok::<(), Error>(())
 //! })?;
 //! # Ok::<(), ucall::Error>(())

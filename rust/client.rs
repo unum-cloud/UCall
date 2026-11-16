@@ -41,7 +41,7 @@ struct ucall_client_options_t {
     log: ucall_log_t,
     max_concurrent_calls: usize,
     backend: ucall_io_backend_t,
-    cpu_class: ucall_cpu_class_t,
+    cpu_class_ceiling: ucall_cpu_class_t,
     max_response_bytes: usize,
     server: ucall_server_t,
     event_loop: usize,
@@ -164,8 +164,9 @@ pub struct ClientOptions<'server> {
     pub peer_authorizer: Option<Arc<PeerAuthorizer>>,
     /// The requested I/O backend.
     pub backend: Backend,
-    /// The CPU class the client confines itself to; `None` takes what the CPU offers.
-    pub cpu_class: Option<CPUClass>,
+    /// A ceiling on the CPU class, intersected with what the constructing thread's CPU runs: the
+    /// newest compiled class fitting both runs, and `None` sets no ceiling.
+    pub cpu_class_ceiling: Option<CPUClass>,
     /// Where log lines go; `None` keeps the client silent.
     pub log: Option<Log>,
     /// The largest response a call buffers, past which it fails with `Status::Overflow`; zero
@@ -346,7 +347,7 @@ impl Client {
             log: lend_log(&core.log),
             max_concurrent_calls: options.calls,
             backend: options.backend.to_raw(),
-            cpu_class: CPUClass::to_raw(options.cpu_class),
+            cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
             max_response_bytes: options.max_response_bytes,
             server: core.server.as_ref().map_or(ptr::null_mut(), |server| server.raw),
             event_loop: options.event_loop,

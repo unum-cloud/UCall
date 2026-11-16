@@ -32,7 +32,7 @@
       "name": "debug",
       "inherits": ["base", "clang"],
       "displayName": "Host Debug",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug" }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "Debug", "UCALL_BUILD_TOOLS": "ON" }
     },
     {
       "name": "check",
@@ -44,6 +44,7 @@
         "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O0 -g0 -DNDEBUG",
         "UCALL_BUILD_EXAMPLES": "ON",
         "UCALL_BUILD_BENCH": "ON",
+        "UCALL_BUILD_TOOLS": "ON",
         "UCALL_WERROR": "ON"
       }
     },
@@ -51,7 +52,7 @@
       "name": "relwithdebinfo",
       "inherits": ["base", "clang"],
       "displayName": "Host RelWithDebInfo",
-      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "UCALL_BUILD_TOOLS": "ON" }
     },
     {
       "name": "release",
@@ -62,7 +63,8 @@
         "CMAKE_BUILD_TYPE": "Release",
         "CMAKE_C_FLAGS": "-ffile-prefix-map=${sourceDir}=.",
         "CMAKE_CXX_FLAGS": "-ffile-prefix-map=${sourceDir}=.",
-        "UCALL_BUILD_SHARED": "ON"
+        "UCALL_BUILD_SHARED": "ON",
+        "UCALL_BUILD_TOOLS": "ON"
       }
     },
     {

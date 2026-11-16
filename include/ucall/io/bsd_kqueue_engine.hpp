@@ -2,7 +2,9 @@
  *  @file include/ucall/io/bsd_kqueue_engine.hpp
  *  @author Ash Vardanian
  *  @date January 13, 2025
- *  @brief kqueue readiness for Apple and FreeBSD sockets, with FreeBSD file reads through AIO.
+ *  @brief kqueue readiness for Apple and FreeBSD sockets, with file reads through AIO: FreeBSD
+ *      lands them as @c EVFILT_AIO events, while macOS, whose kqueue reports no AIO completion,
+ *      polls each read in flight between its waits.
  */
 #pragma once
 
@@ -18,6 +20,8 @@
 #include <sys/event.h> // `kevent`, `EVFILT_READ`
 #if UCALL_OS_FREEBSD_
 #include <aio.h> // `aio_read`, `aiocb`
+#else
+#include "ucall/io/polled_file_reads.hpp" // `polled_file_reads`
 #endif
 
 namespace unum::ucall::io {
@@ -195,7 +199,8 @@ struct bsd_kqueue_engine {
 };
 
 /** kqueue readiness; FreeBSD reads files through @c aio_read completing as @c EVFILT_AIO events,
- *  while macOS, lacking kernel file AIO for this, reads them blocking and uncached. */
+ *  while macOS, whose kqueue reports no AIO completion, reads them through AIO it polls between
+ *  waits, a vectored read as one @c lio_listio batch per vector run. */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
@@ -208,7 +213,7 @@ struct kqueue_readiness {
         : events(rebound_allocator<struct kevent> {allocator}), file_reads(rebound_allocator<aiocb> {allocator}) {}
 #else
     explicit kqueue_readiness(allocator_t const& allocator = {}) noexcept
-        : events(rebound_allocator<struct kevent> {allocator}) {}
+        : events(rebound_allocator<struct kevent> {allocator}), file_reads(allocator) {}
 #endif
     kqueue_readiness(kqueue_readiness const&) = delete;
     kqueue_readiness& operator=(kqueue_readiness const&) = delete;
@@ -227,6 +232,10 @@ struct kqueue_readiness {
 
     /** File reads the kernel accepted and has not landed, which @c stop waits for. */
     std::size_t file_reads_in_flight {};
+#else
+
+    /** The AIO control blocks of file reads in flight, which each wait polls. */
+    polled_file_reads<allocator_t> file_reads;
 #endif
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(events.resize(capacity)) || reserve_file_reads(capacity) != ucall_status_success_k)
@@ -288,10 +297,28 @@ struct kqueue_readiness {
         return attempt_io<atomic_ref_template_>(request, stage, interest, statistics);
     }
 #else
-    ucall_status_t reserve_file_reads(std::size_t) noexcept { return ucall_status_success_k; }
-    descriptor_t attempt(unsigned, io_request_t& request, operation_stage_t& stage, io_interest_t& interest,
+    ucall_status_t reserve_file_reads(std::size_t capacity) noexcept { return file_reads.reserve(capacity); }
+
+    /** Starts a file read as operation @p index, polled to landing by @c wait; a refusal to queue
+     *  reads blocking instead. Everything else is a plain syscall. */
+    descriptor_t attempt(unsigned index, io_request_t& request, operation_stage_t& stage, io_interest_t& interest,
                          io_statistics_t& statistics) noexcept {
-        return attempt_io<atomic_ref_template_>(request, stage, interest, statistics);
+        bool const single = request.operation == io_operation_t::file_read_k;
+        if (!single && request.operation != io_operation_t::file_read_vectors_k)
+            return attempt_io<atomic_ref_template_>(request, stage, interest, statistics);
+        if (stage == operation_stage_t::cancelled_k) return -ECANCELED;
+        io_vector_t const whole {request.data, request.length};
+        span<io_vector_t const> const vectors = single ? span<io_vector_t const> {&whole, 1}
+                                                       : span<io_vector_t const> {io_vectors(request)};
+        descriptor_t result = 0;
+        tally<atomic_ref_template_>(statistics.kernel_enters);
+        if (!file_reads.start(index, request.file.file, vectors, request.file.offset, result)) {
+            tally<atomic_ref_template_>(statistics.file_reads_blocking);
+            return result;
+        }
+        tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
+        interest = io_interest_t::landing_k;
+        return 0;
     }
 #endif // UCALL_OS_FREEBSD_
 
@@ -299,6 +326,10 @@ struct kqueue_readiness {
      *  a failed registration to @p errored and a landed file read to @p landed, by operation. */
     template <typename fired_type_, typename errored_type_, typename landed_type_>
     int wait(std::uint64_t nanoseconds, fired_type_&& fired, errored_type_&& errored, landed_type_&& landed) noexcept {
+#if !UCALL_OS_FREEBSD_
+        // Nothing reports a polled read landing, so the wait stays short while one flies.
+        nanoseconds = file_reads.cap_wait(nanoseconds);
+#endif
         timespec const duration {static_cast<time_t>(nanoseconds / 1'000'000'000),
                                  static_cast<long>(nanoseconds % 1'000'000'000)};
         int count = kevent(descriptor, nullptr, 0, events.data(),
@@ -316,6 +347,9 @@ struct kqueue_readiness {
                       static_cast<short>(events[i].filter == EVFILT_READ ? POLLIN : POLLOUT));
             else land_file_read(index, landed);
         }
+#if !UCALL_OS_FREEBSD_
+        file_reads.reap(landed);
+#endif
         return count;
     }
 #if UCALL_OS_FREEBSD_
@@ -339,8 +373,12 @@ struct kqueue_readiness {
 #else
     template <typename landed_type_>
     void land_file_read(unsigned, landed_type_&) noexcept {}
+
+    /** Waits for every polled file read still in the kernel, handing each to @p landed. */
     template <typename landed_type_>
-    void drain_files(landed_type_&&) noexcept {}
+    void drain_files(landed_type_&& landed) noexcept {
+        file_reads.drain(landed);
+    }
 #endif // UCALL_OS_FREEBSD_
     ~kqueue_readiness() noexcept {
         if (descriptor >= 0) close(descriptor);
