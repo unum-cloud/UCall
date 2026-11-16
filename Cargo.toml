@@ -18,13 +18,14 @@ include = [
   "/build.rs",
   "/LICENSE",
 ]
+homepage = "https://www.unum.cloud/docs/ucall"
 license = "Apache-2.0"
 links = "ucall"
 name = "ucall"
 publish = true
 readme = "rust/README.md"
 repository = "https://github.com/unum-cloud/UCall"
-documentation = "https://docs.rs/ucall"
+documentation = "https://www.unum.cloud/docs/ucall/rust"
 version = "1.0.0-rc.1"
 
 [lib]

@@ -1,10 +1,10 @@
 cff-version: 1.2.0
-title: "UCall: Low-Latency Client-Server Networking Stack Built around Noise Encryption, io_uring and SIMD"
+title: "UCall: Low-Latency Client-Server Communication Engine Built around Noise, io_uring & SIMD"
 message: "If you use this software, please cite it as below."
 type: software
 license: Apache-2.0
 repository-code: https://github.com/unum-cloud/UCall
-url: https://github.com/unum-cloud/UCall
+url: https://www.unum.cloud/docs/ucall
 doi: 10.5281/zenodo.7951496
 abstract: >-
   UCall is a low-latency client-server communication engine built around Noise, io_uring and

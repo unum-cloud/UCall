@@ -9,7 +9,7 @@ project(
     VERSION ${CMAKE_MATCH_1}
     LANGUAGES C CXX
     DESCRIPTION "HTTP and Noise clients and servers with capability-specialized I/O backends"
-    HOMEPAGE_URL "https://github.com/unum-cloud/UCall"
+    HOMEPAGE_URL "https://www.unum.cloud/docs/ucall"
 )
 
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)

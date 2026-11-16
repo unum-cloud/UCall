@@ -10,9 +10,111 @@ The [Python](../python/README.md) and [Rust](../rust/README.md) bindings wrap th
 Link `ucall::static` or `ucall::shared`, each a single library containing every enabled backend.
 An installed tree or the SDK archive finds them through `find_package(ucall)`, and the shared library through `pkg-config --libs ucall` too.
 
+```sh
+cmake -B build -D UCALL_BUILD_TEST=ON -D UCALL_BUILD_EXAMPLES=ON && cmake --build build
+build/ucall_test_c && build/ucall_example_hello
+```
+
 ## Quickstart
 
-[`examples/hello.c`](../examples/hello.c) initializes a server on one interface, registers an echo route, and polls its event loop until stopped.
+A server on a free loopback port greets whoever `GET /hello/{name}` names, and a client bound to the server's event loop calls `/hello/world` on the same thread.
+Each `ucall_server_take_call()` round advances both, until the completion arrives.
+The program prints the body and exits nonzero unless it reads "Hello, world"; it is [`examples/hello.c`](../examples/hello.c).
+
+```c
+#include <stdio.h>
+#include <string.h>
+
+#include "ucall/ucall.h"
+
+static int failed(ucall_outcome_t const* outcome) {
+    if (outcome->status == ucall_status_success_k) return 0;
+    fprintf(stderr, "%s: %s\n", ucall_status_name(outcome->status), outcome->message);
+    return 1;
+}
+
+static void hello(ucall_received_http_request_t request, void* context) {
+    ucall_server_t server = *(ucall_server_t*)context;
+    ucall_outcome_t outcome = {0};
+    ucall_bytes_view_t name = {0};
+    ucall_server_request_path_parameter_t parameter = {.server = server,
+                                                       .outcome = &outcome,
+                                                       .request = request,
+                                                       .name = {(ucall_byte_t const*)"name", 4},
+                                                       .value = &name};
+    ucall_server_request_path_parameter(&parameter);
+    ucall_reply_part_t parts[2] = {
+        {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)"Hello, ", 7}},
+        {.kind = ucall_reply_part_bytes_k, .data.bytes = name}};
+    ucall_server_reply_vectored_t reply = {.server = server,
+                                           .outcome = &outcome,
+                                           .request = request,
+                                           .parts = parts,
+                                           .parts_count = 2};
+    ucall_server_reply_vectored(&reply);
+}
+
+int main(void) {
+    ucall_network_interface_t listener = {.address = {(ucall_byte_t const*)"127.0.0.1:0", 11},
+                                          .max_concurrent_connections = 1};
+    ucall_server_options_t options = {.interfaces = &listener, .interfaces_count = 1}, resolved = {0};
+    ucall_server_t server = NULL;
+    ucall_outcome_t outcome = {0};
+    ucall_server_init_t init = {.server = &server, .outcome = &outcome, .options = &options, .resolved = &resolved};
+    ucall_server_init(&init);
+    if (failed(&outcome)) return 1;
+    ucall_server_add_http_endpoint_t route = {.server = server,
+                                              .outcome = &outcome,
+                                              .uri_template = {(ucall_byte_t const*)"/hello/{name}", 13},
+                                              .verb = ucall_verb_get_k,
+                                              .callback = hello,
+                                              .context = &server};
+    ucall_server_add_http_endpoint(&route);
+    if (failed(&outcome)) return 1;
+
+    // A client bound to the server's event loop advances whenever that loop is polled.
+    ucall_client_options_t client_options = {.max_concurrent_connections = 1, .server = server};
+    ucall_client_t client = NULL;
+    ucall_client_init_t client_init = {.client = &client, .outcome = &outcome, .options = &client_options};
+    ucall_client_init(&client_init);
+    if (failed(&outcome)) return 1;
+    char url[128];
+    ucall_bytes_view_t address = resolved.interfaces[0].address;
+    snprintf(url, sizeof url, "http://%.*s/hello/world", (int)address.length, (char const*)address.data);
+    ucall_client_call_t call = {.client = client,
+                                .outcome = &outcome,
+                                .url = {(ucall_byte_t const*)url, strlen(url)},
+                                .verb = ucall_verb_get_k};
+    ucall_client_call(&call);
+    if (failed(&outcome)) return 1;
+
+    ucall_completed_call_t completed = {0};
+    size_t count = 0;
+    ucall_server_take_call_t poll = {.server = server, .outcome = &outcome, .timeout_microseconds = 1000};
+    ucall_client_take_completed_t take = {.client = client,
+                                          .outcome = &outcome,
+                                          .calls = &completed,
+                                          .capacity = 1,
+                                          .count = &count};
+    while (count == 0) {
+        ucall_server_take_call(&poll);
+        if (failed(&outcome)) return 1;
+        ucall_client_take_completed(&take);
+    }
+    if (failed(&completed.outcome)) return 1;
+    ucall_bytes_view_t body = {0};
+    ucall_client_response_body_t body_read = {.response = completed.response, .outcome = &outcome, .body = &body};
+    ucall_client_response_body(&body_read);
+    printf("%.*s\n", (int)body.length, (char const*)body.data);
+    int greeted = body.length == 12 && memcmp(body.data, "Hello, world", 12) == 0;
+
+    ucall_client_response_free(completed.response);
+    ucall_client_free(client);
+    ucall_server_stop(server);
+    ucall_server_free(server);
+    return greeted ? 0 : 1;
+}
+```
 
 ## Serving
 
@@ -44,11 +146,53 @@ All byte views carry an explicit length, including empty and binary values.
 
 ## Files & Streams
 
-A streamed reply is chunked for HTTP/1.1 peers, keeps identity framing when its headers declare `Content-Length`, and is delimited by the close for HTTP/1.0 peers; a chunk reports `ucall_status_would_block_k` while the socket lags too far behind.
+A streamed reply opens with `ucall_server_reply_begin()`, takes any number of `ucall_server_reply_append()` calls, and closes with exactly one `ucall_server_reply_end()`:
+
+```c
+static void rows(ucall_received_http_request_t request, void* context) {
+    ucall_server_t server = *(ucall_server_t*)context;
+    ucall_outcome_t outcome = {0};
+    ucall_bytes_view_t headers[1] = {{(ucall_byte_t const*)"content-type: text/csv", 22}};
+    ucall_server_reply_begin_t begin = {
+        .server = server, .outcome = &outcome, .request = request, .headers = headers, .headers_count = 1};
+    ucall_server_reply_begin(&begin);
+    for (int row = 0; row != 3 && outcome.status == ucall_status_success_k; ++row) {
+        char line[32];
+        int length = snprintf(line, sizeof line, "%d,%d\n", row, row * row);
+        ucall_reply_part_t part = {.kind = ucall_reply_part_bytes_k,
+                                   .data.bytes = {(ucall_byte_t const*)line, (size_t)length}};
+        ucall_server_reply_append_t append = {
+            .server = server, .outcome = &outcome, .request = request, .parts = &part, .parts_count = 1};
+        ucall_server_reply_append(&append);
+    }
+    ucall_server_reply_end_t end = {.server = server, .outcome = &outcome, .request = request};
+    ucall_server_reply_end(&end);
+}
+```
+
+The stream is chunked for HTTP/1.1 peers, keeps identity framing when its headers declare `Content-Length`, and is delimited by the close for HTTP/1.0 peers.
+An append reports `ucall_status_would_block_k`, queueing nothing, while the socket lags too far behind; retry once the peer catches up.
+
 Vectored replies and stream chunks take reply parts: bytes, a range of a file descriptor the caller keeps open until the outcome is final, or a range of a path opened beneath one of the interface's `reply_directories`.
+A worker thread holding a retained request answers with a header and a file, while another thread polls the loop that sends it:
+
+```c
+ucall_outcome_t sent = {0}; // kept alive until it leaves ucall_status_deferred_k
+ucall_reply_part_t parts[2] = {
+    {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)"frame:", 6}},
+    {.kind = ucall_reply_part_path_k, .data.path = {.directory_index = 0, .relative_path = name}},
+};
+ucall_server_reply_vectored_t reply = {
+    .server = server, .outcome = &sent, .request = request, .parts = parts, .parts_count = 2};
+ucall_server_reply_vectored(&reply);
+if (ucall_outcome_wait(&sent) != ucall_status_success_k)
+    fprintf(stderr, "%s: %s\n", ucall_status_name(sent.status), sent.message);
+```
+
 The event loop opens files with `O_DIRECT`, refusing caller descriptors without it, and reads aligned extents itself before sending the requested slice.
-Replies leave through zero-copy sends, so a connection closes only once the kernel let go of what it sent, and resets a peer that stops acknowledging by the linger deadline.
+Paths are copied before the call returns, and empty or absolute paths, `..` components and any resolution leaving the directory are refused.
 A reply with file or path parts publishes its outcome as `ucall_status_deferred_k`, then success once they are sent, or the cause; a refusal before the head becomes `404` or `416`, and a failure after it resets the connection.
+Replies leave through zero-copy sends where the backend has them, so a connection closes only once the kernel let go of what it sent, and resets a peer that stops acknowledging by the linger deadline.
 
 ## Batches
 
@@ -73,13 +217,54 @@ reply_to_each(requests, &search, &read);            // ucall_server_reply_conten
 
 ## Calling
 
-`ucall_client_call()` returns a synchronous acceptance outcome; success guarantees one completion and refusal produces none.
-Keep the borrowed URL, headers, body, and security-key inputs alive until completion retrieval.
-`ucall_client_take_completed()` drives progress and retrieves a batch of records containing the caller cookie, final outcome, and response.
-Retrieval returns each call's admission credit.
+`ucall_client_call()` submits without driving the network, and `ucall_client_take_completed()` drives every accepted call and retrieves a batch of finished ones:
+
+```c
+ucall_client_options_t options = {.max_concurrent_connections = 4, .max_pipelined_calls = 16};
+ucall_client_t client = NULL;
+ucall_outcome_t outcome = {0};
+ucall_client_init_t init = {.client = &client, .outcome = &outcome, .options = &options};
+ucall_client_init(&init);
+
+static char const url[] = "http://127.0.0.1:8545/echo";
+static ucall_byte_t const bodies[64] = {0};
+size_t accepted = 0;
+for (size_t index = 0; index != 64; ++index) {
+    ucall_client_call_t call = {.client = client,
+                                .outcome = &outcome,
+                                .url = {(ucall_byte_t const*)url, sizeof url - 1},
+                                .verb = ucall_verb_post_k,
+                                .body = {bodies + index, 1},
+                                .context = (void*)index};
+    ucall_client_call(&call);
+    accepted += outcome.status == ucall_status_success_k; // a refusal produces no completion
+}
+
+ucall_completed_call_t completed[16];
+size_t count = 0;
+ucall_client_take_completed_t take = {.client = client,
+                                      .outcome = &outcome,
+                                      .calls = completed,
+                                      .capacity = 16,
+                                      .count = &count,
+                                      .timeout_microseconds = 1000000};
+for (; accepted != 0; accepted -= count) {
+    ucall_client_take_completed(&take);
+    for (size_t index = 0; index != count; ++index) {
+        ucall_completed_call_t* done = &completed[index];
+        printf("call %zu: %s, HTTP %u\n", (size_t)done->context, ucall_status_name(done->outcome.status),
+               (unsigned)ucall_client_response_status(done->response));
+        ucall_client_response_free(done->response);
+    }
+}
+ucall_client_free(client);
+```
+
+Success of `ucall_client_call()` guarantees exactly one completion, and refusal produces none.
+Keep the borrowed URL, headers, body, and security-key inputs alive until completion retrieval, which also returns the call's admission credit.
 The connection budget must be positive; a zero call budget uses the connection budget times `max_pipelined_calls`.
-Retrieved responses belong to the caller until `ucall_client_response_free()`; client teardown discards unretrieved results.
-Response accessors take only the response, which stays readable after its client is freed.
+Retrieved responses belong to the caller until `ucall_client_response_free()`, and stay readable after the client is freed; client teardown discards unretrieved results.
+A client whose `server` option names a server shares that server's event loop, as the Quickstart's does, and its `ucall_client_take_completed()` only pops what that loop finished.
 HTTP calls support connection reuse, pipelining, chunked receive framing, redirects, and request deadlines.
 A client's `max_pipelined_calls` bounds the calls one connection carries at once, and no call is pipelined behind one that is not idempotent or that sends `Connection: close`.
 A pipelined connection lost mid-flight retries its unanswered idempotent calls and finishes the rest with `ucall_status_connection_closed_k`.
@@ -90,8 +275,61 @@ Connections race the answered addresses as RFC 8305's Happy Eyeballs does.
 
 ## Noise Keys
 
-XX and IK servers authenticate clients; KK clients connect to a separately configured peer, and a KK server interface names its preknown initiator in `noise_peer_key`.
 `ucall_noise_key_generate()` draws a static keypair from the operating system's entropy, reporting `ucall_status_io_k` when it is refused, and `ucall_noise_key_derive()` recovers the public key of a stored private key.
+An XX interface and an XX client each vet the other's key through a `ucall_peer_authorizer_t`:
+
+```c
+static ucall_status_t admit(ucall_noise_key_t const* peer_static_key, void* expected_key) {
+    return memcmp(*peer_static_key, expected_key, sizeof(ucall_noise_key_t)) == 0 ? ucall_status_success_k
+                                                                                    : ucall_status_peer_rejected_k;
+}
+
+ucall_noise_key_t server_private_key, server_public_key, client_private_key, client_public_key;
+ucall_outcome_t outcome = {0};
+ucall_noise_key_generate_t server_keys = {
+    .outcome = &outcome, .private_key = &server_private_key, .public_key = &server_public_key};
+ucall_noise_key_generate(&server_keys);
+ucall_noise_key_generate_t client_keys = {
+    .outcome = &outcome, .private_key = &client_private_key, .public_key = &client_public_key};
+ucall_noise_key_generate(&client_keys);
+ucall_noise_key_derive_t derive = {.outcome = &outcome, .private_key = &server_private_key, .public_key = &server_public_key};
+ucall_noise_key_derive(&derive); // what a restarted server does with its stored private key
+
+ucall_network_interface_t sealed = {.address = {(ucall_byte_t const*)"0.0.0.0:8546", 12},
+                                    .max_concurrent_connections = 1024,
+                                    .security = ucall_security_noise_xx_k,
+                                    .noise_private_key = &server_private_key,
+                                    .peer_authorizer = admit,
+                                    .peer_authorizer_context = client_public_key};
+ucall_client_options_t client_options = {.max_concurrent_connections = 1,
+                                         .noise_private_key = &client_private_key,
+                                         .peer_authorizer = admit,
+                                         .peer_authorizer_context = server_public_key};
+```
+
+The client calls `http+noise://` URLs, which imply Noise XX, and a handler reads the client's authenticated key through `ucall_server_request_peer()`.
+IK clients name the server's key in advance through the call's `noise_peer_key`.
+KK clients connect to a separately configured peer, and a KK server interface names its preknown initiator in `noise_peer_key`.
+An authorizer returning any status but success refuses the peer, and that status becomes the connection's outcome.
+
+## Errors
+
+Every verb that can fail writes a `ucall_outcome_t`: a `ucall_status_t` to branch on, and a static `message` with the detail it cannot carry, never freed and `NULL` exactly on success.
+Statuses 0 to 19 are numbered as in every Unum library, and 20 up are UCall's own, from `ucall_status_connection_failed_k` to `ucall_status_would_block_k`.
+`ucall_status_name()` spells a status in lowercase with dashes, as in "already-exists", and `ucall_status_from_name()` reads it back.
+
+```c
+ucall_server_add_http_endpoint(&route);
+if (outcome.status == ucall_status_already_exists_k)
+    fprintf(stderr, "registered twice: %s\n", outcome.message);
+else if (outcome.status != ucall_status_success_k)
+    fprintf(stderr, "%s: %s\n", ucall_status_name(outcome.status), outcome.message);
+```
+
+A verb answers `ucall_status_uninitialized_k` for a `NULL` handle before it reads anything else, then checks its arguments and the state they meet, as each verb's documented statuses list them.
+A refusal leaves the server, client and request as they were: a refused reply keeps its request, except one to a closed connection, and a refused call produces no completion.
+A deferred outcome reads `ucall_status_deferred_k` until the event loop publishes its final status; poll it with `ucall_outcome_status()` or block with `ucall_outcome_wait()`, never by reading the field.
+A completed client call carries its own outcome, independent of the acceptance one, and HTTP error statuses are ordinary responses.
 
 ## Threads & Polling
 
@@ -109,11 +347,9 @@ Server shutdown uses baseline atomics and native wakeups, so another thread can 
 - __Backends.__
   Select `automatic`, `posix`, `linux-epollaio`, `linux-uring612`, `linux-uring618`, `bsd-kqueue`, `windows-iocp`, or `windows-rio` in the server or client configuration; explicit unavailable selections fail.
   All variants use the same HTTP/1.1 and Noise connection automata.
-- __io_uring.__
-  Both io_uring variants use registered files, direct descriptors, an incremental provided receive-buffer ring, a sparse table of registered buffers, `SEND_ZC` zero-copy sends and `READ_FIXED` file reads.
-  The 6.18 variant adds multishot receive and vectored `READV_FIXED` file reads.
-- __Readiness and completion ports.__
-  `linux-epollaio` reads files through Linux AIO completing into its epoll set, sends with `MSG_ZEROCOPY`, and refuses to start where `io_setup` is refused, naming `fs.aio-max-nr`.
-  `posix` and macOS `kqueue` read files blocking, FreeBSD `kqueue` through `aio_read`, and IOCP through overlapped unbuffered reads; these send by copying.
-- __Credit-limited accepts.__
-  Accepts remain one-shot operations: multishot direct accept can consume more connections than a finite file table can install before userspace observes a completion.
+- __Zero-copy where the kernel offers it.__
+  Both io_uring variants and `linux-epollaio` send without copying and read files unbuffered on the event loop, while `posix`, `kqueue` and IOCP send by copying.
+- __One argument struct per verb.__
+  Fields are named at the call site, zeroed fields take their documented defaults, and every fallible verb reports through the outcome its struct points at.
+- __Bound clients.__
+  A client made with a server's handle runs on that server's event loop, so one thread serves and calls without a second engine.

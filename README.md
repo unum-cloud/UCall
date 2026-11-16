@@ -1,25 +1,36 @@
 <h1 align="center">UCall</h1>
 <h3 align="center">
-  Low-Latency Client-Server Communication Engine<br />
-  Built around Noise, io_uring &amp; SIMD<br />
+Low-Latency Client-Server Communication Engine<br/>
+Built around Noise, io_uring &amp; SIMD
 </h3>
-<br />
+<br/>
 
 <p align="center">
-  <a href="https://discord.gg/4mxGrenbNt"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
-  &nbsp;&nbsp;&nbsp;
-  <a href="https://github.com/unum-cloud/UCall"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
+<a href="https://discord.gg/4mxGrenbNt"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/discord.svg" alt="Discord"></a>
+&nbsp;&nbsp;&nbsp;
+<a href="https://www.linkedin.com/company/unum-cloud/"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/linkedin.svg" alt="LinkedIn"></a>
+&nbsp;&nbsp;&nbsp;
+<a href="https://twitter.com/unum_cloud"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/twitter.svg" alt="Twitter"></a>
+&nbsp;&nbsp;&nbsp;
+<a href="https://unum.cloud/post"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/blog.svg" alt="Blog"></a>
+&nbsp;&nbsp;&nbsp;
+<a href="https://github.com/unum-cloud/UCall"><img height="25" src="https://github.com/unum-cloud/.github/raw/main/assets/github.svg" alt="GitHub"></a>
+</p>
+
+<p align="center">
+HTTP/1.1 • Noise • Batches • Files & Streams
+<br/>
+<a href="https://github.com/unum-cloud/UCall/blob/main/c/README.md">C</a> •
+<a href="https://github.com/unum-cloud/UCall/blob/main/python/README.md">Python</a> •
+<a href="https://github.com/unum-cloud/UCall/blob/main/rust/README.md">Rust</a> •
+<a href="https://github.com/unum-cloud/UCall/blob/main/mojo/README.md">Mojo</a>
+<br/>
+Linux • macOS • FreeBSD • Windows
+<br/>
+x86 • Arm • RISC-V • POWER
 </p>
 
 ---
-
-![UCall banner](https://github.com/ashvardanian/ashvardanian/blob/master/repositories/UCall-v1.png?raw=true)
 
 > What would a client-server communication engine look like built around Noise, io_uring, and SIMD?
 > UCall keeps application handlers synchronous while its connection state machines overlap network I/O.
@@ -40,207 +51,118 @@ Moreover, it's easy to use synchronous handlers, even when the underlying backen
 And it provides server-side batching for high-latency batch-processing endpoints, like GPU inference tasks and OLAP database queries.
 The [native examples](https://github.com/unum-cloud/UCall/blob/main/examples/README.md) demonstrate binary echo, conditional key-value writes, atomic ledger transfers, and batched inference through the C ABI.
 
-## FastAPI UX Comparison
-
-Both columns serve the same typed endpoint; UCall's [Python bindings](https://github.com/unum-cloud/UCall/blob/main/python/README.md) bind its parameters in C and answer on the polling thread.
-
-<table width="100%">
-<tr>
-<th width="50%">FastAPI</th><th width="50%">UCall</th>
-</tr>
-<tr>
-<td>
+## Quickstart
 
 ```sh
-pip install fastapi uvicorn
+pip install ucall     # Python
+cargo add ucall       # Rust
 ```
 
-</td>
-<td>
-
-```sh
-pip install ucall
-```
-
-</td>
-</tr>
-<tr>
-<td>
-
-```python
-from fastapi import FastAPI
-
-server = FastAPI()
-
-@server.get('/sum')
-def sum(a: int, b: int):
-    return a + b
-
-import uvicorn
-uvicorn.run(server, host='0.0.0.0', port=8000)
-```
-
-</td>
-<td>
-
-```python
-import ucall
-
-server = ucall.Server(ucall.Interface('0.0.0.0:8000'))
-
-@server.get('/sum')
-def sum(a: int, b: int):
-    return a + b
-
-server.run()
-```
-
-</td>
-</tr>
-</table>
-
-## Build From Source
-
-A source build needs CMake 3.28 and a C++20 compiler, and pulls StringZilla, ForkUnion and SmashTable as submodules:
-
-```sh
-git clone --recursive https://github.com/unum-cloud/UCall.git && cd UCall
-cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
-cmake --build build_release --parallel
-cmake --install build_release --prefix ~/.local
-```
-
-> The install holds the C headers, `libucall_static`, `libucall_shared`, a `ucall.pc`, and a CMake package naming `ucall::static` and `ucall::shared`, which a C program links like any C library.
-> It also holds `ucall`, a command-line client for one HTTP or Noise call, as in `ucall -d @body.json http://127.0.0.1:8080/echo`.
-> `-H` adds a header line, `-d @-` reads the body from standard input, `-i` prints the status line and every response field before the body, and `--server-key` pins the server for an `http+noise://` URL.
-> `ucall keygen FILE` writes a fresh Noise private key and prints its public half, and the exit code is 0 for a 2xx answer and the status's hundreds digit otherwise.
-> Leaving `UCALL_BUILD_SHARED` off installs the archive without the shared library and its `ucall.pc`.
-
-`pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](https://github.com/unum-cloud/UCall/blob/main/CONTRIBUTING.md) lists the presets, tests and cross builds.
-
-## Multiversioned and Monoversioned Builds
-
-UCall compiles in one of two shapes, picked by `UCALL_MULTIVERSIONED`.
-
-- __Multiversioned builds are for distribution.__
-  One binary runs well across diverse machines, because each CPU picks its own class at runtime.
-  This is the default, and the shape of the Python wheels and the Rust crate.
-- __Monoversioned builds are for throughput.__
-  For common hardware and data-center deployments, the binary carries only the best code for one machine.
-  These are the leanest binaries: they start fast and take little memory and disk.
-  Outside that machine they refuse cleanly with `ucall_status_unsupported_k`, never crashing and never falling back to slower code in silence.
-- __The switches.__
-  `UCALL_MULTIVERSIONED=OFF` picks the second shape and `UCALL_MARCH` names its CPU floor.
-  The `xeon4_hopper`, `xeon6_blackwell`, `grace_hopper`, `vera_rubin` and `venice_mi450` presets spell whole machines.
-
-A monoversioned build compiles the single `monoversioned` CPU class in place of the ladder of named ones.
-
-## C Quickstart
-
-One callback reads a request's body and replies with it, and `main` initializes the server, registers the route, and polls its one loop on the calling thread.
-The listing is [`examples/hello.c`](https://github.com/unum-cloud/UCall/blob/main/examples/hello.c), which CI links against both installed libraries:
+Every binding tells one story: a server routes `GET /hello/{name}`, a client in the same program calls `/hello/world`, and the program checks the answer reads `Hello, world`.
+In C, one thread drives both, since a client bound to the server's event loop advances whenever that loop is polled:
 
 ```c
 #include <stdio.h>
+#include <string.h>
 
-#include <ucall/ucall.h>
+#include "ucall/ucall.h"
 
-static void echo(ucall_received_http_request_t request, void* context) {
+static int failed(ucall_outcome_t const* outcome) {
+    if (outcome->status == ucall_status_success_k) return 0;
+    fprintf(stderr, "%s: %s\n", ucall_status_name(outcome->status), outcome->message);
+    return 1;
+}
+
+static void hello(ucall_received_http_request_t request, void* context) {
     ucall_server_t server = *(ucall_server_t*)context;
     ucall_outcome_t outcome = {0};
-    ucall_bytes_view_t body = {0};
-    ucall_server_request_body_t read = {.server = server, .outcome = &outcome, .request = request, .body = &body};
-    ucall_server_request_body(&read);
-    ucall_server_reply_content_t reply = {.server = server, .outcome = &outcome, .request = request, .body = body};
-    ucall_server_reply_content(&reply);
+    ucall_bytes_view_t name = {0};
+    ucall_server_request_path_parameter_t parameter = {.server = server,
+                                                       .outcome = &outcome,
+                                                       .request = request,
+                                                       .name = {(ucall_byte_t const*)"name", 4},
+                                                       .value = &name};
+    ucall_server_request_path_parameter(&parameter);
+    ucall_reply_part_t parts[2] = {
+        {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)"Hello, ", 7}},
+        {.kind = ucall_reply_part_bytes_k, .data.bytes = name}};
+    ucall_server_reply_vectored_t reply = {.server = server,
+                                           .outcome = &outcome,
+                                           .request = request,
+                                           .parts = parts,
+                                           .parts_count = 2};
+    ucall_server_reply_vectored(&reply);
 }
 
 int main(void) {
-    ucall_network_interface_t listener = {
-        .address = {(ucall_byte_t const*)"127.0.0.1:8080", 14},
-        .max_concurrent_connections = 1024,
-    };
-    ucall_server_options_t options = {.interfaces = &listener, .interfaces_count = 1};
+    ucall_network_interface_t listener = {.address = {(ucall_byte_t const*)"127.0.0.1:0", 11},
+                                          .max_concurrent_connections = 1};
+    ucall_server_options_t options = {.interfaces = &listener, .interfaces_count = 1}, resolved = {0};
     ucall_server_t server = NULL;
     ucall_outcome_t outcome = {0};
-    ucall_server_init_t init = {.server = &server, .outcome = &outcome, .options = &options};
+    ucall_server_init_t init = {.server = &server, .outcome = &outcome, .options = &options, .resolved = &resolved};
     ucall_server_init(&init);
-    if (outcome.status != ucall_status_success_k) {
-        fprintf(stderr, "%s\n", outcome.message);
-        return 1;
-    }
-
+    if (failed(&outcome)) return 1;
     ucall_server_add_http_endpoint_t route = {.server = server,
                                               .outcome = &outcome,
-                                              .uri_template = {(ucall_byte_t const*)"/echo", 5},
-                                              .verb = ucall_verb_post_k,
-                                              .callback = echo,
+                                              .uri_template = {(ucall_byte_t const*)"/hello/{name}", 13},
+                                              .verb = ucall_verb_get_k,
+                                              .callback = hello,
                                               .context = &server};
     ucall_server_add_http_endpoint(&route);
-    ucall_server_take_calls_t poll = {.server = server, .outcome = &outcome};
-    ucall_server_take_calls(&poll);
+    if (failed(&outcome)) return 1;
+
+    // A client bound to the server's event loop advances whenever that loop is polled.
+    ucall_client_options_t client_options = {.max_concurrent_connections = 1, .server = server};
+    ucall_client_t client = NULL;
+    ucall_client_init_t client_init = {.client = &client, .outcome = &outcome, .options = &client_options};
+    ucall_client_init(&client_init);
+    if (failed(&outcome)) return 1;
+    char url[128];
+    ucall_bytes_view_t address = resolved.interfaces[0].address;
+    snprintf(url, sizeof url, "http://%.*s/hello/world", (int)address.length, (char const*)address.data);
+    ucall_client_call_t call = {.client = client,
+                                .outcome = &outcome,
+                                .url = {(ucall_byte_t const*)url, strlen(url)},
+                                .verb = ucall_verb_get_k};
+    ucall_client_call(&call);
+    if (failed(&outcome)) return 1;
+
+    ucall_completed_call_t completed = {0};
+    size_t count = 0;
+    ucall_server_take_call_t poll = {.server = server, .outcome = &outcome, .timeout_microseconds = 1000};
+    ucall_client_take_completed_t take = {.client = client,
+                                          .outcome = &outcome,
+                                          .calls = &completed,
+                                          .capacity = 1,
+                                          .count = &count};
+    while (count == 0) {
+        ucall_server_take_call(&poll);
+        if (failed(&outcome)) return 1;
+        ucall_client_take_completed(&take);
+    }
+    if (failed(&completed.outcome)) return 1;
+    ucall_bytes_view_t body = {0};
+    ucall_client_response_body_t body_read = {.response = completed.response, .outcome = &outcome, .body = &body};
+    ucall_client_response_body(&body_read);
+    printf("%.*s\n", (int)body.length, (char const*)body.data);
+    int greeted = body.length == 12 && memcmp(body.data, "Hello, world", 12) == 0;
+
+    ucall_client_response_free(completed.response);
+    ucall_client_free(client);
+    ucall_server_stop(server);
     ucall_server_free(server);
-    return outcome.status == ucall_status_success_k ? 0 : 1;
+    return greeted ? 0 : 1;
 }
 ```
 
 ```sh
-export PKG_CONFIG_PATH=~/.local/lib/pkgconfig LD_LIBRARY_PATH=~/.local/lib
-cc examples/hello.c $(pkg-config --cflags --libs ucall) -o hello && ./hello &
-curl -X POST --data 'Hello, UCall!' http://127.0.0.1:8080/echo
+cc examples/hello.c $(pkg-config --cflags --libs ucall) -o hello && ./hello
 ```
 
-## Rust Quickstart
+The same program in [Python](https://github.com/unum-cloud/UCall/blob/main/python/README.md#quickstart), [Rust](https://github.com/unum-cloud/UCall/blob/main/rust/README.md#quickstart) and [Mojo](https://github.com/unum-cloud/UCall/blob/main/mojo/README.md#quickstart) opens each binding's guide.
 
-The crate wraps the same ABI, with closures for handlers and threads the application owns for polling:
-
-```rust
-use std::time::Duration;
-use ucall::*;
-
-let interface = Interface::new("127.0.0.1:0").pipelined_requests(16);
-let mut server = Server::new(&[interface])?;
-server.post("/sum", |request: Request| {
-    let sum: u64 = request.body().iter().map(|&byte| u64::from(byte)).sum();
-    let _ = request.reply(HTTPStatus::OK, &[], sum.to_string().as_bytes());
-})?;
-let batching = Batching { min_size: 8, max_size: 64, max_latency: Duration::from_micros(500) };
-let infer = server.batch("/infer", Verb::Post, batching, |batch: Batch| {
-    for request in batch {
-        let _ = request.reply(HTTPStatus::OK, &[], b"scored");
-    }
-})?;
-let address = server.address(0).unwrap().to_owned();
-
-let mut client = Client::new(ClientOptions { connections: 4, ..Default::default() })?;
-std::thread::scope(|scope| {
-    for event_loop in 0..server.event_loops() {
-        let server = &server;
-        scope.spawn(move || server.take_calls(event_loop));
-    }
-    scope.spawn(|| infer.take_batches());
-    let sum = client.post(format!("http://{address}/sum"), vec![1, 2, 3]);
-    let scored = client.post(format!("http://{address}/infer"), b"pixels".as_slice());
-    server.stop();
-    assert_eq!(sum?.body(), b"6");
-    assert_eq!(scored?.body(), b"scored");
-    Ok::<(), Error>(())
-})?;
-```
-
-The [Rust guide](https://github.com/unum-cloud/UCall/blob/main/rust/README.md) covers streaming, files, Noise and metrics.
-
-## Performance
-
-The native [benchmark driver](https://github.com/unum-cloud/UCall/blob/main/bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
-It runs closed-loop by default, or open-loop at a fixed arrival rate that charges each call its delay from the intended send time.
-Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
-On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
-The [framework comparison](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison) serves a 1 KB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
-The guide also measures pipelining depth, Noise against TLS 1.3 behind nginx, scaling across event loops, and 10,000 connections.
-The [C ABI page](https://github.com/unum-cloud/UCall/blob/main/c/README.md) describes the implemented native surface; SDK and authorization plans below are labeled as such.
-
-## Design Principles
+## Architecture
 
 ### Asynchronous Engine for Synchronous Applications
 
@@ -617,6 +539,65 @@ ucall_server_options_t config = {
 
 A datagram that fails to send is dropped, and the next one carries its counters, so collectors see every request counted once.
 
+## FastAPI UX Comparison
+
+Both columns serve the same typed endpoint; UCall's [Python bindings](https://github.com/unum-cloud/UCall/blob/main/python/README.md) bind its parameters in C and answer on the polling thread.
+
+<table width="100%">
+<tr>
+<th width="50%">FastAPI</th><th width="50%">UCall</th>
+</tr>
+<tr>
+<td>
+
+```sh
+pip install fastapi uvicorn
+```
+
+</td>
+<td>
+
+```sh
+pip install ucall
+```
+
+</td>
+</tr>
+<tr>
+<td>
+
+```python
+from fastapi import FastAPI
+
+server = FastAPI()
+
+@server.get('/sum')
+def sum(a: int, b: int):
+    return a + b
+
+import uvicorn
+uvicorn.run(server, host='0.0.0.0', port=8000)
+```
+
+</td>
+<td>
+
+```python
+import ucall
+
+server = ucall.Server(ucall.Interface('0.0.0.0:8000'))
+
+@server.get('/sum')
+def sum(a: int, b: int):
+    return a + b
+
+server.run()
+```
+
+</td>
+</tr>
+</table>
+
 ## Differences & Limitations
 
 ### Where Would You Prefer WebRTC?
@@ -714,6 +695,93 @@ server {
 }
 ```
 
+## Performance
+
+The native [benchmark driver](https://github.com/unum-cloud/UCall/blob/main/bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
+It runs closed-loop by default, or open-loop at a fixed arrival rate that charges each call its delay from the intended send time.
+Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
+On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
+The [framework comparison](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison) serves a 1 KB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
+The guide also measures pipelining depth, Noise against TLS 1.3 behind nginx, scaling across event loops, and 10,000 connections.
+The [C ABI page](https://github.com/unum-cloud/UCall/blob/main/c/README.md) describes the native surface; the SDK and authorization plans under [Architecture](#architecture) are labeled as such.
+
+## Compatibility
+
+Every binding wraps the same C ABI, so the features below differ only where a language has no way to spell one.
+
+| Feature                         |  C  | Python | Rust | Mojo |
+| :------------------------------ | :-: | :----: | :--: | :--: |
+| Routes with path parameters     |  ✓  |   ✓    |  ✓   |  ✓   |
+| Handlers with typed parameters  |     |   ✓    |      |      |
+| Batch endpoints                 |  ✓  |   ✓    |  ✓   |  ✓   |
+| File, path and streamed replies |  ✓  |   ✓    |  ✓   |  ✓   |
+| Streamed request bodies         |  ✓  |   ✓    |  ✓   |  ✓   |
+| Pipelined client calls          |  ✓  |   ✓    |  ✓   |  ✓   |
+| Noise XX, IK and KK             |  ✓  |   ✓    |  ✓   |  ✓   |
+| Peer authorizers                |  ✓  |   ✓    |  ✓   |  ✓   |
+| Loop and batch statistics       |  ✓  |   ✓    |  ✓   |  ✓   |
+| StatsD metrics and log sinks    |  ✓  |   ✓    |  ✓   |  ✓   |
+| `await` on deferred replies     |     |   ✓    |  ✓   |      |
+
+| Platform | Backends                                      | Architectures           |
+| :------- | :-------------------------------------------- | :---------------------- |
+| Linux    | io_uring 6.12 and 6.18, epoll with AIO, POSIX | x86, Arm, RISC-V, POWER |
+| macOS    | kqueue, POSIX                                 | Arm, x86                |
+| FreeBSD  | kqueue, POSIX                                 | x86, Arm                |
+| Windows  | Registered I/O, IOCP                          | x86, Arm                |
+
+### Build From Source
+
+A source build needs CMake 3.28 and a C++20 compiler, and pulls StringZilla, ForkUnion and SmashTable as submodules:
+
+```sh
+git clone --recursive https://github.com/unum-cloud/UCall.git && cd UCall
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
+cmake --build build_release --parallel
+cmake --install build_release --prefix ~/.local
+```
+
+> The install holds the C headers, `libucall_static`, `libucall_shared`, a `ucall.pc`, and a CMake package naming `ucall::static` and `ucall::shared`, which a C program links like any C library.
+> It also holds `ucall`, a command-line client for one HTTP or Noise call, as in `ucall -d @body.json http://127.0.0.1:8080/echo`.
+> `-H` adds a header line, `-d @-` reads the body from standard input, `-i` prints the status line and every response field before the body, and `--server-key` pins the server for an `http+noise://` URL.
+> `ucall keygen FILE` writes a fresh Noise private key and prints its public half, and the exit code is 0 for a 2xx answer and the status's hundreds digit otherwise.
+> Leaving `UCALL_BUILD_SHARED` off installs the archive without the shared library and its `ucall.pc`.
+
+`pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](https://github.com/unum-cloud/UCall/blob/main/CONTRIBUTING.md) lists the presets, tests and cross builds.
+
+### Multiversioned and Monoversioned Builds
+
+UCall compiles in one of two shapes, picked by `UCALL_MULTIVERSIONED`.
+
+- __Multiversioned builds are for distribution.__
+  One binary runs well across diverse machines, because each CPU picks its own class at runtime.
+  This is the default, and the shape of the Python wheels and the Rust crate.
+- __Monoversioned builds are for throughput.__
+  For common hardware and data-center deployments, the binary carries only the best code for one machine.
+  These are the leanest binaries: they start fast and take little memory and disk.
+  Outside that machine they refuse cleanly with `ucall_status_unsupported_k`, never crashing and never falling back to slower code in silence.
+- __The switches.__
+  `UCALL_MULTIVERSIONED=OFF` picks the second shape and `UCALL_MARCH` names its CPU floor.
+  The `xeon4`, `xeon6`, `grace`, `vera` and `venice` presets spell whole machines by their CPUs.
+
+A monoversioned build compiles the single `monoversioned` CPU class in place of the ladder of named ones.
+
+## Repository Layout
+
+| Directory                   | Holds                                                                             |
+| :-------------------------- | :-------------------------------------------------------------------------------- |
+| `c/`                        | The C ABI headers `ucall.h`, `types.h`, `server.h` and `client.h`, and a C caller |
+| `include/ucall/`            | The C++ 20 core: HTTP, DNS, the Noise tunnel, I/O engines and the network loops   |
+| `src/`                      | The library exporting the C ABI, one unit per compiled CPU class                  |
+| `python/`, `rust/`, `mojo/` | The bindings, each with its own guide                                             |
+| `cli/`                      | The `ucall` command-line client                                                   |
+| `tools/`                    | The server shared by examples and benchmarks                                      |
+| `examples/`                 | `hello.c`, and echo, key-value, ledger and inference servers                      |
+| `bench/`                    | The benchmark driver and the framework comparison                                 |
+| `test/`                     | Native, Python and fuzzing suites                                                 |
+| `verification/`             | Spin models of the concurrent protocols                                           |
+| `cmake/`                    | Build helpers and cross toolchains                                                |
+
 ## Citation
 
 If UCall helps your research or product, please cite it:
@@ -721,9 +789,9 @@ If UCall helps your research or product, please cite it:
 ```bibtex
 @software{Vardanian_UCall,
   author = {Vardanian, Ash},
-  title = {{UCall: Low-Latency Client-Server Networking Stack Built around Noise Encryption, io\_uring and SIMD}},
+  title = {{UCall: Low-Latency Client-Server Communication Engine Built around Noise, io\_uring \& SIMD}},
   doi = {10.5281/zenodo.7951496},
-  url = {https://github.com/unum-cloud/UCall},
+  url = {https://www.unum.cloud/docs/ucall},
   license = {Apache-2.0}
 }
 ```

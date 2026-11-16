@@ -36,7 +36,8 @@ classifiers = [
 dependencies = []
 
 [project.urls]
-Homepage = "https://github.com/unum-cloud/UCall"
+Homepage = "https://www.unum.cloud/docs/ucall"
+Documentation = "https://www.unum.cloud/docs/ucall/python"
 Repository = "https://github.com/unum-cloud/UCall"
 Issues = "https://github.com/unum-cloud/UCall/issues"
 

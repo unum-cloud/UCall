@@ -22,17 +22,17 @@ server = ucall.Server(ucall.Interface("127.0.0.1:0"))
 
 
 @server.get("/hello/{name}")
-def hello(name: str, excited: bool = False):
-    return f"Hello, {name}{'!' if excited else ''}"
+def hello(name: str):
+    return f"Hello, {name}"
 
 
 runner = threading.Thread(target=server.run)
 runner.start()
 client = ucall.Client(connections=1)
-response = client.get(f"http://{server.addresses[0]}/hello/world?excited=yes")
+response = client.get(f"http://{server.addresses[0]}/hello/world")
 server.stop()
 runner.join()
-assert bytes(response.body) == b"Hello, world!"
+assert bytes(response.body) == b"Hello, world"
 ```
 
 `run` serves the one event loop on the thread the application lent it, the client blocks in `get` until its response arrives, and `stop` releases the serving thread.
@@ -40,14 +40,10 @@ assert bytes(response.body) == b"Hello, world!"
 ## Serving
 
 `ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
-Its `log=` callable receives each line the server writes as a `ucall.LogLevel` and a `str`, on whichever thread wrote it and holding the interpreter lock, filtered by `log_level=` and shaped by `log_format=`, and `metrics=ucall.Metrics(address, sample_rate, prefix, tags, interval_microseconds)` sends StatsD datagrams from every event loop.
-An `Interface` also takes `max_request_bytes=`, past which a request is answered 413, and `reply_directories=`, the directories a `ucall.Path` part names by position.
-`descriptor=` takes a listening socket, or its descriptor, that systemd or a supervisor opened, TCP or AF_UNIX, in place of an address; the server accepts on duplicates and never closes it.
-Without interfaces it answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545".
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
-It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
-At its connection budget a new peer evicts the idle keep-alive connection that progressed least recently.
-Port zero binds a free port, which `server.addresses` reports.
+It admits 1024 connections by default, evicting the idle keep-alive connection that progressed least recently for a new peer, and reads one request per connection at a time unless `pipelined_requests` allows more, while replies still leave in request order.
+`max_request_bytes=` answers 413 past its size, `reply_directories=` names the directories a `ucall.Path` part resolves beneath, and `descriptor=` takes a listening socket that systemd or a supervisor opened in place of an address, which the server never closes.
+Without interfaces the server answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545", and port zero binds a free port, which `server.addresses` reports.
 
 ```python
 import ucall
@@ -59,48 +55,47 @@ print(f"{server.event_loops} event loops on {server.backend.name} with {server.c
 
 
 @server.get("/users/{user}/files/{*path}")
-def listing(user: str, path: str, limit: int = 10, hidden: bool = False):
-    return {"user": user, "path": path, "limit": limit, "hidden": hidden}
+def listing(user: str, path: str):
+    return {"user": user, "path": path}
+```
+
+Endpoints register before any loop is polled, with `route` taking any `Verb` and `get`, `post`, `put`, `delete` and `patch` naming one; each decorator returns the function unchanged.
+Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice raises `ucall.Error` with `Status.ALREADY_EXISTS`.
+Routing is exact, so `/users` and `/users/` are different paths.
+A path no endpoint matches answers 404, one whose endpoints take other verbs answers 405 with an `allow` header, a GET endpoint also serves HEAD, `OPTIONS` answers 204 with the same `allow` list, and a request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
+
+### Typed Parameters
+
+```python
+@server.get("/search/{index}")
+def search(index: str, query: str, limit: int = 10, exact: bool = False):
+    return {"index": index, "query": query, "limit": limit, "exact": exact}
 
 
 @server.post("/scale")
 def scale(value: float, factor: float = 2.0):
     return value * factor
+```
 
+Registration reads a handler's signature once, and each parameter annotated `str`, `int`, `float`, `bool` or `bytes`, or left bare, binds by name from the first place that has it: a template placeholder, the percent-decoded query, a JSON object body parsed once in C, or its default.
+So `GET /search/docs?query=cats&exact=yes` calls `search("docs", "cats", 10, True)`, and `POST /scale` with `{"value": 1.5}` answers `3.0`.
+Text converts as `int(text)` and `float(text)` do, `bool` reads "1", "true", "yes" and "on" or "0", "false", "no" and "off" in any case, and a JSON value must already have the annotated type, except that an integer widens to `float` and a string encodes to `bytes`.
+A missing or malformed value answers 400 with the reason as plain text, such as "missing parameter 'limit'", without calling the handler.
+Registration raises `TypeError` for `*args`, `**kwargs`, more than 16 parameters, an annotation outside that list, or an `async def` handler, since handlers run on the polling thread.
+A returned `bytes`, `bytearray` or `memoryview` replies as application/octet-stream, a `str` as UTF-8 text/plain, anything else as application/json, and None as 204.
 
+### Raw Requests
+
+```python
 @server.route("/anything", ucall.Verb.ANY)
 def anything(request: ucall.Request):
     request.reply_error(501, f"{request.verb.name} is not served\n")
 ```
 
-Endpoints register before any loop is polled, with `route` taking any `Verb` and `get`, `post`, `put`, `delete` and `patch` naming one.
-Each decorator registers the function through `add_endpoint` and returns it unchanged, so it stays callable from Python.
-Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice raises `ucall.Error` with `Status.ALREADY_EXISTS`.
-Routing is exact: an empty segment is a segment, so `/users` and `/users/` are different paths.
-A path no endpoint matches answers 404, one whose endpoints take other verbs answers 405 with an `allow` header, a GET endpoint also serves HEAD, and `OPTIONS` answers 204 with the same `allow` list.
-A request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
-
-Registration reads a handler's signature once.
-A handler taking one parameter annotated `ucall.Request` receives the request itself.
-Any other handler takes parameters annotated `str`, `int`, `float`, `bool` or `bytes`, or left bare, and each binds by name from the first place that has it:
-
-- a placeholder of the template, as sent;
-- the query, percent-decoded with "+" as a space, a "%" without two hexadecimal digits answering 400;
-- a JSON object body, parsed once in C and only when an earlier place missed a parameter, with integers of any width kept exact;
-- the parameter's default.
-
-Text converts as `int(text)` and `float(text)` do, `bool` reads "1", "true", "yes" and "on" or "0", "false", "no" and "off" in any case, and `bytes` takes the raw bytes.
-A JSON value must already have the annotated type, except that an integer widens to `float` and a string encodes to `bytes`.
-A missing or malformed value answers 400 with the reason as plain text, such as "missing parameter 'limit'", without calling the handler.
-Registration raises `TypeError` for `*args`, `**kwargs`, more than 16 parameters, or an annotation outside that list.
-It refuses an `async def` handler with `TypeError` too, since handlers run on the polling thread; a coroutine application registers a plain function, calls `request.detach()`, and replies from its own event loop.
-
-What a handler returns becomes the reply: `bytes`, `bytearray` and `memoryview` as application/octet-stream, `str` as UTF-8 text/plain, and anything else as application/json, written in C, or through `json.dumps` for a value C does not write, such as a dict keyed by numbers.
-None from a typed handler answers 204, and None from a handler taking the request means it replies itself.
+A handler taking one parameter annotated `ucall.Request` receives the request itself and replies through it, as [Requests](#requests) shows; a coroutine application calls `request.detach()` and replies from its own event loop.
 A handler's exception reaches `sys.unraisablehook` and answers 500, and the loop keeps serving.
-
-`server.event_loop_statistics(loop)` copies one loop's counters as a dict, from any thread while the loop runs: polls, system calls, submissions and completions, accepted connections, requests, and the bytes received, sent and copied.
-Divided by `requests`, they price one call.
+`log=` on the server receives each line it writes as a `ucall.LogLevel` and a `str`, filtered by `log_level=` and shaped by `log_format=`, and `metrics=ucall.Metrics(address, sample_rate, prefix, tags, interval_microseconds)` sends StatsD datagrams from every event loop.
+`server.event_loop_statistics(loop)` copies one loop's counters as a dict, from any thread while the loop runs; divided by `requests`, they price one call.
 
 ## Requests
 
@@ -384,17 +379,10 @@ On the serving side, failures become replies rather than exceptions: 400 for par
 
 ## Threads & Polling
 
-The package starts no threads and needs no event loop of its own: every handler runs on a thread the application lent to a polling call.
-
-- A route handler runs on the thread inside `take_call`, `take_calls` or `run` for the event loop that received the request.
-- A batch handler runs on the thread inside `take_batch` or `take_batches` for its endpoint, never on an event loop.
-- A server's peer authorizer runs on the polling thread completing the handshake, and a client's on the client's own thread inside `take_completed` or a blocking call.
-
+The package starts no threads and needs no event loop of its own: a route handler runs on the thread inside `take_call`, `take_calls` or `run` for its event loop, a batch handler on the thread inside `take_batch` or `take_batches` for its endpoint, and a peer authorizer on the thread completing the handshake.
 Each event loop and each batch endpoint has one polling owner at a time.
-`take_calls` and `take_batches` run until `server.stop()`, while `take_call` and `take_batch` return after one round, waiting up to their timeout, so a loop of them interleaves polling with other work on the same thread.
-`server.stop()` works from any thread, handlers included, and wakes every polling thread; join them before releasing the server.
-The first stop drains, answering every request already held before its connection closes, and a second one cuts the replies still in flight.
-An interface accepts on its own number of event loops, one by default, and `server.event_loops` reports the largest of those counts.
+`take_calls` and `take_batches` run until `server.stop()`, while `take_call` and `take_batch` return after one round, waiting up to their timeout.
+`server.stop()` works from any thread, handlers included, and wakes every polling thread; the first stop drains the requests already held, and a second cuts the replies still in flight.
 
 ```python
 import threading
@@ -411,40 +399,19 @@ for thread in threads:
     thread.join()
 ```
 
-Every polling call releases the interpreter lock while it waits on the network and takes it back only to run a Python handler, authorizer or batch handler.
-So loops parse, route and send in parallel, while Python handlers on several loops take turns on the lock unless they release it themselves, as NumPy does in its kernels.
-On a free-threaded interpreter there is no lock to take turns on, and handlers on several loops run at once.
-Signals reach Python only on the main thread between calls, so `take_calls` and `take_batches` belong on other threads.
-
-`server.run()` covers the simplest server, one event loop and no batch endpoints, on the calling thread, and raises `RuntimeError` for anything larger.
-It polls in slices of 100 milliseconds and checks for signals between them, so Ctrl+C raises `KeyboardInterrupt` from it, and once stopped it lets the loop finish the requests in flight before returning.
-The blocking client calls wait in the same slices, so Ctrl+C interrupts them too, and the interrupted call completes later through `take_completed`.
-
-A `Client` belongs to the thread that created it, and any other thread calling it gets `ucall.Error` with `Status.INVALID_ARGUMENT`, so a program calling from several threads makes one client per thread.
-A `Request` and a `Response` move freely between threads.
-Every thread that polls, replies or reads must run on a CPU supporting the CPU class the server or client resolved at start, so `CPUClass.SERIAL` is the safe choice on machines mixing CPU generations.
+Every polling call releases the interpreter lock while it waits on the network and takes it back only to run Python code, so loops parse, route and send in parallel while Python handlers take turns on the lock; on a free-threaded interpreter they run at once.
+`server.run()` serves one event loop and no batch endpoints on the calling thread, polling in slices of 100 milliseconds so Ctrl+C raises `KeyboardInterrupt`, and the blocking client calls wait in the same slices.
+Signals reach Python only on the main thread, so `take_calls` and `take_batches` belong on other threads.
+A `Client` belongs to the thread that created it, and any other thread calling it gets `Status.INVALID_ARGUMENT`, while a `Request` and a `Response` move freely between threads.
+Every thread that polls, replies or reads must run on a CPU supporting the resolved CPU class, so `CPUClass.SERIAL` is the safe choice on machines mixing CPU generations.
 
 ## Design
 
-The binding is a thin native layer, and every rule below follows from that.
-
 - __Processing stays native.__
-  Parameter binding, percent-decoding, conversion, reply serialization and the blocking client calls run in the extension, and `ucall/__init__.py` only re-exports it.
-  A handler's signature is resolved once at registration, so a request costs a table walk and one call, and a typed handler never sees a `Request` object at all.
-- __Verbs share one name across languages.__
-  `take_call`, `take_calls`, `take_batch`, `take_batches`, `submit` and `take_completed` name the same calls in Python and Rust.
+  Parameter binding, percent-decoding, conversion, reply serialization and the blocking client calls run in the extension, and a handler's signature is resolved once at registration, so a typed handler never sees a `Request` object at all.
 - __Ownership follows the request.__
   A reply consumes its `Request`, a released request answers 500, views over a body pin it until released, and a `Response` frees itself.
-- __Handlers never stop a loop.__
-  An exception inside a handler or an authorizer reaches `sys.unraisablehook` and answers 500 or rejects the peer, and Ctrl+C raised inside one is re-armed for the main thread.
-- __Blocking stays simple.__
-  Every method looks as it would without asynchrony, and only a reply with file or path parts answers a `Deferred`.
-- __Deferred replies are symmetric through language idioms.__
-  A `Deferred` owns its outcome: `wait()` blocks, `await` borrows the running loop's executor, and releasing it waits, as releasing any owner does.
-  The verbs that may defer exist only on a `DetachedRequest`, so by type no polling thread waits on its own loop.
-- __No extra cost until used.__
-  Bytes-only replies keep their outcome on the stack, up to sixteen reply parts lay out on the stack, and a `Deferred` is the one allocation a file reply adds.
+- __Deferred replies only where they can wait.__
+  Every method looks as it would without asynchrony, and only a reply with file or path parts on a `DetachedRequest` answers a `Deferred`, so no polling thread waits on its own loop; `wait()` blocks, `await` borrows the running loop's executor, and releasing one waits.
 - __No life of its own.__
-  The binding starts no threads, keeps no global state beyond imported helpers, and needs no async runtime, so it drops into any threading model.
-- __Statuses and modes are enums.__
-  `ucall.Status`, `Backend`, `CPUClass`, `Security`, `Verb`, `BodyDelivery` and `LogLevel` are `enum.IntEnum` classes, so nothing is ever compared as a string.
+  The binding starts no threads, keeps no global state beyond imported helpers and needs no async runtime, and an exception inside a handler or an authorizer reaches `sys.unraisablehook` rather than stopping a loop.

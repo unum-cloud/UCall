@@ -4,6 +4,25 @@ For coding guidelines, refer to [ashvardanian/CONTRIBUTING.md](https://github.co
 Configuring a source checkout enables the hooks in `.githooks/`.
 They check staged additions, Doxygen and docstring structure, imports, naming, and language formatting.
 
+## Before You Start
+
+Pull the NumKong, StringZilla, ForkUnion and SmashTable submodules before building anything, and put each on the branch `.gitmodules` names, so it tracks that branch instead of sitting on a detached commit:
+
+```sh
+git submodule update --init --recursive
+git submodule foreach --quiet 'git switch --quiet "$(git config -f "$toplevel/.gitmodules" "submodule.$name.branch")"'
+```
+
+Later, bring every submodule to the tip of its branch before bumping the commits this repository records:
+
+```sh
+git submodule foreach --quiet 'git pull --ff-only --quiet'
+```
+
+`cmake/ucall_siblings.cmake` builds each submodule in place when it is checked out, and otherwise fetches the commit `ucall_sibling` pins for it.
+A commit that moves a submodule moves its pin too, and the pre-commit hook refuses one where the two disagree.
+Machine specifics such as a compiler path go into a gitignored `CMakeUserPresets.json`, whose presets inherit the ones in `CMakePresets.json`.
+
 ## Compiling C and C++
 
 Building takes CMake 3.28 and a C++20 compiler.
@@ -75,6 +94,142 @@ The pick reads StringZilla's and ForkUnion's detected masks, never their enabled
 A value no class takes fails with `invalid_argument`, as a misspelled name does in `ucall_cpu_class_from_name`.
 A pinned class the machine does not run fails with `unsupported`, and otherwise its masks become the ceiling.
 Construction takes the newest compiled class on the ladder whose masks fit the ceiling, and fails with `unsupported` when none does, as a monoversioned build does on an older machine.
+
+## Code Rules
+
+Use the vocabulary already established by the sibling libraries: variants, CPU classes, capability ladders, and outcomes.
+A name identifies the resource or operation it represents; do not introduce another wrapper to rename an existing concept.
+Class, alias, and variable templates have bare names, template parameters end in an underscore, concrete types use `_t`, and concrete constants use `_k`.
+Declare sibling namespace aliases once and use `st::`, `fu::`, and `sz::` at use sites.
+Spell full sibling namespaces only when declaring those aliases.
+Each template in `include/` takes its kits and atomic reference as template arguments, and `src/` picks them per CPU class.
+No template in `include/` names a CPU class or a capability mask; classes, masks, and the ladder that chooses rungs stay in `src/`.
+
+Every mutable object has one owner and one authoritative state.
+Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
+That owner holds its connections, protocol transitions, deadlines, and backend operation records.
+Endpoint callbacks execute synchronously on the polling caller, and batch callbacks on the batch endpoint's polling owner.
+Cross-thread retained replies and server shutdown publish state atomically rather than changing the loop's I/O records directly.
+Public contracts say when inputs may be reused, when an outcome becomes final, and which owner must outlive which handle.
+Cancellation requests work to stop; only retirement permits its storage to be reused.
+Represent mutually exclusive phases with scoped enums and independent properties with named enum flags.
+Derive state from existing ownership pointers or counters when they already provide the answer; do not mirror it with booleans.
+Give owning classes explicit copy and move contracts.
+An object referenced by kernel user data or live child pointers stays at a stable address and cannot be copied or moved.
+
+Pass one allocator instance through owning parents, child objects, containers, and buffers, rebinding it for each element type.
+Allocators return null on allocation failure, and callers report that failure without throwing.
+Deallocation uses the allocator that created the allocation, including responses that outlive their clients.
+
+Keep scalar control in the state machine and bulk byte work in capability-selected StringZilla kernels.
+An explicit CPU instantiation exists only when its selected kernels, atomics, or waits differ from its parent.
+Use ForkUnion references for cross-thread admission and publication; keep single-owner counters local.
+Do not add an abstraction, wrapper, flag, or dedicated file for symmetry or a possible future use.
+
+### Macros
+
+Every all-caps name starts with the full project name, `UCALL_`.
+A trailing `_` marks a name as internal: it may change in any release, and nothing outside this repository may define or test it.
+A name without it is a public contract, either a switch you may set or a value you may read.
+
+| Family                    | Form                           | Example                 |
+| :------------------------ | :----------------------------- | :---------------------- |
+| CPU class                 | `UCALL_TARGET_<CLASS>`         | `UCALL_TARGET_SERIAL`   |
+| Optional facility         | `UCALL_WITH_[<OS>_]<FACILITY>` | `UCALL_WITH_BSD_KQUEUE` |
+| Architecture fact         | `UCALL_ARCH_<ARCH>_`           | `UCALL_ARCH_ARM64_`     |
+| Operating-system identity | `UCALL_OS_<OS>_`               | `UCALL_OS_POSIX_`       |
+
+Every name in these families is always defined, as 0 or 1, and tested with `#if`.
+`defined(...)` appears only in a `!defined` default and in a guard that an `#error` follows.
+A kernel facility, like `UCALL_WITH_WINDOWS_IOCP`, defaults from the identity, while `UCALL_WITH_LINUX_URING` defaults to 0, and the target that links liburing sets it.
+Only the Platform Identity region of `c/ucall/types.h` reads operating-system predefines like `__linux__`.
+Compiler predefines like `__clang__`, `__GNUC__` and `_MSC_VER` are read raw where they matter.
+
+### Capacities and Bounds
+
+Derive storage from a caller's admission budget, protocol geometry, or an actual operating-system or hardware property.
+An I/O transfer limit segments an operation; it does not become a message-size limit.
+Exhausted resources apply backpressure or report allocation failure rather than truncating input.
+Do not tune constants until one benchmark looks good.
+
+### Statuses
+
+Statuses 0 to 19 carry the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
+A library leaves out the ones it cannot answer but never renumbers the rest, and numbers its own statuses from 20.
+Every enum the C interface names, statuses included, has a `ucall_*_name` answering "unrecognized" for a value it does not know and a `ucall_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
+CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
+`ucall_version_name` answers the full version, pre-release suffix included.
+
+### Refusals
+
+A call the library cannot run answers one status, picked by what is wrong, in this order: `invalid_argument`, `read_only`, `config_mismatch`, `unsupported`, `contended`, `overflow`.
+A `NULL` handle the call operates on answers `uninitialized` before any of them.
+A malformed argument or list, one that is empty, `NULL` or names a handle twice, answers `invalid_argument`.
+A write to a handle opened read-only answers `read_only`.
+Handles of another kind, or of a geometry the call cannot join, answer `config_mismatch`.
+A well-formed case nothing implements yet, like several event loops on one IOCP interface, answers `unsupported`.
+An option the library cannot honour is refused with `unsupported`, never ignored.
+A handle another call holds answers `contended` rather than waiting, and a size past its counter answers `overflow`.
+A refusal moves nothing: every output and handle reads as it did before the call.
+Each header lists a verb's refusals under `@par Statuses` in this order and in these words.
+
+### Query Views
+
+A batched kernel takes its queries as one flat transparent view over a static extent, like a `std::array` of views sized by the batch's extent, never as a span of pointers it chases one query at a time.
+A query type that owns packed storage exposes a view of it, and the kernel reads that view.
+
+### Split String Literals
+
+A string literal split across lines by hand ends every fragment but the last with a trailing `//`.
+Without the pin, clang-format joins the fragments or restacks them into a staircase.
+This holds in C, C++, CUDA and HIP sources alike.
+
+```cpp
+char const help[] =                                 //
+    "Usage: probe [options]\n"                      // allowed: every fragment but the last is pinned
+    "Runs one probe.\n";
+
+char const help[] = "Usage: probe [options]\n"
+                    "Runs one probe.\n";            // refused: the first fragment is unpinned
+```
+
+The check is `check_split_string_literal_pinned`.
+A comment that explains the line pins it just as well, and a bare `//` on a member line is not taken for a member's documentation.
+
+### Vocabulary
+
+One word names each concept, here and in every Unum project; the right column lists the words it replaces.
+
+| Concept                                                          | Word                                  | Refused                                       |
+| :--------------------------------------------------------------- | :------------------------------------ | :-------------------------------------------- |
+| a kind of work in a plan, ended by a barrier                     | phase                                 | stage, step, pass                             |
+| the same work again, counted                                     | repetition, named for what repeats: round, depth, nesting | phase, pass       |
+| an independent unit of one phase, run by any thread in any order | task                                 | step, chunk                                   |
+| sequential work                                                  | step                                  | task                                          |
+| a per-capability kernel bundle                                   | kit                                   | trait                                         |
+| a compiled alternative per class, dtype or residency             | variant                               | arm, cell                                     |
+| RAM, VRAM or NVMe                                                | residency                             | home, memory side                             |
+| an exported operation and its table entry                        | verb; trampoline                      | …                                             |
+| a fixed-shape collection a verb fills                            | outputs                               | landing, lander                               |
+| a member of a plan, cursor or walk                               | what it holds and when it holds it    | bits, current, state, data, flags, tmp, scratch |
+
+### Comments and Formatting
+
+Public C and C++ contracts use Doxygen tags; Python public functions and modules describe their purpose in docstrings.
+A closing `@par Statuses:` block lists only the statuses a verb's contract adds, while resource failures, deferral and defects are covered once by the categories in the `ucall_status_t` docblock.
+A code comment explains a non-obvious reason rather than narrating an operation.
+Keep source headers, attribution, and original creation dates consistent with the file's history.
+
+Begin each Markdown sentence on a separate source line and align table columns.
+Run `dprint fmt` for Markdown, `clang-format` for C and C++, Ruff for Python, and `cargo +stable fmt` for Rust.
+The staged-file hooks check these conventions and reject template suffixes even with brace initialization.
+
+### Review and Measurements
+
+A commit message explains the resulting behavior, why the change matters, and how it was checked.
+Stage a concrete review candidate with a proposed title and body; staging does not authorize committing.
+Performance reports name the backend, CPU class, build, placement, workload, admission budgets, and load generator.
+Traced timings explain costs and are not throughput measurements.
 
 ## Running Tests
 
@@ -165,6 +320,49 @@ git submodule update --init forkunion
 ./verification/check.sh segment_links.pml
 ```
 
+## Bindings
+
+Every binding is a thin layer over the C interface, and these rules hold in each of them.
+Typed bindings are those whose compiler checks callback signatures, and dynamic bindings are the rest; in UCall the typed ones are Rust and Mojo, and the dynamic ones are Python.
+
+The C library decides what is valid.
+A binding forwards its status, turns each status into its language's error in one place, re-checks nothing the library refuses, and keeps no copy of state the library already holds.
+Name tables come from the library's `ucall_*_name` and `ucall_*_from_name` pairs, never from a switch written in the binding.
+
+One mechanism reports every outcome: `ucall_outcome_status` reads it without waiting, and `ucall_outcome_wait` parks until it is final.
+Nothing in a binding takes a lock, sends a notification or adds synchronization of its own.
+The object that submitted a deferred call is the only one that polls its outcome, so no other thread ever waits on it, and whatever a second caller asks, the library answers.
+A blocking `wait` calls `ucall_outcome_wait`.
+An asynchronous bridge never parks a thread: it reads `ucall_outcome_status` and, while the call is deferred, yields to its runtime.
+A runtime with a timer pauses between reads with a backoff growing from about 1 µs to 1 ms, like Python's `asyncio.sleep`, Swift's `Task.sleep`, JavaScript's `setTimeout` and C#'s `Task.Delay`.
+A Rust future yields only: `poll` reads the status and, while it is deferred, calls `wake_by_ref` and returns `Poll::Pending`, with no sleep and no timer thread.
+
+A callback never raises into the library.
+Its fault never unwinds through C frames and never waits in a latch for the call to end: typed bindings give their callback types no way to throw, like a `noexcept` C++ callback type, while dynamic bindings report the fault through their language's unraisable path, like Python's `sys.unraisablehook` and JavaScript's uncaught-exception handler, and the callback answers cancel.
+A Rust callback that panics aborts the process, as Rust does for any unwind reaching an `extern "C"` frame; nothing catches the unwind.
+A binding that hands the library no callback of its own has nothing to report.
+
+A view the library hands back lives until the next call on its arena.
+The library describes where the memory sits, and the caller checks it; the binding neither copies the view to be safe nor checks its residency on the caller's behalf.
+
+Every array a verb reads shares the call's one count, so mismatched shapes cannot be expressed.
+Where a binding's own types carry two lengths, like a slice of keys beside a matrix of values, it checks once that they agree before the call crosses into the library, and nowhere else.
+
+Each verb has one body, which fills the C struct and calls the library with no layers in between.
+What it returns is read from the struct's output slot, a trampoline receives the handler itself as its state with no hub around it, and whether a call blocks or defers follows from the type of the receiver it is called on, never from a flag.
+Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle.
+
+A typed binding takes the scalar as a type parameter of each call, like USearch's `search::<f32>`, rather than letting a handle's type fix one.
+A deferred Rust call owns what it lends the library until the call is final, since the borrow checker cannot see the library holding it.
+A C++ wrapper over the C interface is a full typed binding: it has a deferred receiver, `noexcept` callback types and per-call scalar templates.
+
+A dynamic binding publishes every field of every report the library fills.
+A type the binding hands to C by cast, like a slice of parts lent as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
+Tests never restate a struct's layout that the compiler already pins: no `offset_of!`, `size_of`, `MemoryLayout` or `Marshal.SizeOf` asserts against the C structs; `offsetof` tables that declare members are declarations, not tests.
+Tests of how names print and parse, and of an engine run again through the binding, stay.
+
+`.githooks/pre-commit` refuses locks in binding sources, throwing callback types, caught unwinds and kept exceptions.
+
 ## Python
 
 `pyproject.toml` builds with `scikit-build-core`, which configures the top-level CMake tree with `UCALL_BUILD_PYTHON=ON` and installs the `ucall_python` target, the extension `ucall.lib`, into the `python/ucall/` package.
@@ -190,81 +388,6 @@ cargo clippy --all-targets -- -D warnings
 RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 ```
 
-## Code Clarity
-
-Use the vocabulary already established by the sibling libraries: variants, CPU classes, capability ladders, and outcomes.
-A name identifies the resource or operation it represents; do not introduce another wrapper to rename an existing concept.
-Class, alias, and variable templates have bare names, template parameters end in an underscore, concrete types use `_t`, and concrete constants use `_k`.
-Declare sibling namespace aliases once and use `st::`, `fu::`, and `sz::` at use sites.
-Spell full sibling namespaces only when declaring those aliases.
-Each template in `include/` takes its kits and atomic reference as template arguments, and `src/` picks them per CPU class.
-No template in `include/` names a CPU class or a capability mask; classes, masks, and the ladder that chooses rungs stay in `src/`.
-
-Every mutable object has one owner and one authoritative state.
-Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
-That owner holds its connections, protocol transitions, deadlines, and backend operation records.
-Endpoint callbacks execute synchronously on the polling caller, and batch callbacks on the batch endpoint's polling owner.
-Cross-thread retained replies and server shutdown publish state atomically rather than changing the loop's I/O records directly.
-Public contracts say when inputs may be reused, when an outcome becomes final, and which owner must outlive which handle.
-Cancellation requests work to stop; only retirement permits its storage to be reused.
-Represent mutually exclusive phases with scoped enums and independent properties with named enum flags.
-Derive state from existing ownership pointers or counters when they already provide the answer; do not mirror it with booleans.
-Give owning classes explicit copy and move contracts.
-An object referenced by kernel user data or live child pointers stays at a stable address and cannot be copied or moved.
-
-Pass one allocator instance through owning parents, child objects, containers, and buffers, rebinding it for each element type.
-Allocators return null on allocation failure, and callers report that failure without throwing.
-Deallocation uses the allocator that created the allocation, including responses that outlive their clients.
-
-Keep scalar control in the state machine and bulk byte work in capability-selected StringZilla kernels.
-An explicit CPU instantiation exists only when its selected kernels, atomics, or waits differ from its parent.
-Use ForkUnion references for cross-thread admission and publication; keep single-owner counters local.
-Do not add an abstraction, wrapper, flag, or dedicated file for symmetry or a possible future use.
-
-### Macros
-
-Every all-caps name starts with the full project name, `UCALL_`.
-A trailing `_` marks a name as internal: it may change in any release, and nothing outside this repository may define or test it.
-A name without it is a public contract, either a switch you may set or a value you may read.
-
-| Family                    | Form                           | Example                 |
-| :------------------------ | :----------------------------- | :---------------------- |
-| CPU class                 | `UCALL_TARGET_<CLASS>`         | `UCALL_TARGET_SERIAL`   |
-| Optional facility         | `UCALL_WITH_[<OS>_]<FACILITY>` | `UCALL_WITH_BSD_KQUEUE` |
-| Architecture fact         | `UCALL_ARCH_<ARCH>_`           | `UCALL_ARCH_ARM64_`     |
-| Operating-system identity | `UCALL_OS_<OS>_`               | `UCALL_OS_POSIX_`       |
-
-Every name in these families is always defined, as 0 or 1, and tested with `#if`.
-`defined(...)` appears only in a `!defined` default and in a guard that an `#error` follows.
-A kernel facility, like `UCALL_WITH_WINDOWS_IOCP`, defaults from the identity, while `UCALL_WITH_LINUX_URING` defaults to 0, and the target that links liburing sets it.
-Only the Platform Identity region of `c/ucall/types.h` reads operating-system predefines like `__linux__`.
-Compiler predefines like `__clang__`, `__GNUC__` and `_MSC_VER` are read raw where they matter.
-
-### Capacities and Bounds
-
-Derive storage from a caller's admission budget, protocol geometry, or an actual operating-system or hardware property.
-An I/O transfer limit segments an operation; it does not become a message-size limit.
-Exhausted resources apply backpressure or report allocation failure rather than truncating input.
-Do not tune constants until one benchmark looks good.
-
-### Comments and Formatting
-
-Public C and C++ contracts use Doxygen tags; Python public functions and modules describe their purpose in docstrings.
-A closing `@par Statuses:` block lists only the statuses a verb's contract adds, while resource failures, deferral and defects are covered once by the categories in the `ucall_status_t` docblock.
-A code comment explains a non-obvious reason rather than narrating an operation.
-Keep source headers, attribution, and original creation dates consistent with the file's history.
-
-Begin each Markdown sentence on a separate source line and align table columns.
-Run `dprint fmt` for Markdown, `clang-format` for C and C++, Ruff for Python, and `cargo +stable fmt` for Rust.
-The staged-file hooks check these conventions and reject template suffixes even with brace initialization.
-
-### Review and Measurements
-
-A commit message explains the resulting behavior, why the change matters, and how it was checked.
-Stage a concrete review candidate with a proposed title and body; staging does not authorize committing.
-Performance reports name the backend, CPU class, build, placement, workload, admission budgets, and load generator.
-Traced timings explain costs and are not throughput measurements.
-
 ## Commits
 
 `.githooks/commit-msg` checks every message:
@@ -273,6 +396,9 @@ Traced timings explain costs and are not throughput measurements.
 - The summary opens with a capital letter, unless it opens with a code identifier, which keeps its own case.
 - The title runs to at most 80 characters, and a body line to at most 100 columns, unless it holds a URL or is indented code.
 - The message carries no AI-assistant attribution, since authorship is the human who committed.
+- `Break` marks a change to what the project offers, such as a dropped modality or binding; `Chore` removes or rearranges without changing it.
+- The body is prose wrapped near 80 columns and explains the change in primary logic, not renames or formatting.
+- One commit per topic, however many files it touches; an intermediate commit may leave the tree unbuildable.
 
 Git's merge, `fixup!` and `squash!` titles are exempt from the title rules.
 A `Release: vX.Y.Z` title is exempt too, but its commit must stamp every version site, and no other commit may change `VERSION`.

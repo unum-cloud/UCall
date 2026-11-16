@@ -4,8 +4,11 @@
 [package]
 authors = ["Ash Vardanian <info@unum.cloud>"]
 description = "Native HTTP and Noise networking with caller-owned polling and request batching"
+documentation = "https://www.unum.cloud/docs/ucall/mojo"
+homepage = "https://www.unum.cloud/docs/ucall"
 license = "Apache-2.0"
 name = "ucall_mojo"
+repository = "https://github.com/unum-cloud/UCall"
 version = "1.0.0-rc.1"
 
 [package.build]

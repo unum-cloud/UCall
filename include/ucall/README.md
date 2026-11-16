@@ -55,3 +55,16 @@ Pin a commit, not a version, when building on them.
 `network.hpp` is the umbrella, holding `network_variant`, the alias-only descriptor every `network/` template takes, and `serial_network`.
 
 Outside `include/`, `cli/ucall.cpp` is the `ucall` command-line client, one HTTP or Noise call over the C ABI, and `test/properties.hpp` holds the oracles over these parsers that the seeded suite cases and the libFuzzer harnesses in `test/fuzz/` share.
+
+## I/O Engines
+
+Every engine answers the same requests, and each spends what its kernel offers:
+
+- __io_uring.__
+  Both io_uring variants use registered files, direct descriptors, an incremental provided receive-buffer ring, a sparse table of registered buffers, `SEND_ZC` zero-copy sends and `READ_FIXED` file reads.
+  The 6.18 variant adds multishot receive and vectored `READV_FIXED` file reads.
+- __Readiness and completion ports.__
+  `linux-epollaio` reads files through Linux AIO completing into its epoll set, sends with `MSG_ZEROCOPY`, and refuses to start where `io_setup` is refused, naming `fs.aio-max-nr`.
+  `posix` and macOS `kqueue` read files blocking, FreeBSD `kqueue` through `aio_read`, and IOCP through overlapped unbuffered reads; these send by copying.
+- __Credit-limited accepts.__
+  Accepts remain one-shot operations: multishot direct accept can consume more connections than a finite file table can install before userspace observes a completion.

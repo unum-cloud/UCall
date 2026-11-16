@@ -147,12 +147,10 @@ std::thread::scope(|scope| {
 });
 ```
 
-`reply_parts` concatenates `ReplyPart::bytes`, `ReplyPart::path` and `ReplyPart::file` parts into one body whose Content-Length is measured from the files.
-`ReplyPart::from` turns a borrowed `std::io::IoSlice` into a bytes part, so vectored buffers from other I/O code map over directly.
-A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and the event loop opens, reads and closes it unbuffered.
-A `File` borrows the caller's descriptor, opened with `O_DIRECT`, for the `Deferred`'s lifetime, while bytes and paths are copied before the call returns, so they may be dropped right after it.
-A file that is missing, unreadable or too short replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
-`Deferred::status` polls without blocking, `Deferred::wait` blocks until the reply is final, `.await` polls the status between other tasks, yielding to the executor until the reply is final, since the library has no wake-up, and dropping a `Deferred` waits for it, which is why only a detached request makes one.
+`reply_parts` concatenates `ReplyPart::bytes`, `ReplyPart::path` and `ReplyPart::file` parts into one body whose Content-Length is measured from the files, and `ReplyPart::from` turns a borrowed `std::io::IoSlice` into a bytes part.
+A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and a `File` borrows the caller's `O_DIRECT` descriptor for the `Deferred`'s lifetime, while bytes and paths are copied before the call returns.
+A missing, unreadable or too short file replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
+`Deferred::status` polls, `Deferred::wait` blocks, `.await` polls between other tasks, yielding to the executor until the reply is final, and dropping a `Deferred` waits for it, which is why only a detached request makes one.
 
 ### Streaming a Reply
 
@@ -166,7 +164,7 @@ fn send_rows(detached: DetachedRequest, rows: &[String]) -> Result<()> {
 }
 ```
 
-The stream is chunked unless a Content-Length header declares the length; `append` refuses with `Status::WouldBlock`, queueing nothing, while the peer lags behind what is queued; `end` answers `None` or a `Deferred` like `reply_parts`, and dropping an unended stream ends it.
+The stream is chunked unless a Content-Length header declares the length, `append` refuses with `Status::WouldBlock`, queueing nothing, while the peer lags behind, and dropping an unended stream ends it.
 
 ### Streaming an Upload
 
@@ -185,8 +183,7 @@ fn store(mut detached: DetachedRequest) -> Result<()> {
 }
 ```
 
-An endpoint registered through `Server::route_with` with `BodyDelivery::Streamed` runs its handler once the headers arrive; the handler hands `request.detach()` to a worker as above, and `body_chunk` blocks for the bytes decoded since the last pull, empty once the body ended.
-On the polling thread, where nothing arrives while the handler runs, a pull with nothing decoded refuses with `Status::WouldBlock` instead of waiting.
+An endpoint registered through `Server::route_with` with `BodyDelivery::Streamed` runs its handler once the headers arrive and hands `request.detach()` to a worker, whose `body_chunk` blocks for the next bytes; on the polling thread a pull with nothing decoded refuses with `Status::WouldBlock` instead.
 
 Async code awaits the same pulls without parking a thread, as each poll of `next_body_chunk` reads the pull's status and yields while the bytes have not arrived:
 
