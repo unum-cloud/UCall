@@ -32,7 +32,7 @@ set(NUMKONG_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
 
 ucall_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
-    ff22abca2e1f271f37bd8cb10174bc9dd37ed4e7
+    4ac15c46016516fd8d22bf453126c70d9a88bb81
 )
 ucall_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
@@ -46,6 +46,6 @@ ucall_sibling(
 if (UCALL_BUILD_EXAMPLES)
     ucall_sibling(
         numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
-        8870e51d68b11d5a713ce5d647df98d8960f542d
+        1febcfe4a62abc70a9b59d303f3632af1c8214ca
     )
 endif ()
