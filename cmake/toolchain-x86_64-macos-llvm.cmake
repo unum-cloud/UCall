@@ -14,7 +14,7 @@ set(UCALL_MACOS_SDK
     CACHE PATH "A macOS SDK, or a tree holding its `usr/include`"
 )
 # Compiler checks re-read this file in a project of their own, which needs the path forwarded.
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES UCALL_MACOS_SDK)
+set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES UCALL_MACOS_SDK)
 if (NOT IS_DIRECTORY "${UCALL_MACOS_SDK}/usr/include")
     message(FATAL_ERROR "UCALL_MACOS_SDK must name a macOS SDK, not '${UCALL_MACOS_SDK}'")
 endif ()

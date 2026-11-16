@@ -177,6 +177,77 @@ Each header lists a verb's refusals under `@par Statuses` in this order and in t
 
 A batched kernel takes its queries as one flat transparent view over a static extent, like a `std::array` of views sized by the batch's extent, never as a span of pointers it chases one query at a time.
 A query type that owns packed storage exposes a view of it, and the kernel reads that view.
+`.githooks/pre-commit` refuses a `std::span` of pointers to const under `include/`, except a span of C strings, which names things rather than batching queries.
+
+### Compile-Time Choices
+
+Code picks between alternatives at compile time through three gates, each for one kind of choice.
+
+`#if` picks a toolchain or a platform, and nothing else.
+A feature the compiler or the operating system lacks is a `#if`; a choice between two algorithms is not.
+
+```cpp
+#if defined(_WIN32) // allowed: the platform decides
+using file_handle_t = void*;
+#else
+using file_handle_t = int;
+#endif
+```
+
+A `requires` clause picks an overload when a whole function differs.
+Every constrained overload has an unconstrained fallback beside it, so a type the constraint rejects still finds a function.
+
+```cpp
+template <typename index_type_>
+status_t run_plan(index_type_& index) noexcept requires is_nvme_index<index_type_> { /* NVMe rounds */ }
+
+template <typename index_type_>
+status_t run_plan(index_type_& index) noexcept { /* every other residency */ }
+```
+
+`if constexpr` branches on a named concept or a `constexpr bool`, one level deep.
+An `else if constexpr` chain is still one level.
+
+```cpp
+template <typename query_type_>
+concept hinted_query = requires(query_type_& query) { query.find_hinted(0u); };
+
+if constexpr (hinted_query<query_type_>) seeds = query.find_hinted(shard); // allowed: a named concept
+else if constexpr (serial_class_k) seeds = {};                            // allowed: one chain, one level
+```
+
+The hook refuses each of these, in the directories its `gated_source_directories` names:
+
+```cpp
+if constexpr (requires { query.find_hinted(0u); }) { /* ... */ }   // refused: name the probe as a concept
+
+if constexpr (is_ram_k) {
+    if constexpr (is_serial_k) { /* ... */ }                        // refused: a second choice inside the first
+}
+
+template <typename value_type_, typename = std::enable_if_t<std::is_integral_v<value_type_>>>
+value_type_ clamp(value_type_ value) noexcept;                      // refused: write `requires` on the overload
+
+struct sorted_tag_t {};
+void insert(entry_t entry, sorted_tag_t) noexcept;                  // refused: a tag that only picks an overload
+```
+
+Control flow nests at most three deep: `if`, `for`, `while`, `switch`, `do`, `try` and `catch` each count, and so does `if constexpr`.
+An `else` or `catch` body sits at its `if`'s or `try`'s depth, so an `else if` chain stays flat.
+A body without braces counts like a braced one, while a lambda or a plain block adds nothing.
+Both sides of a `#if` count from the depth the `#if` began at.
+
+```cpp
+for (shard_t& shard : shards)                       // 1
+    for (node_t node : shard.nodes)                 // 2
+        if (node.live)                              // 3
+            while (node.next != end) step(node);    // refused: 4 deep
+```
+
+To flatten, return early from failures, extract the inner loop into a function named for what it does, or split an overload per case.
+
+The checks are `check_constexpr_conditions_named`, `check_constexpr_branches_flat`, `check_enable_if_and_tags_absent` and `check_constexpr_nesting`.
+They judge only the lines a commit adds, so existing code flattens as it is touched.
 
 ### Split String Literals
 

@@ -12,8 +12,9 @@
 set(CMAKE_SYSTEM_NAME Linux)
 set(CMAKE_SYSTEM_PROCESSOR ppc64le)
 
-find_program(CMAKE_C_COMPILER powerpc64le-linux-gnu-gcc REQUIRED)
-find_program(CMAKE_CXX_COMPILER powerpc64le-linux-gnu-g++ REQUIRED)
+# The `g++-15-powerpc64le-linux-gnu` package installs only the versioned name, so it is looked up first.
+find_program(CMAKE_C_COMPILER NAMES powerpc64le-linux-gnu-gcc-15 powerpc64le-linux-gnu-gcc REQUIRED)
+find_program(CMAKE_CXX_COMPILER NAMES powerpc64le-linux-gnu-g++-15 powerpc64le-linux-gnu-g++ REQUIRED)
 
 find_program(ucall_qemu_ppc64le_ qemu-ppc64le)
 if (ucall_qemu_ppc64le_)

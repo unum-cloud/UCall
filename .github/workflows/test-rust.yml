@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  test_rust:
+  test_rust_ubuntu_clang:
     name: Test Rust on Ubuntu
     runs-on: ubuntu-26.04
     timeout-minutes: 30

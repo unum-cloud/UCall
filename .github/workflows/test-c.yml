@@ -7,7 +7,7 @@ permissions:
   contents: read
 
 jobs:
-  test_ubuntu_debug:
+  test_c_ubuntu_gcc:
     name: Test Debug Build on Ubuntu with GCC 15
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -42,7 +42,7 @@ jobs:
             exit 1
           fi
 
-  test_ubuntu_clang:
+  test_c_ubuntu_clang:
     name: Test on Ubuntu with Clang 22
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -77,7 +77,7 @@ jobs:
             exit 1
           fi
 
-  test_ubuntu_sanitizers:
+  test_c_ubuntu_clang_sanitizers:
     name: Test ${{ matrix.preset }} Preset on Ubuntu with Clang 22
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -119,7 +119,7 @@ jobs:
             exit 1
           fi
 
-  test_macos:
+  test_c_macos_appleclang:
     name: Test on macOS
     runs-on: macos-26
     timeout-minutes: 30
@@ -150,7 +150,7 @@ jobs:
             exit 1
           fi
 
-  test_windows:
+  test_c_windows_msvc:
     name: Test on Windows with Visual Studio 2026
     runs-on: windows-2025-vs2026
     timeout-minutes: 30
@@ -182,7 +182,7 @@ jobs:
           fi
 
   # The toolchain file runs each suite on an emulated RVA23 core with Zacas, which admits the `alibaba_c930` class.
-  test_qemu_riscv:
+  test_c_qemu_riscv64_gcc:
     name: Test RISC-V under QEMU
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -218,7 +218,7 @@ jobs:
           fi
 
   # The toolchain file runs each suite on an emulated POWER10, which admits the `ibm_power10` class.
-  test_qemu_power:
+  test_c_qemu_ppc64le_gcc:
     name: Test POWER10 under QEMU
     runs-on: ubuntu-26.04
     timeout-minutes: 60
@@ -254,7 +254,7 @@ jobs:
           fi
 
   # Every target at -O0 with warnings as errors, so a warning any example or benchmark raises fails here.
-  check_ubuntu:
+  check_c_ubuntu_clang:
     name: Check Every Target on Ubuntu with Clang 22
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -277,7 +277,7 @@ jobs:
           cmake --build --preset check --parallel 4
 
   # Each parser's libFuzzer harness runs five minutes, seeded by the run number, and a failure keeps what it found.
-  fuzz_ubuntu:
+  fuzz_c_ubuntu_clang:
     name: Fuzz ${{ matrix.target }} Parser on Ubuntu with Clang 22
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -318,7 +318,7 @@ jobs:
 
   # The archive and the shared library as a C program sees them once installed: through CMake's package and through
   # pkg-config. The installed archive brings the liburing it was built with as `ucall::uring`, so the runner has none.
-  install_ubuntu:
+  test_c_ubuntu_clang_install:
     name: Install And Consume On Ubuntu
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -365,9 +365,15 @@ jobs:
           export PKG_CONFIG_PATH="$RUNNER_TEMP/ucall/lib/pkgconfig"
           "$CC" examples/hello.c $(pkg-config --cflags --libs ucall) -o "$RUNNER_TEMP/hello_pkg_config"
           LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" ldd "$RUNNER_TEMP/hello_pkg_config" | grep -q libucall_shared
+      # The Quickstart greets itself through a client bound to its own server, and exits nonzero on a wrong answer.
+      - name: Run the Quickstart
+        run: |
+          "$RUNNER_TEMP/consumer/build/hello_static"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" "$RUNNER_TEMP/consumer/build/hello_shared"
+          LD_LIBRARY_PATH="$RUNNER_TEMP/ucall/lib" "$RUNNER_TEMP/hello_pkg_config"
 
   # AlmaLinux 8 carries Linux 4.18 headers, so the build proves the kernel mirrors suffice and the test checks them.
-  test_old_kernel_headers:
+  test_c_manylinux_gcc:
     name: Build C Library on Old Kernel Headers
     runs-on: ubuntu-26.04
     timeout-minutes: 30
@@ -386,7 +392,7 @@ jobs:
 
   # Each machine profile builds the library for one CPU; the Arm ones build natively on Arm runners. Clang 22 compiles
   # it, as older compilers predate Olympus.
-  build_machine_profile:
+  build_c_ubuntu_clang_profiles:
     name: Build Machine Profile ${{ matrix.preset }}
     runs-on: ${{ contains(fromJSON('["grace", "vera"]'), matrix.preset) && 'ubuntu-26.04-arm' || 'ubuntu-26.04' }}
     timeout-minutes: 30
@@ -410,7 +416,7 @@ jobs:
           cmake --build --preset ${{ matrix.preset }} --parallel 4
 
   # The NDK's own toolchain builds the library over the `linux-epollaio` backend; nothing runs it.
-  build_android:
+  build_c_android_ndk:
     name: Build for Android ARM64
     runs-on: ubuntu-26.04
     timeout-minutes: 30

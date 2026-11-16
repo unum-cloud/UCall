@@ -22,6 +22,12 @@ payload=$(grep -v '^#' "$1")
 subject=$(grep -m 1 -v '^[[:space:]]*$' <<< "$payload")
 failed=0
 
+# A manifest names the release on every line that opens with its version key, so a workspace and its package agree.
+stamped() { # stamped <path> <line-prefix> <line-suffix>
+    git show ":$1" 2>/dev/null | awk -v prefix="$2" -v line="$2$version$3" \
+        'index($0, prefix) == 1 { seen = 1; if ($0 != line) stale = 1 } END { exit !(seen && !stale) }'
+}
+
 case "$subject" in
 Merge* | "fixup!"* | "squash!"*) ;;
 # Releases are minted by hand, so this check is all that stands between a typo and a published package.
@@ -35,7 +41,9 @@ Release:*)
         core=${version%%-*} stale=""
         IFS=. read -r major minor patch <<< "$core"
         [ "$(git show :VERSION 2>/dev/null)" = "$version" ] || stale="$stale VERSION"
-        git show :Cargo.toml 2>/dev/null | grep -qxF "version = \"$version\"" || stale="$stale Cargo.toml"
+        for manifest in Cargo.toml pixi.toml mojo/pixi.toml; do
+            stamped "$manifest" 'version = "' '"' || stale="$stale $manifest"
+        done
         # The C macros take numbers only, so a candidate keeps its core there.
         for field in "MAJOR $major" "MINOR $minor" "PATCH $patch"; do
             git show :c/ucall/types.h 2>/dev/null | grep -qxF "#define UCALL_VERSION_$field" || stale="$stale c/ucall/types.h:${field% *}"

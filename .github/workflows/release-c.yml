@@ -1,0 +1,127 @@
+name: Release C
+
+on:
+  release:
+    types: [published]
+
+permissions:
+  contents: read
+
+jobs:
+  hooks:
+    name: Check Release Commit
+    runs-on: ubuntu-26.04
+    timeout-minutes: 5
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+      - name: Check the Release Commit
+        run: .github/scripts/check-release.sh "$GITHUB_REF_NAME"
+
+  # Each archive holds what `cmake --install` lays out: the C headers, both libraries, `ucall.pc`, the CMake package
+  # and the `ucall` command-line client.
+  release_c_linux_clang:
+    name: Create Library for Linux ${{ matrix.platform }}
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: linux_x86_64, os: ubuntu-26.04 }
+          - { platform: linux_aarch64, os: ubuntu-26.04-arm }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Install Toolchain
+        run: sudo apt-get update && sudo apt-get install -y clang lld
+      - name: Build
+        run: |
+          cmake --preset release -DUCALL_INSTALL=ON -DUCALL_BUILD_TEST=OFF
+          cmake --build --preset release
+      - name: Archive the Headers, Libraries and CMake Package
+        run: |
+          archive="ucall_${{ matrix.platform }}_$(cat VERSION)"
+          cmake --install build_release --prefix "$archive"
+          tar -czf "$archive.tar.gz" "$archive"
+      - name: Upload Archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ucall_${{ matrix.platform }}_*.tar.gz --clobber
+
+  release_c_windows_msvc:
+    name: Create Library for Windows ${{ matrix.platform }}
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: windows_x86_64, os: windows-2025-vs2026, preset: msvc2026_x64 }
+          - { platform: windows_arm64, os: windows-11-arm, preset: msvc2026_arm64 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Build
+        run: |
+          cmake --preset ${{ matrix.preset }} -DUCALL_INSTALL=ON -DUCALL_BUILD_TEST=OFF -DUCALL_BUILD_SHARED=ON
+          cmake --build --preset ${{ matrix.preset }} --config Release
+      - name: Archive the Headers, Libraries and CMake Package
+        run: |
+          archive="ucall_${{ matrix.platform }}_$(cat VERSION)"
+          cmake --install build_${{ matrix.preset }} --config Release --prefix "$archive"
+          7z a "$archive.zip" "$archive"
+      - name: Upload Archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ucall_${{ matrix.platform }}_*.zip --clobber
+
+  release_c_macos_appleclang:
+    name: Create Library for macOS ${{ matrix.platform }}
+    needs: hooks
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 60
+    permissions:
+      contents: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { platform: macos_arm64, os: macos-26 }
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v7
+        with:
+          submodules: recursive
+      - name: Build
+        run: |
+          cmake --preset release -DUCALL_INSTALL=ON -DUCALL_BUILD_TEST=OFF
+          cmake --build --preset release
+      - name: Archive the Headers, Libraries and CMake Package
+        run: |
+          archive="ucall_${{ matrix.platform }}_$(cat VERSION)"
+          cmake --install build_release --prefix "$archive"
+          tar -czf "$archive.tar.gz" "$archive"
+      - name: Upload Archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: gh release upload "$GITHUB_REF_NAME" ucall_${{ matrix.platform }}_*.tar.gz --clobber

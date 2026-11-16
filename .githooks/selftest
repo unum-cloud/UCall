@@ -2910,6 +2910,618 @@ FIXTURE
 
 # endregion Binding Doc Fixtures
 
+# region Shared Region Fixtures
+
+# Commits stdin behind the file header, then applies a sed edit and stages it, so a rule judges a commit
+# that touches some lines of an existing construct and leaves the rest.
+stage_committed_fixture() { # stage_committed_fixture <relative-path> <sed-expression> <<< content
+    stage_fixture_with_header "$1"
+    git -C "$fixture_directory" commit --quiet -m "Chore: Seed the fixture"
+    sed "$2" "$fixture_directory/$1" > "$fixture_directory/$1.edited" && mv "$fixture_directory/$1.edited" "$fixture_directory/$1"
+    git -C "$fixture_directory" add -- "$1"
+}
+
+stage_committed_fixture include/$project_directory/probe.hpp 's/probe_text =$/probe_text = "first half "/' <<'FIXTURE'
+static char const *probe_text =
+                                "second half";
+FIXTURE
+run_precommit
+expect_rejection "string split by an added line before an unchanged fragment" "splits a string literal without"
+
+stage_committed_fixture include/$project_directory/probe.hpp 's/bool bounded =/bool bounded_k =/' <<'FIXTURE'
+template <typename value_type_>
+constexpr bool bounded = sizeof(value_type_) < 8;
+FIXTURE
+run_precommit
+expect_rejection "variable template suffixed on the line after its unchanged header" "suffixes a variable template"
+
+stage_committed_fixture include/$project_directory/probe.hpp '/^template/s/value_type_/item_type_/; /constexpr bool/s/value_type_/item_type_/' <<'FIXTURE'
+template <typename value_type_>
+inline bool probe(value_type_ value) noexcept {
+    constexpr bool small_k = sizeof(value_type_) < 8;
+    return small_k && value;
+}
+FIXTURE
+run_precommit
+expect_acceptance "a suffixed local constant below an edited function template header"
+
+assert_rejects "owning string in the library" "an owning std::string" include/$project_directory/probe.hpp <<'FIXTURE'
+inline std::string probe_name() noexcept { return "probe"; }
+FIXTURE
+
+assert_accepts "a string handed to a vendor API on a marked line" include/$project_directory/probe.hpp <<'FIXTURE'
+inline void probe(std::string_view name) noexcept { vendor_open(std::string {name}); } // vendor-boundary
+FIXTURE
+
+assert_rejects "vector in a tool" "uses a standard container" tools/probe.cpp <<'FIXTURE'
+std::vector<int> probe_items;
+FIXTURE
+
+assert_accepts "a directive's comment inside a struct" include/$project_directory/probe.hpp <<'FIXTURE'
+/** Holds one probe. */
+struct probe_t {
+
+    /** The value probed. */
+    int value = 0;
+#if defined(PROBE_EXTRA)
+
+    /** The extra value. */
+    int extra = 0;
+#endif // PROBE_EXTRA
+};
+FIXTURE
+
+assert_accepts "a bare pin and a lint marker on member lines" include/$project_directory/probe.hpp <<'FIXTURE'
+/** Holds one probe. */
+struct probe_t {
+
+    /** The greeting, split by hand. */
+    char const *greeting = "first half " //
+                           "second half";
+
+    /** The flag a kernel reads. */
+    int flag = 0; // device-boundary
+};
+FIXTURE
+
+stage_fixture_verbatim .githooks/pre-commit < "$hooks_directory/pre-commit"
+run_precommit
+expect_acceptance "the hook's shared regions at their pinned sums"
+
+stage_fixture_verbatim .githooks/pre-commit < <(sed 's/^# Prints the reason and the first offending lines\./# Prints the reason and the offending lines./' "$hooks_directory/pre-commit")
+run_precommit
+expect_rejection "a shared region edited away from its pinned sum" "drifts from the sibling hooks' shared regions"
+
+# endregion Shared Region Fixtures
+
+# region Shared Binding Fixtures
+
+assert_rejects "Rust mutex in a binding" "locks in a binding" rust/probe.rs <<'FIXTURE'
+pub struct Callbacks {
+    panic: Mutex<Option<u32>>,
+}
+FIXTURE
+
+assert_rejects "Swift lock in a binding" "locks in a binding" swift/Probe.swift <<'FIXTURE'
+let guard = NSLock()
+FIXTURE
+
+assert_rejects "Go mutex in a binding" "locks in a binding" golang/probe.go <<'FIXTURE'
+package probe
+
+var guard sync.RWMutex
+FIXTURE
+
+assert_rejects "Java synchronized method in a binding" "locks in a binding" java/Probe.java <<'FIXTURE'
+public synchronized void close() {}
+FIXTURE
+
+assert_rejects "C# lock statement in a binding" "locks in a binding" csharp/Probe.cs <<'FIXTURE'
+lock (this.outputs)
+{
+    this.settled = true;
+}
+FIXTURE
+
+assert_rejects "Python lock in a binding" "locks in a binding" python/probe.py <<'FIXTURE'
+import threading
+
+guard = threading.Lock()
+FIXTURE
+
+assert_rejects "CPython critical section in a binding" "locks in a binding" python/probe.c <<'FIXTURE'
+#define probe_guard_begin_(object) Py_BEGIN_CRITICAL_SECTION(object)
+FIXTURE
+
+assert_rejects "standard mutex in the C++ binding" "locks in a binding" cpp/probe.hpp <<'FIXTURE'
+inline std::mutex probe_guard;
+FIXTURE
+
+assert_accepts "atomics in a binding, and a lock named in a comment" rust/probe.rs <<'FIXTURE'
+/// The call's outcome, polled by its one owner; nothing here takes a Mutex.
+pub struct Outcome {
+    status: AtomicU32,
+}
+FIXTURE
+
+assert_accepts "CPython thread state and sequence guards in a binding" python/probe.c <<'FIXTURE'
+static void probe_wait(PyObject* sequence) {
+    Py_BEGIN_CRITICAL_SECTION_SEQUENCE_FAST(sequence);
+    Py_END_CRITICAL_SECTION_SEQUENCE_FAST();
+    Py_BEGIN_ALLOW_THREADS;
+    Py_END_ALLOW_THREADS;
+}
+FIXTURE
+
+assert_accepts "cgo pins in a binding" golang/probe.go <<'FIXTURE'
+package probe
+
+func call() {
+	var pinner runtime.Pinner
+	defer pinner.Unpin()
+	runtime.LockOSThread()
+	defer runtime.UnlockOSThread()
+}
+FIXTURE
+
+assert_accepts "locks in a binding test" golang/probe_test.go <<'FIXTURE'
+package probe
+
+var guard sync.Mutex
+FIXTURE
+
+assert_rejects "throwing Swift callback type" "lets a binding callback raise or keeps an exception" swift/Probe.swift <<'FIXTURE'
+public typealias Progress = @Sendable (_ completed: Int, _ total: Int) throws -> Bool
+FIXTURE
+
+assert_accepts "non-throwing Swift callback beside a throwing verb and a scoped body" swift/Probe.swift <<'FIXTURE'
+public typealias Progress = @Sendable (_ completed: Int, _ total: Int) -> Bool
+
+public func open(path: String, progress: Progress) throws -> Index { try Index(path: path) }
+
+func withBytes<Result>(_ body: (UnsafeRawBufferPointer) throws -> Result) rethrows -> Result { try body(bytes) }
+FIXTURE
+
+assert_rejects "Rust trampoline catching an unwind" "lets a binding callback raise or keeps an exception" rust/probe.rs <<'FIXTURE'
+fn admit(handler: &dyn Fn(u64) -> bool, key: u64) -> bool {
+    std::panic::catch_unwind(|| handler(key)).unwrap_or(false)
+}
+FIXTURE
+
+assert_rejects "Go trampoline recovering a panic" "lets a binding callback raise or keeps an exception" golang/probe.go <<'FIXTURE'
+package probe
+
+func admit(handler func(uint64) bool, key uint64) bool {
+	defer func() { latch(recover()) }()
+	return handler(key)
+}
+FIXTURE
+
+assert_rejects "CPython call re-raising an exception it kept" "lets a binding callback raise or keeps an exception" python/probe.c <<'FIXTURE'
+static void probe_answer(probe_call_t* call) { PyErr_SetRaisedException(call->raised); }
+FIXTURE
+
+assert_accepts "CPython cleanup keeping the pending exception" python/probe.c <<'FIXTURE'
+static void probe_release(probe_call_t* call) {
+    PyObject* const raised = PyErr_GetRaisedException();
+    probe_free(call);
+    PyErr_SetRaisedException(raised);
+}
+FIXTURE
+
+assert_rejects "N-API trampoline keeping an exception" "lets a binding callback raise or keeps an exception" javascript/probe.c <<'FIXTURE'
+static void probe_keep(napi_env env, napi_value* raised) { napi_get_and_clear_last_exception(env, raised); }
+FIXTURE
+
+assert_accepts "N-API trampoline reporting an exception as uncaught" javascript/probe.c <<'FIXTURE'
+static void probe_report(napi_env env) {
+    napi_value raised;
+    if (napi_get_and_clear_last_exception(env, &raised) == napi_ok) napi_fatal_exception(env, raised);
+}
+FIXTURE
+
+assert_rejects "Java upcall keeping an exception" "lets a binding callback raise or keeps an exception" java/Probe.java <<'FIXTURE'
+void admit() {
+    try {
+        handler.run();
+    } catch (Throwable failure) {
+        latch(failure);
+    }
+}
+FIXTURE
+
+assert_accepts "Java downcall rethrowing what a method handle throws" java/Probe.java <<'FIXTURE'
+void invoke() {
+    try {
+        handle.invokeExact();
+    } catch (Throwable failure) {
+        release();
+        throw rethrow(failure);
+    }
+}
+FIXTURE
+
+assert_rejects "span of pointers to const queries" "takes a span of pointers to const" include/$project_directory/probe.hpp <<'FIXTURE'
+void probe_reset(std::span<probe_query_t const* const> queries) noexcept;
+FIXTURE
+
+assert_accepts "flat query view and a span of index pointers" include/$project_directory/probe.hpp <<'FIXTURE'
+void probe_reset(std::span<probe_query_t const> queries, std::span<probe_index_t* const> sources) noexcept;
+FIXTURE
+
+assert_accepts "span of C strings naming devices" include/$project_directory/probe.hpp <<'FIXTURE'
+void probe_name(std::span<char const* const> names) noexcept;
+FIXTURE
+
+assert_accepts "span of C strings spelled const char" include/$project_directory/probe.hpp <<'FIXTURE'
+void probe_name(std::span<const char* const> names) noexcept;
+FIXTURE
+
+assert_rejects "N-API mutex in a binding" "locks in a binding" javascript/probe.c <<'FIXTURE'
+static uv_mutex_t probe_guard;
+FIXTURE
+
+assert_rejects "C# upcall keeping an exception" "lets a binding callback raise or keeps an exception" csharp/Probe.cs <<'FIXTURE'
+void Admit()
+{
+    try
+    {
+        handler();
+    }
+    catch (Exception failure)
+    {
+        Latch(failure);
+    }
+}
+FIXTURE
+
+assert_accepts "C# downcall rethrowing what it caught" csharp/Probe.cs <<'FIXTURE'
+void Invoke()
+{
+    try
+    {
+        handle();
+    }
+    catch (Exception)
+    {
+        Release();
+        throw;
+    }
+}
+FIXTURE
+
+assert_rejects "Kotlin upcall keeping an exception" "lets a binding callback raise or keeps an exception" java/Probe.kt <<'FIXTURE'
+fun admit() {
+    try {
+        handler.run()
+    } catch (failure: Throwable) {
+        latch(failure)
+    }
+}
+FIXTURE
+
+assert_accepts "Kotlin downcall rethrowing what it caught" java/Probe.kt <<'FIXTURE'
+fun invoke() {
+    try {
+        handle.invokeExact()
+    } catch (failure: Throwable) {
+        release()
+        throw failure
+    }
+}
+FIXTURE
+
+assert_rejects "Zig callback type returning an error union" "lets a binding callback raise or keeps an exception" zig/probe.zig <<'FIXTURE'
+const Progress = *const fn (usize, usize, ?*anyopaque) callconv(.c) anyerror!bool;
+FIXTURE
+
+assert_accepts "Zig callback type answering a value beside a fallible verb" zig/probe.zig <<'FIXTURE'
+const Progress = *const fn (usize, usize, ?*anyopaque) callconv(.c) bool;
+
+fn open(path: []const u8) !Progress {
+    return if (path.len == 0) error.Empty else undefined;
+}
+FIXTURE
+
+assert_rejects "Mojo callback type that raises" "lets a binding callback raise or keeps an exception" mojo/probe.mojo <<'FIXTURE'
+comptime Progress = def(Int, Int, Int) thin raises -> Int
+FIXTURE
+
+assert_accepts "Mojo callback type beside a raising verb" mojo/probe.mojo <<'FIXTURE'
+comptime Progress = def(Int, Int, Int) thin abi("C") -> Int
+
+
+def run[handler: def(Int) thin -> Int](count: Int) raises -> Int:
+    return handler(count)
+FIXTURE
+
+assert_rejects "Wolfram callback calling back into the kernel" "lets a binding callback raise or keeps an exception" wolfram/probe.c <<'FIXTURE'
+static void probe_admit(WolframLibraryData library_data) { library_data->Message("admit"); }
+FIXTURE
+
+assert_accepts "Wolfram callback answering through its slots" wolfram/probe.c <<'FIXTURE'
+static void probe_admit(void* state, int* admissions, size_t count) {
+    for (size_t index = 0; index != count; ++index) admissions[index] = state != NULL;
+}
+FIXTURE
+
+assert_rejects "C++ callback type that may throw" "lets a binding callback raise or keeps an exception" cpp/probe.hpp <<'FIXTURE'
+using progress_callback_t = bool (*)(std::size_t completed, std::size_t total);
+FIXTURE
+
+assert_accepts "C++ noexcept callback type beside a C verb pointer" cpp/probe.hpp <<'FIXTURE'
+using progress_callback_t = bool (*)(std::size_t completed, std::size_t total) noexcept;
+using probe_verb_t = void (*)(int*);
+FIXTURE
+
+# endregion Shared Binding Fixtures
+
+# region Shared Build Fixtures
+
+first_library=$(sed -n "s/^library_macro_prefixes='\([A-Z]*\).*/\1/p" "$hooks_directory/pre-commit")
+
+assert_rejects "another library's ARCH flag" "names another library's _ARCH_ flag" include/$project_directory/probe.hpp <<FIXTURE
+inline static constexpr bool compiled_k = ${first_library}_ARCH_CUDA_AMPERE_;
+FIXTURE
+
+assert_accepts "another library's public TARGET switch" include/$project_directory/probe.hpp <<FIXTURE
+#if ${first_library}_TARGET_HASWELL
+inline static constexpr bool compiled_k = true;
+#endif
+FIXTURE
+
+assert_rejects "another library's GPU generation target raised" "sets a library GPU generation target" CMakeLists.txt <<FIXTURE
+target_compile_definitions(probe PRIVATE ${first_library}_TARGET_CDNA3=1)
+FIXTURE
+
+assert_accepts "another library's GPU floor target lowered" CMakeLists.txt <<FIXTURE
+target_compile_definitions(probe PRIVATE ${first_library}_TARGET_ROCM=0)
+FIXTURE
+
+assert_rejects "CMake string surgery" "derives a name or flag by editing a string" CMakeLists.txt <<'FIXTURE'
+string(REPLACE "a" "b" probe_name_ "${probe_source_}")
+FIXTURE
+
+# Stages a sibling pin at 1111..., and a Cargo.toml line when given one.
+stage_sibling_pin() { # stage_sibling_pin [<cargo-dependency-line>]
+    stage_fixture_verbatim cmake/${project_directory}_siblings.cmake <<FIXTURE
+${project_directory}_sibling(
+    forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
+    1111111111111111111111111111111111111111
+)
+FIXTURE
+    [ $# -eq 0 ] || {
+        printf '[dependencies]\n%s\n' "$1" > "$fixture_directory/Cargo.toml"
+        git -C "$fixture_directory" add -- Cargo.toml
+    }
+}
+
+stage_sibling_pin
+git -C "$fixture_directory" update-index --add --cacheinfo 160000,2222222222222222222222222222222222222222,forkunion
+run_precommit
+expect_rejection "sibling pin apart from its gitlink" "the sibling pins disagree"
+
+stage_sibling_pin
+git -C "$fixture_directory" update-index --add --cacheinfo 160000,1111111111111111111111111111111111111111,forkunion
+run_precommit
+expect_acceptance "sibling pin agreeing with its gitlink"
+
+stage_sibling_pin 'forkunion = { git = "https://github.com/ashvardanian/ForkUnion", rev = "3333333333333333333333333333333333333333" }'
+run_precommit
+expect_rejection "Cargo rev apart from the CMake pin" "Cargo.toml says 333333333333"
+
+stage_sibling_pin 'forkunion = { git = "https://github.com/ashvardanian/ForkUnion" }'
+run_precommit
+expect_rejection "Cargo git dependency without a rev" "takes it from git without a rev"
+
+stage_sibling_pin 'forkunion = { git = "https://github.com/ashvardanian/ForkUnion", rev = "1111111111111111111111111111111111111111" }'
+run_precommit
+expect_acceptance "Cargo rev agreeing with the CMake pin"
+
+# endregion Shared Build Fixtures
+
+# region Shared Harness Fixtures
+
+assert_rejects "harness qualifying the visible library namespace" "the library namespace is already visible" test/probe/probe.hpp <<FIXTURE
+namespace ${project_namespace}::test::probe {
+${project_directory}::probe::probe_stage_t stage;
+} // namespace ${project_namespace}::test::probe
+FIXTURE
+
+assert_accepts "harness naming the library type bare" test/probe/probe.hpp <<FIXTURE
+namespace ${project_namespace}::test::probe {
+probe_stage_t stage;
+} // namespace ${project_namespace}::test::probe
+FIXTURE
+
+assert_rejects "test body printing to stdout" "prints to stdout from a test body" test/probe/probe.hpp <<FIXTURE
+namespace ${project_namespace}::test::probe {
+inline void test_probe() { fmt::println("probe passed"); }
+} // namespace ${project_namespace}::test::probe
+FIXTURE
+
+assert_accepts "test body failing on stderr" test/probe/probe.hpp <<FIXTURE
+namespace ${project_namespace}::test::probe {
+inline void test_probe() { fmt::println(stderr, "probe failed"); }
+} // namespace ${project_namespace}::test::probe
+FIXTURE
+
+assert_accepts "a test file's own main printing its summary" test/probe/probe.hpp <<FIXTURE
+namespace ${project_namespace}::test::probe {
+inline void test_probe() {}
+} // namespace ${project_namespace}::test::probe
+
+int main() {
+    fmt::println("probe passed");
+    return 0;
+}
+FIXTURE
+
+# endregion Shared Harness Fixtures
+
+# region Shared Gate Fixtures
+
+assert_rejects "requires expression inline in an if constexpr" "writes a requires expression inside an if constexpr condition" include/$project_directory/probe.hpp <<'FIXTURE'
+template <typename value_type_>
+inline void probe(value_type_ &value) noexcept {
+    if constexpr (requires { value.reset(); }) value.reset();
+}
+FIXTURE
+
+assert_accepts "a named concept in an if constexpr" include/$project_directory/probe.hpp <<'FIXTURE'
+template <typename value_type_>
+concept resettable = requires(value_type_ &value) { value.reset(); };
+
+template <typename value_type_>
+inline void probe(value_type_ &value) noexcept {
+    if constexpr (resettable<value_type_>) value.reset();
+}
+FIXTURE
+
+assert_rejects "if constexpr inside an if constexpr" "nests an if constexpr inside another's branch" include/$project_directory/probe.hpp <<'FIXTURE'
+template <typename value_type_>
+inline int probe() noexcept {
+    if constexpr (sizeof(value_type_) == 4) {
+        if constexpr (alignof(value_type_) == 4) return 1;
+        return 2;
+    }
+    return 0;
+}
+FIXTURE
+
+assert_accepts "an else if constexpr chain" include/$project_directory/probe.hpp <<'FIXTURE'
+template <typename value_type_>
+inline int probe() noexcept {
+    if constexpr (sizeof(value_type_) == 4) return 1;
+    else if constexpr (sizeof(value_type_) == 8) return 2;
+    else return 0;
+}
+FIXTURE
+
+assert_rejects "control flow 4 deep without braces" "nests control flow 4 deep" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int probe(int const *values, int count) noexcept {
+    int total = 0;
+    for (int first = 0; first != count; ++first)
+        for (int second = 0; second != count; ++second)
+            if (values[first] < values[second])
+                while (total < values[second]) ++total;
+    return total;
+}
+FIXTURE
+
+assert_rejects "control flow 4 deep in braces" "nests control flow 4 deep" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int probe(int const *values, int count) noexcept {
+    int total = 0;
+    for (int first = 0; first != count; ++first) {
+        switch (values[first]) {
+        case 0: break;
+        default:
+            if (total < count) {
+                do { ++total; } while (total < values[first]);
+            }
+        }
+    }
+    return total;
+}
+FIXTURE
+
+assert_accepts "three levels around a lambda, an else if chain and both sides of an #if" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int probe(int const *values, int count) noexcept {
+    int total = 0;
+    for (int first = 0; first != count; ++first) {
+        auto add = [&](int value) noexcept {
+            if (value > 0) total += value;
+        };
+        if (values[first] > 0) {
+#if defined(PROBE_WIDE)
+            for (int second = 0; second != count; ++second) add(values[second]);
+#else
+            for (int second = 0; second != first; ++second) add(values[second]);
+#endif
+        }
+        else if (values[first] < 0) {
+            if (total > 0) --total;
+        }
+        else {
+            if (total < 0) ++total;
+        }
+    }
+    return total;
+}
+FIXTURE
+
+assert_accepts "a while after a braceless loop closes it, and a braceless do keeps its while" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int probe(int const *values, int count) noexcept {
+    int total = 0;
+    for (int first = 0; first != count; ++first) {
+        if (total == 0)
+            for (int second = 0; second != count; ++second) total += values[second];
+        while (total > count) {
+            if (total > 0) --total;
+        }
+        if (values[first] > 0)
+            for (int second = 0; second != first; ++second) total += values[second];
+        else if (total < 0)
+            do ++total; while (total < 0);
+    }
+    return total;
+}
+FIXTURE
+
+stage_committed_fixture include/$project_directory/probe.hpp 's/return total;/return total + 1;/' <<'FIXTURE'
+inline int probe(int const *values, int count) noexcept {
+    int total = 0;
+    for (int first = 0; first != count; ++first)
+        for (int second = 0; second != count; ++second)
+            if (values[first] < values[second])
+                while (total < values[second]) ++total;
+    return total;
+}
+FIXTURE
+run_precommit
+expect_acceptance "an edit beside control flow 4 deep that it leaves alone"
+
+assert_accepts "control flow 4 deep outside the gated directories" test/probe/probe.hpp <<FIXTURE
+namespace ${project_namespace}::test::probe {
+inline int probe(int const *values, int count) noexcept {
+    int total = 0;
+    for (int first = 0; first != count; ++first)
+        for (int second = 0; second != count; ++second)
+            if (values[first] < values[second])
+                while (total < values[second]) ++total;
+    return total;
+}
+} // namespace ${project_namespace}::test::probe
+FIXTURE
+
+assert_rejects "enable_if picking an overload" "picks an overload through enable_if or a tag type" include/$project_directory/probe.hpp <<'FIXTURE'
+template <typename value_type_, typename = std::enable_if_t<std::is_integral_v<value_type_>>>
+inline value_type_ probe(value_type_ value) noexcept { return value; }
+FIXTURE
+
+assert_rejects "tag type picking an overload" "picks an overload through enable_if or a tag type" include/$project_directory/probe.hpp <<'FIXTURE'
+struct sorted_tag_t {};
+inline int probe(int value, sorted_tag_t) noexcept { return value; }
+FIXTURE
+
+assert_rejects "true_type parameter picking an overload" "picks an overload through enable_if or a tag type" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int probe(int value, std::true_type) noexcept { return value; }
+FIXTURE
+
+assert_accepts "a requires clause beside an unconstrained fallback, and an iterator category" include/$project_directory/probe.hpp <<'FIXTURE'
+template <typename value_type_>
+inline int probe(value_type_ value) noexcept requires std::is_integral_v<value_type_> {
+    return static_cast<int>(value);
+}
+template <typename value_type_>
+inline int probe(value_type_) noexcept {
+    return 0;
+}
+using probe_category_t = std::random_access_iterator_tag;
+FIXTURE
+
+# endregion Shared Gate Fixtures
+
 # region UCall Fixtures
 
 assert_rejects "id in a comment" "writes id or ids in a comment" include/ucall/probe.h <<'FIXTURE'
@@ -3300,7 +3912,7 @@ ucall_sibling(
 FIXTURE
 git -C "$fixture_directory" update-index --add --cacheinfo 160000,2222222222222222222222222222222222222222,forkunion
 run_precommit
-expect_rejection "sibling pin apart from its gitlink" "pin has drifted"
+expect_rejection "sibling pin apart from its gitlink" "the sibling pins disagree"
 
 stage_fixture_verbatim cmake/ucall_siblings.cmake <<'FIXTURE'
 ucall_sibling(
@@ -3386,7 +3998,7 @@ assert_accepts "docblock above a single-macro conditional, plain comment above a
 #endif
 FIXTURE
 
-assert_rejects "library ARCH flag" "names a NumKong or StringZilla _ARCH_ flag" include/$project_directory/probe.hpp <<'FIXTURE'
+assert_rejects "library ARCH flag" "names another library's _ARCH_ flag" include/$project_directory/probe.hpp <<'FIXTURE'
 inline static constexpr bool compiled_k = NUMKONG_ARCH_CUDA_AMPERE_;
 FIXTURE
 
@@ -3423,9 +4035,11 @@ stage_release_fixture() { # stage_release_fixture <version> [<relative-path> <se
     IFS=. read -r major minor patch <<< "$core"
     (
         cd "$fixture_directory" || exit 1
-        mkdir -p c/ucall
+        mkdir -p c/ucall mojo
         printf '%s\n' "$version" > VERSION
         printf '[package]\nname = "ucall"\nversion = "%s"\n' "$version" > Cargo.toml
+        printf '[workspace]\nversion = "%s"\n\n[package]\nversion = "%s"\n' "$version" "$version" > pixi.toml
+        printf '[package]\nversion = "%s"\n' "$version" > mojo/pixi.toml
         printf '#define UCALL_VERSION_MAJOR %s\n#define UCALL_VERSION_MINOR %s\n#define UCALL_VERSION_PATCH %s\n' \
             "$major" "$minor" "$patch" > c/ucall/types.h
         [ $# -lt 3 ] || { sed "$3" "$2" > "$2.edited" && mv "$2.edited" "$2"; }
@@ -3479,6 +4093,11 @@ FIXTURE
 
 stage_release_fixture 1.1.0-rc.2 Cargo.toml 's/1.1.0-rc.2/1.1.0-rc.1/'
 assert_message_rejects "release with a stale version site" "Cargo.toml" <<'FIXTURE'
+Release: v1.1.0-rc.2
+FIXTURE
+
+stage_release_fixture 1.1.0-rc.2 pixi.toml '$s/1.1.0-rc.2/1.1.0-rc.1/'
+assert_message_rejects "release with a stale package under a current workspace" "pixi.toml" <<'FIXTURE'
 Release: v1.1.0-rc.2
 FIXTURE
 

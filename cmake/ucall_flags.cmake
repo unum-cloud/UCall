@@ -1,13 +1,19 @@
-# Warnings and sanitizers, which UCall's own targets take through `ucall_warnings` and `ucall_sanitizers`.
+# The warning flags and sanitizers UCall's own targets take through `ucall_warnings` and `ucall_sanitizers`.
 
-# Warnings apply to UCall's own targets only, so fetched dependencies build with their own flags. The C interface takes
-# named arguments as partially designated structs, leaving the rest zeroed.
+# Warnings apply to UCall's own targets only, so fetched dependencies build with their own flags.
+# Only C and C++ units take them, since nvcc rejects the host spellings.
+# The C interface takes named arguments as partially designated structs, leaving the rest zeroed.
 add_library(ucall_warnings INTERFACE)
 if (MSVC)
+    # `/W4` is the level `-Wall -Wextra` reach elsewhere, and C4068 is the unknown pragma the other compilers skip.
+    # C4996 flags the portable C library calls MSVC deprecates in favour of its own `_s` spellings.
+    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:/W4;/wd4068;/wd4996;/bigobj>")
     # The conformance switches MSVC leaves off by default, which every other supported compiler behaves as.
-    target_compile_options(ucall_warnings INTERFACE /W3 /permissive- /Zc:preprocessor /Zc:__cplusplus /utf-8 /bigobj)
+    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:/Zc:preprocessor;/utf-8>")
+    # The C compiler rejects the two that exist only for C++.
+    target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:CXX>:/permissive-;/Zc:__cplusplus>")
     if (UCALL_WERROR)
-        target_compile_options(ucall_warnings INTERFACE /WX)
+        target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:/WX>")
     endif ()
 else ()
     target_compile_options(
@@ -17,18 +23,20 @@ else ()
             "$<$<AND:$<COMPILE_LANGUAGE:C,CXX>,$<CXX_COMPILER_ID:Clang,AppleClang>>:-Wdocumentation>"
     )
     if (UCALL_WERROR)
-        target_compile_options(ucall_warnings INTERFACE -Werror)
+        target_compile_options(ucall_warnings INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:-Werror>")
     endif ()
-    target_compile_options(ucall_warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
 endif ()
 
-# Sanitizers instrument UCall's library and tests, while fetched dependencies keep their own flags.
+# Sanitizers instrument UCall's own targets and the sibling headers they compile.
+# Fetched dependencies keep their own flags, and `ucall_siblings.cmake` hands the choice to the siblings' switches.
+# The build type alone picks the optimization level, so an instrumented RelWithDebInfo build stays comparable.
+# The frame pointer only matters where the units compile, and MSVC links its sanitizer runtime by itself.
 add_library(ucall_sanitizers INTERFACE)
 if (UCALL_BUILD_SANITIZERS STREQUAL "address")
     if (MSVC)
         set(ucall_sanitizer_flags_ /fsanitize=address)
     else ()
-        set(ucall_sanitizer_flags_ -fsanitize=address,undefined -fno-omit-frame-pointer)
+        set(ucall_sanitizer_flags_ -fsanitize=address,undefined)
     endif ()
 elseif (UCALL_BUILD_SANITIZERS STREQUAL "thread")
     if (MSVC)
@@ -38,9 +46,11 @@ elseif (UCALL_BUILD_SANITIZERS STREQUAL "thread")
 elseif (NOT UCALL_BUILD_SANITIZERS STREQUAL "off")
     message(FATAL_ERROR "UCALL_BUILD_SANITIZERS is off, address or thread, not '${UCALL_BUILD_SANITIZERS}'")
 endif ()
-if (ucall_sanitizer_flags_)
+if (ucall_sanitizer_flags_ AND MSVC)
     target_compile_options(ucall_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
-    if (NOT MSVC)
-        target_link_options(ucall_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
-    endif ()
+elseif (ucall_sanitizer_flags_)
+    target_compile_options(
+        ucall_sanitizers INTERFACE "$<$<COMPILE_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_};-fno-omit-frame-pointer>"
+    )
+    target_link_options(ucall_sanitizers INTERFACE "$<$<LINK_LANGUAGE:C,CXX>:${ucall_sanitizer_flags_}>")
 endif ()

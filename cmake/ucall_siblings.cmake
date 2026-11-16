@@ -1,35 +1,47 @@
-# The sibling libraries, and the switches UCall forwards to them.
+# The sibling helper, the switches forwarded to the siblings, and the siblings themselves.
 
-# ThreadSanitizer sees no inline assembly, so ForkUnion leaves out the capabilities it cannot see when told.
-set(FORKUNION_BUILD_SANITIZERS ${UCALL_BUILD_SANITIZERS})
+include(FetchContent)
 
-# A sibling builds from its nested checkout, or else from the commit its submodule pins, fetched unless the override
-# variable the caller passes, `FETCHCONTENT_SOURCE_DIR_<NAME>`, names a local checkout.
+# A sibling builds in place from its submodule when a recursive clone checked one out, or else from the commit that
+# submodule pins, fetched, so a plain clone or a `FetchContent` of UCall still configures.
+# The caller names the sibling's `FETCHCONTENT_SOURCE_DIR_<NAME>`, so nothing derives it.
+# A non-empty one points the sibling at a local checkout, as in a workspace keeping the siblings side by side, and
+# outranks the submodule.
+# A parent project that already added the sibling keeps its copy.
+# Every sibling is a system dependency that builds only what UCall's targets link, so its own warnings never fail a
+# build under UCALL_WERROR.
 function (ucall_sibling name_ override_ repository_ tag_)
     if (TARGET ${name_}::header)
         return()
     endif ()
-    if (EXISTS "${CMAKE_CURRENT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT DEFINED ${override_})
-        add_subdirectory(${name_} EXCLUDE_FROM_ALL SYSTEM)
-    else ()
-        FetchContent_Declare(
-            ${name_}
-            GIT_REPOSITORY ${repository_}
-            GIT_TAG ${tag_}
-            EXCLUDE_FROM_ALL SYSTEM
-        )
-        FetchContent_MakeAvailable(${name_})
+    if (EXISTS "${PROJECT_SOURCE_DIR}/${name_}/CMakeLists.txt" AND NOT ${override_})
+        add_subdirectory("${PROJECT_SOURCE_DIR}/${name_}" "${PROJECT_BINARY_DIR}/${name_}" EXCLUDE_FROM_ALL SYSTEM)
+        return()
     endif ()
+    message(STATUS "ucall: ${name_} from its local checkout, or else fetched at ${tag_}")
+    FetchContent_Declare(
+        ${name_}
+        GIT_REPOSITORY ${repository_}
+        GIT_TAG ${tag_}
+        EXCLUDE_FROM_ALL SYSTEM
+    )
+    FetchContent_MakeAvailable(${name_})
 endfunction ()
 
-# The siblings compile at the same floor and build kind.
-set(FORKUNION_MARCH "${UCALL_MARCH}")
-set(STRINGZILLA_MARCH "${UCALL_MARCH}")
-set(NUMKONG_MARCH "${UCALL_MARCH}")
-set(FORKUNION_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
-set(STRINGZILLA_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
-set(NUMKONG_MULTIVERSIONED ${UCALL_MULTIVERSIONED})
+# The siblings build for the floor, the build kind and the sanitizer UCall builds for.
+# ThreadSanitizer then sees their barriers, and ForkUnion leaves out the instructions it cannot see.
+# A sibling this project never adds leaves its switches unread.
+foreach (sibling_ IN ITEMS NUMKONG STRINGZILLA FORKUNION SMASHTABLE)
+    set(${sibling_}_MARCH "${UCALL_MARCH}")
+    set(${sibling_}_MULTIVERSIONED "${UCALL_MULTIVERSIONED}")
+    set(${sibling_}_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
+endforeach ()
 
+# Everything below is this project's own: the siblings it builds on, at the commits their submodules pin.
+
+# StringZilla: the find, compare and hash kits each CPU class unit inlines, and the X25519 kits' instruction sets.
+# ForkUnion: the thread pools and the ISA-specific waiters and atomics.
+# SmashTable: the route tables, connection pools and intrusive lists, header-only.
 ucall_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
     4ac15c46016516fd8d22bf453126c70d9a88bb81
@@ -43,6 +55,7 @@ ucall_sibling(
     30e349dcd1e582896386d959d4a36badce061787
 )
 
+# NumKong: the packed dot products only the inference example serves.
 if (UCALL_BUILD_EXAMPLES)
     ucall_sibling(
         numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong

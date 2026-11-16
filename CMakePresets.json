@@ -66,6 +66,19 @@
       }
     },
     {
+      "name": "profile",
+      "inherits": ["base", "clang"],
+      "displayName": "Host Profile - benchmarks under perf",
+      "description": "The profiling tree behind bench/README.md: full optimization, plus the symbols `perf` needs to attribute samples.",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "RelWithDebInfo",
+        "CMAKE_C_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "CMAKE_CXX_FLAGS_RELWITHDEBINFO": "-O3 -g -DNDEBUG",
+        "UCALL_BUILD_BENCH": "ON",
+        "UCALL_BUILD_SHARED": "ON"
+      }
+    },
+    {
       "name": "asan",
       "inherits": "debug",
       "displayName": "Host Debug with AddressSanitizer and UndefinedBehaviorSanitizer",
@@ -91,6 +104,13 @@
       "architecture": "x64"
     },
     {
+      "name": "msvc2026_arm64",
+      "inherits": ["base", "windows"],
+      "displayName": "Windows ARM64 - Visual Studio 2026",
+      "generator": "Visual Studio 18 2026",
+      "architecture": "ARM64"
+    },
+    {
       "name": "android_arm64",
       "inherits": "base",
       "displayName": "Android ARM64 - compile only",
@@ -103,6 +123,20 @@
         "UCALL_BUILD_TEST": "OFF",
         "UCALL_WITH_LINUX_EPOLLAIO": "ON"
       }
+    },
+    {
+      "name": "linux_arm64",
+      "inherits": ["base", "linux"],
+      "displayName": "Linux ARM64 under QEMU through Clang and LLD",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-aarch64-llvm.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo" }
+    },
+    {
+      "name": "macos_x86_64",
+      "inherits": ["base", "linux"],
+      "displayName": "macOS x86-64 through Clang against the macOS SDK UCALL_MACOS_SDK names, as far as the static library",
+      "toolchainFile": "${sourceDir}/cmake/toolchain-x86_64-macos-llvm.cmake",
+      "cacheVariables": { "CMAKE_BUILD_TYPE": "RelWithDebInfo", "UCALL_BUILD_TEST": "OFF" }
     },
     {
       "name": "linux_riscv64",
@@ -228,11 +262,15 @@
     { "name": "check", "configurePreset": "check" },
     { "name": "relwithdebinfo", "configurePreset": "relwithdebinfo" },
     { "name": "release", "configurePreset": "release" },
+    { "name": "profile", "configurePreset": "profile" },
     { "name": "asan", "configurePreset": "asan" },
     { "name": "fuzz", "configurePreset": "fuzz", "targets": ["ucall_fuzz_dns", "ucall_fuzz_http", "ucall_fuzz_multipart", "ucall_fuzz_routes", "ucall_fuzz_tunnel", "ucall_fuzz_url"] },
     { "name": "tsan", "configurePreset": "tsan" },
     { "name": "msvc2026_x64", "configurePreset": "msvc2026_x64", "configuration": "Release" },
+    { "name": "msvc2026_arm64", "configurePreset": "msvc2026_arm64", "configuration": "Release" },
     { "name": "android_arm64", "configurePreset": "android_arm64" },
+    { "name": "linux_arm64", "configurePreset": "linux_arm64" },
+    { "name": "macos_x86_64", "configurePreset": "macos_x86_64", "targets": ["ucall_static"] },
     { "name": "linux_riscv64", "configurePreset": "linux_riscv64" },
     { "name": "linux_ppc64le", "configurePreset": "linux_ppc64le" },
     { "name": "xeon4", "configurePreset": "xeon4" },
@@ -264,7 +302,35 @@
       "environment": { "TSAN_OPTIONS": "halt_on_error=1" }
     },
     { "name": "msvc2026_x64", "inherits": "base", "configurePreset": "msvc2026_x64", "configuration": "Release" },
+    { "name": "msvc2026_arm64", "inherits": "base", "configurePreset": "msvc2026_arm64", "configuration": "Release" },
+    { "name": "linux_arm64", "inherits": "base", "configurePreset": "linux_arm64" },
     { "name": "linux_riscv64", "inherits": "base", "configurePreset": "linux_riscv64" },
     { "name": "linux_ppc64le", "inherits": "base", "configurePreset": "linux_ppc64le" }
+  ],
+  "workflowPresets": [
+    {
+      "name": "debug",
+      "steps": [
+        { "type": "configure", "name": "debug" },
+        { "type": "build", "name": "debug" },
+        { "type": "test", "name": "debug" }
+      ]
+    },
+    {
+      "name": "release",
+      "steps": [
+        { "type": "configure", "name": "release" },
+        { "type": "build", "name": "release" },
+        { "type": "test", "name": "release" }
+      ]
+    },
+    {
+      "name": "tsan",
+      "steps": [
+        { "type": "configure", "name": "tsan" },
+        { "type": "build", "name": "tsan" },
+        { "type": "test", "name": "tsan" }
+      ]
+    }
   ]
 }

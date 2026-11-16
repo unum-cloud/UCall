@@ -29,7 +29,7 @@ c_stdlib_version = ["2.39"]
 
 # A dependency of the environment too, so `pixi run` puts the library in the prefix `mojo build` bakes as runpath.
 [dependencies]
-mojo = ">=1.2.0,<1.3" # ? Mojo minors still change the language, as 1.1 and 1.2 did, so each is adopted by hand
+mojo = ">=1.2.0,<1.3"  # ? Mojo minors still change the language, as 1.1 and 1.2 did, so each is adopted by hand
 ucall = { path = "." }
 
 # `mojo build` links against a MAX runtime that needs a newer glibc than conda-forge's default

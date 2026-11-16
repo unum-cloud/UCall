@@ -14,7 +14,7 @@ IFS=. read -r major minor patch <<< "$core"
 export version major minor patch
 echo "$version" > VERSION
 perl -pi -e 's/^(#define UCALL_VERSION_MAJOR )[0-9]+$/$1$ENV{major}/; s/^(#define UCALL_VERSION_MINOR )[0-9]+$/$1$ENV{minor}/; s/^(#define UCALL_VERSION_PATCH )[0-9]+$/$1$ENV{patch}/' c/ucall/types.h
-perl -pi -e 's/^(version = ")[^"]+/$1$ENV{version}/' Cargo.toml
+perl -pi -e 's/^(version = ")[^"]+/$1$ENV{version}/' Cargo.toml pixi.toml mojo/pixi.toml
 git commit -am "Release: v$version"
 .github/scripts/check-release.sh "v$version" # catches a missed site even where `core.hooksPath` is unset
 git tag -a "v$version" -m "Release: v$version"

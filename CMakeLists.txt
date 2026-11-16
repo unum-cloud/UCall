@@ -55,6 +55,10 @@ set(UCALL_MARCH
 option(UCALL_MULTIVERSIONED "Keep every CPU class the toolchain compiles, or only the best ones UCALL_MARCH implies" ON)
 
 include(cmake/ucall_flags.cmake)
+# The library reports failures through statuses, so no unit of UCall's own throws or unwinds.
+if (NOT MSVC)
+    target_compile_options(ucall_warnings INTERFACE $<$<COMPILE_LANGUAGE:CXX>:-fno-exceptions>)
+endif ()
 
 # Make Release by default
 if (NOT CMAKE_BUILD_TYPE)
@@ -91,6 +95,9 @@ find_package(Threads REQUIRED)
 set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 include(cmake/ucall_siblings.cmake)
+# The floor lands after the siblings, so MSVC's `native` reads which capabilities StringZilla found this host runs.
+set(ucall_native_probe_library_ stringzilla)
+set(ucall_native_probe_capabilities_ icelake skylake haswell neon)
 include(cmake/ucall_platform.cmake)
 
 if (UCALL_WITH_LINUX_URING)
@@ -331,4 +338,15 @@ if (UCALL_BUILD_TEST)
     add_subdirectory(c)
 endif ()
 
+# `find_package(ucall)` names the libraries `ucall::static` and, when built, `ucall::shared`, both in the `sdk` component
+# with the `ucall` command-line client. The archive's consumers link the liburing it was built with, installed beside it
+# as `ucall::uring`.
+if (TARGET uring)
+    set(ucall_installed_uring_ uring)
+endif ()
+if (UCALL_BUILD_SHARED)
+    set(ucall_installed_shared_ ucall_shared)
+endif ()
+set(ucall_install_sdk_targets_ ucall_header ucall_static ${ucall_installed_uring_} ${ucall_installed_shared_})
+set(ucall_install_programs_ ucall_cli)
 include(cmake/ucall_install.cmake)

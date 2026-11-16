@@ -15,7 +15,7 @@ set(UCALL_FREEBSD_SYSROOT
     CACHE PATH "An unpacked FreeBSD `base.txz`"
 )
 # Compiler checks re-read this file in a project of their own, which needs the path forwarded.
-list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES UCALL_FREEBSD_SYSROOT)
+set(CMAKE_TRY_COMPILE_PLATFORM_VARIABLES UCALL_FREEBSD_SYSROOT)
 if (NOT IS_DIRECTORY "${UCALL_FREEBSD_SYSROOT}/usr/include")
     message(FATAL_ERROR "UCALL_FREEBSD_SYSROOT must name an unpacked FreeBSD base, not '${UCALL_FREEBSD_SYSROOT}'")
 endif ()

@@ -2,9 +2,9 @@
 #
 # ~~~
 #   sudo apt install clang lld crossbuild-essential-arm64 qemu-user
-#   cmake -B build_aarch64_llvm -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
-#   cmake --build build_aarch64_llvm
-#   ctest --test-dir build_aarch64_llvm
+#   cmake --preset linux_arm64
+#   cmake --build --preset linux_arm64
+#   ctest --preset linux_arm64
 # ~~~
 #
 # QEMU's `-cpu max` carries LSE, RCPC and SVE2, so every Arm CPU class the library compiles runs, `aws_g2` and `aws_g5`
@@ -17,9 +17,14 @@ find_program(CMAKE_CXX_COMPILER clang++ REQUIRED)
 
 set(CMAKE_C_COMPILER_TARGET aarch64-linux-gnu)
 set(CMAKE_CXX_COMPILER_TARGET aarch64-linux-gnu)
-set(CMAKE_EXE_LINKER_FLAGS_INIT "-fuse-ld=lld")
-set(CMAKE_SHARED_LINKER_FLAGS_INIT "-fuse-ld=lld")
-set(CMAKE_MODULE_LINKER_FLAGS_INIT "-fuse-ld=lld")
+
+# NumKong's SME kernels carry `__arm_new("za")`, whose lazy saves call `__arm_tpidr2_save` and `__arm_tpidr2_restore`.
+# Only GCC's `libgcc_eh.a` defines them, and the references are hidden, so `-u` pulls those members in statically; LLD
+# resolves LTO symbols before the archive, where `ld.bfd` would drop the members first.
+set(ucall_aarch64_link_flags_ "-fuse-ld=lld -Wl,-u,__arm_tpidr2_save -Wl,-u,__arm_tpidr2_restore -lgcc_eh")
+set(CMAKE_EXE_LINKER_FLAGS_INIT "${ucall_aarch64_link_flags_}")
+set(CMAKE_SHARED_LINKER_FLAGS_INIT "${ucall_aarch64_link_flags_}")
+set(CMAKE_MODULE_LINKER_FLAGS_INIT "${ucall_aarch64_link_flags_}")
 
 find_program(ucall_qemu_aarch64_ qemu-aarch64)
 if (ucall_qemu_aarch64_)
