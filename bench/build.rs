@@ -6,7 +6,5 @@
 
 fn main() -> std::io::Result<()> {
     // `Bytes` fields let the echo payload move between calls without copying.
-    tonic_prost_build::configure()
-        .bytes(".")
-        .compile_protos(&["bench.proto"], &["."])
+    tonic_prost_build::configure().bytes(".").compile_protos(&["bench.proto"], &["."])
 }

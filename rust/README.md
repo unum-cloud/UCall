@@ -108,18 +108,19 @@ server.post("/orders/{order}", |request: Request| {
 `reply` and `reply_error` consume the request, so a request is answered at most once, and Content-Length, Date and Server are generated.
 A reply copies what it sends, and since it consumes the request, a body made of the request's bytes is assembled first, as `receipt` is above.
 A request owns its received bytes and is `Send`, so a handler may hand it to a worker thread and return, and the worker replies whenever it is done.
-A request dropped without a reply answers 500, as does one held by a handler that panics.
+A request dropped without a reply answers 500, and a handler that panics aborts the process.
 A reply to a closed connection still consumes the request and reports `Status::ConnectionClosed`; any other failed reply keeps it, and dropping it then answers 500.
 
 ## Files & Streams
 
-Handlers run on the polling thread, so a reply or a pull that finishes later runs on a worker: `Request::detach` hands the request over as a `DetachedRequest`, which reads and replies like a `Request` and alone has the three verbs below.
+Handlers run on the polling thread, so a reply or a pull that finishes later runs on a worker: `Request::detach` hands the request over as a `DetachedRequest`, which reads and replies like a `Request` and alone has the four verbs below.
 
 | Verb                                   | Returns                                            | Final when                              |
 | :------------------------------------- | :------------------------------------------------- | :-------------------------------------- |
 | `reply_parts(status, headers, parts)`  | `None` for bytes alone, else a `Deferred`          | every part is sent                      |
 | `reply_stream(status, headers)`        | a `ReplyStream` with `append(parts)` and `end()`   | `end()` returns `None` or a `Deferred`  |
 | `body_chunk()`                         | the bytes decoded since the last pull              | an empty chunk once the body ended      |
+| `next_body_chunk()`                    | a `BodyChunk` future of the same bytes             | an empty chunk once the body ended      |
 
 ### Serving a File
 
@@ -137,7 +138,7 @@ std::thread::scope(|scope| {
     for detached in received {
         let name = detached.path_parameter("name").unwrap_or_default().to_vec();
         let path = PathRange { directory: 0, path: name.as_slice().into(), offset: 0, length: 0 };
-        let parts = [ReplyPart::Path(path)];
+        let parts = [ReplyPart::path(path)];
         let replied = detached.reply_parts(HTTPStatus::OK, &[], &parts);
         if let Ok(Some(deferred)) = replied {
             let _ = deferred.wait(); // or: deferred.await
@@ -146,12 +147,12 @@ std::thread::scope(|scope| {
 });
 ```
 
-`reply_parts` concatenates `ReplyPart::Bytes`, `ReplyPart::Path` and `ReplyPart::File` parts into one body whose Content-Length is measured from the files.
+`reply_parts` concatenates `ReplyPart::bytes`, `ReplyPart::path` and `ReplyPart::file` parts into one body whose Content-Length is measured from the files.
 `ReplyPart::from` turns a borrowed `std::io::IoSlice` into a bytes part, so vectored buffers from other I/O code map over directly.
 A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and the event loop opens, reads and closes it unbuffered.
 A `File` borrows the caller's descriptor, opened with `O_DIRECT`, for the `Deferred`'s lifetime, while bytes and paths are copied before the call returns, so they may be dropped right after it.
 A file that is missing, unreadable or too short replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
-`Deferred::status` polls without blocking, `Deferred::wait` blocks until the reply is final, `.await` polls the status between other tasks, since the library has no wake-up, and dropping a `Deferred` waits for it, which is why only a detached request makes one.
+`Deferred::status` polls without blocking, `Deferred::wait` blocks until the reply is final, `.await` polls the status between other tasks, yielding to the executor until the reply is final, since the library has no wake-up, and dropping a `Deferred` waits for it, which is why only a detached request makes one.
 
 ### Streaming a Reply
 
@@ -159,7 +160,7 @@ A file that is missing, unreadable or too short replaces the reply with 404, 416
 fn send_rows(detached: DetachedRequest, rows: &[String]) -> Result<()> {
     let mut stream = detached.reply_stream(HTTPStatus::OK, &["content-type: text/csv".into()])?;
     for row in rows {
-        stream.append(&[ReplyPart::Bytes(row.as_bytes().into())])?;
+        stream.append(&[ReplyPart::bytes(row.as_bytes())])?;
     }
     stream.end().map(|_| ())
 }
@@ -180,12 +181,27 @@ fn store(mut detached: DetachedRequest) -> Result<()> {
         received_bytes += chunk.len();
     }
     let total = received_bytes.to_string();
-    detached.reply_parts(HTTPStatus::OK, &[], &[ReplyPart::Bytes(total.as_bytes().into())]).map(|_| ())
+    detached.reply_parts(HTTPStatus::OK, &[], &[ReplyPart::bytes(total.as_bytes())]).map(|_| ())
 }
 ```
 
 An endpoint registered through `Server::route_with` with `BodyDelivery::Streamed` runs its handler once the headers arrive; the handler hands `request.detach()` to a worker as above, and `body_chunk` blocks for the bytes decoded since the last pull, empty once the body ended.
 On the polling thread, where nothing arrives while the handler runs, a pull with nothing decoded refuses with `Status::WouldBlock` instead of waiting.
+
+Async code awaits the same pulls without parking a thread, as each poll of `next_body_chunk` reads the pull's status and yields while the bytes have not arrived:
+
+```rust
+async fn count(detached: &mut DetachedRequest) -> Result<usize> {
+    let mut received_bytes = 0usize;
+    loop {
+        let chunk = detached.next_body_chunk().await?;
+        if chunk.is_empty() {
+            return Ok(received_bytes);
+        }
+        received_bytes += chunk.len();
+    }
+}
+```
 
 ## Batches
 
@@ -219,7 +235,7 @@ std::thread::scope(|scope| {
 `Batching` dispatches as soon as `min_size` requests wait, never more than `max_size` at once, and a smaller batch once its oldest request waited `max_latency`; zero fields mean 1, 32 and 10 milliseconds.
 The handler runs on the thread polling the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
 A `Batch` lends its requests in arrival order: `get` and `iter` borrow them, `take` moves one out, and iterating it by value takes them all, forwards or reversed.
-Requests the handler neither replies to nor keeps answer 500 once it returns, and all of them do when it panics.
+Requests the handler neither replies to nor keeps answer 500 once it returns, and a handler that panics aborts the process.
 Taken requests may be replied to later, from any thread, while their responses still leave each connection in request order.
 
 The queue holds as many requests as the interfaces admit at once, connections times pipelined requests, and refuses more with 503.
@@ -355,7 +371,8 @@ The crate is a thin layer over UCall's native library, and every rule below foll
 - __Single owners are claimed, never assumed.__
   Event loops and batch endpoints take `&self`, and an atomic claim answers `Status::Contended` to a second poller instead of racing it.
 - __Handlers are plain closures.__
-  A panic inside a handler or an authorizer is caught at the boundary, answering 500 or rejecting the peer, and never unwinds through C.
+  A panic inside a handler, an authorizer or a log callback aborts the process, because it cannot unwind through C and a half-run handler leaves no state worth serving from.
+  Report an expected failure as a reply or a rejection instead.
 - __Polling allocates nothing.__
   A client sizes its tables by its call budget once, and a batch endpoint reuses the slots it lends requests in.
 - __No life of its own.__

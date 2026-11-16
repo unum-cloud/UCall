@@ -60,9 +60,7 @@ fn parse() -> Settings {
             "--concurrency" => settings.concurrency = count(value()).max(1),
             "--threads" => settings.threads = count(value()).max(1),
             "--warmup-seconds" => settings.warmup = Duration::from_secs(count(value()) as u64),
-            "--time-limit-seconds" => {
-                settings.time_limit = Duration::from_secs(count(value()) as u64)
-            }
+            "--time-limit-seconds" => settings.time_limit = Duration::from_secs(count(value()) as u64),
             address if !address.starts_with("--") => settings.address = address.into(),
             other => panic!("unknown flag {other}"),
         }
@@ -71,31 +69,21 @@ fn parse() -> Settings {
 }
 
 /// One call's verdict and duration, or nothing during warmup.
-async fn call(
-    client: &mut bench_client::BenchClient<Channel>,
-    workload: Workload,
-    payload: &Bytes,
-) -> bool {
+async fn call(client: &mut bench_client::BenchClient<Channel>, workload: Workload, payload: &Bytes) -> bool {
     match workload {
         Workload::Echo => client
-            .echo(Payload {
-                data: payload.clone(),
-            })
+            .echo(Payload { data: payload.clone() })
             .await
             .is_ok_and(|response| response.into_inner().data == *payload),
-        Workload::Sum => client
-            .sum(Operands { a: 17, b: 25 })
-            .await
-            .is_ok_and(|response| response.into_inner().sum == 42),
+        Workload::Sum => {
+            client.sum(Operands { a: 17, b: 25 }).await.is_ok_and(|response| response.into_inner().sum == 42)
+        }
     }
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let settings = parse();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(settings.threads)
-        .enable_all()
-        .build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(settings.threads).enable_all().build()?;
     runtime.block_on(async {
         let endpoint = Endpoint::from_shared(format!("http://{}", settings.address))?;
         let mut channels = Vec::with_capacity(settings.connections);
@@ -112,8 +100,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let finished = measured_from + settings.time_limit;
         let mut tasks = Vec::with_capacity(settings.concurrency);
         for index in 0..settings.concurrency {
-            let mut client =
-                bench_client::BenchClient::new(channels[index % channels.len()].clone());
+            let mut client = bench_client::BenchClient::new(channels[index % channels.len()].clone());
             let (workload, payload) = (settings.workload, payload.clone());
             tasks.push(tokio::spawn(async move {
                 let (mut latencies, mut failures) = (Vec::<u32>::new(), 0usize);
@@ -140,10 +127,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         latencies.sort_unstable();
         let percentile = |fraction: f64| {
             latencies
-                .get(
-                    ((latencies.len() as f64 * fraction) as usize)
-                        .min(latencies.len().saturating_sub(1)),
-                )
+                .get(((latencies.len() as f64 * fraction) as usize).min(latencies.len().saturating_sub(1)))
                 .copied()
                 .unwrap_or(0)
         };

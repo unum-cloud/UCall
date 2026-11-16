@@ -38,15 +38,9 @@ fn main() -> Result<(), Box<dyn Error>> {
     match env::var_os("UCALL_LIBRARY_DIR") {
         Some(directory) => {
             let directory = PathBuf::from(directory);
-            let archive_name = if env::var("CARGO_CFG_TARGET_ENV")? == "msvc" {
-                "ucall_static.lib"
-            } else {
-                "libucall_static.a"
-            };
-            println!(
-                "cargo:rerun-if-changed={}",
-                directory.join(archive_name).display()
-            );
+            let archive_name =
+                if env::var("CARGO_CFG_TARGET_ENV")? == "msvc" { "ucall_static.lib" } else { "libucall_static.a" };
+            println!("cargo:rerun-if-changed={}", directory.join(archive_name).display());
             println!("cargo:rustc-link-search=native={}", directory.display());
             println!("cargo:rustc-link-lib=static=ucall_static");
             if target_os == "linux" {
@@ -80,18 +74,13 @@ fn main() -> Result<(), Box<dyn Error>> {
 /// The tree a sibling crate reports through its `links` metadata.
 fn sibling_source(links: &str) -> Result<String, String> {
     let variable = format!("DEP_{}_SOURCE", links.to_uppercase());
-    env::var(&variable).map_err(|_| {
-        format!("{variable} is unset: this `{links}` crate predates reporting its tree")
-    })
+    env::var(&variable).map_err(|_| format!("{variable} is unset: this `{links}` crate predates reporting its tree"))
 }
 
 /// Builds `ucall_static` through CMake and links it with the liburing its io_uring backends need.
 fn build_library(manifest: &Path) -> Result<(), Box<dyn Error>> {
     let mut library = cmake::Config::new(manifest);
-    library
-        .profile("Release")
-        .build_target("ucall_static")
-        .define("UCALL_INSTALL", "OFF");
+    library.profile("Release").build_target("ucall_static").define("UCALL_INSTALL", "OFF");
     // `FetchContent` builds each sibling crate's tree rather than fetching the pinned revision.
     for (variable, links) in [
         ("FETCHCONTENT_SOURCE_DIR_FORKUNION", "forkunion"),

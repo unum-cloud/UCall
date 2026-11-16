@@ -9,7 +9,7 @@
 // The C mirror keeps the C spelling of every name.
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
-use core::ffi::{c_char, c_int, c_void, CStr};
+use core::ffi::{CStr, c_char, c_int, c_void};
 use core::fmt;
 use core::future::{Future, IntoFuture};
 use core::marker::PhantomData;
@@ -18,7 +18,6 @@ use core::ptr::{self, NonNull};
 use core::str::FromStr;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 // region: Raw Declarations
@@ -90,16 +89,11 @@ pub(crate) struct ucall_outcome_t {
     pub(crate) message: *const c_char,
 }
 
-pub(crate) type ucall_peer_authorizer_t = Option<
-    unsafe extern "C" fn(
-        peer_static_key: *const ucall_noise_key_t,
-        context: *mut c_void,
-    ) -> ucall_status_t,
->;
+pub(crate) type ucall_peer_authorizer_t =
+    Option<unsafe extern "C" fn(peer_static_key: *const ucall_noise_key_t, context: *mut c_void) -> ucall_status_t>;
 
-pub(crate) type ucall_log_callback_t = Option<
-    unsafe extern "C" fn(level: ucall_log_level_t, line: ucall_bytes_view_t, context: *mut c_void),
->;
+pub(crate) type ucall_log_callback_t =
+    Option<unsafe extern "C" fn(level: ucall_log_level_t, line: ucall_bytes_view_t, context: *mut c_void)>;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -124,22 +118,13 @@ struct ucall_noise_key_derive_t {
     public_key: *mut ucall_noise_key_t,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn ucall_io_backend_name(backend: ucall_io_backend_t) -> *const c_char;
     fn ucall_cpu_class_name(cpu_class: ucall_cpu_class_t) -> *const c_char;
-    fn ucall_io_backend_from_name(
-        name: ucall_bytes_view_t,
-        backend: *mut ucall_io_backend_t,
-    ) -> ucall_status_t;
-    fn ucall_cpu_class_from_name(
-        name: ucall_bytes_view_t,
-        cpu_class: *mut ucall_cpu_class_t,
-    ) -> ucall_status_t;
+    fn ucall_io_backend_from_name(name: ucall_bytes_view_t, backend: *mut ucall_io_backend_t) -> ucall_status_t;
+    fn ucall_cpu_class_from_name(name: ucall_bytes_view_t, cpu_class: *mut ucall_cpu_class_t) -> ucall_status_t;
     fn ucall_status_name(status: ucall_status_t) -> *const c_char;
-    fn ucall_status_from_name(
-        name: ucall_bytes_view_t,
-        status: *mut ucall_status_t,
-    ) -> ucall_status_t;
+    fn ucall_status_from_name(name: ucall_bytes_view_t, status: *mut ucall_status_t) -> ucall_status_t;
     fn ucall_version_name() -> *const c_char;
     fn ucall_decode_percent(
         encoded: ucall_bytes_view_t,
@@ -279,10 +264,8 @@ pub type Result<Value> = core::result::Result<Value, Error>;
 
 /// Turns a final outcome into a `Result`.
 pub(crate) fn check(outcome: ucall_outcome_t) -> Result<()> {
-    Status::from_raw(outcome.status).map_err(|status| Error {
-        status,
-        message: unsafe { static_string(outcome.message) },
-    })
+    Status::from_raw(outcome.status)
+        .map_err(|status| Error { status, message: unsafe { static_string(outcome.message) } })
 }
 
 /// Reports a failure the binding caught before the call crossed the boundary, under the status
@@ -294,10 +277,7 @@ pub(crate) fn fail(status: Status, message: &'static str) -> Error {
 /// An outcome for the library to overwrite, starting as success.
 impl Default for ucall_outcome_t {
     fn default() -> Self {
-        ucall_outcome_t {
-            status: ucall_status_success_k,
-            message: ptr::null(),
-        }
+        ucall_outcome_t { status: ucall_status_success_k, message: ptr::null() }
     }
 }
 
@@ -320,10 +300,7 @@ unsafe impl Send for Deferred<'_> {}
 impl Deferred<'_> {
     /// An outcome at a stable heap address, for a verb that may finish after it returns.
     pub(crate) fn pending() -> Self {
-        Deferred {
-            outcome: NonNull::from(Box::leak(Box::new(ucall_outcome_t::default()))),
-            files: PhantomData,
-        }
+        Deferred { outcome: NonNull::from(Box::leak(Box::new(ucall_outcome_t::default()))), files: PhantomData }
     }
 
     /// The outcome to hand the verb.
@@ -369,11 +346,11 @@ impl<'f> IntoFuture for Deferred<'f> {
     }
 }
 
-/// A [`Deferred`] being awaited: every poll reads its status, and one not yet final asks to be
-/// polled again.
+/// A [`Deferred`] being awaited: every poll reads its status through `ucall_outcome_status`, and
+/// one not yet final yields to the executor, asking to be polled again.
 ///
-/// The library has no wake-up, so an executor re-polls it while other tasks run, spinning only
-/// when nothing else is ready; [`Deferred::wait`] blocks on the CPU class's waiter.
+/// The library has no wake-up, so an executor re-polls it while other tasks run, and no poll
+/// waits on the library; [`Deferred::wait`] does, on the CPU class's waiter.
 #[must_use = "an awaited reply does nothing unless polled"]
 pub struct Wait<'f>(Option<Deferred<'f>>);
 
@@ -383,15 +360,13 @@ impl Future for Wait<'_> {
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
         let awaited = &mut self.get_mut().0;
         match awaited.take() {
-            None => Poll::Ready(Err(fail(
-                Status::InvalidArgument,
-                "the reply was already awaited",
-            ))),
+            None => Poll::Ready(Err(fail(Status::InvalidArgument, "the reply was already awaited"))),
             Some(deferred) if deferred.status() == Err(Status::Deferred) => {
                 *awaited = Some(deferred);
                 context.waker().wake_by_ref();
                 Poll::Pending
             }
+            // A final outcome returns from the wait at once.
             Some(deferred) => Poll::Ready(deferred.wait()),
         }
     }
@@ -404,15 +379,12 @@ pub(crate) unsafe fn static_string(raw: *const c_char) -> &'static str {
     if raw.is_null() {
         return "";
     }
-    core::str::from_utf8_unchecked(CStr::from_ptr(raw).to_bytes())
+    unsafe { core::str::from_utf8_unchecked(CStr::from_ptr(raw).to_bytes()) }
 }
 
 /// Lends a borrowed slice as the view the library reads.
 pub(crate) fn view(bytes: &[u8]) -> ucall_bytes_view_t {
-    ucall_bytes_view_t {
-        data: bytes.as_ptr(),
-        length: bytes.len(),
-    }
+    ucall_bytes_view_t { data: bytes.as_ptr(), length: bytes.len() }
 }
 
 /// Reads a view the library wrote back as a slice living as long as `'owner`.
@@ -422,7 +394,7 @@ pub(crate) fn view(bytes: &[u8]) -> ucall_bytes_view_t {
 pub(crate) unsafe fn viewed<'owner>(bytes: ucall_bytes_view_t) -> &'owner [u8] {
     match bytes.data.is_null() {
         true => &[],
-        false => core::slice::from_raw_parts(bytes.data, bytes.length),
+        false => unsafe { core::slice::from_raw_parts(bytes.data, bytes.length) },
     }
 }
 
@@ -460,14 +432,8 @@ pub enum PercentMode {
 pub fn decode_percent(encoded: &[u8], mode: PercentMode) -> Result<Vec<u8>> {
     let mut decoded = vec![0; encoded.len()];
     let mut length = 0;
-    let raw = unsafe {
-        ucall_decode_percent(
-            view(encoded),
-            decoded.as_mut_ptr(),
-            &mut length,
-            mode as ucall_percent_mode_t,
-        )
-    };
+    let raw =
+        unsafe { ucall_decode_percent(view(encoded), decoded.as_mut_ptr(), &mut length, mode as ucall_percent_mode_t) };
     Status::from_raw(raw).map_err(|status| fail(status, "a '%' lacks two hexadecimal digits"))?;
     decoded.truncate(length);
     Ok(decoded)
@@ -504,11 +470,7 @@ pub fn generate_noise_keypair() -> Result<(NoiseKey, NoiseKey)> {
 pub fn derive_noise_public_key(private_key: &NoiseKey) -> NoiseKey {
     let mut public_key: NoiseKey = [0; 32];
     let mut outcome = ucall_outcome_t::default();
-    let mut arguments = ucall_noise_key_derive_t {
-        outcome: &mut outcome,
-        private_key,
-        public_key: &mut public_key,
-    };
+    let mut arguments = ucall_noise_key_derive_t { outcome: &mut outcome, private_key, public_key: &mut public_key };
     // Derivation fails only on the null pointers references rule out.
     unsafe { ucall_noise_key_derive(&mut arguments) };
     public_key
@@ -530,6 +492,28 @@ pub struct CrtDescriptor<'f> {
     file: PhantomData<&'f ()>,
 }
 
+/// The C `int` a borrowed descriptor names.
+#[cfg(unix)]
+pub(crate) fn raw_descriptor(descriptor: Descriptor<'_>) -> c_int {
+    std::os::fd::AsRawFd::as_raw_fd(&descriptor)
+}
+/// The C `int` a borrowed descriptor names.
+#[cfg(windows)]
+pub(crate) fn raw_descriptor(descriptor: Descriptor<'_>) -> c_int {
+    descriptor.descriptor
+}
+
+/// Borrows a C descriptor the caller knows stays open for `'f`.
+#[cfg(unix)]
+pub(crate) unsafe fn borrowed_descriptor<'f>(descriptor: c_int) -> Descriptor<'f> {
+    unsafe { std::os::fd::BorrowedFd::borrow_raw(descriptor) }
+}
+/// Borrows a C descriptor the caller knows stays open for `'f`.
+#[cfg(windows)]
+pub(crate) unsafe fn borrowed_descriptor<'f>(descriptor: c_int) -> Descriptor<'f> {
+    unsafe { CrtDescriptor::borrow_raw(descriptor) }
+}
+
 #[cfg(windows)]
 impl CrtDescriptor<'_> {
     /// Borrows `descriptor`.
@@ -538,10 +522,7 @@ impl CrtDescriptor<'_> {
     ///
     /// The descriptor stays open for the returned lifetime.
     pub unsafe fn borrow_raw(descriptor: c_int) -> Self {
-        CrtDescriptor {
-            descriptor,
-            file: PhantomData,
-        }
+        CrtDescriptor { descriptor, file: PhantomData }
     }
 }
 
@@ -555,10 +536,7 @@ pub struct BytesView<'bytes> {
 
 impl<'bytes> From<&'bytes [u8]> for BytesView<'bytes> {
     fn from(bytes: &'bytes [u8]) -> Self {
-        BytesView {
-            raw: view(bytes),
-            bytes: PhantomData,
-        }
+        BytesView { raw: view(bytes), bytes: PhantomData }
     }
 }
 
@@ -578,6 +556,16 @@ impl<'bytes> BytesView<'bytes> {
     /// The bytes this view borrows.
     pub fn as_bytes(&self) -> &'bytes [u8] {
         unsafe { viewed(self.raw) }
+    }
+
+    /// The C view this one wraps.
+    pub(crate) fn raw(&self) -> ucall_bytes_view_t {
+        self.raw
+    }
+
+    /// Wraps a C view the caller knows borrows for `'bytes`.
+    pub(crate) unsafe fn from_raw(raw: ucall_bytes_view_t) -> Self {
+        BytesView { raw, bytes: PhantomData }
     }
 
     /// Lends a run of views as the counted array the library reads.
@@ -746,10 +734,7 @@ impl FromStr for Backend {
         let mut raw: ucall_io_backend_t = 0;
         match unsafe { ucall_io_backend_from_name(view(name.as_bytes()), &mut raw) } {
             0 => Ok(Backend::from_raw(raw)),
-            _ => Err(fail(
-                Status::InvalidArgument,
-                "no I/O backend has that name",
-            )),
+            _ => Err(fail(Status::InvalidArgument, "no I/O backend has that name")),
         }
     }
 }
@@ -810,8 +795,7 @@ impl CPUClass {
 
 impl fmt::Display for CPUClass {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        formatter
-            .write_str(unsafe { static_string(ucall_cpu_class_name(*self as ucall_cpu_class_t)) })
+        formatter.write_str(unsafe { static_string(ucall_cpu_class_name(*self as ucall_cpu_class_t)) })
     }
 }
 
@@ -851,36 +835,26 @@ impl Security {
 /// Decides whether a peer presenting an authenticated static key may proceed past the handshake.
 ///
 /// A server runs it on the polling thread completing the handshake, and a client on its owner
-/// thread inside [`Client::take_completed`](crate::Client::take_completed). A panic rejects the
-/// peer.
+/// thread inside [`Client::take_completed`](crate::Client::take_completed). A panic aborts the
+/// process.
 pub type PeerAuthorizer = dyn Fn(&NoiseKey) -> bool + Send + Sync;
 
 /// Lends an optional authorizer as the C callback and the context it is called with.
 ///
 /// The context points at `authorizer` itself, which must stay in place until the handle is freed.
-pub(crate) fn lend_authorizer(
-    authorizer: &Option<Arc<PeerAuthorizer>>,
-) -> (ucall_peer_authorizer_t, *mut c_void) {
+pub(crate) fn lend_authorizer(authorizer: &Option<Arc<PeerAuthorizer>>) -> (ucall_peer_authorizer_t, *mut c_void) {
     match authorizer {
-        Some(authorizer) => (
-            Some(authorize_trampoline),
-            ptr::from_ref(authorizer).cast_mut().cast(),
-        ),
+        Some(authorizer) => (Some(authorize_trampoline), ptr::from_ref(authorizer).cast_mut().cast()),
         None => (None, ptr::null_mut()),
     }
 }
 
 /// # Safety
 /// `context` must address a live `Arc<PeerAuthorizer>`, and `key` a 32-byte key.
-unsafe extern "C" fn authorize_trampoline(
-    key: *const ucall_noise_key_t,
-    context: *mut c_void,
-) -> ucall_status_t {
-    let authorizer = &*context.cast::<Arc<PeerAuthorizer>>();
-    match catch_unwind(AssertUnwindSafe(|| authorizer(&*key))) {
-        Ok(true) => ucall_status_success_k,
-        _ => ucall_status_peer_rejected_k,
-    }
+unsafe extern "C" fn authorize_trampoline(key: *const ucall_noise_key_t, context: *mut c_void) -> ucall_status_t {
+    let (authorizer, key) = unsafe { (&*context.cast::<Arc<PeerAuthorizer>>(), &*key) };
+    // A panic cannot unwind through this C frame, so it aborts the process.
+    if authorizer(key) { ucall_status_success_k } else { ucall_status_peer_rejected_k }
 }
 
 /// When an endpoint's handler runs: once the body is buffered, or at headers time, with the body
@@ -939,7 +913,7 @@ pub enum LogFormat {
 }
 
 /// Receives one formatted log line, without a trailing newline, on whichever thread produced it,
-/// polling threads included; it should return quickly, and a panic drops the line.
+/// polling threads included; it should return quickly, and a panic aborts the process.
 pub type LogCallback = dyn Fn(LogLevel, &[u8]) + Send + Sync;
 
 /// The one log sink of a server or a client; without one, the library writes nothing anywhere.
@@ -963,26 +937,16 @@ pub(crate) fn lend_log(log: &Option<Box<Log>>) -> ucall_log_t {
             format: log.format as ucall_log_format_t,
             level: log.level as ucall_log_level_t,
         },
-        None => ucall_log_t {
-            callback: None,
-            context: ptr::null_mut(),
-            format: 0,
-            level: 0,
-        },
+        None => ucall_log_t { callback: None, context: ptr::null_mut(), format: 0, level: 0 },
     }
 }
 
 /// # Safety
 /// `context` must address a live `Arc<LogCallback>`, and `line` a valid view.
-unsafe extern "C" fn log_trampoline(
-    level: ucall_log_level_t,
-    line: ucall_bytes_view_t,
-    context: *mut c_void,
-) {
-    let callback = &*context.cast::<Arc<LogCallback>>();
-    let _ = catch_unwind(AssertUnwindSafe(|| {
-        callback(LogLevel::from_raw(level), viewed(line))
-    }));
+unsafe extern "C" fn log_trampoline(level: ucall_log_level_t, line: ucall_bytes_view_t, context: *mut c_void) {
+    let (callback, line) = unsafe { (&*context.cast::<Arc<LogCallback>>(), viewed(line)) };
+    // A panic cannot unwind through this C frame, so it aborts the process.
+    callback(LogLevel::from_raw(level), line);
 }
 
 // region: Tests
@@ -1001,10 +965,7 @@ mod tests {
 
     #[test]
     fn names_parse_back_and_unknown_ones_fail() {
-        assert_eq!(
-            "linux-epollaio".parse::<Backend>(),
-            Ok(Backend::LinuxEpollAIO)
-        );
+        assert_eq!("linux-epollaio".parse::<Backend>(), Ok(Backend::LinuxEpollAIO));
         assert_eq!("automatic".parse::<Backend>(), Ok(Backend::Automatic));
         assert_eq!("serial".parse::<CPUClass>(), Ok(CPUClass::Serial));
         let unknown = "linux-epol".parse::<Backend>().unwrap_err();
@@ -1012,10 +973,7 @@ mod tests {
         assert!("".parse::<CPUClass>().is_err());
         assert!("automatic".parse::<CPUClass>().is_err());
         assert_eq!(Status::from_name("would-block"), Some(Status::WouldBlock));
-        assert_eq!(
-            Status::from_name("invalid-argument"),
-            Some(Status::InvalidArgument)
-        );
+        assert_eq!(Status::from_name("invalid-argument"), Some(Status::InvalidArgument));
         assert_eq!(Status::from_name("success"), None);
         assert_eq!(Status::from_name("would-bloc"), None);
     }

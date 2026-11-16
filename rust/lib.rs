@@ -56,15 +56,14 @@ mod testing;
 
 pub use client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed, Response};
 pub use server::{
-    Batch, BatchEndpoint, BatchEndpointStatistics, Batching, DetachedRequest, EventLoopStatistics,
-    FileRange, Interface, Metrics, PathRange, Peer, PeerAddress, Polling, ReplyPart, ReplyStream,
-    Request, RequestPart, Server, ServerOptions,
+    Batch, BatchEndpoint, BatchEndpointStatistics, Batching, BodyChunk, DetachedRequest, EventLoopStatistics,
+    FileRange, Interface, Metrics, PathRange, Peer, PeerAddress, Polling, ReplyPart, ReplyStream, Request, RequestPart,
+    Server, ServerOptions,
 };
 #[cfg(windows)]
 pub use types::CrtDescriptor;
 pub use types::{
-    decode_percent, derive_noise_public_key, generate_noise_keypair, version, Backend,
-    BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, Error, HTTPStatus, Log, LogCallback,
-    LogFormat, LogLevel, NoiseKey, PeerAuthorizer, PercentMode, Result, Security, Status, Verb,
-    Wait,
+    Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, Error, HTTPStatus, Log, LogCallback, LogFormat,
+    LogLevel, NoiseKey, PeerAuthorizer, PercentMode, Result, Security, Status, Verb, Wait, decode_percent,
+    derive_noise_public_key, generate_noise_keypair, version,
 };

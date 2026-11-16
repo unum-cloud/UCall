@@ -12,10 +12,7 @@ pub struct Arguments {
 
 /// Reads `--port N` and `--threads N`, defaulting to 8545 and 1.
 pub fn parse() -> Arguments {
-    let mut arguments = Arguments {
-        port: 8545,
-        threads: 1,
-    };
+    let mut arguments = Arguments { port: 8545, threads: 1 };
     let mut words = std::env::args().skip(1);
     while let Some(flag) = words.next() {
         let value = words.next().unwrap_or_default();

@@ -28,20 +28,11 @@ impl bench_server::Bench for Service {
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let arguments = arguments::parse();
-    let runtime = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(arguments.threads)
-        .enable_all()
-        .build()?;
+    let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(arguments.threads).enable_all().build()?;
     runtime.block_on(async {
         let address = std::net::SocketAddr::from(([127, 0, 0, 1], arguments.port));
-        println!(
-            "Listening on {address} with {} Tokio workers",
-            arguments.threads
-        );
-        tonic::transport::Server::builder()
-            .add_service(bench_server::BenchServer::new(Service))
-            .serve(address)
-            .await?;
+        println!("Listening on {address} with {} Tokio workers", arguments.threads);
+        tonic::transport::Server::builder().add_service(bench_server::BenchServer::new(Service)).serve(address).await?;
         Ok(())
     })
 }

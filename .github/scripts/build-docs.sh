@@ -5,8 +5,8 @@
 set -euo pipefail
 version=$(cat VERSION)
 name=ucall_docs_$version out=build/ucall_docs_$version
-# Rustdoc's JSON is unstable, so this pins the toolchain whose format the website reads.
-toolchain=${UCALL_RUST_TOOLCHAIN:-beta-2026-10-18}
+# Rustdoc's JSON is unstable, so `RUSTC_BOOTSTRAP` opens it on the stable toolchain the rest of CI builds with.
+toolchain=${UCALL_RUST_TOOLCHAIN:-stable}
 rm -rf "$out" && mkdir -p "$out"/{doxygen,headers,python,rust,mojo} build/docs-scratch/library
 
 rm -rf build/xml && (cd docs && doxygen conf.dox) && cp -r build/xml/. "$out/doxygen"

@@ -15,26 +15,28 @@
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
 use core::ffi::{c_int, c_void};
-use core::marker::PhantomData;
+use core::fmt;
+use core::future::Future;
+use core::marker::{PhantomData, PhantomPinned};
 use core::mem::ManuallyDrop;
 use core::ops::Deref;
+use core::pin::Pin;
 use core::ptr;
 use core::sync::atomic::{AtomicBool, Ordering};
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr, SocketAddrV4, SocketAddrV6};
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::Arc;
 
 use crate::types::{
-    check, fail, lend_authorizer, lend_log, microseconds, ucall_body_delivery_t,
-    ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t,
-    ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t,
-    ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t, ucall_security_t,
-    ucall_server_t, ucall_status_already_exists_k, ucall_status_connection_closed_k,
-    ucall_status_deferred_k, ucall_status_invalid_argument_k, ucall_status_out_of_memory_k,
-    ucall_status_success_k, ucall_status_uninitialized_k, ucall_verb_t, view, viewed, Backend,
-    BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, HTTPStatus, Log, NoiseKey,
-    PeerAuthorizer, Result, Security, Status, Verb,
+    Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, HTTPStatus, Log, NoiseKey, PeerAuthorizer,
+    Result, Security, Status, Verb, borrowed_descriptor, check, fail, lend_authorizer, lend_log, microseconds,
+    raw_descriptor, ucall_body_delivery_t, ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t,
+    ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t,
+    ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t, ucall_security_t, ucall_server_t,
+    ucall_status_already_exists_k, ucall_status_connection_closed_k, ucall_status_deferred_k,
+    ucall_status_invalid_argument_k, ucall_status_out_of_memory_k, ucall_status_success_k,
+    ucall_status_uninitialized_k, ucall_verb_t, view, viewed,
 };
 
 // region: Raw Declarations
@@ -135,13 +137,8 @@ struct ucall_server_batch_endpoint_statistics_t {
 type ucall_received_http_request_callback_t =
     Option<unsafe extern "C" fn(request: ucall_received_http_request_t, context: *mut c_void)>;
 
-type ucall_received_http_batch_callback_t = Option<
-    unsafe extern "C" fn(
-        requests: *const ucall_received_http_request_t,
-        count: usize,
-        context: *mut c_void,
-    ),
->;
+type ucall_received_http_batch_callback_t =
+    Option<unsafe extern "C" fn(requests: *const ucall_received_http_request_t, count: usize, context: *mut c_void)>;
 
 #[repr(C)]
 struct ucall_server_add_http_endpoint_t {
@@ -367,7 +364,7 @@ struct ucall_server_reply_end_t {
     request: ucall_received_http_request_t,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn ucall_server_init(arguments: *mut ucall_server_init_t);
     fn ucall_server_free(server: ucall_server_t);
     fn ucall_server_stop(server: ucall_server_t);
@@ -376,15 +373,10 @@ extern "C" {
     fn ucall_server_event_loop_statistics(arguments: *mut ucall_server_event_loop_statistics_t);
     fn ucall_server_take_batch(arguments: *mut ucall_server_take_batch_t);
     fn ucall_server_take_batches(arguments: *mut ucall_server_take_batches_t);
-    fn ucall_server_batch_endpoint_statistics(
-        arguments: *mut ucall_server_batch_endpoint_statistics_t,
-    );
+    fn ucall_server_batch_endpoint_statistics(arguments: *mut ucall_server_batch_endpoint_statistics_t);
     fn ucall_server_add_http_endpoint(arguments: *mut ucall_server_add_http_endpoint_t);
     fn ucall_server_add_http_batch_endpoint(arguments: *mut ucall_server_add_http_batch_endpoint_t);
-    fn ucall_server_request_verb(
-        server: ucall_server_t,
-        request: ucall_received_http_request_t,
-    ) -> ucall_verb_t;
+    fn ucall_server_request_verb(server: ucall_server_t, request: ucall_received_http_request_t) -> ucall_verb_t;
     fn ucall_server_request_path(arguments: *mut ucall_server_request_path_t);
     fn ucall_server_request_path_segments_count(
         server: ucall_server_t,
@@ -400,10 +392,7 @@ extern "C" {
     fn ucall_server_request_peer(arguments: *mut ucall_server_request_peer_t);
     fn ucall_server_request_body(arguments: *mut ucall_server_request_body_t);
     fn ucall_server_request_body_chunk(arguments: *mut ucall_server_request_body_chunk_t);
-    fn ucall_server_request_parts_count(
-        server: ucall_server_t,
-        request: ucall_received_http_request_t,
-    ) -> usize;
+    fn ucall_server_request_parts_count(server: ucall_server_t, request: ucall_received_http_request_t) -> usize;
     fn ucall_server_request_part(arguments: *mut ucall_server_request_part_t);
     fn ucall_server_reply_content(arguments: *mut ucall_server_reply_content_t);
     fn ucall_server_reply_error(arguments: *mut ucall_server_reply_error_t);
@@ -474,20 +463,14 @@ impl Interface {
     /// and never closes `listener`, which must outlive [`Server::new`].
     #[cfg(unix)]
     pub fn listening(listener: &impl std::os::fd::AsRawFd) -> Self {
-        Interface {
-            listen_descriptor: Some(listener.as_raw_fd() as isize),
-            ..Interface::new("")
-        }
+        Interface { listen_descriptor: Some(listener.as_raw_fd() as isize), ..Interface::new("") }
     }
 
     /// An interface accepting on a listening stream socket another owner opened; the server
     /// accepts on duplicates and never closes `listener`, which must outlive [`Server::new`].
     #[cfg(windows)]
     pub fn listening(listener: &impl std::os::windows::io::AsRawSocket) -> Self {
-        Interface {
-            listen_descriptor: Some(listener.as_raw_socket() as isize),
-            ..Interface::new("")
-        }
+        Interface { listen_descriptor: Some(listener.as_raw_socket() as isize), ..Interface::new("") }
     }
 
     /// Pins the interface to a physical device, like "eth0"; only Linux supports it.
@@ -511,10 +494,7 @@ impl Interface {
     }
 
     /// Vets each client's authenticated static key before any of its requests is read.
-    pub fn peer_authorizer(
-        mut self,
-        authorizer: impl Fn(&NoiseKey) -> bool + Send + Sync + 'static,
-    ) -> Self {
+    pub fn peer_authorizer(mut self, authorizer: impl Fn(&NoiseKey) -> bool + Send + Sync + 'static) -> Self {
         self.peer_authorizer = Some(Arc::new(authorizer));
         self
     }
@@ -548,12 +528,9 @@ impl Interface {
         self
     }
 
-    /// Directories the [`ReplyPart::Path`] parts of replies to this interface's requests resolve
+    /// Directories the [`ReplyPart::path`] parts of replies to this interface's requests resolve
     /// beneath, by position; each is opened when the server starts, failing it if one cannot be.
-    pub fn reply_directories(
-        mut self,
-        directories: impl IntoIterator<Item = impl Into<String>>,
-    ) -> Self {
+    pub fn reply_directories(mut self, directories: impl IntoIterator<Item = impl Into<String>>) -> Self {
         self.reply_directories = directories.into_iter().map(Into::into).collect();
         self
     }
@@ -608,9 +585,7 @@ unsafe impl Sync for ServerCore {}
 impl ServerCore {
     /// The interfaces as the library resolved them, every default filled in.
     fn interfaces(&self) -> &[ucall_network_interface_t] {
-        unsafe {
-            core::slice::from_raw_parts(self.resolved.interfaces, self.resolved.interfaces_count)
-        }
+        unsafe { core::slice::from_raw_parts(self.resolved.interfaces, self.resolved.interfaces_count) }
     }
 }
 
@@ -649,17 +624,11 @@ struct Route {
 
 /// # Safety
 /// `context` must address a live [`Route`], and `request` be a retained handle of its server.
-unsafe extern "C" fn route_trampoline(
-    request: ucall_received_http_request_t,
-    context: *mut c_void,
-) {
-    let route = &*context.cast::<Route>();
-    let request = Request {
-        server: Arc::clone(&route.server),
-        raw: request,
-    };
-    // Unwinding drops the request, which answers 500.
-    let _ = catch_unwind(AssertUnwindSafe(|| (route.handler)(request)));
+unsafe extern "C" fn route_trampoline(request: ucall_received_http_request_t, context: *mut c_void) {
+    let route = unsafe { &*context.cast::<Route>() };
+    let request = Request { server: Arc::clone(&route.server), raw: request };
+    // A panic cannot unwind through this C frame, so it aborts the process.
+    (route.handler)(request);
 }
 
 /// What [`Server::take_call`] found of its event loop.
@@ -725,20 +694,15 @@ impl Server {
     /// endpoint `options` name.
     pub fn with_options(interfaces: &[Interface], options: ServerOptions) -> Result<Server> {
         // The contexts point into this vector and box, which the core keeps until the free.
-        let authorizers: Vec<Option<Arc<PeerAuthorizer>>> = interfaces
-            .iter()
-            .map(|interface| interface.peer_authorizer.clone())
-            .collect();
+        let authorizers: Vec<Option<Arc<PeerAuthorizer>>> =
+            interfaces.iter().map(|interface| interface.peer_authorizer.clone()).collect();
         let log = options.log.map(Box::new);
         // The library copies the directories, keys and metric names during initialization.
         let directories: Vec<Vec<ucall_bytes_view_t>> = interfaces
             .iter()
             .map(|interface| {
                 let directories = &interface.reply_directories;
-                directories
-                    .iter()
-                    .map(|path| view(path.as_bytes()))
-                    .collect()
+                directories.iter().map(|path| view(path.as_bytes())).collect()
             })
             .collect();
         let raw_interfaces: Vec<ucall_network_interface_t> = interfaces
@@ -749,20 +713,11 @@ impl Server {
                 let (peer_authorizer, peer_authorizer_context) = lend_authorizer(authorizer);
                 ucall_network_interface_t {
                     address: view(interface.address.as_bytes()),
-                    listen_descriptor: interface
-                        .listen_descriptor
-                        .as_ref()
-                        .map_or(ptr::null(), ptr::from_ref),
+                    listen_descriptor: interface.listen_descriptor.as_ref().map_or(ptr::null(), ptr::from_ref),
                     device_name: view(interface.device_name.as_deref().unwrap_or("").as_bytes()),
                     security: interface.security.to_raw(),
-                    noise_private_key: interface
-                        .noise_private_key
-                        .as_ref()
-                        .map_or(ptr::null(), ptr::from_ref),
-                    noise_peer_key: interface
-                        .noise_peer_key
-                        .as_ref()
-                        .map_or(ptr::null(), ptr::from_ref),
+                    noise_private_key: interface.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
+                    noise_peer_key: interface.noise_peer_key.as_ref().map_or(ptr::null(), ptr::from_ref),
                     peer_authorizer,
                     peer_authorizer_context,
                     event_loops: interface.event_loops,
@@ -776,11 +731,7 @@ impl Server {
             .collect();
 
         let metrics = options.metrics.unwrap_or_default();
-        let tags: Vec<ucall_bytes_view_t> = metrics
-            .tags
-            .iter()
-            .map(|tag| view(tag.as_bytes()))
-            .collect();
+        let tags: Vec<ucall_bytes_view_t> = metrics.tags.iter().map(|tag| view(tag.as_bytes())).collect();
         let config = ucall_server_options_t {
             interfaces: raw_interfaces.as_ptr(),
             interfaces_count: raw_interfaces.len(),
@@ -797,27 +748,13 @@ impl Server {
         let mut raw: ucall_server_t = ptr::null_mut();
         let mut resolved = config;
         let mut outcome = ucall_outcome_t::default();
-        let mut arguments = ucall_server_init_t {
-            server: &mut raw,
-            outcome: &mut outcome,
-            options: &config,
-            resolved: &mut resolved,
-        };
+        let mut arguments =
+            ucall_server_init_t { server: &mut raw, outcome: &mut outcome, options: &config, resolved: &mut resolved };
         unsafe { ucall_server_init(&mut arguments) };
-        let core = ServerCore {
-            raw,
-            resolved,
-            _authorizers: authorizers,
-            _log: log,
-        };
+        let core = ServerCore { raw, resolved, _authorizers: authorizers, _log: log };
         check(outcome)?;
 
-        let event_loops = core
-            .interfaces()
-            .iter()
-            .map(|interface| interface.event_loops)
-            .max()
-            .unwrap_or(0);
+        let event_loops = core.interfaces().iter().map(|interface| interface.event_loops).max().unwrap_or(0);
         Ok(Server {
             core: Arc::new(core),
             polled: (0..event_loops).map(|_| AtomicBool::new(false)).collect(),
@@ -851,14 +788,10 @@ impl Server {
     ///
     /// Templates capture `{name}` segments and a greedy `{*name}` tail, read back through
     /// [`Request::path_parameter`]; literal segments match before captures, and captures before a
-    /// tail. A handler that panics, or drops its request unreplied, answers 500. Registering the
-    /// same template and verb twice fails with [`Status::AlreadyExists`].
-    pub fn route(
-        &mut self,
-        path: &str,
-        verb: Verb,
-        handler: impl Fn(Request) + Send + Sync + 'static,
-    ) -> Result<()> {
+    /// tail. A handler that drops its request unreplied answers 500, and one that panics aborts
+    /// the process. Registering the same template and verb twice fails with
+    /// [`Status::AlreadyExists`].
+    pub fn route(&mut self, path: &str, verb: Verb, handler: impl Fn(Request) + Send + Sync + 'static) -> Result<()> {
         self.route_with(path, verb, BodyDelivery::Buffered, handler)
     }
 
@@ -872,10 +805,7 @@ impl Server {
         delivery: BodyDelivery,
         handler: impl Fn(Request) + Send + Sync + 'static,
     ) -> Result<()> {
-        let route = Box::into_raw(Box::new(Route {
-            server: Arc::clone(&self.core),
-            handler: Box::new(handler),
-        }));
+        let route = Box::into_raw(Box::new(Route { server: Arc::clone(&self.core), handler: Box::new(handler) }));
         let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_add_http_endpoint_t {
             server: self.core.raw,
@@ -896,55 +826,35 @@ impl Server {
     }
 
     /// Routes GET requests on `path` to `handler`.
-    pub fn get(
-        &mut self,
-        path: &str,
-        handler: impl Fn(Request) + Send + Sync + 'static,
-    ) -> Result<()> {
+    pub fn get(&mut self, path: &str, handler: impl Fn(Request) + Send + Sync + 'static) -> Result<()> {
         self.route(path, Verb::Get, handler)
     }
 
     /// Routes POST requests on `path` to `handler`.
-    pub fn post(
-        &mut self,
-        path: &str,
-        handler: impl Fn(Request) + Send + Sync + 'static,
-    ) -> Result<()> {
+    pub fn post(&mut self, path: &str, handler: impl Fn(Request) + Send + Sync + 'static) -> Result<()> {
         self.route(path, Verb::Post, handler)
     }
 
     /// Routes PUT requests on `path` to `handler`.
-    pub fn put(
-        &mut self,
-        path: &str,
-        handler: impl Fn(Request) + Send + Sync + 'static,
-    ) -> Result<()> {
+    pub fn put(&mut self, path: &str, handler: impl Fn(Request) + Send + Sync + 'static) -> Result<()> {
         self.route(path, Verb::Put, handler)
     }
 
     /// Routes DELETE requests on `path` to `handler`.
-    pub fn delete(
-        &mut self,
-        path: &str,
-        handler: impl Fn(Request) + Send + Sync + 'static,
-    ) -> Result<()> {
+    pub fn delete(&mut self, path: &str, handler: impl Fn(Request) + Send + Sync + 'static) -> Result<()> {
         self.route(path, Verb::Delete, handler)
     }
 
     /// Routes PATCH requests on `path` to `handler`.
-    pub fn patch(
-        &mut self,
-        path: &str,
-        handler: impl Fn(Request) + Send + Sync + 'static,
-    ) -> Result<()> {
+    pub fn patch(&mut self, path: &str, handler: impl Fn(Request) + Send + Sync + 'static) -> Result<()> {
         self.route(path, Verb::Patch, handler)
     }
 
     /// Collects requests matching `path` and `verb` from every event loop into one queue, which
     /// the returned endpoint drains into `handler` on whichever thread drains it.
     ///
-    /// Requests the handler neither replies to nor keeps answer 500 once it returns, as do all of
-    /// them when it panics.
+    /// Requests the handler neither replies to nor keeps answer 500 once it returns; a handler
+    /// that panics aborts the process.
     pub fn batch(
         &mut self,
         path: &str,
@@ -972,22 +882,17 @@ impl Server {
             endpoint: &mut raw,
         };
         unsafe { ucall_server_add_http_batch_endpoint(&mut arguments) };
-        let endpoint = BatchEndpoint {
-            server: self.core.raw,
-            raw,
-            state,
-            polled: AtomicBool::new(false),
-        };
+        let endpoint = BatchEndpoint { server: self.core.raw, raw, state, polled: AtomicBool::new(false) };
         check(outcome)?;
         Ok(endpoint)
     }
 
     /// Claims event loop `index` for the calling thread until the returned guard drops.
     fn claim(&self, index: usize) -> Result<Claim<'_>> {
-        let polled = self.polled.get(index).ok_or(fail(
-            Status::InvalidArgument,
-            "the server has no event loop with that index",
-        ))?;
+        let polled = self
+            .polled
+            .get(index)
+            .ok_or(fail(Status::InvalidArgument, "the server has no event loop with that index"))?;
         Claim::take(polled, "another thread is polling this event loop")
     }
 
@@ -1018,11 +923,8 @@ impl Server {
     pub fn take_calls(&self, event_loop: usize) -> Result<()> {
         let _claim = self.claim(event_loop)?;
         let mut outcome = ucall_outcome_t::default();
-        let mut arguments = ucall_server_take_calls_t {
-            server: self.core.raw,
-            outcome: &mut outcome,
-            event_loop_index: event_loop,
-        };
+        let mut arguments =
+            ucall_server_take_calls_t { server: self.core.raw, outcome: &mut outcome, event_loop_index: event_loop };
         unsafe { ucall_server_take_calls(&mut arguments) };
         check(outcome)
     }
@@ -1181,18 +1083,14 @@ unsafe extern "C" fn batch_trampoline(
     count: usize,
     context: *mut c_void,
 ) {
-    let state = &mut *context.cast::<BatchState>();
-    let handles = core::slice::from_raw_parts(requests, count);
+    let (state, handles) =
+        unsafe { (&mut *context.cast::<BatchState>(), core::slice::from_raw_parts(requests, count)) };
     let server = &state.server;
-    state.requests.extend(handles.iter().map(|&raw| {
-        Some(Request {
-            server: Arc::clone(server),
-            raw,
-        })
-    }));
+    state.requests.extend(handles.iter().map(|&raw| Some(Request { server: Arc::clone(server), raw })));
     let handler = &state.handler;
     let requests = &mut state.requests;
-    let _ = catch_unwind(AssertUnwindSafe(|| handler(Batch { requests })));
+    // A panic cannot unwind through this C frame, so it aborts the process.
+    handler(Batch { requests });
     // Whatever the handler left behind answers 500 as it drops.
     state.requests.clear();
 }
@@ -1255,10 +1153,7 @@ impl BatchEndpoint {
     ///
     /// Fails with [`Status::Contended`] while another thread drains the same endpoint.
     pub fn take_batch(&self, timeout: Duration) -> Result<()> {
-        let _claim = Claim::take(
-            &self.polled,
-            "another thread is polling this batch endpoint",
-        )?;
+        let _claim = Claim::take(&self.polled, "another thread is polling this batch endpoint")?;
         let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_take_batch_t {
             server: self.server,
@@ -1275,16 +1170,10 @@ impl BatchEndpoint {
     ///
     /// Fails with [`Status::Contended`] while another thread drains the same endpoint.
     pub fn take_batches(&self) -> Result<()> {
-        let _claim = Claim::take(
-            &self.polled,
-            "another thread is polling this batch endpoint",
-        )?;
+        let _claim = Claim::take(&self.polled, "another thread is polling this batch endpoint")?;
         let mut outcome = ucall_outcome_t::default();
-        let mut arguments = ucall_server_take_batches_t {
-            server: self.server,
-            outcome: &mut outcome,
-            endpoint: self.raw,
-        };
+        let mut arguments =
+            ucall_server_take_batches_t { server: self.server, outcome: &mut outcome, endpoint: self.raw };
         unsafe { ucall_server_take_batches(&mut arguments) };
         check(outcome)
     }
@@ -1383,17 +1272,9 @@ impl PeerAddress {
         match raw.family {
             1 => {
                 let octets = [raw.bytes[0], raw.bytes[1], raw.bytes[2], raw.bytes[3]];
-                PeerAddress::Ip(SocketAddr::V4(SocketAddrV4::new(
-                    Ipv4Addr::from(octets),
-                    raw.port,
-                )))
+                PeerAddress::Ip(SocketAddr::V4(SocketAddrV4::new(Ipv4Addr::from(octets), raw.port)))
             }
-            2 => PeerAddress::Ip(SocketAddr::V6(SocketAddrV6::new(
-                Ipv6Addr::from(raw.bytes),
-                raw.port,
-                0,
-                raw.scope,
-            ))),
+            2 => PeerAddress::Ip(SocketAddr::V6(SocketAddrV6::new(Ipv6Addr::from(raw.bytes), raw.port, 0, raw.scope))),
             3 => PeerAddress::Unix,
             _ => PeerAddress::Unknown,
         }
@@ -1520,9 +1401,7 @@ impl Request {
                 value: &mut value,
             };
             unsafe { ucall_server_request_field(&mut arguments) };
-            check(outcome)
-                .ok()
-                .map(|()| unsafe { (viewed(name), viewed(value)) })
+            check(outcome).ok().map(|()| unsafe { (viewed(name), viewed(value)) })
         })
     }
 
@@ -1570,11 +1449,7 @@ impl Request {
             address: &mut address,
         };
         unsafe { ucall_server_request_peer(&mut arguments) };
-        Peer {
-            network_interface_index,
-            static_key,
-            address: PeerAddress::from_raw(&address),
-        }
+        Peer { network_interface_index, static_key, address: PeerAddress::from_raw(&address) }
     }
 
     /// Path components in order, as sent and still percent-encoded.
@@ -1620,11 +1495,7 @@ impl Request {
         };
         unsafe { ucall_server_request_part(&mut arguments) };
         check(outcome).map(|()| unsafe {
-            RequestPart {
-                name: viewed(name),
-                content_type: viewed(content_type),
-                data: viewed(data),
-            }
+            RequestPart { name: viewed(name), content_type: viewed(content_type), data: viewed(data) }
         })
     }
 
@@ -1738,31 +1609,101 @@ pub struct RequestPart<'request> {
     pub data: &'request [u8],
 }
 
-/// One part of a reply body, laid out as `ucall_reply_part_t`, so a slice of parts is the C array:
-/// bytes and paths borrow for `'b`, copied before the call returns, and descriptors for `'f`,
-/// read until the reply is final.
-#[derive(Clone, Copy, Debug)]
-#[repr(C, i32)]
-pub enum ReplyPart<'b, 'f> {
+/// One part of a reply body: a `ucall_reply_part_t` and nothing else, so a slice of parts is the C
+/// array the library reads. Bytes and paths borrow for `'b`, copied before the call returns, and
+/// descriptors for `'f`, read until the reply is final.
+#[derive(Clone, Copy)]
+#[repr(transparent)]
+pub struct ReplyPart<'b, 'f> {
+    raw: ucall_reply_part_t,
+    borrows: PhantomData<(BytesView<'b>, Descriptor<'f>)>,
+}
+
+impl<'b, 'f> ReplyPart<'b, 'f> {
     /// Bytes in memory, copied before the call returns.
-    Bytes(BytesView<'b>) = ucall_reply_part_bytes_k,
+    pub fn bytes(bytes: impl Into<BytesView<'b>>) -> Self {
+        Self::wrap(ucall_reply_part_bytes_k, ucall_reply_part_data_t { bytes: bytes.into().raw() })
+    }
+
     /// A range of a regular file opened with `O_DIRECT`, which the event loop reads unbuffered
     /// after the call returns, so it stays open until the reply is final.
-    File(FileRange<'f>) = ucall_reply_part_file_k,
+    pub fn file(range: FileRange<'f>) -> Self {
+        let file = ucall_file_range_t {
+            file_descriptor: raw_descriptor(range.file),
+            offset: range.offset,
+            length: range.length,
+        };
+        Self::wrap(ucall_reply_part_file_k, ucall_reply_part_data_t { file })
+    }
+
     /// A range of a file the event loop opens beneath one of the interface's
     /// [`Interface::reply_directories`], and closes once it is sent.
-    Path(PathRange<'b>) = ucall_reply_part_path_k,
+    pub fn path(range: PathRange<'b>) -> Self {
+        let path = ucall_path_range_t {
+            directory_index: range.directory,
+            relative_path: range.path.raw(),
+            offset: range.offset,
+            length: range.length,
+        };
+        Self::wrap(ucall_reply_part_path_k, ucall_reply_part_data_t { path })
+    }
+
+    /// The bytes of a bytes part.
+    pub fn as_bytes(&self) -> Option<&'b [u8]> {
+        // The kind names the union member the constructor wrote.
+        (self.raw.kind == ucall_reply_part_bytes_k).then(|| unsafe { viewed(self.raw.data.bytes) })
+    }
+
+    /// The range of a file part.
+    pub fn as_file(&self) -> Option<FileRange<'f>> {
+        (self.raw.kind == ucall_reply_part_file_k).then(|| {
+            let file = unsafe { self.raw.data.file };
+            FileRange {
+                file: unsafe { borrowed_descriptor(file.file_descriptor) },
+                offset: file.offset,
+                length: file.length,
+            }
+        })
+    }
+
+    /// The range of a path part.
+    pub fn as_path(&self) -> Option<PathRange<'b>> {
+        (self.raw.kind == ucall_reply_part_path_k).then(|| {
+            let path = unsafe { self.raw.data.path };
+            PathRange {
+                directory: path.directory_index,
+                path: unsafe { BytesView::from_raw(path.relative_path) },
+                offset: path.offset,
+                length: path.length,
+            }
+        })
+    }
+
+    fn wrap(kind: ucall_reply_part_kind_t, data: ucall_reply_part_data_t) -> Self {
+        ReplyPart { raw: ucall_reply_part_t { kind, data }, borrows: PhantomData }
+    }
+}
+
+impl fmt::Debug for ReplyPart<'_, '_> {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if let Some(bytes) = self.as_bytes() {
+            formatter.debug_tuple("Bytes").field(&bytes).finish()
+        } else if let Some(file) = self.as_file() {
+            formatter.debug_tuple("File").field(&file).finish()
+        } else {
+            formatter.debug_tuple("Path").field(&self.as_path()).finish()
+        }
+    }
 }
 
 impl<'b> From<&'b std::io::IoSlice<'_>> for ReplyPart<'b, '_> {
     fn from(slice: &'b std::io::IoSlice<'_>) -> Self {
-        ReplyPart::Bytes(BytesView::from(&**slice))
+        ReplyPart::bytes(&**slice)
     }
 }
 
-/// `ucall_file_range_t`: the caller's `O_DIRECT` descriptor, borrowed until the reply is final.
+/// A range of the caller's `O_DIRECT` descriptor, borrowed until the reply is final.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
 pub struct FileRange<'f> {
     /// The open file, borrowed and never closed by UCall.
     pub file: Descriptor<'f>,
@@ -1772,9 +1713,8 @@ pub struct FileRange<'f> {
     pub length: u64,
 }
 
-/// `ucall_path_range_t`: a file beneath one of the interface's reply directories.
+/// A range of a file beneath one of the interface's reply directories.
 #[derive(Clone, Copy, Debug)]
-#[repr(C)]
 pub struct PathRange<'b> {
     /// The position of the directory among the interface's reply directories.
     pub directory: usize,
@@ -1785,11 +1725,6 @@ pub struct PathRange<'b> {
     /// The range's byte count; zero sends through the end of the file.
     pub length: u64,
 }
-
-const _: () = assert!(
-    size_of::<ReplyPart>() == size_of::<ucall_reply_part_t>()
-        && align_of::<ReplyPart>() == align_of::<ucall_reply_part_t>()
-);
 
 /// A request taken off its polling thread, and the only owner of the verbs that may finish
 /// later: [`DetachedRequest::reply_parts`], [`DetachedRequest::reply_stream`] and
@@ -1811,7 +1746,7 @@ const _: () = assert!(
 /// // The worker outlives the scope, as the sender it waits on lives in the server's handler.
 /// std::thread::spawn(move || {
 ///     for detached in received {
-///         let parts = [ReplyPart::Bytes(b"frame".into())];
+///         let parts = [ReplyPart::bytes(b"frame")];
 ///         if let Ok(Some(deferred)) = detached.reply_parts(HTTPStatus::OK, &[], &parts) {
 ///             let _ = deferred.wait(); // or: deferred.await
 ///         }
@@ -1885,11 +1820,7 @@ impl DetachedRequest {
     ///
     /// A closed connection still consumes the request and reports [`Status::ConnectionClosed`];
     /// any other failure keeps it, and dropping it then answers 500.
-    pub fn reply_stream<'f>(
-        self,
-        status: HTTPStatus,
-        headers: &[BytesView<'_>],
-    ) -> Result<ReplyStream<'f>> {
+    pub fn reply_stream<'f>(self, status: HTTPStatus, headers: &[BytesView<'_>]) -> Result<ReplyStream<'f>> {
         let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_server_reply_begin_t {
             server: self.0.server.raw,
@@ -1906,11 +1837,8 @@ impl DetachedRequest {
         }
         let request = ManuallyDrop::new(self.0);
         // A closed connection still takes its end, which dropping the stream sends.
-        let stream = ReplyStream {
-            server: unsafe { ptr::read(&request.server) },
-            raw: request.raw,
-            files: PhantomData,
-        };
+        let stream =
+            ReplyStream { server: unsafe { ptr::read(&request.server) }, raw: request.raw, files: PhantomData };
         check(outcome).map(|()| stream)
     }
 
@@ -1936,6 +1864,73 @@ impl DetachedRequest {
             ucall_outcome_wait(outcome_pointer);
         }
         check(outcome).map(|()| unsafe { viewed(data) })
+    }
+
+    /// Pulls the body bytes decoded since the last pull as a future for async code, answering
+    /// what [`DetachedRequest::body_chunk`] answers without parking the thread that awaits it.
+    ///
+    /// The first poll submits the pull, and every poll reads its status through
+    /// `ucall_outcome_status`, yielding to the executor while the bytes have not arrived.
+    pub fn next_body_chunk(&mut self) -> BodyChunk<'_> {
+        BodyChunk {
+            request: self,
+            data: view(&[]),
+            outcome: ucall_outcome_t::default(),
+            submitted: false,
+            _pinned: PhantomPinned,
+        }
+    }
+}
+
+/// A pull of a request's next body bytes being awaited, from [`DetachedRequest::next_body_chunk`].
+///
+/// The library writes the bytes and the outcome into it after the pull returns, so it is pinned
+/// from its first poll, and dropping a submitted pull that is not final waits for it.
+#[must_use = "a body pull does nothing unless polled"]
+pub struct BodyChunk<'r> {
+    request: &'r mut DetachedRequest,
+    data: ucall_bytes_view_t,
+    outcome: ucall_outcome_t,
+    submitted: bool,
+    _pinned: PhantomPinned,
+}
+
+// The pull borrows its request exclusively, and until it is final only the library writes it.
+unsafe impl Send for BodyChunk<'_> {}
+
+impl<'r> Future for BodyChunk<'r> {
+    type Output = Result<&'r [u8]>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        // Nothing moves out of the pinned pull, whose fields the library writes in place.
+        let pull = unsafe { self.get_unchecked_mut() };
+        let outcome = ptr::addr_of_mut!(pull.outcome);
+        if !pull.submitted {
+            pull.submitted = true;
+            let mut arguments = ucall_server_request_body_chunk_t {
+                server: pull.request.0.server.raw,
+                outcome,
+                request: pull.request.0.raw,
+                data: ptr::addr_of_mut!(pull.data),
+            };
+            unsafe { ucall_server_request_body_chunk(&mut arguments) };
+        }
+        if unsafe { ucall_outcome_status(outcome) } == ucall_status_deferred_k {
+            context.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        // A final outcome returns from the wait at once, ordering the bytes written before it.
+        unsafe { ucall_outcome_wait(outcome) };
+        Poll::Ready(check(pull.outcome).map(|()| unsafe { viewed(pull.data) }))
+    }
+}
+
+impl Drop for BodyChunk<'_> {
+    fn drop(&mut self) {
+        // The library writes a submitted pull's bytes and outcome until it is final.
+        if self.submitted {
+            unsafe { ucall_outcome_wait(ptr::addr_of_mut!(self.outcome)) };
+        }
     }
 }
 
@@ -1985,11 +1980,8 @@ impl<'f> ReplyStream<'f> {
 
     fn end_raw(&self) -> Result<Option<Deferred<'f>>> {
         let deferred = Deferred::pending();
-        let mut arguments = ucall_server_reply_end_t {
-            server: self.server.raw,
-            outcome: deferred.raw(),
-            request: self.raw,
-        };
+        let mut arguments =
+            ucall_server_reply_end_t { server: self.server.raw, outcome: deferred.raw(), request: self.raw };
         unsafe { ucall_server_reply_end(&mut arguments) };
         match unsafe { ucall_outcome_status(deferred.raw()) } {
             ucall_status_deferred_k => Ok(Some(deferred)),
@@ -2015,14 +2007,12 @@ mod tests {
     use std::io::{IoSlice, Read, Write};
     use std::net::{TcpStream, UdpSocket};
     use std::os::fd::AsFd;
-    use std::sync::Mutex;
     use std::time::Instant;
 
     use super::*;
     use crate::client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed};
     use crate::testing::{
-        client, detaching, direct_directory, loopback, next_detached, open_direct, pattern,
-        serving, Stopping,
+        Stopping, client, detaching, direct_directory, loopback, next_detached, open_direct, pattern, serving,
     };
     use crate::types::{derive_noise_public_key, generate_noise_keypair};
 
@@ -2045,20 +2035,12 @@ mod tests {
                         body.extend_from_slice(request.path());
                         body.push(b' ');
                         body.extend_from_slice(request.query_string());
-                        let hosts = request
-                            .fields()
-                            .filter(|(name, _)| *name == b"host")
-                            .count();
+                        let hosts = request.fields().filter(|(name, _)| *name == b"host").count();
                         body.extend_from_slice(format!(" {hosts}").as_bytes());
-                        let _ = request.reply(
-                            HTTPStatus::OK,
-                            &["content-type: text/plain".into()],
-                            &body,
-                        );
+                        let _ = request.reply(HTTPStatus::OK, &["content-type: text/plain".into()], &body);
                     }
                     _ => {
-                        let _ =
-                            request.reply_error(HTTPStatus::BAD_REQUEST, "a and b must be numbers");
+                        let _ = request.reply_error(HTTPStatus::BAD_REQUEST, "a and b must be numbers");
                     }
                 }
             })
@@ -2066,18 +2048,12 @@ mod tests {
         let address = server.address(0).unwrap().to_owned();
         serving(&server, || {
             let mut client = client(1);
-            let response = client
-                .get(format!("http://{address}/sum/apples?a=2&b=40"))
-                .unwrap();
+            let response = client.get(format!("http://{address}/sum/apples?a=2&b=40")).unwrap();
             assert_eq!(response.status_code(), HTTPStatus::OK);
             assert_eq!(response.header("Content-Type"), Some(&b"text/plain"[..]));
             assert_eq!(response.body(), b"42 apples /sum/apples a=2&b=40 1");
-            assert!(response
-                .fields()
-                .any(|field| field == (&b"content-type"[..], &b"text/plain"[..])));
-            let refused = client
-                .get(format!("http://{address}/sum/apples?a=2"))
-                .unwrap();
+            assert!(response.fields().any(|field| field == (&b"content-type"[..], &b"text/plain"[..])));
+            let refused = client.get(format!("http://{address}/sum/apples?a=2")).unwrap();
             assert_eq!(refused.status_code(), HTTPStatus::BAD_REQUEST);
         });
         assert_eq!(server.event_loop_statistics(0).unwrap().requests, 2);
@@ -2119,16 +2095,11 @@ mod tests {
     #[test]
     fn batches_reply_in_reverse_while_responses_stay_ordered() {
         let mut server = Server::new(&[loopback(1).pipelined_requests(4)]).unwrap();
-        let sizes = Arc::new(Mutex::new(Vec::new()));
-        let batching = Batching {
-            min_size: 4,
-            max_size: 4,
-            max_latency: Duration::from_secs(5),
-        };
-        let observed = Arc::clone(&sizes);
+        let (observed, sizes) = std::sync::mpsc::channel();
+        let batching = Batching { min_size: 4, max_size: 4, max_latency: Duration::from_secs(5) };
         let endpoint = server
             .batch("/score", Verb::Put, batching, move |batch: Batch| {
-                observed.lock().unwrap().push(batch.len());
+                observed.send(batch.len()).unwrap();
                 for request in batch.into_iter().rev() {
                     let body = request.body().to_vec();
                     let _ = request.reply(HTTPStatus::OK, &[], &body);
@@ -2139,31 +2110,21 @@ mod tests {
         std::thread::scope(|scope| {
             let polling = scope.spawn(|| endpoint.take_batches());
             serving(&server, || {
-                let mut client = Client::new(ClientOptions {
-                    connections: 1,
-                    pipelined_calls: 4,
-                    calls: 4,
-                    ..Default::default()
-                })
-                .unwrap();
+                let mut client =
+                    Client::new(ClientOptions { connections: 1, pipelined_calls: 4, calls: 4, ..Default::default() })
+                        .unwrap();
                 for context in 0..4u64 {
                     // PUT, because a POST never pipelines behind another one.
                     let call = ClientCall {
                         verb: Verb::Put,
-                        ..ClientCall::post(
-                            format!("http://{address}/score"),
-                            vec![b'0' + context as u8],
-                        )
+                        ..ClientCall::post(format!("http://{address}/score"), vec![b'0' + context as u8])
                     };
                     client.submit(call, context).unwrap();
                 }
                 let mut completed: [Completed; 4] = Default::default();
                 let mut order = Vec::new();
                 while order.len() != 4 {
-                    for done in client
-                        .take_completed(&mut completed, Duration::from_secs(5))
-                        .unwrap()
-                    {
+                    for done in client.take_completed(&mut completed, Duration::from_secs(5)).unwrap() {
                         let response = done.response.as_ref().unwrap();
                         assert_eq!(response.body(), [b'0' + done.context as u8]);
                         order.push(done.context);
@@ -2176,7 +2137,7 @@ mod tests {
             });
             assert_eq!(polling.join().unwrap(), Ok(()));
         });
-        assert_eq!(*sizes.lock().unwrap(), [4]);
+        assert_eq!(sizes.try_iter().collect::<Vec<_>>(), [4]);
         let statistics = endpoint.statistics().unwrap();
         let expected = BatchEndpointStatistics {
             batches: 1,
@@ -2196,10 +2157,7 @@ mod tests {
         let path = std::env::temp_dir().join(format!("ucall-echo-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
         let listener = UnixListener::bind(&path).unwrap();
-        let mut server = Server::new(&[Interface::listening(&listener)
-            .connections(4)
-            .event_loops(1)])
-        .unwrap();
+        let mut server = Server::new(&[Interface::listening(&listener).connections(4).event_loops(1)]).unwrap();
         server
             .post("/echo", |request: Request| {
                 let body = if request.peer().address == PeerAddress::Unix {
@@ -2214,15 +2172,10 @@ mod tests {
         let body = pattern(64 << 10);
         serving(&server, || {
             let mut connection = UnixStream::connect(&path).unwrap();
-            let head = format!(
-                "POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
-                body.len()
-            );
+            let head = format!("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n", body.len());
             connection.write_all(head.as_bytes()).unwrap();
             connection.write_all(&body).unwrap();
-            connection
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            connection.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut response = Vec::new();
             let mut buffer = [0; 65536];
             while !response.ends_with(&body) {
@@ -2240,13 +2193,10 @@ mod tests {
         let (noise_peer_key, _) = generate_noise_keypair().unwrap();
         let (noise_private_key, _) = generate_noise_keypair().unwrap();
         let client_public_key = derive_noise_public_key(&noise_private_key);
-        let authorized = Arc::new(Mutex::new(None));
-        let recorded = Arc::clone(&authorized);
+        let (recorded, authorized) = std::sync::mpsc::channel();
         let noise = loopback(1)
             .security(Security::NoiseXX, noise_peer_key)
-            .peer_authorizer(move |key: &NoiseKey| {
-                recorded.lock().unwrap().replace(*key).is_none()
-            });
+            .peer_authorizer(move |key: &NoiseKey| recorded.send(*key).is_ok());
         let mut server = Server::new(&[loopback(1), noise]).unwrap();
         server
             .get("/peer", |request: Request| {
@@ -2273,27 +2223,19 @@ mod tests {
             let response = client.get(format!("http://{plain}/peer")).unwrap();
             assert_eq!(response.body(), [[0; 32].as_slice(), &[0]].concat());
             let response = client.get(format!("http+noise://{sealed}/peer")).unwrap();
-            let key = authorized
-                .lock()
-                .unwrap()
-                .expect("the authorizer saw the client's key");
+            let key = authorized.try_recv().expect("the authorizer saw the client's key");
             assert_eq!(key, client_public_key);
             assert_eq!(response.body(), [key.as_slice(), &[1]].concat());
         });
     }
 
     #[test]
-    fn panics_and_dropped_requests_answer_500() {
+    fn dropped_requests_answer_500() {
         let mut server = Server::new(&[loopback(1)]).unwrap();
-        server
-            .get("/panic", |_: Request| panic!("the handler failed"))
-            .unwrap();
         server.get("/drop", drop).unwrap();
         let address = server.address(0).unwrap().to_owned();
         serving(&server, || {
             let mut client = client(1);
-            let panicked = client.get(format!("http://{address}/panic")).unwrap();
-            assert_eq!(panicked.status_code(), HTTPStatus::INTERNAL_ERROR);
             let dropped = client.get(format!("http://{address}/drop")).unwrap();
             assert_eq!(dropped.status_code(), HTTPStatus::INTERNAL_ERROR);
             assert_eq!(dropped.body(), b"The request was dropped without a reply");
@@ -2337,14 +2279,14 @@ mod tests {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
                     let parts = [
-                        ReplyPart::Bytes(b"<".into()),
-                        ReplyPart::Path(PathRange {
+                        ReplyPart::bytes(b"<"),
+                        ReplyPart::path(PathRange {
                             directory: 0,
                             path: b"clip.bin".into(),
                             offset: 1000,
                             length: 5000,
                         }),
-                        ReplyPart::Bytes(b">".into()),
+                        ReplyPart::bytes(b">"),
                     ];
                     let detached = next_detached(&received);
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
@@ -2368,16 +2310,10 @@ mod tests {
         serving(&server, || {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
-                    let missing = ReplyPart::Path(PathRange {
-                        directory: 0,
-                        path: b"missing.bin".into(),
-                        offset: 0,
-                        length: 0,
-                    });
+                    let missing =
+                        ReplyPart::path(PathRange { directory: 0, path: b"missing.bin".into(), offset: 0, length: 0 });
                     let detached = next_detached(&received);
-                    let deferred = detached
-                        .reply_parts(HTTPStatus::OK, &[], &[missing])
-                        .unwrap();
+                    let deferred = detached.reply_parts(HTTPStatus::OK, &[], &[missing]).unwrap();
                     let mut awaited = pin!(deferred.expect("a path part defers").into_future());
                     let mut context = Context::from_waker(Waker::noop());
                     let ended = loop {
@@ -2388,7 +2324,7 @@ mod tests {
                     };
                     assert_eq!(ended.unwrap_err().status, Status::NotFound);
                     let detached = next_detached(&received);
-                    let parts = [ReplyPart::Bytes(b"final".into())];
+                    let parts = [ReplyPart::bytes(b"final")];
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
                     assert!(deferred.is_none());
                 });
@@ -2444,15 +2380,9 @@ mod tests {
                 scope.spawn(move || {
                     let detached = next_detached(&received);
                     let mut stream = detached.reply_stream(HTTPStatus::OK, &[]).unwrap();
-                    stream.append(&[ReplyPart::Bytes(b"<".into())]).unwrap();
-                    let range = ReplyPart::File(FileRange {
-                        file: file.as_fd(),
-                        offset: 4096,
-                        length: 4096,
-                    });
-                    stream
-                        .append(&[range, ReplyPart::Bytes(b">".into())])
-                        .unwrap();
+                    stream.append(&[ReplyPart::bytes(b"<")]).unwrap();
+                    let range = ReplyPart::file(FileRange { file: file.as_fd(), offset: 4096, length: 4096 });
+                    stream.append(&[range, ReplyPart::bytes(b">")]).unwrap();
                     if let Some(deferred) = stream.end().unwrap() {
                         deferred.wait().unwrap();
                     }
@@ -2475,7 +2405,7 @@ mod tests {
         serving(&server, || {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
-                    let overflowing = ReplyPart::Path(PathRange {
+                    let overflowing = ReplyPart::path(PathRange {
                         directory: 0,
                         path: b"clip.bin".into(),
                         offset: u64::MAX,
@@ -2506,9 +2436,7 @@ mod tests {
                     let mut stream = detached.reply_stream(HTTPStatus::OK, &[]).unwrap();
                     for row in 0..3 {
                         let text = format!("row {row}\n");
-                        stream
-                            .append(&[ReplyPart::Bytes(text.as_bytes().into())])
-                            .unwrap();
+                        stream.append(&[ReplyPart::bytes(text.as_bytes())]).unwrap();
                     }
                     assert!(stream.end().unwrap().is_none());
                 });
@@ -2522,9 +2450,7 @@ mod tests {
     fn streamed_body_pulls_chunks_on_a_worker() {
         let mut server = Server::new(&[loopback(1)]).unwrap();
         let (handler, received) = detaching();
-        server
-            .route_with("/upload", Verb::Post, BodyDelivery::Streamed, handler)
-            .unwrap();
+        server.route_with("/upload", Verb::Post, BodyDelivery::Streamed, handler).unwrap();
         let address = server.address(0).unwrap().to_owned();
         let body = pattern(4 << 20);
         serving(&server, || {
@@ -2539,7 +2465,44 @@ mod tests {
                         }
                         pulled.extend_from_slice(chunk);
                     }
-                    let parts = [ReplyPart::Bytes(pulled.as_slice().into())];
+                    let parts = [ReplyPart::bytes(pulled.as_slice())];
+                    let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
+                    assert!(deferred.is_none());
+                });
+                let url = format!("http://{address}/upload");
+                let response = client(1).post(url, body.clone()).unwrap();
+                assert_eq!(response.body(), body.as_slice());
+            });
+        });
+    }
+
+    #[test]
+    fn streamed_body_awaits_chunks_without_parking() {
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        let (handler, received) = detaching();
+        server.route_with("/upload", Verb::Post, BodyDelivery::Streamed, handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        let body = pattern(4 << 20);
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                scope.spawn(move || {
+                    let mut detached = next_detached(&received);
+                    let mut context = Context::from_waker(Waker::noop());
+                    let mut pulled = Vec::new();
+                    loop {
+                        let mut pull = pin!(detached.next_body_chunk());
+                        let chunk = loop {
+                            match pull.as_mut().poll(&mut context) {
+                                Poll::Ready(chunk) => break chunk.unwrap(),
+                                Poll::Pending => std::thread::yield_now(),
+                            }
+                        };
+                        if chunk.is_empty() {
+                            break;
+                        }
+                        pulled.extend_from_slice(chunk);
+                    }
+                    let parts = [ReplyPart::bytes(pulled.as_slice())];
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &parts).unwrap();
                     assert!(deferred.is_none());
                 });
@@ -2559,7 +2522,7 @@ mod tests {
                 let mut detached = request.detach();
                 let pulled = detached.body_chunk().map(<[u8]>::len);
                 let answer = format!("{:?}", pulled.map_err(|error| error.status));
-                let parts = [ReplyPart::Bytes(answer.as_bytes().into())];
+                let parts = [ReplyPart::bytes(answer.as_bytes())];
                 // Bytes alone are final on return, so nothing waits on this thread.
                 let _ = detached.reply_parts(HTTPStatus::OK, &[], &parts);
             })
@@ -2570,19 +2533,14 @@ mod tests {
             let mut connection = TcpStream::connect(&address).unwrap();
             let head = b"POST /upload HTTP/1.1\r\nHost: a\r\nContent-Length: 5\r\n\r\n";
             connection.write_all(head).unwrap();
-            connection
-                .set_read_timeout(Some(Duration::from_secs(5)))
-                .unwrap();
+            connection.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
             let mut response = Vec::new();
             let mut buffer = [0; 4096];
             while !response.ends_with(b"Err(WouldBlock)") {
                 match connection.read(&mut buffer) {
                     Ok(read) if read != 0 => response.extend_from_slice(&buffer[..read]),
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
-                    other => panic!(
-                        "answered {:?} then {other:?}",
-                        String::from_utf8_lossy(&response)
-                    ),
+                    other => panic!("answered {:?} then {other:?}", String::from_utf8_lossy(&response)),
                 }
             }
             assert!(response.starts_with(b"HTTP/1.1 200"));
@@ -2604,10 +2562,7 @@ mod tests {
                     }
                     summary.push(';');
                 }
-                let past = request
-                    .part(count)
-                    .map(|_| ())
-                    .map_err(|error| error.status);
+                let past = request.part(count).map(|_| ()).map_err(|error| error.status);
                 summary.push_str(&format!("{past:?}"));
                 let _ = request.reply(HTTPStatus::OK, &[], summary.as_bytes());
             })
@@ -2618,8 +2573,7 @@ mod tests {
             "one\r\n--zz\r\nContent-Disposition: form-data; name=\"b\"\r\n\r\ntwo\r\n--zz--\r\n",
         );
         serving(&server, || {
-            let form: Cow<'static, [u8]> =
-                b"content-type: multipart/form-data; boundary=zz"[..].into();
+            let form: Cow<'static, [u8]> = b"content-type: multipart/form-data; boundary=zz"[..].into();
             let call = ClientCall {
                 headers: vec![form],
                 ..ClientCall::post(format!("http://{address}/form"), body.as_bytes())
@@ -2660,9 +2614,7 @@ mod tests {
         let (noise_peer_key, server_public_key) = generate_noise_keypair().unwrap();
         let (noise_private_key, client_public_key) = generate_noise_keypair().unwrap();
         let (stranger_key, _) = generate_noise_keypair().unwrap();
-        let sealed = loopback(2)
-            .security(Security::NoiseKK, noise_peer_key)
-            .noise_peer_key(client_public_key);
+        let sealed = loopback(2).security(Security::NoiseKK, noise_peer_key).noise_peer_key(client_public_key);
         let mut server = Server::new(&[sealed]).unwrap();
         server
             .get("/peer", |request: Request| {
@@ -2709,19 +2661,14 @@ mod tests {
     #[test]
     fn metrics_datagram_reaches_a_socket() {
         let socket = UdpSocket::bind("127.0.0.1:0").unwrap();
-        socket
-            .set_read_timeout(Some(Duration::from_millis(100)))
-            .unwrap();
+        socket.set_read_timeout(Some(Duration::from_millis(100))).unwrap();
         let metrics = Metrics {
             address: socket.local_addr().unwrap().to_string(),
             prefix: "rusty".into(),
             interval: Duration::from_millis(10),
             ..Default::default()
         };
-        let options = ServerOptions {
-            metrics: Some(metrics),
-            ..Default::default()
-        };
+        let options = ServerOptions { metrics: Some(metrics), ..Default::default() };
         let mut server = Server::with_options(&[loopback(1)], options).unwrap();
         server
             .get("/ping", |request: Request| {
@@ -2759,10 +2706,7 @@ mod tests {
             })
             .unwrap();
             let call = ClientCall {
-                options: ClientCallOptions {
-                    timeout: Duration::from_millis(200),
-                    ..Default::default()
-                },
+                options: ClientCallOptions { timeout: Duration::from_millis(200), ..Default::default() },
                 ..ClientCall::get(format!("http://{address}/slow"))
             };
             let started = Instant::now();

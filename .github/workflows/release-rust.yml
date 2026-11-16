@@ -46,6 +46,9 @@ jobs:
         run: python -m pip install "cmake>=3.28"
       - name: Install Clang 22
         run: sudo apt-get update && sudo apt-get install -y clang-22
+      - name: Install Rust
+        # rustup reads the channel and components from rust-toolchain.toml.
+        run: rustup toolchain install
       - name: Authenticate with crates.io
         id: crates_io
         uses: rust-lang/crates-io-auth-action@v1

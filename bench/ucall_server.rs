@@ -14,8 +14,7 @@ fn query_integer(request: &Request, name: &str) -> Option<i64> {
 
 fn main() -> ucall::Result<()> {
     let arguments = arguments::parse();
-    let interface =
-        Interface::new(format!("127.0.0.1:{}", arguments.port)).event_loops(arguments.threads);
+    let interface = Interface::new(format!("127.0.0.1:{}", arguments.port)).event_loops(arguments.threads);
     let mut server = Server::new(&[interface])?;
     server.post("/echo", |request: Request| {
         // A reply consumes its request, so the body is copied out first.
@@ -38,11 +37,7 @@ fn main() -> ucall::Result<()> {
         let headers = [BytesView::from("content-type: text/plain")];
         let _ = request.reply(HTTPStatus::OK, &headers, b"ready\n");
     })?;
-    println!(
-        "Listening on 127.0.0.1:{} with {} event loops",
-        arguments.port,
-        server.event_loops()
-    );
+    println!("Listening on 127.0.0.1:{} with {} event loops", arguments.port, server.event_loops());
     std::thread::scope(|scope| {
         for event_loop in 0..server.event_loops() {
             let server = &server;

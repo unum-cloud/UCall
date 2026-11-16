@@ -20,11 +20,10 @@ use std::sync::Arc;
 
 use crate::server::{Server, ServerCore};
 use crate::types::{
-    check, fail, lend_authorizer, lend_log, microseconds, ucall_bytes_view_t, ucall_client_t,
-    ucall_cpu_class_t, ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t,
-    ucall_outcome_t, ucall_peer_authorizer_t, ucall_received_http_response_t, ucall_security_t,
-    ucall_server_t, ucall_verb_t, view, viewed, Backend, CPUClass, HTTPStatus, Log, NoiseKey,
-    PeerAuthorizer, Result, Security, Status, Verb,
+    Backend, CPUClass, HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb, check, fail,
+    lend_authorizer, lend_log, microseconds, ucall_bytes_view_t, ucall_client_t, ucall_cpu_class_t,
+    ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t,
+    ucall_received_http_response_t, ucall_security_t, ucall_server_t, ucall_verb_t, view, viewed,
 };
 
 // region: Raw Declarations
@@ -128,14 +127,12 @@ struct ucall_client_response_body_t {
     body: *mut ucall_bytes_view_t,
 }
 
-extern "C" {
+unsafe extern "C" {
     fn ucall_client_init(arguments: *mut ucall_client_init_t);
     fn ucall_client_free(client: ucall_client_t);
     fn ucall_client_call(arguments: *mut ucall_client_call_t);
     fn ucall_client_take_completed(arguments: *mut ucall_client_take_completed_t);
-    fn ucall_client_response_status(
-        response: ucall_received_http_response_t,
-    ) -> ucall_http_status_t;
+    fn ucall_client_response_status(response: ucall_received_http_response_t) -> ucall_http_status_t;
     fn ucall_client_response_header(arguments: *mut ucall_client_response_header_t);
     fn ucall_client_response_fields_count(arguments: *mut ucall_client_response_fields_count_t);
     fn ucall_client_response_field(arguments: *mut ucall_client_response_field_t);
@@ -229,35 +226,22 @@ impl ClientCall {
 
     /// A POST of `body` to `url` with no headers.
     pub fn post(url: impl Into<Cow<'static, str>>, body: impl Into<Cow<'static, [u8]>>) -> Self {
-        ClientCall {
-            verb: Verb::Post,
-            body: body.into(),
-            ..ClientCall::get(url)
-        }
+        ClientCall { verb: Verb::Post, body: body.into(), ..ClientCall::get(url) }
     }
 
     /// A PUT of `body` to `url` with no headers.
     pub fn put(url: impl Into<Cow<'static, str>>, body: impl Into<Cow<'static, [u8]>>) -> Self {
-        ClientCall {
-            verb: Verb::Put,
-            ..ClientCall::post(url, body)
-        }
+        ClientCall { verb: Verb::Put, ..ClientCall::post(url, body) }
     }
 
     /// A DELETE of `url` with no headers.
     pub fn delete(url: impl Into<Cow<'static, str>>) -> Self {
-        ClientCall {
-            verb: Verb::Delete,
-            ..ClientCall::get(url)
-        }
+        ClientCall { verb: Verb::Delete, ..ClientCall::get(url) }
     }
 
     /// A PATCH of `body` to `url` with no headers.
     pub fn patch(url: impl Into<Cow<'static, str>>, body: impl Into<Cow<'static, [u8]>>) -> Self {
-        ClientCall {
-            verb: Verb::Patch,
-            ..ClientCall::post(url, body)
-        }
+        ClientCall { verb: Verb::Patch, ..ClientCall::post(url, body) }
     }
 }
 
@@ -356,10 +340,7 @@ impl Client {
             max_pipelined_calls: options.pipelined_calls,
             connect_timeout_microseconds: microseconds(options.connect_timeout),
             call_timeout_microseconds: microseconds(options.call_timeout),
-            noise_private_key: options
-                .noise_private_key
-                .as_ref()
-                .map_or(ptr::null(), ptr::from_ref),
+            noise_private_key: options.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
             peer_authorizer,
             peer_authorizer_context,
             log: lend_log(&core.log),
@@ -367,10 +348,7 @@ impl Client {
             backend: options.backend.to_raw(),
             cpu_class: CPUClass::to_raw(options.cpu_class),
             max_response_bytes: options.max_response_bytes,
-            server: core
-                .server
-                .as_ref()
-                .map_or(ptr::null_mut(), |server| server.raw),
+            server: core.server.as_ref().map_or(ptr::null_mut(), |server| server.raw),
             event_loop: options.event_loop,
         };
         let mut resolved = config;
@@ -402,16 +380,12 @@ impl Client {
 
     /// Admits a call into a free slot, answering the slot it took.
     fn admit(&mut self, request: ClientCall, context: u64) -> Result<usize> {
-        let index = self.free.pop().ok_or(fail(
-            Status::Contended,
-            "every call slot holds an unretrieved call",
-        ))?;
+        let index = self.free.pop().ok_or(fail(Status::Contended, "every call slot holds an unretrieved call"))?;
         let call = &mut self.calls[index];
         call.context = context;
         let request = call.request.insert(request);
         call.headers.clear();
-        call.headers
-            .extend(request.headers.iter().map(|line| view(line)));
+        call.headers.extend(request.headers.iter().map(|line| view(line)));
         let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_client_call_t {
             client: self.core.raw,
@@ -426,16 +400,8 @@ impl Client {
                 max_retries: request.options.max_retries,
                 max_redirects: request.options.max_redirects,
                 security: request.options.security.to_raw(),
-                noise_private_key: request
-                    .options
-                    .noise_private_key
-                    .as_ref()
-                    .map_or(ptr::null(), ptr::from_ref),
-                noise_peer_key: request
-                    .options
-                    .noise_peer_key
-                    .as_ref()
-                    .map_or(ptr::null(), ptr::from_ref),
+                noise_private_key: request.options.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
+                noise_peer_key: request.options.noise_peer_key.as_ref().map_or(ptr::null(), ptr::from_ref),
             },
             context: index as *mut c_void,
         };
@@ -480,19 +446,13 @@ impl Client {
         self.free.push(index);
         let response = match check(raw.outcome) {
             Ok(()) if !raw.response.is_null() => Ok(Response { raw: raw.response }),
-            Ok(()) => Err(fail(
-                Status::Internal,
-                "a successful call completed without a response",
-            )),
+            Ok(()) => Err(fail(Status::Internal, "a successful call completed without a response")),
             Err(error) => {
                 unsafe { ucall_client_response_free(raw.response) };
                 Err(error)
             }
         };
-        Completed {
-            context: call.context,
-            response,
-        }
+        Completed { context: call.context, response }
     }
 
     /// Drives every admitted call on this thread and fills the front of `completed` with finished
@@ -555,20 +515,12 @@ impl Client {
     }
 
     /// Posts `body` to `url` and polls until the response arrives.
-    pub fn post(
-        &mut self,
-        url: impl Into<Cow<'static, str>>,
-        body: impl Into<Cow<'static, [u8]>>,
-    ) -> Result<Response> {
+    pub fn post(&mut self, url: impl Into<Cow<'static, str>>, body: impl Into<Cow<'static, [u8]>>) -> Result<Response> {
         self.call(ClientCall::post(url, body))
     }
 
     /// Puts `body` at `url` and polls until the response arrives.
-    pub fn put(
-        &mut self,
-        url: impl Into<Cow<'static, str>>,
-        body: impl Into<Cow<'static, [u8]>>,
-    ) -> Result<Response> {
+    pub fn put(&mut self, url: impl Into<Cow<'static, str>>, body: impl Into<Cow<'static, [u8]>>) -> Result<Response> {
         self.call(ClientCall::put(url, body))
     }
 
@@ -598,13 +550,7 @@ pub struct Completed {
 impl Default for Completed {
     /// An entry no poll filled yet, for preparing a buffer.
     fn default() -> Self {
-        Completed {
-            context: 0,
-            response: Err(fail(
-                Status::WouldBlock,
-                "no call completed into this entry",
-            )),
-        }
+        Completed { context: 0, response: Err(fail(Status::WouldBlock, "no call completed into this entry")) }
     }
 }
 
@@ -658,11 +604,7 @@ impl Response {
     pub fn body(&self) -> &[u8] {
         let mut body = view(&[]);
         let mut outcome = ucall_outcome_t::default();
-        let mut arguments = ucall_client_response_body_t {
-            response: self.raw,
-            outcome: &mut outcome,
-            body: &mut body,
-        };
+        let mut arguments = ucall_client_response_body_t { response: self.raw, outcome: &mut outcome, body: &mut body };
         unsafe { ucall_client_response_body(&mut arguments) };
         unsafe { viewed(body) }
     }
@@ -686,11 +628,8 @@ impl Response {
     pub fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
         let mut count = 0;
         let mut outcome = ucall_outcome_t::default();
-        let mut arguments = ucall_client_response_fields_count_t {
-            response: self.raw,
-            outcome: &mut outcome,
-            count: &mut count,
-        };
+        let mut arguments =
+            ucall_client_response_fields_count_t { response: self.raw, outcome: &mut outcome, count: &mut count };
         unsafe { ucall_client_response_fields_count(&mut arguments) };
         (0..count).map_while(move |index| {
             let (mut name, mut value) = (view(&[]), view(&[]));
@@ -703,9 +642,7 @@ impl Response {
                 value: &mut value,
             };
             unsafe { ucall_client_response_field(&mut arguments) };
-            check(outcome)
-                .ok()
-                .map(|()| unsafe { (viewed(name), viewed(value)) })
+            check(outcome).ok().map(|()| unsafe { (viewed(name), viewed(value)) })
         })
     }
 }
@@ -743,9 +680,7 @@ mod tests {
         serving(&server, || {
             let mut client = client(1);
             let body: Vec<u8> = (0..=255).collect();
-            let response = client
-                .post(format!("http://{address}/echo"), body.clone())
-                .unwrap();
+            let response = client.post(format!("http://{address}/echo"), body.clone()).unwrap();
             drop(client);
             assert_eq!(response.status_code(), HTTPStatus::OK);
             assert_eq!(response.body(), body.as_slice());
@@ -757,26 +692,12 @@ mod tests {
         let server = echo_server();
         let address = server.address(0).unwrap().to_owned();
         serving(&server, || {
-            let mut client = Client::new(ClientOptions {
-                connections: 1,
-                calls: 2,
-                ..Default::default()
-            })
-            .unwrap();
-            client
-                .submit(
-                    ClientCall::post(format!("http://{address}/echo"), b"first".as_slice()),
-                    7,
-                )
-                .unwrap();
-            let blocking = client
-                .post(format!("http://{address}/echo"), b"second".as_slice())
-                .unwrap();
+            let mut client = Client::new(ClientOptions { connections: 1, calls: 2, ..Default::default() }).unwrap();
+            client.submit(ClientCall::post(format!("http://{address}/echo"), b"first".as_slice()), 7).unwrap();
+            let blocking = client.post(format!("http://{address}/echo"), b"second".as_slice()).unwrap();
             assert_eq!(blocking.body(), b"second");
             let mut completed: [Completed; 2] = Default::default();
-            let kept = client
-                .take_completed(&mut completed, Duration::ZERO)
-                .unwrap();
+            let kept = client.take_completed(&mut completed, Duration::ZERO).unwrap();
             assert_eq!(kept.len(), 1);
             assert_eq!(kept[0].context, 7);
             assert_eq!(kept[0].response.as_ref().unwrap().body(), b"first");
@@ -793,24 +714,14 @@ mod tests {
         })
         .unwrap();
         // Nothing listens on port 1, so the admitted call fails once it is driven.
-        client
-            .submit(ClientCall::get("http://127.0.0.1:1/"), 1)
-            .unwrap();
-        let refused = client
-            .submit(ClientCall::get("http://127.0.0.1:1/"), 2)
-            .unwrap_err();
+        client.submit(ClientCall::get("http://127.0.0.1:1/"), 1).unwrap();
+        let refused = client.submit(ClientCall::get("http://127.0.0.1:1/"), 2).unwrap_err();
         assert_eq!(refused.status, Status::Contended);
         let mut completed: [Completed; 1] = Default::default();
-        while client
-            .take_completed(&mut completed, Duration::from_secs(1))
-            .unwrap()
-            .is_empty()
-        {}
+        while client.take_completed(&mut completed, Duration::from_secs(1)).unwrap().is_empty() {}
         assert_eq!(completed[0].context, 1);
         assert!(completed[0].response.is_err());
-        client
-            .submit(ClientCall::get("http://127.0.0.1:1/"), 3)
-            .unwrap();
+        client.submit(ClientCall::get("http://127.0.0.1:1/"), 3).unwrap();
     }
 }
 

@@ -27,9 +27,8 @@ impl Drop for Stopping<'_> {
 /// server and checks every loop finished cleanly.
 pub fn serving(server: &Server, calls: impl FnOnce()) {
     std::thread::scope(|scope| {
-        let polling: Vec<_> = (0..server.event_loops())
-            .map(|event_loop| scope.spawn(move || server.take_calls(event_loop)))
-            .collect();
+        let polling: Vec<_> =
+            (0..server.event_loops()).map(|event_loop| scope.spawn(move || server.take_calls(event_loop))).collect();
         let stopping = Stopping(server);
         calls();
         drop(stopping);
@@ -41,25 +40,16 @@ pub fn serving(server: &Server, calls: impl FnOnce()) {
 
 /// One event loop on a free loopback port, admitting `connections` at once.
 pub fn loopback(connections: usize) -> Interface {
-    Interface::new("127.0.0.1:0")
-        .connections(connections)
-        .event_loops(1)
+    Interface::new("127.0.0.1:0").connections(connections).event_loops(1)
 }
 
 /// A plaintext client holding up to `connections` open at once.
 pub fn client(connections: usize) -> Client {
-    Client::new(ClientOptions {
-        connections,
-        ..Default::default()
-    })
-    .unwrap()
+    Client::new(ClientOptions { connections, ..Default::default() }).unwrap()
 }
 
 /// A handler detaching every request into the returned receiver, for a worker to answer.
-pub fn detaching() -> (
-    impl Fn(Request) + Send + Sync + 'static,
-    Receiver<DetachedRequest>,
-) {
+pub fn detaching() -> (impl Fn(Request) + Send + Sync + 'static, Receiver<DetachedRequest>) {
     let (handed, received) = mpsc::channel();
     let handler = move |request: Request| handed.send(request.detach()).unwrap();
     (handler, received)
@@ -68,9 +58,7 @@ pub fn detaching() -> (
 /// The next request [`detaching`] handed over, failing the test instead of waiting forever when
 /// no call reached the server, since the server's handler keeps the sender alive.
 pub fn next_detached(received: &Receiver<DetachedRequest>) -> DetachedRequest {
-    received
-        .recv_timeout(Duration::from_secs(30))
-        .expect("no request reached the handler")
+    received.recv_timeout(Duration::from_secs(30)).expect("no request reached the handler")
 }
 
 /// An empty directory beside the test binary, inside the build tree, since file parts read
@@ -84,11 +72,7 @@ pub fn direct_directory(name: &str) -> PathBuf {
 
 /// Opens `path` for the unbuffered reads a file part requires.
 pub fn open_direct(path: &Path) -> File {
-    OpenOptions::new()
-        .read(true)
-        .custom_flags(libc::O_DIRECT)
-        .open(path)
-        .unwrap()
+    OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path).unwrap()
 }
 
 /// `length` bytes cycling through a prime period, so a misplaced range shows.

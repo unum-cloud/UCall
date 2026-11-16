@@ -29,6 +29,9 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y clang-22
+      - name: Install Rust
+        # rustup reads the channel and components from rust-toolchain.toml.
+        run: rustup toolchain install
       - name: Test Rust
         run: cargo test
         env:

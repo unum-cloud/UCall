@@ -30,10 +30,9 @@ jobs:
           echo "$RUNNER_TEMP/doxygen-1.18.0/bin" >> "$GITHUB_PATH"
       - name: Install griffe
         run: pip install griffe==2.4.1
-      - name: Set Up Rust
-        uses: dtolnay/rust-toolchain@master
-        with:
-          toolchain: beta-2026-10-18
+      - name: Install Rust
+        # rustup reads the channel and components from rust-toolchain.toml.
+        run: rustup toolchain install
       - name: Set Up Pixi
         uses: prefix-dev/setup-pixi@v0
         with:

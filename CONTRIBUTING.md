@@ -255,7 +255,7 @@ A code comment explains a non-obvious reason rather than narrating an operation.
 Keep source headers, attribution, and original creation dates consistent with the file's history.
 
 Begin each Markdown sentence on a separate source line and align table columns.
-Run `dprint fmt` for Markdown, `clang-format` for C and C++, Ruff for Python, and `cargo +nightly fmt` for Rust.
+Run `dprint fmt` for Markdown, `clang-format` for C and C++, Ruff for Python, and `cargo +stable fmt` for Rust.
 The staged-file hooks check these conventions and reject template suffixes even with brace initialization.
 
 ### Review and Measurements
