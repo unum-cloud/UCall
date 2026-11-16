@@ -9,7 +9,7 @@
 #include <csignal> // `std::signal`, `std::sig_atomic_t`, `SIGINT`, `SIGTERM`
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint16_t`, `std::uint64_t`
-#include <cstdio>  // `std::printf`, `std::fprintf`, `std::snprintf`
+#include <cstdio>  // `stdout`, `stderr`, `std::fflush`
 
 #include <algorithm>        // `std::min`, `std::find_if`
 #include <chrono>           // `std::chrono::milliseconds`
@@ -18,6 +18,7 @@
 #include <string_view>      // `std::string_view`
 #include <thread>           // `std::this_thread::sleep_for`
 
+#include <fmt/format.h>          // `fmt::print`, `fmt::format_to_n`, `fmt::format_to`, `fmt::basic_memory_buffer`
 #include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`, `fu_pool_capabilities`
 
 #include "ucall/utilities/types.hpp" // `bytes_view`, `st::status_t`
@@ -80,8 +81,8 @@ struct server_t {
 
     static bool succeeded(ucall_outcome_t const& outcome) {
         if (outcome.status == ucall_status_success_k) return true;
-        std::fprintf(stderr, "%s%s%s\n", ucall_status_name(outcome.status), outcome.message ? ": " : "",
-                     outcome.message ? outcome.message : "");
+        fmt::print(stderr, "{}{}{}\n", ucall_status_name(outcome.status), outcome.message ? ": " : "",
+                   outcome.message ? outcome.message : "");
         return false;
     }
     static void health(ucall_received_http_request_t request, void* context) {
@@ -105,23 +106,22 @@ struct server_t {
         for (int i = 1; i != argc; ++i) {
             std::string_view flag {argv[i]};
             if (flag == "--help") {
-                std::printf(
-                    "Usage: %s [--backend name] [--cpu-class name] [--threads N] [--host IP] [--port N]\n"
-                    "       [--connections N] [--pipelined-requests N] [--security none|xx|ik] [--key HEX]\n"
-                    "       [--batch-min N] [--batch-max N] [--batch-latency-us N] [--stats human|json]\n"
-                    "       [--reply-directory PATH]\n"
-                    "Backend defaults to automatic, CPU class to serial, and threads to 1.\n"
-                    "The host defaults to 127.0.0.1 and the port to 8545; pass 0.0.0.0 or :: to accept every NIC.\n"
-                    "Admission defaults to 1024 connections of 1 request each.\n"
-                    "Noise needs the 64-digit hex server private key; without --key one is generated.\n"
-                    "Either way the public key is printed; XX admits every client key.\n"
-                    "Batch budgets default to the library's 1, 32, and 10000 microseconds.\n"
-                    "--stats json prints every loop's and batch endpoint's counters as a JSON object.\n" //
+                fmt::print(
+                    "Usage: {} [--backend name] [--cpu-class name] [--threads N] [--host IP] [--port N]\n"           //
+                    "       [--connections N] [--pipelined-requests N] [--security none|xx|ik] [--key HEX]\n"        //
+                    "       [--batch-min N] [--batch-max N] [--batch-latency-us N] [--stats human|json]\n"           //
+                    "       [--reply-directory PATH]\n"                                                              //
+                    "Backend defaults to automatic, CPU class to serial, and threads to 1.\n"                        //
+                    "The host defaults to 127.0.0.1 and the port to 8545; pass 0.0.0.0 or :: to accept every NIC.\n" //
+                    "Admission defaults to 1024 connections of 1 request each.\n"                                    //
+                    "Noise needs the 64-digit hex server private key; without --key one is generated.\n"             //
+                    "Either way the public key is printed; XX admits every client key.\n"                            //
+                    "Batch budgets default to the library's 1, 32, and 10000 microseconds.\n"                        //
+                    "--stats json prints every loop's and batch endpoint's counters as a JSON object.\n"             //
                     "--reply-directory registers the directory path parts of replies open files beneath.\n",
                     argv[0]);
                 for (count_flag_t const& count : counts)
-                    std::printf("%.*s N: %.*s (%zu)\n", static_cast<int>(count.name.size()), count.name.data(),
-                                static_cast<int>(count.help.size()), count.help.data(), count.value);
+                    fmt::print("{} N: {} ({})\n", count.name, count.help, count.value);
                 return 1;
             }
             std::string_view value {};
@@ -169,8 +169,7 @@ struct server_t {
             else if (flag == "--cpu-class") valid = parse_cpu_class(value, config.cpu_class);
             else if (extra != counts.end()) valid = parse_count(value, extra->value);
             if (!valid) {
-                std::fprintf(stderr, "Invalid argument: %.*s=%.*s\n", static_cast<int>(flag.size()), flag.data(),
-                             static_cast<int>(value.size()), value.data());
+                fmt::print(stderr, "Invalid argument: {}={}\n", flag, value);
                 return -1;
             }
         }
@@ -186,10 +185,10 @@ struct server_t {
                 ucall_noise_key_generate(&generate);
             }
             if (outcome.status != ucall_status_success_k) {
-                std::fprintf(stderr, "The server key is unavailable: %s\n", outcome.message);
+                fmt::print(stderr, "The server key is unavailable: {}\n", outcome.message ? outcome.message : "");
                 return -1;
             }
-            std::printf("Server public key: ");
+            fmt::print("Server public key: ");
             print_key(stdout, public_key);
             network_interface.noise_private_key = &private_key;
             if (network_interface.security == ucall_security_noise_xx_k)
@@ -199,8 +198,9 @@ struct server_t {
         std::signal(SIGTERM, request_stop);
         // IPv6 literals take brackets, as the server prints its own bound addresses.
         bool const bracketed = host.find(':') != host.npos;
-        std::snprintf(address, sizeof(address), bracketed ? "[%.*s]:%zu" : "%.*s:%zu", static_cast<int>(host.size()),
-                      host.data(), port);
+        auto const written = bracketed ? fmt::format_to_n(address, sizeof(address) - 1, "[{}]:{}", host, port)
+                                       : fmt::format_to_n(address, sizeof(address) - 1, "{}:{}", host, port);
+        *written.out = '\0';
         network_interface.address = bytes_view(address);
         network_interface.max_concurrent_connections = connections;
         network_interface.max_pipelined_requests = pipelined_requests;
@@ -219,9 +219,8 @@ struct server_t {
         if (!add_endpoint("/health", ucall_verb_get_k, health, &server)) return -1;
         event_loops = resolved.interfaces[0].event_loops;
         std::string_view const bound = text_view(resolved.interfaces[0].address);
-        std::printf("Listening on %.*s using %s, %s, %zu application-owned serving loops\n",
-                    static_cast<int>(bound.size()), bound.data(), ucall_io_backend_name(resolved.backend),
-                    ucall_cpu_class_name(resolved.cpu_class), event_loops);
+        fmt::print("Listening on {} using {}, {}, {} application-owned serving loops\n", bound,
+                   ucall_io_backend_name(resolved.backend), ucall_cpu_class_name(resolved.cpu_class), event_loops);
         std::fflush(stdout); // Scripts read the public key and the address before the server exits.
         return 0;
     }
@@ -274,7 +273,7 @@ struct server_t {
         serving = process_clocks_t::now();
         std::size_t const threads = event_loops + batch_endpoints.size();
         if (st::failed(outcomes.resize(threads))) {
-            std::fprintf(stderr, "No memory for %zu polling threads\n", threads);
+            fmt::print(stderr, "No memory for {} polling threads\n", threads);
             return 1;
         }
         fu_topology_t topology {};
@@ -283,7 +282,7 @@ struct server_t {
         if (status == fu_success_k) status = fu_pool_spawn(topology, pool, threads, fu_caller_exclusive_k);
         if (topology) fu_topology_delete(topology);
         if (status != fu_success_k) {
-            std::fprintf(stderr, "ForkUnion initialization failed: %d\n", static_cast<int>(status));
+            fmt::print(stderr, "ForkUnion initialization failed: {}\n", static_cast<int>(status));
             return 1;
         }
         if (fu_pool_unsafe_for_threads(pool, serve, this, &generation) != fu_success_k) return 1;
@@ -299,7 +298,6 @@ struct server_t {
     /** Prints the counters of every loop and batch endpoint, then the seconds served and spent. */
     bool report() const {
         bool const json = statistics_format == statistics_format_t::json_k;
-        auto number = [](std::uint64_t value) { return static_cast<unsigned long long>(value); };
         struct named_counter_t {
             char const *json_name, *human_name;
             std::uint64_t ucall_event_loop_statistics_t::* counter;
@@ -335,39 +333,57 @@ struct server_t {
             {"shed_connections", "shed connections", &ucall_event_loop_statistics_t::shed_connections},
             {"windows_unpinned", "unpinned windows", &ucall_event_loop_statistics_t::windows_unpinned}};
         ucall_outcome_t outcome {};
-        if (json) std::printf("{\"event_loops\":[");
+        // Each row composes on the stack and leaves in one write, so no log line splits a row.
+        fmt::basic_memory_buffer<char, 4096> row;
+        auto emit = [&] {
+            std::fwrite(row.data(), 1, row.size(), stdout);
+            row.clear();
+        };
+        if (json) fmt::format_to(fmt::appender(row), "{{\"event_loops\":[");
         for (std::size_t index = 0; index != event_loops; ++index) {
             ucall_event_loop_statistics_t counters {};
             ucall_server_event_loop_statistics_t query {server, &outcome, index, &counters};
             ucall_server_event_loop_statistics(&query);
             if (!succeeded(outcome)) return false;
-            if (json) std::printf("%s{\"index\":%zu", index ? "," : "", index);
-            else std::printf("Event loop %zu:", index);
+            if (json) fmt::format_to(fmt::appender(row), "{}{{\"index\":{}", index ? "," : "", index);
+            else fmt::format_to(fmt::appender(row), "Event loop {}:", index);
             char const* separator = " ";
             for (named_counter_t const& named : counters_k) {
-                if (json) std::printf(",\"%s\":%llu", named.json_name, number(counters.*named.counter));
-                else std::printf("%s%llu %s", separator, number(counters.*named.counter), named.human_name);
+                if (json) fmt::format_to(fmt::appender(row), ",\"{}\":{}", named.json_name, counters.*named.counter);
+                else
+                    fmt::format_to(fmt::appender(row), "{}{} {}", separator, counters.*named.counter, named.human_name);
                 separator = ", ";
             }
-            std::printf(json ? "}" : "\n");
+            fmt::format_to(fmt::appender(row), "{}", json ? "}" : "\n");
+            emit();
         }
-        if (json) std::printf("],\"batch_endpoints\":[");
+        if (json) fmt::format_to(fmt::appender(row), "],\"batch_endpoints\":[");
         for (std::size_t index = 0; index != batch_endpoints.size(); ++index) {
             ucall_batch_endpoint_statistics_t counters {};
             ucall_server_batch_endpoint_statistics_t query {server, &outcome, batch_endpoints[index], &counters};
             ucall_server_batch_endpoint_statistics(&query);
             if (!succeeded(outcome)) return false;
-            std::printf(json ? "%s{\"index\":%zu,\"batches\":%llu,\"requests\":%llu,\"filled_batches\":%llu,"
-                               "\"ready_batches\":%llu,\"expired_batches\":%llu}"
-                             : "%sBatch endpoint %zu: %llu batches, %llu requests, %llu filled, %llu ready, "
-                               "%llu expired\n",
-                        json && index ? "," : "", index, number(counters.batches), number(counters.requests),
-                        number(counters.filled_batches), number(counters.ready_batches),
-                        number(counters.expired_batches));
+            if (json)
+                fmt::format_to(fmt::appender(row),
+                               "{}{{\"index\":{},\"batches\":{},\"requests\":{},\"filled_batches\":{}," //
+                               "\"ready_batches\":{},\"expired_batches\":{}}}",
+                               index ? "," : "", index, counters.batches, counters.requests, counters.filled_batches,
+                               counters.ready_batches, counters.expired_batches);
+            else
+                fmt::format_to(fmt::appender(row),
+                               "Batch endpoint {}: {} batches, {} requests, {} filled, {} ready, {} expired\n", index,
+                               counters.batches, counters.requests, counters.filled_batches, counters.ready_batches,
+                               counters.expired_batches);
+            emit();
         }
         process_clocks_t const spent = process_clocks_t::now() - serving;
-        if (json) std::printf("],\"wall_seconds\":%.6f,\"cpu_seconds\":%.6f}\n", spent.wall_seconds, spent.cpu_seconds);
-        else std::printf("Served for %.6f s using %.6f s of CPU\n", spent.wall_seconds, spent.cpu_seconds);
+        if (json)
+            fmt::format_to(fmt::appender(row), "],\"wall_seconds\":{:.6f},\"cpu_seconds\":{:.6f}}}\n",
+                           spent.wall_seconds, spent.cpu_seconds);
+        else
+            fmt::format_to(fmt::appender(row), "Served for {:.6f} s using {:.6f} s of CPU\n", spent.wall_seconds,
+                           spent.cpu_seconds);
+        emit();
         return true;
     }
     ~server_t() {

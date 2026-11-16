@@ -8,7 +8,7 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
-#include <cstdio>  // `std::fprintf`, `stderr`
+#include <cstdio>  // `std::FILE`, `stderr`
 #include <cstdlib> // `std::exit`, `std::getenv`, `std::strtod`
 
 #include <charconv>     // `std::from_chars`
@@ -18,6 +18,9 @@
 #include <regex>        // `std::regex`, `std::regex_search`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
+
+#include <fmt/format.h> // `fmt::print`
+#include <fmt/ranges.h> // `fmt::join`
 
 #include "ucall/utilities/types.hpp" // `UCALL_OS_WINDOWS_`
 #include "ucall/ucall.h"             // `ucall_noise_key_t`, `ucall_status_t`
@@ -69,8 +72,7 @@ inline bool parse_key(std::string_view text, ucall_noise_key_t& key) noexcept {
 
 /** Prints @p key to @p file as the 64 hexadecimal digits @ref parse_key reads, then a newline. */
 inline void print_key(std::FILE* file, ucall_noise_key_t const& key) noexcept {
-    for (ucall_byte_t const byte : key) std::fprintf(file, "%02x", static_cast<unsigned>(byte));
-    std::fputc('\n', file);
+    fmt::print(file, "{:02x}\n", fmt::join(key, ""));
 }
 
 /** An engine name as @c ucall_io_backend_name spells it, left untouched when it names none. */
@@ -135,8 +137,7 @@ struct settings_t {
 
 /** Prints why @p value of @p name does not parse, then exits with status 1. */
 [[noreturn]] inline void exit_unparsed(std::string_view name, std::string_view value, char const* expected) noexcept {
-    std::fprintf(stderr, "%.*s=\"%.*s\" does not parse, expected %s\n", static_cast<int>(name.size()), name.data(),
-                 static_cast<int>(value.size()), value.data(), expected);
+    fmt::print(stderr, "{}=\"{}\" does not parse, expected {}\n", name, value, expected);
     std::exit(1);
 }
 
@@ -174,8 +175,7 @@ inline settings_t read_settings(int argc, char const* const* argv, std::string_v
             continue;
         }
         if (flag != "--help") exit_unparsed(flag, value, "a flag of the usage below");
-        std::printf("Usage: %.*s [--backend name] [--cpu-class name]\n", static_cast<int>(synopsis.size()),
-                    synopsis.data());
+        fmt::print("Usage: {} [--backend name] [--cpu-class name]\n", synopsis);
         std::exit(0);
     }
     return settings;

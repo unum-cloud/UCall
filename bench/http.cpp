@@ -11,7 +11,7 @@
 #include <cctype>  // `std::toupper`
 #include <cmath>   // `std::ceil`
 #include <cstdint> // `std::uint64_t`
-#include <cstdio>  // `std::printf`, `std::snprintf`
+#include <cstdio>  // `stdout`, `stderr`, `std::fwrite`
 #include <cstdlib> // `std::getenv`
 #include <cstring> // `std::memcmp`
 
@@ -27,6 +27,7 @@
 #include <tuple>       // `std::tuple`
 #include <vector>      // `std::vector`
 
+#include <fmt/format.h>          // `fmt::print`, `fmt::format_to`, `fmt::format_to_n`, `fmt::basic_memory_buffer`
 #include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_for_threads`
 #include <forkunion/types.hpp>   // `fu::split_mix`
 
@@ -203,15 +204,13 @@ static std::string environment_variable(flag_t const& flag) {
 
 static void usage(char const* binary) {
     constexpr int column_k = 28;
-    std::printf("Usage: %s --requests count | --time-limit duration [flags]\n", binary);
+    fmt::print("Usage: {} --requests count | --time-limit duration [flags]\n", binary);
     for (auto const& flag : flags_k) {
         auto width = static_cast<int>(flag.name.size() + (flag.placeholder.empty() ? 0 : flag.placeholder.size() + 1));
-        std::printf("  %.*s%s%.*s%*s%.*s [env: %s]\n", static_cast<int>(flag.name.size()), flag.name.data(),
-                    flag.placeholder.empty() ? "" : " ", static_cast<int>(flag.placeholder.size()),
-                    flag.placeholder.data(), fu::max_of(column_k - width, 1), "", static_cast<int>(flag.help.size()),
-                    flag.help.data(), environment_variable(flag).c_str());
+        fmt::print("  {}{}{}{:{}}{} [env: {}]\n", flag.name, flag.placeholder.empty() ? "" : " ", flag.placeholder, "",
+                   fu::max_of(column_k - width, 1), flag.help, environment_variable(flag));
     }
-    std::printf("  --help%*sprint this usage\n", column_k - 6, "");
+    fmt::print("  --help{:{}}print this usage\n", "", column_k - 6);
 }
 
 static bool parse(int argc, char** argv, settings_t& settings) {
@@ -223,21 +222,20 @@ static bool parse(int argc, char** argv, settings_t& settings) {
         auto found = std::find_if(flags_k.begin(), flags_k.end(),
                                   [&](flag_t const& flag) { return flag.name == name; });
         if (found == flags_k.end()) {
-            std::fprintf(stderr, "%.*s is not a flag, see --help\n", static_cast<int>(name.size()), name.data());
+            fmt::print(stderr, "{} is not a flag, see --help\n", name);
             return false;
         }
         std::string_view value;
         if (equal != argument.npos) value = argument.substr(equal + 1);
         else if (!found->placeholder.empty()) {
             if (i + 1 == argc) {
-                std::fprintf(stderr, "%.*s requires a value\n", static_cast<int>(name.size()), name.data());
+                fmt::print(stderr, "{} requires a value\n", name);
                 return false;
             }
             value = argv[++i];
         }
         if (!found->assign(value, settings)) {
-            std::fprintf(stderr, "Invalid argument: %.*s=%.*s\n", static_cast<int>(name.size()), name.data(),
-                         static_cast<int>(value.size()), value.data());
+            fmt::print(stderr, "Invalid argument: {}={}\n", name, value);
             return false;
         }
         given.set(static_cast<std::size_t>(found - flags_k.begin()));
@@ -247,12 +245,12 @@ static bool parse(int argc, char** argv, settings_t& settings) {
         auto variable = environment_variable(flags_k[index]);
         char const* value = std::getenv(variable.c_str());
         if (!value || !*value || flags_k[index].assign(value, settings)) continue;
-        std::fprintf(stderr, "%s=\"%s\" does not parse\n", variable.c_str(), value);
+        fmt::print(stderr, "{}=\"{}\" does not parse\n", variable, value);
         return false;
     }
     if (settings.reply_order == reply_order_t::reordered_k) settings.body_check = body_check_t::echo_k;
     if (!settings.requests && !settings.time_limit.count()) {
-        std::fputs("--requests or --time-limit must bound the measured run\n", stderr);
+        fmt::print(stderr, "--requests or --time-limit must bound the measured run\n");
         return false;
     }
     if (settings.urls.empty())
@@ -261,17 +259,17 @@ static bool parse(int argc, char** argv, settings_t& settings) {
                                        : "http://127.0.0.1:8545/echo");
     if (settings.reply_order == reply_order_t::reordered_k &&
         (settings.requests % 2 || settings.warmup_requests % 2 || settings.verb != ucall_verb_post_k)) {
-        std::fputs("Paired replies require POST and even measured/warmup request counts\n", stderr);
+        fmt::print(stderr, "Paired replies require POST and even measured/warmup request counts\n");
         return false;
     }
     auto noise = std::any_of(settings.urls.begin(), settings.urls.end(),
                              [](std::string const& url) { return url.starts_with("http+noise://"); });
     if (noise && settings.client_key.empty()) {
-        std::fputs("http+noise:// URLs require --client-key\n", stderr);
+        fmt::print(stderr, "http+noise:// URLs require --client-key\n");
         return false;
     }
     if (!noise && (!settings.client_key.empty() || !settings.server_key.empty())) {
-        std::fputs("--client-key and --server-key apply only to http+noise:// URLs\n", stderr);
+        fmt::print(stderr, "--client-key and --server-key apply only to http+noise:// URLs\n");
         return false;
     }
     return true;
@@ -279,8 +277,8 @@ static bool parse(int argc, char** argv, settings_t& settings) {
 
 static bool succeeded(ucall_outcome_t const& outcome, char const* operation) {
     if (outcome.status == ucall_status_success_k) return true;
-    std::fprintf(stderr, "%s: %s%s%s\n", operation, ucall_status_name(outcome.status), outcome.message ? ": " : "",
-                 outcome.message ? outcome.message : "");
+    fmt::print(stderr, "{}: {}{}{}\n", operation, ucall_status_name(outcome.status), outcome.message ? ": " : "",
+               outcome.message ? outcome.message : "");
     return false;
 }
 
@@ -411,10 +409,10 @@ struct worker_t {
                 }
                 std::size_t headers = 0;
                 if (settings.reply_order == reply_order_t::reordered_k) {
-                    auto length = std::snprintf(slot.pair_header, sizeof(slot.pair_header),
-                                                "x-ucall-pair: %llu:%zu:%zu",
-                                                static_cast<unsigned long long>(run_id + !measured), index,
-                                                pair * origins.size() + group.origin);
+                    auto const written = fmt::format_to_n(slot.pair_header, sizeof(slot.pair_header) - 1,
+                                                          "x-ucall-pair: {}:{}:{}", run_id + !measured, index,
+                                                          pair * origins.size() + group.origin);
+                    auto const length = written.out - slot.pair_header;
                     slot.headers[headers++] = bytes_view({slot.pair_header, static_cast<std::size_t>(length)});
                     slot.pair = {slot.pair_header + sizeof("x-ucall-pair: ") - 1,
                                  static_cast<std::size_t>(length) - (sizeof("x-ucall-pair: ") - 1)};
@@ -623,14 +621,15 @@ struct run_t {
     }
 };
 
-/** Prints @p text as a JSON string, escaping the quote and backslash that URLs may carry. */
-static void print_json_string(std::string_view text) {
-    std::putchar('"');
+/** Prints @p text into @p row as a JSON string, escaping the quotes and backslashes URLs carry. */
+template <typename row_type_>
+static void print_json_string(row_type_& row, std::string_view text) {
+    row.push_back('"');
     for (char character : text) {
-        if (character == '"' || character == '\\') std::putchar('\\');
-        std::putchar(character);
+        if (character == '"' || character == '\\') row.push_back('\\');
+        row.push_back(character);
     }
-    std::putchar('"');
+    row.push_back('"');
 }
 
 static int run(settings_t const& settings) {
@@ -639,8 +638,7 @@ static int run(settings_t const& settings) {
     auto clients = fu::min_of(settings.threads, fu::min_of(settings.connections / settings.urls.size() / width,
                                                            settings.in_flight / settings.urls.size() / width));
     if (!clients) {
-        std::fprintf(stderr, "Each active origin needs at least %u connections and in-flight slots per worker\n",
-                     width);
+        fmt::print(stderr, "Each active origin needs at least {} connections and in-flight slots per worker\n", width);
         return 1;
     }
     resources.workers.resize(clients);
@@ -697,7 +695,7 @@ static int run(settings_t const& settings) {
     fu_capabilities_t effective {};
     if (status == fu_success_k) status = fu_pool_capabilities(resources.pool, &effective);
     if (status != fu_success_k) {
-        std::fprintf(stderr, "ForkUnion initialization failed: %d\n", static_cast<int>(status));
+        fmt::print(stderr, "ForkUnion initialization failed: {}\n", static_cast<int>(status));
         return 1;
     }
     auto pinned = (effective & placement) == placement;
@@ -717,8 +715,8 @@ static int run(settings_t const& settings) {
         if (!run.dispatch(phase_t::warmup_k, settings.warmup)) return 1;
         for (auto const& worker : resources.workers)
             if (!worker.valid || worker.failures || worker.rejected) {
-                std::fprintf(stderr, "Warmup failed: %s\n",
-                             worker.first_error ? worker.first_error : ucall_status_name(worker.first_rejection));
+                fmt::print(stderr, "Warmup failed: {}\n",
+                           worker.first_error ? worker.first_error : ucall_status_name(worker.first_rejection));
                 return 1;
             }
     }
@@ -739,8 +737,9 @@ static int run(settings_t const& settings) {
         valid &= worker.valid;
         latencies.merge(worker.latencies);
         if (worker.first_error)
-            std::fprintf(stderr, "Worker %zu: %s (HTTP %u)\n", i, worker.first_error, worker.first_http_status);
-        if (worker.rejected) std::fprintf(stderr, "Rejected calls: %s\n", ucall_status_name(worker.first_rejection));
+            fmt::print(stderr, "Worker {}: {} (HTTP {})\n", i, worker.first_error ? worker.first_error : "",
+                       worker.first_http_status);
+        if (worker.rejected) fmt::print(stderr, "Rejected calls: {}\n", ucall_status_name(worker.first_rejection));
     }
     std::vector<origin_result_t> origins(settings.urls.size());
     long double latency_sum = 0;
@@ -780,107 +779,133 @@ static int run(settings_t const& settings) {
     char const* const percentiles[] = {"p50", "p90", "p99", "p99.9", "p99.99"};
     auto load = settings.rate ? "open-loop" : "closed-loop";
     auto security = has_server_key ? "ik" : has_client_key ? "xx" : "none";
+    // Every row composes on the stack and leaves in one write.
+    fmt::basic_memory_buffer<char, 4096> row;
+    auto emit = [&](std::FILE* stream) {
+        std::fwrite(row.data(), 1, row.size(), stream);
+        row.clear();
+    };
+    auto out = fmt::appender(row);
     if (settings.format == output_format_t::json_k) {
-        std::printf("{\"row\":\"configuration\",\"origins\":%zu,\"threads\":%zu,\"clients\":%zu,\"placement\":\"%s\","
-                    "\"workload\":\"%s\",\"connection_reuse\":\"%s\",\"load\":\"%s\",\"rate_requests_per_second\":%zu,"
-                    "\"connections\":%zu,\"in_flight_calls\":%zu,\"pipeline_depth\":%zu,\"request_body_bytes\":%zu,"
-                    "\"warmup_requests\":%zu,\"warmup_seconds\":%.6f,\"measured_requests\":%zu,"
-                    "\"time_limit_seconds\":%.6f,\"seed\":%llu,\"security\":\"%s\"}\n",
-                    settings.urls.size(), settings.threads, clients, pinned ? "pinned" : "floating",
-                    settings.reply_order == reply_order_t::reordered_k ? "paired replies" : "ordinary",
-                    settings.connection_reuse == connection_reuse_t::close_k ? "close" : "keep-alive", load,
-                    settings.rate, settings.connections, capacity, settings.pipeline_depth, settings.bytes,
-                    settings.warmup_requests, std::chrono::duration<double>(settings.warmup).count(), settings.requests,
-                    std::chrono::duration<double>(settings.time_limit).count(),
-                    static_cast<unsigned long long>(settings.seed), security);
-        std::printf("{\"row\":\"total\",\"successful_requests\":%zu,\"failed_requests\":%zu,\"rejected_requests\":%zu,"
-                    "\"elapsed_seconds\":%.6f,\"throughput_requests_per_second\":%.1f,"
-                    "\"response_body_gigabytes_per_second\":%.3f,\"driver_cpu_us_per_request\":%.3f," //
-                    "\"driver_busy_fraction\":%.3f,\"latency_mean_us\":%.2f",
-                    successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second,
-                    cpu_microseconds_per_request, busy_fraction, mean);
+        fmt::format_to(
+            out,
+            "{{\"row\":\"configuration\",\"origins\":{},\"threads\":{},\"clients\":{},\"placement\":\"{}\","   //
+            "\"workload\":\"{}\",\"connection_reuse\":\"{}\",\"load\":\"{}\",\"rate_requests_per_second\":{}," //
+            "\"connections\":{},\"in_flight_calls\":{},\"pipeline_depth\":{},\"request_body_bytes\":{},"       //
+            "\"warmup_requests\":{},\"warmup_seconds\":{:.6f},\"measured_requests\":{},"                       //
+            "\"time_limit_seconds\":{:.6f},\"seed\":{},\"security\":\"{}\"}}\n",
+            settings.urls.size(), settings.threads, clients, pinned ? "pinned" : "floating",
+            settings.reply_order == reply_order_t::reordered_k ? "paired replies" : "ordinary",
+            settings.connection_reuse == connection_reuse_t::close_k ? "close" : "keep-alive", load, settings.rate,
+            settings.connections, capacity, settings.pipeline_depth, settings.bytes, settings.warmup_requests,
+            std::chrono::duration<double>(settings.warmup).count(), settings.requests,
+            std::chrono::duration<double>(settings.time_limit).count(), settings.seed, security);
+        emit(stdout);
+        fmt::format_to(
+            out,
+            "{{\"row\":\"total\",\"successful_requests\":{},\"failed_requests\":{},\"rejected_requests\":{}," //
+            "\"elapsed_seconds\":{:.6f},\"throughput_requests_per_second\":{:.1f},"                           //
+            "\"response_body_gigabytes_per_second\":{:.3f},\"driver_cpu_us_per_request\":{:.3f},"             //
+            "\"driver_busy_fraction\":{:.3f},\"latency_mean_us\":{:.2f}",
+            successful, failures, rejected, seconds, successful / seconds, gigabytes_per_second,
+            cpu_microseconds_per_request, busy_fraction, mean);
         for (std::size_t i = 0; i != std::size(fractions); ++i)
-            std::printf(",\"latency_%s_us\":%.2f", percentiles[i], microseconds(latencies.percentile(fractions[i])));
-        std::printf(",\"latency_max_us\":%.2f}\n", microseconds(latency_max));
+            fmt::format_to(out, ",\"latency_{}_us\":{:.2f}", percentiles[i],
+                           microseconds(latencies.percentile(fractions[i])));
+        fmt::format_to(out, ",\"latency_max_us\":{:.2f}}}\n", microseconds(latency_max));
+        emit(stdout);
         for (std::size_t origin_index = 0; origin_index != origins.size(); ++origin_index) {
             auto const& total = origins[origin_index];
-            std::printf("{\"row\":\"origin\",\"index\":%zu,\"url\":", origin_index);
-            print_json_string(settings.urls[origin_index]);
-            std::printf(",\"issued_requests\":%zu,\"completed_requests\":%zu,\"successful_requests\":%zu,"
-                        "\"failed_requests\":%zu,\"rejected_requests\":%zu,\"byte_checks\":%zu,"
-                        "\"reordered_completions\":%zu,\"response_body_bytes\":%zu,\"latency_mean_us\":%.2f,"
-                        "\"latency_max_us\":%.2f,\"first_completion_ms\":%.3f,\"last_completion_ms\":%.3f}\n",
-                        total.issued, total.completed, total.successful, total.failures, total.rejected,
-                        total.byte_checks, total.reordered, total.response_bytes,
-                        total.successful
-                            ? static_cast<double>(total.latency_sum / total.successful) / nanoseconds_per_microsecond_k
-                            : 0.0,
-                        microseconds(total.latency_max), offset(total, total.first_completed),
-                        offset(total, total.last_completed));
+            fmt::format_to(out, "{{\"row\":\"origin\",\"index\":{},\"url\":", origin_index);
+            print_json_string(row, settings.urls[origin_index]);
+            fmt::format_to(out,
+                           ",\"issued_requests\":{},\"completed_requests\":{},\"successful_requests\":{},"       //
+                           "\"failed_requests\":{},\"rejected_requests\":{},\"byte_checks\":{},"                 //
+                           "\"reordered_completions\":{},\"response_body_bytes\":{},\"latency_mean_us\":{:.2f}," //
+                           "\"latency_max_us\":{:.2f},\"first_completion_ms\":{:.3f},\"last_completion_ms\":{:.3f}}}\n",
+                           total.issued, total.completed, total.successful, total.failures, total.rejected,
+                           total.byte_checks, total.reordered, total.response_bytes,
+                           total.successful ? static_cast<double>(total.latency_sum / total.successful) /
+                                                  nanoseconds_per_microsecond_k
+                                            : 0.0,
+                           microseconds(total.latency_max), offset(total, total.first_completed),
+                           offset(total, total.last_completed));
+            emit(stdout);
         }
-        for (std::size_t i = 0; i != workers.size(); ++i)
-            std::printf("{\"row\":\"worker\",\"index\":%zu,\"backend\":\"%s\",\"cpu_class\":\"%s\","
-                        "\"successful_requests\":%zu,\"failed_requests\":%zu}\n",
-                        i, ucall_io_backend_name(workers[i].resolved.backend),
-                        ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
-                        workers[i].failures);
-        std::fputs(
-            "Server counters: stop the server with SIGINT or SIGTERM; with --stats json it prints them as JSON\n",
-            stderr);
+        for (std::size_t i = 0; i != workers.size(); ++i) {
+            fmt::format_to(out,
+                           "{{\"row\":\"worker\",\"index\":{},\"backend\":\"{}\",\"cpu_class\":\"{}\"," //
+                           "\"successful_requests\":{},\"failed_requests\":{}}}\n",
+                           i, ucall_io_backend_name(workers[i].resolved.backend),
+                           ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
+                           workers[i].failures);
+            emit(stdout);
+        }
+        fmt::print(
+            stderr,
+            "Server counters: stop the server with SIGINT or SIGTERM; with --stats json it prints them as JSON\n");
     }
     else {
-        std::printf("Configuration\n  Origins: %zu\n  ForkUnion workers: %zu, %s\n  Clients: %zu\n  Workload: %s\n"
-                    "  Connection reuse: %s\n  Load: %s",
-                    settings.urls.size(), settings.threads, pinned ? "pinned to cores" : "floating", clients,
-                    settings.reply_order == reply_order_t::reordered_k ? "paired replies" : "ordinary",
-                    settings.connection_reuse == connection_reuse_t::close_k ? "close after response" : "keep-alive",
-                    load);
-        if (settings.rate) std::printf(" at %zu requests/s", settings.rate);
-        std::printf("\n  Connections: %zu\n  In-flight calls: %zu\n  Pipeline depth: %zu\n"
-                    "  Request body: %zu bytes, seed %llu\n  Security: %s\n",
-                    settings.connections, capacity, settings.pipeline_depth, settings.bytes,
-                    static_cast<unsigned long long>(settings.seed),
-                    has_server_key   ? "Noise IK"
-                    : has_client_key ? "Noise XX"
-                                     : "plaintext");
+        fmt::format_to(out,
+                       "Configuration\n  Origins: {}\n  ForkUnion workers: {}, {}\n  Clients: {}\n  Workload: {}\n" //
+                       "  Connection reuse: {}\n  Load: {}",
+                       settings.urls.size(), settings.threads, pinned ? "pinned to cores" : "floating", clients,
+                       settings.reply_order == reply_order_t::reordered_k ? "paired replies" : "ordinary",
+                       settings.connection_reuse == connection_reuse_t::close_k ? "close after response" : "keep-alive",
+                       load);
+        if (settings.rate) fmt::format_to(out, " at {} requests/s", settings.rate);
+        fmt::format_to(out,
+                       "\n  Connections: {}\n  In-flight calls: {}\n  Pipeline depth: {}\n" //
+                       "  Request body: {} bytes, seed {}\n  Security: {}\n",
+                       settings.connections, capacity, settings.pipeline_depth, settings.bytes, settings.seed,
+                       has_server_key   ? "Noise IK"
+                       : has_client_key ? "Noise XX"
+                                        : "plaintext");
         // Zero leaves a phase to its other bound.
         for (auto [name, requests, limit] : {std::tuple {"Warmup", settings.warmup_requests, settings.warmup},
                                              std::tuple {"Measured", settings.requests, settings.time_limit}}) {
-            std::printf("  %s: ", name);
-            if (requests) std::printf("%zu requests%s", requests, limit.count() ? " or " : "\n");
-            if (limit.count()) std::printf("%.3f s\n", std::chrono::duration<double>(limit).count());
-            if (!requests && !limit.count()) std::printf("none\n");
+            fmt::format_to(out, "  {}: ", name);
+            if (requests) fmt::format_to(out, "{} requests{}", requests, limit.count() ? " or " : "\n");
+            if (limit.count()) fmt::format_to(out, "{:.3f} s\n", std::chrono::duration<double>(limit).count());
+            if (!requests && !limit.count()) fmt::format_to(out, "none\n");
         }
-        std::printf("Exchanges\n  Successful: %zu requests\n  Failures: %zu requests\n  Rejected: %zu requests\n"
-                    "  Elapsed: %.6f s\n  Throughput: %.1f requests/s\n"              //
-                    "  Driver CPU: %.3f us/request, %.3f of its clients' time busy\n" //
-                    "  Response body throughput: %.3f GB/s\n  Latency: mean %.2f us",
-                    successful, failures, rejected, seconds, successful / seconds, cpu_microseconds_per_request,
-                    busy_fraction, gigabytes_per_second, mean);
+        emit(stdout);
+        fmt::format_to(out,
+                       "Exchanges\n  Successful: {} requests\n  Failures: {} requests\n  Rejected: {} requests\n" //
+                       "  Elapsed: {:.6f} s\n  Throughput: {:.1f} requests/s\n"                                   //
+                       "  Driver CPU: {:.3f} us/request, {:.3f} of its clients' time busy\n"                      //
+                       "  Response body throughput: {:.3f} GB/s\n  Latency: mean {:.2f} us",
+                       successful, failures, rejected, seconds, successful / seconds, cpu_microseconds_per_request,
+                       busy_fraction, gigabytes_per_second, mean);
         for (std::size_t i = 0; i != std::size(fractions); ++i)
-            std::printf(", %s %.2f us", percentiles[i], microseconds(latencies.percentile(fractions[i])));
-        std::printf(", max %.2f us\n", microseconds(latency_max));
+            fmt::format_to(out, ", {} {:.2f} us", percentiles[i], microseconds(latencies.percentile(fractions[i])));
+        fmt::format_to(out, ", max {:.2f} us\n", microseconds(latency_max));
+        emit(stdout);
         for (std::size_t origin_index = 0; origin_index != origins.size(); ++origin_index) {
             auto const& total = origins[origin_index];
-            std::printf(
-                "  Origin %zu %s: issued %zu requests, completed %zu, successful %zu, failed %zu, rejected %zu, "
-                "byte checks %zu, reordered %zu, body %zu bytes\n"
-                "    Mean latency: %.2f us, max: %.2f us, first/last completion: %.3f/%.3f ms\n",
-                origin_index, settings.urls[origin_index].c_str(), total.issued, total.completed, total.successful,
+            fmt::format_to(
+                out,
+                "  Origin {} {}: issued {} requests, completed {}, successful {}, failed {}, rejected {}, " //
+                "byte checks {}, reordered {}, body {} bytes\n"                                             //
+                "    Mean latency: {:.2f} us, max: {:.2f} us, first/last completion: {:.3f}/{:.3f} ms\n",
+                origin_index, settings.urls[origin_index], total.issued, total.completed, total.successful,
                 total.failures, total.rejected, total.byte_checks, total.reordered, total.response_bytes,
                 total.successful
                     ? static_cast<double>(total.latency_sum / total.successful) / nanoseconds_per_microsecond_k
                     : 0.0,
                 microseconds(total.latency_max), offset(total, total.first_completed),
                 offset(total, total.last_completed));
+            emit(stdout);
         }
-        for (std::size_t i = 0; i != workers.size(); ++i)
-            std::printf("  Worker %zu: %s, %s, %zu successful requests, %zu failed requests\n", i,
-                        ucall_io_backend_name(workers[i].resolved.backend),
-                        ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
-                        workers[i].failures);
-        std::printf(
-            "Server counters\n  Stop the server with SIGINT or SIGTERM: it prints one line per loop and batch "
+        for (std::size_t i = 0; i != workers.size(); ++i) {
+            fmt::format_to(out, "  Worker {}: {}, {}, {} successful requests, {} failed requests\n", i,
+                           ucall_io_backend_name(workers[i].resolved.backend),
+                           ucall_cpu_class_name(workers[i].resolved.cpu_class), workers[i].successful,
+                           workers[i].failures);
+            emit(stdout);
+        }
+        fmt::print(
+            "Server counters\n  Stop the server with SIGINT or SIGTERM: it prints one line per loop and batch " //
             "endpoint.\n  Divide its submissions, completions, kernel enters and bytes copied by its requests.\n");
     }
     if (!successful) return 1;

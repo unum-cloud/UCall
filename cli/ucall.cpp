@@ -30,6 +30,8 @@
 #include <limits> // `std::numeric_limits`
 #include <span>   // `std::span`
 
+#include <fmt/format.h> // `fmt::print`, `fmt::format_to`, `fmt::basic_memory_buffer`
+
 #include "ucall/ucall.h"
 #include "ucall/utilities/types.hpp" // `st::vector`, `st::failed`
 #include "arguments.hpp"             // `parse_key`, `parse_duration`
@@ -43,13 +45,13 @@ enum exit_code_t : int { exit_success_k = 0, exit_failure_k = 1, exit_usage_k = 
 enum class head_output_t { omitted_k, included_k };
 
 static int usage() {
-    std::fputs("usage: ucall [-X VERB] [-H 'name: value']... [-d @FILE | -d @- | -d TEXT] [-i] [-o FILE]\n"       //
+    fmt::print(stderr,
+               "usage: ucall [-X VERB] [-H 'name: value']... [-d @FILE | -d @- | -d TEXT] [-i] [-o FILE]\n"       //
                "             [--key FILE] [--server-key FILE] [--timeout 30s] URL\n"                              //
                "       ucall proxy --listen HOST:PORT --to http+noise://HOST:PORT --key FILE --server-key FILE\n" //
                "       ucall proxy --listen HOST:PORT --security xx|ik --key FILE [--peer-key FILE]...\n"         //
                "             --to http://HOST:PORT\n"                                                             //
-               "       ucall keygen FILE\n",
-               stderr);
+               "       ucall keygen FILE\n");
     return exit_usage_k;
 }
 
@@ -157,13 +159,15 @@ static bool parse_call(std::span<char*> arguments, call_plan_t& plan) {
 }
 
 static int report(char const* step, ucall_outcome_t const& outcome) {
-    std::fprintf(stderr, "ucall: %s failed: %s\n", step, outcome.message ? outcome.message : "unknown status");
+    fmt::print(stderr, "ucall: {} failed: {}\n", step, outcome.message ? outcome.message : "unknown status");
     return exit_failure_k;
 }
 
 /** Writes the status line and every field line of @p response in arrival order, then a blank. */
 static void write_head(std::FILE* output, ucall_received_http_response_t response, int status) {
-    std::fprintf(output, "HTTP/1.1 %d\n", status);
+    // The head composes on the stack and leaves in one write ahead of the body.
+    fmt::basic_memory_buffer<char, 4096> head;
+    fmt::format_to(fmt::appender(head), "HTTP/1.1 {}\n", status);
     ucall_outcome_t outcome {};
     std::size_t count = 0;
     ucall_client_response_fields_count_t counting {response, &outcome, &count};
@@ -172,10 +176,10 @@ static void write_head(std::FILE* output, ucall_received_http_response_t respons
         ucall_bytes_view_t name {}, value {};
         ucall_client_response_field_t field {response, &outcome, index, &name, &value};
         ucall_client_response_field(&field);
-        std::fprintf(output, "%.*s: %.*s\n", static_cast<int>(name.length), reinterpret_cast<char const*>(name.data),
-                     static_cast<int>(value.length), reinterpret_cast<char const*>(value.data));
+        fmt::format_to(fmt::appender(head), "{}: {}\n", uc::text_view(name), uc::text_view(value));
     }
-    std::fputc('\n', output);
+    head.push_back('\n');
+    std::fwrite(head.data(), 1, head.size(), output);
 }
 
 static int call(std::span<char*> arguments) {
@@ -236,7 +240,7 @@ static int call(std::span<char*> arguments) {
         ucall_client_response_body_t read {completed.response, &outcome, &body};
         ucall_client_response_body(&read);
         std::FILE* output = plan.output_path ? std::fopen(plan.output_path, "wb") : stdout;
-        if (!output) std::fprintf(stderr, "ucall: cannot write %s\n", plan.output_path);
+        if (!output) fmt::print(stderr, "ucall: cannot write {}\n", plan.output_path);
         else {
             if (plan.head == head_output_t::included_k) write_head(output, completed.response, status);
             std::fwrite(body.data, 1, body.length, output);
@@ -358,9 +362,7 @@ struct proxy_t {
             [[maybe_unused]] st::status_t const placed = forwards.emplace_back(st::assume_reserved);
             forwards.back().next_free = std::exchange(free_forwards, &forwards.back());
         }
-        std::printf("Proxying %.*s to %.*s\n", static_cast<int>(resolved.interfaces[0].address.length),
-                    reinterpret_cast<char const*>(resolved.interfaces[0].address.data), static_cast<int>(to.size()),
-                    to.data());
+        fmt::print("Proxying {} to {}\n", uc::text_view(resolved.interfaces[0].address), to);
         std::fflush(stdout);
         return true;
     }
@@ -589,7 +591,7 @@ static int keygen(std::span<char*> arguments) {
     if (outcome.status != ucall_status_success_k) return report("key generation", outcome);
     std::FILE* file = std::fopen(arguments[0], "wx");
     if (!file) {
-        std::fprintf(stderr, "ucall: cannot create %s, or it already exists\n", arguments[0]);
+        fmt::print(stderr, "ucall: cannot create {}, or it already exists\n", arguments[0]);
         return exit_failure_k;
     }
     tools::print_key(file, private_key);

@@ -97,14 +97,13 @@ if (UCALL_WITH_LINUX_URING)
     include(cmake/liburing.cmake)
 endif ()
 
-if (UCALL_BUILD_TEST)
-    FetchContent_Declare(
-        fmt
-        GIT_REPOSITORY https://github.com/fmtlib/fmt.git
-        GIT_TAG 12.2.0
-        SYSTEM FIND_PACKAGE_ARGS 12.2.0
-    )
-    FetchContent_MakeAvailable(fmt)
+# Suites, benchmarks, examples and the command-line client print through {fmt}, as the sibling projects' do.
+if (UCALL_BUILD_TEST
+    OR UCALL_BUILD_BENCH
+    OR UCALL_BUILD_EXAMPLES
+    OR UCALL_INSTALL
+)
+    include(cmake/fmt.cmake)
 endif ()
 
 # Both flavors compile the same units, and their C interface lives in `c/ucall`, which `ucall::header` names alone.
@@ -300,7 +299,7 @@ if (UCALL_BUILD_EXAMPLES)
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
-        target_link_libraries(ucall_example_${example_} PRIVATE ucall_static forkunion::static ucall_warnings)
+        target_link_libraries(ucall_example_${example_} PRIVATE ucall_static forkunion::static fmt::fmt ucall_warnings)
     endforeach ()
     target_link_libraries(ucall_example_inference PRIVATE numkong::static)
     add_executable(ucall_example_hello examples/hello.c)
@@ -311,14 +310,14 @@ if (UCALL_BUILD_EXAMPLES OR UCALL_INSTALL)
     add_executable(ucall_cli cli/ucall.cpp)
     set_target_properties(ucall_cli PROPERTIES OUTPUT_NAME ucall)
     target_include_directories(ucall_cli PRIVATE tools)
-    target_link_libraries(ucall_cli PRIVATE ucall_static ucall_warnings)
+    target_link_libraries(ucall_cli PRIVATE ucall_static fmt::fmt ucall_warnings)
 endif ()
 if (UCALL_BUILD_BENCH)
     add_executable(ucall_bench_http bench/http.cpp)
     add_executable(ucall_bench_server bench/ucall_server.cpp)
     foreach (bench_ ucall_bench_http ucall_bench_server)
         target_include_directories(${bench_} PRIVATE tools)
-        target_link_libraries(${bench_} PRIVATE ucall_static forkunion::static ucall_warnings)
+        target_link_libraries(${bench_} PRIVATE ucall_static forkunion::static fmt::fmt ucall_warnings)
     endforeach ()
 endif ()
 if (UCALL_BUILD_PYTHON)
