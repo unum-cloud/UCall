@@ -494,6 +494,10 @@ struct received_response_t : ucall_received_http_response_handle_t {
     ucall_http_status_t status {};
     void (*destroy)(received_response_t*) noexcept {};
 
+    /** Pulls a streamed body's next bytes into its view, answering the pull's status; null for a
+     *  buffered response, whose body @c content holds. */
+    ucall_status_t (*body_chunk)(received_response_t*, ucall_bytes_view_t*) noexcept {};
+
     received_response_t() noexcept = default;
     received_response_t(received_response_t const&) = delete;
     received_response_t& operator=(received_response_t const&) = delete;

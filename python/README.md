@@ -306,6 +306,22 @@ Every received response is a `Response`, whatever its HTTP status, and only a fa
 A `Response` owns its received bytes, so it stays readable after its `Client` is gone, and supports the buffer protocol as a request does: `bytes(response)` copies its body and `response.body` views it.
 Releasing the client cancels the calls still in flight and discards completions not yet retrieved.
 
+### Streamed Response Bodies
+
+```python
+response = client.get(f"{base}/dataset.bin", body_delivery=ucall.BodyDelivery.STREAMED)
+with open("dataset.bin", "wb") as file:
+    for chunk in response.body_chunks():  # or: async for chunk in response.body_chunks()
+        file.write(chunk)
+```
+
+A call with `body_delivery=ucall.BodyDelivery.STREAMED`, on `submit`, `request` and every verb, completes once its head arrived, so a download larger than `max_response_bytes` is pulled through `response.body_chunks()` as it lands, while `response.body` raises `Status.INVALID_ARGUMENT`.
+Each chunk is a `memoryview` valid until the next pull, which releases it, and the bytes decoded before a failure come out before the failure is raised.
+Pulls run on the client's thread and never wait in the library: `for` advances the client while nothing was decoded, and `async for` advances it between the loop's other tasks, as `await deferred` polls.
+A client bound to a server advances only as that server's loop polls, so there `for` raises `Status.WOULD_BLOCK` and `async for` yields until the loop polled.
+Every streamed response is pulled to its end or released, bodiless ones too, as its connection carries no other call meanwhile; releasing it early closes that connection and fails the calls pipelined behind it with `Status.CONNECTION_CLOSED`.
+Redirects stay buffered so they can be followed, and only the final response streams.
+
 ## Noise Keys
 
 Interfaces and calls can run over the Noise protocol instead of plain TCP, authenticating both sides by 32-byte Curve25519 static keys.

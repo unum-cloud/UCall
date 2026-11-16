@@ -761,6 +761,360 @@ static std::size_t test_warm_client_allocates_nothing(sweep_cell_t const& cell) 
     return failures + fixture.stop();
 }
 
+/** Advances @p fixture's server loop and client once each, retrieving no completion. */
+static void advance(fixture_t& fixture) {
+    ucall_outcome_t outcome {};
+    ucall_server_take_call_t serving {fixture.server, &outcome, 0, 0};
+    ucall_server_take_call(&serving);
+    std::size_t count = 0;
+    ucall_client_take_completed_t take {fixture.client, &outcome, nullptr, 0, &count, 0};
+    ucall_client_take_completed(&take);
+}
+
+/** Submits a streamed call of @p verb to @p url under @p security, its cookie @p context. */
+static std::size_t submit_streamed(fixture_t& fixture, std::string const& url, ucall_security_t security,
+                                   void* context = nullptr, ucall_verb_t verb = ucall_verb_get_k) {
+    ucall_outcome_t outcome {};
+    ucall_client_call_t call {};
+    call.client = fixture.client;
+    call.outcome = &outcome;
+    call.url = uc::bytes_view(url);
+    call.verb = verb;
+    call.context = context;
+    call.options.security = security;
+    call.options.noise_peer_key = &fixture.server_public;
+    call.options.body_delivery = ucall_body_delivery_streamed_k;
+    ucall_client_call(&call);
+    return expect(outcome.status == ucall_status_success_k, "submitting {}: {}", url,
+                  ucall_status_name(outcome.status));
+}
+
+/** One pull of @p response, answering its status and writing what it handed into @p data. */
+static ucall_status_t pull_once(ucall_client_t client, ucall_received_http_response_t response,
+                                std::string_view& data) {
+    ucall_outcome_t outcome {};
+    ucall_bytes_view_t chunk {};
+    ucall_client_response_body_chunk_t pull {client, &outcome, response, &chunk};
+    ucall_client_response_body_chunk(&pull);
+    data = {reinterpret_cast<char const*>(chunk.data), chunk.length};
+    return outcome.status;
+}
+
+/** Pulls @p response until its body ends or fails, handing @p each every chunk and advancing the
+ *  fixture while nothing was decoded; answers how the body ended, or a timeout. */
+template <typename each_type_>
+static ucall_status_t pull_until_end(fixture_t& fixture, ucall_received_http_response_t response, each_type_&& each) {
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
+    for (;;) {
+        std::string_view data;
+        ucall_status_t const status = pull_once(fixture.client, response, data);
+        if (status == ucall_status_would_block_k) {
+            if (steady_clock::now() > deadline) return ucall_status_timeout_k;
+            advance(fixture);
+            continue;
+        }
+        if (status != ucall_status_success_k || data.empty()) return status;
+        each(data);
+    }
+}
+
+/** The 64 MiB body the download routes send, as one view and as uneven chunk-sized parts. */
+struct download_t {
+    std::string body;
+    std::vector<ucall_reply_part_t> parts;
+    ucall_server_t server {};
+    std::size_t failures = 0;
+
+    explicit download_t(random_generator_t& generator) : body(std::size_t {64} << 20, '\0') {
+        for (std::size_t offset = 0; offset != body.size(); offset += sizeof(std::uint64_t)) {
+            std::uint64_t const word = generator();
+            std::memcpy(body.data() + offset, &word, sizeof(word));
+        }
+        // Sizes straddling every receive boundary, from one byte to past the client's cap.
+        std::size_t const sizes[] {1, 7, 4093, 65536, 300'001, 1 << 20, 3 << 20};
+        for (std::size_t offset = 0, index = 0; offset != body.size(); ++index) {
+            std::size_t const size = fu::min_of(sizes[index % std::size(sizes)], body.size() - offset);
+            parts.push_back(bytes_part(std::string_view {body}.substr(offset, size)));
+            offset += size;
+        }
+    }
+
+    /** Replies with the whole body behind its <tt>content-length</tt>. */
+    static void length(ucall_received_http_request_t request, void* context) {
+        auto& download = *static_cast<download_t*>(context);
+        ucall_outcome_t outcome {};
+        ucall_server_reply_content_t reply {
+            download.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view(download.body)};
+        ucall_server_reply_content(&reply);
+        download.failures += expect(outcome.status == ucall_status_success_k, "reply: {}",
+                                    ucall_status_name(outcome.status));
+    }
+
+    /** Replies with the body in chunks of every size in @c parts. */
+    static void chunked(ucall_received_http_request_t request, void* context) {
+        auto& download = *static_cast<download_t*>(context);
+        ucall_outcome_t outcome {};
+        ucall_server_reply_begin_t begin {download.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0};
+        ucall_server_reply_begin(&begin);
+        download.failures += expect(outcome.status == ucall_status_success_k, "begin: {}",
+                                    ucall_status_name(outcome.status));
+        ucall_server_reply_append_t append {download.server, &outcome, request, download.parts.data(),
+                                            download.parts.size()};
+        ucall_server_reply_append(&append);
+        download.failures += expect(outcome.status == ucall_status_success_k, "append: {}",
+                                    ucall_status_name(outcome.status));
+        ucall_outcome_t ended {};
+        ucall_server_reply_end_t end {download.server, &ended, request};
+        ucall_server_reply_end(&end);
+        download.failures += expect(ended.status == ucall_status_success_k, "end: {}", ucall_status_name(ended.status));
+    }
+};
+
+/** A 64 MiB download through a 1 MiB response cap, by <tt>content-length</tt> and by chunks: the
+ *  call completes at the head, and the pulls hand every byte in order, then the end. */
+static std::size_t test_streamed_download(sweep_cell_t const& cell, random_generator_t& generator) {
+    std::size_t const cap = std::size_t {1} << 20;
+    fixture_t fixture {cell, {.max_response_bytes = cap}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    download_t download {generator};
+    download.server = fixture.server;
+    std::size_t failures = 0;
+    for (auto [route, callback] :
+         {std::pair {"/download/length", &download_t::length}, std::pair {"/download/chunked", &download_t::chunked}}) {
+        ucall_outcome_t outcome {};
+        ucall_server_add_http_endpoint_t add {fixture.server,   &outcome, uc::bytes_view(route),
+                                              ucall_verb_get_k, callback, &download};
+        ucall_server_add_http_endpoint(&add);
+        require(failures, outcome.status == ucall_status_success_k, "route: {}", ucall_status_name(outcome.status));
+    }
+    for (std::string_view route : {"/download/length", "/download/chunked"}) {
+        failures += submit_streamed(fixture, fmt::format("{}{}", fixture.url, route), cell.security);
+        auto const completed = fixture.wait();
+        failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}: {}", route,
+                           ucall_status_name(completed.outcome.status));
+        if (!completed.response) break;
+        failures += expect(ucall_client_response_status(completed.response) == ucall_http_status_ok_k);
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t whole {};
+        ucall_client_response_body_t get {completed.response, &outcome, &whole};
+        ucall_client_response_body(&get);
+        failures += expect(outcome.status == ucall_status_invalid_argument_k, "a streamed body read whole: {}",
+                           ucall_status_name(outcome.status));
+        std::size_t received = 0, pulls = 0, largest = 0;
+        bool matches = true;
+        ucall_status_t const ended = pull_until_end(fixture, completed.response, [&](std::string_view data) {
+            matches = matches && received + data.size() <= download.body.size() &&
+                      std::memcmp(data.data(), download.body.data() + received, data.size()) == 0;
+            received += data.size();
+            largest = fu::max_of(largest, data.size());
+            ++pulls;
+        });
+        failures += expect(ended == ucall_status_success_k && received == download.body.size() && matches,
+                           "{} ended {} after {} of {} bytes in {} pulls, {}", route, ucall_status_name(ended),
+                           received, download.body.size(), pulls, matches ? "in order" : "corrupted");
+        // Each pull drains at most the window its connection reads into, which the cap bounds.
+        failures += expect(pulls > 1 && largest <= 2 * cap, "{} pulls, the largest {} bytes", pulls, largest);
+        std::string_view data;
+        failures += expect(
+            pull_once(fixture.client, completed.response, data) == ucall_status_success_k && data.empty(),
+            "a pull past the end handed {} bytes", data.size());
+        ucall_client_response_free(completed.response);
+    }
+    return failures + download.failures + fixture.stop();
+}
+
+/** A streamed call's small or missing body answers in one pull and then the end, a larger one in
+ *  however many pulls it arrived in, and a buffered response refuses pulls. */
+static std::size_t test_streamed_whole_bodies(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {}};
+    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    std::size_t failures = 0;
+    struct planned_t {
+        ucall_verb_t verb;
+        std::string_view target;
+        ucall_http_status_t status;
+    };
+    for (planned_t const planned : {planned_t {ucall_verb_get_k, "/vectored", ucall_http_status_created_k},
+                                    planned_t {ucall_verb_head_k, "/vectored", ucall_http_status_created_k},
+                                    planned_t {ucall_verb_get_k, "/status/204", 204},
+                                    planned_t {ucall_verb_get_k, "/headers", ucall_http_status_ok_k}}) {
+        failures += submit_streamed(fixture, fmt::format("{}{}", fixture.url, planned.target), cell.security, nullptr,
+                                    planned.verb);
+        auto const completed = fixture.wait();
+        failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}: {}",
+                           planned.target, ucall_status_name(completed.outcome.status));
+        if (!completed.response) break;
+        failures += expect(ucall_client_response_status(completed.response) == planned.status, "{} answered {}",
+                           planned.target, ucall_client_response_status(completed.response));
+        bool const bodiless = planned.verb == ucall_verb_head_k || planned.status == 204;
+        if (bodiless || planned.target == "/headers") {
+            std::string_view first, second;
+            ucall_status_t const once = pull_once(fixture.client, completed.response, first);
+            ucall_status_t const twice = pull_once(fixture.client, completed.response, second);
+            failures += expect(once == ucall_status_success_k && twice == ucall_status_success_k && second.empty() &&
+                                   first.empty() == bodiless,
+                               "{} {} pulled {} bytes as {}, then {} bytes as {}",
+                               planned.verb == ucall_verb_head_k ? "HEAD" : "GET", planned.target, first.size(),
+                               ucall_status_name(once), second.size(), ucall_status_name(twice));
+        }
+        else {
+            std::size_t received = 0;
+            ucall_status_t const ended = pull_until_end(fixture, completed.response,
+                                                        [&](std::string_view data) { received += data.size(); });
+            failures += expect(ended == ucall_status_success_k && received == 100 * 1024 + 11,
+                               "{} ended {} after {} bytes", planned.target, ucall_status_name(ended), received);
+        }
+        ucall_client_response_free(completed.response);
+    }
+    auto const buffered = call_and_wait(fixture, ucall_verb_get_k, "/echo/1", cell.security, failures);
+    if (buffered.response) {
+        std::string_view data;
+        failures += expect(pull_once(fixture.client, buffered.response, data) == ucall_status_invalid_argument_k,
+                           "a buffered response was pulled");
+        ucall_client_response_free(buffered.response);
+    }
+    return failures + fixture.stop();
+}
+
+/** A body cut short, a malformed chunk size, and a close-delimited body past the cap: the pulls
+ *  hand what was decoded, then how the body ended. */
+static std::size_t test_streamed_endings(sweep_cell_t const& cell, random_generator_t& generator) {
+    std::size_t const cap = 64 * 1024;
+    std::string const long_body(2 * cap, 'c');
+    struct planned_t {
+        std::string answer;
+        std::string_view expected;
+        ucall_status_t ended;
+    };
+    planned_t const plan[] {
+        {"HTTP/1.1 200 OK\r\ntransfer-encoding: chunked\r\n\r\n5\r\nhello\r\nzz\r\n", "hello",
+         ucall_status_malformed_k},
+        {"HTTP/1.1 200 OK\r\ncontent-length: 100\r\n\r\nshort", "short", ucall_status_connection_closed_k},
+        {fmt::format("HTTP/1.1 200 OK\r\n\r\n{}", long_body), long_body, ucall_status_success_k},
+    };
+    std::size_t failures = 0;
+    for (planned_t const& planned : plan) {
+        fixture_t fixture {cell, {.max_response_bytes = cap}};
+        scripted_server_t server {generator, [&](std::string_view, std::size_t, std::size_t) {
+                                      return scripted_answer_t {planned.answer, after_answer_t::close_k};
+                                  }};
+        require(failures, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+                ucall_status_name(fixture.status));
+        failures += submit_streamed(fixture, server.url("/ending"), ucall_security_none_k);
+        auto const completed = fixture.wait();
+        failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "the head: {}",
+                           ucall_status_name(completed.outcome.status));
+        if (completed.response) {
+            std::string received;
+            ucall_status_t const ended = pull_until_end(fixture, completed.response,
+                                                        [&](std::string_view data) { received += data; });
+            failures += expect(ended == planned.ended && received == planned.expected,
+                               "ended {} rather than {} after {} bytes", ucall_status_name(ended),
+                               ucall_status_name(planned.ended), received.size());
+            ucall_client_response_free(completed.response);
+        }
+        server.stop();
+        failures += fixture.stop();
+    }
+    return failures;
+}
+
+/** A streamed body past the cap is a barrier before the response pipelined behind it, which
+ *  answers its own call once the body ended, on the same connection. */
+static std::size_t test_streamed_barrier(sweep_cell_t const& cell, random_generator_t& generator) {
+    std::size_t const cap = 64 * 1024;
+    std::string const body(4 * cap, 'b');
+    fixture_t fixture {cell, {.pipelined_calls = 2, .max_response_bytes = cap}};
+    scripted_server_t server {generator,
+                              [&](std::string_view request, std::size_t connection, std::size_t index) {
+                                  return index ? answer_target(request, connection, index) : answer_ok(body);
+                              },
+                              100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    int streamed = 0;
+    scripted_call_t follower {server.url("/follower")};
+    follower.expected = "/follower";
+    std::size_t failures = submit_streamed(fixture, server.url("/streamed"), ucall_security_none_k, &streamed);
+    failures += submit(fixture, follower);
+    auto const head = fixture.wait();
+    failures += expect(head.context == &streamed && head.outcome.status == ucall_status_success_k && head.response,
+                       "the streamed call completed {}", ucall_status_name(head.outcome.status));
+    if (head.response) {
+        std::size_t received = 0;
+        ucall_status_t const ended = pull_until_end(fixture, head.response,
+                                                    [&](std::string_view data) { received += data.size(); });
+        failures += expect(ended == ucall_status_success_k && received == body.size(), "ended {} after {} bytes",
+                           ucall_status_name(ended), received);
+        ucall_client_response_free(head.response);
+    }
+    failures += check_answer(fixture.wait());
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {2}),
+                       "{} connections carried the calls", server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
+/** Freeing a streamed response mid-body closes its connection and ends the call pipelined behind it
+ *  with @c ucall_status_connection_closed_k, never sending it again; freeing the client then cuts
+ *  another streamed body short. */
+static std::size_t test_streamed_free_mid_body(sweep_cell_t const& cell, random_generator_t& generator) {
+    fixture_t fixture {cell, {.pipelined_calls = 2}};
+    scripted_server_t server {
+        generator,
+        [](std::string_view, std::size_t, std::size_t index) {
+            std::string_view const head = "HTTP/1.1 200 OK\r\ncontent-length: 1000000\r\n\r\npartial";
+            return scripted_answer_t {std::string {index ? std::string_view {} : head}};
+        },
+        100ms};
+    require(0, fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+            ucall_status_name(fixture.status));
+    int streamed = 0;
+    scripted_call_t follower {server.url("/follower")};
+    std::size_t failures = submit_streamed(fixture, server.url("/streamed"), ucall_security_none_k, &streamed);
+    failures += submit(fixture, follower);
+    auto const head = fixture.wait();
+    failures += expect(head.context == &streamed && head.outcome.status == ucall_status_success_k && head.response,
+                       "the streamed call completed {}", ucall_status_name(head.outcome.status));
+    if (head.response) {
+        std::string received;
+        steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
+        while (received.size() < 7 && steady_clock::now() < deadline) {
+            std::string_view data;
+            if (pull_once(fixture.client, head.response, data) == ucall_status_success_k) received += data;
+            else advance(fixture);
+        }
+        failures += expect(received == "partial", "pulled {:?}", received);
+        ucall_client_response_free(head.response);
+    }
+    auto const settled = fixture.wait();
+    failures += expect(
+        settled.context == &follower && settled.outcome.status == ucall_status_connection_closed_k && !settled.response,
+        "the follower completed {}", ucall_status_name(settled.outcome.status));
+    if (settled.response) ucall_client_response_free(settled.response);
+
+    // A second connection streams another body, which the client's free cuts short.
+    failures += submit_streamed(fixture, server.url("/streamed"), ucall_security_none_k, &streamed);
+    auto const second = fixture.wait();
+    failures += expect(second.outcome.status == ucall_status_success_k && second.response, "the second call: {}",
+                       ucall_status_name(second.outcome.status));
+    // A pull names the client its response came from, whose handle it never reads.
+    ucall_client_t const freed = std::exchange(fixture.client, nullptr);
+    ucall_client_free(freed);
+    if (second.response) {
+        std::string_view data;
+        ucall_status_t const status = pull_once(freed, second.response, data);
+        failures += expect(status == ucall_status_connection_closed_k && data.empty(),
+                           "a pull after the client's free answered {} with {} bytes", ucall_status_name(status),
+                           data.size());
+        ucall_client_response_free(second.response);
+    }
+    server.stop();
+    failures += expect(server.requests_per_connection == (std::vector<std::size_t> {2, 1}),
+                       "{} connections carried the calls", server.requests_per_connection.size());
+    return failures + fixture.stop();
+}
+
 std::size_t check_client(sweep_cell_t const& cell, settings_t const& settings) {
     random_generator_t generator {stream_key(settings.seed, name_of(cell))};
     std::size_t failures = 0;
@@ -779,7 +1133,12 @@ std::size_t check_client(sweep_cell_t const& cell, settings_t const& settings) {
         failures += test_client_response_fields(cell, generator);
         failures += test_client_log_lines(cell);
         failures += test_bound_client_calls_from_handler(cell);
+        failures += test_streamed_endings(cell, generator);
+        failures += test_streamed_free_mid_body(cell, generator);
+        failures += test_streamed_barrier(cell, generator);
     }
+    failures += test_streamed_whole_bodies(cell);
+    failures += test_streamed_download(cell, generator);
     if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k) {
         failures += test_client_responses_outlive_free(cell);
         failures += test_warm_client_allocates_nothing(cell);

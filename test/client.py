@@ -6,6 +6,7 @@ Author: Ash Vardanian
 Date: October 25, 2026
 """
 
+import asyncio
 import socket
 import threading
 import time
@@ -85,6 +86,69 @@ def test_response_cap_fails_with_overflow(backend, loopback, serving):
         with pytest.raises(ucall.Error) as capped:
             client.post(f"{base}/echo", bytes(4096))
         assert capped.value.status == ucall.Status.OVERFLOW
+
+
+def test_streamed_bodies_download_past_the_response_cap(backend, loopback, serving):
+    server = ucall.Server(loopback(), backend=backend)
+    # A prime period, so a misplaced or repeated chunk shows.
+    payload = (bytes(range(251)) * ((4 << 20) // 251 + 1))[: 4 << 20]
+
+    @server.get("/large")
+    def large(request: ucall.Request):
+        return payload
+
+    @server.get("/empty")
+    def empty(request: ucall.Request):
+        return b""
+
+    with serving(server) as base:
+        client = ucall.Client(connections=1, backend=backend, max_response_bytes=1 << 20)
+        with pytest.raises(ucall.Error) as capped:
+            client.get(f"{base}/large")
+        assert capped.value.status == ucall.Status.OVERFLOW
+
+        response = client.get(f"{base}/large", body_delivery=ucall.BodyDelivery.STREAMED)
+        assert response.status_code == 200
+        with pytest.raises(ucall.Error) as buffered:
+            _ = response.body
+        assert buffered.value.status == ucall.Status.INVALID_ARGUMENT
+        chunks = response.body_chunks()
+        first = next(chunks)
+        head, kept = bytes(first), first[:1]
+        with pytest.raises(BufferError):
+            next(chunks)
+        kept.release()
+        assert head + b"".join(bytes(chunk) for chunk in chunks) == payload
+
+        async def drain(response):
+            return b"".join([bytes(chunk) async for chunk in response.body_chunks()])
+
+        response = client.get(f"{base}/large", body_delivery=ucall.BodyDelivery.STREAMED)
+        assert asyncio.run(drain(response)) == payload
+
+        # A bodiless response is pulled too, before its connection carries the next call.
+        response = client.get(f"{base}/empty", body_delivery=ucall.BodyDelivery.STREAMED)
+        assert list(response.body_chunks()) == []
+        response = client.get(f"{base}/empty")
+        assert bytes(response.body) == b""
+        with pytest.raises(ucall.Error) as refused:
+            next(response.body_chunks())
+        assert refused.value.status == ucall.Status.INVALID_ARGUMENT
+
+        response = client.get(f"{base}/empty", body_delivery=ucall.BodyDelivery.STREAMED)
+        failures = []
+
+        def intrude():
+            try:
+                next(response.body_chunks())
+            except ucall.Error as error:
+                failures.append(error.status)
+
+        intruder = threading.Thread(target=intrude)
+        intruder.start()
+        intruder.join()
+        assert failures == [ucall.Status.INVALID_ARGUMENT]
+        assert list(response.body_chunks()) == []
 
 
 def test_request_options_per_call(backend, loopback, serving):

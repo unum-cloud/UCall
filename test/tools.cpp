@@ -101,7 +101,7 @@ static std::string read_file(scratch_directory_t const& scratch, std::string_vie
  *  a stale or linked temporary refuses the write and leaves the target alone, and
  *  <tt>keygen</tt> writes an owner-only key and never replaces an existing one. */
 static std::size_t test_cli_landing(sweep_cell_t const& cell) {
-    fixture_t fixture {cell, {.connections = 4}};
+    fixture_t fixture {cell, {.connections = 4, .max_request_bytes = 8 << 20}};
     require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
     scratch_directory_t scratch;
     require(0, scratch.ready() && scratch.write("out.txt", "earlier"));
@@ -112,6 +112,16 @@ static std::size_t test_cli_landing(sweep_cell_t const& cell) {
     auto const landed = run_cli(scratch, fmt::format("-o {} -d landed {}/echo/6", output, fixture.url));
     failures += expect(landed.exit_code == 0 && read_file(scratch, "out.txt") == "landed", "-o exited {} leaving {:?}",
                        landed.exit_code, read_file(scratch, "out.txt"));
+
+    // Several MiB stream through the pulls into the landed file, byte for byte.
+    std::string large(6 << 20, '\0');
+    for (std::size_t i = 0; i != large.size(); ++i) large[i] = static_cast<char>('a' + i % 23);
+    require(0, scratch.write("large.bin", large));
+    auto const streamed = run_cli(scratch, fmt::format("-o {} -d @{} {}/echo/9", scratch.name("large.out"),
+                                                       scratch.name("large.bin"), fixture.url));
+    failures += expect(streamed.exit_code == 0 && read_file(scratch, "large.out") == large,
+                       "a streamed -o exited {} leaving {} bytes", streamed.exit_code,
+                       read_file(scratch, "large.out").size());
 
     require(0, scratch.write("out.txt.tmp", "stale"));
     auto const stale = run_cli(scratch, fmt::format("-o {} -d lost {}/echo/7 2>/dev/null", output, fixture.url));

@@ -41,7 +41,7 @@ mod types;
 #[cfg(test)]
 mod testing;
 
-pub use client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed, Response};
+pub use client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed, Response, ResponseBodyChunk};
 pub use server::{
     Batch, BatchEndpoint, BatchEndpointStatistics, Batching, BodyChunk, DetachedRequest, EventLoopStatistics,
     FileRange, Interface, Metrics, PathRange, Peer, PeerAddress, Polling, ReplyPart, ReplyStream, Request, RequestPart,

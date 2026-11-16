@@ -53,6 +53,11 @@ using utilities::sockets_start;
 using utilities::span;
 using utilities::text_view;
 
+/** Where a streamed response's body stands: whole in @c storage and not yet pulled, arriving
+ *  through its connection, abandoned by a free while arriving, or ended. A free and the client's
+ *  end of the body race only from @c arriving_k, so whichever comes second returns the response. */
+enum class response_body_t : std::uint32_t { whole_k, arriving_k, abandoned_k, ended_k };
+
 /** A received response, homed in its client's pool, which a free returns it to. */
 template <typename network_type_>
 struct response {
@@ -60,6 +65,7 @@ struct response {
     using response_t = typename network_t::response_t;
     using response_pool_t = typename network_t::response_pool_t;
     using client_t = typename network_t::client_t;
+    using client_connection_t = typename network_t::client_connection_t;
     template <typename value_type_>
     using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
     template <typename value_type_>
@@ -67,7 +73,8 @@ struct response {
     template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
     explicit response(response_pool_t& home) noexcept
-        : storage(rebound_allocator<byte_t> {home.allocator}), pool(&home) {
+        : storage(rebound_allocator<byte_t> {home.allocator}), body_chunk(rebound_allocator<byte_t> {home.allocator}),
+          pulled_chunk(rebound_allocator<byte_t> {home.allocator}), pool(&home) {
         static_assert(offsetof(response_t, received) == 0);
         received.destroy = &release;
     }
@@ -78,6 +85,22 @@ struct response {
     /** The response's bytes, head then body, which @c received.content views; kept warm. */
     vector<byte_t> storage;
 
+    /** A streamed body's bytes decoded since the last pull, which its connection rotates in. */
+    vector<byte_t> body_chunk;
+
+    /** The bytes the last pull handed out, kept until the next pull or the free. */
+    vector<byte_t> pulled_chunk;
+
+    /** The connection decoding a streamed body into @c body_chunk while attached, or null. */
+    client_connection_t* connection {};
+
+    /** How a streamed body ended once @c body is @c ended_k: success, or why it was cut short. */
+    ucall_status_t body_status {ucall_status_success_k};
+
+    /** Where a streamed body stands, read only while @c received.body_chunk is set, and touched
+     *  through @c atomic_ref, as the free runs on any thread. */
+    response_body_t body {};
+
     /** Links the client's free responses, or the pool's stack of returned ones. */
     response_t* next {};
 
@@ -86,6 +109,11 @@ struct response {
 
     static void release(received_response_t* response) noexcept {
         auto* owned = reinterpret_cast<response_t*>(response);
+        // A body still arriving is its client's to return once it sees the free, so this is all.
+        response_body_t arriving = response_body_t::arriving_k;
+        if (atomic_ref<response_body_t> {owned->body}.compare_exchange_strong(
+                arriving, response_body_t::abandoned_k, std::memory_order_acq_rel, std::memory_order_acquire))
+            return;
         response_pool_t& home = *owned->pool;
         // Home first, so the count never names a response nobody holds.
         home.returned.push(*owned);
@@ -288,12 +316,13 @@ struct client_connection {
     using client_origin_t = typename network_t::client_origin_t;
     using client_connection_t = typename network_t::client_connection_t;
     using client_t = typename network_t::client_t;
+    using response_t = typename network_t::response_t;
     explicit client_connection(allocator_t const& allocator) noexcept
         : transport(allocator), requests(rebound_allocator<byte_t> {allocator}) {
         transport.role = transport_role_t::client_k;
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(client_connection) == 2256);
+            static_assert(sizeof(client_connection) == 2264);
     }
     client_connection(client_connection const&) = delete;
     client_connection& operator=(client_connection const&) = delete;
@@ -341,6 +370,9 @@ struct client_connection {
 
     /** Calls from @c oldest_exchange to @c newest_exchange, up to the pipeline depth. */
     std::uint32_t outstanding_exchanges {};
+
+    /** The response whose body it decodes, a barrier before the responses behind it, or null. */
+    response_t* streaming {};
 
     /** The other connection racing it for one call, the first to open taking the call, or null. */
     client_connection_t* rival {};
@@ -476,6 +508,9 @@ struct client : ucall_client_handle_t {
 
     /** Responses taken back from @c responses for the next answers, linked through @c next. */
     response_t* free_responses {};
+
+    /** Connections whose @c streaming is set, which each round checks for a freed response. */
+    std::size_t streaming_connections {};
     ~client() noexcept {
         owned_engine.stop();
         crypto_t::secure_zero(private_key);
@@ -488,6 +523,12 @@ struct client : ucall_client_handle_t {
             for (auto& question : lookup.questions)
                 if (question.descriptor >= 0) engine->close_socket(question.descriptor);
         for (std::size_t i = 0; i != completed.size(); ++i) ucall_client_response_free(completed[i].response);
+        // After the frees above, so a body freed there returns here.
+        for (auto& connection : connections) {
+            if (!connection || !connection->streaming) continue;
+            connection->streaming->body_chunk.clear();
+            end_body(*this, *connection, ucall_status_connection_closed_k);
+        }
         delete_responses(allocator, free_responses);
         if (responses && atomic_ref<std::size_t> {responses->outside}.fetch_sub(1, std::memory_order_acq_rel) == 1)
             delete_pool(*responses);
@@ -907,7 +948,8 @@ struct client : ucall_client_handle_t {
      *  closes the connection or, per RFC 9112 §9.3.2, cannot be replayed. */
     static bool accepts_another_exchange(client_t const& client, client_connection_t const& connection) noexcept {
         client_exchange_t const* newest = connection.newest_exchange;
-        return connection.outstanding_exchanges < client.config.max_pipelined_calls &&
+        // A streamed body holds the connection, so a call that cannot be sent yet goes elsewhere.
+        return !connection.streaming && connection.outstanding_exchanges < client.config.max_pipelined_calls &&
                (!newest || (newest->connection_intent == http_connection_t::keep_alive_k && idempotent(*newest)));
     }
 
@@ -921,7 +963,7 @@ struct client : ucall_client_handle_t {
      *  though an open connection keeps a receive posted meanwhile. */
     static bool connection_vacant(client_connection_t const& connection) noexcept {
         auto stage = connection.transport.stage;
-        return !connection.oldest_exchange &&
+        return !connection.oldest_exchange && !connection.streaming &&
                (stage == transport_stage_t::idle_k || stage == transport_stage_t::open_k ||
                 stage == transport_stage_t::closed_k);
     }
@@ -1067,6 +1109,9 @@ struct client : ucall_client_handle_t {
         if (response) {
             client.free_responses = response->next;
             response->storage.clear();
+            response->body_chunk.clear();
+            response->pulled_chunk.clear();
+            response->received.body_chunk = nullptr;
         }
         else response = allocate_unique<response_t>(client.allocator, *client.responses).release();
         if (response) atomic_ref<std::size_t> {client.responses->outside}.store_add(1, std::memory_order_relaxed);
@@ -1108,6 +1153,11 @@ struct client : ucall_client_handle_t {
             response->received.body_length = message.body_length;
             response->received.status = code;
             response->received.content = response->storage;
+            // A streamed call's body that came whole with its head is pulled all at once.
+            if (exchange.arguments.options.body_delivery == ucall_body_delivery_streamed_k) {
+                response->received.body_chunk = &finish_pull;
+                response->body = response_body_t::whole_k;
+            }
             status = ucall_status_success_k;
         }
         ++connection.answered_exchanges;
@@ -1120,6 +1170,138 @@ struct client : ucall_client_handle_t {
         if (!exchange.origin) return finish_exchange(client, exchange, ucall_status_out_of_memory_k);
         exchange.attempts = 0;
         queue_call(client, exchange);
+    }
+
+    /** Ends @p connection's streamed body with @p status: its response keeps what was decoded for
+     *  its pulls, unless its free came first, when it returns to the client now. */
+    static void end_body(client_t& client, client_connection_t& connection, ucall_status_t status) noexcept {
+        response_t& response = *std::exchange(connection.streaming, nullptr);
+        --client.streaming_connections;
+        response.connection = nullptr;
+        response.body_status = status;
+        // Releasing orders the end before a pull that reads it after the client's free.
+        response_body_t arriving = response_body_t::arriving_k;
+        if (atomic_ref<response_body_t> {response.body}.compare_exchange_strong(
+                arriving, response_body_t::ended_k, std::memory_order_acq_rel, std::memory_order_acquire))
+            return;
+        response.next = std::exchange(client.free_responses, &response);
+        // Never the last count, as the client holds its own.
+        atomic_ref<std::size_t> {client.responses->outside}.store_sub(1, std::memory_order_acq_rel);
+    }
+
+    /** Hands @p received's bytes decoded since the last pull, the end, or how the body was cut
+     *  short, on its client's owner thread. */
+    static ucall_status_t finish_pull(received_response_t* received, ucall_bytes_view_t* data) noexcept {
+        auto& response = *reinterpret_cast<response_t*>(received);
+        // Acquiring the state orders what the client wrote as it ended the body before these reads.
+        response_body_t const body = atomic_ref<response_body_t> {response.body}.load(std::memory_order_acquire);
+        response.pulled_chunk.clear();
+        if (body == response_body_t::whole_k) {
+            atomic_ref<response_body_t> {response.body}.store(response_body_t::ended_k, std::memory_order_relaxed);
+            *data = bytes_view(text_view(response.storage).substr(received->headers_length, received->body_length));
+            return ucall_status_success_k;
+        }
+        if (!response.body_chunk.empty()) {
+            std::swap(response.pulled_chunk, response.body_chunk);
+            *data = bytes_view(text_view(response.pulled_chunk));
+            // Its connection stopped reading while these bytes waited.
+            if (body == response_body_t::arriving_k) mark_ready(*response.connection->client, *response.connection);
+            return ucall_status_success_k;
+        }
+        return body == response_body_t::ended_k ? response.body_status : ucall_status_would_block_k;
+    }
+
+    /** Completes @p connection's oldest call with the head parsed at @p offset of @c input, rule
+     *  C1b of @c call_open: the head moves to a fresh response, and the body behind it stays in
+     *  @c input to stream into that response. */
+    static void dispatch_streamed(client_t& client, client_connection_t& connection, std::size_t offset) noexcept {
+        auto& transport = connection.transport;
+        auto& message = transport.message;
+        auto& exchange = *connection.oldest_exchange;
+        response_t* response = take_response(client);
+        if (!response) return transport.fail(ucall_status_out_of_memory_k);
+        if (ucall_status_t const appended = http_t::append_text(
+                response->storage, {transport.text().substr(offset, message.headers_length)});
+            appended != ucall_status_success_k) {
+            response_t::release(&response->received);
+            return transport.fail(appended);
+        }
+        http_t::drop_bytes(transport.input, offset + message.headers_length);
+        response->received.headers_length = message.headers_length;
+        response->received.body_length = 0;
+        response->received.status = message.status;
+        response->received.content = response->storage;
+        response->received.body_chunk = &finish_pull;
+        response->body = response_body_t::arriving_k;
+        response->body_status = ucall_status_success_k;
+        response->connection = &connection;
+        connection.streaming = response;
+        ++client.streaming_connections;
+        // The connection keeps the framing and decodes the body from the front of what remains.
+        message.decoded_length = message.chunk_remaining = message.cursor = message.scanned = 0;
+        message.chunk_state = http::http_chunk_state_t::size_k;
+        // A caller's close waits for the body, past the call itself.
+        if (exchange.connection_intent == http_connection_t::close_k) message.connection = http_connection_t::close_k;
+        ++connection.answered_exchanges;
+        pop_call(connection);
+        finish_exchange(client, exchange, ucall_status_success_k, response);
+    }
+
+    /** Decodes what @c input holds of @p connection's streamed body in place and, once the last
+     *  bytes were pulled, rotates @c input into the response's @c body_chunk, as a server's
+     *  @c stream_body does; complete once the body ended, leaving what follows it in @c input. */
+    static http_parse_t stream_body(client_t& client, client_connection_t& connection) noexcept {
+        auto& transport = connection.transport;
+        auto& message = transport.message;
+        response_t& response = *connection.streaming;
+        if (atomic_ref<response_body_t> {response.body}.load(std::memory_order_acquire) ==
+            response_body_t::abandoned_k) {
+            // Nothing behind an unread body can be framed past, and replaying the calls behind it
+            // would undo the caller's choice to drop it.
+            while (connection.oldest_exchange)
+                finish_exchange(client, pop_call(connection), ucall_status_connection_closed_k);
+            transport.fail(ucall_status_connection_closed_k);
+            end_body(client, connection, ucall_status_connection_closed_k);
+            return http_parse_t::malformed_k;
+        }
+        if (!response.body_chunk.empty()) return http_parse_t::incomplete_k;
+        std::size_t payload = 0, consumed = 0;
+        http_parse_t parsed = http_parse_t::incomplete_k;
+        // Over Noise only a close record, never a bare end of stream, ends a close-delimited body.
+        if (message.framing == http_framing_t::until_close_k) {
+            payload = consumed = transport.input.size();
+            if (transport.peer_stream == peer_stream_t::closed_k &&
+                !(transport.tunnel.encrypts() && transport.tunnel.may_open()))
+                parsed = http_parse_t::complete_k;
+        }
+        else
+            parsed = http_t::http_stream_body(transport.input, message, client.config.max_response_bytes, payload,
+                                              consumed);
+        if (payload) {
+            // Rotating buffers hands the payload over where it was decoded, never copying it.
+            std::swap(response.body_chunk, transport.input);
+            transport.input.clear();
+            ucall_status_t const kept = http_t::append_text(transport.input,
+                                                            {text_view(response.body_chunk).substr(consumed)});
+            if (kept != ucall_status_success_k) transport.fail(kept);
+            // Never grows.
+            [[maybe_unused]] st::status_t const shrunk = response.body_chunk.resize(payload);
+        }
+        else http_t::drop_bytes(transport.input, consumed);
+        // What decoded before bad framing is handed out before the failure is.
+        if (parsed != http_parse_t::complete_k && parsed != http_parse_t::incomplete_k) {
+            end_body(client, connection, ucall_status_malformed_k);
+            transport.fail(ucall_status_malformed_k);
+        }
+        else if (parsed == http_parse_t::complete_k) {
+            bool const closes = !message.keep_alive();
+            message = {};
+            end_body(client, connection, ucall_status_success_k);
+            if (closes) transport.fail(ucall_status_success_k);
+        }
+        else if (transport.peer_stream == peer_stream_t::closed_k)
+            end_body(client, connection, ucall_status_connection_closed_k);
+        return parsed;
     }
 
     /** Composes into @p connection's requests every waiting call of its origin that
@@ -1151,14 +1333,21 @@ struct client : ucall_client_handle_t {
      *  in order:
      *  C1 responses: while reading and a sent call awaits, each whole response answers the oldest
      *     call, a redirect queueing it again as a fresh call; a response without keep-alive, or to
-     *     a call that asked to close, closes the connection.
+     *     a call that asked to close, closes the connection. A streamed call's final response
+     *     answers it at its head, unless its body came whole within the cap.
+     *  C1b bodies: a streamed body is a barrier, decoded into its response's chunk before any
+     *     response behind it parses; while that chunk is unpulled the connection reads nothing, and
+     *     the cap bounds only the head and each framing line. Its end closes as C1 says, a free of
+     *     its response closes the connection, ending every call behind it with
+     *     @c ucall_status_connection_closed_k, never sent again, and a close cuts it short.
      *  C2 requests: while reading, an idle transmit side composes every call of the origin's queue
      *     that @c accepts_another_exchange lets this connection carry into @c output, appending
      *     each to the FIFO, so one send takes them all.
      *  C3 emit: while reading, the next chunk of those requests while its send is idle, else a
      *     receive, posted even with no call so a peer close is seen before reuse.
      *  C4 done: a peer close, or bytes no call asked for, close the connection, losing any call
-     *     still on the FIFO; with the FIFO empty and the side reading, the connection stays open.
+     *     still on the FIFO, once no body streams; with the FIFO empty and the side reading, the
+     *     connection stays open.
      *  C5 loss: @c call_lost settles the calls of the closed connection. */
     static io_request_t* call_open(client_t& client, client_connection_t& connection) noexcept {
         auto& transport = connection.transport;
@@ -1171,13 +1360,33 @@ struct client : ucall_client_handle_t {
         // Responses answered this round, erased from `input` once after it rather than one by one.
         std::size_t consumed = 0;
         while (transport.stage == transport_stage_t::open_k && transport.receiving == receive_state_t::reading_k &&
-               awaits_response(connection)) {
+               (connection.streaming || awaits_response(connection))) {
+            if (connection.streaming) {
+                if (stream_body(client, connection) == http_parse_t::complete_k) continue;
+                // An engine prefetching into a shared ring parks what an unpulled body holds there.
+                if (connection.streaming && !connection.streaming->body_chunk.empty())
+                    client.engine->receive_pause(transport.descriptor);
+                break;
+            }
             auto role = connection.oldest_exchange->arguments.verb == ucall_verb_head_k ? http_role_t::head_response_k
                                                                                         : http_role_t::response_k;
             span<byte_t> unparsed {input.data() + consumed, input.data() + input.size()};
             auto parsed = http_t::http_parse(unparsed, transport.message, role);
             auto const& message = transport.message;
             auto const cap = client.config.max_response_bytes;
+            // A parsed head is valid, so what the body holds is the stream's to report.
+            // Redirects stay buffered, so a streamed call follows them as a buffered one does.
+            auto const code = message.status;
+            bool const streamed = connection.oldest_exchange->arguments.options.body_delivery ==
+                                      ucall_body_delivery_streamed_k &&
+                                  message.headers_length && code >= 200 && code != 301 && code != 302 && code != 303 &&
+                                  code != 307 && code != 308;
+            if (streamed && message.headers_length <= cap &&
+                !(parsed == http_parse_t::complete_k && message.wire_length <= cap)) {
+                dispatch_streamed(client, connection, consumed);
+                consumed = 0;
+                continue;
+            }
             // Bounded as a server bounds requests: a declared length up front, anything else
             // as it arrives.
             bool const fits = message.headers_length && message.framing == http_framing_t::length_k
@@ -1220,7 +1429,9 @@ struct client : ucall_client_handle_t {
         transport.aim_receive();
         if (transport.stage != transport_stage_t::open_k)
             return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
-        if (transport.peer_stream == peer_stream_t::closed_k || (!connection.oldest_exchange && !input.empty()))
+        // A streamed body ends itself, and what follows a peer's close in it is its own.
+        if (!connection.streaming &&
+            (transport.peer_stream == peer_stream_t::closed_k || (!connection.oldest_exchange && !input.empty())))
             transport.receiving = receive_state_t::ended_k;
         if (transport.receiving == receive_state_t::reading_k) {
             client_origin_t& origin = *connection.origin;
@@ -1236,7 +1447,10 @@ struct client : ucall_client_handle_t {
                 // Sealing failed the connection.
                 return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
             }
-            if (transport.receive_operation == operation_state_t::idle_k) return transport.emit_receive();
+            // A streamed body reads on only once its last chunk was pulled.
+            if (transport.receive_operation == operation_state_t::idle_k &&
+                (!connection.streaming || connection.streaming->body_chunk.empty()))
+                return transport.emit_receive();
             return nullptr;
         }
         transport.fail(connection.oldest_exchange ? ucall_status_connection_closed_k : ucall_status_success_k);
@@ -1328,6 +1542,8 @@ struct client : ucall_client_handle_t {
             if (transport.transmit_operation == operation_state_t::submitted_k)
                 client.engine->cancel(transport.transmit_request);
         }
+        if (connection.streaming && transport.stage != transport_stage_t::open_k)
+            end_body(client, connection, ucall_status_connection_closed_k);
         if (transport.stage == transport_stage_t::closed_k && connection.oldest_exchange)
             call_lost(client, connection, now);
         // A rival that lost its own connect leaves its connection dialing alone.
@@ -1394,6 +1610,12 @@ struct client : ucall_client_handle_t {
                 else if (!earliest || connection_due(*connection) < earliest) earliest = connection_due(*connection);
             }
         }
+        // A response freed mid-body wakes no connection, so each round looks at those streaming.
+        if (client.streaming_connections)
+            for (auto& connection : client.connections)
+                if (connection->streaming && atomic_ref<response_body_t> {connection->streaming->body}.load(
+                                                 std::memory_order_acquire) == response_body_t::abandoned_k)
+                    mark_ready(client, *connection);
         // Completions only record bytes, so ready connections answer and take calls before
         // the rest dial.
         step_ready_connections(client, now);
@@ -1602,8 +1824,11 @@ struct client : ucall_client_handle_t {
         return true;
     }
 
-    /** Ends every call with @c client.failure, detached from the connections carrying them. */
+    /** Ends every call with @c client.failure, detached from the connections carrying them, and
+     *  every streamed body with @c ucall_status_connection_closed_k. */
     static void abandon_calls(client_t& client) noexcept {
+        for (auto& connection : client.connections)
+            if (connection->streaming) end_body(client, *connection, ucall_status_connection_closed_k);
         for (client_origin_t* origin = client.live; origin; origin = origin->next) {
             origin->waiting_head = origin->waiting_tail = nullptr;
             origin->waiting = 0;
@@ -1630,6 +1855,8 @@ struct client : ucall_client_handle_t {
     static void client_call(ucall_client_call_t* arguments) noexcept {
         if (!arguments->outcome || !http_t::valid_view(arguments->url) || !http_t::valid_view(arguments->body) ||
             !http_t::http_verb_name(arguments->verb) || !formatting_t::security_valid(arguments->options.security) ||
+            (arguments->options.body_delivery != ucall_body_delivery_buffered_k &&
+             arguments->options.body_delivery != ucall_body_delivery_streamed_k) ||
             (arguments->headers_count && !arguments->headers)) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;

@@ -468,8 +468,11 @@ static void test_handle_refusals(void) {
            .verb = ucall_verb_get_k);
     EXPECT(ucall_status_invalid_argument_k, ucall_client_call, .client = client, .url = VIEW("http://localhost/"),
            .verb = ucall_verb_get_k, .options = {.security = ucall_security_noise_ik_k, .noise_private_key = &key});
+    EXPECT(ucall_status_invalid_argument_k, ucall_client_call, .client = client, .url = VIEW("http://localhost/"),
+           .verb = ucall_verb_get_k, .options = {.body_delivery = (ucall_body_delivery_t)2});
     EXPECT(ucall_status_unsupported_k, ucall_client_call, .client = client, .url = VIEW("ftp://localhost/"),
-           .verb = ucall_verb_get_k, .headers = &header, .headers_count = 1);
+           .verb = ucall_verb_get_k, .headers = &header, .headers_count = 1,
+           .options = {.body_delivery = ucall_body_delivery_streamed_k});
     EXPECT(ucall_status_uninitialized_k, ucall_client_take_completed, .client = NULL, .count = &count);
     EXPECT(ucall_status_invalid_argument_k, ucall_client_take_completed, .client = client, .count = NULL);
     EXPECT(ucall_status_invalid_argument_k, ucall_client_take_completed, .client = client, .calls = NULL, .capacity = 2,
@@ -484,6 +487,10 @@ static void test_handle_refusals(void) {
     EXPECT(ucall_status_invalid_argument_k, ucall_client_response_field, .response = NULL, .name = &view,
            .value = &view);
     EXPECT(ucall_status_invalid_argument_k, ucall_client_response_body, .response = NULL, .body = &view);
+    EXPECT(ucall_status_uninitialized_k, ucall_client_response_body_chunk, .client = NULL, .data = &view);
+    EXPECT(ucall_status_invalid_argument_k, ucall_client_response_body_chunk, .client = client, .response = NULL,
+           .data = &view);
+    EXPECT(ucall_status_invalid_argument_k, ucall_client_response_body_chunk, .client = client, .data = NULL);
     assert(ucall_client_response_status(NULL) == 0);
     ucall_client_response_free(NULL);
 

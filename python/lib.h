@@ -353,6 +353,16 @@ extern PyTypeObject CompletedType;
 /** `ucall.Response`, one received response. */
 extern PyTypeObject ResponseType;
 
+/** @c ucall.ResponseBodyChunks, the iterator pulling a streamed response's body. */
+extern PyTypeObject ResponseBodyChunksType;
+
+/** A view over bytes a response pulled, counted among the response's exports. */
+extern PyTypeObject ResponseBytesType;
+
+/** The coroutine @c ucall._until_final makes of @p pending and @p finish, bound methods of one
+ *  owner: it polls @p pending with a backoff, so no thread waits on the library. */
+PyObject* ucall_py_until_final(PyObject* pending, PyObject* finish);
+
 #pragma endregion Vocabulary
 
 #endif // UNUM_UCALL_PYTHON_LIB_H

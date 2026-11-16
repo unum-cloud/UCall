@@ -22,6 +22,7 @@ from ucall.client import (
     ClientCallEntry,
     ClientInit,
     ClientResponseBody,
+    ClientResponseBodyChunk,
     ClientResponseField,
     ClientResponseFieldsCount,
     ClientResponseHeader,
@@ -241,6 +242,8 @@ struct Symbols:
     """`ucall_client_response_field`."""
     var client_response_body: ClientResponseBody
     """`ucall_client_response_body`."""
+    var client_response_body_chunk: ClientResponseBodyChunk
+    """`ucall_client_response_body_chunk`."""
     var client_response_free: Release
     """`ucall_client_response_free`."""
 
@@ -329,6 +332,7 @@ struct Symbols:
         )
         self.client_response_field = _resolve[ClientResponseField](handle, "ucall_client_response_field")
         self.client_response_body = _resolve[ClientResponseBody](handle, "ucall_client_response_body")
+        self.client_response_body_chunk = _resolve[ClientResponseBodyChunk](handle, "ucall_client_response_body_chunk")
         self.client_response_free = _resolve[Release](handle, "ucall_client_response_free")
 
 

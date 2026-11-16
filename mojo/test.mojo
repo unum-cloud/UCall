@@ -15,6 +15,7 @@ from std.testing import TestSuite, assert_equal, assert_false, assert_true
 from ucall import (
     Backend,
     Batch,
+    BodyDelivery,
     BytesView,
     CPUClass,
     Client,
@@ -236,6 +237,93 @@ def test_server_answers_a_bound_client() raises:
     server.stop()
 
 
+def large(var request: Request) raises:
+    """Answers with 4 MiB cycling through a prime period, so a misplaced or repeated chunk shows."""
+    var body = List[Byte](capacity=4 << 20)
+    for index in range(4 << 20):
+        body.append(Byte(index % 251))
+    request^.reply(HTTPStatus.OK, body)
+
+
+def nothing(var request: Request) raises:
+    """Answers with no body at all."""
+    request^.reply(HTTPStatus.NO_CONTENT, List[Byte]())
+
+
+def test_streamed_bodies_download_past_the_response_cap() raises:
+    """A streamed call completes at its head, and its body, four times the client's response cap, is
+    pulled chunk by chunk; a bound client's pull raises `WOULD_BLOCK` until the server's loop polls."""
+    var library = Library()
+    var server = Server(library, [Interface("127.0.0.1:0", connections=2)])
+    server.get["/large", large]()
+    server.get["/nothing", nothing]()
+    var origin = String("http://", server.address(0).value())
+    var options = ClientOptions(connections=1)
+    options.calls = 2
+    options.max_response_bytes = 1 << 20
+    var client = Client(server, options, event_loop=0)
+    var streamed = ClientCall.get(origin + "/large")
+    streamed.options.body_delivery = BodyDelivery.STREAMED
+    client.submit(streamed.copy(), 0)
+    var completed = List[Completed]()
+    while len(completed) == 0:
+        _ = server.take_call(0, 1_000)
+        client.take_completed(completed)
+    assert_false(Bool(completed[0].error), "a streamed call completes at its head")
+    ref response = completed[0].response.value()
+    assert_equal(response.status_code().code, 200)
+    var pulled = 0
+    var mismatches = 0
+    var waits = 0
+    while True:
+        try:
+            var chunk = response.body_chunk()
+            if len(chunk) == 0:
+                break
+            for byte in chunk:
+                if Int(byte) != pulled % 251:
+                    mismatches += 1
+                pulled += 1
+        except error:
+            assert_true(error.status == Status.WOULD_BLOCK, "a bound client's pull waits for its loop")
+            waits += 1
+            _ = server.take_call(0, 1_000)
+    assert_equal(pulled, 4 << 20, "the whole body arrived")
+    assert_equal(mismatches, 0, "every byte arrived in place")
+    assert_true(waits > 0, "the body outran one receive window")
+
+    # A bodiless response is pulled too, its first pull answering the end at once.
+    streamed.url = origin + "/nothing"
+    client.submit(streamed.copy(), 1)
+    client.submit(ClientCall.get(origin + "/nothing"), 2)
+    var answered = List[Completed]()
+    while len(answered) < 2:
+        _ = server.take_call(0, 1_000)
+        client.take_completed(completed)
+        while len(completed) != 0:
+            answered.append(completed.pop(0))
+    for position in range(2):
+        ref done = answered[position]
+        ref bodiless = done.response.value()
+        assert_equal(bodiless.status_code().code, 204)
+        var refusal = Status.SUCCESS
+        var length = -1
+        try:
+            length = len(bodiless.body_chunk())
+        except error:
+            refusal = error.status
+        if done.context == 1:
+            assert_true(refusal == Status.SUCCESS, "the streamed response pulls")
+            assert_equal(length, 0, "a streamed bodiless response ends at once")
+        else:
+            assert_true(refusal == Status.INVALID_ARGUMENT, "a buffered response refuses a pull")
+    # A bound client must go first, as the server is not freed while one lives.
+    _ = answered^
+    _ = completed^
+    _ = client^
+    server.stop()
+
+
 def admit_every_key(peer_static_key: NoiseKey) -> Bool:
     """Admits every authenticated peer."""
     return True
@@ -337,6 +425,7 @@ def main() raises:
     suite.test[test_generated_noise_keys_derive_back]()
     suite.test[test_cpu_class_ceiling_caps_rather_than_refuses]()
     suite.test[test_server_answers_a_bound_client]()
+    suite.test[test_streamed_bodies_download_past_the_response_cap]()
     suite.test[test_noise_authorizers_admit_and_reject]()
     suite.test[test_quickstart]()
     suite^.run()

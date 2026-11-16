@@ -78,7 +78,47 @@ typedef struct Response {
 
     /** The received response, freed with the object. */
     ucall_received_http_response_t handle;
+
+    /** The client it came from, which a streamed body's pulls name and advance; a pull never
+     *  reads through it, and once it is freed no body still arrives to advance. */
+    ucall_client_t client;
+
+    /** The thread owning that client, the only one a streamed body is pulled on. */
+    unsigned long owner;
+
+    /** Whether a server's event loop advances that client, so an empty pull returns to it. */
+    int bound;
+
+    /** Live buffer exports over the last pulled chunk, which the next pull would leave dangling. */
+    Py_ssize_t exports;
 } Response;
+
+/** The exporter behind a pulled chunk's memoryview, counted among its response's exports. */
+typedef struct ResponseBytes {
+    PyObject ob_base;
+
+    /** The response owning the bytes, kept alive and refusing pulls while the view is. */
+    struct Response* response;
+
+    /** The bytes exported. */
+    ucall_bytes_view_t bytes;
+} ResponseBytes;
+
+typedef struct ResponseBodyChunks {
+    PyObject ob_base;
+
+    /** The response whose body it pulls. */
+    Response* response;
+
+    /** The memoryview the last pull yielded, which the next pull releases, or NULL. */
+    PyObject* chunk;
+
+    /** The last pull's outcome, final on return. */
+    ucall_outcome_t outcome;
+
+    /** The bytes the last pull decoded. */
+    ucall_bytes_view_t data;
+} ResponseBodyChunks;
 
 /** Returns the inputs a finished or cancelled call borrowed and unlinks it from its client. */
 static void completed_release_inputs(Client* client, Completed* call) {
@@ -241,22 +281,63 @@ static PyObject* Response_fields(Response* self, [[maybe_unused]] PyObject* unus
     return fields;
 }
 
+static char const doc_Response_body_chunks[] =                                                      //
+    "body_chunks() -> ResponseBodyChunks\n"                                                         //
+    "\n"                                                                                            //
+    "Iterates the body of a `BodyDelivery.STREAMED` call as it arrives, each chunk the bytes\n"     //
+    "decoded since the last pull.\n"                                                                //
+    "\n"                                                                                            //
+    "Each chunk is a read-only memoryview valid until the next pull, which releases it. Pulls\n"    //
+    "run on the client's thread and advance the client while nothing was decoded; a client\n"       //
+    "bound to a server advances only as its loop polls, so there a pull finding nothing\n"          //
+    "raises `Status.WOULD_BLOCK`, and `async for` yields until it polled. Every streamed\n"         //
+    "response is pulled to its end or released, bodiless ones too, as its connection carries\n"     //
+    "no other call meanwhile; releasing it early closes that connection, failing the calls\n"       //
+    "pipelined behind it with `Status.CONNECTION_CLOSED`.\n"                                        //
+    "\n"                                                                                            //
+    "Returns:\n"                                                                                    //
+    "  ResponseBodyChunks: The iterator, ending once the body did.\n"                               //
+    "\n"                                                                                            //
+    "Raises:\n"                                                                                     //
+    "  BufferError: From a pull, while a view derived from the last chunk is still alive.\n"        //
+    "  Error: From a pull, `Status.CONNECTION_CLOSED` or `Status.MALFORMED` for a body cut short\n" //
+    "    or badly framed, or `Status.INVALID_ARGUMENT` for a buffered response or another\n"        //
+    "    thread.\n"                                                                                 //
+    "\n"                                                                                            //
+    "Example:\n"                                                                                    //
+    "  >>> response = client.get(url, body_delivery=ucall.BodyDelivery.STREAMED)\n"                 //
+    "  >>> for chunk in response.body_chunks():  # or: async for chunk in ...\n"                    //
+    "  ...     file.write(chunk)";
+
+static PyObject* Response_body_chunks(Response* self, [[maybe_unused]] PyObject* unused) {
+    ResponseBodyChunks* const chunks = PyObject_New(ResponseBodyChunks, &ResponseBodyChunksType);
+    if (!chunks) return NULL;
+    chunks->response = (Response*)Py_NewRef(self);
+    chunks->chunk = NULL;
+    chunks->outcome = (ucall_outcome_t) {0};
+    chunks->data = (ucall_bytes_view_t) {0};
+    return (PyObject*)chunks;
+}
+
 static PyMethodDef Response_methods[] = {
     {"header", (PyCFunction)Response_header, METH_O, doc_Response_header},
     {"fields", (PyCFunction)Response_fields, METH_NOARGS, doc_Response_fields},
+    {"body_chunks", (PyCFunction)Response_body_chunks, METH_NOARGS, doc_Response_body_chunks},
     {NULL, NULL, 0, NULL},
 };
 
 static PyGetSetDef Response_getset[] = {
     {"status_code", (getter)Response_get_status_code, NULL, "The HTTP status the server sent.", NULL},
-    {"body", (getter)Response_get_body, NULL, "A read-only memoryview of the body, alive as long as it is.", NULL},
+    {"body", (getter)Response_get_body, NULL,
+     "A read-only memoryview of the body, alive as long as it is; a streamed call's raises.", NULL},
     {NULL, NULL, NULL, NULL, NULL},
 };
 
 static char const doc_Response[] =                                                             //
     "One received HTTP response, which owns its bytes and outlives its client.\n"              //
     "\n"                                                                                       //
-    "`body` and the buffer protocol view the received bytes without a copy.\n"                 //
+    "`body` and the buffer protocol view the received bytes without a copy, and a streamed\n"  //
+    "call's body is pulled through `body_chunks` instead.\n"                                   //
     "\n"                                                                                       //
     "Example:\n"                                                                               //
     "  >>> response = client.post(\"http://127.0.0.1:8545/sum\", json={\"a\": 1, \"b\": 2})\n" //
@@ -275,6 +356,198 @@ PyTypeObject ResponseType = {
 };
 
 #pragma endregion Completions
+
+#pragma region Response Body Chunks
+
+static int ResponseBytes_getbuffer(ResponseBytes* self, Py_buffer* view, int flags) {
+    static ucall_byte_t const empty_k[1] = {0};
+    void* const data = (void*)(self->bytes.data ? self->bytes.data : empty_k);
+    if (PyBuffer_FillInfo(view, (PyObject*)self, data, (Py_ssize_t)self->bytes.length, 1, flags) != 0) return -1;
+    ++self->response->exports;
+    return 0;
+}
+
+static void ResponseBytes_releasebuffer(ResponseBytes* self, [[maybe_unused]] Py_buffer* view) {
+    --self->response->exports;
+}
+
+static void ResponseBytes_dealloc(ResponseBytes* self) {
+    Py_CLEAR(self->response);
+    PyObject_Free(self);
+}
+
+static PyBufferProcs ResponseBytes_buffer = {(getbufferproc)ResponseBytes_getbuffer,
+                                             (releasebufferproc)ResponseBytes_releasebuffer};
+
+PyTypeObject ResponseBytesType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "ucall.ResponseBytes",
+    .tp_basicsize = sizeof(ResponseBytes),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = "Bytes a response pulled, behind a memoryview that refuses the next pull while alive.",
+    .tp_dealloc = (destructor)ResponseBytes_dealloc,
+    .tp_as_buffer = &ResponseBytes_buffer,
+};
+
+/** Releases the chunk the last pull yielded, so a view of it the caller kept reads nothing. */
+static int response_chunks_release(ResponseBodyChunks* self) {
+    PyObject* const chunk = self->chunk;
+    if (!chunk) return 0;
+    self->chunk = NULL;
+    PyObject* const released = PyObject_CallMethod(chunk, "release", NULL);
+    Py_DECREF(chunk);
+    Py_XDECREF(released);
+    return released ? 0 : -1;
+}
+
+/** Pulls once into the iterator's outcome: 0 once pulled, -1 with an exception set. */
+static int response_chunks_pull(ResponseBodyChunks* self) {
+    Response* const response = self->response;
+    if (response_chunks_release(self) != 0) return -1;
+    if (PyThread_get_thread_ident() != response->owner) {
+        ucall_py_raise_status(ucall_status_invalid_argument_k,
+                              "a streamed ucall.Response is pulled on the thread that owns its client");
+        return -1;
+    }
+    if (response->exports) {
+        PyErr_Format(PyExc_BufferError,
+                     "%zd views over the response's bytes are alive, and the next pull would free them; " //
+                     "drop them or copy with bytes() first",
+                     response->exports);
+        return -1;
+    }
+    self->outcome = (ucall_outcome_t) {0};
+    self->data = (ucall_bytes_view_t) {0};
+    ucall_client_response_body_chunk_t pull = {response->client, &self->outcome, response->handle, &self->data};
+    ucall_client_response_body_chunk(&pull);
+    return 0;
+}
+
+/** The chunk a pull decoded, or NULL with an exception set or, at the body's end, without. */
+static PyObject* response_chunks_yield(ResponseBodyChunks* self) {
+    if (ucall_py_raise_outcome(&self->outcome) != 0 || !self->data.length) return NULL;
+    ResponseBytes* const exporter = PyObject_New(ResponseBytes, &ResponseBytesType);
+    if (!exporter) return NULL;
+    exporter->response = (Response*)Py_NewRef(self->response);
+    exporter->bytes = self->data;
+    self->chunk = PyMemoryView_FromObject((PyObject*)exporter);
+    Py_DECREF(exporter);
+    return Py_XNewRef(self->chunk);
+}
+
+/** Advances a client with its own engine and pulls again, answering whether still nothing was
+ *  decoded. */
+static PyObject* response_chunks_pending(ResponseBodyChunks* self, [[maybe_unused]] PyObject* unused) {
+    if (!self->response->bound) {
+        size_t count = 0;
+        ucall_outcome_t outcome = {0};
+        ucall_client_take_completed_t take = {self->response->client, &outcome, NULL, 0, &count, 0};
+        Py_BEGIN_ALLOW_THREADS;
+        ucall_client_take_completed(&take);
+        Py_END_ALLOW_THREADS;
+        if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
+    }
+    if (response_chunks_pull(self) != 0) return NULL;
+    return PyBool_FromLong(self->outcome.status == ucall_status_would_block_k);
+}
+
+static PyObject* ResponseBodyChunks_next(ResponseBodyChunks* self) {
+    if (response_chunks_pull(self) != 0) return NULL;
+    while (self->outcome.status == ucall_status_would_block_k && !self->response->bound) {
+        PyObject* const pending = response_chunks_pending(self, NULL);
+        Py_XDECREF(pending);
+        if (!pending || PyErr_CheckSignals() != 0) return NULL;
+    }
+    return response_chunks_yield(self);
+}
+
+/** The chunk of a final pull for @c async @c for, which ends on @c StopAsyncIteration. */
+static PyObject* response_chunks_yield_async(ResponseBodyChunks* self, [[maybe_unused]] PyObject* unused) {
+    PyObject* const chunk = response_chunks_yield(self);
+    if (!chunk && !PyErr_Occurred()) PyErr_SetNone(PyExc_StopAsyncIteration);
+    return chunk;
+}
+
+static PyMethodDef response_chunks_pending_method = {"pending", (PyCFunction)response_chunks_pending, METH_NOARGS,
+                                                     NULL};
+static PyMethodDef response_chunks_finish_method = {"finish", (PyCFunction)response_chunks_yield_async, METH_NOARGS,
+                                                    NULL};
+
+/** A future the running loop resolves at once to a final pull's chunk, or to its exception. */
+static PyObject* response_chunks_resolved(ResponseBodyChunks* self, PyObject* loop) {
+    PyObject* const future = PyObject_CallMethod(loop, "create_future", NULL);
+    if (!future) return NULL;
+    PyObject* const chunk = response_chunks_yield_async(self, NULL);
+    PyObject* const raised = chunk ? NULL : PyErr_GetRaisedException();
+    PyObject* const set = PyObject_CallMethod(future, chunk ? "set_result" : "set_exception", "O",
+                                              chunk ? chunk : raised);
+    Py_XDECREF(chunk);
+    Py_XDECREF(raised);
+    if (!set) {
+        Py_DECREF(future);
+        return NULL;
+    }
+    Py_DECREF(set);
+    return future;
+}
+
+/** @c async @c for pulls as @c next does, advancing the client between the running loop's other
+ *  tasks while nothing was decoded. */
+static PyObject* ResponseBodyChunks_anext(ResponseBodyChunks* self) {
+    PyObject* const asyncio = PyImport_ImportModule("asyncio");
+    PyObject* const loop = asyncio ? PyObject_CallMethod(asyncio, "get_running_loop", NULL) : NULL;
+    PyObject* future = NULL;
+    if (loop && response_chunks_pull(self) == 0) {
+        if (self->outcome.status != ucall_status_would_block_k) future = response_chunks_resolved(self, loop);
+        else {
+            PyObject* const pending = PyCFunction_New(&response_chunks_pending_method, (PyObject*)self);
+            PyObject* const finish = pending ? PyCFunction_New(&response_chunks_finish_method, (PyObject*)self) : NULL;
+            future = finish ? ucall_py_until_final(pending, finish) : NULL;
+            Py_XDECREF(finish);
+            Py_XDECREF(pending);
+        }
+    }
+    Py_XDECREF(loop);
+    Py_XDECREF(asyncio);
+    return future;
+}
+
+static PyAsyncMethods ResponseBodyChunks_async = {
+    .am_aiter = PyObject_SelfIter,
+    .am_anext = (unaryfunc)ResponseBodyChunks_anext,
+};
+
+static void ResponseBodyChunks_dealloc(ResponseBodyChunks* self) {
+    // Releasing may run while an exception unwinds past the iterator, which must survive it.
+    PyObject* const pending = PyErr_GetRaisedException();
+    if (response_chunks_release(self) != 0) PyErr_Clear();
+    PyErr_SetRaisedException(pending);
+    Py_CLEAR(self->response);
+    PyObject_Free(self);
+}
+
+static char const doc_ResponseBodyChunks[] =                                                        //
+    "The iterator `Response.body_chunks` returns, yielding memoryviews of a streamed body.\n"       //
+    "\n"                                                                                            //
+    "`for` advances the client on this thread until bytes arrive, and `async for` returns a\n"      //
+    "chunk already decoded at once and advances the client between the running loop's other\n"      //
+    "tasks otherwise.\n"                                                                            //
+    "\n"                                                                                            //
+    "Example:\n"                                                                                    //
+    "  >>> async for chunk in response.body_chunks():  # or: for chunk in response.body_chunks()\n" //
+    "  ...     digest.update(chunk)";
+
+PyTypeObject ResponseBodyChunksType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "ucall.ResponseBodyChunks",
+    .tp_basicsize = sizeof(ResponseBodyChunks),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = doc_ResponseBodyChunks,
+    .tp_dealloc = (destructor)ResponseBodyChunks_dealloc,
+    .tp_as_async = &ResponseBodyChunks_async,
+    .tp_iter = PyObject_SelfIter,
+    .tp_iternext = (iternextfunc)ResponseBodyChunks_next,
+};
+
+#pragma endregion Response Body Chunks
 
 #pragma region Client
 
@@ -454,6 +727,7 @@ typedef struct call_options_t {
     PyObject* timeout;
     PyObject* retries;
     PyObject* redirects;
+    PyObject* body_delivery;
 } call_options_t;
 
 /**
@@ -462,9 +736,11 @@ typedef struct call_options_t {
  */
 static Completed* client_submit(Client* self, ucall_verb_t verb, PyObject* url, PyObject* body, PyObject* headers,
                                 call_options_t const* options, PyObject* context) {
-    int security = ucall_security_none_k;
+    int security = ucall_security_none_k, body_delivery = ucall_body_delivery_buffered_k;
     ucall_client_call_t submission = {0};
     if (ucall_py_enum_from_object(options->security, "security", &ucall_py_security_enum, &security) != 0 ||
+        ucall_py_enum_from_object(options->body_delivery, "body_delivery", &ucall_py_body_delivery_enum,
+                                  &body_delivery) != 0 ||
         ucall_py_size_from_object(options->timeout, "timeout_microseconds", &submission.options.timeout_microseconds) !=
             0 ||
         ucall_py_size_from_object(options->retries, "max_retries", &submission.options.max_retries) != 0 ||
@@ -479,6 +755,7 @@ static Completed* client_submit(Client* self, ucall_verb_t verb, PyObject* url, 
     submission.client = self->handle;
     submission.verb = verb;
     submission.options.security = (ucall_security_t)security;
+    submission.options.body_delivery = (ucall_body_delivery_t)body_delivery;
     if (options->noise_peer_key && options->noise_peer_key != Py_None) {
         if (ucall_py_key_from_object(options->noise_peer_key, "noise_peer_key", call->noise_peer_key) != 0)
             goto refused;
@@ -532,6 +809,10 @@ static PyObject* client_take(Client* self, size_t timeout_microseconds, size_t c
         Response* const response = records[index].response ? PyObject_New(Response, &ResponseType) : NULL;
         if (response) {
             response->handle = records[index].response;
+            response->client = self->handle;
+            response->owner = self->owner;
+            response->bound = self->server != NULL;
+            response->exports = 0;
             call->response = (PyObject*)response;
         }
         else ucall_client_response_free(records[index].response);
@@ -551,7 +832,7 @@ static PyObject* client_take(Client* self, size_t timeout_microseconds, size_t c
 static char const doc_Client_submit[] =                                                                   //
     "submit(verb, url, /, body=b\"\", headers=(), *, context=None, security=Security.NONE,\n"             //
     "    noise_peer_key=None, noise_private_key=None, timeout_microseconds=0, max_retries=0,\n"           //
-    "    max_redirects=0) -> None\n"                                                                      //
+    "    max_redirects=0, body_delivery=BodyDelivery.BUFFERED) -> None\n"                                 //
     "\n"                                                                                                  //
     "Queues one exchange without driving I/O.\n"                                                          //
     "\n"                                                                                                  //
@@ -573,6 +854,8 @@ static char const doc_Client_submit[] =                                         
     "    0 takes the client's `call_timeout_microseconds`.\n"                                             //
     "  max_retries (int, optional): Connection attempts before sending; 0 takes 3.\n"                     //
     "  max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.\n"                //
+    "  body_delivery (BodyDelivery, optional): `BodyDelivery.STREAMED` completes once the head\n"         //
+    "    arrived, the body pulled through `Response.body_chunks` past `max_response_bytes`.\n"            //
     "  context (object, optional): Anything, handed back as `Completed.context`.\n"                       //
     "\n"                                                                                                  //
     "Raises:\n"                                                                                           //
@@ -598,6 +881,7 @@ static PyObject* Client_submit(Client* self, PyObject* const* values, Py_ssize_t
         {"timeout_microseconds", &options.timeout},
         {"max_retries", &options.retries},
         {"max_redirects", &options.redirects},
+        {"body_delivery", &options.body_delivery},
     };
     if (ucall_py_parse_fast("submit", values, count, names, 2, 4, arguments,
                             sizeof(arguments) / sizeof(arguments[0])) != 0 ||
@@ -702,7 +986,7 @@ static PyObject* client_request(Client* self, ucall_verb_t verb, PyObject* url, 
 static char const doc_Client_request[] =                                                                    //
     "request(verb, url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE,\n"                 //
     "    noise_peer_key=None, noise_private_key=None, timeout_microseconds=0, max_retries=0,\n"             //
-    "    max_redirects=0) -> Response\n"                                                                    //
+    "    max_redirects=0, body_delivery=BodyDelivery.BUFFERED) -> Response\n"                               //
     "\n"                                                                                                    //
     "Sends one exchange and waits for its response on this thread.\n"                                       //
     "\n"                                                                                                    //
@@ -725,6 +1009,8 @@ static char const doc_Client_request[] =                                        
     "    0 takes the client's `call_timeout_microseconds`.\n"                                               //
     "  max_retries (int, optional): Connection attempts before sending; 0 takes 3.\n"                       //
     "  max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.\n"                  //
+    "  body_delivery (BodyDelivery, optional): `BodyDelivery.STREAMED` returns once the head\n"             //
+    "    arrived, the body pulled through `Response.body_chunks`. Defaults to buffered.\n"                  //
     "\n"                                                                                                    //
     "Returns:\n"                                                                                            //
     "  Response: The response, whatever its HTTP status.\n"                                                 //
@@ -753,6 +1039,7 @@ static PyObject* Client_request(Client* self, PyObject* const* values, Py_ssize_
         {"timeout_microseconds", &options.timeout},
         {"max_retries", &options.retries},
         {"max_redirects", &options.redirects},
+        {"body_delivery", &options.body_delivery},
     };
     if (ucall_py_parse_fast("request", values, count, names, 2, 3, arguments,
                             sizeof(arguments) / sizeof(arguments[0])) != 0)
@@ -778,6 +1065,7 @@ static PyObject* client_verb(Client* self, char const* name, ucall_verb_t verb, 
         {"timeout_microseconds", &options.timeout},
         {"max_retries", &options.retries},
         {"max_redirects", &options.redirects},
+        {"body_delivery", &options.body_delivery},
     };
     if (ucall_py_parse_fast(name, values, count, names, 1, positional_max, arguments,
                             sizeof(arguments) / sizeof(arguments[0])) != 0)
@@ -785,24 +1073,26 @@ static PyObject* client_verb(Client* self, char const* name, ucall_verb_t verb, 
     return client_request(self, verb, url, body, json, headers, &options);
 }
 
-static char const doc_Client_get[] =                                                                      //
-    "get(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n"    //
-    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0) -> Response\n"   //
-    "\n"                                                                                                  //
-    "Sends a GET and waits for its response, as `request` does.\n"                                        //
-    "\n"                                                                                                  //
-    "Args:\n"                                                                                             //
-    "  url (str | bytes): The full URL.\n"                                                                //
-    "  **options: `body`, `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n" //
-    "\n"                                                                                                  //
-    "Returns:\n"                                                                                          //
-    "  Response: The response, whatever its HTTP status.\n"                                               //
-    "\n"                                                                                                  //
-    "Raises:\n"                                                                                           //
-    "  Error: The exchange failed.\n"                                                                     //
-    "\n"                                                                                                  //
-    "Example:\n"                                                                                          //
-    "  >>> bytes(client.get(\"http://127.0.0.1:8545/sum?a=1&b=2\").body)\n"                               //
+static char const doc_Client_get[] =                                                                   //
+    "get(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n" //
+    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0,\n"            //
+    "    body_delivery=BodyDelivery.BUFFERED) -> Response\n"                                           //
+    "\n"                                                                                               //
+    "Sends a GET and waits for its response, as `request` does.\n"                                     //
+    "\n"                                                                                               //
+    "Args:\n"                                                                                          //
+    "  url (str | bytes): The full URL.\n"                                                             //
+    "  **options: `body`, `json`, `headers`, `security`, `body_delivery`, the keys and limits,\n"      //
+    "    as `request` takes them.\n"                                                                   //
+    "\n"                                                                                               //
+    "Returns:\n"                                                                                       //
+    "  Response: The response, whatever its HTTP status.\n"                                            //
+    "\n"                                                                                               //
+    "Raises:\n"                                                                                        //
+    "  Error: The exchange failed.\n"                                                                  //
+    "\n"                                                                                               //
+    "Example:\n"                                                                                       //
+    "  >>> bytes(client.get(\"http://127.0.0.1:8545/sum?a=1&b=2\").body)\n"                            //
     "  b'3'";
 
 static PyObject* Client_get(Client* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
@@ -811,14 +1101,16 @@ static PyObject* Client_get(Client* self, PyObject* const* values, Py_ssize_t co
 
 static char const doc_Client_post[] =                                                                   //
     "post(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n" //
-    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0) -> Response\n" //
+    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0,\n"             //
+    "    body_delivery=BodyDelivery.BUFFERED) -> Response\n"                                            //
     "\n"                                                                                                //
     "Sends a POST and waits for its response, as `request` does.\n"                                     //
     "\n"                                                                                                //
     "Args:\n"                                                                                           //
     "  url (str | bytes): The full URL.\n"                                                              //
     "  body (Buffer, optional): Any bytes-like object to send.\n"                                       //
-    "  **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n"       //
+    "  **options: `json`, `headers`, `security`, `body_delivery`, the keys and limits, as\n"            //
+    "    `request` takes them.\n"                                                                       //
     "\n"                                                                                                //
     "Returns:\n"                                                                                        //
     "  Response: The response, whatever its HTTP status.\n"                                             //
@@ -834,25 +1126,27 @@ static PyObject* Client_post(Client* self, PyObject* const* values, Py_ssize_t c
     return client_verb(self, "post", ucall_verb_post_k, 2, values, count, names);
 }
 
-static char const doc_Client_put[] =                                                                    //
-    "put(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n"  //
-    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0) -> Response\n" //
-    "\n"                                                                                                //
-    "Sends a PUT and waits for its response, as `request` does.\n"                                      //
-    "\n"                                                                                                //
-    "Args:\n"                                                                                           //
-    "  url (str | bytes): The full URL.\n"                                                              //
-    "  body (Buffer, optional): Any bytes-like object to send.\n"                                       //
-    "  **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n"       //
-    "\n"                                                                                                //
-    "Returns:\n"                                                                                        //
-    "  Response: The response, whatever its HTTP status.\n"                                             //
-    "\n"                                                                                                //
-    "Raises:\n"                                                                                         //
-    "  Error: The exchange failed.\n"                                                                   //
-    "\n"                                                                                                //
-    "Example:\n"                                                                                        //
-    "  >>> client.put(\"http://127.0.0.1:8545/files/notes.txt\", b\"hello\").status_code\n"             //
+static char const doc_Client_put[] =                                                                   //
+    "put(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n" //
+    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0,\n"            //
+    "    body_delivery=BodyDelivery.BUFFERED) -> Response\n"                                           //
+    "\n"                                                                                               //
+    "Sends a PUT and waits for its response, as `request` does.\n"                                     //
+    "\n"                                                                                               //
+    "Args:\n"                                                                                          //
+    "  url (str | bytes): The full URL.\n"                                                             //
+    "  body (Buffer, optional): Any bytes-like object to send.\n"                                      //
+    "  **options: `json`, `headers`, `security`, `body_delivery`, the keys and limits, as\n"           //
+    "    `request` takes them.\n"                                                                      //
+    "\n"                                                                                               //
+    "Returns:\n"                                                                                       //
+    "  Response: The response, whatever its HTTP status.\n"                                            //
+    "\n"                                                                                               //
+    "Raises:\n"                                                                                        //
+    "  Error: The exchange failed.\n"                                                                  //
+    "\n"                                                                                               //
+    "Example:\n"                                                                                       //
+    "  >>> client.put(\"http://127.0.0.1:8545/files/notes.txt\", b\"hello\").status_code\n"            //
     "  200";
 
 static PyObject* Client_put(Client* self, PyObject* const* values, Py_ssize_t count, PyObject* names) {
@@ -861,13 +1155,15 @@ static PyObject* Client_put(Client* self, PyObject* const* values, Py_ssize_t co
 
 static char const doc_Client_delete[] =                                                                   //
     "delete(url, /, *, body=b\"\", json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n" //
-    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0) -> Response\n"   //
+    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0,\n"               //
+    "    body_delivery=BodyDelivery.BUFFERED) -> Response\n"                                              //
     "\n"                                                                                                  //
     "Sends a DELETE and waits for its response, as `request` does.\n"                                     //
     "\n"                                                                                                  //
     "Args:\n"                                                                                             //
     "  url (str | bytes): The full URL.\n"                                                                //
-    "  **options: `body`, `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n" //
+    "  **options: `body`, `json`, `headers`, `security`, `body_delivery`, the keys and limits,\n"         //
+    "    as `request` takes them.\n"                                                                      //
     "\n"                                                                                                  //
     "Returns:\n"                                                                                          //
     "  Response: The response, whatever its HTTP status.\n"                                               //
@@ -885,14 +1181,16 @@ static PyObject* Client_delete(Client* self, PyObject* const* values, Py_ssize_t
 
 static char const doc_Client_patch[] =                                                                      //
     "patch(url, /, body=b\"\", *, json=None, headers=(), security=Security.NONE, noise_peer_key=None,\n"    //
-    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0) -> Response\n"     //
+    "    noise_private_key=None, timeout_microseconds=0, max_retries=0, max_redirects=0,\n"                 //
+    "    body_delivery=BodyDelivery.BUFFERED) -> Response\n"                                                //
     "\n"                                                                                                    //
     "Sends a PATCH and waits for its response, as `request` does.\n"                                        //
     "\n"                                                                                                    //
     "Args:\n"                                                                                               //
     "  url (str | bytes): The full URL.\n"                                                                  //
     "  body (Buffer, optional): Any bytes-like object to send.\n"                                           //
-    "  **options: `json`, `headers`, `security`, the keys and limits, as `request` takes them.\n"           //
+    "  **options: `json`, `headers`, `security`, `body_delivery`, the keys and limits, as\n"                //
+    "    `request` takes them.\n"                                                                           //
     "\n"                                                                                                    //
     "Returns:\n"                                                                                            //
     "  Response: The response, whatever its HTTP status.\n"                                                 //

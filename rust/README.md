@@ -283,6 +283,29 @@ Every received response is a `Response`, whatever its HTTP status, and only a fa
 A `Response` owns its received bytes and is `Send`, so it stays readable after its `Client` is dropped and may move to another thread.
 Dropping the client cancels the calls still in flight and discards completions not yet retrieved.
 
+### Streamed Response Bodies
+
+```rust
+let mut call = ClientCall::get("http://127.0.0.1:8545/dataset.bin");
+call.options.body_delivery = BodyDelivery::Streamed;
+let mut response = client.call(call)?;
+let mut received_bytes = 0usize;
+loop {
+    let chunk = response.body_chunk()?; // or: response.next_body_chunk().await?
+    if chunk.is_empty() {
+        break;
+    }
+    received_bytes += chunk.len();
+}
+```
+
+A call whose `ClientCallOptions::body_delivery` is `BodyDelivery::Streamed` completes once its head arrived, so a download larger than `max_response_bytes` is pulled through `Response::body_chunk` as it lands, while `Response::body` reads empty.
+Each chunk borrows the response until the next pull, and the bytes decoded before a failure come out before the failure is returned.
+Pulls run on the client's thread, failing with `Status::InvalidArgument` on any other, and never wait in the library: `body_chunk` advances the client while nothing was decoded, and each poll of `next_body_chunk` advances it once and yields.
+A client bound to a server advances only as that server's loop polls, so there `body_chunk` fails with `Status::WouldBlock` and `next_body_chunk` yields until the loop polled.
+Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection carries no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `Status::ConnectionClosed`.
+Redirects stay buffered so they can be followed, and only the final response streams.
+
 ## Noise Keys
 
 Interfaces and calls can run over the Noise protocol instead of plain TCP, authenticating both sides by 32-byte Curve25519 static keys.

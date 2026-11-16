@@ -312,14 +312,26 @@ void ucall_client_response_field(ucall_client_response_field_t* arguments) {
 void ucall_client_response_body(ucall_client_response_body_t* arguments) {
     if (!arguments) return;
     if (arguments->body) *arguments->body = {};
-    if (!arguments->response || !arguments->body) {
+    auto* response = static_cast<received_response_t*>(arguments->response);
+    if (!response || !arguments->body || response->body_chunk) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    auto& response = *static_cast<received_response_t*>(arguments->response);
-    auto bytes = text_view(response.bytes());
-    *arguments->body = bytes_view(bytes.substr(response.headers_length, response.body_length));
+    auto bytes = text_view(response->bytes());
+    *arguments->body = bytes_view(bytes.substr(response->headers_length, response->body_length));
     publish(arguments->outcome, ucall_status_success_k);
+}
+void ucall_client_response_body_chunk(ucall_client_response_body_chunk_t* arguments) {
+    if (!arguments) return;
+    if (arguments->data) *arguments->data = {};
+    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
+    // The response pulls through its own instantiation, never through a client that may be gone.
+    auto* response = static_cast<received_response_t*>(arguments->response);
+    if (!response || !arguments->data || !response->body_chunk) {
+        publish(arguments->outcome, ucall_status_invalid_argument_k);
+        return;
+    }
+    publish(arguments->outcome, response->body_chunk(response, arguments->data));
 }
 
 ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_http_request_t request) {

@@ -132,7 +132,9 @@ void ucall_client_call(ucall_client_call_t* arguments) {
     ucall_security_t security = options.security;
     if (url.starts_with("http+noise://") && security == ucall_security_none_k) security = ucall_security_noise_xx_k;
     bool known = false;
-    if ((security != ucall_security_none_k && !options.noise_private_key && !client.config.noise_private_key) ||
+    if ((options.body_delivery != ucall_body_delivery_buffered_k &&
+         options.body_delivery != ucall_body_delivery_streamed_k) ||
+        (security != ucall_security_none_k && !options.noise_private_key && !client.config.noise_private_key) ||
         (security == ucall_security_noise_xx_k && !client.config.peer_authorizer) ||
         ((security == ucall_security_noise_ik_k || security == ucall_security_noise_kk_k) && !options.noise_peer_key) ||
         !url_valid(url, known)) {
@@ -183,6 +185,13 @@ void ucall_client_response_body(ucall_client_response_body_t* arguments) {
     if (!arguments) return;
     if (arguments->body) *arguments->body = {};
     refuse_exchange(arguments->body ? arguments->response : nullptr, arguments->outcome);
+}
+
+void ucall_client_response_body_chunk(ucall_client_response_body_chunk_t* arguments) {
+    if (!arguments) return;
+    if (arguments->data) *arguments->data = {};
+    if (!admit(arguments->client, arguments->outcome)) return;
+    refuse_exchange(arguments->data ? arguments->response : nullptr, arguments->outcome);
 }
 
 void ucall_client_response_free(ucall_received_http_response_t) {}

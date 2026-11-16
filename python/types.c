@@ -83,15 +83,15 @@ static char const doc_Verb[] =                                                  
     "  >>> ucall.Verb.POST == 2\n"                                                             //
     "  True";
 
-static char const doc_BodyDelivery[] =                                                          //
-    "BodyDelivery(value)\n"                                                                     //
-    "\n"                                                                                        //
-    "When an endpoint's handler runs: once the body is buffered, or at headers time with the\n" //
-    "body pulled through `DetachedRequest.body_chunks`.\n"                                      //
-    "\n"                                                                                        //
-    "Example:\n"                                                                                //
-    "  >>> @server.post(\"/upload\", body=ucall.BodyDelivery.STREAMED)\n"                       //
-    "  ... def upload(request: ucall.Request):\n"                                               //
+static char const doc_BodyDelivery[] =                                                            //
+    "BodyDelivery(value)\n"                                                                       //
+    "\n"                                                                                          //
+    "When a body is handed over: once it is buffered, or at headers time with the body pulled\n"  //
+    "through `DetachedRequest.body_chunks` on a server and `Response.body_chunks` on a client.\n" //
+    "\n"                                                                                          //
+    "Example:\n"                                                                                  //
+    "  >>> @server.post(\"/upload\", body=ucall.BodyDelivery.STREAMED)\n"                         //
+    "  ... def upload(request: ucall.Request):\n"                                                 //
     "  ...     workers.submit(store, request.detach())";
 
 static char const doc_LogFormat[] =                                                         //

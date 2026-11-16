@@ -60,8 +60,9 @@ typedef struct ucall_client_options_t {
     ucall_cpu_class_t cpu_class_ceiling;
 
     /** Largest response a call buffers, head and body, past which it fails with
-     *  @c ucall_status_overflow_k, as @c max_request_bytes bounds a server's requests. Zero takes
-     *  the largest receive buffer the kernel grants a socket. */
+     *  @c ucall_status_overflow_k, as @c max_request_bytes bounds a server's requests. A streamed
+     *  call's cap bounds its head and each framing line of its body instead. Zero takes the largest
+     *  receive buffer the kernel grants a socket. */
     size_t max_response_bytes;
 
     /** A server whose event loop drives this client, or NULL for a client with its own engine. A
@@ -114,11 +115,13 @@ UCALL_EXPORT void ucall_client_init(ucall_client_init_t* arguments);
  *  @param[in] client Client from @c ucall_client_init(), or @c NULL.
  *
  *  @note Cancels accepted calls and discards unretrieved completions. Retrieved responses remain
- *      caller-owned and readable. Do not submit or poll concurrently with teardown.
+ *      caller-owned and readable, though a streamed body that had not ended is cut short: its
+ *      unpulled bytes are dropped and its next pull answers @c ucall_status_connection_closed_k.
+ *      Do not submit or poll concurrently with teardown.
  */
 UCALL_EXPORT void ucall_client_free(ucall_client_t client);
 
-/** Options of one client call: time budget, retries, redirects and security. */
+/** Options of one client call: time budget, retries, redirects, security and body delivery. */
 typedef struct ucall_client_call_options_t {
 
     /** Time budget including queueing and redirects. Zero uses the client's call timeout. */
@@ -138,6 +141,12 @@ typedef struct ucall_client_call_options_t {
 
     /** The server's expected key; needed for IK and KK. */
     ucall_noise_key_t const* noise_peer_key;
+
+    /** When the call completes: once the whole response is buffered, or once its head arrived, with
+     *  the body pulled through @c ucall_client_response_body_chunk(). Redirects stay buffered, and
+     *  only the final response streams. A streamed body has no deadline once its head arrived;
+     *  freeing its response stops it. Default: buffered. */
+    ucall_body_delivery_t body_delivery;
 
 } ucall_client_call_options_t;
 
@@ -186,9 +195,9 @@ typedef struct ucall_client_call_t {
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c client is @c NULL.
  *  - @c ucall_status_unsupported_k The @c url names a scheme other than @c http and @c http+noise.
- *  - @c ucall_status_invalid_argument_k A view, the @c verb or the security mode is invalid, the
- *    mode lacks the key or authorizer it needs, or the @c url has no scheme or a malformed
- *    authority.
+ *  - @c ucall_status_invalid_argument_k A view, the @c verb, the security mode or the body delivery
+ *    is invalid, the mode lacks the key or authorizer it needs, or the @c url has no scheme or a
+ *    malformed authority.
  *  - @c ucall_status_contended_k Every call the client admits is taken.
  *  - @c ucall_status_overflow_k The @c url's length overflows its counter.
  */
@@ -358,12 +367,69 @@ typedef struct ucall_client_response_body_t {
 /**
  *  @brief Extracts the body content from the received response.
  *
+ *  A streamed call's response is pulled through @c ucall_client_response_body_chunk() instead.
+ *
  *  @note @b Thread-safe across responses, though two threads must not use one @c response at once.
  *
  *  @par Statuses:
- *  - @c ucall_status_invalid_argument_k The @c response or the @c body output is @c NULL.
+ *  - @c ucall_status_invalid_argument_k The @c response or the @c body output is @c NULL, or the
+ *    response is streamed.
  */
 UCALL_EXPORT void ucall_client_response_body(ucall_client_response_body_t* arguments);
+
+/** Arguments of @c ucall_client_response_body_chunk(). */
+typedef struct ucall_client_response_body_chunk_t {
+
+    /** The client the response came from. */
+    ucall_client_t client;
+
+    /** The verb's status, final on return: the next bytes, the end, or nothing decoded yet. */
+    ucall_outcome_t* outcome;
+
+    /** A response of a call submitted with @c ucall_body_delivery_streamed_k. */
+    ucall_received_http_response_t response;
+
+    /** Output for a borrowed view of the bytes decoded since the last pull, valid until the next
+     *  pull or the response's free; empty once the body ended. */
+    ucall_bytes_view_t* data;
+
+} ucall_client_response_body_chunk_t;
+
+/**
+ *  @brief Pulls the next chunk of a response body that is still arriving.
+ *
+ *  A call submitted with @c ucall_body_delivery_streamed_k completes once its head arrived, so a
+ *  download larger than @c max_response_bytes streams through its owner. Each pull takes every
+ *  byte decoded since the last one; the connection reads on only once the previous bytes were
+ *  pulled, and answers no call pipelined behind it until the body ended. A pull never blocks: the
+ *  client's polling moves the bytes, so a pull with nothing decoded yet answers
+ *  @c ucall_status_would_block_k. A body already whole when its head arrived, as with bodiless
+ *  statuses, @c HEAD and small bodies, comes whole from the first pull, and the next one answers
+ *  empty. Bytes decoded before a failure are handed out before the failure is.
+ *
+ *  Freeing the response before its body ended closes its connection, and the calls pipelined
+ *  behind it end with @c ucall_status_connection_closed_k, never sent again. Once the client is
+ *  freed, a body that had not ended drops its unpulled bytes and answers
+ *  @c ucall_status_connection_closed_k.
+ *
+ *  @warning The returned @c data is valid only until the next pull or the response's free.
+ *  @sa Use @c ucall_client_response_body() for responses that are not streamed.
+ *
+ *  @note Pulls run on the client's owner thread, the one polling @c ucall_client_take_completed(),
+ *      while the response may be freed on any thread.
+ *
+ *  @par Statuses:
+ *  - @c ucall_status_uninitialized_k The @c client is @c NULL.
+ *  - @c ucall_status_invalid_argument_k The @c response or the @c data output is @c NULL, or the
+ *    response is not streamed.
+ *  - @c ucall_status_malformed_k The body's framing is malformed, or a framing line runs past
+ *    @c max_response_bytes.
+ *  - @c ucall_status_connection_closed_k The connection closed, or the client was freed, before the
+ *    body ended.
+ *  - @c ucall_status_would_block_k Nothing was decoded since the last pull, so poll the client
+ *    before pulling again.
+ */
+UCALL_EXPORT void ucall_client_response_body_chunk(ucall_client_response_body_chunk_t* arguments);
 
 /**
  *  @brief Frees the received response handle. Does nothing for @c NULL.

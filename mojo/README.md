@@ -190,6 +190,28 @@ def main() raises:
 A client owns every input until its call completes, in slots sized once by the resolved call budget, and a `Response` stays readable after its client is dropped.
 `Client(server, options, event_loop=0)` binds the client to a server's event loop instead, so that loop's `take_call` drives both, as the Quickstart does.
 
+### Streamed Response Bodies
+
+```mojo
+def download(mut client: Client) raises:
+    var call = ClientCall.get("http://127.0.0.1:8545/dataset.bin")
+    call.options.body_delivery = BodyDelivery.STREAMED
+    var response = client.call(call^)
+    var received_bytes = 0
+    while True:
+        var chunk = response.body_chunk()
+        if len(chunk) == 0:
+            break
+        received_bytes += len(chunk)
+```
+
+A call whose `ClientCallOptions.body_delivery` is `BodyDelivery.STREAMED` completes once its head arrived, so a download larger than `max_response_bytes` is pulled through `Response.body_chunk` as it lands, while `Response.body` raises `INVALID_ARGUMENT`.
+Each chunk borrows the response until the next pull, and the bytes decoded before a failure come out before the failure is raised.
+Pulls run on the client's thread and never wait in the library: `body_chunk` advances the client while nothing was decoded.
+A client bound to a server advances only as that server's loop polls, so there `body_chunk` raises `WOULD_BLOCK`, to be pulled again after the next `take_call`.
+Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection carries no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `CONNECTION_CLOSED`.
+Redirects stay buffered so they can be followed, and only the final response streams.
+
 ## Noise Keys
 
 An interface with `Security.NOISE_XX` learns client keys during the handshake, so it vets them through a `PeerAuthorizer`, and a client calling an "http+noise://" URL vets the server's the same way:

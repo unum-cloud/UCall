@@ -420,8 +420,10 @@ static struct {
     {"Client", &ClientType},
     {"Completed", &CompletedType},
     {"Response", &ResponseType},
+    {"ResponseBodyChunks", &ResponseBodyChunksType},
     {NULL, &EndpointType},
     {NULL, &RequestBytesType},
+    {NULL, &ResponseBytesType},
 };
 
 /** The module, named as the extension is built, so @c lib.__name__ agrees with its file. */

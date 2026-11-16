@@ -395,14 +395,14 @@ struct CPUClass(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
 
 @fieldwise_init
 struct BodyDelivery(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
-    """When an endpoint's handler runs, `ucall_body_delivery_t` in C."""
+    """When a body is handed over, `ucall_body_delivery_t` in C."""
 
     var code: c_int
     """The raw `ucall_body_delivery_t` value the ABI exchanges."""
     comptime BUFFERED = Self(0)
     """Once the whole body is buffered."""
     comptime STREAMED = Self(1)
-    """At headers time, the body pulled through `DetachedRequest.body_chunk`."""
+    """At headers time, the body pulled through `DetachedRequest.body_chunk` or `Response.body_chunk`."""
 
 
 @fieldwise_init

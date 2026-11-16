@@ -1463,7 +1463,7 @@ static PyMethodDef deferred_pending_method = {"pending", (PyCFunction)deferred_p
 
 /** The coroutine @c ucall._until_final makes of @p pending and @p finish, bound methods of one
  *  owner: it polls @p pending with a backoff, so no thread waits on the library. */
-static PyObject* ucall_py_until_final(PyObject* pending, PyObject* finish) {
+PyObject* ucall_py_until_final(PyObject* pending, PyObject* finish) {
     PyObject* const package = PyImport_ImportModule("ucall");
     PyObject* const coroutine = package ? PyObject_CallMethod(package, "_until_final", "OO", pending, finish) : NULL;
     Py_XDECREF(package);

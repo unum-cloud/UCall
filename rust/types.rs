@@ -861,14 +861,15 @@ unsafe extern "C" fn authorize_trampoline(key: *const ucall_noise_key_t, context
     if authorizer(key) { ucall_status_success_k } else { ucall_status_peer_rejected_k }
 }
 
-/// When an endpoint's handler runs: once the body is buffered, or at headers time, with the body
-/// pulled through [`DetachedRequest::body_chunk`](crate::DetachedRequest::body_chunk).
+/// When a body is handed over: once it is buffered, or at headers time, with the body pulled
+/// through [`DetachedRequest::body_chunk`](crate::DetachedRequest::body_chunk) on a server and
+/// [`Response::body_chunk`](crate::Response::body_chunk) on a client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
 pub enum BodyDelivery {
-    /// The handler runs once the whole body arrived, read through `body`.
+    /// Handed over once the whole body arrived, read through `body`.
     #[default]
     Buffered,
-    /// The handler runs once the headers arrived, and the body is pulled chunk by chunk.
+    /// Handed over once the headers arrived, and the body is pulled chunk by chunk.
     Streamed,
 }
 

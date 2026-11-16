@@ -183,6 +183,32 @@ static void write_head(std::FILE* output, ucall_received_http_response_t respons
     std::fwrite(head.data(), 1, head.size(), output);
 }
 
+/** Pulls @p response's streamed body into @p output chunk by chunk, polling @p client while nothing
+ *  arrived and giving up after @p idle without a byte: whether every byte landed in @p output. */
+static bool write_body(ucall_client_t client, ucall_received_http_response_t response, std::FILE* output,
+                       std::chrono::microseconds idle) {
+    ucall_outcome_t outcome {};
+    ucall_bytes_view_t chunk {};
+    ucall_client_response_body_chunk_t pull {client, &outcome, response, &chunk};
+    auto quiet_since = std::chrono::steady_clock::now();
+    for (;;) {
+        ucall_client_response_body_chunk(&pull);
+        if (outcome.status == ucall_status_success_k && !chunk.length) return true;
+        if (outcome.status == ucall_status_success_k) {
+            if (std::fwrite(chunk.data, 1, chunk.length, output) != chunk.length) return false;
+            quiet_since = std::chrono::steady_clock::now();
+            continue;
+        }
+        if (outcome.status != ucall_status_would_block_k) return report("body", outcome), false;
+        if (std::chrono::steady_clock::now() - quiet_since > idle)
+            return fmt::print(stderr, "ucall: the body stalled\n"), false;
+        // Nothing decoded yet: one bounded round of the client's I/O moves the next bytes.
+        std::size_t none = 0;
+        ucall_client_take_completed_t advance {client, &outcome, nullptr, 0, &none, 1000};
+        ucall_client_take_completed(&advance);
+    }
+}
+
 static int call(std::span<char*> arguments) {
     call_plan_t plan {};
     if (!parse_call(arguments, plan)) return usage();
@@ -214,6 +240,8 @@ static int call(std::span<char*> arguments) {
     request.body = {reinterpret_cast<ucall_byte_t const*>(plan.body.data()), plan.body.size()};
     request.options.timeout_microseconds = static_cast<std::size_t>(
         std::chrono::duration_cast<std::chrono::microseconds>(plan.timeout).count());
+    // The body streams, so a download larger than the client's response cap still lands whole.
+    request.options.body_delivery = ucall_body_delivery_streamed_k;
     if (plan.server_key_read) {
         request.options.security = ucall_security_noise_ik_k;
         request.options.noise_peer_key = plan.server_key_read;
@@ -237,16 +265,14 @@ static int call(std::span<char*> arguments) {
     else if (completed.outcome.status != ucall_status_success_k) report("call", completed.outcome);
     else {
         auto const status = static_cast<int>(ucall_client_response_status(completed.response));
-        ucall_bytes_view_t body {};
-        ucall_client_response_body_t read {completed.response, &outcome, &body};
-        ucall_client_response_body(&read);
         // A file output lands whole or not at all, so a failed write keeps an earlier answer.
         tools::landed_file_t landed;
         std::FILE* output = stdout;
         if (plan.output_path && landed.open(plan.output_path, tools::readers_t::shared_k)) output = landed.stream();
         else if (plan.output_path) output = nullptr;
         if (output && plan.head == head_output_t::included_k) write_head(output, completed.response, status);
-        bool written = output && std::fwrite(body.data, 1, body.length, output) == body.length;
+        auto const idle = std::chrono::duration_cast<std::chrono::microseconds>(plan.timeout);
+        bool written = output && write_body(client, completed.response, output, idle);
         written = written && (plan.output_path ? landed.land(tools::landing_t::replace_k) : std::fflush(stdout) == 0);
         if (written) code = status / 100 == 2 ? exit_success_k : status / 100;
         else if (plan.output_path) fmt::print(stderr, "ucall: cannot write {}\n", plan.output_path);

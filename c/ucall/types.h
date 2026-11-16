@@ -303,14 +303,15 @@ typedef struct ucall_http_batch_endpoint_handle_t* ucall_http_batch_endpoint_t;
 /** Opaque handle for a single HTTP response received on the @b client side. */
 typedef struct ucall_received_http_response_handle_t* ucall_received_http_response_t;
 
-/** When an endpoint's callback runs: once the body is buffered, or at headers time with the body
- *  pulled through ucall_server_request_body_chunk(). */
+/** When a body is handed over: once it is buffered, or at headers time with the body pulled in
+ *  chunks, through ucall_server_request_body_chunk() or ucall_client_response_body_chunk(). */
 typedef enum ucall_body_delivery_t {
 
-    /** The callback runs once the whole body is buffered, within @c max_request_bytes. */
+    /** Handed over once the whole body is buffered, within @c max_request_bytes or
+     *  @c max_response_bytes. */
     ucall_body_delivery_buffered_k = 0,
 
-    /** The callback runs at headers time and pulls the body in chunks. */
+    /** Handed over at headers time, with the body pulled in chunks. */
     ucall_body_delivery_streamed_k = 1,
 } ucall_body_delivery_t;
 

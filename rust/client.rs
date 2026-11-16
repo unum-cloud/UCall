@@ -12,18 +12,23 @@
 #![allow(non_camel_case_types)]
 
 use core::ffi::c_void;
+use core::future::Future;
+use core::pin::Pin;
 use core::ptr;
+use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::sync::Arc;
+use std::thread::{self, ThreadId};
 
 use crate::server::{Server, ServerCore};
 use crate::types::{
-    Backend, CPUClass, HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb, check, fail,
-    lend_authorizer, lend_log, microseconds, ucall_bytes_view_t, ucall_client_t, ucall_cpu_class_t,
-    ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t,
-    ucall_received_http_response_t, ucall_security_t, ucall_server_t, ucall_verb_t, view, viewed,
+    Backend, BodyDelivery, CPUClass, HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb, check,
+    fail, lend_authorizer, lend_log, microseconds, ucall_body_delivery_t, ucall_bytes_view_t, ucall_client_t,
+    ucall_cpu_class_t, ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t,
+    ucall_peer_authorizer_t, ucall_received_http_response_t, ucall_security_t, ucall_server_t, ucall_verb_t, view,
+    viewed,
 };
 
 // region: Raw Declarations
@@ -63,6 +68,7 @@ struct ucall_client_call_options_t {
     security: ucall_security_t,
     noise_private_key: *const ucall_noise_key_t,
     noise_peer_key: *const ucall_noise_key_t,
+    body_delivery: ucall_body_delivery_t,
 }
 
 #[repr(C)]
@@ -127,6 +133,14 @@ struct ucall_client_response_body_t {
     body: *mut ucall_bytes_view_t,
 }
 
+#[repr(C)]
+struct ucall_client_response_body_chunk_t {
+    client: ucall_client_t,
+    outcome: *mut ucall_outcome_t,
+    response: ucall_received_http_response_t,
+    data: *mut ucall_bytes_view_t,
+}
+
 unsafe extern "C" {
     fn ucall_client_init(arguments: *mut ucall_client_init_t);
     fn ucall_client_free(client: ucall_client_t);
@@ -137,6 +151,7 @@ unsafe extern "C" {
     fn ucall_client_response_fields_count(arguments: *mut ucall_client_response_fields_count_t);
     fn ucall_client_response_field(arguments: *mut ucall_client_response_field_t);
     fn ucall_client_response_body(arguments: *mut ucall_client_response_body_t);
+    fn ucall_client_response_body_chunk(arguments: *mut ucall_client_response_body_chunk_t);
     fn ucall_client_response_free(response: ucall_received_http_response_t);
 }
 
@@ -180,7 +195,8 @@ pub struct ClientOptions<'server> {
     pub event_loop: usize,
 }
 
-/// One call's time budget, retries, redirects and security, each zero field taking its default.
+/// One call's time budget, retries, redirects, security and body delivery, each zero field taking
+/// its default.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct ClientCallOptions {
     /// Time budget including queueing and redirects; zero takes the client's `call_timeout`.
@@ -195,6 +211,10 @@ pub struct ClientCallOptions {
     pub noise_private_key: Option<NoiseKey>,
     /// The server's static key, which Noise IK and KK need in advance.
     pub noise_peer_key: Option<NoiseKey>,
+    /// When the call completes: once the whole response is buffered, or with
+    /// [`BodyDelivery::Streamed`] once its head arrived, the body pulled through
+    /// [`Response::body_chunk`] past `max_response_bytes`. Redirects stay buffered.
+    pub body_delivery: BodyDelivery,
 }
 
 /// One HTTP call, owning everything the library reads until the call completes.
@@ -403,6 +423,7 @@ impl Client {
                 security: request.options.security.to_raw(),
                 noise_private_key: request.options.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
                 noise_peer_key: request.options.noise_peer_key.as_ref().map_or(ptr::null(), ptr::from_ref),
+                body_delivery: request.options.body_delivery.to_raw(),
             },
             context: index as *mut c_void,
         };
@@ -446,7 +467,12 @@ impl Client {
         call.request = None;
         self.free.push(index);
         let response = match check(raw.outcome) {
-            Ok(()) if !raw.response.is_null() => Ok(Response { raw: raw.response }),
+            Ok(()) if !raw.response.is_null() => Ok(Response {
+                raw: raw.response,
+                client: self.core.raw,
+                owner: thread::current().id(),
+                bound: self.core.server.is_some(),
+            }),
             Ok(()) => Err(fail(Status::Internal, "a successful call completed without a response")),
             Err(error) => {
                 unsafe { ucall_client_response_free(raw.response) };
@@ -558,7 +584,8 @@ impl Default for Completed {
 /// A received HTTP response, freed on drop.
 ///
 /// It owns its received bytes, so it stays readable after its [`Client`] is dropped and may move
-/// to another thread.
+/// to another thread. A response of a [`BodyDelivery::Streamed`] call is pulled through
+/// [`Response::body_chunk`] on its client's thread instead.
 ///
 /// ```
 /// use ucall::*;
@@ -590,6 +617,12 @@ impl Default for Completed {
 /// ```
 pub struct Response {
     raw: ucall_received_http_response_t,
+    // A pull never reads through the client, which only its owner advances, and only while a
+    // body still arrives, which a freed client has ended.
+    client: ucall_client_t,
+    owner: ThreadId,
+    // A server's event loop advances a bound client, so a pull finding nothing returns to it.
+    bound: bool,
 }
 
 // The library reads a response without its client, and one thread at a time uses it.
@@ -601,7 +634,8 @@ impl Response {
         HTTPStatus(unsafe { ucall_client_response_status(self.raw) })
     }
 
-    /// The response body, decoded from chunked framing if it arrived that way.
+    /// The response body, decoded from chunked framing if it arrived that way; empty for a
+    /// streamed call, whose body [`Response::body_chunk`] pulls.
     pub fn body(&self) -> &[u8] {
         let mut body = view(&[]);
         let mut outcome = ucall_outcome_t::default();
@@ -646,6 +680,107 @@ impl Response {
             check(outcome).ok().map(|()| unsafe { (viewed(name), viewed(value)) })
         })
     }
+
+    /// Pulls the body bytes decoded since the last pull, advancing the client until they arrive;
+    /// empty once the body ended.
+    ///
+    /// Every response of a [`BodyDelivery::Streamed`] call is pulled to its end or dropped, since
+    /// its connection carries no other call meanwhile; dropping it early closes that connection
+    /// and fails the calls pipelined behind it with [`Status::ConnectionClosed`]. A body cut
+    /// short fails with [`Status::ConnectionClosed`], a malformed one with [`Status::Malformed`],
+    /// a buffered response or a thread other than the client's with [`Status::InvalidArgument`].
+    /// A client bound to a server advances only as that server's loop polls, so a pull finding
+    /// nothing there fails with [`Status::WouldBlock`] instead, to be pulled again after the next
+    /// [`Server::take_call`].
+    pub fn body_chunk(&mut self) -> Result<&[u8]> {
+        if thread::current().id() != self.owner {
+            return Err(fail(Status::InvalidArgument, "a streamed response pulls on its client's thread"));
+        }
+        let mut data = view(&[]);
+        let mut outcome = ucall_outcome_t::default();
+        let mut arguments = ucall_client_response_body_chunk_t {
+            client: self.client,
+            outcome: ptr::addr_of_mut!(outcome),
+            response: self.raw,
+            data: ptr::addr_of_mut!(data),
+        };
+        let (mut count, mut advanced) = (0, ucall_outcome_t::default());
+        let mut advance = ucall_client_take_completed_t {
+            client: self.client,
+            outcome: ptr::addr_of_mut!(advanced),
+            calls: ptr::null_mut(),
+            capacity: 0,
+            count: &mut count,
+            timeout_microseconds: 0,
+        };
+        loop {
+            unsafe { ucall_client_response_body_chunk(&mut arguments) };
+            match check(outcome) {
+                Err(error) if error.status == Status::WouldBlock && !self.bound => {
+                    unsafe { ucall_client_take_completed(&mut advance) };
+                    check(advanced)?;
+                }
+                pulled => return pulled.map(|()| unsafe { viewed(data) }),
+            }
+        }
+    }
+
+    /// Pulls the body bytes decoded since the last pull as a future for async code, answering
+    /// what [`Response::body_chunk`] answers without spinning the thread that awaits it.
+    ///
+    /// Every poll pulls once and, while nothing was decoded, advances a client with its own engine
+    /// and yields to the executor.
+    pub fn next_body_chunk(&mut self) -> ResponseBodyChunk<'_> {
+        ResponseBodyChunk { response: self }
+    }
+}
+
+/// A pull of a response's next body bytes being awaited, from [`Response::next_body_chunk`].
+#[must_use = "a body pull does nothing unless polled"]
+pub struct ResponseBodyChunk<'r> {
+    response: &'r mut Response,
+}
+
+impl<'r> Future for ResponseBodyChunk<'r> {
+    type Output = Result<&'r [u8]>;
+
+    fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+        let response = &*self.get_mut().response;
+        if thread::current().id() != response.owner {
+            return Poll::Ready(Err(fail(Status::InvalidArgument, "a streamed response pulls on its client's thread")));
+        }
+        let mut data = view(&[]);
+        let mut outcome = ucall_outcome_t::default();
+        let mut arguments = ucall_client_response_body_chunk_t {
+            client: response.client,
+            outcome: &mut outcome,
+            response: response.raw,
+            data: &mut data,
+        };
+        unsafe { ucall_client_response_body_chunk(&mut arguments) };
+        match check(outcome) {
+            Err(error) if error.status == Status::WouldBlock => {}
+            // The bytes live in the response this future borrows for `'r`, until its next pull.
+            pulled => return Poll::Ready(pulled.map(|()| unsafe { viewed(data) })),
+        }
+        if !response.bound {
+            let (mut count, mut advanced) = (0, ucall_outcome_t::default());
+            let mut advance = ucall_client_take_completed_t {
+                client: response.client,
+                outcome: ptr::addr_of_mut!(advanced),
+                calls: ptr::null_mut(),
+                capacity: 0,
+                count: &mut count,
+                timeout_microseconds: 0,
+            };
+            unsafe { ucall_client_take_completed(&mut advance) };
+            if let Err(error) = check(advanced) {
+                return Poll::Ready(Err(error));
+            }
+        }
+        context.waker().wake_by_ref();
+        Poll::Pending
+    }
 }
 
 impl Drop for Response {
@@ -658,9 +793,81 @@ impl Drop for Response {
 
 #[cfg(test)]
 mod tests {
+    use core::pin::pin;
+    use core::task::Waker;
+
     use super::*;
     use crate::server::{Request, Server};
-    use crate::testing::{client, loopback, serving};
+    use crate::testing::{client, loopback, pattern, serving};
+
+    #[test]
+    fn streamed_bodies_download_past_the_response_cap() {
+        let body = pattern(4 << 20);
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        let large = body.clone();
+        server
+            .get("/large", move |request: Request| {
+                let _ = request.reply(HTTPStatus::OK, &[], &large);
+            })
+            .unwrap();
+        server
+            .get("/empty", |request: Request| {
+                let _ = request.reply(HTTPStatus::NO_CONTENT, &[], &[]);
+            })
+            .unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        serving(&server, || {
+            let mut client =
+                Client::new(ClientOptions { connections: 1, max_response_bytes: 1 << 20, ..Default::default() })
+                    .unwrap();
+            let mut streamed = ClientCall::get(format!("http://{address}/large"));
+            streamed.options.body_delivery = BodyDelivery::Streamed;
+            let overflow = client.get(format!("http://{address}/large")).err().map(|error| error.status);
+            assert_eq!(overflow, Some(Status::Overflow));
+
+            let mut response = client.call(streamed.clone()).unwrap();
+            assert_eq!(response.status_code(), HTTPStatus::OK);
+            assert_eq!(response.body(), b"");
+            let mut pulled = Vec::new();
+            loop {
+                let chunk = response.body_chunk().unwrap();
+                if chunk.is_empty() {
+                    break;
+                }
+                pulled.extend_from_slice(chunk);
+            }
+            assert!(pulled == body);
+
+            let mut response = client.call(streamed.clone()).unwrap();
+            let mut context = Context::from_waker(Waker::noop());
+            pulled.clear();
+            loop {
+                let mut pull = pin!(response.next_body_chunk());
+                let chunk = loop {
+                    match pull.as_mut().poll(&mut context) {
+                        Poll::Ready(chunk) => break chunk.unwrap(),
+                        Poll::Pending => std::thread::yield_now(),
+                    }
+                };
+                if chunk.is_empty() {
+                    break;
+                }
+                pulled.extend_from_slice(chunk);
+            }
+            assert!(pulled == body);
+
+            // A bodiless response is pulled too, its first pull answering the end at once.
+            streamed.url = format!("http://{address}/empty").into();
+            let mut empty = client.call(streamed.clone()).unwrap();
+            assert_eq!(empty.status_code(), HTTPStatus::NO_CONTENT);
+            assert_eq!(empty.body_chunk().unwrap(), b"");
+            let mut buffered = client.get(format!("http://{address}/empty")).unwrap();
+            assert_eq!(buffered.body_chunk().unwrap_err().status, Status::InvalidArgument);
+            let mut moved = client.call(streamed).unwrap();
+            let elsewhere = std::thread::spawn(move || moved.body_chunk().map(<[u8]>::len).unwrap_err().status);
+            assert_eq!(elsewhere.join().unwrap(), Status::InvalidArgument);
+        });
+    }
 
     fn echo_server() -> Server {
         let mut server = Server::new(&[loopback(1).pipelined_requests(2)]).unwrap();

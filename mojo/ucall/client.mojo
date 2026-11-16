@@ -19,6 +19,7 @@ from ucall.server import Server, _ServerCore, _array, _lend, _outcome_in, _view_
 from ucall.types import (
     Address,
     Backend,
+    BodyDelivery,
     BytesView,
     CPUClass,
     Entry,
@@ -54,6 +55,8 @@ comptime ClientResponseField = Entry[ClientResponseFieldArguments]
 """`ucall_client_response_field`."""
 comptime ClientResponseBody = Entry[ClientResponseBodyArguments]
 """`ucall_client_response_body`."""
+comptime ClientResponseBodyChunk = Entry[ClientResponseBodyChunkArguments]
+"""`ucall_client_response_body_chunk`."""
 
 # endregion Signatures
 
@@ -100,6 +103,7 @@ struct ClientCallOptionsArguments(ImplicitlyCopyable):
     var security: Security
     var noise_private_key: Optional[Pointer[NoiseKey, ImmUntrackedOrigin]]
     var noise_peer_key: Optional[Pointer[NoiseKey, ImmUntrackedOrigin]]
+    var body_delivery: BodyDelivery
 
 
 @fieldwise_init
@@ -177,6 +181,16 @@ struct ClientResponseBodyArguments(ImplicitlyCopyable):
     var body: Pointer[BytesView[ImmUntrackedOrigin], MutUntrackedOrigin]
 
 
+@fieldwise_init
+struct ClientResponseBodyChunkArguments(ImplicitlyCopyable):
+    """`ucall_client_response_body_chunk_t`, laid out as the ABI declares it."""
+
+    var client: Address
+    var outcome: Pointer[Outcome, MutUntrackedOrigin]
+    var response: Address
+    var data: Pointer[BytesView[ImmUntrackedOrigin], MutUntrackedOrigin]
+
+
 # endregion Arguments
 
 # region Calls
@@ -225,7 +239,8 @@ struct ClientOptions(Copyable, Movable):
 
 @fieldwise_init
 struct ClientCallOptions(Copyable, Defaultable, Movable):
-    """One call's time budget, retries, redirects and security, each zero field taking its default."""
+    """One call's time budget, retries, redirects, security and body delivery, each zero field taking its
+    default."""
 
     var timeout_microseconds: Int
     """Time budget including queueing and redirects; zero takes the client's call timeout."""
@@ -239,10 +254,14 @@ struct ClientCallOptions(Copyable, Defaultable, Movable):
     """The private key this call authenticates with in place of the client's own."""
     var noise_peer_key: Optional[NoiseKey]
     """The server's static key, which Noise IK and KK need in advance."""
+    var body_delivery: BodyDelivery
+    """When the call completes: once the whole response is buffered, or with `STREAMED` once its head
+    arrived, the body pulled through `Response.body_chunk` past `max_response_bytes`. Redirects stay
+    buffered."""
 
     def __init__(out self):
         """Every default."""
-        self = Self(0, 0, 0, Security.NONE, None, None)
+        self = Self(0, 0, 0, Security.NONE, None, None, BodyDelivery.BUFFERED)
 
 
 @fieldwise_init
@@ -463,6 +482,7 @@ struct Client(Movable):
                     call.options.security,
                     _lend(call.options.noise_private_key),
                     _lend(call.options.noise_peer_key),
+                    call.options.body_delivery,
                 ),
                 index,
             ),
@@ -519,7 +539,7 @@ struct Client(Movable):
         if retrieved.outcome.status != c_int(0):
             self.library.symbols().client_response_free(retrieved.response)
             return Completed(context, None, self.library._error(retrieved.outcome, "ucall_client_take_completed"))
-        return Completed(context, Response(self.library, retrieved.response), None)
+        return Completed(context, Response(self.library, retrieved.response, self.handle, Bool(self.server)), None)
 
     def take_completed(mut self, mut completed: List[Completed], timeout_microseconds: Int = 0) raises Error:
         """Drives every admitted call on this thread and refills `completed` with finished ones,
@@ -599,17 +619,25 @@ struct Client(Movable):
 struct Response(Movable):
     """A received HTTP response, freed once dropped.
 
-    It owns its received bytes, so it stays readable after its client is dropped.
+    It owns its received bytes, so it stays readable after its client is dropped. A response of a
+    `BodyDelivery.STREAMED` call is pulled through `body_chunk` on its client's thread instead.
     """
 
     var library: Library
     """The loaded library, held so the release can still reach `ucall_client_response_free`."""
     var handle: Address
     """The `ucall_received_http_response_t`."""
+    var client: Address
+    """The `ucall_client_t` it came from, which a pull never reads through and only advances while a
+    body still arrives, which a freed client has ended."""
+    var bound: Bool
+    """Whether a server's event loop advances that client, so a pull finding nothing returns to it."""
 
-    def __init__(out self, library: Library, handle: Address):
+    def __init__(out self, library: Library, handle: Address, client: Address, bound: Bool):
         self.library = library
         self.handle = handle
+        self.client = client
+        self.bound = bound
 
     def __deinit__(deinit self):
         """Frees the response. Calls `ucall_client_response_free`."""
@@ -689,6 +717,57 @@ struct Response(Movable):
         )
         self.library._check(outcome[unsafe_offset=0], "ucall_client_response_field")
         return (name[unsafe_offset=0].span[ImmOrigin(origin_of(self))](), value[unsafe_offset=0].span[ImmOrigin(origin_of(self))]())
+
+    def body_chunk(ref self) raises Error -> Span[Byte, ImmOrigin(origin_of(self))]:
+        """Pulls the body bytes decoded since the last pull, advancing the client until they arrive;
+        empty once the body ended. Calls `ucall_client_response_body_chunk` and
+        `ucall_client_take_completed`.
+
+        Pull on the client's thread. A client bound to a server advances only as that server's loop
+        polls, so a pull finding nothing there raises `WOULD_BLOCK`, to be pulled again after the next
+        `take_call`. Every response of a streamed call is pulled to its end or dropped,
+        since its connection carries no other call meanwhile; dropping it early closes that connection
+        and fails the calls pipelined behind it with `CONNECTION_CLOSED`.
+
+        Returns:
+            The bytes, valid until the next pull.
+
+        Raises:
+            `Error` with `CONNECTION_CLOSED` for a body cut short, `MALFORMED` for a malformed one, or
+            `INVALID_ARGUMENT` for a buffered response.
+        """
+        var data = _view_in(stack_allocation[1, BytesView[ImmUntrackedOrigin]]())
+        var outcome = _outcome_in(stack_allocation[1, Outcome]())
+        var count = stack_allocation[1, c_size_t]().unsafe_origin_cast[MutAnyOrigin]()
+        var advanced = _outcome_in(stack_allocation[1, Outcome]())
+        var none = stack_allocation[1, CompletedCallArguments]().unsafe_origin_cast[MutUntrackedOrigin]()
+        while True:
+            _cross(
+                ClientResponseBodyChunkArguments(
+                    self.client,
+                    outcome.unsafe_origin_cast[MutUntrackedOrigin](),
+                    self.handle,
+                    data.unsafe_origin_cast[MutUntrackedOrigin](),
+                ),
+                self.library.symbols().client_response_body_chunk,
+            )
+            if Status.of(outcome[unsafe_offset=0].status) != Status.WOULD_BLOCK or self.bound:
+                break
+            # Nothing was decoded yet, so the client moves its bytes, retrieving no completion.
+            _cross(
+                ClientTakeCompletedArguments(
+                    self.client,
+                    advanced.unsafe_origin_cast[MutUntrackedOrigin](),
+                    none,
+                    c_size_t(0),
+                    count.unsafe_origin_cast[MutUntrackedOrigin](),
+                    c_size_t(0),
+                ),
+                self.library.symbols().client_take_completed,
+            )
+            self.library._check(advanced[unsafe_offset=0], "ucall_client_take_completed")
+        self.library._check(outcome[unsafe_offset=0], "ucall_client_response_body_chunk")
+        return data[unsafe_offset=0].span[ImmOrigin(origin_of(self))]()
 
 
 # endregion Responses

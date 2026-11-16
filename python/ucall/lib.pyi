@@ -190,8 +190,8 @@ class Verb(enum.IntEnum):
     ANY = 8
 
 class BodyDelivery(enum.IntEnum):
-    """When an endpoint's handler runs: once the body is buffered, or at headers time with the
-    body pulled through `DetachedRequest.body_chunks`.
+    """When a body is handed over: once it is buffered, or at headers time with the body pulled
+    through `DetachedRequest.body_chunks` on a server and `Response.body_chunks` on a client.
 
     Example:
       >>> @server.post("/upload", body=ucall.BodyDelivery.STREAMED)
@@ -1352,7 +1352,8 @@ class Server:
 class Response(Buffer):
     """One received HTTP response, which owns its bytes and outlives its client.
 
-    `body` and the buffer protocol view the received bytes without a copy.
+    `body` and the buffer protocol view the received bytes without a copy, and a streamed
+    call's body is pulled through `body_chunks` instead.
 
     Example:
       >>> response = client.post("http://127.0.0.1:8545/sum", json={"a": 1, "b": 2})
@@ -1364,7 +1365,7 @@ class Response(Buffer):
         """The HTTP status the server sent."""
     @property
     def body(self) -> memoryview:
-        """A read-only memoryview of the body, alive as long as it is."""
+        """A read-only memoryview of the body, alive as long as it is; a streamed call's raises."""
     def header(self, name: str | bytes, /) -> str | None:
         """Looks up a header of the response by its case-insensitive name.
 
@@ -1389,7 +1390,49 @@ class Response(Buffer):
           >>> dict(client.get(url).fields())[b'content-type']
           b'text/plain'
         """
+    def body_chunks(self) -> ResponseBodyChunks:
+        """Iterates the body of a `BodyDelivery.STREAMED` call as it arrives, each chunk the bytes
+        decoded since the last pull.
+
+        Each chunk is a read-only memoryview valid until the next pull, which releases it. Pulls
+        run on the client's thread and advance the client while nothing was decoded; a client
+        bound to a server advances only as its loop polls, so there a pull finding nothing
+        raises `Status.WOULD_BLOCK`, and `async for` yields until it polled. Every streamed
+        response is pulled to its end or released, bodiless ones too, as its connection carries
+        no other call meanwhile; releasing it early closes that connection, failing the calls
+        pipelined behind it with `Status.CONNECTION_CLOSED`.
+
+        Returns:
+          ResponseBodyChunks: The iterator, ending once the body did.
+
+        Raises:
+          BufferError: From a pull, while a view derived from the last chunk is still alive.
+          Error: From a pull, `Status.CONNECTION_CLOSED` or `Status.MALFORMED` for a body cut short
+            or badly framed, or `Status.INVALID_ARGUMENT` for a buffered response or another
+            thread.
+
+        Example:
+          >>> response = client.get(url, body_delivery=ucall.BodyDelivery.STREAMED)
+          >>> for chunk in response.body_chunks():  # or: async for chunk in ...
+          ...     file.write(chunk)
+        """
     def __buffer__(self, flags: int, /) -> memoryview: ...
+
+class ResponseBodyChunks(Iterator[memoryview], AsyncIterator[memoryview]):
+    """The iterator `Response.body_chunks` returns, yielding memoryviews of a streamed body.
+
+    `for` advances the client on this thread until bytes arrive, and `async for` returns a
+    chunk already decoded at once and advances the client between the running loop's other
+    tasks otherwise.
+
+    Example:
+      >>> async for chunk in response.body_chunks():  # or: for chunk in response.body_chunks()
+      ...     digest.update(chunk)
+    """
+    def __iter__(self) -> ResponseBodyChunks: ...
+    def __next__(self) -> memoryview: ...
+    def __aiter__(self) -> ResponseBodyChunks: ...
+    def __anext__(self) -> Awaitable[memoryview]: ...
 
 class Completed:
     """The final result of one accepted client call, from `Client.take_completed`.
@@ -1488,6 +1531,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
     ) -> Response:
         """Sends one exchange and waits for its response on this thread.
 
@@ -1510,6 +1554,9 @@ class Client:
             0 takes the client's `call_timeout_microseconds`.
           max_retries (int, optional): Connection attempts before sending; 0 takes 3.
           max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.
+          body_delivery (BodyDelivery, optional): `BodyDelivery.STREAMED` completes once the head
+            arrived, the body pulled through `Response.body_chunks` past `max_response_bytes`.
+            Defaults to buffered.
 
         Returns:
           Response: The response, whatever its HTTP status.
@@ -1537,6 +1584,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
     ) -> Response:
         """Sends a GET and waits for its response, as `request` does.
 
@@ -1568,6 +1616,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
     ) -> Response:
         """Sends a POST and waits for its response, as `request` does.
 
@@ -1600,6 +1649,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
     ) -> Response:
         """Sends a PUT and waits for its response, as `request` does.
 
@@ -1632,6 +1682,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
     ) -> Response:
         """Sends a DELETE and waits for its response, as `request` does.
 
@@ -1663,6 +1714,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
     ) -> Response:
         """Sends a PATCH and waits for its response, as `request` does.
 
@@ -1695,6 +1747,7 @@ class Client:
         timeout_microseconds: int = 0,
         max_retries: int = 0,
         max_redirects: int = 0,
+        body_delivery: BodyDelivery | str = BodyDelivery.BUFFERED,
         context: object = None,
     ) -> None:
         """Queues one exchange without driving I/O.
@@ -1717,6 +1770,9 @@ class Client:
             0 takes the client's `call_timeout_microseconds`.
           max_retries (int, optional): Connection attempts before sending; 0 takes 3.
           max_redirects (int, optional): Redirect hops followed before failing; 0 takes 5.
+          body_delivery (BodyDelivery, optional): `BodyDelivery.STREAMED` completes once the head
+            arrived, the body pulled through `Response.body_chunks` past `max_response_bytes`.
+            Defaults to buffered.
           context (object, optional): Anything, handed back as `Completed.context`.
 
         Raises:

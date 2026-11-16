@@ -273,6 +273,38 @@ Host names go through a built-in stub resolver driven by the client's own engine
 Connections race the answered addresses as RFC 8305's Happy Eyeballs does.
 `max_response_bytes` caps what a call buffers, failing with `ucall_status_overflow_k` past it, and the client's `log` reports failed dials, refused handshakes and refused redirects.
 
+### Streamed Response Bodies
+
+A call whose options set `body_delivery` to `ucall_body_delivery_streamed_k` completes once its head arrived, so a download larger than `max_response_bytes` is pulled through `ucall_client_response_body_chunk()` as it lands:
+
+```c
+ucall_bytes_view_t data = {0};
+ucall_client_response_body_chunk_t pull = {
+    .client = client, .outcome = &outcome, .response = completed[0].response, .data = &data};
+size_t polled = 0;
+ucall_client_take_completed_t advance = {.client = client, .outcome = &outcome, .count = &polled};
+for (;;) {
+    ucall_client_response_body_chunk(&pull);
+    if (outcome.status == ucall_status_would_block_k) {
+        ucall_client_take_completed(&advance); // moves the bytes, retrieving nothing
+        continue;
+    }
+    if (outcome.status != ucall_status_success_k || !data.length) break; // a failure, or the end
+    fwrite(data.data, 1, data.length, stdout);
+}
+ucall_client_response_free(completed[0].response);
+```
+
+Each pull hands every byte decoded since the last one, valid until the next pull or the response's free, and an empty view once the body ended; bytes decoded before a failure come out before it.
+A pull never blocks: it runs on the client's owner thread, the one polling `ucall_client_take_completed()`, and answers `ucall_status_would_block_k` while nothing new arrived.
+The connection reads on only once the previous bytes were pulled, so the cap bounds the head and each framing line rather than the body, and a body has no deadline once its head arrived.
+A streamed body is a barrier: the connection takes no new call and answers none pipelined behind it until the body ended.
+Redirects stay buffered so they can be followed, and a body already whole with its head, as with bodiless statuses, `HEAD` and small bodies, comes whole from the first pull, then the end.
+`ucall_client_response_body()` refuses a streamed response with `ucall_status_invalid_argument_k`, and the pull refuses a buffered one the same way.
+Bad chunk framing answers `ucall_status_malformed_k`, and a connection closing early `ucall_status_connection_closed_k`.
+The response may be freed on any thread; freeing it before its body ended closes its connection and ends the calls pipelined behind it with `ucall_status_connection_closed_k`, never sending them again.
+Freeing the client drops the unpulled bytes of a body still arriving, whose next pull answers `ucall_status_connection_closed_k`.
+
 ## Noise Keys
 
 `ucall_noise_key_generate()` draws a static keypair from the operating system's entropy, reporting `ucall_status_io_k` when it is refused, and `ucall_noise_key_derive()` recovers the public key of a stored private key.
