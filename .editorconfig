@@ -1,5 +1,9 @@
 root = true
 
+# Code wraps at 120 columns in every language. Prose wraps at 100 - documentation comments,
+# their tag descriptions, and Markdown paragraphs - so comment blocks stay a narrower column
+# than the code they sit above. Editors honor `max_line_length`; the per-language formatters
+# carry the same 120 in their own configs.
 [*]
 indent_style = space
 indent_size = 4
@@ -7,6 +11,21 @@ end_of_line = lf
 charset = utf-8
 trim_trailing_whitespace = true
 insert_final_newline = true
+max_line_length = 120
 
 [*.{js,mjs,cjs,ts,mts,json}]
 indent_size = 2
+
+[*.yml]
+indent_style = space
+indent_size = 2
+
+[*.{kt,kts,scala}]
+indent_style = space
+indent_size = 4
+
+# The house grouping, which ktlint reads and enforces: the platform first, then third parties,
+# then our own package, with a blank line between each.
+[*.{kt,kts}]
+ij_kotlin_imports_layout = java.**, javax.**, kotlin.**, |, *, |, cloud.unum.**
+ktlint_standard_max-line-length = disabled

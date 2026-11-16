@@ -1,0 +1,11 @@
+# Canonical contributor identities (prefer GitHub no-reply addresses when available)
+# Line format: Canonical Name <canonical-email> [Alias Name] <alias-email>
+# Repeat the line to cover each alias email you want mapped to the canonical identity.
+Ash Vardanian <1983160+ashvardanian@users.noreply.github.com>
+Mark Reed <5108907+MarkReedZ@users.noreply.github.com> <MarkReedZ@users.noreply.github.com>
+Mark Reed <5108907+MarkReedZ@users.noreply.github.com> <mark@chattyr.com>
+Gurgen Yegoryan <21982202+gurgenyegoryan@users.noreply.github.com> <gurgen.yegoryan@gmail.com>
+Victor Zverovich <576385+vitaut@users.noreply.github.com> <victor.zverovich@gmail.com>
+Victor Zverovich <576385+vitaut@users.noreply.github.com> <viz@meta.com>
+Darvin Harutyunyan <12006323+DarvinHarutyunyan@users.noreply.github.com>
+Vladimir Orshulevich <37376514+VoVoR@users.noreply.github.com>

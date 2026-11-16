@@ -80,7 +80,11 @@ BinPackLongBracedList: true
 BreakBeforeCloseBracketBracedList: false
 PenaltyBreakBeforeFirstCallParameter: 1
 
-# Align consecutive macro definitions.
+# The export macro the C interface puts before every declaration, read as an attribute.
+AttributeMacros:
+  - UCALL_EXPORT
+
+# Align consecutive macro definitions, as the `*_TARGET_*` capability flags run in blocks
 AlignConsecutiveMacros:
   Enabled: true
   AcrossEmptyLines: false
@@ -89,7 +93,7 @@ AlignConsecutiveMacros:
 # Preprocessor directive indentation: None (flat), AfterHash (#  if), BeforeHash (  #if)
 IndentPPDirectives: None
 
-# Pointers bind to the type.
+# The C++ convention `int* x`, binding the pointer to the type.
 PointerAlignment: Left
 DerivePointerAlignment: false
 

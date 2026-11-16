@@ -1,0 +1,24 @@
+# Normalize every text file to LF in the repository, and check it out as LF on every platform.
+#
+# Without this, line endings fall back to each developer's `core.autocrlf`: a Windows checkout
+# gets a CRLF worktree, while clang-format, cmake-format, rustfmt and ruff all write LF. Every
+# formatter run then rewrites whole files, and the `--check` gates in .githooks/pre-commit can
+# never pass on Windows. `eol=lf` is the operative part - `text=auto` alone still yields CRLF
+# worktrees there.
+* text=auto eol=lf
+
+# https://help.github.com/articles/dealing-with-line-endings/
+#
+# Linux start script should use lf
+/gradlew        text eol=lf
+
+# These are Windows script files and should use crlf
+*.bat           text eol=crlf
+
+# GitHub's Linguist doesn't properly classify many languages
+# https://github.com/github-linguist/linguist/blob/main/docs/overrides.md
+*.h linguist-language=C
+*.c linguist-language=C
+*.hpp linguist-language=C++
+*.cpp linguist-language=C++
+*.cuh linguist-language=CUDA

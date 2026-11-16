@@ -1,6 +1,4 @@
-"""Formatting policy for CMake source files."""
-
-# Options effecting formatting.
+# Options affecting formatting.
 with section("format"):
     # How wide to allow formatted cmake files
     line_width = 120
@@ -17,3 +15,19 @@ with section("format"):
     # If a statement is wrapped to more than one line, than dangle the closing
     # parenthesis on its own line.
     dangle_parens = True
+
+# The project's own functions, so a keyword stays on the line of the items it brings.
+with section("parse"):
+    additional_commands = {
+        "ucall_cpu_variant": {"pargs": "2+"},
+        "ucall_engine_sources": {"pargs": "2+"},
+        "ucall_setup_library": {"pargs": 2},
+        "ucall_sibling": {"pargs": 4},
+    }
+
+with section("markup"):
+    # Never reflow hand-authored comment blocks: a file-level docstring can carry multi-line apt,
+    # uv or cmake usage that a reflow would restitch into an unreadable run. Disabling markup keeps
+    # every comment verbatim, so the docstring survives without a `cmake-format: off` guard.
+    enable_markup = False
+    first_comment_is_literal = True
