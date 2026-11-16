@@ -168,6 +168,26 @@ class route_trie {
         return result;
     }
 
+    /** The child of @p parent along the literal @p segment, linked in when missing, or null once
+     *  the pools run out. */
+    node_t* literal_child(node_t* parent, std::string_view segment) noexcept {
+        if (auto found = literal(parent, segment)) return found;
+        auto created = child(parent, segment_type_t::literal_k);
+        auto edge = take(edges_);
+        if (!created || !edge) return nullptr;
+        *edge = {segment, created, parent->literals};
+        parent->literals = edge;
+        return created;
+    }
+
+    /** A parameter or wildcard child made under @p parent for @p parsed, naming it in @p name, or
+     *  null once the pool runs out. */
+    node_t* named_child(node_t* parent, parsed_segment_t const& parsed, std::string_view& name) noexcept {
+        auto result = child(parent, parsed.type);
+        if (result) name = parsed.content;
+        return result;
+    }
+
   public:
     using allocator_t = allocator_type_;
 
@@ -204,25 +224,15 @@ class route_trie {
             parsed_segment_t parsed {};
             [[maybe_unused]] bool const validated = parse_segment<search_type_>(segment, parsed);
             if (parsed.type == segment_type_t::literal_k) {
-                auto found = literal(current, parsed.content);
-                if (!found) {
-                    found = child(current, parsed.type);
-                    auto edge = take(edges_);
-                    if (!found || !edge) return ucall_status_out_of_memory_k;
-                    *edge = {parsed.content, found, current->literals};
-                    current->literals = edge;
-                }
-                current = found;
+                current = literal_child(current, parsed.content);
+                if (!current) return ucall_status_out_of_memory_k;
             }
             else {
                 auto& next = parsed.type == segment_type_t::param_k ? current->parameter : current->wildcard;
                 auto& name = parsed.type == segment_type_t::param_k ? current->parameter_name : current->wildcard_name;
                 if (next && !search_type_::equal(name, parsed.content)) return ucall_status_invalid_argument_k;
-                if (!next) {
-                    next = child(current, parsed.type);
-                    if (!next) return ucall_status_out_of_memory_k;
-                    name = parsed.content;
-                }
+                if (!next) next = named_child(current, parsed, name);
+                if (!next) return ucall_status_out_of_memory_k;
                 current = next;
             }
         }
@@ -260,8 +270,9 @@ class route_trie {
                     current = current->parameter;
                     continue;
                 }
-                if (current->wildcard && remains(static_cast<std::size_t>(segment.data() - cursor.path.data())))
-                    if (auto found = endpoint(current->wildcard, verb, tag, allowed)) return found;
+                bool const tail = current->wildcard &&
+                                  remains(static_cast<std::size_t>(segment.data() - cursor.path.data()));
+                if (auto found = tail ? endpoint(current->wildcard, verb, tag, allowed) : nullptr) return found;
             }
             cursor.offset = before;
             bool descend {};
@@ -269,17 +280,15 @@ class route_trie {
                 auto failed = current;
                 current = current->parent;
                 cursor.previous();
-                if (failed->kind == segment_type_t::literal_k && current->parameter) {
-                    auto const resumed = cursor.offset;
-                    if (!cursor.next().empty()) {
-                        current = current->parameter;
-                        descend = true;
-                        break;
-                    }
-                    cursor.offset = resumed;
+                auto const resumed = cursor.offset;
+                descend = failed->kind == segment_type_t::literal_k && current->parameter && !cursor.next().empty();
+                if (descend) {
+                    current = current->parameter;
+                    break;
                 }
-                if (current->wildcard && remains(cursor.offset))
-                    if (auto found = endpoint(current->wildcard, verb, tag, allowed)) return found;
+                cursor.offset = resumed;
+                bool const tail = current->wildcard && remains(cursor.offset);
+                if (auto found = tail ? endpoint(current->wildcard, verb, tag, allowed) : nullptr) return found;
             }
             if (!descend) return nullptr;
         }

@@ -10,9 +10,10 @@
 #include <cerrno>
 #include <climits> // `CHAR_BIT`
 
-#include <atomic>  // `std::memory_order_relaxed`
-#include <limits>  // `std::numeric_limits`
-#include <variant> // `std::variant`, `std::visit`
+#include <atomic>   // `std::memory_order_relaxed`
+#include <concepts> // `std::convertible_to`, `std::same_as`
+#include <limits>   // `std::numeric_limits`
+#include <variant>  // `std::variant`, `std::visit`
 
 #include <smashtable/intrusive_list.hpp> // `intrusive_list`
 
@@ -595,6 +596,13 @@ inline bool io_pending(descriptor_t result) noexcept {
     return result == -EAGAIN || result == -EWOULDBLOCK || result == -EINPROGRESS || result == -EINTR;
 }
 
+/** A readiness engine whose level-triggered set keeps polling what nothing waits on, so it must
+ *  hear of each operation's end. */
+template <typename engine_type_>
+concept readiness_disarming = requires(engine_type_& engine, descriptor_t descriptor, unsigned index) {
+    engine.readiness.disarm(descriptor, io_direction_t::receive_k, index);
+};
+
 /** Marks an armed operation ready, for the next progress pass of a readiness engine. */
 template <typename engine_type_>
 void readiness_wake(engine_type_& engine, unsigned index) noexcept {
@@ -655,7 +663,7 @@ io_completion_t readiness_finish(engine_type_& engine, unsigned index, descripto
         engine.timed.pop_back();
     }
     // Only a level-triggered set keeps polling what nothing waits on, so only it hears of the end.
-    if constexpr (requires { engine.readiness.disarm(request.descriptor, io_direction_t::receive_k, index); })
+    if constexpr (readiness_disarming<engine_type_>)
         if (operation.interest == io_interest_t::armed_k || operation.interest == io_interest_t::ready_k)
             engine.readiness.disarm(request.descriptor, io_direction(request.operation), index);
     if (request.operation == io_operation_t::accept_k) request.length = 0;
@@ -774,6 +782,42 @@ enum class zero_copy_stage_t : std::uint8_t {
     copying_k,
 };
 
+/** An engine that names the host setting its refused setup needs raised. */
+template <typename engine_type_>
+concept io_engine_naming_refusals = requires(engine_type_ const& engine) {
+    { engine.refusal } -> std::convertible_to<char const*>;
+};
+
+/** An engine that grows its capacity in place, keeping the setup it proved. */
+template <typename engine_type_>
+concept io_engine_growing_in_place = requires(engine_type_& engine, std::size_t capacity) {
+    { engine.grow(capacity) } -> std::same_as<ucall_status_t>;
+};
+
+/** An engine that keeps the records sends' releases name apart from the rest. */
+template <typename engine_type_>
+concept io_engine_reserving_releases = requires(engine_type_& engine, std::size_t count) {
+    engine.reserve_releases(count);
+};
+
+/** An engine that prefetches a stream's bytes, and so can pause while nobody pulls them. */
+template <typename engine_type_>
+concept io_engine_prefetching = requires(engine_type_& engine, descriptor_t descriptor) {
+    engine.receive_pause(descriptor);
+};
+
+/** An engine whose accepted sockets share flags its listener must be created with. */
+template <typename engine_type_>
+concept io_engine_creating_listeners = requires(engine_type_& engine, int family) {
+    { engine.open_listener(family) } -> std::same_as<descriptor_t>;
+};
+
+/** An engine that accepts only from listeners it creates, naming why it refuses a borrowed one. */
+template <typename engine_type_>
+concept io_engine_refusing_borrowed_listeners = requires {
+    { engine_type_::borrowed_listener_refusal_k } -> std::convertible_to<char const*>;
+};
+
 /**
  *  @brief Several engines behind one type: @c open picks one at runtime, and every engine verb
  *      forwards to it through one @c std::visit, a predictable switch per call.
@@ -832,7 +876,7 @@ class io_engine_variant {
     char const* refusal() const noexcept {
         return std::visit(
             [](auto const& engine) noexcept -> char const* {
-                if constexpr (requires { engine.refusal; }) return engine.refusal;
+                if constexpr (io_engine_naming_refusals<decltype(engine)>) return engine.refusal;
                 else return nullptr;
             },
             engines_);
@@ -848,7 +892,7 @@ class io_engine_variant {
         ucall_status_t grown = ucall_status_success_k;
         bool const in_place = std::visit(
             [&](auto& engine) noexcept {
-                if constexpr (requires { engine.grow(capacity); }) {
+                if constexpr (io_engine_growing_in_place<decltype(engine)>) {
                     grown = engine.grow(capacity);
                     return true;
                 }
@@ -863,7 +907,7 @@ class io_engine_variant {
     void reserve_releases(std::size_t count) noexcept {
         std::visit(
             [&](auto& engine) noexcept {
-                if constexpr (requires { engine.reserve_releases(count); }) engine.reserve_releases(count);
+                if constexpr (io_engine_reserving_releases<decltype(engine)>) engine.reserve_releases(count);
             },
             engines_);
     }
@@ -873,7 +917,7 @@ class io_engine_variant {
     void receive_pause(descriptor_t descriptor) noexcept {
         std::visit(
             [&](auto& engine) noexcept {
-                if constexpr (requires { engine.receive_pause(descriptor); }) engine.receive_pause(descriptor);
+                if constexpr (io_engine_prefetching<decltype(engine)>) engine.receive_pause(descriptor);
             },
             engines_);
     }
@@ -897,7 +941,7 @@ class io_engine_variant {
     descriptor_t open_listener(int family) noexcept {
         return std::visit(
             [&](auto& engine) noexcept {
-                if constexpr (requires { engine.open_listener(family); }) return engine.open_listener(family);
+                if constexpr (io_engine_creating_listeners<decltype(engine)>) return engine.open_listener(family);
                 else return socket_open(family);
             },
             engines_);
@@ -925,28 +969,33 @@ class io_engine_variant {
     static constexpr ucall_io_backend_t backends_k[] {engine_types_::backend_k...};
     static constexpr io_receive_memory_t receive_memories_k[] {engine_types_::receive_memory_k...};
 
+    /** Past the last engine, the ladder answers why the last one tried refused. */
+    template <std::size_t index_>
+        requires(index_ == sizeof...(engine_types_))
+    ucall_status_t open_(ucall_io_backend_t, std::size_t, std::size_t, io_issuer_scope_t, io_listeners_t,
+                         ucall_status_t refused) noexcept {
+        return refused;
+    }
+
     template <std::size_t index_>
     ucall_status_t open_(ucall_io_backend_t backend, std::size_t depth, std::size_t capacity, io_issuer_scope_t scope,
                          io_listeners_t listeners, ucall_status_t refused) noexcept {
-        if constexpr (index_ == sizeof...(engine_types_)) return refused;
-        else {
-            using engine_t = std::variant_alternative_t<index_, engines_t>;
-            bool const automatic = backend == ucall_io_backend_automatic_k;
-            if (!automatic && backend != backends_k[index_])
-                return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
-            if constexpr (requires { engine_t::borrowed_listener_refusal_k; })
-                if (listeners == io_listeners_t::borrowed_k) {
-                    if (automatic) return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
-                    engines_.template emplace<index_>(allocator_).refusal = engine_t::borrowed_listener_refusal_k;
-                    return ucall_status_unsupported_k;
-                }
-            ucall_status_t const opened = engines_.template emplace<index_>(allocator_).open(depth, capacity, scope);
-            // Only the automatic ladder passes on, and only past a host refusing an engine's setup.
-            if (!automatic || (opened != ucall_status_unsupported_k && opened != ucall_status_io_k &&
-                               opened != ucall_status_out_of_memory_k))
-                return opened;
-            return open_<index_ + 1>(backend, depth, capacity, scope, listeners, opened);
-        }
+        using engine_t = std::variant_alternative_t<index_, engines_t>;
+        bool const automatic = backend == ucall_io_backend_automatic_k;
+        if (!automatic && backend != backends_k[index_])
+            return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
+        if constexpr (io_engine_refusing_borrowed_listeners<engine_t>)
+            if (listeners == io_listeners_t::borrowed_k) {
+                if (automatic) return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
+                engines_.template emplace<index_>(allocator_).refusal = engine_t::borrowed_listener_refusal_k;
+                return ucall_status_unsupported_k;
+            }
+        ucall_status_t const opened = engines_.template emplace<index_>(allocator_).open(depth, capacity, scope);
+        // Only the automatic ladder passes on, and only past a host refusing an engine's setup.
+        if (!automatic || (opened != ucall_status_unsupported_k && opened != ucall_status_io_k &&
+                           opened != ucall_status_out_of_memory_k))
+            return opened;
+        return open_<index_ + 1>(backend, depth, capacity, scope, listeners, opened);
     }
 
     /** The engine @c open picked, or the one it tried last. */

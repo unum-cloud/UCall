@@ -874,7 +874,7 @@ static int request_claim_reply(Request* self, PyObject* body, ucall_bytes_view_t
     }
     if (self->exports) {
         PyErr_Format(PyExc_BufferError,
-                     "%zd views over the request body are alive, and the reply would free their bytes; "
+                     "%zd views over the request body are alive, and the reply would free their bytes; " //
                      "drop them or copy with bytes() first",
                      self->exports);
         return -1;
@@ -1454,17 +1454,32 @@ static PyObject* Deferred_wait(Deferred* self, [[maybe_unused]] PyObject* unused
     Py_RETURN_NONE;
 }
 
-/** @c await @c deferred runs @c wait in the running loop's default executor. */
+/** Whether a deferred reply still sends, read without waiting. */
+static PyObject* deferred_pending(Deferred* self, [[maybe_unused]] PyObject* unused) {
+    return PyBool_FromLong(ucall_outcome_status(&self->outcome) == ucall_status_deferred_k);
+}
+
+static PyMethodDef deferred_pending_method = {"pending", (PyCFunction)deferred_pending, METH_NOARGS, NULL};
+
+/** The coroutine @c ucall._until_final makes of @p pending and @p finish, bound methods of one
+ *  owner: it polls @p pending with a backoff, so no thread waits on the library. */
+static PyObject* ucall_py_until_final(PyObject* pending, PyObject* finish) {
+    PyObject* const package = PyImport_ImportModule("ucall");
+    PyObject* const coroutine = package ? PyObject_CallMethod(package, "_until_final", "OO", pending, finish) : NULL;
+    Py_XDECREF(package);
+    return coroutine;
+}
+
+/** @c await @c deferred polls the outcome between the running loop's other tasks, then raises as
+ *  @c wait does. */
 static PyObject* Deferred_await(Deferred* self) {
-    PyObject* const asyncio = PyImport_ImportModule("asyncio");
-    PyObject* const loop = asyncio ? PyObject_CallMethod(asyncio, "get_running_loop", NULL) : NULL;
-    PyObject* const wait = loop ? PyObject_GetAttrString((PyObject*)self, "wait") : NULL;
-    PyObject* const future = wait ? PyObject_CallMethod(loop, "run_in_executor", "OO", Py_None, wait) : NULL;
-    PyObject* const awaiting = future ? PyObject_CallMethod(future, "__await__", NULL) : NULL;
-    Py_XDECREF(future);
+    PyObject* const pending = PyCFunction_New(&deferred_pending_method, (PyObject*)self);
+    PyObject* const wait = pending ? PyObject_GetAttrString((PyObject*)self, "wait") : NULL;
+    PyObject* const coroutine = wait ? ucall_py_until_final(pending, wait) : NULL;
+    PyObject* const awaiting = coroutine ? PyObject_CallMethod(coroutine, "__await__", NULL) : NULL;
+    Py_XDECREF(coroutine);
     Py_XDECREF(wait);
-    Py_XDECREF(loop);
-    Py_XDECREF(asyncio);
+    Py_XDECREF(pending);
     return awaiting;
 }
 
@@ -1855,14 +1870,17 @@ static PyObject* body_chunks_yield_async(BodyChunks* self) {
     return chunk;
 }
 
-/** Waits for a deferred pull in an executor thread, without the interpreter lock. */
+/** Whether a pull still waits for its chunk, read without waiting. */
+static PyObject* body_chunks_pending(BodyChunks* self, [[maybe_unused]] PyObject* unused) {
+    return PyBool_FromLong(ucall_outcome_status(&self->outcome) == ucall_status_deferred_k);
+}
+
+/** The chunk of a pull @c body_chunks_pending reported final. */
 static PyObject* body_chunks_finish(BodyChunks* self, [[maybe_unused]] PyObject* unused) {
-    Py_BEGIN_ALLOW_THREADS;
-    ucall_outcome_wait(&self->outcome);
-    Py_END_ALLOW_THREADS;
     return body_chunks_yield_async(self);
 }
 
+static PyMethodDef body_chunks_pending_method = {"pending", (PyCFunction)body_chunks_pending, METH_NOARGS, NULL};
 static PyMethodDef body_chunks_finish_method = {"finish", (PyCFunction)body_chunks_finish, METH_NOARGS, NULL};
 
 /** A future the running loop resolves at once to a final pull's chunk, or to its exception. */
@@ -1883,8 +1901,8 @@ static PyObject* body_chunks_resolved(BodyChunks* self, PyObject* loop) {
     return future;
 }
 
-/** @c async @c for pulls as @c next does, running a deferred pull's wait in the running loop's
- *  default executor. */
+/** @c async @c for pulls as @c next does, polling a deferred pull between the running loop's other
+ *  tasks. */
 static PyObject* BodyChunks_anext(BodyChunks* self) {
     PyObject* const asyncio = PyImport_ImportModule("asyncio");
     PyObject* const loop = asyncio ? PyObject_CallMethod(asyncio, "get_running_loop", NULL) : NULL;
@@ -1892,9 +1910,11 @@ static PyObject* BodyChunks_anext(BodyChunks* self) {
     if (loop && body_chunks_pull(self) == 0) {
         if (ucall_outcome_status(&self->outcome) != ucall_status_deferred_k) future = body_chunks_resolved(self, loop);
         else {
-            PyObject* const finish = PyCFunction_New(&body_chunks_finish_method, (PyObject*)self);
-            future = finish ? PyObject_CallMethod(loop, "run_in_executor", "OO", Py_None, finish) : NULL;
+            PyObject* const pending = PyCFunction_New(&body_chunks_pending_method, (PyObject*)self);
+            PyObject* const finish = pending ? PyCFunction_New(&body_chunks_finish_method, (PyObject*)self) : NULL;
+            future = finish ? ucall_py_until_final(pending, finish) : NULL;
             Py_XDECREF(finish);
+            Py_XDECREF(pending);
         }
     }
     Py_XDECREF(loop);
@@ -1916,14 +1936,14 @@ static void BodyChunks_dealloc(BodyChunks* self) {
     PyObject_Free(self);
 }
 
-static char const doc_BodyChunks[] =                                                                //
-    "The iterator `DetachedRequest.body_chunks` returns, yielding memoryviews of the body.\n"       //
-    "\n"                                                                                            //
-    "`async for` returns a chunk already decoded at once and waits for one still arriving in the\n" //
-    "running loop's default executor; `for` waits on the calling thread.\n"                         //
-    "\n"                                                                                            //
-    "Example:\n"                                                                                    //
-    "  >>> async for chunk in detached.body_chunks():  # or: for chunk in detached.body_chunks()\n" //
+static char const doc_BodyChunks[] =                                                                 //
+    "The iterator `DetachedRequest.body_chunks` returns, yielding memoryviews of the body.\n"        //
+    "\n"                                                                                             //
+    "`async for` returns a chunk already decoded at once and polls for one still arriving between\n" //
+    "the running loop's other tasks; `for` waits on the calling thread.\n"                           //
+    "\n"                                                                                             //
+    "Example:\n"                                                                                     //
+    "  >>> async for chunk in detached.body_chunks():  # or: for chunk in detached.body_chunks()\n"  //
     "  ...     digest.update(chunk)";
 
 PyTypeObject BodyChunksType = {
@@ -3362,8 +3382,8 @@ static PyObject* Server_run(Server* self, [[maybe_unused]] PyObject* unused) {
     Py_ssize_t const batches = server_batch_endpoints_count(self);
     if (self->event_loops != 1 || batches)
         return PyErr_Format(PyExc_RuntimeError,
-                            "Server.run() polls one event loop on the calling thread, and this server has %zu event "
-                            "loops and %zd batch endpoints, so poll each loop with take_calls and drain each batch "
+                            "Server.run() polls one event loop on the calling thread, and this server has %zu event " //
+                            "loops and %zd batch endpoints, so poll each loop with take_calls and drain each batch "  //
                             "endpoint with take_batches on threads of your own.",
                             self->event_loops, batches);
     ucall_outcome_t outcome = {0};

@@ -359,6 +359,14 @@ struct windows_overlapped {
         return ucall_status_success_k;
     }
 
+    /** Takes a packet no operation posted: the timer's marks it unarmed, and any other is a
+     *  notification counted into @p notifications. */
+    void take_foreign(ULONG_PTR key, std::size_t& notifications) noexcept {
+        --foreign;
+        if (key == windows_timer_key_k) timer_due = 0;
+        else ++notifications;
+    }
+
     /** Answers settled operations into @p completions, waiting once when blocking finds none, until
      *  @p deadline or the earliest operation's; returns early once a notification arrived, counted
      *  into @p notifications. */
@@ -400,9 +408,7 @@ struct windows_overlapped {
             }
             for (ULONG i = 0; i != dequeued; ++i) {
                 if (entries[i].lpCompletionKey != windows_overlapped_key_k) {
-                    --foreign;
-                    if (entries[i].lpCompletionKey == windows_timer_key_k) timer_due = 0;
-                    else ++notifications;
+                    take_foreign(entries[i].lpCompletionKey, notifications);
                     continue;
                 }
                 operation_t& operation = *reinterpret_cast<operation_t*>(entries[i].lpOverlapped);

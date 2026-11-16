@@ -405,17 +405,17 @@ struct server : ucall_server_handle_t {
                 return;
             }
             std::size_t connections_count = 0, acceptors_count = 0;
-            for (auto& network_interface : server->network_interfaces)
-                if (event_loop_index < network_interface.config.event_loops) {
-                    std::size_t const quota = network_interface.quota(event_loop_index);
-                    if (quota > (std::numeric_limits<std::size_t>::max)() - connections_count) {
-                        publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
-                        return;
-                    }
-                    connections_count += quota;
-                    event_loop.max_exchanges += quota * network_interface.config.max_pipelined_requests;
-                    ++acceptors_count;
+            for (auto& network_interface : server->network_interfaces) {
+                if (event_loop_index >= network_interface.config.event_loops) continue;
+                std::size_t const quota = network_interface.quota(event_loop_index);
+                if (quota > (std::numeric_limits<std::size_t>::max)() - connections_count) {
+                    publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
+                    return;
                 }
+                connections_count += quota;
+                event_loop.max_exchanges += quota * network_interface.config.max_pipelined_requests;
+                ++acceptors_count;
+            }
             if (st::failed(event_loop.connections.resize(connections_count))) {
                 publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
                 return;
@@ -440,17 +440,17 @@ struct server : ucall_server_handle_t {
                 event_loop.idle = connection.get();
             }
             std::size_t acceptor_index = 0;
-            for (auto& network_interface : server->network_interfaces)
-                if (event_loop_index < network_interface.config.event_loops) {
-                    auto& acceptor = event_loop.interface_acceptors[acceptor_index++];
-                    acceptor.event_loop = &event_loop;
-                    acceptor.network_interface = &network_interface;
-                    if (st::failed(acceptor.peer_addresses.resize(
-                            fu::max_of<std::size_t>(network_interface.quota(event_loop_index), 1)))) {
-                        publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
-                        return;
-                    }
+            for (auto& network_interface : server->network_interfaces) {
+                if (event_loop_index >= network_interface.config.event_loops) continue;
+                auto& acceptor = event_loop.interface_acceptors[acceptor_index++];
+                acceptor.event_loop = &event_loop;
+                acceptor.network_interface = &network_interface;
+                if (st::failed(acceptor.peer_addresses.resize(
+                        fu::max_of<std::size_t>(network_interface.quota(event_loop_index), 1)))) {
+                    publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
+                    return;
                 }
+            }
         }
         // Each engine opens before its loop's listeners, the later loops on the backend the first
         // one resolved, so loop zero's listeners and the sockets they accept carry its engine's
@@ -770,13 +770,12 @@ struct server : ucall_server_handle_t {
             else {
                 auto& connection = *static_cast<connection_t*>(completion.request->context);
                 advance_completion(event_loop.engine, completion);
-                if (completion.request != &connection.file_read_request) {
-                    if (completion.request->operation == io_operation_t::send_zero_copy_k)
-                        replies_t::complete_zero_copy_send(event_loop, connection, completion);
-                }
-                else if (completion.request->operation == io_operation_t::file_open_k)
+                bool const file_read = completion.request == &connection.file_read_request;
+                if (!file_read && completion.request->operation == io_operation_t::send_zero_copy_k)
+                    replies_t::complete_zero_copy_send(event_loop, connection, completion);
+                else if (file_read && completion.request->operation == io_operation_t::file_open_k)
                     replies_t::complete_file_open(connection, completion);
-                else replies_t::complete_file_read(event_loop, connection, completion);
+                else if (file_read) replies_t::complete_file_read(event_loop, connection, completion);
                 serving_t::mark_ready(event_loop, connection);
             }
         }
@@ -1076,26 +1075,11 @@ struct server : ucall_server_handle_t {
         }
         endpoint->path = {endpoint->storage.data(), path.size()};
         endpoint->verb = arguments->verb;
-        if constexpr (requires { arguments->min_batch_size; }) {
-            endpoint->batch = allocate_unique<batch_endpoint_t>(server.allocator, server.allocator);
-            auto* batch = endpoint->batch.get();
-            auto slots = server.requests_budget + server.event_loops.size();
-            auto max_batch_size = arguments->max_batch_size ? arguments->max_batch_size : 32;
-            ucall_status_t prepared = ucall_status_out_of_memory_k;
-            if (batch && !st::failed(batch->collected.reserve(max_batch_size)) &&
-                !st::failed(batch->slots.resize(std::bit_ceil(slots))) &&
-                !st::failed(server.batch_endpoints.reserve(server.batch_endpoints.size() + 1)))
-                prepared = batch->wake.open();
-            if (prepared != ucall_status_success_k) {
-                allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
-                publish<atomic_ref>(arguments->outcome, prepared);
-                return;
-            }
-            batch->min_batch_size = arguments->min_batch_size ? arguments->min_batch_size : 1;
-            batch->max_batch_size = max_batch_size;
-            batch->max_latency_microseconds = arguments->max_latency_microseconds ? arguments->max_latency_microseconds
-                                                                                  : 10'000;
-            batch->context = arguments->context;
+        if (ucall_status_t const prepared = prepare_endpoint(server, *endpoint, *arguments);
+            prepared != ucall_status_success_k) {
+            allocator_delete<endpoint_t, allocator_t> {server.allocator}(endpoint);
+            publish<atomic_ref>(arguments->outcome, prepared);
+            return;
         }
         endpoint->next = server.endpoints;
         server.endpoints = endpoint;
@@ -1103,23 +1087,55 @@ struct server : ucall_server_handle_t {
         // listed, but it is no batch endpoint: nothing deposits into it and nothing reports it.
         if (auto status = server.routes.insert(endpoint->path, endpoint->verb, endpoint);
             status != ucall_status_success_k) {
-            if constexpr (requires { arguments->min_batch_size; }) endpoint->batch.reset();
+            endpoint->batch.reset();
             publish<atomic_ref>(arguments->outcome, status);
             return;
         }
-        if constexpr (requires { arguments->min_batch_size; }) {
-            auto& batch = *endpoint->batch;
-            batch.callback = arguments->callback;
-            [[maybe_unused]] st::status_t const listed = server.batch_endpoints.emplace_back(st::assume_reserved,
-                                                                                             &batch);
-            *arguments->endpoint = &batch;
-        }
-        else {
-            endpoint->callback = arguments->callback;
-            endpoint->body_delivery = arguments->body_delivery;
-            endpoint->context = arguments->context;
-        }
+        attach_endpoint(server, *endpoint, *arguments);
         publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
+    }
+
+    /** A plain endpoint needs nothing before it is routed. */
+    static ucall_status_t prepare_endpoint(server_t&, endpoint_t&, ucall_server_add_http_endpoint_t const&) noexcept {
+        return ucall_status_success_k;
+    }
+
+    /** Reserves a batch endpoint's queue, slots and wake before it is routed, so routing it
+     *  allocates nothing further. */
+    static ucall_status_t prepare_endpoint(server_t& server, endpoint_t& endpoint,
+                                           ucall_server_add_http_batch_endpoint_t const& arguments) noexcept {
+        endpoint.batch = allocate_unique<batch_endpoint_t>(server.allocator, server.allocator);
+        auto* batch = endpoint.batch.get();
+        auto slots = server.requests_budget + server.event_loops.size();
+        auto max_batch_size = arguments.max_batch_size ? arguments.max_batch_size : 32;
+        if (!batch || st::failed(batch->collected.reserve(max_batch_size)) ||
+            st::failed(batch->slots.resize(std::bit_ceil(slots))) ||
+            st::failed(server.batch_endpoints.reserve(server.batch_endpoints.size() + 1)))
+            return ucall_status_out_of_memory_k;
+        if (ucall_status_t const opened = batch->wake.open(); opened != ucall_status_success_k) return opened;
+        batch->min_batch_size = arguments.min_batch_size ? arguments.min_batch_size : 1;
+        batch->max_batch_size = max_batch_size;
+        batch->max_latency_microseconds = arguments.max_latency_microseconds ? arguments.max_latency_microseconds
+                                                                             : 10'000;
+        batch->context = arguments.context;
+        return ucall_status_success_k;
+    }
+
+    /** Hands a routed plain endpoint its callback. */
+    static void attach_endpoint(server_t&, endpoint_t& endpoint,
+                                ucall_server_add_http_endpoint_t const& arguments) noexcept {
+        endpoint.callback = arguments.callback;
+        endpoint.body_delivery = arguments.body_delivery;
+        endpoint.context = arguments.context;
+    }
+
+    /** Hands a routed batch endpoint its callback, lists it for statistics, and returns it. */
+    static void attach_endpoint(server_t& server, endpoint_t& endpoint,
+                                ucall_server_add_http_batch_endpoint_t const& arguments) noexcept {
+        auto& batch = *endpoint.batch;
+        batch.callback = arguments.callback;
+        [[maybe_unused]] st::status_t const listed = server.batch_endpoints.emplace_back(st::assume_reserved, &batch);
+        *arguments.endpoint = &batch;
     }
     static void server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments) noexcept {
         add_endpoint(arguments);

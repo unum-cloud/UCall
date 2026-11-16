@@ -17,6 +17,7 @@
 #include "crypto_x25519_radix51.hpp" // `field_radix51`, `serial_words`, `scalar_multiply_through`
 #include "secure_tunnel.hpp"         // `crypto_t`, `hmac_of`, `run_of`, `from_hex`
 
+#include "ucall/http/messages.hpp" // `serial_hash_kit_t`, `neonaes_hash_kit_t` and the other hash kits
 #include "ucall/tunnel/crypto.hpp" // `serial_x25519_kit_t`, `haswell_x25519_kit_t`, `neon_x25519_kit_t`
 
 namespace unum::ucall::test::tunnel {
@@ -249,6 +250,129 @@ static std::size_t test_x25519_kits() {
     return failures;
 }
 
+/** Whether this machine runs @p capability, as StringZilla detects it. */
+[[nodiscard]] static bool runs_here(sz_capability_t capability) noexcept {
+    sz_capability_t detected = sz_cap_serial_k;
+    if (sz_capabilities_detected_cpu(&detected) != sz_success_k) detected = sz_cap_serial_k;
+    return (detected & capability) == capability;
+}
+
+/** Fills @p bytes from a pattern seeded by @p seed, so every kit sees the same input. */
+static void fill_pattern(span<byte_t> bytes, std::uint64_t seed) noexcept {
+    for (std::size_t index = 0; index != bytes.size(); ++index)
+        bytes[index] = static_cast<byte_t>((seed * 0x9E3779B97F4A7C15ull + index * 0xBF58476D1CE4E5B9ull) >> 56);
+}
+
+/** Digests the same messages, whole and split at a seed-chosen point, through @p kit_type_ and the
+ *  serial kit, counting every digest that differs by a single bit. */
+template <typename kit_type_>
+static std::size_t sha256_kit_matches_serial(char const* name) {
+    if constexpr (!kit_type_::compiled_k) return 0;
+    else {
+        if (!runs_here(kit_type_::capability_k)) return 0;
+        std::size_t failures = 0;
+        byte_t message[1031];
+        for (std::size_t length : {0u, 1u, 55u, 56u, 63u, 64u, 65u, 127u, 128u, 1000u, 1031u}) {
+            fill_pattern({message, length}, length);
+            auto digest_through = [&](auto init, auto update, auto digest, std::size_t cut, byte_t* out) {
+                sz_sha256_state_t state;
+                init(&state, nullptr);
+                update(&state, reinterpret_cast<sz_cptr_t>(message), cut, nullptr);
+                update(&state, reinterpret_cast<sz_cptr_t>(message) + cut, length - cut, nullptr);
+                digest(&state, reinterpret_cast<sz_u8_t*>(out), nullptr);
+            };
+            byte_t expected[32], produced[32];
+            std::size_t const cut = length / 3;
+            digest_through(serial_sha256_kit_t::init, serial_sha256_kit_t::update, serial_sha256_kit_t::digest, cut,
+                           expected);
+            digest_through(kit_type_::init, kit_type_::update, kit_type_::digest, cut, produced);
+            failures += expect(bytes_equal(produced, expected), "{} SHA-256 left serial at {} bytes", name, length);
+        }
+        return failures;
+    }
+}
+
+/** Seals the same messages through @p kit_type_ and the serial kit, counting every ciphertext or
+ *  tag that differs by a single bit, and every seal the other kit cannot open. */
+template <typename kit_type_>
+static std::size_t aes256_gcm_kit_matches_serial(char const* name) {
+    if constexpr (!kit_type_::compiled_k) return 0;
+    else {
+        if (!runs_here(kit_type_::capability_k)) return 0;
+        std::size_t failures = 0;
+        byte_t secret[32], nonce[12], associated[37], text[1031], expected[1031], produced[1031], opened[1031];
+        byte_t expected_tag[16], produced_tag[16];
+        for (std::size_t length : {0u, 1u, 15u, 16u, 17u, 64u, 255u, 1031u}) {
+            fill_pattern(secret, length + 1), fill_pattern(nonce, length + 2);
+            fill_pattern(associated, length + 3), fill_pattern({text, length}, length + 4);
+            sz_aes256_gcm_key_t serial_key, kit_key;
+            serial_aes256_gcm_kit_t::key_init(&serial_key, reinterpret_cast<sz_u8_t const*>(secret), nullptr);
+            kit_type_::key_init(&kit_key, reinterpret_cast<sz_u8_t const*>(secret), nullptr);
+            std::size_t const associated_length = length % sizeof(associated);
+            serial_aes256_gcm_kit_t::encrypt(
+                &serial_key, reinterpret_cast<sz_u8_t const*>(nonce), reinterpret_cast<sz_cptr_t>(associated),
+                associated_length, reinterpret_cast<sz_cptr_t>(text), length, reinterpret_cast<sz_ptr_t>(expected),
+                reinterpret_cast<sz_u8_t*>(expected_tag), nullptr);
+            kit_type_::encrypt(&kit_key, reinterpret_cast<sz_u8_t const*>(nonce),
+                               reinterpret_cast<sz_cptr_t>(associated), associated_length,
+                               reinterpret_cast<sz_cptr_t>(text), length, reinterpret_cast<sz_ptr_t>(produced),
+                               reinterpret_cast<sz_u8_t*>(produced_tag), nullptr);
+            failures += expect(
+                bytes_equal({produced, length}, {expected, length}) && bytes_equal(produced_tag, expected_tag),
+                "{} AES-256-GCM left serial at {} bytes", name, length);
+            sz_status_t const verdict = kit_type_::decrypt(
+                &kit_key, reinterpret_cast<sz_u8_t const*>(nonce), reinterpret_cast<sz_cptr_t>(associated),
+                associated_length, reinterpret_cast<sz_cptr_t>(expected), length, reinterpret_cast<sz_ptr_t>(opened),
+                reinterpret_cast<sz_u8_t const*>(expected_tag), nullptr);
+            failures += expect(verdict == sz_success_k && bytes_equal({opened, length}, {text, length}),
+                               "{} AES-256-GCM failed to open serial's seal at {} bytes", name, length);
+        }
+        return failures;
+    }
+}
+
+/** Hashes the same texts through @p kit_type_ and the serial kit, counting every hash that differs,
+ *  as route and header lookups must land in the same bucket whichever class built them. */
+template <typename kit_type_>
+static std::size_t hash_kit_matches_serial(char const* name) {
+    if constexpr (!kit_type_::compiled_k) return 0;
+    else {
+        if (!runs_here(kit_type_::capability_k)) return 0;
+        std::size_t failures = 0;
+        byte_t text[1031];
+        for (std::size_t length : {0u, 1u, 15u, 16u, 17u, 31u, 32u, 33u, 63u, 64u, 65u, 255u, 1031u}) {
+            fill_pattern({text, length}, length + 5);
+            sz_u64_t expected = 0, produced = 0;
+            [[maybe_unused]] sz_status_t const reference = uc::http::serial_hash_kit_t::hash(
+                reinterpret_cast<sz_cptr_t>(text), length, length * 31, &expected, nullptr);
+            [[maybe_unused]] sz_status_t const candidate = kit_type_::hash(reinterpret_cast<sz_cptr_t>(text), length,
+                                                                           length * 31, &produced, nullptr);
+            failures += expect(produced == expected, "{} hash left serial at {} bytes", name, length);
+        }
+        return failures;
+    }
+}
+
+/** Every SHA-256, AES-256-GCM and hash kit a CPU class may pick, against the serial floor bit for
+ *  bit, since each class runs exactly one of them and must agree with a peer running any other. */
+static std::size_t test_cipher_kits() {
+    std::size_t failures = 0;
+    failures += sha256_kit_matches_serial<neonsha_sha256_kit_t>("neonsha");
+    failures += sha256_kit_matches_serial<goldmont_sha256_kit_t>("goldmont");
+    failures += sha256_kit_matches_serial<powervsx_sha256_kit_t>("powervsx");
+    failures += aes256_gcm_kit_matches_serial<icelake_aes256_gcm_kit_t>("icelake");
+    failures += aes256_gcm_kit_matches_serial<neonaes_aes256_gcm_kit_t>("neonaes");
+    failures += aes256_gcm_kit_matches_serial<westmere_aes256_gcm_kit_t>("westmere");
+    failures += aes256_gcm_kit_matches_serial<powervsx_aes256_gcm_kit_t>("powervsx");
+    failures += hash_kit_matches_serial<uc::http::icelake_hash_kit_t>("icelake");
+    failures += hash_kit_matches_serial<uc::http::skylake_hash_kit_t>("skylake");
+    failures += hash_kit_matches_serial<uc::http::neonaes_hash_kit_t>("neonaes");
+    failures += hash_kit_matches_serial<uc::http::powervsx_hash_kit_t>("powervsx");
+    failures += hash_kit_matches_serial<uc::http::rvv_hash_kit_t>("rvv");
+    failures += hash_kit_matches_serial<uc::http::westmere_hash_kit_t>("westmere");
+    return failures;
+}
+
 #pragma endregion Kit Differential
 
 #pragma region Primitives
@@ -370,6 +494,7 @@ std::size_t check_crypto(settings_t const& settings) {
     failures += test_entropy();
     failures += test_x25519();
     failures += test_x25519_kits();
+    failures += test_cipher_kits();
     return report("tunnel crypto", failures);
 }
 

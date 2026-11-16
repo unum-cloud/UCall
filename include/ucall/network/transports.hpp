@@ -298,8 +298,9 @@ struct transport {
                 }
                 auto verdict = authorizer ? authorizer(&peer_key, authorizer_context) : ucall_status_success_k;
                 crypto_t::secure_zero(peer_key);
+                if (verdict != ucall_status_success_k && interface_statistics)
+                    tally<atomic_ref>(interface_statistics->authorizer_refusals);
                 if (verdict != ucall_status_success_k) {
-                    if (interface_statistics) tally<atomic_ref>(interface_statistics->authorizer_refusals);
                     fail(verdict);
                     continue;
                 }

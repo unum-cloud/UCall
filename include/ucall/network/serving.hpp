@@ -871,9 +871,7 @@ struct serving {
             replies_t::detach(event_loop, connection);
             unlist(event_loop, connection);
             // A descriptor just came free, so the reserves the residue held closed reopen now.
-            if (std::exchange(event_loop.accept_deadline, 0))
-                for (auto& acceptor : event_loop.interface_acceptors)
-                    if (acceptor.stage == acceptor_stage_t::idle_k) reopen_reserve(event_loop, acceptor);
+            if (std::exchange(event_loop.accept_deadline, 0)) reopen_idle_reserves(event_loop);
             if (auto* counters = connection.transport.interface_statistics)
                 atomic_ref<std::uint64_t> {counters->connections}.store(counters->connections - 1,
                                                                         std::memory_order_relaxed);
@@ -1105,6 +1103,12 @@ struct serving {
         tally<atomic_ref>(event_loop.statistics.shed_connections);
         acceptor.stage = acceptor_stage_t::idle_k;
         reopen_reserve(event_loop, acceptor);
+    }
+
+    /** Reopens the reserve of every idle acceptor of @p event_loop. */
+    static void reopen_idle_reserves(event_loop_t& event_loop) noexcept {
+        for (auto& acceptor : event_loop.interface_acceptors)
+            if (acceptor.stage == acceptor_stage_t::idle_k) reopen_reserve(event_loop, acceptor);
     }
 
     /** Reopens @p acceptor's reserve, or, refused, holds it closed until a close frees a descriptor

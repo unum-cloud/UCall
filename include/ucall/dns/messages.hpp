@@ -185,20 +185,20 @@ struct decoded_answer_t {
         position += 10;
         if (position + length > packet.size()) return decoded;
         if (ttl & 0x80000000u) ttl = 0;
-        if (record_class == 1 && owner.equals(target)) {
-            if (record_type == static_cast<std::uint16_t>(record_type_t::cname_k)) {
-                std::size_t end = 0;
-                if (!decode_name(packet, position, target, end) || end != position + length) return decoded;
-                least_ttl = fu::min_of(least_ttl, ttl);
-            }
-            else if (record_type == static_cast<std::uint16_t>(type)) {
-                if (length != width) return decoded;
-                if ((decoded.addresses_count + 1) * width <= addresses.size())
-                    std::memcpy(addresses.data() + decoded.addresses_count++ * width, packet.data() + position, width);
-                least_ttl = fu::min_of(least_ttl, ttl);
-            }
-        }
+        std::size_t const data = position;
         position += length;
+        if (record_class != 1 || !owner.equals(target)) continue;
+        if (record_type == static_cast<std::uint16_t>(record_type_t::cname_k)) {
+            std::size_t end = 0;
+            if (!decode_name(packet, data, target, end) || end != position) return decoded;
+            least_ttl = fu::min_of(least_ttl, ttl);
+        }
+        else if (record_type == static_cast<std::uint16_t>(type)) {
+            if (length != width) return decoded;
+            if ((decoded.addresses_count + 1) * width <= addresses.size())
+                std::memcpy(addresses.data() + decoded.addresses_count++ * width, packet.data() + data, width);
+            least_ttl = fu::min_of(least_ttl, ttl);
+        }
     }
     if (decoded.addresses_count) {
         decoded.ttl_seconds = least_ttl;

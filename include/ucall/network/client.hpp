@@ -1122,6 +1122,31 @@ struct client : ucall_client_handle_t {
         queue_call(client, exchange);
     }
 
+    /** Composes into @p connection's requests every waiting call of its origin that
+     *  @c accepts_another_exchange lets it carry, rule C2 of @c call_open, and starts sending them
+     *  once any call joined. */
+    static void compose_requests(client_t& client, client_connection_t& connection) noexcept {
+        auto& transport = connection.transport;
+        client_origin_t& origin = *connection.origin;
+        secure_tunnel_geometry_t const geometry = request_geometry(origin.security);
+        auto& output = connection.requests;
+        output.clear();
+        if (st::failed(output.resize(geometry.headroom))) transport.fail(ucall_status_out_of_memory_k);
+        client_exchange_t* const newest = connection.newest_exchange;
+        while (transport.stage == transport_stage_t::open_k && origin.waiting_head &&
+               accepts_another_exchange(client, connection)) {
+            client_exchange_t& exchange = unqueue_call(origin);
+            if (ucall_status_t const appended = append_request(output, exchange); appended != ucall_status_success_k)
+                finish_exchange(client, exchange, appended);
+            else push_call(connection, exchange);
+        }
+        if (connection.newest_exchange == newest) return;
+        if (ucall_status_t const framed = frame_requests(output, geometry); framed != ucall_status_success_k)
+            transport.fail(framed);
+        transport.transmitting = transmit_state_t::sending_k;
+        transport.output_offset = 0;
+    }
+
     /** Steps an open client connection, answering its next engine request or null, by these rules
      *  in order:
      *  C1 responses: while reading and a sent call awaits, each whole response answers the oldest
@@ -1201,26 +1226,7 @@ struct client : ucall_client_handle_t {
             client_origin_t& origin = *connection.origin;
             if (transport.transmitting == transmit_state_t::idle_k && origin.waiting_head &&
                 accepts_another_exchange(client, connection)) {
-                secure_tunnel_geometry_t const geometry = request_geometry(origin.security);
-                auto& output = connection.requests;
-                output.clear();
-                if (st::failed(output.resize(geometry.headroom))) transport.fail(ucall_status_out_of_memory_k);
-                client_exchange_t* const newest = connection.newest_exchange;
-                while (transport.stage == transport_stage_t::open_k && origin.waiting_head &&
-                       accepts_another_exchange(client, connection)) {
-                    client_exchange_t& exchange = unqueue_call(origin);
-                    if (ucall_status_t const appended = append_request(output, exchange);
-                        appended != ucall_status_success_k)
-                        finish_exchange(client, exchange, appended);
-                    else push_call(connection, exchange);
-                }
-                if (connection.newest_exchange != newest) {
-                    if (ucall_status_t const framed = frame_requests(output, geometry);
-                        framed != ucall_status_success_k)
-                        transport.fail(framed);
-                    transport.transmitting = transmit_state_t::sending_k;
-                    transport.output_offset = 0;
-                }
+                compose_requests(client, connection);
                 if (transport.stage != transport_stage_t::open_k)
                     return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
             }

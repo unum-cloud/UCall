@@ -168,7 +168,7 @@ def video(request: ucall.Request):
 `reply_parts` concatenates bytes-like objects, `ucall.Path(directory, path, offset=0, length=0)` and `ucall.File(descriptor, offset=0, length=0)` into one body whose Content-Length is measured from the files.
 A `Path` resolves beneath the named `reply_directories` entry, and the event loop opens, reads and closes it unbuffered.
 A `File` is the caller's regular file opened with `os.O_DIRECT`, or an object whose `fileno()` answers one; UCall never closes it, and the `Deferred` keeps it open until the reply is final.
-`deferred.status()` reads the outcome without waiting, `deferred.wait()` blocks without the interpreter lock and raises the failure, such as `Status.NOT_FOUND` after a 404, and `await deferred` runs that wait on the running loop's default executor.
+`deferred.status()` reads the outcome without waiting, `deferred.wait()` blocks without the interpreter lock and raises the failure, such as `Status.NOT_FOUND` after a 404, and `await deferred` polls the status between the loop's other tasks, backing off from 1 µs to 1 ms, so no thread waits on it.
 Releasing an unfinished `Deferred` waits for it, which is why only a detached request makes one.
 
 ### Streaming a Reply
@@ -203,7 +203,7 @@ def upload(request: ucall.Request):
 
 An endpoint registered with `body=ucall.BodyDelivery.STREAMED`, on `add_endpoint`, `route` and every verb decorator, runs its handler once the headers arrived.
 `body_chunks()` yields each chunk as a `memoryview` valid until the next pull, which releases it, and waits for bytes without the interpreter lock.
-`async for` over it returns a chunk already decoded at once and runs the wait for one still arriving on the running loop's default executor, as `await deferred` does.
+`async for` over it returns a chunk already decoded at once and polls for one still arriving between the loop's other tasks, as `await deferred` does.
 
 ## Batches
 
@@ -412,6 +412,6 @@ Every thread that polls, replies or reads must run on a CPU supporting the resol
 - __Ownership follows the request.__
   A reply consumes its `Request`, a released request answers 500, views over a body pin it until released, and a `Response` frees itself.
 - __Deferred replies only where they can wait.__
-  Every method looks as it would without asynchrony, and only a reply with file or path parts on a `DetachedRequest` answers a `Deferred`, so no polling thread waits on its own loop; `wait()` blocks, `await` borrows the running loop's executor, and releasing one waits.
+  Every method looks as it would without asynchrony, and only a reply with file or path parts on a `DetachedRequest` answers a `Deferred`, so no polling thread waits on its own loop; `wait()` blocks, `await` polls with a backoff, and releasing one waits.
 - __No life of its own.__
   The binding starts no threads, keeps no global state beyond imported helpers and needs no async runtime, and an exception inside a handler or an authorizer reaches `sys.unraisablehook` rather than stopping a loop.

@@ -931,8 +931,8 @@ class ReplyStream:
 class BodyChunks(Iterator[memoryview], AsyncIterator[memoryview]):
     """The iterator `DetachedRequest.body_chunks` returns, yielding memoryviews of the body.
 
-    `async for` returns a chunk already decoded at once and waits for one still arriving in the
-    running loop's default executor; `for` waits on the calling thread.
+    `async for` returns a chunk already decoded at once and polls for one still arriving between
+    the running loop's other tasks; `for` waits on the calling thread.
 
     Example:
       >>> async for chunk in detached.body_chunks():  # or: for chunk in detached.body_chunks()

@@ -739,6 +739,57 @@ struct messages {
         }
     }
 
+    /** The bytes of absolute-form @p target before its path, or @c npos when its scheme or
+     *  authority is malformed. */
+    static std::size_t http_origin_length(std::string_view target) noexcept {
+        auto const scheme = find(target, "://");
+        if (scheme == std::string_view::npos || !http_token(target.substr(0, scheme)) || target.size() == scheme + 3)
+            return std::string_view::npos;
+        auto const authority = target.substr(scheme + 3);
+        return scheme + 3 + fu::min_of(fu::min_of(find(authority, '/'), find(authority, '?')), authority.size());
+    }
+
+    /** Whether every element of the comma-separated list @p text is a token. */
+    static bool http_token_list(std::string_view text) noexcept {
+        while (!text.empty()) {
+            auto comma = find(text, ',');
+            if (!http_token(trim_http(text.substr(0, comma)))) return false;
+            if (comma == std::string_view::npos) break;
+            text.remove_prefix(comma + 1);
+        }
+        return true;
+    }
+
+    /** Applies the head field @p name, already lowercased, with its trimmed @p value to
+     *  @p message, noting the fields seen so far: complete, or why a repeated or malformed field
+     *  refuses the head. */
+    static http_parse_t http_header_field(std::string_view name, std::string_view value, std::string_view version,
+                                          http_message_t& message, bool& has_length, bool& has_transfer, bool& has_host,
+                                          bool& has_close) noexcept {
+        if (equal(name, "content-length")) {
+            if (has_length || value.empty()) return http_parse_t::malformed_k;
+            auto result = std::from_chars(value.data(), value.data() + value.size(), message.content_length);
+            if (result.ec != std::errc {} || result.ptr != value.data() + value.size())
+                return http_parse_t::malformed_k;
+            has_length = true;
+        }
+        else if (equal(name, "transfer-encoding")) {
+            if (has_transfer) return http_parse_t::malformed_k;
+            if (!equal(value, "chunked")) return http_parse_t::unsupported_k;
+            has_transfer = true;
+        }
+        else if (equal(name, "connection")) {
+            if (http_has_token(value, "close")) has_close = true;
+            else if (version == "HTTP/1.0" && http_has_token(value, "keep-alive"))
+                message.connection = http_connection_t::keep_alive_k;
+        }
+        else if (equal(name, "host")) {
+            if (has_host || value.empty()) return http_parse_t::malformed_k;
+            has_host = true;
+        }
+        return http_parse_t::complete_k;
+    }
+
     static http_parse_t http_parse(span<byte_t> bytes, http_message_t& message, http_role_t role) noexcept {
         auto text = text_view(bytes);
         if (!message.headers_length) {
@@ -762,19 +813,12 @@ struct messages {
                 message.target_length = second - space - 1;
                 auto target = first.substr(message.target_offset, message.target_length);
                 bool const asterisk = target == "*" && message.verb == ucall_verb_options_k;
-                if (!target.starts_with('/') && !asterisk) {
-                    // RFC 9112 3.2.2: absolute-form names the origin too, which routing ignores.
-                    auto const scheme = find(target, "://");
-                    if (scheme == std::string_view::npos || !http_token(target.substr(0, scheme)) ||
-                        target.size() == scheme + 3)
-                        return http_parse_t::malformed_k;
-                    auto const authority = target.substr(scheme + 3);
-                    std::size_t const path = fu::min_of(fu::min_of(find(authority, '/'), find(authority, '?')),
-                                                        authority.size());
-                    message.target_offset += scheme + 3 + path;
-                    message.target_length -= scheme + 3 + path;
-                    target.remove_prefix(scheme + 3 + path);
-                }
+                // RFC 9112 3.2.2: absolute-form names the origin too, which routing ignores.
+                std::size_t const origin = target.starts_with('/') || asterisk ? 0 : http_origin_length(target);
+                if (origin == std::string_view::npos) return http_parse_t::malformed_k;
+                message.target_offset += origin;
+                message.target_length -= origin;
+                target.remove_prefix(origin);
                 if (find(target, ' ') != std::string_view::npos || find(target, '#') != std::string_view::npos ||
                     find(target, '\t') != std::string_view::npos || !http_value(target))
                     return http_parse_t::malformed_k;
@@ -804,38 +848,15 @@ struct messages {
                      value = trim_http(text.substr(colon + 1, line_end - colon - 1));
                 if (!http_token(name) || !http_value(value)) return http_parse_t::malformed_k;
                 lowercase_ascii({reinterpret_cast<char*>(bytes.data()) + start, name.size()});
-                if (equal(name, "connection") || equal(name, "transfer-encoding")) {
-                    auto tokens = value;
-                    while (!tokens.empty()) {
-                        auto comma = find(tokens, ',');
-                        if (!http_token(trim_http(tokens.substr(0, comma)))) return http_parse_t::malformed_k;
-                        if (comma == std::string_view::npos) break;
-                        tokens.remove_prefix(comma + 1);
-                    }
+                bool const listed = equal(name, "connection") || equal(name, "transfer-encoding");
+                if (listed && !http_token_list(value)) return http_parse_t::malformed_k;
+                if (listed)
                     lowercase_ascii(
                         {reinterpret_cast<char*>(bytes.data()) + (value.data() - text.data()), value.size()});
-                }
-                if (equal(name, "content-length")) {
-                    if (has_length || value.empty()) return http_parse_t::malformed_k;
-                    auto result = std::from_chars(value.data(), value.data() + value.size(), message.content_length);
-                    if (result.ec != std::errc {} || result.ptr != value.data() + value.size())
-                        return http_parse_t::malformed_k;
-                    has_length = true;
-                }
-                else if (equal(name, "transfer-encoding")) {
-                    if (has_transfer) return http_parse_t::malformed_k;
-                    if (!equal(value, "chunked")) return http_parse_t::unsupported_k;
-                    has_transfer = true;
-                }
-                else if (equal(name, "connection")) {
-                    if (http_has_token(value, "close")) has_close = true;
-                    else if (version == "HTTP/1.0" && http_has_token(value, "keep-alive"))
-                        message.connection = http_connection_t::keep_alive_k;
-                }
-                else if (equal(name, "host")) {
-                    if (has_host || value.empty()) return http_parse_t::malformed_k;
-                    has_host = true;
-                }
+                if (http_parse_t const applied = http_header_field(name, value, version, message, has_length,
+                                                                   has_transfer, has_host, has_close);
+                    applied != http_parse_t::complete_k)
+                    return applied;
                 start = line_end + 2;
             }
             if (has_close) message.connection = http_connection_t::close_k;

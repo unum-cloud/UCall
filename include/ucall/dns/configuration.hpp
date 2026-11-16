@@ -93,6 +93,19 @@ inline std::size_t read_file(char const* path, span<char> buffer) noexcept {
     return read;
 }
 
+/** Replaces the search list of @p options with the domains left in @p line, NUL-separated, keeping
+ *  only the first when @p keyword is <tt>domain</tt>, which names one. */
+inline void parse_search_list(std::string_view keyword, std::string_view line, resolver_options_t& options) noexcept {
+    options.search_length = 0;
+    for (auto domain = next_word(line); !domain.empty(); domain = next_word(line)) {
+        if (options.search_length + domain.size() + 1 > resolver_options_t::search_bytes_k) break;
+        std::memcpy(options.search + options.search_length, domain.data(), domain.size());
+        options.search_length += static_cast<std::uint32_t>(domain.size());
+        options.search[options.search_length++] = '\0';
+        if (keyword == "domain") break;
+    }
+}
+
 /** Parses the text of a <tt>resolv.conf</tt> into @p options; later <tt>domain</tt> and <tt>search</tt> lines replace
  *  earlier ones, and nameservers past the third are ignored, as <tt>resolv.h</tt> does. */
 inline void parse_resolv_conf(std::string_view text, resolver_options_t& options) noexcept {
@@ -107,16 +120,7 @@ inline void parse_resolv_conf(std::string_view text, resolver_options_t& options
             if (parse_address(next_word(line), 53, options.nameservers[options.nameservers_count]))
                 ++options.nameservers_count;
         }
-        else if (keyword == "domain" || keyword == "search") {
-            options.search_length = 0;
-            for (auto domain = next_word(line); !domain.empty(); domain = next_word(line)) {
-                if (options.search_length + domain.size() + 1 > resolver_options_t::search_bytes_k) break;
-                std::memcpy(options.search + options.search_length, domain.data(), domain.size());
-                options.search_length += static_cast<std::uint32_t>(domain.size());
-                options.search[options.search_length++] = '\0';
-                if (keyword == "domain") break;
-            }
-        }
+        else if (keyword == "domain" || keyword == "search") parse_search_list(keyword, line, options);
         else if (keyword == "options")
             for (auto option = next_word(line); !option.empty(); option = next_word(line)) {
                 parse_option(option, "ndots:", 15, options.ndots);
@@ -179,17 +183,17 @@ inline void read_system(resolver_options_t& options) noexcept {
     alignas(IP_ADAPTER_ADDRESSES) byte_t buffer[16 * 1024];
     auto* adapters = reinterpret_cast<IP_ADAPTER_ADDRESSES*>(buffer);
     ULONG const flags = GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST | GAA_FLAG_SKIP_FRIENDLY_NAME;
-    if (GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, adapters, &size) == NO_ERROR)
-        for (auto* adapter = adapters; adapter; adapter = adapter->Next) {
-            if (adapter->OperStatus != IfOperStatusUp) continue;
-            for (auto* server = adapter->FirstDnsServerAddress; server; server = server->Next) {
-                if (options.nameservers_count == resolver_options_t::max_nameservers_k) break;
-                auto& slot = options.nameservers[options.nameservers_count++];
-                std::memcpy(&slot, server->Address.lpSockaddr,
-                            fu::min_of<std::size_t>(server->Address.iSockaddrLength, sizeof(slot)));
-                reinterpret_cast<sockaddr_in&>(slot).sin_port = htons(53);
-            }
+    bool const listed = GetAdaptersAddresses(AF_UNSPEC, flags, nullptr, adapters, &size) == NO_ERROR;
+    for (auto* adapter = listed ? adapters : nullptr; adapter; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        for (auto* server = adapter->FirstDnsServerAddress; server; server = server->Next) {
+            if (options.nameservers_count == resolver_options_t::max_nameservers_k) break;
+            auto& slot = options.nameservers[options.nameservers_count++];
+            std::memcpy(&slot, server->Address.lpSockaddr,
+                        fu::min_of<std::size_t>(server->Address.iSockaddrLength, sizeof(slot)));
+            reinterpret_cast<sockaddr_in&>(slot).sin_port = htons(53);
         }
+    }
 #else
     char text[16 * 1024];
     parse_resolv_conf({text, read_file("/etc/resolv.conf", text)}, options);

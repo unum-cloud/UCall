@@ -7,6 +7,7 @@
 #pragma once
 
 #include <bit>      // `std::bit_cast`, `std::countr_zero`, `std::has_single_bit`
+#include <concepts> // `std::convertible_to`
 #include <optional> // `std::optional`
 
 #include "ucall/http/messages.hpp"     // `http_connection_t`, `http_role_t`
@@ -42,6 +43,13 @@ using utilities::native_file_t;
 using utilities::publish;
 using utilities::span;
 using utilities::text_view;
+
+/** An allocator that knows its platform's default page, such as a huge page, so a pool carves runs
+ *  of that size rather than of the base page. */
+template <typename allocator_type_>
+concept sized_pages = requires(allocator_type_& pages) {
+    { pages.default_page_size() } -> std::convertible_to<std::size_t>;
+};
 
 /** Queues, frames, sends and releases the segments of server replies. */
 template <typename network_type_>
@@ -109,6 +117,82 @@ struct replies {
             .release();
     }
 
+    /** Frames one bytes part into a fresh record held in @p batch, copied as the exchange's framing
+     *  asks, unless it is bodiless or empty, and adds its bytes to @c streamed. */
+    static ucall_status_t frame_bytes_part(server_exchange_t& exchange, std::string_view data,
+                                           reply_batch_t& batch) noexcept {
+        exchange.streamed += data.size();
+        if (data.empty() || exchange.framing == reply_framing_t::bodiless_k) return ucall_status_success_k;
+        reply_segment_t* segment = take_segment(exchange);
+        if (!segment) return ucall_status_out_of_memory_k;
+        segment->next = batch.newest_segment;
+        batch.newest_segment = segment;
+        if (!batch.oldest_segment) batch.oldest_segment = segment;
+        char digits[sizeof(std::size_t) * 2];
+        auto written = std::to_chars(digits, digits + sizeof(digits), data.size(), 16);
+        std::string_view const size {digits, static_cast<std::size_t>(written.ptr - digits)};
+        ucall_status_t const framed = exchange.framing == reply_framing_t::chunked_k
+                                          ? formatting_t::frame_segment(segment->bytes, exchange.geometry,
+                                                                        {size, "\r\n", data, "\r\n"})
+                                          : formatting_t::frame_segment(segment->bytes, exchange.geometry, {data});
+        if (framed != ucall_status_success_k) return framed;
+        batch.bytes += segment->bytes.size();
+        batch.copied += data.size();
+        return ucall_status_success_k;
+    }
+
+    /** Aims @p record at the caller's open @p file. */
+    static ucall_status_t aim_at_file(ucall_file_range_t const& file, file_segment_t& record) noexcept {
+        record.file_offset = file.offset;
+        record.remaining_bytes = file.length;
+        record.file = native_file_of(file.file_descriptor);
+        record.stage = file_segment_stage_t::opened_k;
+        record.file_origin = file_origin_t::caller_descriptor_k;
+        // Windows reads through a handle its loop reopens beneath the caller's, owning it.
+        if constexpr (UCALL_OS_WINDOWS_) {
+            record.stage = file_segment_stage_t::unopened_k;
+            record.file_origin = file_origin_t::opened_path_k;
+            return http_t::append_text(record.segment.bytes, {std::string_view {"\0", 1}});
+        }
+        return ucall_status_success_k;
+    }
+
+    /** Aims @p record at @p path under one of the interface's reply directories, which the loop
+     *  opens. */
+    static ucall_status_t aim_at_path(server_exchange_t& exchange, ucall_path_range_t const& path,
+                                      file_segment_t& record) noexcept {
+        record.file_offset = path.offset;
+        record.remaining_bytes = path.length;
+        record.file = exchange.network_interface->reply_directory_descriptors[path.directory_index];
+        record.stage = file_segment_stage_t::unopened_k;
+        record.file_origin = file_origin_t::opened_path_k;
+        return http_t::append_text(record.segment.bytes, {text_view(path.relative_path), std::string_view {"\0", 1}});
+    }
+
+    /** Frames one file or path part as a file segment held in @p batch, adding its range to
+     *  @c streamed unless the loop measures it for a deferred head. */
+    static ucall_status_t frame_file_part(server_exchange_t& exchange, ucall_reply_part_t const& part,
+                                          reply_batch_t& batch) noexcept {
+        file_segment_t* record = take_file_segment(exchange);
+        if (!record) return ucall_status_out_of_memory_k;
+        record->next = batch.newest_file_segment;
+        batch.newest_file_segment = record;
+        if (!batch.oldest_file_segment) batch.oldest_file_segment = record;
+        record->segment.bytes.clear();
+        record->segment.next = batch.newest_segment;
+        batch.newest_segment = &record->segment;
+        if (!batch.oldest_segment) batch.oldest_segment = &record->segment;
+        record->chunk_prefix_bytes = 0;
+        record->alignment_log2 = 0;
+        ++batch.file_segments;
+        ucall_status_t const aimed = part.kind == ucall_reply_part_file_k
+                                         ? aim_at_file(part.data.file, *record)
+                                         : aim_at_path(exchange, part.data.path, *record);
+        if (aimed != ucall_status_success_k) return aimed;
+        if (exchange.reply_head == reply_head_t::pushed_k) exchange.streamed += record->remaining_bytes;
+        return ucall_status_success_k;
+    }
+
     /** Frames @p parts into fresh records held in @p batch: bytes parts copied as the
      *  exchange's framing asks, unless it is bodiless, and file and path parts as file
      *  segments. Adds the bytes to @c streamed, and the ranges too unless the loop measures
@@ -116,69 +200,10 @@ struct replies {
     static ucall_status_t build_reply_batch(server_exchange_t& exchange, span<ucall_reply_part_t const> parts,
                                             reply_batch_t& batch) noexcept {
         for (ucall_reply_part_t const& part : parts) {
-            if (part.kind == ucall_reply_part_bytes_k) {
-                std::string_view const data = text_view(part.data.bytes);
-                exchange.streamed += data.size();
-                if (data.empty() || exchange.framing == reply_framing_t::bodiless_k) continue;
-                reply_segment_t* segment = take_segment(exchange);
-                if (!segment) return ucall_status_out_of_memory_k;
-                segment->next = batch.newest_segment;
-                batch.newest_segment = segment;
-                if (!batch.oldest_segment) batch.oldest_segment = segment;
-                char digits[sizeof(std::size_t) * 2];
-                auto written = std::to_chars(digits, digits + sizeof(digits), data.size(), 16);
-                std::string_view const size {digits, static_cast<std::size_t>(written.ptr - digits)};
-                ucall_status_t const framed =
-                    exchange.framing == reply_framing_t::chunked_k
-                        ? formatting_t::frame_segment(segment->bytes, exchange.geometry, {size, "\r\n", data, "\r\n"})
-                        : formatting_t::frame_segment(segment->bytes, exchange.geometry, {data});
-                if (framed != ucall_status_success_k) return framed;
-                batch.bytes += segment->bytes.size();
-                batch.copied += data.size();
-                continue;
-            }
-            file_segment_t* record = take_file_segment(exchange);
-            if (!record) return ucall_status_out_of_memory_k;
-            record->next = batch.newest_file_segment;
-            batch.newest_file_segment = record;
-            if (!batch.oldest_file_segment) batch.oldest_file_segment = record;
-            record->segment.bytes.clear();
-            record->segment.next = batch.newest_segment;
-            batch.newest_segment = &record->segment;
-            if (!batch.oldest_segment) batch.oldest_segment = &record->segment;
-            record->chunk_prefix_bytes = 0;
-            record->alignment_log2 = 0;
-            ++batch.file_segments;
-            if (part.kind == ucall_reply_part_file_k) {
-                ucall_file_range_t const& file = part.data.file;
-                record->file_offset = file.offset;
-                record->remaining_bytes = file.length;
-                record->file = native_file_of(file.file_descriptor);
-                record->stage = file_segment_stage_t::opened_k;
-                record->file_origin = file_origin_t::caller_descriptor_k;
-                // Windows reads through a handle its loop reopens beneath the caller's, owning it.
-                if constexpr (UCALL_OS_WINDOWS_) {
-                    record->stage = file_segment_stage_t::unopened_k;
-                    record->file_origin = file_origin_t::opened_path_k;
-                    if (ucall_status_t const named = http_t::append_text(record->segment.bytes,
-                                                                         {std::string_view {"\0", 1}});
-                        named != ucall_status_success_k)
-                        return named;
-                }
-            }
-            else {
-                ucall_path_range_t const& path = part.data.path;
-                record->file_offset = path.offset;
-                record->remaining_bytes = path.length;
-                record->file = exchange.network_interface->reply_directory_descriptors[path.directory_index];
-                record->stage = file_segment_stage_t::unopened_k;
-                record->file_origin = file_origin_t::opened_path_k;
-                if (ucall_status_t const copied = http_t::append_text(
-                        record->segment.bytes, {text_view(path.relative_path), std::string_view {"\0", 1}});
-                    copied != ucall_status_success_k)
-                    return copied;
-            }
-            if (exchange.reply_head == reply_head_t::pushed_k) exchange.streamed += record->remaining_bytes;
+            ucall_status_t const framed = part.kind == ucall_reply_part_bytes_k
+                                              ? frame_bytes_part(exchange, text_view(part.data.bytes), batch)
+                                              : frame_file_part(exchange, part, batch);
+            if (framed != ucall_status_success_k) return framed;
         }
         return ucall_status_success_k;
     }
@@ -974,7 +999,7 @@ struct replies {
         using page_t = typename file_window_pool_t::page_t;
         rebound_allocator<page_t> pages {event_loop.allocator};
         std::size_t granularity = page_bytes_k;
-        if constexpr (requires { pages.default_page_size(); })
+        if constexpr (sized_pages<rebound_allocator<page_t>>)
             granularity = fu::max_of<std::size_t>(pages.default_page_size(), page_bytes_k);
         std::size_t const window_bytes = file_window_pool_t::window_bytes;
         std::size_t const run_windows = fu::min_of<std::size_t>(fu::max_of<std::size_t>(granularity / window_bytes, 1),

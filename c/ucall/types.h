@@ -370,7 +370,7 @@ typedef enum ucall_verb_t {
 } ucall_verb_t;
 
 /**
- *  @brief Library-level outcomes, preserving USearch numbers for shared statuses.
+ *  @brief Library-level outcomes: 0 to 19 as every Unum library numbers them, 20 up UCall's own.
  *
  *  These codes represent library/transport-level outcomes. For HTTP-specific status codes (200,
  *  404, 500), use @c ucall_http_status_t.

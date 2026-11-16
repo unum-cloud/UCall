@@ -608,7 +608,7 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
 
     def __init__(out self):
         """Every counter at zero, as a failed read leaves them."""
-        self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
+        self = Self(0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0)
 
 
 @fieldwise_init

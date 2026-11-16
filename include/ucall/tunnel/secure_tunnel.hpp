@@ -94,6 +94,16 @@ class secure_tunnel {
      */
     alignas(secure_tunnel_noise_t) byte_t storage_[sizeof(secure_tunnel_noise_t)];
 
+    /** Seals a close record as @p noise's outbound bytes and shuts the sending side, or answers
+     *  false once the keys are exhausted. */
+    bool seal_close_record(secure_tunnel_noise_t& noise) noexcept {
+        std::size_t const written = crypto_t::seal_record(noise, noise.outbound, 0, secure_tunnel_record_t::close_k);
+        if (!written) return false;
+        noise.outbound_length = written;
+        sending_ = direction_t::shut_k;
+        return true;
+    }
+
   public:
     secure_tunnel() noexcept = default;
     secure_tunnel(secure_tunnel const&) = delete;
@@ -332,22 +342,22 @@ class secure_tunnel {
             switch (state_) {
 
             case secure_tunnel_state_t::starting_k:
-                if (role_ == secure_tunnel_role_t::initiator_k) {
-                    if (secure_tunnel_fault_t const reason = crypto_t::write_handshake_message(noise);
-                        reason != secure_tunnel_fault_t::none_k)
-                        return fail(reason);
-                    if (noise.handshake_complete()) {
-                        sending_ = direction_t::open_k;
-                        receiving_ = direction_t::open_k;
-                    }
-                    state_ = secure_tunnel_state_t::transmitting_k;
-                    step.outbound = {noise.outbound, noise.outbound + noise.outbound_length};
-                    step.state = state_;
-                    return step;
-                }
                 // A responder that parked here would be waiting for a peer that is waiting for it.
-                state_ = secure_tunnel_state_t::receiving_k;
-                continue;
+                if (role_ != secure_tunnel_role_t::initiator_k) {
+                    state_ = secure_tunnel_state_t::receiving_k;
+                    continue;
+                }
+                if (secure_tunnel_fault_t const reason = crypto_t::write_handshake_message(noise);
+                    reason != secure_tunnel_fault_t::none_k)
+                    return fail(reason);
+                if (noise.handshake_complete()) {
+                    sending_ = direction_t::open_k;
+                    receiving_ = direction_t::open_k;
+                }
+                state_ = secure_tunnel_state_t::transmitting_k;
+                step.outbound = {noise.outbound, noise.outbound + noise.outbound_length};
+                step.state = state_;
+                return step;
 
             case secure_tunnel_state_t::transmitting_k:
                 // Reaching here means the caller sent what it was handed, which is the contract.
@@ -394,13 +404,9 @@ class secure_tunnel {
             }
 
             case secure_tunnel_state_t::ready_k: {
-                if (request == secure_tunnel_request_t::close_k && sending_ == direction_t::open_k) {
-                    std::size_t const written = crypto_t::seal_record(noise, noise.outbound, 0,
-                                                                      secure_tunnel_record_t::close_k);
-                    if (!written) return fail(secure_tunnel_fault_t::keys_exhausted_k);
-                    noise.outbound_length = written;
-                    sending_ = direction_t::shut_k;
-                }
+                if (request == secure_tunnel_request_t::close_k && sending_ == direction_t::open_k &&
+                    !seal_close_record(noise))
+                    return fail(secure_tunnel_fault_t::keys_exhausted_k);
                 if (sending_ == direction_t::shut_k && receiving_ == direction_t::shut_k)
                     state_ = secure_tunnel_state_t::closed_k;
                 else if (noise.outbound_length) state_ = secure_tunnel_state_t::transmitting_k;

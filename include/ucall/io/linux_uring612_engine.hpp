@@ -1560,14 +1560,14 @@ void uring_stop(engine_type_& engine) noexcept {
     if (!queue.fault) {
         for (auto& owner : engine.socket_slots.records)
             if (owner.stage != uring_socket_stage_t::vacant_k) engine.retire(owner);
-        while (engine.has_kernel_work() && !queue.fault) {
-            int result = queue.enter(1, 0);
-            if (result < 0) {
-                queue.fault = result;
-                break;
-            }
-            uring_reap(engine);
+    }
+    while (!queue.fault && engine.has_kernel_work()) {
+        int result = queue.enter(1, 0);
+        if (result < 0) {
+            queue.fault = result;
+            break;
         }
+        uring_reap(engine);
     }
     // Failed submission must not bypass terminal CQEs that still reference caller memory.
     ucall_status_t const retirement = queue.fault ? uring_drain_after_fault(engine) : queue.unregister_files();
