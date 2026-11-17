@@ -239,9 +239,11 @@ struct replies {
         atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.store_add(batch.bytes, std::memory_order_relaxed);
         atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.store_add(batch.file_segments,
                                                                                    std::memory_order_relaxed);
-        if (batch.newest_file_segment)
-            link_chain(exchange.shared.pushed_file_segments, exchange.pushed_file_tail, *batch.newest_file_segment,
-                       *batch.oldest_file_segment);
+        if (batch.newest_file_segment) {
+            link_chain(atomic_ref<file_segment_t*> {exchange.shared.pushed_file_segments}, exchange.pushed_file_tail,
+                       *batch.newest_file_segment, *batch.oldest_file_segment);
+            exchange.pushed_file_tail = batch.newest_file_segment;
+        }
         reply_segment_t* newest = batch.newest_segment;
         reply_segment_t* oldest = batch.oldest_segment;
         if (first) {
@@ -463,9 +465,10 @@ struct replies {
     }
 
     /** Turns the chain from @p newest down to @p oldest around and links it behind @p tail, or as
-     *  @p first when nothing was linked yet, publishing it to the loop with one release store. */
+     *  @p first when nothing was linked yet, publishing it to the loop with one release store; the
+     *  caller's tail becomes @p newest. */
     template <typename record_type_>
-    static void link_chain(record_type_*& first, record_type_*& tail, record_type_& newest,
+    static void link_chain(atomic_ref<record_type_*> first, record_type_* tail, record_type_& newest,
                            record_type_& oldest) noexcept {
         record_type_* forward = nullptr;
         for (record_type_* record = &newest; record;) {
@@ -474,25 +477,36 @@ struct replies {
             forward = record;
             record = older;
         }
-        atomic_ref<record_type_*> {tail ? tail->next : first}.store(&oldest, std::memory_order_release);
-        tail = &newest;
+        (tail ? atomic_ref<record_type_*> {tail->next} : first).store(&oldest, std::memory_order_release);
     }
 
-    /** Moves the chain linked after @p newest, or from @p first, into the loop's queue; false when
+    /** The records the loop adopts from a chain, the first and the last it queues, both null when
      *  the replier linked nothing new. */
     template <typename record_type_>
-    static bool adopt_chain(record_type_*& first, record_type_*& oldest, record_type_*& newest) noexcept {
-        record_type_* next = atomic_ref<record_type_*> {newest ? newest->next : first}.load(std::memory_order_acquire);
-        if (!next) return false;
-        if (!oldest) oldest = next;
-        for (; next; next = atomic_ref<record_type_*> {next->next}.load(std::memory_order_acquire)) newest = next;
-        return true;
+    struct adopted_records {
+        record_type_* oldest = nullptr;
+        record_type_* newest = nullptr;
+    };
+
+    /** The chain linked after the loop's @p newest, or from @p first, that the loop queues next. */
+    template <typename record_type_>
+    static adopted_records<record_type_> adopt_chain(atomic_ref<record_type_*> first, record_type_* newest) noexcept {
+        adopted_records<record_type_> adopted;
+        record_type_* next =
+            (newest ? atomic_ref<record_type_*> {newest->next} : first).load(std::memory_order_acquire);
+        for (; next; next = atomic_ref<record_type_*> {next->next}.load(std::memory_order_acquire)) {
+            if (!adopted.oldest) adopted.oldest = next;
+            adopted.newest = next;
+        }
+        return adopted;
     }
 
     /** Links the chain from @p newest down to @p oldest behind the exchange's earlier segments and
      *  lists the exchange for its event loop. Only the one replier of an exchange calls it. */
     static void push_segments(server_exchange_t& exchange, reply_segment_t& newest, reply_segment_t& oldest) noexcept {
-        link_chain(exchange.shared.pushed_segments, exchange.pushed_tail, newest, oldest);
+        link_chain(atomic_ref<reply_segment_t*> {exchange.shared.pushed_segments}, exchange.pushed_tail, newest,
+                   oldest);
+        exchange.pushed_tail = &newest;
         list_replied(exchange);
     }
 
@@ -551,12 +565,18 @@ struct replies {
      *  reply ended, then the file segments published ahead of those segments; false when the
      *  replier pushed nothing since the last adoption. */
     static bool adopt_segments(server_exchange_t& exchange) noexcept {
-        if (!adopt_chain(exchange.shared.pushed_segments, exchange.oldest_segment, exchange.newest_segment))
-            return false;
+        adopted_records<reply_segment_t> const segments = adopt_chain(
+            atomic_ref<reply_segment_t*> {exchange.shared.pushed_segments}, exchange.newest_segment);
+        if (!segments.newest) return false;
+        if (!exchange.oldest_segment) exchange.oldest_segment = segments.oldest;
+        exchange.newest_segment = segments.newest;
         exchange.stage = exchange.newest_segment == &exchange.end_segment ? exchange_stage_t::ended_k
                                                                           : exchange_stage_t::collected_k;
         // File segments are linked ahead of their own segments, so this meets each adopted above.
-        adopt_chain(exchange.shared.pushed_file_segments, exchange.oldest_file_segment, exchange.newest_file_segment);
+        adopted_records<file_segment_t> const file_segments = adopt_chain(
+            atomic_ref<file_segment_t*> {exchange.shared.pushed_file_segments}, exchange.newest_file_segment);
+        if (!exchange.oldest_file_segment) exchange.oldest_file_segment = file_segments.oldest;
+        if (file_segments.newest) exchange.newest_file_segment = file_segments.newest;
         return_parked(exchange);
         return true;
     }
@@ -1007,7 +1027,7 @@ struct replies {
         std::size_t const run_bytes = (run_windows * window_bytes + granularity - 1) / granularity * granularity;
         page_t* const run = pages.allocate(run_bytes / page_bytes_k);
         if (!run) return ucall_status_out_of_memory_k;
-        byte_t* const base = reinterpret_cast<byte_t*>(run);
+        byte_t* const base = bytes_of(run, 1).data();
         io_request_t release {.operation = io_operation_t::zero_copy_release_k, .context = &pool};
         // Past the engine's table or its locked-memory cap, sends pin each window themselves.
         if (pool.pinning == range_pinning_t::pinned_k) {

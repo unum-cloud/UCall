@@ -175,6 +175,31 @@ inline std::string_view text_view(span<byte_t const> bytes) noexcept {
     return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
 }
 
+/** The bytes behind @p count typed elements at @p data, read-only. */
+template <typename value_type_>
+span<byte_t const> bytes_of(value_type_ const* data, std::size_t count) noexcept {
+    return std::as_bytes(std::span {data, count});
+}
+
+/** The bytes behind @p count typed elements at @p data, writable. */
+template <typename value_type_>
+span<byte_t> bytes_of(value_type_* data, std::size_t count) noexcept {
+    return std::as_writable_bytes(std::span {data, count});
+}
+
+/** The typed elements behind @p bytes, the inverse of @ref bytes_of and the one place a payload's
+ *  bytes are read back as its elements; a trailing partial element is left out. */
+template <typename element_type_>
+span<element_type_ const> elements_of(span<byte_t const> bytes) noexcept {
+    return {reinterpret_cast<element_type_ const*>(bytes.data()), bytes.size() / sizeof(element_type_)};
+}
+
+/** The writable typed elements behind @p bytes, for a codec decoding straight into its slice. */
+template <typename element_type_>
+span<element_type_> elements_of(span<byte_t> bytes) noexcept {
+    return {reinterpret_cast<element_type_*>(bytes.data()), bytes.size() / sizeof(element_type_)};
+}
+
 /** The bytes of @p text, as engines and tunnels take their input. */
 inline span<byte_t const> byte_span(std::string_view text) noexcept { return std::as_bytes(std::span {text}); }
 
@@ -186,9 +211,11 @@ namespace unum::ucall {
  *  points share. */
 using utilities::byte_span;
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::bytes_view;
 using utilities::cpu_ceiling_t;
 using utilities::descriptor_t;
+using utilities::elements_of;
 using utilities::native_file_t;
 using utilities::span;
 using utilities::text_view;

@@ -1,5 +1,5 @@
-"""The hooks and fixtures the Python suites share: the report header, the backend sweep, the
-filter, and the loopback interfaces, polling threads and unbuffered directories servers need.
+"""The hooks and fixtures the Python suites share: the report header, the backend sweep, and the
+loopback interfaces, polling threads and unbuffered directories servers need.
 
 File: test/conftest.py
 Author: Ash Vardanian
@@ -28,7 +28,7 @@ def pytest_report_header() -> list[str]:
     """The build this run exercises and its settings, printed where pytest prints its own header."""
     return [
         f"UCall {ucall.__version__} from {ucall.lib.__file__}",
-        f"- Seed: {SETTINGS.seed}, scale: {SETTINGS.scale:g}, filter: {SETTINGS.filter.pattern or 'none'}",
+        f"- Seed: {SETTINGS.seed}, scale: {SETTINGS.scale:g}",
     ]
 
 
@@ -52,8 +52,8 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
 
 # region Shared Pytest
-def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item]) -> None:
-    """Refuses a test whose cases outgrow MAX_CASES_PER_TEST, then deselects what the filter setting leaves out."""
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    """Refuses a test whose cases outgrow MAX_CASES_PER_TEST."""
     variants: dict[tuple[str, str], set[str]] = collections.defaultdict(set)
     for item in items:
         callspec = getattr(item, "callspec", None)
@@ -68,10 +68,6 @@ def pytest_collection_modifyitems(config: pytest.Config, items: list[pytest.Item
     ]
     if oversized:
         raise pytest.UsageError(f"over MAX_CASES_PER_TEST={MAX_CASES_PER_TEST}: " + "; ".join(oversized))
-    deselected = [item for item in items if not SETTINGS.filter.selects(item.nodeid)]
-    if deselected:
-        config.hook.pytest_deselected(items=deselected)
-        items[:] = [item for item in items if SETTINGS.filter.selects(item.nodeid)]
 
 
 def pytest_make_parametrize_id(config: pytest.Config, val: object, argname: str) -> str | None:

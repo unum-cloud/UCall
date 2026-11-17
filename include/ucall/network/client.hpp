@@ -790,7 +790,7 @@ struct client : ucall_client_handle_t {
                                             deadline_after(client.config.connect_timeout_microseconds));
             transport.transmit_request = {.operation = io_operation_t::connect_k,
                                           .descriptor = descriptor,
-                                          .data = reinterpret_cast<byte_t*>(&connection.target),
+                                          .data = bytes_of(&connection.target, 1).data(),
                                           .length = static_cast<std::size_t>(target_length),
                                           .deadline = transport.deadline,
                                           .context = &connection};

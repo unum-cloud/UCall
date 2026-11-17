@@ -51,6 +51,24 @@ Moreover, it's easy to use synchronous handlers, even when the underlying backen
 And it provides server-side batching for high-latency batch-processing endpoints, like GPU inference tasks and OLAP database queries.
 The [native examples](https://github.com/unum-cloud/UCall/blob/main/examples/README.md) demonstrate binary echo, conditional key-value writes, atomic ledger transfers, and batched inference through the C ABI.
 
+## Performance
+
+Requests per second from one server core, every reply verified, and each framework's multiple of FastAPI.
+
+| Framework        |       1 KB echo |       Typed sum |
+| :--------------- | --------------: | --------------: |
+| UCall, C         | 291 k/s · 14.0× | 440 k/s · 31.7× |
+| UCall, Rust      | 278 k/s · 13.4× | 403 k/s · 29.1× |
+| UCall, Python    | 268 k/s · 12.9× | 367 k/s · 26.4× |
+| actix-web        | 247 k/s · 11.9× | 281 k/s · 20.2× |
+| axum             | 227 k/s · 10.9× | 265 k/s · 19.1× |
+| gRPC, Rust tonic | 82.7 k/s · 4.0× |  108 k/s · 7.8× |
+| gRPC, Python     | 14.8 k/s · 0.7× | 15.0 k/s · 1.1× |
+| FastAPI          | 20.8 k/s · 1.0× | 13.9 k/s · 1.0× |
+
+The Python bindings stay within 8% of the native server, as the handler runs on the polling thread with no event loop in between.
+Measured on one core of an Intel Core i9-13950HX; four-core runs and latency percentiles are in the [benchmark guide](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison).
+
 ## Quickstart
 
 ```sh
@@ -694,16 +712,6 @@ server {
     return 301 https://$server_name$request_uri;
 }
 ```
-
-## Performance
-
-The native [benchmark driver](https://github.com/unum-cloud/UCall/blob/main/bench/README.md) measures complete HTTP exchanges through the C ABI, including connection reuse, response validation, throughput, latency percentiles through p99.99, and client CPU time per request.
-It runs closed-loop by default, or open-loop at a fixed arrival rate that charges each call its delay from the intended send time.
-Each run records the selected backend, CPU kernel class, application polling threads, connection budget, and calls in flight.
-On the server side, `ucall_server_event_loop_statistics()` counts each loop's submissions, completions, kernel enters, and copied bytes, which the echo example prints on exit to price one request.
-The [framework comparison](https://github.com/unum-cloud/UCall/blob/main/bench/README.md#framework-comparison) serves a 1 KB loopback echo and a typed sum through UCall natively and through its Rust and Python bindings, axum, actix-web, FastAPI and Python gRPC from the same cores.
-The guide also measures pipelining depth, Noise against TLS 1.3 behind nginx, scaling across event loops, and 10,000 connections.
-The [C ABI page](https://github.com/unum-cloud/UCall/blob/main/c/README.md) describes the native surface; the SDK and authorization plans under [Architecture](#architecture) are labeled as such.
 
 ## Compatibility
 

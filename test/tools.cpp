@@ -13,6 +13,8 @@
 #include <sys/wait.h> // `WIFEXITED`, `WEXITSTATUS`, `waitpid`
 #include <unistd.h>   // `fork`, `execv`, `pipe`
 
+#include <fmt/ranges.h> // `fmt::join` - the keys' hex digits
+
 #include <network.hpp>
 
 using namespace unum::ucall::test;
@@ -44,11 +46,7 @@ static cli_run_t run_cli(scratch_directory_t const& scratch, std::string_view ar
     return run;
 }
 
-static std::string hexadecimal(ucall_noise_key_t const& key) {
-    std::string text;
-    for (auto byte : key) text += fmt::format("{:02x}", static_cast<unsigned>(byte));
-    return text;
-}
+static std::string hexadecimal(ucall_noise_key_t const& key) { return fmt::format("{:02x}", fmt::join(key, "")); }
 
 /** Plaintext calls: a GET to standard output, a POST from a file and from standard input, a header
  *  reaching the handler, <tt>-i</tt> printing the status line and fields before the body, and a 404
@@ -159,8 +157,9 @@ static void test_cli_noise_ik(sweep_cell_t const& cell) {
     fixture_t fixture {{cell.backend, cell.cpu_class_ceiling, ucall_security_noise_ik_k}, {}};
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     scratch_directory_t scratch;
-    if (!expect_true(scratch.ready() && scratch.write("server.key", hexadecimal(fixture.server_public) + "\n") &&
-                     scratch.write("client.key", hexadecimal(fixture.client_private) + "\n")))
+    if (!expect_true(scratch.ready() &&
+                     scratch.write("server.key", fmt::format("{}\n", hexadecimal(fixture.server_public))) &&
+                     scratch.write("client.key", fmt::format("{}\n", hexadecimal(fixture.client_private)))))
         return;
     fixture.serve_in_background();
     auto const run = run_cli(scratch, fmt::format("--server-key {} --key {} -d sealed {}/echo/3",
@@ -300,10 +299,11 @@ static void test_cli_proxy_round_trip() {
                      scratch.write("forward.pub", hexadecimal(forward_public))))
         return;
     proxy_run_t reverse, forward, broken;
-    spawn_proxy(reverse, {"--listen", "127.0.0.1:0", "--security", "ik", "--key", scratch.name("reverse.key"),
-                          "--peer-key", scratch.name("forward.pub"), "--to", "http://" + upstream.address});
+    spawn_proxy(reverse,
+                {"--listen", "127.0.0.1:0", "--security", "ik", "--key", scratch.name("reverse.key"), "--peer-key",
+                 scratch.name("forward.pub"), "--to", fmt::format("http://{}", upstream.address)});
     if (!expect_true(!reverse.address.empty(), "the reverse proxy printed no address")) return;
-    spawn_proxy(forward, {"--listen", "127.0.0.1:0", "--to", "http+noise://" + reverse.address, "--key",
+    spawn_proxy(forward, {"--listen", "127.0.0.1:0", "--to", fmt::format("http+noise://{}", reverse.address), "--key",
                           scratch.name("forward.key"), "--server-key", scratch.name("reverse.pub")});
     if (!expect_true(!forward.address.empty(), "the forward proxy printed no address")) return;
     auto const run = run_cli(scratch, fmt::format("-i -X PUT -d payload -H 'X-Kept: one' -H 'Connection: x-drop' " //

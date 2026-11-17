@@ -510,7 +510,7 @@ struct received_response_t : ucall_received_http_response_handle_t {
 template <typename element_type_, typename allocator_type_>
 std::string_view text_view(st::vector<element_type_, allocator_type_> const& bytes) noexcept {
     static_assert(sizeof(element_type_) == 1);
-    return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
+    return text_view(bytes_of(bytes.data(), bytes.size()));
 }
 
 template <typename compare_kit_type_, typename find_kit_type_, typename byteset_kit_type_, typename hash_kit_type_,

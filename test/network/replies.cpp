@@ -136,7 +136,7 @@ static case_result_t test_file_parts_vectored(sweep_cell_t const& cell) {
         expect_true(completed.outcome.status == ucall_status_success_k, "{}",
                     ucall_status_name(completed.outcome.status));
         if (completed.response)
-            expect_true(response_header(completed.response, "content-length") == std::to_string(expected.size()),
+            expect_true(response_header(completed.response, "content-length") == fmt::format("{}", expected.size()),
                         "content-length {}", response_header(completed.response, "content-length"));
         check_answer(completed, ucall_http_status_ok_k, verb == ucall_verb_get_k ? expected : "");
         expect_outcome(fixture, outcome, ucall_status_success_k);

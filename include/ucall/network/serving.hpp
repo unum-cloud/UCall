@@ -1077,7 +1077,7 @@ struct serving {
             headroom = fu::min_of(fu::min_of(limit > active ? limit - active : 0, idle ? idle - 1 : 0),
                                   acceptor.peer_addresses.size() - 1);
         }
-        acceptor.request.data = reinterpret_cast<byte_t*>(acceptor.peer_addresses.data());
+        acceptor.request.data = bytes_of(acceptor.peer_addresses.data(), 1).data();
         acceptor.request.length = 1 + headroom;
     }
 
@@ -1191,7 +1191,7 @@ struct serving {
             }
             static_assert(shed_reply_k.size() <= sizeof(io_peer_address_t));
             // The accept is done with its peer address, and a send takes writable bytes.
-            byte_t* const reply = reinterpret_cast<byte_t*>(acceptor.peer_addresses.data());
+            byte_t* const reply = bytes_of(acceptor.peer_addresses.data(), 1).data();
             std::memcpy(reply, shed_reply_k.data(), shed_reply_k.size());
             acceptor.shed_request.data = reply;
             acceptor.shed_request.length = shed_reply_k.size();

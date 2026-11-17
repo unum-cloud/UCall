@@ -720,7 +720,7 @@ static case_result_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const&
         std::size_t offset = 0;
         for (std::size_t i = 0; i != 4; ++i) {
             auto const response = read_response(client, offset);
-            expect_true(response.status == 200 && response.body == std::to_string(i), "response {}: {} {}", i,
+            expect_true(response.status == 200 && response.body == fmt::format("{}", i), "response {}: {} {}", i,
                         response.status, response.body);
             if (!response.length) break;
             offset += response.length;

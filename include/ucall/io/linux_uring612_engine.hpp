@@ -1145,7 +1145,7 @@ struct uring_operations {
                           ? -ETIMEDOUT
                           : operation.result;
         if (operation.request->operation == io_operation_t::accept_k && result >= 0)
-            return {operation.request, result, reinterpret_cast<byte_t*>(&socket_slots.peers[operation.accepted]), 0,
+            return {operation.request, result, bytes_of(&socket_slots.peers[operation.accepted], 1).data(), 0,
                     operation.stage == uring_operation_stage_t::yielded_k ? io_continuation_t::pending_k
                                                                           : io_continuation_t::ended_k};
         unsigned const offset = operation.buffer;

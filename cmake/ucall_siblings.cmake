@@ -48,21 +48,21 @@ set(SMASHTABLE_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
 # SmashTable: the route tables, connection pools and intrusive lists, header-only.
 ucall_sibling(
     stringzilla FETCHCONTENT_SOURCE_DIR_STRINGZILLA https://github.com/ashvardanian/StringZilla
-    4ac15c46016516fd8d22bf453126c70d9a88bb81
+    135694cbbbb1b0fb06d807d7c1bf41596e98db82
 )
 ucall_sibling(
     forkunion FETCHCONTENT_SOURCE_DIR_FORKUNION https://github.com/ashvardanian/ForkUnion
-    2105dd71bbbe3e22c92cf4a4f332a579abb8b780
+    59662d01e66ee40a87d8f5b28387a29d16c78ddd
 )
 ucall_sibling(
     smashtable FETCHCONTENT_SOURCE_DIR_SMASHTABLE https://github.com/ashvardanian/SmashTable
-    30e349dcd1e582896386d959d4a36badce061787
+    e44798287a3aca9a263ba4fd7a98076d7a803f7f
 )
 
 # NumKong: the packed dot products only the inference example serves.
 if (UCALL_BUILD_EXAMPLES)
     ucall_sibling(
         numkong FETCHCONTENT_SOURCE_DIR_NUMKONG https://github.com/ashvardanian/NumKong
-        1febcfe4a62abc70a9b59d303f3632af1c8214ca
+        310ee417fa73bf85baaac7e707910f081427ede5
     )
 endif ()

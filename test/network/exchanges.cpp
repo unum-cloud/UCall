@@ -465,7 +465,7 @@ static void test_reply_vectored(sweep_cell_t const& cell) {
     check_answer(completed, ucall_http_status_created_k, expected);
     completed = call_and_wait(fixture, ucall_verb_head_k, "/vectored", cell.security);
     if (completed.response)
-        expect_true(response_header(completed.response, "content-length") == std::to_string(expected.size()));
+        expect_true(response_header(completed.response, "content-length") == fmt::format("{}", expected.size()));
     check_answer(completed, ucall_http_status_created_k, {});
     fixture.stop();
 }
@@ -940,7 +940,7 @@ static void test_pipelined_burst(sweep_cell_t const& cell, split_mix_generator_t
         std::string burst;
         for (std::size_t i = 0; i != count; ++i)
             burst += fmt::format("POST /echo/{} HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}", i,
-                                 std::to_string(i).size(), i);
+                                 fmt::formatted_size("{}", i), i);
         raw_client_t client;
         if (!expect_true(client.connect(fixture.address))) return;
         // The writer must not wait on replies the reader has not taken yet.
@@ -952,7 +952,7 @@ static void test_pipelined_burst(sweep_cell_t const& cell, split_mix_generator_t
         std::size_t offset = 0, answered = 0;
         for (; answered != count; ++answered) {
             auto const response = read_response(client, offset);
-            if (response.status != 200 || response.body != std::to_string(answered)) break;
+            if (response.status != 200 || response.body != fmt::format("{}", answered)) break;
             offset += response.length;
         }
         writer.join();

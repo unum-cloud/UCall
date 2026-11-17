@@ -355,12 +355,12 @@ Verdicts and the summary go to stdout, failed checks and `rerun:` lines to stder
 A run exits 1 when a case failed, a check failed outside any case, or nothing ran, 3 when `UCALL_NO_SKIPS` is set and a case skipped, and 0 otherwise.
 Under a debugger, `UCALL_TRAP_ON_FAILURE=1` stops at the first failed check; without one, the trap dumps core.
 
-The Python suites, `test/server.py`, `test/client.py` and `test/readme.py`, take their hooks and fixtures from `test/conftest.py` and their settings and backends from `test/base.py`; pytest's header prints the same `- Seed:` line, and `UCALL_FILTER` deselects by node ID.
+The Python suites, `test/server.py`, `test/client.py` and `test/readme.py`, take their hooks and fixtures from `test/conftest.py` and their settings and backends from `test/base.py`; pytest's header prints the same `- Seed:` line, and pytest's own `-k` and node IDs select cases.
 Rust tests sit in each module of `rust/`, and the Mojo suite in `mojo/test.mojo`.
 
 ```bash
 python -X faulthandler -m pytest -x
-UCALL_FILTER=readme python -m pytest
+python -m pytest -k readme
 cargo test
 pixi run test
 ```
@@ -370,7 +370,7 @@ pixi run test
 | Variable                      | Flag                      |        Default | Meaning                                                                                           |
 | :---------------------------- | :------------------------ | -------------: | :------------------------------------------------------------------------------------------------ |
 | `UCALL_SEED`                  | `--seed`                  |           `42` | Seed of every input stream, any unsigned 64-bit value, or `random` to draw one                    |
-| `UCALL_FILTER`                | `--filter`                |          unset | Regex searched in case labels and pytest node IDs, else a substring, which is all C matches       |
+| `UCALL_FILTER`                | `--filter`                |          unset | Regex searched in C++ case labels and benchmark rows                                              |
 | `UCALL_SCALE`                 | `--scale`                 |            `1` | Positive factor on the iteration counts of native sweeps, like `0.1` for a quick pass             |
 | `UCALL_TRAP_ON_FAILURE`       | `--trap-on-failure`       |          unset | Any value but `0` traps into the debugger at the first failed check                               |
 | `UCALL_NO_SKIPS`              | `--no-skips`              |          unset | Any value but `0` exits 3 when a case skipped, for runners that must cover every cell             |
@@ -379,7 +379,7 @@ pixi run test
 | `UCALL_TEST_DIRECT_DIRECTORY` | `--test-direct-directory` |     build tree | Where cases make the directories their `O_DIRECT` files live in, since `/tmp` is often tmpfs      |
 
 The flags reach the native binaries only.
-Python reads `UCALL_SEED`, `UCALL_FILTER`, `UCALL_SCALE` and `UCALL_TEST_DIRECT_DIRECTORY`, falling back to pytest's `tmp_path` for the last; Rust reads `UCALL_SEED` and `UCALL_TEST_DIRECT_DIRECTORY`, falling back to the test binary's directory.
+Python reads `UCALL_SEED`, `UCALL_SCALE` and `UCALL_TEST_DIRECT_DIRECTORY`, falling back to pytest's `tmp_path` for the last; Rust reads `UCALL_SEED` and `UCALL_TEST_DIRECT_DIRECTORY`, falling back to the test binary's directory.
 
 ### Writing a Test
 

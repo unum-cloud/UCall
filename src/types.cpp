@@ -14,9 +14,7 @@
 
 using namespace unum::ucall;
 
-static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept {
-    return spelling == std::string_view {reinterpret_cast<char const*>(name.data), name.length};
-}
+static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept { return spelling == text_view(name); }
 
 /** Writes the entry of @p values that @p name_of spells as @p name into @p value, else nothing. */
 template <typename value_type_, std::size_t count_>

@@ -193,7 +193,7 @@ struct server : ucall_server_handle_t {
             [[maybe_unused]] st::status_t const kept = network_interface.reply_directory_descriptors.push_back(
                 st::assume_reserved, std::bit_cast<native_file_t>(directory));
             std::size_t const length = settings.reply_directories[i].length;
-            network_interface.reply_directory_views[i] = {reinterpret_cast<ucall_byte_t const*>(name), length};
+            network_interface.reply_directory_views[i] = bytes_view({name, length});
             name += length + 1;
         }
         settings.reply_directories = network_interface.reply_directory_views.data();
@@ -916,12 +916,12 @@ struct server : ucall_server_handle_t {
         [[maybe_unused]] st::status_t const shrunk = endpoint.collected.resize(kept);
         auto head = endpoint.head;
         for (; head != tail; ++head) {
-            server_exchange_t*& word = endpoint.slots[head & (endpoint.slots.size() - 1)];
-            auto slot = atomic_ref<server_exchange_t*> {word};
+            std::size_t const index = head & (endpoint.slots.size() - 1);
+            auto slot = atomic_ref<server_exchange_t*> {endpoint.slots[index]};
             auto* exchange = slot.load(std::memory_order_acquire);
             // The depositor has claimed this index and stores into it right after.
             while (!exchange) {
-                waiter_t {}(&word, exchange, 0);
+                waiter_t {}(&endpoint.slots[index], exchange, 0);
                 exchange = slot.load(std::memory_order_acquire);
             }
             slot.store(nullptr, std::memory_order_relaxed);

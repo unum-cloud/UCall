@@ -192,9 +192,9 @@ struct resolving {
 
     /** Whether @p request is one of the client's lookups'. */
     static bool owns(client_t const& client, io_request_t const* request) noexcept {
-        auto const* const begin = reinterpret_cast<byte_t const*>(client.lookups.data());
-        auto const* const address = reinterpret_cast<byte_t const*>(request);
-        return address >= begin && address < begin + client.lookups.size_bytes();
+        auto const lookups = std::as_bytes(client.lookups);
+        auto const* const address = bytes_of(request, 1).data();
+        return address >= lookups.data() && address < lookups.data() + lookups.size();
     }
 
     /** Lands one completion of a lookup's question and moves the question on. */
@@ -378,7 +378,7 @@ struct resolving {
         std::uint64_t const deadline = deadline_after(std::size_t {options(client).timeout_seconds} * 1'000'000);
         question.send_request = {.operation = io_operation_t::connect_k,
                                  .descriptor = question.descriptor,
-                                 .data = reinterpret_cast<byte_t*>(&server),
+                                 .data = bytes_of(&server, 1).data(),
                                  .length = server.ss_family == AF_INET6 ? sizeof(sockaddr_in6) : sizeof(sockaddr_in),
                                  .deadline = deadline,
                                  .context = &lookup};

@@ -17,6 +17,12 @@
 
 #include "ucall/ucall.h"
 
+#if UCALL_OS_WINDOWS_
+#include <io.h> // `_write`
+#else
+#include <unistd.h> // `write`, `STDERR_FILENO`
+#endif
+
 /*  region Shared C Checks  */
 static size_t failed_checks = 0;
 static size_t failed_checks_before_case = 0;
@@ -25,7 +31,6 @@ static size_t failed_cases = 0;
 static size_t skipped_cases = 0;
 static char const* current_case = NULL;
 static char const* program_name = "";
-static char const* test_filter = NULL;
 static uint64_t test_seed = 42;
 static double test_scale = 1.0;
 static bool refuse_skips = false;
@@ -40,11 +45,22 @@ static inline uint64_t split_mix_bits(uint64_t value) {
     return value ^ (value >> 31);
 }
 
+/** Writes @p text to the standard error through a raw @c write, which a signal handler may call. */
+static void write_text(char const* text) {
+#if UCALL_OS_WINDOWS_
+    (void)!_write(2, text, (unsigned)strlen(text));
+#else
+    (void)!write(STDERR_FILENO, text, strlen(text));
+#endif
+}
+
 /** Counts a failed check at @p file : @p line without stopping, so one run lists every mismatch. */
 static inline bool expect_at(bool is_met, char const* file, int line, char const* what) {
     if (is_met) return true;
     fflush(stdout);
-    fprintf(stderr, "  check failed at %s:%d\n    %s\n", file, line, what);
+    char message[512];
+    snprintf(message, sizeof message, "  check failed at %s:%d\n    %s\n", file, line, what);
+    write_text(message);
     ++failed_checks;
     return false;
 }
@@ -64,7 +80,9 @@ static inline char const* setting_text(int argc, char** argv, char const* variab
 
 /** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
 static inline void exit_unparsed(char const* variable, char const* text, char const* expected) {
-    fprintf(stderr, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    char message[512];
+    snprintf(message, sizeof message, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    write_text(message);
     exit(1);
 }
 
@@ -100,15 +118,13 @@ static inline bool read_flag_setting(int argc, char** argv, char const* variable
 static inline void start_test_run(int argc, char** argv) {
     program_name = argc != 0 ? argv[0] : "";
     read_test_settings(argc, argv);
-    printf("- Seed: %" PRIu64 ", scale: %g, filter: %s\n", test_seed, test_scale, test_filter ? test_filter : "none");
+    printf("- Seed: %" PRIu64 ", scale: %g\n", test_seed, test_scale);
 }
 
-/** Starts the case @p label unless the filter leaves it out, matched by substring. */
-static inline bool start_test_case(char const* label) {
-    if (test_filter && !strstr(label, test_filter)) return false;
+/** Starts the case @p label, which every run runs. */
+static inline void start_test_case(char const* label) {
     current_case = label;
     failed_checks_before_case = failed_checks;
-    return true;
 }
 
 /** Ends the case @ref start_test_case began: @p skip_reason when it skipped, NULL when it ran. */
@@ -125,8 +141,11 @@ static inline void finish_test_case(char const* skip_reason) {
     else {
         ++failed_cases;
         fflush(stdout);
-        fprintf(stderr, "- %s ... FAILED: %zu failed check(s)\n", current_case, failed);
-        fprintf(stderr, "  rerun: %s --seed %" PRIu64 " --filter '%s'\n", program_name, test_seed, current_case);
+        char message[512];
+        snprintf(message, sizeof message, "- %s ... FAILED: %zu failed check(s)\n", current_case, failed);
+        write_text(message);
+        snprintf(message, sizeof message, "  rerun: %s --seed %" PRIu64 "\n", program_name, test_seed);
+        write_text(message);
     }
     current_case = NULL;
 }
@@ -144,7 +163,6 @@ static inline int finish_test_run(void) {
 
 static void read_test_settings(int argc, char** argv) {
     test_seed = read_seed_setting(argc, argv, "UCALL_SEED", "--seed");
-    test_filter = setting_text(argc, argv, "UCALL_FILTER", "--filter");
     test_scale = read_real_setting(argc, argv, "UCALL_SCALE", "--scale", 1.0);
     refuse_skips = read_flag_setting(argc, argv, "UCALL_NO_SKIPS", "--no-skips", false);
 }
@@ -658,9 +676,9 @@ static void test_handle_refusals(void) {
 int main(int argc, char** argv) {
     printf("UCall %s\n", ucall_version_name());
     start_test_run(argc, argv);
-    if (start_test_case("test_names_and_keys")) test_names_and_keys(), finish_test_case(NULL);
-    if (start_test_case("test_type_refusals")) test_type_refusals(), finish_test_case(NULL);
-    if (start_test_case("test_handle_refusals")) test_handle_refusals(), finish_test_case(NULL);
+    start_test_case("test_names_and_keys"), test_names_and_keys(), finish_test_case(NULL);
+    start_test_case("test_type_refusals"), test_type_refusals(), finish_test_case(NULL);
+    start_test_case("test_handle_refusals"), test_handle_refusals(), finish_test_case(NULL);
     return finish_test_run();
 }
 

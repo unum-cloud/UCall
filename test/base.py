@@ -1,5 +1,5 @@
-"""Settings and matrices the Python suites share: the seed, filter and scale the environment
-names, and the backends a server runs on. Fixtures live in `conftest`.
+"""Settings and matrices the Python suites share: the seed and scale the environment names, and
+the backends a server runs on. Fixtures live in `conftest`.
 
 File: test/base.py
 Author: Ash Vardanian
@@ -8,7 +8,6 @@ Date: October 19, 2026
 
 import os
 import random
-import re
 import sys
 from dataclasses import dataclass
 from typing import NoReturn
@@ -74,32 +73,6 @@ def env_flag(variable: str, fallback: bool = False) -> bool:
     return text not in {"0", "false", "off", "no"}
 
 
-@dataclass(frozen=True)
-class Filter:
-    """Which node ids a run selects: a regex search when the pattern compiles, else a substring, all when empty."""
-
-    pattern: str
-    regex: re.Pattern[str] | None
-
-    def selects(self, nodeid: str) -> bool:
-        """Whether `nodeid` passes the filter."""
-        if not self.pattern:
-            return True
-        if self.regex is not None:
-            return self.regex.search(nodeid) is not None
-        return self.pattern in nodeid
-
-
-def env_filter(variable: str) -> Filter:
-    """The filter the environment `variable` spells, compiled once."""
-    pattern = env_text(variable) or ""
-    try:
-        regex = re.compile(pattern) if pattern else None
-    except re.error:
-        regex = None
-    return Filter(pattern, regex)
-
-
 def mix(value: int) -> int:
     """SplitMix64's finalizer, a bijection that spreads every input bit over all 64 output bits."""
     value = ((value ^ (value >> 30)) * 0xBF58476D1CE4E5B9) & _UINT64_MASK
@@ -123,11 +96,10 @@ class Settings:
     """Every `UCALL_*` variable the Python suites read, parsed once at import."""
 
     seed: int
-    filter: Filter
     scale: float
 
 
-SETTINGS = Settings(seed=env_seed("UCALL_SEED"), filter=env_filter("UCALL_FILTER"), scale=env_real("UCALL_SCALE", 1.0))
+SETTINGS = Settings(seed=env_seed("UCALL_SEED"), scale=env_real("UCALL_SCALE", 1.0))
 
 BACKENDS = {
     ucall.Backend.POSIX: sys.platform.startswith(("linux", "darwin", "freebsd")),

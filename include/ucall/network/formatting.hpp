@@ -339,7 +339,7 @@ struct formatting {
                 else put_escaped(field.value), put("\"");
             }
         }
-        log.callback(level, {reinterpret_cast<ucall_byte_t const*>(line), length}, log.context);
+        log.callback(level, bytes_view({line, length}), log.context);
     }
 
     /** Characters of an IMF-fixdate, the form of every @c date header a reply carries. */
@@ -390,7 +390,7 @@ struct formatting {
                 appended != ucall_status_success_k)
                 return appended;
             http_t::lowercase_ascii({reinterpret_cast<char*>(output.data()) + previous, colon});
-            std::string_view name {reinterpret_cast<char const*>(output.data()) + previous, colon};
+            std::string_view name = text_view(bytes_of(output.data() + previous, colon));
             if (declared && !*declared && http_t::equal(name, "content-length")) {
                 std::string_view const value = http_t::trim_http(line.substr(colon + 1));
                 std::uint64_t length {};
