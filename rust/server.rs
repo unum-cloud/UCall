@@ -2000,9 +2000,7 @@ impl Drop for ReplyStream<'_> {
 
 #[cfg(test)]
 mod tests {
-    use core::future::{Future, IntoFuture};
-    use core::pin::pin;
-    use core::task::{Context, Poll, Waker};
+    use core::future::IntoFuture;
     use std::borrow::Cow;
     use std::io::{IoSlice, Read, Write};
     use std::net::{TcpStream, UdpSocket};
@@ -2012,7 +2010,7 @@ mod tests {
     use super::*;
     use crate::client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed};
     use crate::testing::{
-        Stopping, client, detaching, direct_directory, loopback, next_detached, open_direct, pattern, serving,
+        Stopping, block_on, client, detaching, direct_directory, loopback, next_detached, open_direct, pattern, serving,
     };
     use crate::types::{derive_noise_public_key, generate_noise_keypair};
 
@@ -2300,8 +2298,8 @@ mod tests {
     fn reply_parts_concatenates_bytes_and_paths() {
         let directory = direct_directory("reply-parts");
         let clip = pattern(10_000);
-        std::fs::write(directory.join("clip.bin"), &clip).unwrap();
-        let interface = loopback(1).reply_directories([directory.to_str().unwrap()]);
+        std::fs::write(directory.path().join("clip.bin"), &clip).unwrap();
+        let interface = loopback(1).reply_directories([directory.path().to_str().unwrap()]);
         let mut server = Server::new(&[interface]).unwrap();
         let (handler, received) = detaching();
         server.get("/clip", handler).unwrap();
@@ -2333,7 +2331,7 @@ mod tests {
     #[test]
     fn path_part_defers_until_sent() {
         let directory = direct_directory("deferred-paths");
-        let interface = loopback(1).reply_directories([directory.to_str().unwrap()]);
+        let interface = loopback(1).reply_directories([directory.path().to_str().unwrap()]);
         let mut server = Server::new(&[interface]).unwrap();
         let (handler, received) = detaching();
         server.get("/{name}", handler).unwrap();
@@ -2345,14 +2343,7 @@ mod tests {
                         ReplyPart::path(PathRange { directory: 0, path: b"missing.bin".into(), offset: 0, length: 0 });
                     let detached = next_detached(&received);
                     let deferred = detached.reply_parts(HTTPStatus::OK, &[], &[missing]).unwrap();
-                    let mut awaited = pin!(deferred.expect("a path part defers").into_future());
-                    let mut context = Context::from_waker(Waker::noop());
-                    let ended = loop {
-                        match awaited.as_mut().poll(&mut context) {
-                            Poll::Ready(ended) => break ended,
-                            Poll::Pending => std::thread::yield_now(),
-                        }
-                    };
+                    let ended = block_on(deferred.expect("a path part defers").into_future());
                     assert_eq!(ended.unwrap_err().status, Status::NotFound);
                     let detached = next_detached(&received);
                     let parts = [ReplyPart::bytes(b"final")];
@@ -2398,7 +2389,7 @@ mod tests {
     fn reply_stream_appends_then_ends() {
         let directory = direct_directory("reply-stream");
         let clip = pattern(8192);
-        let path = directory.join("clip.bin");
+        let path = directory.path().join("clip.bin");
         std::fs::write(&path, &clip).unwrap();
         let file = open_direct(&path);
         let mut server = Server::new(&[loopback(1)]).unwrap();
@@ -2428,7 +2419,7 @@ mod tests {
     #[test]
     fn reply_parts_rejects_overflowing_range() {
         let directory = direct_directory("overflowing-range");
-        let interface = loopback(1).reply_directories([directory.to_str().unwrap()]);
+        let interface = loopback(1).reply_directories([directory.path().to_str().unwrap()]);
         let mut server = Server::new(&[interface]).unwrap();
         let (handler, received) = detaching();
         server.get("/clip", handler).unwrap();
@@ -2518,16 +2509,9 @@ mod tests {
             std::thread::scope(|scope| {
                 scope.spawn(move || {
                     let mut detached = next_detached(&received);
-                    let mut context = Context::from_waker(Waker::noop());
                     let mut pulled = Vec::new();
                     loop {
-                        let mut pull = pin!(detached.next_body_chunk());
-                        let chunk = loop {
-                            match pull.as_mut().poll(&mut context) {
-                                Poll::Ready(chunk) => break chunk.unwrap(),
-                                Poll::Pending => std::thread::yield_now(),
-                            }
-                        };
+                        let chunk = block_on(detached.next_body_chunk()).unwrap();
                         if chunk.is_empty() {
                             break;
                         }
@@ -2579,7 +2563,7 @@ mod tests {
     }
 
     #[test]
-    fn multipart_parts_by_index() {
+    fn multipart_parts_read_by_index_and_refuse_one_past_the_last() {
         let mut server = Server::new(&[loopback(1)]).unwrap();
         server
             .post("/form", |request: Request| {
@@ -2616,7 +2600,7 @@ mod tests {
     }
 
     #[test]
-    fn path_segments_by_index() {
+    fn path_segments_read_by_index_still_escaped_and_without_the_query() {
         let mut server = Server::new(&[loopback(1)]).unwrap();
         server
             .get("/files/{*path}", |request: Request| {

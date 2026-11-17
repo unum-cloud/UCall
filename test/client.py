@@ -1,6 +1,10 @@
 """Exercises `ucall.Client`: its owning thread, its blocking calls, and the completions they
 keep for later.
 
+Run:
+    python -m pytest test/client.py -v
+    UCALL_FILTER=linux_uring618 python -m pytest test/client.py
+
 File: test/client.py
 Author: Ash Vardanian
 Date: October 25, 2026
@@ -16,15 +20,18 @@ import pytest
 import ucall
 
 
-def test_status_names_and_version_come_from_the_library():
+def test_names_come_from_the_library():
+    """Statuses parse from the library's own spellings, a misspelled one is refused, and the version matches."""
     assert ucall.Status.from_name("would-block") is ucall.Status.WOULD_BLOCK
     assert ucall.Status.from_name("invalid-argument") is ucall.Status.INVALID_ARGUMENT
-    with pytest.raises(ValueError):
+    with pytest.raises(ValueError) as misspelled:  # noqa: PT011
         ucall.Status.from_name("would-bloc")
+    assert str(misspelled.value) == "no ucall.Status is spelled 'would-bloc'"
     assert ucall.version() == ucall.__version__
 
 
 def test_client_refuses_other_threads():
+    """A client answers only the thread that made it, refusing submits, takes and blocking calls from any other."""
     client = ucall.Client(connections=1)
     failures = []
 
@@ -48,7 +55,8 @@ def test_client_refuses_other_threads():
     assert client.take_completed() == []
 
 
-def test_blocking_calls_keep_other_completions(backend, loopback, serving):
+def test_blocking_calls_keep_other_completions_for_the_next_take(backend, loopback, serving):
+    """A blocking call keeps the completions it drove past for the next take, and a refused connect raises."""
     server = ucall.Server(loopback(), backend=backend)
 
     @server.post("/echo")
@@ -73,7 +81,8 @@ def test_blocking_calls_keep_other_completions(backend, loopback, serving):
         assert isinstance(refused.value, ConnectionError)
 
 
-def test_response_cap_fails_with_overflow(backend, loopback, serving):
+def test_responses_over_the_cap_fail_with_overflow(backend, loopback, serving):
+    """A response larger than `max_response_bytes` fails with an overflow, while a smaller one arrives whole."""
     server = ucall.Server(loopback(), backend=backend)
 
     @server.post("/echo")
@@ -89,6 +98,7 @@ def test_response_cap_fails_with_overflow(backend, loopback, serving):
 
 
 def test_streamed_bodies_download_past_the_response_cap(backend, loopback, serving):
+    """A streamed body downloads past the response cap, pulled only on its own thread; a bodiless one pulls empty."""
     server = ucall.Server(loopback(), backend=backend)
     # A prime period, so a misplaced or repeated chunk shows.
     payload = (bytes(range(251)) * ((4 << 20) // 251 + 1))[: 4 << 20]
@@ -151,7 +161,8 @@ def test_streamed_bodies_download_past_the_response_cap(backend, loopback, servi
         assert list(response.body_chunks()) == []
 
 
-def test_request_options_per_call(backend, loopback, serving):
+def test_request_options_timeout_overrides_client(backend, loopback, serving):
+    """A timeout passed with one call ends that call, whatever the client's own default."""
     server = ucall.Server(loopback(), backend=backend)
     held = []
 
@@ -170,7 +181,8 @@ def test_request_options_per_call(backend, loopback, serving):
     assert elapsed < 5
 
 
-def test_client_and_server_log_lines(loopback, serving):
+def test_clients_and_servers_log_lines_in_text_and_json(loopback, serving):
+    """A client logs a failed connect as a text line, and a server logs a refusal as a JSON line."""
     lines = []
     probe = socket.socket()
     probe.bind(("127.0.0.1", 0))

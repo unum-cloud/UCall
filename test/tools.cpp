@@ -5,6 +5,8 @@
  *  @brief Drives the <tt>ucall</tt> command-line client, which the arguments after <tt>--</tt> run,
  *      against an in-process fixture server.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include <poll.h>     // `poll`
 #include <signal.h>   // `kill`, `SIGINT`
 #include <sys/stat.h> // `stat`, `lstat`
@@ -51,39 +53,38 @@ static std::string hexadecimal(ucall_noise_key_t const& key) {
 /** Plaintext calls: a GET to standard output, a POST from a file and from standard input, a header
  *  reaching the handler, <tt>-i</tt> printing the status line and fields before the body, and a 404
  *  exiting with its hundreds digit. */
-static std::size_t test_cli_plaintext(sweep_cell_t const& cell) {
+static void test_cli_plaintext(sweep_cell_t const& cell) {
     fixture_t fixture {cell, {.connections = 4}};
-    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     scratch_directory_t scratch;
-    require(0, scratch.ready() && scratch.write("body.txt", "from a file"));
+    if (!expect_true(scratch.ready() && scratch.write("body.txt", "from a file"))) return;
     fixture.serve_in_background();
-    std::size_t failures = 0;
 
     auto const got = run_cli(scratch, fmt::format("{}/headers", fixture.url));
-    failures += expect(got.exit_code == 0 && got.output.starts_with("/headers;"), "GET exited {} with {:?}",
-                       got.exit_code, got.output);
+    expect_true(got.exit_code == 0 && got.output.starts_with("/headers;"), "GET exited {} with {:?}", got.exit_code,
+                got.output);
 
     auto const filed = run_cli(scratch, fmt::format("-d @{} {}/echo/1", scratch.name("body.txt"), fixture.url));
-    failures += expect(filed.exit_code == 0 && filed.output == "from a file", "POST from a file exited {} with {:?}",
-                       filed.exit_code, filed.output);
+    expect_true(filed.exit_code == 0 && filed.output == "from a file", "POST from a file exited {} with {:?}",
+                filed.exit_code, filed.output);
 
     auto const piped = run_cli(scratch, fmt::format("-d @- {}/echo/2 < {}", fixture.url, scratch.name("body.txt")));
-    failures += expect(piped.exit_code == 0 && piped.output == "from a file", "POST from stdin exited {} with {:?}",
-                       piped.exit_code, piped.output);
+    expect_true(piped.exit_code == 0 && piped.output == "from a file", "POST from stdin exited {} with {:?}",
+                piped.exit_code, piped.output);
 
     auto const headed = run_cli(scratch, fmt::format("-H 'X-~: tilde' {}/headers", fixture.url));
-    failures += expect(headed.exit_code == 0 && headed.output.find(";tilde;") != std::string::npos,
-                       "a header exited {} with {:?}", headed.exit_code, headed.output);
+    expect_true(headed.exit_code == 0 && headed.output.find(";tilde;") != std::string::npos,
+                "a header exited {} with {:?}", headed.exit_code, headed.output);
 
     auto const headed_output = run_cli(scratch, fmt::format("-i -d echoed {}/echo/5", fixture.url));
-    failures += expect(headed_output.exit_code == 0 && headed_output.output.starts_with("HTTP/1.1 200\n") &&
-                           headed_output.output.find("\nx-ucall: passed\n") != std::string::npos &&
-                           headed_output.output.ends_with("\n\nechoed"),
-                       "-i exited {} with {:?}", headed_output.exit_code, headed_output.output);
+    expect_true(headed_output.exit_code == 0 && headed_output.output.starts_with("HTTP/1.1 200\n") &&
+                    headed_output.output.find("\nx-ucall: passed\n") != std::string::npos &&
+                    headed_output.output.ends_with("\n\nechoed"),
+                "-i exited {} with {:?}", headed_output.exit_code, headed_output.output);
 
     auto const missing = run_cli(scratch, fmt::format("{}/missing", fixture.url));
-    failures += expect(missing.exit_code == 4, "a 404 exited {}", missing.exit_code);
-    return failures + fixture.stop();
+    expect_true(missing.exit_code == 4, "a 404 exited {}", missing.exit_code);
+    fixture.stop();
 }
 
 /** Everything a file under @p scratch holds, or empty when it won't open. */
@@ -100,76 +101,74 @@ static std::string read_file(scratch_directory_t const& scratch, std::string_vie
 /** Files the tool writes land whole through a temporary: <tt>-o</tt> replaces an earlier answer,
  *  a stale or linked temporary refuses the write and leaves the target alone, and
  *  <tt>keygen</tt> writes an owner-only key and never replaces an existing one. */
-static std::size_t test_cli_landing(sweep_cell_t const& cell) {
+static void test_cli_landing(sweep_cell_t const& cell) {
     fixture_t fixture {cell, {.connections = 4, .max_request_bytes = 8 << 20}};
-    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     scratch_directory_t scratch;
-    require(0, scratch.ready() && scratch.write("out.txt", "earlier"));
+    if (!expect_true(scratch.ready() && scratch.write("out.txt", "earlier"))) return;
     fixture.serve_in_background();
-    std::size_t failures = 0;
     std::string const output = scratch.name("out.txt"), temporary = scratch.name("out.txt.tmp");
 
     auto const landed = run_cli(scratch, fmt::format("-o {} -d landed {}/echo/6", output, fixture.url));
-    failures += expect(landed.exit_code == 0 && read_file(scratch, "out.txt") == "landed", "-o exited {} leaving {:?}",
-                       landed.exit_code, read_file(scratch, "out.txt"));
+    expect_true(landed.exit_code == 0 && read_file(scratch, "out.txt") == "landed", "-o exited {} leaving {:?}",
+                landed.exit_code, read_file(scratch, "out.txt"));
 
     // Several MiB stream through the pulls into the landed file, byte for byte.
     std::string large(6 << 20, '\0');
     for (std::size_t i = 0; i != large.size(); ++i) large[i] = static_cast<char>('a' + i % 23);
-    require(0, scratch.write("large.bin", large));
+    if (!expect_true(scratch.write("large.bin", large))) return;
     auto const streamed = run_cli(scratch, fmt::format("-o {} -d @{} {}/echo/9", scratch.name("large.out"),
                                                        scratch.name("large.bin"), fixture.url));
-    failures += expect(streamed.exit_code == 0 && read_file(scratch, "large.out") == large,
-                       "a streamed -o exited {} leaving {} bytes", streamed.exit_code,
-                       read_file(scratch, "large.out").size());
+    expect_true(streamed.exit_code == 0 && read_file(scratch, "large.out") == large,
+                "a streamed -o exited {} leaving {} bytes", streamed.exit_code, read_file(scratch, "large.out").size());
 
-    require(0, scratch.write("out.txt.tmp", "stale"));
+    if (!expect_true(scratch.write("out.txt.tmp", "stale"))) return;
     auto const stale = run_cli(scratch, fmt::format("-o {} -d lost {}/echo/7 2>/dev/null", output, fixture.url));
-    failures += expect(stale.exit_code == 1 && read_file(scratch, "out.txt") == "landed" &&
-                           read_file(scratch, "out.txt.tmp") == "stale",
-                       "a stale temporary exited {} leaving {:?}", stale.exit_code, read_file(scratch, "out.txt"));
+    expect_true(stale.exit_code == 1 && read_file(scratch, "out.txt") == "landed" &&
+                    read_file(scratch, "out.txt.tmp") == "stale",
+                "a stale temporary exited {} leaving {:?}", stale.exit_code, read_file(scratch, "out.txt"));
     std::remove(temporary.c_str());
 
-    require(
-        0, scratch.write("aside.txt", "aside") && ::symlink(scratch.name("aside.txt").c_str(), temporary.c_str()) == 0);
+    if (!expect_true(scratch.write("aside.txt", "aside") &&
+                     ::symlink(scratch.name("aside.txt").c_str(), temporary.c_str()) == 0))
+        return;
     auto const linked = run_cli(scratch, fmt::format("-o {} -d lost {}/echo/8 2>/dev/null", output, fixture.url));
-    failures += expect(linked.exit_code == 1 && read_file(scratch, "out.txt") == "landed" &&
-                           read_file(scratch, "aside.txt") == "aside",
-                       "a linked temporary exited {}", linked.exit_code);
+    expect_true(linked.exit_code == 1 && read_file(scratch, "out.txt") == "landed" &&
+                    read_file(scratch, "aside.txt") == "aside",
+                "a linked temporary exited {}", linked.exit_code);
     std::remove(temporary.c_str());
 
     std::string const key = scratch.name("own.key");
     auto const generated = run_cli(scratch, fmt::format("keygen {}", key));
     struct stat key_stat {};
     bool const owner_only = ::stat(key.c_str(), &key_stat) == 0 && (key_stat.st_mode & 0777) == 0600;
-    failures += expect(generated.exit_code == 0 && owner_only, "keygen exited {} with mode {:o}", generated.exit_code,
-                       key_stat.st_mode & 0777);
+    expect_true(generated.exit_code == 0 && owner_only, "keygen exited {} with mode {:o}", generated.exit_code,
+                key_stat.st_mode & 0777);
     std::string const first_key = read_file(scratch, "own.key");
     auto const again = run_cli(scratch, fmt::format("keygen {} 2>/dev/null", key));
     struct stat temporary_stat {};
-    failures += expect(again.exit_code == 1 && read_file(scratch, "own.key") == first_key &&
-                           ::lstat(scratch.name("own.key.tmp").c_str(), &temporary_stat) != 0,
-                       "a second keygen exited {}", again.exit_code);
-    return failures + fixture.stop();
+    expect_true(again.exit_code == 1 && read_file(scratch, "own.key") == first_key &&
+                    ::lstat(scratch.name("own.key.tmp").c_str(), &temporary_stat) != 0,
+                "a second keygen exited {}", again.exit_code);
+    fixture.stop();
 }
 
 /** An IK call over <tt>http+noise://</tt> with the server's key pinned from a file and the
  *  caller's own. */
-static std::size_t test_cli_noise_ik(sweep_cell_t const& cell) {
+static void test_cli_noise_ik(sweep_cell_t const& cell) {
     fixture_t fixture {{cell.backend, cell.cpu_class_ceiling, ucall_security_noise_ik_k}, {}};
-    require(0, fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status));
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     scratch_directory_t scratch;
-    require(0, scratch.ready() && scratch.write("server.key", hexadecimal(fixture.server_public) + "\n") &&
-                   scratch.write("client.key", hexadecimal(fixture.client_private) + "\n"));
+    if (!expect_true(scratch.ready() && scratch.write("server.key", hexadecimal(fixture.server_public) + "\n") &&
+                     scratch.write("client.key", hexadecimal(fixture.client_private) + "\n")))
+        return;
     fixture.serve_in_background();
-    std::size_t failures = 0;
     auto const run = run_cli(scratch, fmt::format("--server-key {} --key {} -d sealed {}/echo/3",
                                                   scratch.name("server.key"), scratch.name("client.key"), fixture.url));
-    failures += expect(run.exit_code == 0 && run.output == "sealed", "IK exited {} with {:?}", run.exit_code,
-                       run.output);
+    expect_true(run.exit_code == 0 && run.output == "sealed", "IK exited {} with {:?}", run.exit_code, run.output);
     auto const unpinned = run_cli(scratch, fmt::format("-d sealed {}/echo/4 2>/dev/null", fixture.url));
-    failures += expect(unpinned.exit_code == 2, "a Noise URL without --server-key exited {}", unpinned.exit_code);
-    return failures + fixture.stop();
+    expect_true(unpinned.exit_code == 2, "a Noise URL without --server-key exited {}", unpinned.exit_code);
+    fixture.stop();
 }
 
 /** An upstream answering every target with its verb, target and fields, all on one background
@@ -285,9 +284,9 @@ static void spawn_proxy(proxy_run_t& run, std::vector<std::string> arguments) {
 /** A plaintext call through a forward proxy into Noise IK, and through a reverse proxy back to a
  *  plaintext upstream, keeping verb, path, query and fields but the hop-by-hop ones both ways; and
  *  an unreachable upstream answering 502. */
-static std::size_t test_cli_proxy_round_trip() {
+static void test_cli_proxy_round_trip() {
     echo_upstream_t upstream;
-    require(0, upstream.start(), "the upstream failed to start");
+    if (!expect_true(upstream.start(), "the upstream failed to start")) return;
     ucall_noise_key_t reverse_private {}, reverse_public {}, forward_private {}, forward_public {};
     ucall_outcome_t outcome {};
     ucall_noise_key_generate_t reverse_keys {&outcome, &reverse_private, &reverse_public};
@@ -295,43 +294,38 @@ static std::size_t test_cli_proxy_round_trip() {
     ucall_noise_key_generate_t forward_keys {&outcome, &forward_private, &forward_public};
     ucall_noise_key_generate(&forward_keys);
     scratch_directory_t scratch;
-    require(0, scratch.ready() && scratch.write("reverse.key", hexadecimal(reverse_private)) &&
-                   scratch.write("reverse.pub", hexadecimal(reverse_public)) &&
-                   scratch.write("forward.key", hexadecimal(forward_private)) &&
-                   scratch.write("forward.pub", hexadecimal(forward_public)));
+    if (!expect_true(scratch.ready() && scratch.write("reverse.key", hexadecimal(reverse_private)) &&
+                     scratch.write("reverse.pub", hexadecimal(reverse_public)) &&
+                     scratch.write("forward.key", hexadecimal(forward_private)) &&
+                     scratch.write("forward.pub", hexadecimal(forward_public))))
+        return;
     proxy_run_t reverse, forward, broken;
     spawn_proxy(reverse, {"--listen", "127.0.0.1:0", "--security", "ik", "--key", scratch.name("reverse.key"),
                           "--peer-key", scratch.name("forward.pub"), "--to", "http://" + upstream.address});
-    require(0, !reverse.address.empty(), "the reverse proxy printed no address");
+    if (!expect_true(!reverse.address.empty(), "the reverse proxy printed no address")) return;
     spawn_proxy(forward, {"--listen", "127.0.0.1:0", "--to", "http+noise://" + reverse.address, "--key",
                           scratch.name("forward.key"), "--server-key", scratch.name("reverse.pub")});
-    require(0, !forward.address.empty(), "the forward proxy printed no address");
-    std::size_t failures = 0;
+    if (!expect_true(!forward.address.empty(), "the forward proxy printed no address")) return;
     auto const run = run_cli(scratch, fmt::format("-i -X PUT -d payload -H 'X-Kept: one' -H 'Connection: x-drop' " //
                                                   "-H 'X-Drop: gone' 'http://{}/a/b?q=1&r=two'",
                                                   forward.address));
     std::string_view const output = run.output;
-    failures += expect(run.exit_code == 0 && output.find("\nx-upstream: answered\n") != std::string_view::npos &&
-                           output.find(fmt::format("{} /a/b?q=1&r=two|", static_cast<int>(ucall_verb_put_k))) !=
-                               std::string_view::npos &&
-                           output.find("x-kept=one;") != std::string_view::npos &&
-                           output.find("x-drop") == std::string_view::npos &&
-                           output.find("connection=") == std::string_view::npos,
-                       "the round trip exited {} with {:?}", run.exit_code, run.output);
+    expect_true(run.exit_code == 0 && output.find("\nx-upstream: answered\n") != std::string_view::npos &&
+                    output.find(fmt::format("{} /a/b?q=1&r=two|", static_cast<int>(ucall_verb_put_k))) !=
+                        std::string_view::npos &&
+                    output.find("x-kept=one;") != std::string_view::npos &&
+                    output.find("x-drop") == std::string_view::npos &&
+                    output.find("connection=") == std::string_view::npos,
+                "the round trip exited {} with {:?}", run.exit_code, run.output);
     spawn_proxy(broken, {"--listen", "127.0.0.1:0", "--to", "http://127.0.0.1:1"});
-    require(failures, !broken.address.empty(), "the broken proxy printed no address");
+    if (!expect_true(!broken.address.empty(), "the broken proxy printed no address")) return;
     auto const refused = run_cli(scratch, fmt::format("http://{}/ 2>/dev/null", broken.address));
-    failures += expect(refused.exit_code == 5, "an unreachable upstream exited {}", refused.exit_code);
-    failures += expect(
-        forward.stop() == exit_stopped_k && reverse.stop() == exit_stopped_k && broken.stop() == exit_stopped_k,
-        "a proxy did not stop as a signal stops a command");
-    return failures;
+    expect_true(refused.exit_code == 5, "an unreachable upstream exited {}", refused.exit_code);
+    expect_true(forward.stop() == exit_stopped_k && reverse.stop() == exit_stopped_k && broken.stop() == exit_stopped_k,
+                "a proxy did not stop as a signal stops a command");
 }
 
 int main(int argc, char** argv) {
-    install_test_signal_handlers();
-    test_settings = read_settings(argc, argv, "ucall_test_tools -- <command that runs the ucall tool>");
-    settings_t const& settings = test_settings;
     for (int index = 1; index < argc; ++index)
         if (std::string_view {argv[index]} == "--") {
             cli_words.assign(argv + index + 1, argv + argc);
@@ -341,16 +335,15 @@ int main(int argc, char** argv) {
         fmt::println(stderr, "Usage: {} -- <command that runs the ucall tool>", argv[0]);
         return 1;
     }
-    print_probe(settings);
-    sweep_cell_t const cell {settings.backend, settings.cpu_class_ceiling, ucall_security_none_k};
-    std::size_t failures_count = 0;
-    if (settings.filter.selects("tools cli"))
-        failures_count += report("tools cli", keeping_descriptors([&] {
-                                     std::size_t failures = test_cli_plaintext(cell);
-                                     failures += test_cli_landing(cell);
-                                     failures += test_cli_noise_ik(cell);
-                                     failures += test_cli_proxy_round_trip();
-                                     return failures;
-                                 }));
-    return report("total", failures_count) ? 1 : 0;
+    start_test_run(argc, argv);
+    sweep_cell_t const cell {test_run.settings.backend, test_run.settings.cpu_class_ceiling, ucall_security_none_k};
+    run_test_case("main", [&] {
+        return keeping_descriptors([&] {
+            test_cli_plaintext(cell);
+            test_cli_landing(cell);
+            test_cli_noise_ik(cell);
+            test_cli_proxy_round_trip();
+        });
+    });
+    return finish_test_run();
 }

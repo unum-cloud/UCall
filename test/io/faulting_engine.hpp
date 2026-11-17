@@ -8,7 +8,7 @@
 #include "ucall/io/posix_engine.hpp" // `posix_engine_t`
 #include "ucall/network.hpp"         // `serial_network`
 
-#include "harness.hpp" // `expect`
+#include "harness.hpp" // `expect_true`
 
 namespace unum::ucall::test::io {
 

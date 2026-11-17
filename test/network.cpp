@@ -3,35 +3,45 @@
  *  @author Ash Vardanian
  *  @date October 19, 2026
  *  @brief The network suite's cell loop: every cell of the diagonal sweep runs every area's cases
- *      on its backend, under its CPU class and in its security mode, as one verdict line.
+ *      on its backend, under its CPU class and in its security mode, as one verdict line, and each
+ *      case that may skip as a verdict line of its own.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 #include "network.hpp"
 
 namespace unum::ucall::test::network {
 
-std::size_t check_network(settings_t const& settings) {
-    std::size_t failures_count = 0;
-    for (sweep_cell_t const& cell : diagonal_sweep(settings)) {
-        sz::string_t const name = formatted("network {}", name_of(cell));
-        if (!settings.filter.selects(name)) continue;
-        if (!opens(cell)) {
-            failures_count += report(name.c_str(), "this host lacks the engine or the class");
-            continue;
-        }
-        failures_count += report(name.c_str(), keeping_descriptors([&] {
-                                     std::size_t failures = check_exchanges(cell, settings);
-                                     failures += check_serving(cell, settings);
-                                     failures += check_loops(cell, settings);
+/** Why a cell skips when its backend or class does not initialize here. */
+static constexpr char const* cell_refused_k = "the backend or the CPU class is refused on this machine";
+
+void run_network_cases() {
+    for (sweep_cell_t const& cell : diagonal_sweep()) {
+        sz::string_t const label = cell_arguments(cell);
+        bool const opened = opens(cell);
+        run_test_case(called("test_network_cell", label).c_str(), [&] {
+            if (!opened) return case_result_t::skipped(cell_refused_k);
+            return keeping_descriptors([&] {
+                split_mix_generator_t generator {case_stream_key()};
+                test_exchanges_cell(cell, generator);
+                test_serving_cell(cell, generator);
+                test_loops_cell(cell, generator);
 #if UCALL_OS_POSIX_
-                                     failures += check_replies(cell, settings);
-                                     failures += check_client(cell, settings);
-                                     failures += check_resolving(cell, settings);
-                                     failures += check_metrics(cell, settings);
+                test_replies_cell(cell, generator);
+                test_client_cell(cell, generator);
+                test_resolving_cell(cell);
+                test_metrics_cell(cell);
 #endif
-                                     return failures;
-                                 }));
+            });
+        });
+        if (!opened) continue;
+        run_exchanges_cases(cell, label);
+        run_serving_cases(cell, label);
+        run_loops_cases(cell, label);
+#if UCALL_OS_POSIX_
+        run_replies_cases(cell, label);
+        run_resolving_cases(cell, label);
+#endif
     }
-    return failures_count;
 }
 
 } // namespace unum::ucall::test::network

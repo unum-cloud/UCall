@@ -11,6 +11,8 @@
  *  Checked against every kit compiled in and this machine runs, because a CPU class only ever
  *  exercises one, and against the radix-51 field on targets no kit picks it for.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include <cstdint> // `std::uint8_t`
 #include <cstring> // `std::memcpy`
 
@@ -93,12 +95,12 @@ struct decoded_vector_t {
     byte_t scalar[x25519_key_size_k] {};
     byte_t point[x25519_key_size_k] {};
 
-    /** Decodes @p vector, counting a malformed literal into @p failures. */
-    decoded_vector_t(x25519_vector_t const& vector, std::size_t& failures) {
-        failures += expect(from_hex(vector.scalar_hex, {scalar, scalar + x25519_key_size_k}),
-                           "{} has a bad scalar literal", vector.label);
-        failures += expect(from_hex(vector.point_hex, {point, point + x25519_key_size_k}), "{} has a bad point literal",
-                           vector.label);
+    /** Decodes @p vector, checking each literal is hex of the right length. */
+    decoded_vector_t(x25519_vector_t const& vector) {
+        expect_true(from_hex(vector.scalar_hex, {scalar, scalar + x25519_key_size_k}), "{} has a bad scalar literal",
+                    vector.label);
+        expect_true(from_hex(vector.point_hex, {point, point + x25519_key_size_k}), "{} has a bad point literal",
+                    vector.label);
     }
 };
 
@@ -159,8 +161,7 @@ static x25519_backend_t const& x25519_reference_k = x25519_backends_k[0];
 
 #pragma region Known Answers
 
-static std::size_t test_x25519() {
-    std::size_t failures = 0;
+static void test_x25519() {
 
     // RFC 7748 §5.2: k = u = 9, then k = X25519(k, u). The trip counts are the specification's
     // own, so they are fixed rather than scaled.
@@ -168,8 +169,8 @@ static std::size_t test_x25519() {
     scalar[0] = byte_t {9}, point[0] = byte_t {9};
 
     byte_t after_one[x25519_key_size_k];
-    failures += expect(x25519_multiply_serial(after_one, scalar, point));
-    failures += expect_hex(after_one, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
+    expect_true(x25519_multiply_serial(after_one, scalar, point));
+    expect_equal_bytes(after_one, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
 
     for (std::size_t iteration = 0; iteration != 1000; ++iteration) {
         byte_t next[x25519_key_size_k];
@@ -177,29 +178,28 @@ static std::size_t test_x25519() {
         std::memcpy(point, scalar, x25519_key_size_k);
         std::memcpy(scalar, next, x25519_key_size_k);
     }
-    failures += expect_hex(scalar, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
+    expect_equal_bytes(scalar, "684cf59ba83309552800ef566f2f4d3c1c3887c49360e3875f2eb94d99532c51");
 
     // RFC 7748 vector 1 and Wycheproof tcId=100 hold the same key, before and after clamping.
     byte_t raw_scalar[x25519_key_size_k], clamped_scalar[x25519_key_size_k], shared_point[x25519_key_size_k];
-    failures += expect(from_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
-                                {raw_scalar, raw_scalar + x25519_key_size_k}));
-    failures += expect(from_hex("a046e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449a44",
-                                {clamped_scalar, clamped_scalar + x25519_key_size_k}));
-    failures += expect(from_hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
-                                {shared_point, shared_point + x25519_key_size_k}));
+    expect_true(from_hex("a546e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449ac4",
+                         {raw_scalar, raw_scalar + x25519_key_size_k}));
+    expect_true(from_hex("a046e36bf0527c9d3b16154b82465edd62144c0ac1fc5a18506a2244ba449a44",
+                         {clamped_scalar, clamped_scalar + x25519_key_size_k}));
+    expect_true(from_hex("e6db6867583030db3594c1a424b15f7c726624ec26b3353b10a903a6d0ab1c4c",
+                         {shared_point, shared_point + x25519_key_size_k}));
 
     byte_t from_raw[x25519_key_size_k], from_clamped[x25519_key_size_k];
-    failures += expect(x25519_multiply_serial(from_raw, raw_scalar, shared_point));
-    failures += expect(x25519_multiply_serial(from_clamped, clamped_scalar, shared_point));
-    failures += expect_bytes(from_raw, from_clamped);
-    failures += expect_hex(from_raw, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
+    expect_true(x25519_multiply_serial(from_raw, raw_scalar, shared_point));
+    expect_true(x25519_multiply_serial(from_clamped, clamped_scalar, shared_point));
+    expect_equal_bytes(from_raw, from_clamped);
+    expect_equal_bytes(from_raw, "c3da55379de9c6908e94ea4df28d084f32eccf03491c71f754b4075577a28552");
 
     byte_t nine[x25519_key_size_k] {};
     nine[0] = byte_t {9};
     byte_t derived[x25519_key_size_k];
     x25519_derive_public<serial_x25519_kit_t>(derived, nine);
-    failures += expect_hex(derived, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
-    return failures;
+    expect_equal_bytes(derived, "422c8e7a6227d7bca1350b3e2bb7279f7897b87bb6854b783c60e80311ae3079");
 }
 
 #pragma endregion Known Answers
@@ -212,19 +212,18 @@ static std::size_t test_x25519() {
  *  The chain matters separately from the vectors: a carry bug a single multiplication hides
  *  compounds once each result feeds the next.
  */
-static std::size_t test_x25519_kits() {
-    std::size_t failures = 0;
+static void test_x25519_kits() {
 
     for (x25519_backend_t const& backend : x25519_backends_k) {
         if (!runnable_here(backend)) continue;
         for (x25519_vector_t const& vector : x25519_vectors_k) {
-            decoded_vector_t const decoded(vector, failures);
+            decoded_vector_t const decoded(vector);
             byte_t produced[x25519_key_size_k];
             shared_secret_t const answer = reported(
                 backend.multiply(std::span {produced}, std::span {decoded.scalar}, std::span {decoded.point}));
-            failures += expect(answer == vector.expected, "{} called {} a {} secret, expected {}", backend.name,
-                               vector.label, answer, vector.expected);
-            failures += expect_hex(produced, vector.shared_hex);
+            expect_true(answer == vector.expected, "{} called {} a {} secret, expected {}", backend.name, vector.label,
+                        answer, vector.expected);
+            expect_equal_bytes(produced, vector.shared_hex);
         }
     }
 
@@ -235,19 +234,18 @@ static std::size_t test_x25519_kits() {
 
         byte_t scalar[x25519_key_size_k] {}, point[x25519_key_size_k] {};
         scalar[0] = byte_t {9}, point[0] = byte_t {9};
-        for (std::size_t iteration = 0; iteration != scale_iterations(100); ++iteration) {
+        for (std::size_t iteration = 0; iteration != scaled_iterations(100); ++iteration) {
             byte_t expected[x25519_key_size_k], produced[x25519_key_size_k];
             [[maybe_unused]] bool const reference_usable = x25519_reference_k.multiply(
                 std::span {expected}, std::span {scalar}, std::span {point});
             [[maybe_unused]] bool const candidate_usable = backend.multiply(std::span {produced}, std::span {scalar},
                                                                             std::span {point});
-            failures += expect(bytes_equal(produced, expected), "{} left {} at iteration {}", backend.name,
-                               x25519_reference_k.name, iteration);
+            expect_true(bytes_equal(produced, expected), "{} left {} at iteration {}", backend.name,
+                        x25519_reference_k.name, iteration);
             std::memcpy(point, scalar, x25519_key_size_k);
             std::memcpy(scalar, expected, x25519_key_size_k);
         }
     }
-    return failures;
 }
 
 /** Whether this machine runs @p capability, as StringZilla detects it. */
@@ -266,11 +264,9 @@ static void fill_pattern(span<byte_t> bytes, std::uint64_t seed) noexcept {
 /** Digests the same messages, whole and split at a seed-chosen point, through @p kit_type_ and the
  *  serial kit, counting every digest that differs by a single bit. */
 template <typename kit_type_>
-static std::size_t sha256_kit_matches_serial(char const* name) {
-    if constexpr (!kit_type_::compiled_k) return 0;
-    else {
-        if (!runs_here(kit_type_::capability_k)) return 0;
-        std::size_t failures = 0;
+static void sha256_kit_matches_serial(char const* name) {
+    if constexpr (kit_type_::compiled_k) {
+        if (!runs_here(kit_type_::capability_k)) return;
         byte_t message[1031];
         for (std::size_t length : {0u, 1u, 55u, 56u, 63u, 64u, 65u, 127u, 128u, 1000u, 1031u}) {
             fill_pattern({message, length}, length);
@@ -286,20 +282,17 @@ static std::size_t sha256_kit_matches_serial(char const* name) {
             digest_through(serial_sha256_kit_t::init, serial_sha256_kit_t::update, serial_sha256_kit_t::digest, cut,
                            expected);
             digest_through(kit_type_::init, kit_type_::update, kit_type_::digest, cut, produced);
-            failures += expect(bytes_equal(produced, expected), "{} SHA-256 left serial at {} bytes", name, length);
+            expect_true(bytes_equal(produced, expected), "{} SHA-256 left serial at {} bytes", name, length);
         }
-        return failures;
     }
 }
 
 /** Seals the same messages through @p kit_type_ and the serial kit, counting every ciphertext or
  *  tag that differs by a single bit, and every seal the other kit cannot open. */
 template <typename kit_type_>
-static std::size_t aes256_gcm_kit_matches_serial(char const* name) {
-    if constexpr (!kit_type_::compiled_k) return 0;
-    else {
-        if (!runs_here(kit_type_::capability_k)) return 0;
-        std::size_t failures = 0;
+static void aes256_gcm_kit_matches_serial(char const* name) {
+    if constexpr (kit_type_::compiled_k) {
+        if (!runs_here(kit_type_::capability_k)) return;
         byte_t secret[32], nonce[12], associated[37], text[1031], expected[1031], produced[1031], opened[1031];
         byte_t expected_tag[16], produced_tag[16];
         for (std::size_t length : {0u, 1u, 15u, 16u, 17u, 64u, 255u, 1031u}) {
@@ -317,28 +310,24 @@ static std::size_t aes256_gcm_kit_matches_serial(char const* name) {
                                reinterpret_cast<sz_cptr_t>(associated), associated_length,
                                reinterpret_cast<sz_cptr_t>(text), length, reinterpret_cast<sz_ptr_t>(produced),
                                reinterpret_cast<sz_u8_t*>(produced_tag), nullptr);
-            failures += expect(
-                bytes_equal({produced, length}, {expected, length}) && bytes_equal(produced_tag, expected_tag),
-                "{} AES-256-GCM left serial at {} bytes", name, length);
+            expect_true(bytes_equal({produced, length}, {expected, length}) && bytes_equal(produced_tag, expected_tag),
+                        "{} AES-256-GCM left serial at {} bytes", name, length);
             sz_status_t const verdict = kit_type_::decrypt(
                 &kit_key, reinterpret_cast<sz_u8_t const*>(nonce), reinterpret_cast<sz_cptr_t>(associated),
                 associated_length, reinterpret_cast<sz_cptr_t>(expected), length, reinterpret_cast<sz_ptr_t>(opened),
                 reinterpret_cast<sz_u8_t const*>(expected_tag), nullptr);
-            failures += expect(verdict == sz_success_k && bytes_equal({opened, length}, {text, length}),
-                               "{} AES-256-GCM failed to open serial's seal at {} bytes", name, length);
+            expect_true(verdict == sz_success_k && bytes_equal({opened, length}, {text, length}),
+                        "{} AES-256-GCM failed to open serial's seal at {} bytes", name, length);
         }
-        return failures;
     }
 }
 
 /** Hashes the same texts through @p kit_type_ and the serial kit, counting every hash that differs,
  *  as route and header lookups must land in the same bucket whichever class built them. */
 template <typename kit_type_>
-static std::size_t hash_kit_matches_serial(char const* name) {
-    if constexpr (!kit_type_::compiled_k) return 0;
-    else {
-        if (!runs_here(kit_type_::capability_k)) return 0;
-        std::size_t failures = 0;
+static void hash_kit_matches_serial(char const* name) {
+    if constexpr (kit_type_::compiled_k) {
+        if (!runs_here(kit_type_::capability_k)) return;
         byte_t text[1031];
         for (std::size_t length : {0u, 1u, 15u, 16u, 17u, 31u, 32u, 33u, 63u, 64u, 65u, 255u, 1031u}) {
             fill_pattern({text, length}, length + 5);
@@ -347,58 +336,53 @@ static std::size_t hash_kit_matches_serial(char const* name) {
                 reinterpret_cast<sz_cptr_t>(text), length, length * 31, &expected, nullptr);
             [[maybe_unused]] sz_status_t const candidate = kit_type_::hash(reinterpret_cast<sz_cptr_t>(text), length,
                                                                            length * 31, &produced, nullptr);
-            failures += expect(produced == expected, "{} hash left serial at {} bytes", name, length);
+            expect_true(produced == expected, "{} hash left serial at {} bytes", name, length);
         }
-        return failures;
     }
 }
 
 /** Every SHA-256, AES-256-GCM and hash kit a CPU class may pick, against the serial floor bit for
  *  bit, since each class runs exactly one of them and must agree with a peer running any other. */
-static std::size_t test_cipher_kits() {
-    std::size_t failures = 0;
-    failures += sha256_kit_matches_serial<neonsha_sha256_kit_t>("neonsha");
-    failures += sha256_kit_matches_serial<goldmont_sha256_kit_t>("goldmont");
-    failures += sha256_kit_matches_serial<powervsx_sha256_kit_t>("powervsx");
-    failures += aes256_gcm_kit_matches_serial<icelake_aes256_gcm_kit_t>("icelake");
-    failures += aes256_gcm_kit_matches_serial<neonaes_aes256_gcm_kit_t>("neonaes");
-    failures += aes256_gcm_kit_matches_serial<westmere_aes256_gcm_kit_t>("westmere");
-    failures += aes256_gcm_kit_matches_serial<powervsx_aes256_gcm_kit_t>("powervsx");
-    failures += hash_kit_matches_serial<uc::http::icelake_hash_kit_t>("icelake");
-    failures += hash_kit_matches_serial<uc::http::skylake_hash_kit_t>("skylake");
-    failures += hash_kit_matches_serial<uc::http::neonaes_hash_kit_t>("neonaes");
-    failures += hash_kit_matches_serial<uc::http::powervsx_hash_kit_t>("powervsx");
-    failures += hash_kit_matches_serial<uc::http::rvv_hash_kit_t>("rvv");
-    failures += hash_kit_matches_serial<uc::http::westmere_hash_kit_t>("westmere");
-    return failures;
+static void test_cipher_kits() {
+    sha256_kit_matches_serial<neonsha_sha256_kit_t>("neonsha");
+    sha256_kit_matches_serial<goldmont_sha256_kit_t>("goldmont");
+    sha256_kit_matches_serial<powervsx_sha256_kit_t>("powervsx");
+    aes256_gcm_kit_matches_serial<icelake_aes256_gcm_kit_t>("icelake");
+    aes256_gcm_kit_matches_serial<neonaes_aes256_gcm_kit_t>("neonaes");
+    aes256_gcm_kit_matches_serial<westmere_aes256_gcm_kit_t>("westmere");
+    aes256_gcm_kit_matches_serial<powervsx_aes256_gcm_kit_t>("powervsx");
+    hash_kit_matches_serial<uc::http::icelake_hash_kit_t>("icelake");
+    hash_kit_matches_serial<uc::http::skylake_hash_kit_t>("skylake");
+    hash_kit_matches_serial<uc::http::neonaes_hash_kit_t>("neonaes");
+    hash_kit_matches_serial<uc::http::powervsx_hash_kit_t>("powervsx");
+    hash_kit_matches_serial<uc::http::rvv_hash_kit_t>("rvv");
+    hash_kit_matches_serial<uc::http::westmere_hash_kit_t>("westmere");
 }
 
 #pragma endregion Kit Differential
 
 #pragma region Primitives
 
-static std::size_t test_hmac() {
-    std::size_t failures = 0;
+static void test_hmac() {
     byte_t key_storage[131];
     byte_t data_storage[50];
     byte_t digest[crypto_t::hash_size_k];
 
     // RFC 4231 §4.2-§4.7, byte for byte: the named reproducer for `-fno-strict-aliasing`, so a
     // digest that drifts here is a miscompile rather than a redesign.
-    failures += expect_hex(
-        hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), byte_span("Hi There"), digest),
-        "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
+    expect_equal_bytes(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0x0b}), byte_span("Hi There"), digest),
+                       "b0344c61d8db38535ca8afceaf0bf12b881dc200c9833da726e9376c2e32cff7");
 
-    failures += expect_hex(hmac_of(byte_span("Jefe"), byte_span("what do ya want for nothing?"), digest),
-                           "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
+    expect_equal_bytes(hmac_of(byte_span("Jefe"), byte_span("what do ya want for nothing?"), digest),
+                       "5bdcc146bf60754e6a042426089575c75a003f089d2739839dec58b964ec3843");
 
-    failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0xaa}),
-                                   run_of({data_storage, data_storage + 50}, byte_t {0xdd}), digest),
-                           "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
+    expect_equal_bytes(hmac_of(run_of({key_storage, key_storage + 20}, byte_t {0xaa}),
+                               run_of({data_storage, data_storage + 50}, byte_t {0xdd}), digest),
+                       "773ea91e36800e46854db8ebd09181a72959098b3ef8c122d9635514ced565fe");
 
-    failures += expect_hex(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
-                                   byte_span("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
-                           "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
+    expect_equal_bytes(hmac_of(run_of({key_storage, key_storage + 131}, byte_t {0xaa}),
+                               byte_span("Test Using Larger Than Block-Size Key - Hash Key First"), digest),
+                       "60e431591ee0b67f0d8a26aacbf5b77f8e0bc6213728c5140546040f0ee37f54");
 
     span<byte_t const> const cached_key = run_of({key_storage, key_storage + 40}, byte_t {0x5a});
     crypto_t::hmac_sha256_t cached;
@@ -408,7 +392,7 @@ static std::size_t test_hmac() {
         byte_t reused[crypto_t::hash_size_k], fresh[crypto_t::hash_size_k];
         cached.compute(data, {}, reused);
         crypto_t::hmac_sha256(cached_key, data, fresh);
-        failures += expect_bytes(reused, fresh);
+        expect_equal_bytes(reused, fresh);
     }
 
     byte_t joined[17];
@@ -417,12 +401,10 @@ static std::size_t test_hmac() {
     split_hmac.reset(run_of({key_storage, key_storage + 32}, byte_t {0x0b}));
     byte_t split[crypto_t::hash_size_k];
     split_hmac.compute(byte_span("chaining"), byte_span("-material"), split);
-    failures += expect_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
-    return failures;
+    expect_equal_bytes(split, hmac_of(run_of({key_storage, key_storage + 32}, byte_t {0x0b}), joined, digest));
 }
 
-static std::size_t test_hkdf() {
-    std::size_t failures = 0;
+static void test_hkdf() {
     byte_t digest[crypto_t::hash_size_k];
     byte_t material_storage[22];
     span<byte_t const> const material = run_of({material_storage, material_storage + 22}, byte_t {0x0b});
@@ -431,8 +413,8 @@ static std::size_t test_hkdf() {
     byte_t const salt_storage[] = {byte_t {0x00}, byte_t {0x01}, byte_t {0x02}, byte_t {0x03}, byte_t {0x04},
                                    byte_t {0x05}, byte_t {0x06}, byte_t {0x07}, byte_t {0x08}, byte_t {0x09},
                                    byte_t {0x0a}, byte_t {0x0b}, byte_t {0x0c}};
-    failures += expect_hex(hmac_of(salt_storage, material, digest),
-                           "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
+    expect_equal_bytes(hmac_of(salt_storage, material, digest),
+                       "077709362c2e32df0ddc3f0dc47bba6390b6c73bb50f9c3122ec844ad7c2b3e5");
 
     // With an empty info string, RFC 5869's T(1) reduces to HMAC(PRK, 0x01).
     byte_t chaining_key[crypto_t::hash_size_k];
@@ -447,7 +429,7 @@ static std::size_t test_hkdf() {
     byte_t const one = byte_t {0x01};
     byte_t expected[crypto_t::hash_size_k];
     crypto_t::hmac_sha256(pseudo_random_key, {&one, &one + 1}, expected);
-    failures += expect_bytes(outputs[0], expected);
+    expect_equal_bytes(outputs[0], expected);
 
     byte_t empty_chaining_key[crypto_t::hash_size_k] {};
     byte_t chained[3][crypto_t::hash_size_k];
@@ -458,44 +440,40 @@ static std::size_t test_hkdf() {
     crypto_t::hmac_sha256_t chaining_hmac;
     chaining_hmac.reset(pseudo_random_key);
     chaining_hmac.compute(chained[0], {&two, &two + 1}, expected);
-    failures += expect_bytes(chained[1], expected);
-    failures += expect(!bytes_equal(chained[0], chained[1]));
+    expect_equal_bytes(chained[1], expected);
+    expect_true(!bytes_equal(chained[0], chained[1]));
 
     byte_t two_outputs[3][crypto_t::hash_size_k] {};
     byte_t three_outputs[3][crypto_t::hash_size_k] {};
     crypto_t::hkdf_sha256(empty_chaining_key, {}, 2, two_outputs);
     crypto_t::hkdf_sha256(empty_chaining_key, {}, 3, three_outputs);
-    failures += expect_bytes(two_outputs[0], three_outputs[0]);
-    failures += expect_bytes(two_outputs[1], three_outputs[1]);
-    failures += expect(all_zero(two_outputs[2]));
-    failures += expect(!all_zero(three_outputs[2]));
-    return failures;
+    expect_equal_bytes(two_outputs[0], three_outputs[0]);
+    expect_equal_bytes(two_outputs[1], three_outputs[1]);
+    expect_true(all_zero(two_outputs[2]));
+    expect_true(!all_zero(three_outputs[2]));
 }
 
-static std::size_t test_entropy() {
-    std::size_t failures = 0;
+static void test_entropy() {
     // Not a statistical test - proof the platform call is wired, since zeros here would silently
     // destroy every ephemeral key.
     byte_t first[32] {}, second[32] {};
-    failures += expect(crypto_t::secure_random_bytes(first) == secure_tunnel_fault_t::none_k);
-    failures += expect(crypto_t::secure_random_bytes(second) == secure_tunnel_fault_t::none_k);
-    failures += expect(!all_zero(first));
-    failures += expect(!bytes_equal(first, second));
-    return failures;
+    expect_true(crypto_t::secure_random_bytes(first) == secure_tunnel_fault_t::none_k);
+    expect_true(crypto_t::secure_random_bytes(second) == secure_tunnel_fault_t::none_k);
+    expect_true(!all_zero(first));
+    expect_true(!bytes_equal(first, second));
 }
 
 #pragma endregion Primitives
 
-std::size_t check_crypto(settings_t const& settings) {
-    if (!settings.filter.selects("tunnel crypto")) return 0;
-    std::size_t failures = 0;
-    failures += test_hmac();
-    failures += test_hkdf();
-    failures += test_entropy();
-    failures += test_x25519();
-    failures += test_x25519_kits();
-    failures += test_cipher_kits();
-    return report("tunnel crypto", failures);
+void run_crypto_cases() {
+    run_test_case("run_crypto_cases", [] {
+        test_hmac();
+        test_hkdf();
+        test_entropy();
+        test_x25519();
+        test_x25519_kits();
+        test_cipher_kits();
+    });
 }
 
 } // namespace unum::ucall::test::tunnel

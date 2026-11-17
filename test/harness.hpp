@@ -2,70 +2,88 @@
  *  @file test/harness.hpp
  *  @author Ash Vardanian
  *  @date August 9, 2026
- *  @brief Shared harness for the C++ test suites: counted checks, scaling, and byte diagnostics.
+ *  @brief Harness for the C++ test suites: the run, its checks, the sweep and byte diagnostics.
  *
- *  Every check answers its own failure count, a case adds them up and returns them, and each cell
- *  of a sweep prints one verdict line through @c report, which a failure follows with the command
- *  that reruns only that cell, under the same seed.
+ *  A failed check counts into @c test_run and lets the case go on, so one run lists every mismatch
+ *  it reaches. @c run_test_case diffs that count around each case and prints its verdict, which a
+ *  failure follows with the command that reruns only that case, under the same seed. Where the next
+ *  line would dereference what a check guarded, the case returns on the check's answer instead.
  *
- *  A failed @c expect lets the case go on. Where the next line would dereference what the check
- *  guarded, @c require returns from the case instead, with the failures counted so far.
+ *  @section harness_settings Settings
  *
- *  @section Environment Variables
+ *  Each reads <tt>UCALL_&lt;NAME&gt;</tt>, and a <tt>--name</tt> flag of the same name overrides it.
  *
- *  - <tt>UCALL_SEED</tt> : Seed for the deterministic generator, or <tt>random</tt>. Defaults to
- *    42, and is always printed at startup, so a run reproduces without being told.
- *  - <tt>UCALL_MULTIPLIER</tt> : Scales every sweep and iteration count. Defaults to 1.0. Use 0.1
- *    for a quick smoke run, 10 for a thorough one.
- *  - <tt>UCALL_FILTER</tt> : Cell names to run, as a regex or else a substring; unset runs
- *    everything, and a filter selecting nothing runs nothing and passes.
+ *  - <tt>UCALL_SEED</tt> : Seed every case's streams derive from, or <tt>random</tt>. Defaults to 42,
+ *    and is always printed at startup, so a run reproduces without being told.
+ *  - <tt>UCALL_SCALE</tt> : Scales every sweep and iteration count. Defaults to 1. Use 0.1 for a
+ *    quick run, 10 for a thorough one.
+ *  - <tt>UCALL_FILTER</tt> : Case labels to run, as a regex or else a substring; unset runs every
+ *    case, and a filter selecting none fails the run.
+ *  - <tt>UCALL_TRAP_ON_FAILURE</tt> : Traps on the first failed check, to stop there under a
+ *    debugger.
+ *  - <tt>UCALL_NO_SKIPS</tt> : Exits with 3 when any case skipped.
+ *  - <tt>UCALL_BACKEND</tt> : The one engine a sweep keeps; unset keeps every compiled one.
+ *  - <tt>UCALL_CPU_CLASS_CEILING</tt> : The one CPU class ceiling a sweep keeps; unset keeps every
+ *    class this machine runs.
+ *  - <tt>UCALL_TEST_DIRECT_DIRECTORY</tt> : Where cases reading files with @c O_DIRECT make their
+ *    directories; the working directory when unset, which CTest sets to the build tree.
  *
  *  @section Example Usage
  *
  *  @code{.sh}
  *  # Only the 6.18 ring's network cells, at a tenth of the usual depth.
- *  UCALL_FILTER='network linux-uring618' UCALL_MULTIPLIER=0.1 build_debug_siblings/ucall_test
+ *  UCALL_FILTER='^network\.linux_uring618\.' UCALL_SCALE=0.1 build_debug_siblings/ucall_test
  *
  *  # A thorough sweep, reproducible from a named seed.
- *  UCALL_SEED=12345 UCALL_MULTIPLIER=10 build_debug_siblings/ucall_test
+ *  build_debug_siblings/ucall_test --seed 12345 --scale 10
  *  @endcode
  */
 #pragma once
-#include <cerrno>  // `errno`, `EAGAIN`, `EINTR`
-#include <csignal> // `std::signal`, `std::raise`, `SIGABRT`, `SIGSEGV`
-#include <cstddef> // `std::size_t`
-#include <cstdint> // `std::uint64_t`
-#include <cstdio>  // `stderr`, `stdout`, `std::fflush`
-#include <cstdlib> // `std::abort`, `std::getenv`, `std::strtod`, `std::strtoull`
-#include <cstring> // `std::strstr`, `std::memcmp`
+#include <cerrno>    // `errno`, `EAGAIN`, `EINTR`
+#include <cinttypes> // `PRIu64`, `PRIuLEAST32`
+#include <cctype>    // `std::tolower`
+#include <cmath>     // `std::llround`, `std::isfinite`
+#include <csignal>   // `std::signal`, `std::raise`, `SIGABRT`, `SIGSEGV`, `SIGTRAP`
+#include <cstddef>   // `std::size_t`
+#include <cstdint>   // `std::uint64_t`, `std::uint_least32_t`
+#include <cstdio>    // `std::printf`, `std::fprintf`, `stderr`
+#include <cstdlib>   // `std::abort`, `std::exit`, `std::getenv`, `std::strtod`
+#include <cstring>   // `std::strcmp`, `std::strncmp`, `std::memcmp`
 
-#include <atomic>      // `std::atomic`
-#include <charconv>    // `std::from_chars`
-#include <chrono>      // `std::chrono::steady_clock`
-#include <filesystem>  // `std::filesystem::remove_all`
-#include <limits>      // `std::numeric_limits`
-#include <random>      // `std::uniform_random_bit_generator`
-#include <string>      // `std::string`
-#include <type_traits> // `std::true_type`, `std::is_invocable_v`
-#include <utility>     // `std::forward`, `std::exchange`
+#include <algorithm>       // `std::max`, `std::replace`
+#include <atomic>          // `std::atomic`
+#include <charconv>        // `std::from_chars`
+#include <chrono>          // `std::chrono::steady_clock`
+#include <filesystem>      // `std::filesystem::remove_all`
+#include <functional>      // `std::invoke`
+#include <limits>          // `std::numeric_limits`
+#include <optional>        // `std::optional`
+#include <random>          // `std::random_device`, `std::uniform_random_bit_generator`
+#include <regex>           // `std::regex`, `std::regex_search`
+#include <source_location> // `std::source_location`
+#include <string>          // `std::string`
+#include <string_view>     // `std::string_view`
+#include <system_error>    // `std::errc`
+#include <thread>          // `std::this_thread::yield`
+#include <type_traits>     // `std::true_type`, `std::invoke_result_t`, `std::type_identity_t`
+#include <utility>         // `std::forward`, `std::exchange`
 
 #include <fmt/base.h>   // `fmt::print`, `fmt::format_string`
-#include <fmt/color.h>  // `fmt::text_style`, `fmt::fg`, `fmt::emphasis`
 #include <fmt/format.h> // `fmt::formatter`, `fmt::format_to`
 
-#include <forkunion/types.hpp>         // `fu::split_mix`
+#include <forkunion/types.hpp>         // `fu::max_of`
 #include <stringzilla/stringzilla.hpp> // `sz::string_t`
 
 #include "ucall/ucall.h"             // `ucall_client_init`, `ucall_io_backend_name`
 #include "ucall/utilities/types.hpp" // `byte_t`, `span`
 
-#include "arguments.hpp" // `settings_t`, `read_settings`, `filter_t`
+#include "arguments.hpp" // `exit_stopped_k`, `parse_backend`, `parse_cpu_class`
 #include "lib.hpp"       // `cpu_classes_k`
 
 #if UCALL_OS_LINUX_ || UCALL_OS_APPLE_
-#include <unistd.h> // `isatty`, `STDERR_FILENO`
+#include <unistd.h> // `write`, `STDERR_FILENO`
 #endif
-#if UCALL_OS_LINUX_ && defined(__GLIBC__)
+#if (defined(__GLIBC__) || UCALL_OS_APPLE_) && __has_include(<execinfo.h>)
 #include <execinfo.h> // `backtrace`, `backtrace_symbols_fd`
 #endif
 #if UCALL_OS_POSIX_
@@ -96,14 +114,431 @@ struct fmt::formatter<sz::string_t> : fmt::formatter<std::string_view> {
 
 namespace unum::ucall::test {
 
-/** Scratch extent shared by buffer and record fixtures. */
-inline constexpr std::size_t fixture_buffer_bytes_k = 4096;
+using tools::exit_stopped_k;
 
-/** How long a check waits for what it expects to happen. A passing case never waits it out, so it
- *  bounds hangs rather than speed, and leaves room for sanitizers and emulated CPUs. */
+/** Stops in an attached debugger, or dumps core without one; SIGTRAP skips the crash handlers. */
+inline void trap_into_debugger() noexcept {
+#if UCALL_OS_WINDOWS_
+    __debugbreak();
+#else
+    std::raise(SIGTRAP);
+#endif
+}
+
+/** Names the fatal signal and the case in progress, then backtraces; defined after the run. */
+inline void install_test_signal_handlers() noexcept;
+
+/** What this build compiled and this machine runs, printed above the settings line. */
+struct machine_t {
+    char const* version = "";
+    st::vector<ucall_cpu_class_t> admitted_classes;
+    st::vector<ucall_io_backend_t> compiled_backends;
+};
+
+/** Probes the classes this machine admits and the engines this build compiled; defined later. */
+inline machine_t probe_machine() noexcept;
+
+/** Prints the version line, the classes admitted and the backends compiled. */
+inline void print(machine_t const& machine) noexcept;
+
+#pragma region Shared Settings
+
+/** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
+[[noreturn]] inline void exit_unparsed(char const* variable, char const* text, char const* expected) noexcept {
+    std::fprintf(stderr, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    std::exit(1);
+}
+
+/** The text of a setting: its @p flag when given, else its environment @p variable , else null. */
+inline char const* setting_text(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    for (int index = 1; index < argc; ++index) {
+        std::string_view const argument {argv[index]};
+        if (argument == flag)
+            return index + 1 < argc && std::strncmp(argv[index + 1], "--", 2) != 0 ? argv[index + 1] : "1";
+        if (argument.size() > flag.size() && argument.starts_with(flag) && argument[flag.size()] == '=')
+            return argv[index] + flag.size() + 1;
+    }
+    char const* text = std::getenv(variable);
+    return text && *text ? text : nullptr;
+}
+
+/** A switch, @p fallback when unset: 0, false, off and no turn it off, anything else on. */
+inline bool read_flag_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                              bool fallback = false) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    for (char const* off : {"0", "false", "off", "no"})
+        if (std::strcmp(text, off) == 0) return false;
+    return true;
+}
+
+/** A whole number, @p fallback when unset. */
+inline std::size_t read_count_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                                      std::size_t fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    std::string_view const spelled {text};
+    std::size_t count = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), count);
+    if (error != std::errc {} || end != spelled.data() + spelled.size())
+        exit_unparsed(variable, text, "a whole number");
+    return count;
+}
+
+/** A positive real, @p fallback when unset. */
+inline double read_real_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                                double fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    char* end = nullptr;
+    double const value = std::strtod(text, &end);
+    if (*end != '\0' || !(value > 0) || !std::isfinite(value))
+        exit_unparsed(variable, text, "a positive number like 0.1 or 10");
+    return value;
+}
+
+/** A positive duration such as 200ms, 10s or 2m, @p fallback when unset. */
+inline std::chrono::milliseconds read_duration_setting(int argc, char** argv, char const* variable,
+                                                       std::string_view flag,
+                                                       std::chrono::milliseconds fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    std::string_view const spelled {text};
+    std::uint32_t count = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), count);
+    std::string_view const unit = spelled.substr(static_cast<std::size_t>(end - spelled.data()));
+    if (error == std::errc {} && count != 0) {
+        if (unit == "ms") return std::chrono::milliseconds(count);
+        if (unit == "s") return std::chrono::seconds(count);
+        if (unit == "m") return std::chrono::minutes(count);
+    }
+    exit_unparsed(variable, text, "a duration like 200ms, 10s or 2m");
+}
+
+/** The run's seed: 42 when unset, drawn afresh for @c random , else any unsigned 64-bit value. */
+inline std::uint64_t read_seed_setting(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return 42;
+    std::string_view const spelled {text};
+    if (spelled == "random") {
+        std::random_device device;
+        return (static_cast<std::uint64_t>(device()) << 32) ^ device();
+    }
+    std::uint64_t seed = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), seed);
+    if (error != std::errc {} || end != spelled.data() + spelled.size())
+        exit_unparsed(variable, text, "an unsigned integer or random");
+    return seed;
+}
+
+/** Which labels a run selects: a regex search when the pattern compiles, else a substring. */
+struct filter_t {
+    std::string pattern;
+    std::optional<std::regex> regex;
+
+    bool selects(std::string_view label) const noexcept {
+        if (pattern.empty()) return true;
+        if (regex) return std::regex_search(label.begin(), label.end(), *regex);
+        return label.find(pattern) != std::string_view::npos;
+    }
+};
+
+/** The filter a setting spells, compiled once; empty, selecting everything, when unset. */
+inline filter_t read_filter_setting(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    filter_t filter;
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return filter;
+    filter.pattern = text;
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    try {
+        filter.regex.emplace(filter.pattern);
+    }
+    catch (std::regex_error const&) {
+    }
+#else
+    filter.regex.emplace(filter.pattern);
+#endif
+    return filter;
+}
+
+/** What every suite and bench reads before its own settings; @c program starts the rerun lines. */
+struct common_settings_t {
+    std::uint64_t seed = 42;
+    filter_t filter;
+    char const* program = "";
+};
+
+/** SplitMix64's finalizer, a bijection that spreads every input bit over all 64 output bits. */
+constexpr std::uint64_t split_mix_bits(std::uint64_t value) noexcept {
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+
+/** The @p index -th stream of the family @p name under @p seed , identical in every language. */
+constexpr std::uint64_t stream_key(std::uint64_t seed, std::string_view name, std::uint64_t index = 0) noexcept {
+    std::uint64_t hashed = 0xCBF29CE484222325ull;
+    for (char const character : name) hashed = (hashed ^ static_cast<std::uint8_t>(character)) * 0x100000001B3ull;
+    return split_mix_bits(split_mix_bits(seed ^ hashed) + index);
+}
+
+/**
+ *  @brief SplitMix64 over one 64-bit state, seeded by a @ref stream_key , bit-identical to the
+ *      JavaScript generator NumKong ships.
+ *
+ *  Distributions are not specified to draw the same sequence on every standard library, so a
+ *  failure would stop reproducing from its seed when the toolchain changed; @ref below is the
+ *  portable bounded draw.
+ */
+struct split_mix_generator_t {
+    using result_type = std::uint64_t;
+    std::uint64_t state = 0;
+
+    explicit split_mix_generator_t(std::uint64_t key) noexcept : state(key) {}
+    static constexpr result_type(min)() noexcept { return 0; }
+    static constexpr result_type(max)() noexcept { return ~result_type {0}; }
+    result_type operator()() noexcept { return split_mix_bits(state += 0x9E3779B97F4A7C15ull); }
+
+    /** A uniform draw below @p bound , zero for an empty bound, without the bias of a modulo. */
+    std::uint64_t below(std::uint64_t bound) noexcept {
+        if (bound == 0) return 0;
+        std::uint64_t const rejection_floor = (0u - bound) % bound;
+        std::uint64_t draw = (*this)();
+        while (draw < rejection_floor) draw = (*this)();
+        return draw % bound;
+    }
+};
+
+#pragma endregion Shared Settings
+
+/** What the suites read: the run's settings, then the engine and class a sweep keeps and where
+ *  unbuffered file cases make their directories. */
+struct test_settings_t : common_settings_t {
+    double scale = 1.0;
+    bool trap_on_failure = false;
+    bool refuse_skips = false;
+    ucall_io_backend_t backend = ucall_io_backend_automatic_k;
+    ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
+    char const* direct_directory = ".";
+};
+
+/** Reads every @c test_settings_t field, each from its flag or else its variable. */
+inline test_settings_t read_test_settings(int argc, char** argv) noexcept {
+    test_settings_t settings;
+    settings.seed = read_seed_setting(argc, argv, "UCALL_SEED", "--seed");
+    settings.filter = read_filter_setting(argc, argv, "UCALL_FILTER", "--filter");
+    settings.scale = read_real_setting(argc, argv, "UCALL_SCALE", "--scale", 1.0);
+    settings.trap_on_failure = read_flag_setting(argc, argv, "UCALL_TRAP_ON_FAILURE", "--trap-on-failure");
+    settings.refuse_skips = read_flag_setting(argc, argv, "UCALL_NO_SKIPS", "--no-skips");
+    settings.program = argc != 0 ? argv[0] : "";
+    if (char const* text = setting_text(argc, argv, "UCALL_BACKEND", "--backend");
+        text && !tools::parse_backend(text, settings.backend))
+        exit_unparsed("UCALL_BACKEND", text, "an engine name such as posix or linux-uring618");
+    if (char const* text = setting_text(argc, argv, "UCALL_CPU_CLASS_CEILING", "--cpu-class-ceiling");
+        text && !tools::parse_cpu_class(text, settings.cpu_class_ceiling))
+        exit_unparsed("UCALL_CPU_CLASS_CEILING", text, "a CPU class name such as serial or aws-g2");
+    if (char const* text = setting_text(argc, argv, "UCALL_TEST_DIRECT_DIRECTORY", "--test-direct-directory"))
+        settings.direct_directory = text;
+    return settings;
+}
+
+#pragma region Shared Run
+
+/** What a case reports beyond its checks: that it ran, or why it skipped. */
+struct case_result_t {
+    char const* skip_reason = nullptr;
+
+    [[nodiscard]] static constexpr case_result_t skipped(char const* reason) noexcept { return {reason}; }
+};
+
+/**
+ *  @brief The run in progress: the harness's one sanctioned mutable global.
+ *
+ *  Checks fire on worker threads and inside helpers as well as in a case's own body, so the run
+ *  counts failed checks in one place and @ref run_test_case diffs that count around each case,
+ *  rather than threading a tally through every call. After a crash, printing @c test_run from a
+ *  core dump names the case in progress and the last failed check, and the signal handlers print
+ *  the case too.
+ */
+struct test_run_t {
+    test_settings_t settings {};
+    char const* current_case = nullptr;
+    std::atomic<std::size_t> failed_checks {0};
+    std::atomic<char const*> last_failed_file {nullptr};
+    std::atomic<std::uint_least32_t> last_failed_line {0};
+    std::size_t passed_cases = 0;
+    std::size_t failed_cases = 0;
+    std::size_t skipped_cases = 0;
+};
+
+inline test_run_t test_run;
+
+/** How long any wait in a test may take; a passing case never waits it out, so it bounds hangs. */
 inline constexpr std::chrono::seconds wait_limit_k {120};
 
+/** Yields until @p predicate holds; false when @ref wait_limit_k passed first. */
+template <typename predicate_type_>
+bool spin_until(predicate_type_&& predicate) noexcept {
+    auto const deadline = std::chrono::steady_clock::now() + wait_limit_k;
+    while (!predicate()) {
+        if (std::chrono::steady_clock::now() > deadline) return false;
+        std::this_thread::yield();
+    }
+    return true;
+}
+
+/** @p baseline iterations under the @c SCALE setting, never fewer than one. */
+inline std::size_t scaled_iterations(std::size_t baseline) noexcept {
+    double const scaled = static_cast<double>(baseline) * test_run.settings.scale;
+    return scaled < 1 ? 1 : static_cast<std::size_t>(std::llround(scaled));
+}
+
+/** The step that visits a @p coverage fraction of a sweep, at least one. */
+inline std::size_t sweep_stride(double coverage) noexcept {
+    double const stride = 1.0 / coverage;
+    return stride < 1 ? 1 : static_cast<std::size_t>(std::llround(stride));
+}
+
+/** The @p index -th stream of the case in progress, so a filtered run draws what a full one did. */
+inline std::uint64_t case_stream_key(std::uint64_t index = 0) noexcept {
+    return stream_key(test_run.settings.seed, test_run.current_case ? test_run.current_case : "", index);
+}
+
+/** Line-buffers stdout, prints the machine, reads the settings, arms the crash handlers and
+ *  prints the settings line, before the first case. */
+inline void start_test_run(int argc, char** argv) noexcept {
+    std::setvbuf(stdout, nullptr, _IOLBF, BUFSIZ); // before any output, or the C library keeps its buffering
+    print(probe_machine());
+    test_run.settings = read_test_settings(argc, argv);
+    install_test_signal_handlers();
+    std::printf("- Seed: %" PRIu64 ", scale: %g, filter: %s\n", test_run.settings.seed, test_run.settings.scale,
+                test_run.settings.filter.pattern.empty() ? "none" : test_run.settings.filter.pattern.c_str());
+}
+
+/** Counts one failed check at @p where , and traps when the run asked to stop at the first. */
+inline void record_failed_check(std::source_location where) noexcept {
+    std::fflush(stdout); // so a log that merges both streams keeps the failure under its case
+    std::fprintf(stderr, "  check failed at %s:%" PRIuLEAST32 "\n", where.file_name(), where.line());
+    test_run.last_failed_file.store(where.file_name(), std::memory_order_relaxed);
+    test_run.last_failed_line.store(where.line(), std::memory_order_relaxed);
+    test_run.failed_checks.fetch_add(1, std::memory_order_relaxed);
+    if (test_run.settings.trap_on_failure) trap_into_debugger();
+}
+
+/** Holds when @p is_met does; otherwise counts a failed check at the caller's line. */
+inline bool expect_true(bool is_met, std::source_location where = std::source_location::current()) noexcept {
+    if (!is_met) record_failed_check(where);
+    return is_met;
+}
+
+/** Prints one case's verdict, and the line that reruns it alone when it failed. */
+inline void report_test_case(char const* label, std::size_t failed_checks, char const* skip_reason,
+                             double seconds) noexcept {
+    if (skip_reason) {
+        std::printf("- %s ... skipped: %s\n", label, skip_reason);
+        return;
+    }
+    if (failed_checks == 0) {
+        std::printf("- %s ... ok (%.2f s)\n", label, seconds);
+        return;
+    }
+    std::fflush(stdout);
+    std::fprintf(stderr, "- %s ... FAILED: %zu failed check(s)\n", label, failed_checks);
+    std::fprintf(stderr, "  rerun: %s --seed %" PRIu64 " --filter '^", test_run.settings.program,
+                 test_run.settings.seed);
+    for (char const* character = label; *character; ++character) {
+        if (std::strchr("\\^$.|?*+()[]{}", *character)) std::fputc('\\', stderr); // labels are code, the filter a regex
+        std::fputc(*character, stderr);
+    }
+    std::fputs("$'\n", stderr);
+}
+
+/** Runs one case unless the filter leaves it out, and records whether it passed or skipped. */
+template <typename case_function_type_, typename... argument_types_>
+void run_test_case(char const* label, case_function_type_&& case_function, argument_types_&&... arguments) noexcept {
+    if (!test_run.settings.filter.selects(label)) return;
+    test_run.current_case = label;
+    std::size_t const failed_before = test_run.failed_checks.load();
+    auto const started = std::chrono::steady_clock::now();
+    case_result_t result {};
+    using returned_type = std::invoke_result_t<case_function_type_, argument_types_...>;
+    if constexpr (std::is_void_v<returned_type>)
+        std::invoke(case_function, std::forward<argument_types_>(arguments)...);
+    else result = std::invoke(case_function, std::forward<argument_types_>(arguments)...);
+    std::chrono::duration<double> const elapsed = std::chrono::steady_clock::now() - started;
+    std::size_t const failed_checks = test_run.failed_checks.load() - failed_before;
+    if (result.skip_reason) ++test_run.skipped_cases;
+    else if (failed_checks != 0) ++test_run.failed_cases;
+    else ++test_run.passed_cases;
+    report_test_case(label, failed_checks, result.skip_reason, elapsed.count());
+    test_run.current_case = nullptr;
+}
+
+/** The exit code: 1 when a case or a check outside any case failed, or nothing ran; 3 when
+ *  skips are refused and one happened; else 0. */
+inline int finish_test_run() noexcept {
+    std::printf("%zu passed, %zu failed, %zu skipped, seed %" PRIu64 "\n", test_run.passed_cases, test_run.failed_cases,
+                test_run.skipped_cases, test_run.settings.seed);
+    bool const failed = test_run.failed_cases != 0 || test_run.failed_checks.load() != 0;
+    if (failed || test_run.passed_cases + test_run.skipped_cases == 0) return 1;
+    if (test_run.skipped_cases != 0 && test_run.settings.refuse_skips) return 3;
+    return 0;
+}
+
+#pragma endregion Shared Run
+
+#pragma region Crash Localization
+
+/**
+ *  @brief Names the signal and the case in progress, prints a backtrace, then re-raises the signal,
+ *      so a crash self-localizes rather than dying silently under CI's output redirection.
+ *
+ *  Writes through a raw @c write, since the crashing thread may already hold the stdio lock that
+ *  @c std::fprintf takes.
+ */
+inline void test_fatal_signal_handler(int signal_number) noexcept {
+    auto const write_text = [](std::string_view text) noexcept {
+#if UCALL_OS_POSIX_
+        [[maybe_unused]] auto const written = ::write(STDERR_FILENO, text.data(), text.size());
+#else
+        std::fwrite(text.data(), 1, text.size(), stderr);
+#endif
+    };
+    std::string_view signal_name = "SIGSEGV";
+    if (signal_number == SIGABRT) signal_name = "SIGABRT";
+    else if (signal_number == SIGILL) signal_name = "SIGILL";
+    else if (signal_number == SIGFPE) signal_name = "SIGFPE";
+#if defined(SIGBUS)
+    else if (signal_number == SIGBUS) signal_name = "SIGBUS";
+#endif
+    write_text("\n*** ");
+    write_text(signal_name);
+    write_text(" in case '");
+    write_text(test_run.current_case ? test_run.current_case : "none");
+    write_text("' - backtrace follows ***\n");
+#if (defined(__GLIBC__) || UCALL_OS_APPLE_) && __has_include(<execinfo.h>)
+    void* frames[64];
+    int const frames_count = backtrace(frames, sizeof(frames) / sizeof(frames[0]));
+    // The `_fd` form writes without allocating, which is what makes it usable from a handler.
+    backtrace_symbols_fd(frames, frames_count, STDERR_FILENO);
+#endif
+    std::signal(signal_number, SIG_DFL);
+    std::raise(signal_number);
+}
+
+inline void install_test_signal_handlers() noexcept {
+    for (int signal_number : {SIGSEGV, SIGABRT, SIGILL, SIGFPE}) std::signal(signal_number, test_fatal_signal_handler);
+#if defined(SIGBUS)
+    std::signal(SIGBUS, test_fatal_signal_handler);
+#endif
+}
+
+#pragma endregion Crash Localization
+
 #pragma region Byte Ranges
+
+/** Scratch extent shared by buffer and record fixtures. */
+inline constexpr std::size_t fixture_buffer_bytes_k = 4096;
 
 /** Fills a range with one repeated value, keeping its pointer and length together. */
 inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
@@ -202,152 +637,89 @@ inline void print_hex_(span<byte_t const> bytes, std::size_t limit = 32) {
 
 #pragma endregion Byte Ranges
 
-#pragma region Diagnostics
+#pragma region Checks
 
-/** Whether diagnostics may use colour: only when standard error is a terminal. */
-[[nodiscard]] inline bool diagnostics_are_styled_() noexcept {
-#if UCALL_OS_LINUX_ || UCALL_OS_APPLE_
-    static bool const styled = isatty(STDERR_FILENO) != 0;
-    return styled;
-#else
-    return false;
-#endif
-}
+/**
+ *  @brief A format string bundled with the @c std::source_location of the call that spelled it.
+ *
+ *  The implicit conversion from a string literal captures the caller's line behind the variadic
+ *  arguments of a check's context, where a defaulted trailing parameter cannot go, and checks the
+ *  pattern against those arguments at compile time, as @c fmt::format_string does.
+ */
+template <typename... args_types_>
+struct format_at {
+    fmt::format_string<args_types_...> format;
+    std::source_location location;
 
-[[nodiscard]] inline fmt::text_style failure_style_() {
-    return diagnostics_are_styled_() ? fmt::fg(fmt::color::crimson) | fmt::emphasis::bold : fmt::text_style {};
-}
+    template <typename text_type_>
+    consteval format_at(text_type_ const& text,
+                        std::source_location location = std::source_location::current()) noexcept
+        : format(text), location(location) {}
+};
 
-[[nodiscard]] inline fmt::text_style detail_style_() {
-    return diagnostics_are_styled_() ? fmt::fg(fmt::color::dim_gray) : fmt::text_style {};
-}
-
-/** Prints the header line every failed check shares, before any context the caller adds. */
-inline void report_failure(char const* expression, char const* file, int line) {
-    fmt::print(stderr, failure_style_(), "Test verification failed: {}, {}:{}\n", expression, file, line);
-}
-
-/** Backs @c expect: counts one failure when @p holds is false, printing it with its location. */
-[[nodiscard]] inline std::size_t expect_(bool holds, char const* expression, char const* file, int line) {
-    if (holds) return 0;
-    report_failure(expression, file, line);
-    return 1;
-}
-
-/** Backs @c expect with context: counts like the plain overload, then prints the context. */
-template <typename... argument_types_>
-[[nodiscard]] std::size_t expect_(bool holds, char const* expression, char const* file, int line,
-                                  fmt::format_string<argument_types_...> format, argument_types_&&... arguments) {
-    if (holds) return 0;
-    report_failure(expression, file, line);
-    fmt::print(stderr, "  ");
-    fmt::print(stderr, format, std::forward<argument_types_>(arguments)...);
+/** Prints @p context formatted with @p args , indented under a failed check's location line. */
+template <typename... args_types_>
+void print_context_(format_at<std::type_identity_t<args_types_>...> context, args_types_ const&... args) noexcept {
+    fmt::print(stderr, "    ");
+    fmt::vprint(stderr, context.format.get(), fmt::make_format_args(args...));
     fmt::print(stderr, "\n");
-    return 1;
 }
 
-/** Backs @c expect_bytes: reports a mismatch and counts it as one failure. */
-[[nodiscard]] inline std::size_t expect_bytes_(span<byte_t const> actual, span<byte_t const> expected,
-                                               char const* actual_text, char const* expected_text, char const* file,
-                                               int line) {
-    if (bytes_equal(actual, expected)) return 0;
+/** Holds when @p held does; otherwise counts a failed check at the caller's line and prints
+ *  @p context formatted with @p args beneath it. */
+template <typename... args_types_>
+bool expect_true(bool is_met, format_at<std::type_identity_t<args_types_>...> context,
+                 args_types_ const&... args) noexcept {
+    if (is_met) return true;
+    record_failed_check(context.location);
+    print_context_<args_types_...>(context, args...);
+    return false;
+}
 
-    fmt::print(stderr, failure_style_(), "Test verification failed: bytes differ, {}:{}\n", file, line);
-    fmt::print(stderr, detail_style_(), "  actual   `{}` holds {} bytes\n", actual_text, actual.size());
-    fmt::print(stderr, detail_style_(), "  expected `{}` holds {} bytes\n", expected_text, expected.size());
-
-    std::size_t const shared = actual.size() < expected.size() ? actual.size() : expected.size();
+/** Holds when two byte ranges match; otherwise counts a failed check at the caller's line and
+ *  prints the first differing offset, with a window of both in hex from a little before it. */
+inline bool expect_equal_bytes(span<byte_t const> actual, span<byte_t const> wanted,
+                               std::source_location where = std::source_location::current()) noexcept {
+    if (bytes_equal(actual, wanted)) return true;
+    record_failed_check(where);
+    fmt::print(stderr, "    expected {} bytes, got {}\n", wanted.size(), actual.size());
+    std::size_t const shared = actual.size() < wanted.size() ? actual.size() : wanted.size();
     std::size_t offset = 0;
-    while (offset != shared && actual[offset] == expected[offset]) ++offset;
+    while (offset != shared && actual[offset] == wanted[offset]) ++offset;
     if (offset != shared)
-        fmt::print(stderr, "  first difference at offset {}: {:#04x} against {:#04x}\n", offset,
-                   static_cast<unsigned>(actual[offset]), static_cast<unsigned>(expected[offset]));
-    else fmt::print(stderr, "  the shorter range is a prefix of the longer one\n");
-
-    // A window anchored a little before the difference, so its neighbours are visible too.
+        fmt::print(stderr, "    first difference at offset {}: expected {:#04x}, got {:#04x}\n", offset,
+                   static_cast<unsigned>(wanted[offset]), static_cast<unsigned>(actual[offset]));
+    else fmt::print(stderr, "    the shorter range is a prefix of the longer one\n");
     std::size_t const start = offset > 8 ? offset - 8 : 0;
     auto from_start = [start](span<byte_t const> side) {
         return side.size() > start ? span<byte_t const> {side.data() + start, side.data() + side.size()}
                                    : span<byte_t const> {};
     };
-    fmt::print(stderr, "  actual   from {}: ", start);
+    fmt::print(stderr, "    expected from {}: ", start);
+    print_hex_(from_start(wanted));
+    fmt::print(stderr, "\n    got from {}:      ", start);
     print_hex_(from_start(actual));
-    fmt::print(stderr, "\n  expected from {}: ", start);
-    print_hex_(from_start(expected));
     fmt::print(stderr, "\n");
-    return 1;
+    return false;
 }
 
-/** Backs @c expect_hex: reports a mismatch against the literal and counts it as one failure. */
-[[nodiscard]] inline std::size_t expect_hex_(span<byte_t const> actual, char const* expected_hex,
-                                             char const* actual_text, char const* file, int line) {
-    hex_match_t const answer = bytes_match_hex_(actual, expected_hex);
-    if (answer == hex_match_t::matched_k) return 0;
-
-    fmt::print(stderr, failure_style_(), "Test verification failed: {}, {}:{}\n",
-               answer == hex_match_t::malformed_literal_k ? "the hex literal is malformed" : "bytes do not match hex",
-               file, line);
-    fmt::print(stderr, detail_style_(), "  actual   `{}` holds {} bytes\n", actual_text, actual.size());
-    fmt::print(stderr, "  actual   ");
+/** The same against bytes @p wanted_hex spells in hex, as published vectors do, without decoding
+ *  them into a buffer first; a malformed literal fails the check too. */
+inline bool expect_equal_bytes(span<byte_t const> actual, char const* wanted_hex,
+                               std::source_location where = std::source_location::current()) noexcept {
+    hex_match_t const answer = bytes_match_hex_(actual, wanted_hex);
+    if (answer == hex_match_t::matched_k) return true;
+    record_failed_check(where);
+    if (answer == hex_match_t::malformed_literal_k)
+        fmt::print(stderr, "    the hex literal is malformed for {} bytes\n", actual.size());
+    fmt::print(stderr, "    expected {}\n    got      ", wanted_hex);
     print_hex_(actual, 64);
-    fmt::print(stderr, "\n  expected {}\n", expected_hex);
-    return 1;
+    fmt::print(stderr, "\n");
+    return false;
 }
-
-#pragma endregion Diagnostics
-
-#pragma region Environment
-
-/**
- *  @brief A counter over ForkUnion's SplitMix64 avalanche, modelling
- *      @c std::uniform_random_bit_generator.
- *
- *  Deliberately independent of the library's own entropy, so a bug in @c secure_random_bytes can
- *  never shape the inputs the tests run against.
- *
- *  Satisfying the concept is what lets @c std::shuffle and @c std::sample take it. Do not reach for
- *  @c std::uniform_int_distribution with it: distributions are not specified to yield the same
- *  sequence across standard libraries, so a failure would stop reproducing from @c UCALL_SEED the
- *  moment the toolchain changed. That is what @c below is for.
- */
-struct random_generator_t {
-    using result_type = std::uint64_t;
-
-    /** The next draw's input, starting at the seed. */
-    result_type counter {};
-
-    explicit random_generator_t(result_type seed) noexcept : counter(seed) {}
-
-    [[nodiscard]] static constexpr result_type(min)() noexcept { return 0; }
-    [[nodiscard]] static constexpr result_type(max)() noexcept { return ~result_type {0}; }
-
-    [[nodiscard]] result_type operator()() noexcept { return fu::split_mix(counter++); }
-
-    /**
-     *  @brief The next value in `[0, bound)`, or zero when the bound is empty.
-     *
-     *  Rejects the tail that `%` alone would make likelier, which costs an almost-never-taken
-     *  branch and buys a draw that is uniform and identical on every standard library.
-     */
-    [[nodiscard]] std::size_t below(std::size_t bound) noexcept {
-        if (!bound) return 0;
-        result_type const rejection_floor = (0u - static_cast<result_type>(bound)) % bound;
-        result_type draw = (*this)();
-        while (draw < rejection_floor) draw = (*this)();
-        return static_cast<std::size_t>(draw % bound);
-    }
-};
-
-static_assert(std::uniform_random_bit_generator<random_generator_t>,
-              "the generator must be usable with `std::shuffle` and friends");
-
-using tools::exit_stopped_k;
-using tools::filter_t;
-using tools::read_settings;
-using tools::settings_t;
 
 /** @p text with up to three seeded edits: a byte replaced, inserted, erased or a run repeated. */
-inline std::string mutate(std::string text, random_generator_t& generator) {
+inline std::string mutate(std::string text, split_mix_generator_t& generator) {
     static constexpr std::string_view alphabet_k = "\r\n:;0123456789abcdefABCDEF -\t\x00\x7f\xff";
     for (std::size_t edits = generator.below(4); edits; --edits) {
         std::size_t const at = generator.below(text.size() + 1);
@@ -365,86 +737,50 @@ inline std::string mutate(std::string text, random_generator_t& generator) {
     return text;
 }
 
-/** The settings @c main read once, which the scaled loops and the rerun hints consult. */
-inline settings_t test_settings;
-
-[[nodiscard]] inline std::uint64_t settings_seed() noexcept { return test_settings.seed; }
-
-/** A generator seed from the run's and a cell's @p name, so a filtered run reproduces an unfiltered
- *  one. */
-[[nodiscard]] inline std::uint64_t stream_key(std::uint64_t seed, std::string_view name) noexcept {
-    std::uint64_t hashed = 0xCBF29CE484222325ull;
-    for (char const character : name) {
-        hashed ^= static_cast<std::uint64_t>(static_cast<unsigned char>(character));
-        hashed *= 0x100000001B3ull;
-    }
-    return seed ^ hashed;
-}
-
-/**
- *  @brief Scales a baseline iteration count by the run's multiplier, never below one.
- *
- *  Wrapping every hardcoded trip count is what makes depth an environment variable, not an edit.
- */
-[[nodiscard]] inline std::size_t scale_iterations(std::size_t baseline) noexcept {
-    double const scaled = static_cast<double>(baseline) * test_settings.multiplier;
-    return scaled < 1.0 ? 1u : static_cast<std::size_t>(scaled);
-}
-
-/**
- *  @brief Step for walking an exhaustive space, so the multiplier dials sweeps as well as loops.
- *
- *  Striding rather than truncating keeps the far end reachable at a low multiplier, which matters
- *  where the interesting offsets sit at the end of a record. Complete at the ten-times point.
- */
-[[nodiscard]] inline std::size_t sweep_stride(std::size_t complete) noexcept {
-    double const coverage = test_settings.multiplier / 10.0;
-    if (coverage >= 1.0 || complete == 0) return 1;
-    std::size_t const stride = static_cast<std::size_t>(1.0 / coverage);
-    return stride ? stride : 1;
-}
-
-#pragma endregion Environment
+#pragma endregion Checks
 
 #pragma region Allocators
 
 /** What a @c counting_allocator saw, and the attempt from which it refuses. */
-struct allocation_counts_t {
-    std::atomic<std::size_t> attempts {}, allocations {}, deallocations {}, bytes {};
+struct allocation_ledger_t {
+    std::atomic<std::size_t> allocations {}, deallocations {}, live_bytes {}, refusals {};
 
     /** Every attempt from this one onward fails, so a case can starve setup at any step. */
-    std::atomic<std::size_t> fail_from {(std::numeric_limits<std::size_t>::max)()};
+    std::atomic<std::size_t> refuse_from {(std::numeric_limits<std::size_t>::max)()};
 
     [[nodiscard]] std::size_t live() const noexcept { return allocations - deallocations; }
 };
 
-/** Counts every allocation through @c allocation_counts_t, and fails them on request. */
+/** Counts every allocation into an @c allocation_ledger_t, and refuses them on request. */
 template <typename value_type_>
 struct counting_allocator {
     using value_type = value_type_;
     using propagate_on_container_move_assignment = std::true_type;
-    allocation_counts_t* counts {};
+    allocation_ledger_t* ledger {};
     counting_allocator() noexcept = default;
-    explicit counting_allocator(allocation_counts_t& state) noexcept : counts(&state) {}
+    explicit counting_allocator(allocation_ledger_t& state) noexcept : ledger(&state) {}
     template <typename other_type_>
-    counting_allocator(counting_allocator<other_type_> const& other) noexcept : counts(other.counts) {}
+    counting_allocator(counting_allocator<other_type_> const& other) noexcept : ledger(other.ledger) {}
     value_type_* allocate(std::size_t count) noexcept {
-        if (counts->attempts++ >= counts->fail_from) return nullptr;
+        if (ledger->allocations + ledger->refusals >= ledger->refuse_from) {
+            ++ledger->refusals;
+            return nullptr;
+        }
         value_type_* const result = st::default_allocator<value_type_> {}.allocate(count);
         if (result) {
-            ++counts->allocations;
-            counts->bytes += count * sizeof(value_type_);
+            ++ledger->allocations;
+            ledger->live_bytes += count * sizeof(value_type_);
         }
         return result;
     }
     void deallocate(value_type_* pointer, std::size_t count) noexcept {
-        ++counts->deallocations;
-        counts->bytes -= count * sizeof(value_type_);
+        ++ledger->deallocations;
+        ledger->live_bytes -= count * sizeof(value_type_);
         st::default_allocator<value_type_> {}.deallocate(pointer, count);
     }
     template <typename other_type_>
     bool operator==(counting_allocator<other_type_> const& other) const noexcept {
-        return counts == other.counts;
+        return ledger == other.ledger;
     }
 };
 
@@ -460,16 +796,16 @@ struct counting_allocator {
     return count;
 }
 
-/** The failures @p case_function answers, plus one when it left a descriptor open or closed one it
- *  found. */
+/** What @p case_function answers, checking it left every descriptor as it found them. */
 template <typename case_type_>
-[[nodiscard]] std::size_t keeping_descriptors(case_type_ case_function) {
+case_result_t keeping_descriptors(case_type_&& case_function) {
     std::size_t const before = open_descriptors();
-    std::size_t failures = case_function();
+    case_result_t result {};
+    if constexpr (std::is_void_v<std::invoke_result_t<case_type_>>) case_function();
+    else result = case_function();
     std::size_t const after = open_descriptors();
-    failures += expect_(after == before, "after == before", __FILE__, __LINE__,
-                        "{} descriptors open before the case, {} after", before, after);
-    return failures;
+    expect_true(after == before, "{} descriptors open before the case, {} after", before, after);
+    return result;
 }
 
 /** A fresh directory under `/tmp` for cases that read files, removed with everything in it. */
@@ -500,8 +836,8 @@ struct scratch_directory_t {
 };
 
 /** A fresh directory whose filesystem serves unbuffered reads, for cases that read files with
- *  `O_DIRECT`: under `$UCALL_TEST_DIRECT_DIRECTORY`, else the working directory, which CTest sets
- *  to the build tree, since `/tmp` is often tmpfs. It probes with one aligned read, and @c reason
+ *  @c O_DIRECT: under @c UCALL_TEST_DIRECT_DIRECTORY, else the working directory, which CTest sets
+ *  to the build tree, since @c /tmp is often tmpfs. It probes with one aligned read, and @c reason
  *  says why a filesystem cannot serve, naming the path and the filesystem. */
 struct direct_directory_t {
     std::string path;
@@ -510,8 +846,7 @@ struct direct_directory_t {
     std::uint32_t alignment = 0;
 
     direct_directory_t() {
-        char const* base = std::getenv("UCALL_TEST_DIRECT_DIRECTORY");
-        std::string pattern = fmt::format("{}/ucall-direct-XXXXXX", base && *base ? base : ".");
+        std::string pattern = fmt::format("{}/ucall-direct-XXXXXX", test_run.settings.direct_directory);
         if (!mkdtemp(pattern.data())) {
             reason = fmt::format("no directory could be made as {}", pattern);
             return;
@@ -530,6 +865,15 @@ struct direct_directory_t {
 
     [[nodiscard]] bool ready() const noexcept { return reason.empty(); }
     [[nodiscard]] std::string name(std::string_view relative) const { return fmt::format("{}/{}", path, relative); }
+
+    /** Why a case needing this directory skips, kept past the case so its verdict can print it, or
+     *  null once the directory serves. */
+    [[nodiscard]] char const* unusable() const {
+        if (ready()) return nullptr;
+        static std::string kept;
+        kept = fmt::format("needs a directory serving O_DIRECT, as {}", reason);
+        return kept.c_str();
+    }
 
     /** Writes @p content to the file @p relative names, answering whether all of it landed. */
     [[nodiscard]] bool write(std::string_view relative, std::string_view content) const {
@@ -602,8 +946,11 @@ struct aligned_bytes_t {
 
 /** Where descriptors cannot be counted, every case reads as leaving them as it found them. */
 template <typename case_type_>
-[[nodiscard]] std::size_t keeping_descriptors(case_type_ case_function) {
-    return case_function();
+case_result_t keeping_descriptors(case_type_&& case_function) {
+    case_result_t result {};
+    if constexpr (std::is_void_v<std::invoke_result_t<case_type_>>) case_function();
+    else result = case_function();
+    return result;
 }
 
 #endif // UCALL_OS_POSIX_
@@ -679,7 +1026,7 @@ struct raw_client_t {
      *      @p generator, so a seed reproduces the fragmentation.
      *  @return False when the peer stopped taking bytes or the deadline passed.
      */
-    [[nodiscard]] bool write(span<byte_t const> bytes, std::size_t max_chunk, random_generator_t& generator,
+    [[nodiscard]] bool write(span<byte_t const> bytes, std::size_t max_chunk, split_mix_generator_t& generator,
                              deadline_t deadline) noexcept {
         constexpr int flags = MSG_NOSIGNAL | MSG_DONTWAIT;
         std::size_t offset = 0;
@@ -849,49 +1196,7 @@ struct loopback_pair_t {
 #endif // UCALL_OS_POSIX_
 #pragma endregion Raw Sockets
 
-#pragma region Test Runner
-
-/**
- *  @brief Prints a backtrace on abort or a segmentation fault, then re-raises the default action.
- *
- *  A failed check is counted and located by its own message, so this is for the crash a check did
- *  not see coming, which the last verdict line and the backtrace then name.
- */
-inline void install_test_signal_handlers() noexcept {
-    auto report = [](int signal_number) noexcept {
-#if UCALL_OS_LINUX_ && defined(__GLIBC__)
-        void* frames[32];
-        int const depth = backtrace(frames, 32);
-        fmt::print(stderr, "Caught signal {}, backtrace follows:\n", signal_number);
-        std::fflush(stderr);
-        backtrace_symbols_fd(frames, depth, STDERR_FILENO);
-#else
-        fmt::print(stderr, "Caught signal {}\n", signal_number);
-        std::fflush(stderr);
-#endif
-        std::signal(signal_number, SIG_DFL);
-        std::raise(signal_number);
-    };
-    std::signal(SIGABRT, report);
-    std::signal(SIGSEGV, report);
-}
-
-/** One verdict column, whichever way the cell ended; answers the count it was given, so a caller
- *  accumulates through it. The @c char-pointer overload names a skip. */
-inline std::size_t report(char const* name, std::size_t failures) {
-    fmt::println("{}  {:<44} : {} failures", failures ? "FAILED" : "passed", name, failures);
-    if (failures)
-        fmt::println(stderr, "  rerun: UCALL_SEED={} UCALL_MULTIPLIER={} UCALL_FILTER='{}'", settings_seed(),
-                     test_settings.multiplier, name);
-    std::fflush(stdout);
-    return failures;
-}
-
-inline std::size_t report(char const* name, char const* skip_reason) {
-    fmt::println("skipped  {:<44} : {}", name, skip_reason);
-    std::fflush(stdout);
-    return 0;
-}
+#pragma region Sweep
 
 /** @p format over @p arguments as an owning string, aborting when it cannot be allocated. */
 template <typename... argument_types_>
@@ -901,6 +1206,20 @@ sz::string_t formatted(fmt::format_string<argument_types_ const&...> format,
     if (text.resize(fmt::formatted_size(format, arguments...)) != sz::status_t::success_k) std::abort();
     fmt::format_to(text.data(), format, arguments...);
     return text;
+}
+
+/** The case label for @p function called over @p arguments, like <tt>test_exchanges(posix_k)</tt>. */
+[[nodiscard]] inline sz::string_t called(char const* function, std::string_view arguments) noexcept {
+    return formatted("{}({})", function, arguments);
+}
+
+/** Runs @p test over @p arguments as the case <tt>stem(cell_arguments)</tt>, apart from its cell's
+ *  case as it may skip, checking it leaves every descriptor as it found them. */
+template <typename test_type_, typename... argument_types_>
+void run_cell_case(sz::string_t const& cell_arguments, char const* stem, test_type_&& test,
+                   argument_types_ const&... arguments) {
+    sz::string_t const label = called(stem, cell_arguments);
+    run_test_case(label.c_str(), [&] { return keeping_descriptors([&] { return test(arguments...); }); });
 }
 
 /** One cell of a suite's sweep: the engine it runs on, the CPU class ceiling, how it encrypts. */
@@ -959,8 +1278,9 @@ struct sweep_cell_t {
 
 /** The diagonal a suite sweeps rather than the full product: every compiled backend at the best
  *  class in plaintext, every admitted class on the first backend, and every Noise pattern on the
- *  first backend, each narrowed by the backend and ceiling of @p settings. */
-[[nodiscard]] inline st::vector<sweep_cell_t> diagonal_sweep(settings_t const& settings) noexcept {
+ *  first backend, each narrowed by the run's backend and ceiling. */
+[[nodiscard]] inline st::vector<sweep_cell_t> diagonal_sweep() noexcept {
+    test_settings_t const& settings = test_run.settings;
     st::vector<sweep_cell_t> cells;
     auto add = [&](sweep_cell_t const& cell) noexcept {
         if (st::failed(cells.push_back(sweep_cell_t {cell}))) std::abort();
@@ -980,98 +1300,107 @@ struct sweep_cell_t {
     return cells;
 }
 
-/** How @p security reads in a cell name. */
-[[nodiscard]] inline char const* security_name(ucall_security_t security) noexcept {
+/** The exact spelling of @p backend, as the label of a cell names it. */
+[[nodiscard]] inline char const* backend_constant(ucall_io_backend_t backend) noexcept {
+    struct entry_t {
+        ucall_io_backend_t value;
+        char const* spelling;
+    };
+    static constexpr entry_t entries[] {
+        {ucall_io_backend_automatic_k, "ucall_io_backend_automatic_k"},
+        {ucall_io_backend_posix_k, "ucall_io_backend_posix_k"},
+        {ucall_io_backend_linux_epollaio_k, "ucall_io_backend_linux_epollaio_k"},
+        {ucall_io_backend_linux_uring612_k, "ucall_io_backend_linux_uring612_k"},
+        {ucall_io_backend_linux_uring618_k, "ucall_io_backend_linux_uring618_k"},
+        {ucall_io_backend_bsd_kqueue_k, "ucall_io_backend_bsd_kqueue_k"},
+        {ucall_io_backend_windows_iocp_k, "ucall_io_backend_windows_iocp_k"},
+        {ucall_io_backend_windows_rio_k, "ucall_io_backend_windows_rio_k"},
+    };
+    for (entry_t const& entry : entries)
+        if (entry.value == backend) return entry.spelling;
+    return "ucall_io_backend_automatic_k";
+}
+
+/** The exact spelling of @p cpu_class, as the label of a cell names it. */
+[[nodiscard]] inline char const* cpu_class_constant(ucall_cpu_class_t cpu_class) noexcept {
+    struct entry_t {
+        ucall_cpu_class_t value;
+        char const* spelling;
+    };
+    static constexpr entry_t entries[] {
+        {ucall_cpu_class_unknown_k, "ucall_cpu_class_unknown_k"},
+        {ucall_cpu_class_serial_k, "ucall_cpu_class_serial_k"},
+        {ucall_cpu_class_monoversioned_k, "ucall_cpu_class_monoversioned_k"},
+        {ucall_cpu_class_intel_haswell_k, "ucall_cpu_class_intel_haswell_k"},
+        {ucall_cpu_class_intel_skylake_k, "ucall_cpu_class_intel_skylake_k"},
+        {ucall_cpu_class_intel_icelake_k, "ucall_cpu_class_intel_icelake_k"},
+        {ucall_cpu_class_intel_alder_k, "ucall_cpu_class_intel_alder_k"},
+        {ucall_cpu_class_aws_g2_k, "ucall_cpu_class_aws_g2_k"},
+        {ucall_cpu_class_apple_m4_k, "ucall_cpu_class_apple_m4_k"},
+        {ucall_cpu_class_aws_g5_k, "ucall_cpu_class_aws_g5_k"},
+        {ucall_cpu_class_alibaba_c930_k, "ucall_cpu_class_alibaba_c930_k"},
+        {ucall_cpu_class_ibm_power10_k, "ucall_cpu_class_ibm_power10_k"},
+    };
+    for (entry_t const& entry : entries)
+        if (entry.value == cpu_class) return entry.spelling;
+    return "ucall_cpu_class_unknown_k";
+}
+
+/** The exact spelling of @p security, as the label of a cell names it. */
+[[nodiscard]] inline char const* security_constant(ucall_security_t security) noexcept {
     switch (security) {
-    case ucall_security_noise_xx_k: return "noise-xx";
-    case ucall_security_noise_ik_k: return "noise-ik";
-    case ucall_security_noise_kk_k: return "noise-kk";
-    default: return "plaintext";
+    case ucall_security_noise_xx_k: return "ucall_security_noise_xx_k";
+    case ucall_security_noise_ik_k: return "ucall_security_noise_ik_k";
+    case ucall_security_noise_kk_k: return "ucall_security_noise_kk_k";
+    default: return "ucall_security_none_k";
     }
 }
 
-/** The name a filter selects @p cell by, like "linux-uring618 aws-g2 noise-xx". */
-[[nodiscard]] inline sz::string_t name_of(sweep_cell_t const& cell) noexcept {
-    return formatted("{} {} {}", ucall_io_backend_name(cell.backend),
-                     cell.cpu_class_ceiling ? ucall_cpu_class_name(cell.cpu_class_ceiling) : "best",
-                     security_name(cell.security));
+/** The arguments of a call to the case of @p cell , like "posix_k, aws_g2_k". */
+[[nodiscard]] inline sz::string_t cell_arguments(sweep_cell_t const& cell) noexcept {
+    return formatted("{}, {}, {}", backend_constant(cell.backend), cpu_class_constant(cell.cpu_class_ceiling),
+                     security_constant(cell.security));
 }
 
-/** The library version, the classes it compiled and admits, the engines it compiled, and the run's
- *  settings, printed once before any verdict. */
-inline void print_probe(settings_t const& settings) {
-    fmt::println("UCall {}", ucall_version_name());
+inline machine_t probe_machine() noexcept { return {ucall_version_name(), admitted_classes(), compiled_backends()}; }
+
+inline void print(machine_t const& machine) noexcept {
+    fmt::println("UCall {}", machine.version);
     fmt::print("- CPU classes admitted:");
-    for (ucall_cpu_class_t const cpu_class : admitted_classes()) fmt::print(" {}", ucall_cpu_class_name(cpu_class));
+    for (ucall_cpu_class_t const cpu_class : machine.admitted_classes)
+        fmt::print(" {}", ucall_cpu_class_name(cpu_class));
     fmt::print("\n- Backends compiled:");
-    for (ucall_io_backend_t const backend : compiled_backends()) fmt::print(" {}", ucall_io_backend_name(backend));
-    fmt::println("\n- Seed: {}, multiplier: {:.2f}, filter: {}", settings.seed, settings.multiplier,
-                 settings.filter.pattern.empty() ? "none" : settings.filter.pattern);
+    for (ucall_io_backend_t const backend : machine.compiled_backends)
+        fmt::print(" {}", ucall_io_backend_name(backend));
+    fmt::print("\n");
     std::fflush(stdout);
 }
 
-#pragma endregion Test Runner
+#pragma endregion Sweep
 
 namespace utilities {
-std::size_t check_utilities(settings_t const& settings);
+void run_utilities_cases();
 } // namespace utilities
 
 namespace io {
-std::size_t check_io(settings_t const& settings);
+void run_io_cases();
 } // namespace io
 
 namespace http {
-std::size_t check_http_messages(settings_t const& settings);
-std::size_t check_routes(settings_t const& settings);
-std::size_t check_percent(settings_t const& settings);
-std::size_t check_multipart(settings_t const& settings);
+void run_http_messages_cases();
+void run_routes_cases();
+void run_percent_cases();
+void run_multipart_cases();
 } // namespace http
 
 namespace dns {
-std::size_t check_dns_messages(settings_t const& settings);
-std::size_t check_dns_configuration(settings_t const& settings);
+void run_dns_messages_cases();
+void run_dns_configuration_cases();
 } // namespace dns
 
 namespace tunnel {
-std::size_t check_crypto(settings_t const& settings);
-std::size_t check_secure_tunnel(settings_t const& settings);
+void run_crypto_cases();
+void run_secure_tunnel_cases();
 } // namespace tunnel
 
 } // namespace unum::ucall::test
-
-/*  Defined after the namespace because a macro is text: nothing above needs them, and putting them
- *  last is what lets every helper live in one namespace block rather than two split around them. */
-
-#pragma region Assertion Helpers
-
-/**
- *  @brief Counts one failure when @p condition is false - always active, regardless of `NDEBUG`.
- *
- *  Optional trailing arguments are an @c fmt format string and its operands:
- *  @code{.cpp}
- *  failures += expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
- *  @endcode
- */
-#define expect(condition, ...)                                                       \
-    ::unum::ucall::test::expect_(static_cast<bool>(condition), #condition, __FILE__, \
-                                 __LINE__ __VA_OPT__(, ) __VA_ARGS__)
-
-/**
- *  @brief Like @c expect, but a failure returns from the enclosing case with @p failures plus one.
- *
- *  For the checks whose failure would make the next line unsafe, such as a null about to be read.
- */
-#define require(failures, condition, ...)                                        \
-    do {                                                                         \
-        if (expect(condition __VA_OPT__(, ) __VA_ARGS__)) return (failures) + 1; \
-    } while (0)
-
-/** Compares two byte ranges, naming the first differing offset, and counts a mismatch. */
-#define expect_bytes(actual, expected) \
-    ::unum::ucall::test::expect_bytes_((actual), (expected), #actual, #expected, __FILE__, __LINE__)
-
-/** Compares a byte range against a hex literal, without materialising either as a string. */
-#define expect_hex(actual, expected_hex) \
-    ::unum::ucall::test::expect_hex_((actual), (expected_hex), #actual, __FILE__, __LINE__)
-
-#pragma endregion Assertion Helpers

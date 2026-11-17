@@ -1,6 +1,10 @@
 """Exercises `ucall.Server` against in-process clients on loopback, polled by threads the tests
 start.
 
+Run:
+    python -m pytest test/server.py -v
+    UCALL_SEED=random python -m pytest test/server.py
+
 File: test/server.py
 Author: Ash Vardanian
 Date: October 25, 2026
@@ -24,7 +28,9 @@ import pytest
 import ucall
 
 
-def test_sum_through_query_and_json(backend, loopback):
+@pytest.mark.any_backend
+def test_typed_handlers_sum_from_the_query_and_a_json_body(backend, loopback):
+    """A typed handler binds from the query or a JSON body, takes its defaults, and answers 400 to a bad value."""
     server = ucall.Server(loopback(), backend=backend)
 
     @server.get("/sum")
@@ -52,7 +58,9 @@ def test_sum_through_query_and_json(backend, loopback):
         runner.join()
 
 
+@pytest.mark.any_backend
 def test_typed_parameters_bind_from_path_query_and_json(backend, loopback, serving):
+    """Typed parameters bind from the path, the query and a JSON body, and each refusal names its reason."""
     server = ucall.Server(loopback(), backend=backend)
 
     def describe(word: str, times: int = 1, loud: bool = False, ratio: float = 1.0, raw: bytes = b"", note=None):
@@ -101,7 +109,9 @@ def test_typed_parameters_bind_from_path_query_and_json(backend, loopback, servi
         assert [answer(response) for response, _ in refusals] == [(400, message) for _, message in refusals]
 
 
+@pytest.mark.any_backend
 def test_replies_serialize_by_returned_type(backend, loopback, serving):
+    """What a handler returns picks the content type: bytes are binary, text is UTF-8, the rest JSON, None 204."""
     server = ucall.Server(loopback(), backend=backend)
     results = {
         "bytes": b"\x00raw",
@@ -146,6 +156,7 @@ def test_replies_serialize_by_returned_type(backend, loopback, serving):
 
 
 def test_registration_refuses_unbindable_parameters(loopback):
+    """Registering a handler whose parameters no request binds, or a coroutine function, raises TypeError."""
     server = ucall.Server(loopback())
 
     def variadic(*values: int):
@@ -179,7 +190,9 @@ def test_registration_refuses_unbindable_parameters(loopback):
     ]
 
 
-def test_raw_request_echo(backend, loopback, serving):
+@pytest.mark.any_backend
+def test_raw_requests_echo_their_verb_path_query_and_headers(backend, loopback, serving):
+    """A raw handler reads its verb, path, query and headers, and replies once, never while a body view lives."""
     server = ucall.Server(loopback(), backend=backend)
     refusals = []
 
@@ -232,7 +245,8 @@ def test_raw_request_echo(backend, loopback, serving):
     assert refusals[1] == ucall.Status.ALREADY_EXISTS
 
 
-def test_batch_replies_in_reverse_arrive_in_order(backend, loopback, serving):
+def test_batches_reply_in_reverse_while_responses_stay_ordered(backend, loopback, serving):
+    """A batch answered in reverse reaches a pipelining client in submission order, and its statistics count it."""
     server = ucall.Server(loopback(connections=1, pipelined_requests=4), backend=backend)
     batches = []
 
@@ -266,7 +280,8 @@ def test_batch_replies_in_reverse_arrive_in_order(backend, loopback, serving):
     }
 
 
-def test_peer_under_noise_xx(backend, loopback, serving):
+def test_peers_report_their_interface_and_noise_key(backend, loopback, serving):
+    """A request names its interface, its peer's address and the peer's vetted Noise key, all zeros in plaintext."""
     server_private, server_public = ucall.generate_noise_keypair()
     client_private, client_public = ucall.generate_noise_keypair()
     assert ucall.derive_noise_public_key(client_private) == client_public
@@ -302,10 +317,10 @@ def test_peer_under_noise_xx(backend, loopback, serving):
     assert [(str(ip), port != 0) for ip, port in addresses] == [("127.0.0.1", True)] * 2
 
 
-def test_handler_failures_answer_500(backend, loopback, serving, monkeypatch):
+@pytest.mark.any_backend
+def test_handler_failures_answer_500(backend, loopback, serving, unraisable):
+    """A handler that raises, a raw one that never replies, and one returning what JSON cannot hold each answer 500."""
     server = ucall.Server(loopback(), backend=backend)
-    unraisable = []
-    monkeypatch.setattr("sys.unraisablehook", unraisable.append)
 
     @server.get("/fail")
     def fail():
@@ -334,6 +349,7 @@ def test_handler_failures_answer_500(backend, loopback, serving, monkeypatch):
 
 
 def test_run_refuses_more_than_one_loop_or_any_batch(loopback):
+    """`Server.run` refuses more than one event loop or any batch endpoint, naming what to call instead."""
     several = ucall.Server(loopback(event_loops=2))
     assert several.event_loops == 2
     with pytest.raises(RuntimeError) as refusal:
@@ -355,7 +371,8 @@ def test_run_refuses_more_than_one_loop_or_any_batch(loopback):
     )
 
 
-def test_run_second_interrupt_cuts(backend, loopback):
+def test_a_second_interrupt_cuts_the_draining_run(backend, loopback):
+    """The first interrupt of `Server.run` drains held requests, and a second one cuts the drain short at once."""
     server = ucall.Server(loopback(), backend=backend)
     held = []
     arrived, ended = threading.Event(), threading.Event()
@@ -393,7 +410,8 @@ def test_run_second_interrupt_cuts(backend, loopback):
 
 
 @pytest.mark.skipif(not hasattr(socket, "AF_UNIX"), reason="AF_UNIX sockets are missing here")
-def test_unix_listener_echo(backend, serving, tmp_path):
+def test_unix_listener_echoes(backend, serving, tmp_path):
+    """A server listening on a Unix socket it was handed echoes a large body, reporting an empty peer address."""
     listener = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
     listener.bind(str(tmp_path / "echo.sock"))
     listener.listen()
@@ -420,7 +438,8 @@ def test_unix_listener_echo(backend, serving, tmp_path):
     assert peers == [""]
 
 
-def test_reply_parts_path_and_bytes_on_worker(backend, loopback, serving, direct_directory):
+def test_reply_parts_concatenates_bytes_paths_and_files(backend, loopback, serving, direct_directory):
+    """Reply parts sent from a worker join bytes, paths and files in order, deferring only for a file part."""
     content = bytes(range(256)) * 32
     (direct_directory / "frame.bin").write_bytes(content)
     descriptor = os.open(direct_directory / "frame.bin", os.O_RDONLY | os.O_DIRECT)
@@ -452,7 +471,8 @@ def test_reply_parts_path_and_bytes_on_worker(backend, loopback, serving, direct
     assert answers == [ucall.Deferred, type(None)]
 
 
-def test_reply_parts_overflow_keeps_request(backend, loopback, serving, direct_directory):
+def test_reply_parts_rejects_overflowing_range_and_keeps_the_request(backend, loopback, serving, direct_directory):
+    """A path range whose end overflows 64 bits is refused as an invalid argument, and the request stays answerable."""
     server = ucall.Server(loopback(reply_directories=[direct_directory]), backend=backend)
     refusals = []
 
@@ -474,10 +494,9 @@ def test_reply_parts_overflow_keeps_request(backend, loopback, serving, direct_d
     assert (response.status_code, bytes(response.body)) == (200, b"still answerable")
 
 
-def test_typed_handler_returning_path_raises(loopback, serving, monkeypatch):
+def test_typed_handlers_returning_a_path_answer_500(loopback, serving, unraisable):
+    """A typed handler returning a `ucall.Path`, which may defer, answers 500 and reports a TypeError."""
     server = ucall.Server(loopback())
-    unraisable = []
-    monkeypatch.setattr("sys.unraisablehook", unraisable.append)
 
     @server.get("/video")
     def video():
@@ -494,7 +513,8 @@ def test_typed_handler_returning_path_raises(loopback, serving, monkeypatch):
     ]
 
 
-def test_deferred_await_and_wait(backend, loopback, serving, direct_directory):
+def test_deferred_replies_finish_awaited_or_waited(backend, loopback, serving, direct_directory):
+    """A deferred reply finishes alike awaited or waited on: success for a file, not-found for a missing one."""
     (direct_directory / "note.txt").write_bytes(b"deferred note")
     server = ucall.Server(loopback(reply_directories=[direct_directory]), backend=backend)
     finished = {}
@@ -538,7 +558,8 @@ def test_deferred_await_and_wait(backend, loopback, serving, direct_directory):
     }
 
 
-def test_body_chunks_on_worker(backend, loopback, serving):
+def test_streamed_body_pulls_chunks_on_a_worker(backend, loopback, serving):
+    """A streamed body pulls on a worker by iteration, then by `async for`, releasing a chunk kept past its turn."""
     server = ucall.Server(loopback(), backend=backend)
     payload = os.urandom(1 << 22)
     observed = []
@@ -572,7 +593,9 @@ def test_body_chunks_on_worker(backend, loopback, serving):
     assert observed == ["released"]
 
 
+@pytest.mark.any_backend
 def test_parts_pin_the_request(backend, loopback, serving):
+    """Multipart parts a handler keeps hold the request unanswered until they are dropped, which then answers 500."""
     server = ucall.Server(loopback(), backend=backend)
     body = (
         b"--frontier\r\n"
@@ -613,7 +636,8 @@ def test_parts_pin_the_request(backend, loopback, serving):
     assert replies == [500]
 
 
-def test_body_keyword_on_decorators(loopback, serving):
+def test_body_keyword_streams_through_every_decorator(loopback, serving):
+    """Every registration path takes the `body` keyword, and a streamed endpoint refuses the buffered body."""
     server = ucall.Server(loopback())
     seen = {}
 
@@ -639,6 +663,7 @@ def test_body_keyword_on_decorators(loopback, serving):
 
 
 def test_verb_decorators_route_each_verb(loopback, serving):
+    """Each verb decorator routes only its own verb to its handler on a shared path."""
     server = ucall.Server(loopback())
 
     @server.get("/verb")
@@ -668,7 +693,8 @@ def test_verb_decorators_route_each_verb(loopback, serving):
             assert (response.status_code, bytes(response.body)) == (200, verb.encode())
 
 
-def test_kk_interface(backend, loopback, serving):
+def test_kk_interface_admits_its_peer_key(backend, loopback, serving):
+    """A Noise KK interface admits the one client key it names and refuses a stranger's."""
     server_private, server_public = ucall.generate_noise_keypair()
     client_private, client_public = ucall.generate_noise_keypair()
     stranger_private, _ = ucall.generate_noise_keypair()
@@ -690,7 +716,8 @@ def test_kk_interface(backend, loopback, serving):
     assert admitted == client_public
 
 
-def test_handlers_on_four_loops_from_four_threads(backend, loopback, serving):
+def test_four_event_loops_serve_four_client_threads(backend, loopback, serving):
+    """Four event loops answer four client threads in order, on several threads, and keep a free-threaded GIL off."""
     server = ucall.Server(loopback(event_loops=4), backend=backend)
     loop_threads = set()
 
@@ -712,6 +739,7 @@ def test_handlers_on_four_loops_from_four_threads(backend, loopback, serving):
 
 
 def test_cpu_class_ceiling_caps_rather_than_refuses(loopback):
+    """Every CPU-class ceiling resolves to a class this machine runs, so a foreign one lands on serial."""
     picked = {}
     for ceiling in ucall.CPUClass:
         if ceiling == ucall.CPUClass.UNKNOWN:

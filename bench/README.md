@@ -303,7 +303,7 @@ done
 ```
 
 Add `--server-key` with the printed public key against the IK server, and `--close` to open a new connection for every request.
-`UCALL_BENCH_CLIENT_KEY` and `UCALL_BENCH_SERVER_KEY` keep the keys out of the command line.
+`UCALL_CLIENT_KEY` and `UCALL_SERVER_KEY` keep the keys out of the command line.
 
 | Machine                                       | Class      | Payload | Security  | Connections | Requests/s | p50, µs | p99, µs | Server CPU, µs/request | Date       |
 | :-------------------------------------------- | :--------- | :------ | :-------- | :---------- | ---------: | ------: | ------: | ---------------------: | :--------- |
@@ -442,7 +442,7 @@ kill -INT $server && wait $server
 
 `--requests`, `--time-limit`, or both bound the measured phase, which stops issuing at whichever comes first and then drains its outstanding calls.
 `--warmup-requests` and `--warmup` bound the unmeasured phase the same way, and it finishes before the measured phase begins.
-Durations read like `500ms`, `10s` or `250us`.
+Durations read like `200ms`, `10s` or `2m`.
 Each worker records latencies into its own histogram of 16 linear bins per power of two nanoseconds, merged after timing ends, so a percentile reads at most 1/16 high and recording a completion neither allocates nor sorts.
 The report prints the mean, p50, p90, p99, p99.9, p99.99, and maximum in microseconds.
 The driver timestamps each batch immediately after its polling call returns.
@@ -454,9 +454,9 @@ Rejected submissions, failed exchanges, and incorrect echo bytes are counted and
 
 `--backend` and `--cpu-class-ceiling` select the implementation and kernel bundle, and the report prints each active worker's resolved choices.
 Explicit unsupported selections fail instead of silently changing the experiment.
-`--help` lists every flag; each one also reads its default from a `UCALL_BENCH_` variable named after it, so `UCALL_BENCH_TIME_LIMIT=10s` stands in for `--time-limit 10s` and the command line overrides it.
+`--help` lists every flag; each one also reads its default from a `UCALL_` variable named after it, so `UCALL_TIME_LIMIT=10s` stands in for `--time-limit 10s` and the command line overrides it.
 `--pin` lets the ForkUnion pool pin each worker to its own core where the operating system allows, and the report says whether it did.
-`--seed` fixes the request body bytes, drawn from SplitMix64.
+`--seed` fixes the request body bytes, drawn from SplitMix64, or draws a fresh seed for `random`.
 `--format json` prints one JSON object per row instead: the configuration, the total, each origin, and each worker.
 For the key-value example, seed a value first and use its URL with `--verb get --bytes 0`, omitting `--verify-echo`.
 `--response-bytes N` checks only each response body's length, for services whose replies are not echoes, like the 2-byte sum.

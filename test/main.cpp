@@ -3,20 +3,18 @@
  *  @author Ash Vardanian
  *  @date November 12, 2026
  *  @brief The library suite's entry point: the outcome word, every engine under every admitted CPU
- *      class, and the network cells, rolling every area's failures into the exit code.
+ *      class, and the network cells.
  */
-#include "network.hpp" // `check_network`
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
+#include "network.hpp" // `run_network_cases`
 
 using namespace unum::ucall::test;
 
 int main(int argc, char** argv) {
-    install_test_signal_handlers();
-    test_settings = read_settings(argc, argv, "ucall_test");
-    settings_t const& settings = test_settings;
-    print_probe(settings);
-    std::size_t failures_count = 0;
-    failures_count += utilities::check_utilities(settings);
-    failures_count += io::check_io(settings);
-    failures_count += network::check_network(settings);
-    return report("total", failures_count) ? 1 : 0;
+    start_test_run(argc, argv);
+    utilities::run_utilities_cases();
+    io::run_io_cases();
+    network::run_network_cases();
+    return finish_test_run();
 }

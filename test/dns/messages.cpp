@@ -7,12 +7,14 @@
  *  Every hostile case is a packet a nameserver, or anyone spoofing one, could send: each must be
  *  refused as malformed without reading past its end, never decoded into an address.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include <cstdint> // `std::uint8_t`
 
 #include <vector> // `std::vector`
 
 #include "ucall/dns/messages.hpp" // `compose_query`, `decode_answer`
-#include "harness.hpp"            // `expect`, `require`
+#include "harness.hpp"            // `expect_true`
 #include "properties.hpp"         // `check_dns_answer`
 
 namespace unum::ucall::test::dns {
@@ -70,27 +72,24 @@ wire_name_t spelled(std::string_view name) {
 
 #pragma endregion Fixtures
 
-static std::size_t test_dns_queries() {
-    std::size_t failures = 0;
+static void test_dns_queries() {
     byte_t query[query_bytes_k] {};
     std::size_t const length = compose_query(query, 0xBEEF, spelled("Example.COM."), record_type_t::aaaa_k);
     packet_t expected;
     expected.u16(0xBEEF).u16(0x0100).u16(1).u16(0).u16(0).u16(0).question("example.com", record_type_t::aaaa_k);
-    failures += expect(length == expected.bytes.size() && std::memcmp(query, expected.bytes.data(), length) == 0,
-                       "a query of {} bytes differs from the expected {}", length, expected.bytes.size());
+    expect_true(length == expected.bytes.size() && std::memcmp(query, expected.bytes.data(), length) == 0,
+                "a query of {} bytes differs from the expected {}", length, expected.bytes.size());
 
     wire_name_t wire {};
-    failures += expect(!spell_name("", wire) && !spell_name(".", wire) && !spell_name("a..b", wire),
-                       "an empty name or label was spelled");
-    failures += expect(!spell_name(std::string(64, 'a'), wire), "a 64-byte label was spelled");
+    expect_true(!spell_name("", wire) && !spell_name(".", wire) && !spell_name("a..b", wire),
+                "an empty name or label was spelled");
+    expect_true(!spell_name(std::string(64, 'a'), wire), "a 64-byte label was spelled");
     std::string longest;
     for (int label = 0; label != 64; ++label) longest += "abc.";
-    failures += expect(!spell_name(longest, wire), "a name over 255 bytes was spelled");
-    return failures;
+    expect_true(!spell_name(longest, wire), "a name over 255 bytes was spelled");
 }
 
-static std::size_t test_dns_answers() {
-    std::size_t failures = 0;
+static void test_dns_answers() {
     byte_t addresses[64] {};
 
     {
@@ -111,12 +110,12 @@ static std::size_t test_dns_answers() {
         packet.pointer(origin_name).u16(1).u16(1).u32(120).u16(4).raw({192, 0, 2, 1});
         packet.pointer(origin_name).u16(1).u16(1).u32(90).u16(4).raw({192, 0, 2, 2});
         auto const decoded = decode_answer(packet.view(), 7, spelled("www.example.com"), record_type_t::a_k, addresses);
-        failures += expect(decoded.answer == answer_t::addresses_k && decoded.addresses_count == 2,
-                           "the chain answered {} with {} addresses", static_cast<int>(decoded.answer),
-                           decoded.addresses_count);
-        failures += expect(decoded.ttl_seconds == 60, "the chain's ttl is {}, not the least 60", decoded.ttl_seconds);
-        failures += expect(static_cast<unsigned>(addresses[3]) == 1 && static_cast<unsigned>(addresses[7]) == 2,
-                           "the addresses were not copied in order");
+        expect_true(decoded.answer == answer_t::addresses_k && decoded.addresses_count == 2,
+                    "the chain answered {} with {} addresses", static_cast<int>(decoded.answer),
+                    decoded.addresses_count);
+        expect_true(decoded.ttl_seconds == 60, "the chain's ttl is {}, not the least 60", decoded.ttl_seconds);
+        expect_true(static_cast<unsigned>(addresses[3]) == 1 && static_cast<unsigned>(addresses[7]) == 2,
+                    "the addresses were not copied in order");
     }
 
     {
@@ -124,7 +123,7 @@ static std::size_t test_dns_answers() {
         packet.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
         packet.name("b.example").u16(1).u16(1).u32(30).u16(4).raw({10, 0, 0, 1});
         auto const decoded = decode_answer(packet.view(), 1, spelled("a.example"), record_type_t::a_k, addresses);
-        failures += expect(decoded.answer == answer_t::empty_k, "another owner's address was taken");
+        expect_true(decoded.answer == answer_t::empty_k, "another owner's address was taken");
     }
 
     {
@@ -139,8 +138,8 @@ static std::size_t test_dns_answers() {
         packet.bytes[length_at + 1] = static_cast<std::uint8_t>(rdlength);
         auto const decoded = decode_answer(packet.view(), 2, spelled("missing.example"), record_type_t::aaaa_k,
                                            addresses);
-        failures += expect(decoded.answer == answer_t::absent_k && decoded.ttl_seconds == 45,
-                           "NXDOMAIN answered {} for {} s", static_cast<int>(decoded.answer), decoded.ttl_seconds);
+        expect_true(decoded.answer == answer_t::absent_k && decoded.ttl_seconds == 45, "NXDOMAIN answered {} for {} s",
+                    static_cast<int>(decoded.answer), decoded.ttl_seconds);
     }
 
     {
@@ -148,29 +147,25 @@ static std::size_t test_dns_answers() {
         packet.header(3, 0, 1, 0).question("a.example", record_type_t::a_k);
         packet.pointer(question_offset_k).u16(1).u16(1).u32(0x80000010u).u16(4).raw({10, 0, 0, 1});
         auto const decoded = decode_answer(packet.view(), 3, spelled("a.example"), record_type_t::a_k, addresses);
-        failures += expect(decoded.answer == answer_t::addresses_k && decoded.ttl_seconds == 0,
-                           "a negative ttl read as {}", decoded.ttl_seconds);
+        expect_true(decoded.answer == answer_t::addresses_k && decoded.ttl_seconds == 0, "a negative ttl read as {}",
+                    decoded.ttl_seconds);
     }
 
     {
         packet_t packet;
         packet.header(4, 0, 0, 0, 0x8380).question("a.example", record_type_t::a_k);
-        failures += expect(
-            decode_answer(packet.view(), 4, spelled("a.example"), record_type_t::a_k, addresses).answer ==
-                answer_t::truncated_k,
-            "a truncated answer was not reported");
+        expect_true(decode_answer(packet.view(), 4, spelled("a.example"), record_type_t::a_k, addresses).answer ==
+                        answer_t::truncated_k,
+                    "a truncated answer was not reported");
         packet_t failed;
         failed.header(5, 2, 0, 0).question("a.example", record_type_t::a_k);
-        failures += expect(
-            decode_answer(failed.view(), 5, spelled("a.example"), record_type_t::a_k, addresses).answer ==
-                answer_t::failed_k,
-            "SERVFAIL was not reported as failed");
+        expect_true(decode_answer(failed.view(), 5, spelled("a.example"), record_type_t::a_k, addresses).answer ==
+                        answer_t::failed_k,
+                    "SERVFAIL was not reported as failed");
     }
-    return failures;
 }
 
-static std::size_t test_dns_answers_hostile() {
-    std::size_t failures = 0;
+static void test_dns_answers_hostile() {
     byte_t addresses[64] {};
     auto const refused = [&](packet_t const& packet, std::uint16_t id, std::string_view name, record_type_t type) {
         return decode_answer(packet.view(), id, spelled(name), type, addresses).answer == answer_t::malformed_k;
@@ -180,9 +175,9 @@ static std::size_t test_dns_answers_hostile() {
         packet_t packet;
         packet.header(9, 0, 1, 0).question("a.example", record_type_t::a_k);
         packet.pointer(question_offset_k).u16(1).u16(1).u32(30).u16(4).raw({10, 0, 0, 1});
-        failures += expect(refused(packet, 8, "a.example", record_type_t::a_k), "a wrong id was accepted");
-        failures += expect(refused(packet, 9, "b.example", record_type_t::a_k), "another name was accepted");
-        failures += expect(refused(packet, 9, "a.example", record_type_t::aaaa_k), "another type was accepted");
+        expect_true(refused(packet, 8, "a.example", record_type_t::a_k), "a wrong id was accepted");
+        expect_true(refused(packet, 9, "b.example", record_type_t::a_k), "another name was accepted");
+        expect_true(refused(packet, 9, "a.example", record_type_t::aaaa_k), "another type was accepted");
     }
 
     {
@@ -190,14 +185,14 @@ static std::size_t test_dns_answers_hostile() {
         forward.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
         std::size_t const here = forward.bytes.size();
         forward.pointer(here + 2).u16(1).u16(1).u32(30).u16(4).raw({10, 0, 0, 1});
-        failures += expect(refused(forward, 1, "a.example", record_type_t::a_k), "a forward pointer was followed");
+        expect_true(refused(forward, 1, "a.example", record_type_t::a_k), "a forward pointer was followed");
         packet_t self;
         self.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
         self.pointer(self.bytes.size()).u16(1).u16(1).u32(30).u16(4).raw({10, 0, 0, 1});
-        failures += expect(refused(self, 1, "a.example", record_type_t::a_k), "a self pointer was followed");
+        expect_true(refused(self, 1, "a.example", record_type_t::a_k), "a self pointer was followed");
         packet_t outside;
         outside.header(1, 0, 1, 0).question("a.example", record_type_t::a_k).raw({0xC0});
-        failures += expect(refused(outside, 1, "a.example", record_type_t::a_k), "a cut pointer was read");
+        expect_true(refused(outside, 1, "a.example", record_type_t::a_k), "a cut pointer was read");
     }
 
     {
@@ -205,24 +200,24 @@ static std::size_t test_dns_answers_hostile() {
         packet.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
         std::size_t const loop = packet.bytes.size();
         packet.raw({1, 'x'}).pointer(loop).u16(1).u16(1).u32(30).u16(4).raw({10, 0, 0, 1});
-        failures += expect(refused(packet, 1, "a.example", record_type_t::a_k), "a pointer loop was decoded");
+        expect_true(refused(packet, 1, "a.example", record_type_t::a_k), "a pointer loop was decoded");
     }
 
     {
         packet_t overrun;
         overrun.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
         overrun.pointer(question_offset_k).u16(1).u16(1).u32(30).u16(40).raw({10, 0, 0, 1});
-        failures += expect(refused(overrun, 1, "a.example", record_type_t::a_k), "an RDLENGTH overrun was read");
+        expect_true(refused(overrun, 1, "a.example", record_type_t::a_k), "an RDLENGTH overrun was read");
         packet_t wide;
         wide.header(1, 0, 1, 0).question("a.example", record_type_t::a_k);
         wide.pointer(question_offset_k).u16(1).u16(1).u32(30).u16(5).raw({10, 0, 0, 1, 2});
-        failures += expect(refused(wide, 1, "a.example", record_type_t::a_k), "a 5-byte A record was taken");
+        expect_true(refused(wide, 1, "a.example", record_type_t::a_k), "a 5-byte A record was taken");
         packet_t counted;
         counted.header(1, 0, 60000, 0).question("a.example", record_type_t::a_k);
-        failures += expect(refused(counted, 1, "a.example", record_type_t::a_k), "an impossible count was walked");
+        expect_true(refused(counted, 1, "a.example", record_type_t::a_k), "an impossible count was walked");
         packet_t label;
         label.header(1, 0, 0, 0).raw({64}).raw({'a'});
-        failures += expect(refused(label, 1, "a.example", record_type_t::a_k), "a 64-byte label prefix was read");
+        expect_true(refused(label, 1, "a.example", record_type_t::a_k), "a 64-byte label prefix was read");
     }
 
     {
@@ -233,14 +228,12 @@ static std::size_t test_dns_answers_hostile() {
             std::vector<std::uint8_t> const prefix(packet.bytes.begin(), packet.bytes.begin() + cut);
             auto const decoded = decode_answer({reinterpret_cast<byte_t const*>(prefix.data()), prefix.size()}, 1,
                                                spelled("a.example"), record_type_t::a_k, addresses);
-            failures += expect(decoded.answer == answer_t::malformed_k, "a {}-byte prefix decoded", cut);
+            expect_true(decoded.answer == answer_t::malformed_k, "a {}-byte prefix decoded", cut);
         }
     }
-    return failures;
 }
 
-static std::size_t test_dns_answers_random(random_generator_t& generator) {
-    std::size_t failures = 0;
+static void test_dns_answers_random(split_mix_generator_t& generator) {
     packet_t chain;
     chain.header(1, 0, 3, 1).question("a.example", record_type_t::a_k);
     chain.pointer(question_offset_k).u16(5).u16(1).u32(30).u16(5).raw({1, 'b'}).pointer(question_offset_k + 2);
@@ -264,7 +257,7 @@ static std::size_t test_dns_answers_random(random_generator_t& generator) {
         .u32(4)
         .u32(5);
     wire_name_t const question = spelled("a.example");
-    for (std::size_t iteration = 0; iteration != scale_iterations(4000); ++iteration) {
+    for (std::size_t iteration = 0; iteration != scaled_iterations(4000); ++iteration) {
         std::vector<std::uint8_t> mutated = chain.bytes;
         for (std::size_t edits = 1 + generator.below(4); edits && !mutated.empty(); --edits)
             switch (generator.below(3)) {
@@ -276,20 +269,20 @@ static std::size_t test_dns_answers_random(random_generator_t& generator) {
             }
             }
         if (mutated.empty()) continue;
-        failures += check_dns_answer({reinterpret_cast<byte_t const*>(mutated.data()), mutated.size()}, question);
+        std::size_t const found = check_dns_answer({reinterpret_cast<byte_t const*>(mutated.data()), mutated.size()},
+                                                   question);
+        expect_true(!found, "{} disagreements decoding a mutated {}-byte answer", found, mutated.size());
     }
-    return failures;
 }
 
-std::size_t check_dns_messages(settings_t const& settings) {
-    if (!settings.filter.selects("dns messages")) return 0;
-    random_generator_t generator {stream_key(settings.seed, "dns messages")};
-    std::size_t failures = 0;
-    failures += test_dns_queries();
-    failures += test_dns_answers();
-    failures += test_dns_answers_hostile();
-    failures += test_dns_answers_random(generator);
-    return report("dns messages", failures);
+void run_dns_messages_cases() {
+    run_test_case("run_dns_messages_cases", [] {
+        split_mix_generator_t generator {case_stream_key()};
+        test_dns_queries();
+        test_dns_answers();
+        test_dns_answers_hostile();
+        test_dns_answers_random(generator);
+    });
 }
 
 } // namespace unum::ucall::test::dns

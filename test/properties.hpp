@@ -58,24 +58,24 @@ struct exact_copy_t {
     std::uint16_t const id = copy.size >= 2 ? static_cast<std::uint16_t>(static_cast<unsigned>(copy.bytes[0]) << 8 |
                                                                          static_cast<unsigned>(copy.bytes[1]))
                                             : 0;
-    std::size_t failures = 0;
+    std::size_t disagreements = 0;
     byte_t addresses[48] {};
     for (auto type : {uc::dns::record_type_t::a_k, uc::dns::record_type_t::aaaa_k}) {
         std::size_t const width = type == uc::dns::record_type_t::a_k ? 4 : 16;
         auto const decoded = uc::dns::decode_answer(copy.view(), id, question, type, addresses);
-        failures += decoded.addresses_count * width > sizeof(addresses);
-        failures += decoded.answer == uc::dns::answer_t::addresses_k && !decoded.addresses_count;
-        failures += (decoded.answer == uc::dns::answer_t::malformed_k ||
-                     decoded.answer == uc::dns::answer_t::failed_k ||
-                     decoded.answer == uc::dns::answer_t::truncated_k) &&
-                    (decoded.addresses_count || decoded.ttl_seconds);
+        disagreements += decoded.addresses_count * width > sizeof(addresses);
+        disagreements += decoded.answer == uc::dns::answer_t::addresses_k && !decoded.addresses_count;
+        disagreements += (decoded.answer == uc::dns::answer_t::malformed_k ||
+                          decoded.answer == uc::dns::answer_t::failed_k ||
+                          decoded.answer == uc::dns::answer_t::truncated_k) &&
+                         (decoded.addresses_count || decoded.ttl_seconds);
     }
     uc::dns::wire_name_t name {};
     std::size_t next = 0;
     for (std::size_t offset = 0; offset < copy.size; ++offset)
         if (uc::dns::decode_name(copy.view(), offset, name, next))
-            failures += name.length > uc::dns::name_bytes_k || next > copy.size || next <= offset;
-    return failures;
+            disagreements += name.length > uc::dns::name_bytes_k || next > copy.size || next <= offset;
+    return disagreements;
 }
 
 /** The serial kits, which every class's framing must agree with. */
@@ -93,7 +93,7 @@ using property_http_t =
 [[nodiscard]] inline std::size_t check_http_fragmentation(span<byte_t const> wire, span<std::size_t const> cuts,
                                                           uc::http::http_role_t role) {
     using message_t = property_http_t::http_message_t;
-    std::size_t failures = 0;
+    std::size_t disagreements = 0;
 
     exact_copy_t whole {wire};
     message_t expected {};
@@ -113,13 +113,13 @@ using property_http_t =
         exact_copy_t prefix {wire.first(end)};
         auto const parsed = property_http_t::http_parse({prefix.bytes.get(), prefix.size}, message, role);
         if (parsed == uc::http::http_parse_t::incomplete_k) continue;
-        failures += parsed != verdict;
+        disagreements += parsed != verdict;
         if (parsed == uc::http::http_parse_t::complete_k)
-            failures += message.wire_length != expected.wire_length || message.framing != expected.framing ||
-                        end < expected.wire_length;
+            disagreements += message.wire_length != expected.wire_length || message.framing != expected.framing ||
+                             end < expected.wire_length;
         break;
     }
-    if (verdict != uc::http::http_parse_t::complete_k) return failures;
+    if (verdict != uc::http::http_parse_t::complete_k) return disagreements;
 
     // The same body streamed: arrivals append, and each pull drops what it walked.
     message_t streamed {};
@@ -147,8 +147,8 @@ using property_http_t =
         stepped = feed(body_end);
         if (stepped == uc::http::http_parse_t::incomplete_k && output.size() + pending.size() == before) break;
     }
-    failures += stepped != uc::http::http_parse_t::complete_k || output != decoded;
-    return failures;
+    disagreements += stepped != uc::http::http_parse_t::complete_k || output != decoded;
+    return disagreements;
 }
 
 /** One route as the linear reference sees it: its template, verb, and the answer it registers. */
@@ -233,14 +233,15 @@ inline std::size_t reference_route(std::vector<reference_route_t> const& routes,
         if (trie.insert(route, verbs[index], answer) == ucall_status_success_k)
             routes.push_back({route, verbs[index], index + 1});
     }
-    std::size_t failures = 0;
+    std::size_t disagreements = 0;
     for (std::string_view path : paths) {
         exact_copy_t const copy {byte_span(path)};
         std::string_view const exact = text_view(copy.view());
         for (ucall_verb_t verb : {ucall_verb_get_k, ucall_verb_head_k, ucall_verb_post_k, ucall_verb_delete_k})
-            failures += reinterpret_cast<std::size_t>(trie.match(exact, verb)) != reference_route(routes, exact, verb);
+            disagreements += reinterpret_cast<std::size_t>(trie.match(exact, verb)) !=
+                             reference_route(routes, exact, verb);
     }
-    return failures;
+    return disagreements;
 }
 
 #if UCALL_OS_POSIX_
@@ -261,17 +262,18 @@ using property_message_t =
     first.arguments.url = {reinterpret_cast<ucall_byte_t const*>(copy.bytes.get()), copy.size};
     if (property_client_t::parse_url(first) != ucall_status_success_k) return 0;
     std::string_view const authority = uc::http::text_view(first.authority), target = uc::http::text_view(first.target);
-    std::size_t failures = target.empty() || target.front() != '/' || target.find('#') != std::string_view::npos ||
-                           uc::http::text_view(first.host).size() <= 1 || !first.port;
+    std::size_t disagreements = target.empty() || target.front() != '/' || target.find('#') != std::string_view::npos ||
+                                uc::http::text_view(first.host).size() <= 1 || !first.port;
     std::string const spelled = fmt::format("{}://{}{}", url.substr(0, url.find("://")),
                                             authority.substr(0, authority.size() - 1), target);
     property_exchange_t second {st::default_allocator<uc::byte_t> {}};
     second.arguments.url = bytes_view(spelled);
-    failures += property_client_t::parse_url(second) != ucall_status_success_k ||
-                uc::http::text_view(second.authority) != authority || uc::http::text_view(second.target) != target ||
-                uc::http::text_view(second.host) != uc::http::text_view(first.host) || second.port != first.port ||
-                second.arguments.options.security != first.arguments.options.security;
-    return failures;
+    disagreements += property_client_t::parse_url(second) != ucall_status_success_k ||
+                     uc::http::text_view(second.authority) != authority ||
+                     uc::http::text_view(second.target) != target ||
+                     uc::http::text_view(second.host) != uc::http::text_view(first.host) || second.port != first.port ||
+                     second.arguments.options.security != first.arguments.options.security;
+    return disagreements;
 }
 
 /**
@@ -338,11 +340,12 @@ inline bool reference_multipart(std::string_view body, std::string_view boundary
     std::vector<multipart_part_t> expected;
     bool const reference = !parameter.empty() && parameter.size() <= 70 &&
                            reference_multipart(exact, parameter, expected);
-    std::size_t failures = split != reference;
-    if (split && reference) failures += !std::equal(found.begin(), found.end(), expected.begin(), expected.end());
+    std::size_t disagreements = split != reference;
+    if (split && reference) disagreements += !std::equal(found.begin(), found.end(), expected.begin(), expected.end());
     if (split)
-        for (auto const& part : found) failures += part.offset > copy.size || part.length > copy.size - part.offset;
-    return failures;
+        for (auto const& part : found)
+            disagreements += part.offset > copy.size || part.length > copy.size - part.offset;
+    return disagreements;
 }
 
 /** A Noise pair connected once and reconnected on the same static keys whenever a refused record
@@ -414,17 +417,17 @@ struct property_tunnel_pair_t {
  */
 [[nodiscard]] inline std::size_t check_tunnel_records(span<byte_t const> input, property_tunnel_pair_t& pair) {
     exact_copy_t const copy {input};
-    std::size_t failures = 0;
+    std::size_t disagreements = 0;
     for (auto mode : {uc::tunnel::secure_tunnel_mode_t::noise_xx_k, uc::tunnel::secure_tunnel_mode_t::noise_ik_k,
                       uc::tunnel::secure_tunnel_mode_t::noise_kk_k}) {
         uc::tunnel::secure_tunnel_t responder;
-        if (responder.make(pair.responder(mode)) != uc::tunnel::secure_tunnel_fault_t::none_k) return failures + 1;
+        if (responder.make(pair.responder(mode)) != uc::tunnel::secure_tunnel_fault_t::none_k) return disagreements + 1;
         auto const step = responder.advance(copy.view());
-        failures += step.consumed > copy.size ||
-                    (step.state == uc::tunnel::secure_tunnel_state_t::broken_k && !step.outbound.empty());
+        disagreements += step.consumed > copy.size ||
+                         (step.state == uc::tunnel::secure_tunnel_state_t::broken_k && !step.outbound.empty());
     }
 
-    if (!pair.usable() && !pair.connect()) return failures + 1;
+    if (!pair.usable() && !pair.connect()) return disagreements + 1;
     std::size_t const flips = copy.size ? std::to_integer<std::size_t>(copy.bytes[0]) % 5 : 0;
     std::size_t const payload_at = fu::min_of(copy.size, 1 + 2 * flips);
     span<byte_t const> const payload {copy.bytes.get() + payload_at, copy.size - payload_at};
@@ -432,7 +435,7 @@ struct property_tunnel_pair_t {
     std::size_t const filled = fu::min_of(payload.size(), window.size());
     if (filled) std::memcpy(window.data(), payload.data(), filled);
     auto const sealed = pair.client.seal(pair.wire, filled);
-    if (sealed.empty()) return failures + 1;
+    if (sealed.empty()) return disagreements + 1;
     exact_copy_t record {sealed};
     for (std::size_t flip = 0; flip != flips && 2 + 2 * flip < copy.size; ++flip)
         record.bytes[std::to_integer<std::size_t>(copy.bytes[1 + 2 * flip]) % record.size] ^= copy.bytes[2 + 2 * flip];
@@ -440,17 +443,17 @@ struct property_tunnel_pair_t {
     span<byte_t> const received {record.bytes.get(), record.size};
     if (pair.server.bytes_until_boundary(received)) {
         // A prefix declaring a longer record waits for bytes that never come, so the pair desyncs.
-        failures += !changed;
+        disagreements += !changed;
         pair.server.clear();
-        return failures;
+        return disagreements;
     }
     exact_copy_t destination {sealed};
     auto const opened = pair.server.open(received, {destination.bytes.get(), destination.size});
-    if (changed) failures += opened.consumed != 0;
+    if (changed) disagreements += opened.consumed != 0;
     else
-        failures += opened.consumed != record.size || opened.payload.size() != filled ||
-                    (filled && std::memcmp(opened.payload.data(), payload.data(), filled) != 0);
-    return failures;
+        disagreements += opened.consumed != record.size || opened.payload.size() != filled ||
+                         (filled && std::memcmp(opened.payload.data(), payload.data(), filled) != 0);
+    return disagreements;
 }
 
 } // namespace unum::ucall::test

@@ -8,14 +8,10 @@
 
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
-#include <cstdio>  // `std::FILE`, `stderr`
-#include <cstdlib> // `std::exit`, `std::getenv`, `std::strtod`
+#include <cstdio>  // `std::FILE`
 
 #include <charconv>     // `std::from_chars`
 #include <chrono>       // `std::chrono::nanoseconds`
-#include <optional>     // `std::optional`
-#include <random>       // `std::random_device`
-#include <regex>        // `std::regex`, `std::regex_search`
 #include <string_view>  // `std::string_view`
 #include <system_error> // `std::errc`
 
@@ -56,12 +52,6 @@ inline bool parse_duration(std::string_view text, std::chrono::nanoseconds& valu
     return true;
 }
 
-/** A SplitMix64 seed, any unsigned 64-bit decimal. */
-inline bool parse_seed(std::string_view text, std::uint64_t& value) noexcept {
-    auto [end, error] = std::from_chars(text.data(), text.data() + text.size(), value);
-    return error == std::errc {} && end == text.data() + text.size();
-}
-
 /** A Noise key spelled as 64 hexadecimal digits. */
 inline bool parse_key(std::string_view text, ucall_noise_key_t& key) noexcept {
     if (text.size() != 2 * sizeof(key)) return false;
@@ -86,103 +76,6 @@ inline bool parse_backend(std::string_view text, ucall_io_backend_t& backend) no
 /** A CPU class name as @c ucall_cpu_class_name spells it, left untouched when it names none. */
 inline bool parse_cpu_class(std::string_view text, ucall_cpu_class_t& cpu_class) noexcept {
     return ucall_cpu_class_from_name(bytes_view(text), &cpu_class) == ucall_status_success_k;
-}
-
-/** Which named checks run: every one for an empty pattern, else those the pattern finds as an
- *  ECMAScript regex, or as a substring when it is no valid regex. */
-struct filter_t {
-    std::string_view pattern;
-    std::optional<std::regex> regex;
-
-    /** Whether @p name passes the filter. */
-    bool selects(std::string_view name) const noexcept {
-        if (pattern.empty()) return true;
-        if (regex) return std::regex_search(name.begin(), name.end(), *regex);
-        return name.find(pattern) != std::string_view::npos;
-    }
-};
-
-/** The filter @p pattern spells, compiled once. */
-inline filter_t filter_of(std::string_view pattern) {
-    filter_t filter {pattern, std::nullopt};
-    if (pattern.empty()) return filter;
-#if defined(__cpp_exceptions) && __cpp_exceptions
-    try {
-        filter.regex.emplace(pattern.begin(), pattern.end());
-    }
-    catch (std::regex_error const&) {
-    }
-#else
-    filter.regex.emplace(pattern.begin(), pattern.end());
-#endif
-    return filter;
-}
-
-/** Every setting the suites, the benchmarks and the tools share, its default as the initializer,
- *  filled once by @ref read_settings. */
-struct settings_t {
-
-    /** Seed every case's generator derives from. Override: @c UCALL_SEED, a number or random. */
-    std::uint64_t seed = 42;
-
-    /** Scales every sweep and iteration count. Override: @c UCALL_MULTIPLIER. */
-    double multiplier = 1.0;
-
-    /** Checks to run. Override: @c UCALL_FILTER. */
-    filter_t filter;
-
-    /** The one engine a sweep keeps; automatic keeps every compiled one. Override: @c --backend. */
-    ucall_io_backend_t backend = ucall_io_backend_automatic_k;
-
-    /** The one CPU class ceiling a sweep keeps; unknown keeps every class this machine runs, as
-     *  @c --cpu-class-ceiling overrides. */
-    ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
-};
-
-/** Prints why @p value of @p name does not parse, then exits with status 1. */
-[[noreturn]] inline void exit_unparsed(std::string_view name, std::string_view value, char const* expected) noexcept {
-    fmt::print(stderr, "{}=\"{}\" does not parse, expected {}\n", name, value, expected);
-    std::exit(1);
-}
-
-/** Reads the environment, then the @c --backend and @c --cpu-class-ceiling choices of @p argv,
- *  leaving every argument without a leading dash to the binary. On @c --help prints the usage and
- *  exits with status 0; on a setting that does not parse prints one line and exits with 1. */
-inline settings_t read_settings(int argc, char const* const* argv, std::string_view synopsis) {
-    settings_t settings;
-    auto environment = [](char const* name) noexcept {
-        char const* text = std::getenv(name);
-        return std::string_view {text ? text : ""};
-    };
-    settings.filter = filter_of(environment("UCALL_FILTER"));
-    if (std::string_view const text = environment("UCALL_SEED"); text == "random")
-        settings.seed = std::random_device {}();
-    else if (!text.empty() && !parse_seed(text, settings.seed))
-        exit_unparsed("UCALL_SEED", text, "an unsigned integer or random");
-    if (std::string_view const text = environment("UCALL_MULTIPLIER"); !text.empty()) {
-        char* end = nullptr;
-        settings.multiplier = std::strtod(text.data(), &end);
-        if (end != text.data() + text.size() || !(settings.multiplier > 0.0))
-            exit_unparsed("UCALL_MULTIPLIER", text, "a positive number");
-    }
-    for (int index = 1; index < argc; ++index) {
-        std::string_view const flag = argv[index];
-        // What follows `--` belongs to the program, never to these flags.
-        if (flag == "--") break;
-        if (flag.empty() || flag[0] != '-') continue;
-        std::string_view const value = index + 1 < argc ? argv[index + 1] : "";
-        bool const parsed = flag == "--backend"             ? parse_backend(value, settings.backend)
-                            : flag == "--cpu-class-ceiling" ? parse_cpu_class(value, settings.cpu_class_ceiling)
-                                                            : false;
-        if (parsed) {
-            ++index;
-            continue;
-        }
-        if (flag != "--help") exit_unparsed(flag, value, "a flag of the usage below");
-        fmt::print("Usage: {} [--backend name] [--cpu-class-ceiling name]\n", synopsis);
-        std::exit(0);
-    }
-    return settings;
 }
 
 /** User plus system seconds this process spent so far, read through the platform's accounting. */

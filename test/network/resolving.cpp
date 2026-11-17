@@ -5,6 +5,7 @@
  *  @brief The client's stub resolver against scripted nameservers: CNAME chains, truncation over
  *      TCP, negative caching, TTLs, search names and the IPv4 race behind a silent IPv6.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
 #include <network.hpp>
 
 #include "variants.hpp" // `io_engines_t`, `network_t`
@@ -238,19 +239,18 @@ static ucall_status_t resolved_call(ucall_client_t client, std::string const& ur
 
 /** A lookup whose questions all answer at once, as they do with no nameserver to ask, walks every
  *  search name and fails its call, asking nothing more of a lookup it already ended. */
-static std::size_t test_resolver_without_nameservers(sweep_cell_t const& cell) {
+static void test_resolver_without_nameservers(sweep_cell_t const& cell) {
     uc::dns::resolver_options_t settings {};
     std::string_view const search {"first.test\0second.test\0", 23};
     search.copy(settings.search, search.size());
     settings.search_length = static_cast<std::uint32_t>(search.size());
     settings.timeout_seconds = 1;
     ucall_client_t client = resolving_client(cell, settings);
-    require(0, client, "no client on this backend");
+    if (!expect_true(client, "no client on this backend")) return;
     ucall_status_t const status = resolved_call(client, "http://unnamed-host:80/");
-    std::size_t const failures = expect(status != ucall_status_success_k && status != ucall_status_timeout_k,
-                                        "the call ended {}", ucall_status_name(status));
+    expect_true(status != ucall_status_success_k && status != ucall_status_timeout_k, "the call ended {}",
+                ucall_status_name(status));
     ucall_client_free(client);
-    return failures;
 }
 
 /** An echo server and the scripted resolver naming it, which a case calls by name. */
@@ -268,7 +268,7 @@ struct resolving_fixture_t {
 };
 
 /** A CNAME chain leads A to the address its last name owns, and AAAA to none. */
-static std::size_t test_client_follows_cname_chain(sweep_cell_t const& cell) {
+static void test_client_follows_cname_chain(sweep_cell_t const& cell) {
     resolving_fixture_t fixture {
         cell, [](dns_question_t const& question, std::string_view query) {
             dns_record_t const alias {"alias.test", dns_cname_k, 60, dns_wire_name("middle.test")};
@@ -278,18 +278,17 @@ static std::size_t test_client_follows_cname_chain(sweep_cell_t const& cell) {
                                  {alias, middle, {"real.test", dns_a_k, 60, loopback_v4_k}});
             return dns_reply(query, 0, dns_truncation_t::whole_k, {alias, middle}, {dns_soa("test", 60)});
         }};
-    require(0, fixture.ready(), "setup");
+    if (!expect_true(fixture.ready(), "setup")) return;
     ucall_client_t client = resolving_client(cell, fixture.resolver.options());
-    require(fixture.server.stop(), client, "the resolving client failed to start");
-    std::size_t failures = 0;
+    if (!expect_true(client, "the resolving client failed to start")) return;
     ucall_status_t const status = resolved_call(client, fixture.url("alias.test"));
-    failures += expect(status == ucall_status_success_k, "the alias answered {}", ucall_status_name(status));
+    expect_true(status == ucall_status_success_k, "the alias answered {}", ucall_status_name(status));
     ucall_client_free(client);
-    return failures + fixture.server.stop();
+    fixture.server.stop();
 }
 
 /** An A cut short over UDP is asked again over TCP, whose whole answer the call dials. */
-static std::size_t test_client_retries_truncated_answer_over_tcp(sweep_cell_t const& cell) {
+static void test_client_retries_truncated_answer_over_tcp(sweep_cell_t const& cell) {
     resolving_fixture_t fixture {
         cell, [](dns_question_t const& question, std::string_view query) {
             if (question.type != dns_a_k)
@@ -298,71 +297,68 @@ static std::size_t test_client_retries_truncated_answer_over_tcp(sweep_cell_t co
                 return dns_reply(query, 0, dns_truncation_t::truncated_k, {});
             return dns_reply(query, 0, dns_truncation_t::whole_k, {{"wide.test", dns_a_k, 60, loopback_v4_k}});
         }};
-    require(0, fixture.ready(), "setup");
+    if (!expect_true(fixture.ready(), "setup")) return;
     ucall_client_t client = resolving_client(cell, fixture.resolver.options());
-    require(fixture.server.stop(), client, "the resolving client failed to start");
-    std::size_t failures = 0;
+    if (!expect_true(client, "the resolving client failed to start")) return;
     ucall_status_t const status = resolved_call(client, fixture.url("wide.test"));
-    failures += expect(status == ucall_status_success_k, "the truncated name answered {}", ucall_status_name(status));
+    expect_true(status == ucall_status_success_k, "the truncated name answered {}", ucall_status_name(status));
     auto const questions = fixture.resolver.questions();
-    failures += expect(
+    expect_true(
         std::any_of(questions.begin(), questions.end(),
                     [](dns_question_t const& question) { return question.transport == dns_transport_t::stream_k; }),
         "no question came over TCP");
     ucall_client_free(client);
-    return failures + fixture.server.stop();
+    fixture.server.stop();
 }
 
 /** A name that does not exist fails its calls with @c ucall_status_not_found_k, and the refusal is
  *  cached for its SOA's minimum, so the second call asks nothing. */
-static std::size_t test_client_caches_absent_name(sweep_cell_t const& cell) {
+static void test_client_caches_absent_name(sweep_cell_t const& cell) {
     resolving_fixture_t fixture {cell, [](dns_question_t const&, std::string_view query) {
                                      return dns_reply(query, 3, dns_truncation_t::whole_k, {}, {dns_soa("test", 60)});
                                  }};
-    require(0, fixture.ready(), "setup");
+    if (!expect_true(fixture.ready(), "setup")) return;
     ucall_client_t client = resolving_client(cell, fixture.resolver.options());
-    require(fixture.server.stop(), client, "the resolving client failed to start");
-    std::size_t failures = 0;
+    if (!expect_true(client, "the resolving client failed to start")) return;
     ucall_status_t status = resolved_call(client, fixture.url("missing.test"));
-    failures += expect(status == ucall_status_not_found_k, "the absent name answered {}", ucall_status_name(status));
+    expect_true(status == ucall_status_not_found_k, "the absent name answered {}", ucall_status_name(status));
     std::size_t const asked = fixture.resolver.questions().size();
     status = resolved_call(client, fixture.url("missing.test"));
-    failures += expect(status == ucall_status_not_found_k, "the cached refusal answered {}", ucall_status_name(status));
-    failures += expect(fixture.resolver.questions().size() == asked, "{} questions after a cached refusal, {} before",
-                       fixture.resolver.questions().size(), asked);
+    expect_true(status == ucall_status_not_found_k, "the cached refusal answered {}", ucall_status_name(status));
+    expect_true(fixture.resolver.questions().size() == asked, "{} questions after a cached refusal, {} before",
+                fixture.resolver.questions().size(), asked);
     ucall_client_free(client);
-    return failures + fixture.server.stop();
+    fixture.server.stop();
 }
 
 /** An answer is reused until its TTL passes, then asked again. */
-static std::size_t test_client_asks_again_after_ttl(sweep_cell_t const& cell) {
+static void test_client_asks_again_after_ttl(sweep_cell_t const& cell) {
     resolving_fixture_t fixture {
         cell, [](dns_question_t const& question, std::string_view query) {
             if (question.type != dns_a_k)
                 return dns_reply(query, 0, dns_truncation_t::whole_k, {}, {dns_soa("test", 1)});
             return dns_reply(query, 0, dns_truncation_t::whole_k, {{"brief.test", dns_a_k, 1, loopback_v4_k}});
         }};
-    require(0, fixture.ready(), "setup");
+    if (!expect_true(fixture.ready(), "setup")) return;
     ucall_client_t client = resolving_client(cell, fixture.resolver.options());
-    require(fixture.server.stop(), client, "the resolving client failed to start");
-    std::size_t failures = 0;
+    if (!expect_true(client, "the resolving client failed to start")) return;
     auto count_a = [&] {
         auto const questions = fixture.resolver.questions();
         return std::count_if(questions.begin(), questions.end(),
                              [](dns_question_t const& question) { return question.type == dns_a_k; });
     };
-    failures += expect(resolved_call(client, fixture.url("brief.test")) == ucall_status_success_k);
-    failures += expect(resolved_call(client, fixture.url("brief.test")) == ucall_status_success_k);
-    failures += expect(count_a() == 1, "{} A questions within the TTL", count_a());
+    expect_true(resolved_call(client, fixture.url("brief.test")) == ucall_status_success_k);
+    expect_true(resolved_call(client, fixture.url("brief.test")) == ucall_status_success_k);
+    expect_true(count_a() == 1, "{} A questions within the TTL", count_a());
     std::this_thread::sleep_for(1200ms);
-    failures += expect(resolved_call(client, fixture.url("brief.test")) == ucall_status_success_k);
-    failures += expect(count_a() == 2, "{} A questions after the TTL", count_a());
+    expect_true(resolved_call(client, fixture.url("brief.test")) == ucall_status_success_k);
+    expect_true(count_a() == 2, "{} A questions after the TTL", count_a());
     ucall_client_free(client);
-    return failures + fixture.server.stop();
+    fixture.server.stop();
 }
 
 /** A name with fewer dots than @c ndots is asked with each search suffix first, in order. */
-static std::size_t test_client_walks_search_names(sweep_cell_t const& cell) {
+static void test_client_walks_search_names(sweep_cell_t const& cell) {
     resolving_fixture_t fixture {
         cell, [](dns_question_t const& question, std::string_view query) {
             if (question.name != "svc.two.test")
@@ -371,21 +367,20 @@ static std::size_t test_client_walks_search_names(sweep_cell_t const& cell) {
                 return dns_reply(query, 0, dns_truncation_t::whole_k, {}, {dns_soa("test", 60)});
             return dns_reply(query, 0, dns_truncation_t::whole_k, {{"svc.two.test", dns_a_k, 60, loopback_v4_k}});
         }};
-    require(0, fixture.ready(), "setup");
+    if (!expect_true(fixture.ready(), "setup")) return;
     ucall_client_t client = resolving_client(cell,
                                              fixture.resolver.options(std::string_view {"one.test\0two.test\0", 18}));
-    require(fixture.server.stop(), client, "the resolving client failed to start");
-    std::size_t failures = 0;
+    if (!expect_true(client, "the resolving client failed to start")) return;
     ucall_status_t const status = resolved_call(client, fixture.url("svc"));
-    failures += expect(status == ucall_status_success_k, "the short name answered {}", ucall_status_name(status));
+    expect_true(status == ucall_status_success_k, "the short name answered {}", ucall_status_name(status));
     std::vector<std::string> names;
     for (auto const& question : fixture.resolver.questions())
         if (question.type == dns_a_k) names.push_back(question.name);
     std::vector<std::string> const expected {"svc.one.test", "svc.two.test"};
-    failures += expect(names == expected, "asked {} names first {}", names.size(),
-                       names.empty() ? std::string {} : names.front());
+    expect_true(names == expected, "asked {} names first {}", names.size(),
+                names.empty() ? std::string {} : names.front());
     ucall_client_free(client);
-    return failures + fixture.server.stop();
+    fixture.server.stop();
 }
 
 /** Whether a SYN to @p address, whose listener's queue is full, goes unanswered for 200 ms: Linux
@@ -404,7 +399,7 @@ static bool syn_swallowed(sockaddr_in6 const& address) {
 
 /** When the AAAA address takes SYNs and never answers them, the A address races it after RFC
  *  8305's attempt delay on a second connection, long before the connect timeout. */
-static std::size_t test_client_races_ipv4_after_silent_ipv6(sweep_cell_t const& cell) {
+static case_result_t test_client_races_ipv4_after_silent_ipv6(sweep_cell_t const& cell) {
     resolving_fixture_t fixture {
         cell, [](dns_question_t const& question, std::string_view query) {
             if (question.type == dns_aaaa_k)
@@ -412,7 +407,7 @@ static std::size_t test_client_races_ipv4_after_silent_ipv6(sweep_cell_t const& 
                                  {{"dual.test", dns_aaaa_k, 60, std::string(15, '\0') + std::string(1, '\1')}});
             return dns_reply(query, 0, dns_truncation_t::whole_k, {{"dual.test", dns_a_k, 60, loopback_v4_k}});
         }};
-    require(0, fixture.ready(), "setup");
+    if (!expect_true(fixture.ready(), "setup")) return {};
     // A full accept queue on [::1] at the server's port drops every further SYN without a word.
     int const silent = ::socket(AF_INET6, SOCK_STREAM, 0);
     int enabled = 1;
@@ -423,8 +418,8 @@ static std::size_t test_client_races_ipv4_after_silent_ipv6(sweep_cell_t const& 
     if (silent < 0 || ::setsockopt(silent, IPPROTO_IPV6, IPV6_V6ONLY, &enabled, sizeof(enabled)) != 0 ||
         ::bind(silent, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) != 0 || ::listen(silent, 0) != 0) {
         if (silent >= 0) ::close(silent);
-        return fixture.server.stop() +
-               report("test_client_races_ipv4_after_silent_ipv6", "::1 cannot bind beside the server");
+        fixture.server.stop();
+        return case_result_t::skipped(ipv6_refused_k);
     }
     int const filler = ::socket(AF_INET6, SOCK_STREAM, 0);
     fcntl(filler, F_SETFL, fcntl(filler, F_GETFL) | O_NONBLOCK);
@@ -433,39 +428,43 @@ static std::size_t test_client_races_ipv4_after_silent_ipv6(sweep_cell_t const& 
     if (!syn_swallowed(bound)) {
         ::close(filler);
         ::close(silent);
-        return fixture.server.stop() +
-               report("test_client_races_ipv4_after_silent_ipv6", "the kernel answers SYNs a full queue would drop");
+        fixture.server.stop();
+        return case_result_t::skipped("needs a kernel that drops SYNs past a full accept queue");
     }
     ucall_client_t client = resolving_client(cell, fixture.resolver.options(), 2);
-    std::size_t failures = 0;
     if (client) {
         auto const started = steady_clock::now();
         ucall_status_t const status = resolved_call(client, fixture.url("dual.test"));
         auto const elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - started);
-        failures += expect(status == ucall_status_success_k && elapsed < 2s,
-                           "the dual-stack name answered {} after {} ms", ucall_status_name(status), elapsed.count());
+        expect_true(status == ucall_status_success_k && elapsed < 2s, "the dual-stack name answered {} after {} ms",
+                    ucall_status_name(status), elapsed.count());
         ucall_client_free(client);
     }
-    else failures += expect(false, "the resolving client failed to start");
+    else expect_true(false, "the resolving client failed to start");
     ::close(filler);
     ::close(silent);
-    return failures + fixture.server.stop();
+    fixture.server.stop();
+    return {};
 }
 
 #pragma endregion Scripted Resolver
 
-std::size_t check_resolving(sweep_cell_t const& cell, [[maybe_unused]] settings_t const& settings) {
-    std::size_t failures = 0;
+void test_resolving_cell(sweep_cell_t const& cell) {
     if (cell.security == ucall_security_none_k) {
-        failures += test_client_follows_cname_chain(cell);
-        failures += test_client_retries_truncated_answer_over_tcp(cell);
-        failures += test_client_caches_absent_name(cell);
-        failures += test_client_asks_again_after_ttl(cell);
-        failures += test_client_walks_search_names(cell);
-        failures += test_client_races_ipv4_after_silent_ipv6(cell);
-        failures += test_resolver_without_nameservers(cell);
+        test_client_follows_cname_chain(cell);
+        test_client_retries_truncated_answer_over_tcp(cell);
+        test_client_caches_absent_name(cell);
+        test_client_asks_again_after_ttl(cell);
+        test_client_walks_search_names(cell);
+        test_resolver_without_nameservers(cell);
     }
-    return failures;
+}
+
+void run_resolving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
+    if (cell.security == ucall_security_none_k) {
+        run_cell_case(cell_label, "test_client_races_ipv4_after_silent_ipv6", test_client_races_ipv4_after_silent_ipv6,
+                      cell);
+    }
 }
 
 #endif // UCALL_OS_POSIX_

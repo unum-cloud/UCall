@@ -304,23 +304,157 @@ Stage a concrete review candidate with a proposed title and body; staging does n
 Performance reports name the backend, CPU class, build, placement, workload, admission budgets, and load generator.
 Traced timings explain costs and are not throughput measurements.
 
-## Running Tests
+## Test Suites
+
+### Principles
+
+Tests call the public surface: the C interface and the C++ headers under `include/ucall/`, and each binding its own package; [Private Surface Waivers](#private-surface-waivers) lists the exceptions.
+Oracles never compile out: every C and C++ test unit opens with `#undef NDEBUG // ! A test's oracle must stay live in every build`.
+The harness owns the output: a case only checks, and the run prints its verdict, every failed check, a `rerun:` line and the summary.
+Skips are honest: a case that cannot run says why, `UCALL_NO_SKIPS=1` turns any skip into a failing exit, and a filter that selects nothing fails the run.
+Every reason takes one of four forms: `needs <resource>`, `built without <SWITCH>`, `<facility> is refused on this machine` or `no <device>`.
+Sweeps are full by default: a case runs on every backend, and one whose subject sits above the I/O backends opts out by name with `any_backend`.
+Settings are read once, from `UCALL_<NAME>` variables that a `--name` flag of the same name overrides, and a value that does not parse prints one line and exits 1.
+Inputs come from streams that `stream_key` derives from the seed and the case's name, bit for bit alike in C, C++, Rust, Python and Mojo, so a filtered run draws what an unfiltered one did.
+The native harness holds one mutable global, `test_run`, the documented exception to owning every mutable object.
+Checks fail on worker threads and inside helpers as well as in a case's own body, so the run counts failed checks in one place and `run_test_case` diffs that count around each case, rather than threading a tally through every call.
+After a crash, `p test_run` in a core dump names the case in progress and the last failed check, and the signal handlers print the case too.
+
+### Running
 
 Native suites live in `test/`, mirroring `include/ucall/`, the C caller in `c/test.c`, and benchmark clients in `bench/`.
 `ucall_test` runs the outcome word, every engine and the network cells, `ucall_test_header_only` the parsers and the tunnel, and `ucall_test_tools` the command-line client; each ctest is named after its executable.
 `UCALL_BUILD_STUB=ON` builds `src_stub/`, a stand-in for the C interface that validates every call and serves no network, and `ucall_test_c_stub`, the same `c/test.c` linked against it; the stand-in runs only the serial CPU class.
 `ucall_test` sweeps a diagonal of cells: every compiled backend at the best CPU class in plaintext, every class the machine runs on the first backend, and each Noise pattern on the first backend.
-Each cell prints one verdict line, such as `passed  network linux-uring618 best plaintext`, and a host refusing an engine reads as `skipped`.
-`UCALL_SEED` selects an unsigned seed or `random`, `UCALL_FILTER` selects cells as a regex or else a substring, and `UCALL_MULTIPLIER` scales native sweeps.
-`--backend` and `--cpu-class-ceiling` narrow the sweep to one backend or class, and a ceiling above what the host runs reads as `skipped` rather than sweeping the lower class it resolves to.
+`--backend` and `--cpu-class-ceiling` narrow the sweep to one backend or class, and a ceiling above what the host runs skips rather than sweeping the lower class it resolves to.
 
 ```bash
-UCALL_FILTER='network linux-uring618' UCALL_MULTIPLIER=0.1 build_debug/ucall_test
-UCALL_FILTER='tunnel' ctest --preset debug
+cmake --preset debug
+cmake --build --preset debug
+ctest --preset debug
+UCALL_FILTER=ucall_io_backend_linux_uring618_k UCALL_SCALE=0.1 build_debug/ucall_test
 ```
 
-Python suites sit beside them as `test/server.py` and `test/client.py`, with pytest's hooks in `test/conftest.py` and the settings, backends and fixtures in `test/base.py`; they honour `UCALL_SEED` and filter node IDs by `UCALL_FILTER`.
-Rust tests sit in each module of `rust/`.
+Each binary prints the build, the machine and its settings, then one verdict per case and a summary:
+
+```text
+UCall <version>
+- Compiled for: …
+- This machine: …
+- Seed: 42, scale: 1, filter: none
+- <label> ... ok (0.12 s)
+- <label> ... skipped: <reason>
+- <label> ... FAILED: 1 failed check(s)
+  check failed at test/network/exchanges.cpp:120
+    expected 200, got 500
+  rerun: build_debug/ucall_test --seed 42 --filter '^<label>$'
+41 passed, 1 failed, 3 skipped, seed 42
+```
+
+Verdicts and the summary go to stdout, failed checks and `rerun:` lines to stderr.
+A run exits 1 when a case failed, a check failed outside any case, or nothing ran, 3 when `UCALL_NO_SKIPS` is set and a case skipped, and 0 otherwise.
+Under a debugger, `UCALL_TRAP_ON_FAILURE=1` stops at the first failed check; without one, the trap dumps core.
+
+The Python suites, `test/server.py`, `test/client.py` and `test/readme.py`, take their hooks and fixtures from `test/conftest.py` and their settings and backends from `test/base.py`; pytest's header prints the same `- Seed:` line, and `UCALL_FILTER` deselects by node ID.
+Rust tests sit in each module of `rust/`, and the Mojo suite in `mojo/test.mojo`.
+
+```bash
+python -X faulthandler -m pytest -x
+UCALL_FILTER=readme python -m pytest
+cargo test
+pixi run test
+```
+
+### Environment
+
+| Variable                      | Flag                      |        Default | Meaning                                                                                           |
+| :---------------------------- | :------------------------ | -------------: | :------------------------------------------------------------------------------------------------ |
+| `UCALL_SEED`                  | `--seed`                  |           `42` | Seed of every input stream, any unsigned 64-bit value, or `random` to draw one                    |
+| `UCALL_FILTER`                | `--filter`                |          unset | Regex searched in case labels and pytest node IDs, else a substring, which is all C matches       |
+| `UCALL_SCALE`                 | `--scale`                 |            `1` | Positive factor on the iteration counts of native sweeps, like `0.1` for a quick pass             |
+| `UCALL_TRAP_ON_FAILURE`       | `--trap-on-failure`       |          unset | Any value but `0` traps into the debugger at the first failed check                               |
+| `UCALL_NO_SKIPS`              | `--no-skips`              |          unset | Any value but `0` exits 3 when a case skipped, for runners that must cover every cell             |
+| `UCALL_BACKEND`               | `--backend`               |  every backend | One backend to sweep, by its library name, like `linux-uring618`                                  |
+| `UCALL_CPU_CLASS_CEILING`     | `--cpu-class-ceiling`     |    every class | One CPU class to sweep, by its library name, like `aws-g2`                                        |
+| `UCALL_TEST_DIRECT_DIRECTORY` | `--test-direct-directory` |     build tree | Where cases make the directories their `O_DIRECT` files live in, since `/tmp` is often tmpfs      |
+
+The flags reach the native binaries only.
+Python reads `UCALL_SEED`, `UCALL_FILTER`, `UCALL_SCALE` and `UCALL_TEST_DIRECT_DIRECTORY`, falling back to pytest's `tmp_path` for the last; Rust reads `UCALL_SEED` and `UCALL_TEST_DIRECT_DIRECTORY`, falling back to the test binary's directory.
+
+### Writing a Test
+
+A native case is `void test_<behaviour>(args…)`, or `case_result_t test_<behaviour>(args…)` when it may skip, and takes no settings: it reads them from `test_run.settings`.
+`main` prints the machine, calls `start_test_run(argc, argv)`, registers each case as `run_test_case("<label>", test_<case>, args…)` and returns `finish_test_run()`.
+A label names the code under test and nothing else: a C symbol such as `ucall_server_init`, a qualified C++ name, or the case function's own name, `test_<case>`, and for a runtime choice that function called over the choice's exact constants, as in `test_network_cell(ucall_io_backend_linux_uring618_k, ucall_cpu_class_aws_g2_k, ucall_security_none_k)`.
+Checks count a failure at the caller's line without stopping and return whether they held: `expect_true(held)`, `expect_equal(actual, wanted)`, `expect_near(actual, wanted, tolerance)`, `expect_status(status, wanted)`, `expect_equal_bytes(actual, wanted)`, which prints both in hex, and `expect_throws<E>(callable)`.
+Context trails as a format string and its arguments, `expect_true(held, "setup: {}", ucall_status_name(status))`, printed under the failing line, and `if (!expect_true(…)) return;` stops a step that would be unsafe.
+A case that cannot run returns `case_result_t::skipped(reason)`, its only way to skip.
+Inputs come from `split_mix_generator_t generator {case_stream_key()}`, iteration counts from `scaled_iterations(count)` and sweep steps from `sweep_stride(coverage)`, and every wait goes through `spin_until(predicate)`, which `wait_limit_k` bounds.
+`c/test.c` registers each case between `start_test_case(label)` and `finish_test_case(skip_reason)`, checks with `expect_(condition)` or `expect_at(held, __FILE__, __LINE__, message)`, and prints the same lines, without a time.
+
+A Python test is `test_<subject>_<behaviour>`, read as a sentence, with a one-line docstring.
+A test taking `backend` runs on every backend, and `@pytest.mark.any_backend` runs it once on `Backend.AUTOMATIC` instead, as for argument binding and reply serialization, which sit above the C interface.
+`loopback`, `serving`, `direct_directory`, `unraisable`, `seed` and `rng` are the fixtures in `test/conftest.py`; skips happen only in fixtures and collection marks, and `MAX_CASES_PER_TEST` in `test/base.py` caps the cases one test expands to beside its backends.
+Rust tests are named as behaviour sentences without a prefix, return `()`, and call `.unwrap()`; `rust/testing.rs` holds the seed, stream and scratch-directory helpers every sibling library shares, then UCall's loopback servers and clients, and a test that cannot run calls `return skipped("…")`.
+A Mojo test is a `test_<behaviour>` registered in `main`, and one that cannot run calls `_skipped(reason)`.
+The README Quickstarts are tests too: Python's and Mojo's `test_readme_quickstart` run theirs, Rust's runs as the crate's doctest, and the `test_readme_<language>_mirror` tests of `test/readme.py` hold every other README block to its program.
+
+### Benchmarks
+
+`bench/http.cpp` is UCall's load generator, and the `bench/*_server.*` files are the servers it drives, UCall's and other frameworks', as [bench/README.md](bench/README.md) explains.
+Each flag of the load generator reads its default from `UCALL_<FLAG>`, so `UCALL_TIME_LIMIT=10s` stands in for `--time-limit 10s`, and the command line overrides it.
+It prints the build, the machine and its settings as `- Name: value` lines before its rows, and its timing tables keep their own layout.
+
+### Devices
+
+UCall drives no accelerators: its suites sweep I/O backends and CPU classes, and the hosts below run the classes and platforms the build machine lacks.
+
+#### Arm on an x86 Host
+
+`cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
+`--cpu-class-ceiling` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
+QEMU's user mode has neither io_uring nor Linux AIO, so those cells skip.
+
+```bash
+cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
+cmake --build build_aarch64
+ctest --test-dir build_aarch64
+qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test --backend posix --cpu-class-ceiling aws-g2
+```
+
+#### RISC-V and Power on an x86 Host
+
+The `linux_riscv64` and `linux_ppc64le` presets cross-compile with GCC, and `ctest` runs each suite under QEMU on a core that admits the `alibaba_c930` or `ibm_power10` class.
+RISC-V needs GCC 16, as GCC 15 crashes on StringZilla's RVV kernels, and Power needs GCC 15.
+
+```bash
+cmake --preset linux_ppc64le
+cmake --build --preset linux_ppc64le
+ctest --preset linux_ppc64le
+qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test --backend posix --cpu-class-ceiling ibm-power10
+```
+
+#### Windows, FreeBSD and macOS on a Linux Host
+
+The IOCP and kqueue backends compile on Linux with the host's Clang through one toolchain file each, which name a sysroot and nothing else; their suites run on the platforms themselves.
+
+```bash
+cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake -D UCALL_BUILD_TEST=ON  # needs g++-mingw-w64-x86-64-posix
+cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake -D UCALL_BUILD_TEST=ON \
+    -D UCALL_FREEBSD_SYSROOT=/path/to/unpacked/base.txz
+cmake -B build_macos -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-macos-llvm.cmake \
+    -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk
+cmake --build build_macos --target ucall_static
+```
+
+Windows and FreeBSD link their test executables; macOS stops at the static library, since linking needs Apple's linker.
+
+### Private Surface Waivers
+
+These test units include a header the public surface does not cover:
+
+- `test/network.hpp`, `test/network/client.cpp`, `test/network/loops.cpp` and `test/network/resolving.cpp` include `src/variants.hpp` for `io_engines_t` and `network_t`, the engine and network of each CPU class, which the C interface hides behind its handles.
+- `test/io/engines.hpp` includes `src/lib.hpp` for `cpu_class_t` and the kits each class picks, which the engine tests instantiate one class at a time.
 
 ### Fuzzing
 
@@ -341,46 +475,6 @@ mkdir -p corpus && build_fuzz/ucall_fuzz_routes -max_total_time=60 corpus
 ```
 
 CI runs each harness for five minutes with the run number as its seed and keeps what a failing one found.
-
-### Arm on an x86 Host
-
-`cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
-`--cpu-class-ceiling` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
-QEMU's user mode has neither io_uring nor Linux AIO, so those cells skip.
-
-```bash
-cmake -B build_aarch64 -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-aarch64-llvm.cmake -D UCALL_BUILD_TEST=ON
-cmake --build build_aarch64
-ctest --test-dir build_aarch64
-qemu-aarch64 -L /usr/aarch64-linux-gnu -cpu max build_aarch64/ucall_test --backend posix --cpu-class-ceiling aws-g2
-```
-
-### RISC-V and Power on an x86 Host
-
-The `linux_riscv64` and `linux_ppc64le` presets cross-compile with GCC, and `ctest` runs each suite under QEMU on a core that admits the `alibaba_c930` or `ibm_power10` class.
-RISC-V needs GCC 16, as GCC 15 crashes on StringZilla's RVV kernels, and Power needs GCC 15.
-
-```bash
-cmake --preset linux_ppc64le
-cmake --build --preset linux_ppc64le
-ctest --preset linux_ppc64le
-qemu-ppc64le -L /usr/powerpc64le-linux-gnu -cpu power10 build_linux_ppc64le/ucall_test --backend posix --cpu-class-ceiling ibm-power10
-```
-
-### Windows, FreeBSD and macOS on a Linux Host
-
-The IOCP and kqueue backends compile on Linux with the host's Clang through one toolchain file each, which name a sysroot and nothing else; their suites run on the platforms themselves.
-
-```bash
-cmake -B build_mingw -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-mingw-llvm.cmake -D UCALL_BUILD_TEST=ON  # needs g++-mingw-w64-x86-64-posix
-cmake -B build_freebsd -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-freebsd-llvm.cmake -D UCALL_BUILD_TEST=ON \
-    -D UCALL_FREEBSD_SYSROOT=/path/to/unpacked/base.txz
-cmake -B build_macos -D CMAKE_TOOLCHAIN_FILE=cmake/toolchain-x86_64-macos-llvm.cmake \
-    -D UCALL_MACOS_SDK=/path/to/MacOSX.sdk
-cmake --build build_macos --target ucall_static
-```
-
-Windows and FreeBSD link their test executables; macOS stops at the static library, since linking needs Apple's linker.
 
 ### Model Checking
 

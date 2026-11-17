@@ -4,6 +4,8 @@
  *  @date November 8, 2026
  *  @brief The Linux kernel layouts the library mirrors, checked against the kernel's own headers.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include <cstddef> // `offsetof`
 
 #include <sys/stat.h> // `struct statx`, `STATX_DIOALIGN`

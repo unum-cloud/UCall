@@ -29,8 +29,8 @@
 #include "ucall/network.hpp"           // `serial_network`
 #include "ucall/utilities/sockets.hpp" // `nonblocking`, `monotonic_ns`, `deadline_after`
 
-#include "harness.hpp"  // `expect`, `require`, `report`, `raw_client_t`, `sweep_cell_t`
-#include "variants.hpp" // `io_engines_t`
+#include "harness.hpp"  // `expect_true`, `run_test_case`, `raw_client_t`, `sweep_cell_t`
+#include "variants.hpp" // `uc::io_engines_t`
 
 #if UCALL_OS_POSIX_
 #include <fcntl.h>    // `open`, `fcntl`
@@ -46,6 +46,15 @@ inline ucall_status_t authorize(ucall_noise_key_t const* key, void* context) {
     return std::memcmp(*key, context, sizeof(ucall_noise_key_t)) == 0 ? ucall_status_success_k
                                                                       : ucall_status_peer_rejected_k;
 }
+
+/** Why a case binding the IPv6 loopback skips on a host without it. */
+inline constexpr char const* ipv6_refused_k = "binding ::1 is refused on this machine";
+
+/** Why a case writing raw bytes skips where sockets are not POSIX ones. */
+inline constexpr char const* needs_posix_sockets_k = "needs POSIX sockets";
+
+/** Why a case driving several loops on one interface skips on IOCP, which accepts on one. */
+inline constexpr char const* loops_refused_k = "several loops on one interface are refused on this machine";
 
 /** A reply part holding @p data. */
 inline ucall_reply_part_t bytes_part(std::string_view data) {
@@ -107,9 +116,6 @@ struct fixture_t {
     /** The first setup step that failed, which every case checks before it starts. */
     ucall_status_t status {ucall_status_success_k};
 
-    /** Checks that failed in callbacks and polling threads, which no case frame returns. */
-    std::atomic<std::size_t> failures {};
-
     /** Requests that reached the echo or header-lookup routes. */
     std::atomic<std::size_t> dispatched {};
 
@@ -149,8 +155,7 @@ struct fixture_t {
         ucall_server_reply_vectored_t reply {fixture.server, &outcome, request, ucall_http_status_created_k,
                                              headers,        2,        parts,   5};
         ucall_server_reply_vectored(&reply);
-        fixture.failures += expect(outcome.status == ucall_status_success_k, "vectored: {}",
-                                   ucall_status_name(outcome.status));
+        expect_true(outcome.status == ucall_status_success_k, "vectored: {}", ucall_status_name(outcome.status));
     }
 
     /** Checks the peer is the fixture's client on loopback, then replies with the request body and
@@ -165,21 +170,21 @@ struct fixture_t {
         ucall_server_request_peer_t peer {server,           &outcome, request, &network_interface_index,
                                           &peer_static_key, &address};
         ucall_server_request_peer(&peer);
-        failures += expect(outcome.status == ucall_status_success_k && network_interface_index == 0 &&
-                               std::memcmp(peer_static_key, expected_key, sizeof(expected_key)) == 0,
-                           "peer: {} on interface {}", ucall_status_name(outcome.status), network_interface_index);
+        expect_true(outcome.status == ucall_status_success_k && network_interface_index == 0 &&
+                        std::memcmp(peer_static_key, expected_key, sizeof(expected_key)) == 0,
+                    "peer: {} on interface {}", ucall_status_name(outcome.status), network_interface_index);
         ucall_byte_t const loopback[4] {127, 0, 0, 1};
-        failures += expect(address.family == ucall_address_family_ipv4_k &&
-                               std::memcmp(address.bytes, loopback, sizeof(loopback)) == 0 && address.port,
-                           "peer address family {} port {}", address.family, address.port);
+        expect_true(address.family == ucall_address_family_ipv4_k &&
+                        std::memcmp(address.bytes, loopback, sizeof(loopback)) == 0 && address.port,
+                    "peer address family {} port {}", address.family, address.port);
         ucall_bytes_view_t body {};
         ucall_server_request_body_t extract {server, &outcome, request, &body};
         ucall_server_request_body(&extract);
-        failures += expect(outcome.status == ucall_status_success_k);
+        expect_true(outcome.status == ucall_status_success_k);
         ucall_bytes_view_t header = uc::bytes_view("X-UCall: passed");
         ucall_server_reply_content_t reply {server, &outcome, request, ucall_http_status_ok_k, &header, 1, body};
         ucall_server_reply_content(&reply);
-        failures += expect(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
+        expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
     }
     static void echo(ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
@@ -213,7 +218,7 @@ struct fixture_t {
         ucall_bytes_view_t path {};
         ucall_server_request_path_t get_path {fixture.server, &path_outcome, request, &path};
         ucall_server_request_path(&get_path);
-        fixture.failures += expect(path_outcome.status == ucall_status_success_k);
+        expect_true(path_outcome.status == ucall_status_success_k);
         std::string answer {reinterpret_cast<char const*>(path.data), path.length};
         answer += ';';
         for (std::string_view name : {"Content-TYPE", "X-~", "x-^", "X-Absent"}) {
@@ -230,7 +235,7 @@ struct fixture_t {
         ucall_server_reply_content_t reply {
             fixture.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view(answer)};
         ucall_server_reply_content(&reply);
-        fixture.failures += expect(outcome.status == ucall_status_success_k);
+        expect_true(outcome.status == ucall_status_success_k);
     }
 
     /** Replies with the part count, then each multipart part as <tt>name=type=data</tt>, all
@@ -244,8 +249,8 @@ struct fixture_t {
             ucall_bytes_view_t name {}, type {}, data {};
             ucall_server_request_part_t get {fixture.server, &outcome, request, index, &name, &type, &data};
             ucall_server_request_part(&get);
-            fixture.failures += expect(outcome.status == ucall_status_success_k, "part {}: {}", index,
-                                       ucall_status_name(outcome.status));
+            expect_true(outcome.status == ucall_status_success_k, "part {}: {}", index,
+                        ucall_status_name(outcome.status));
             answer += fmt::format("{}={}={};", uc::text_view(name), uc::text_view(type), uc::text_view(data));
         }
         ucall_outcome_t probe {};
@@ -257,7 +262,7 @@ struct fixture_t {
         ucall_server_reply_content_t reply {
             fixture.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view(answer)};
         ucall_server_reply_content(&reply);
-        fixture.failures += expect(outcome.status == ucall_status_success_k);
+        expect_true(outcome.status == ucall_status_success_k);
     }
 
     /** Replies with no body and the status the <tt>{code}</tt> segment names. */
@@ -268,14 +273,14 @@ struct fixture_t {
         ucall_bytes_view_t code {};
         ucall_server_request_path_parameter_t get {fixture.server, &outcome, request, uc::bytes_view("code"), &code};
         ucall_server_request_path_parameter(&get);
-        fixture.failures += expect(outcome.status == ucall_status_success_k);
+        expect_true(outcome.status == ucall_status_success_k);
         ucall_http_status_t status {};
         std::from_chars(reinterpret_cast<char const*>(code.data),
                         reinterpret_cast<char const*>(code.data) + code.length, status);
         ucall_server_reply_content_t reply {fixture.server, &outcome, request, status, nullptr, 0, {}};
         ucall_server_reply_content(&reply);
-        fixture.failures += expect(outcome.status == ucall_status_success_k, "reply {}: {}", status,
-                                   ucall_status_name(outcome.status));
+        expect_true(outcome.status == ucall_status_success_k, "reply {}: {}", status,
+                    ucall_status_name(outcome.status));
     }
 
     std::size_t held_count() {
@@ -390,17 +395,16 @@ struct fixture_t {
                 ucall_outcome_t outcome {};
                 ucall_server_take_calls_t serving {server, &outcome, loop};
                 ucall_server_take_calls(&serving);
-                failures += expect(outcome.status == ucall_status_success_k, "loop {} ended with {}", loop,
-                                   ucall_status_name(outcome.status));
+                expect_true(outcome.status == ucall_status_success_k, "loop {} ended with {}", loop,
+                            ucall_status_name(outcome.status));
             });
     }
 
-    /** Stops and joins the background loops, answering the failures counted outside a case. */
-    std::size_t stop() {
+    /** Stops and joins the background loops. */
+    void stop() {
         if (!pollers.empty()) ucall_server_stop(server);
         for (auto& poller : pollers) poller.join();
         pollers.clear();
-        return failures.load();
     }
 
     std::size_t poll(ucall_completed_call_t& completed) {
@@ -408,12 +412,12 @@ struct fixture_t {
         for (std::size_t i = 0; i != resolved.interfaces[0].event_loops; ++i) {
             ucall_server_take_call_t serving {server, &outcome, i, 0};
             ucall_server_take_call(&serving);
-            failures += expect(outcome.status == ucall_status_success_k);
+            expect_true(outcome.status == ucall_status_success_k);
         }
         std::size_t count {};
         ucall_client_take_completed_t take {client, &outcome, &completed, 1, &count, 0};
         ucall_client_take_completed(&take);
-        failures += expect(outcome.status == ucall_status_success_k);
+        expect_true(outcome.status == ucall_status_success_k);
         return count;
     }
 
@@ -441,41 +445,40 @@ inline void append_when_room(ucall_server_reply_append_t& append, steady_clock::
 }
 
 /** Checks a 200 response carries @p expected and the echo header, then frees it. */
-inline std::size_t check_response(ucall_received_http_response_t response, std::string_view expected) {
-    std::size_t failures = 0;
-    failures += expect(ucall_client_response_status(response) == ucall_http_status_ok_k);
+inline void check_response(ucall_received_http_response_t response, std::string_view expected) {
+    expect_true(ucall_client_response_status(response) == ucall_http_status_ok_k);
     ucall_outcome_t outcome {};
     ucall_bytes_view_t body {}, header {};
     ucall_client_response_body_t get {response, &outcome, &body};
     ucall_client_response_body(&get);
-    failures += expect(outcome.status == ucall_status_success_k && body.length == expected.size(),
-                       "{} body bytes against {}", body.length, expected.size());
-    failures += expect(body.length != expected.size() || !body.length ||
-                       std::memcmp(body.data, expected.data(), body.length) == 0);
+    expect_true(outcome.status == ucall_status_success_k && body.length == expected.size(), "{} body bytes against {}",
+                body.length, expected.size());
+    expect_true(body.length != expected.size() || !body.length ||
+                std::memcmp(body.data, expected.data(), body.length) == 0);
     ucall_client_response_header_t get_header {response, &outcome, uc::bytes_view("X-UCALL"), &header};
     ucall_client_response_header(&get_header);
-    failures += expect(outcome.status == ucall_status_success_k && header.length == 6 &&
-                       std::memcmp(header.data, "passed", 6) == 0);
+    expect_true(outcome.status == ucall_status_success_k && header.length == 6 &&
+                std::memcmp(header.data, "passed", 6) == 0);
     ucall_client_response_free(response);
-    return failures;
 }
 
-/** Polls until the @c /gate route holds @p count requests, with no call completing meanwhile. */
-inline std::size_t await_held(fixture_t& fixture, std::size_t count) {
-    std::size_t failures = 0;
+/** Polls until the @c /gate route holds @p count requests, with no call completing meanwhile,
+ *  answering false at the first check that fails. */
+inline bool await_held(fixture_t& fixture, std::size_t count) {
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
-    while (fixture.held_count() != count && !failures) {
+    while (fixture.held_count() != count) {
         ucall_completed_call_t completed {};
-        failures += expect(!fixture.poll(completed), "a call completed early");
-        failures += expect(steady_clock::now() < deadline, "the server holds {} of {} requests", fixture.held_count(),
-                           count);
+        if (!expect_true(!fixture.poll(completed), "a call completed early")) return false;
+        if (!expect_true(steady_clock::now() < deadline, "the server holds {} of {} requests", fixture.held_count(),
+                         count))
+            return false;
     }
-    return failures;
+    return true;
 }
 
 /** Calls @p target with @p verb, then waits for the completion, whose response the caller frees. */
 inline ucall_completed_call_t call_and_wait(fixture_t& fixture, ucall_verb_t verb, std::string_view target,
-                                            ucall_security_t security, std::size_t& failures) {
+                                            ucall_security_t security) {
     std::string const url = fmt::format("{}{}", fixture.url, target);
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
@@ -486,10 +489,10 @@ inline ucall_completed_call_t call_and_wait(fixture_t& fixture, ucall_verb_t ver
     call.options.security = security;
     call.options.noise_peer_key = &fixture.server_public;
     ucall_client_call(&call);
-    failures += expect(outcome.status == ucall_status_success_k, "call: {}", ucall_status_name(outcome.status));
+    expect_true(outcome.status == ucall_status_success_k, "call: {}", ucall_status_name(outcome.status));
     auto completed = fixture.wait();
-    failures += expect(completed.outcome.status == ucall_status_success_k && completed.response, "{}: {}", target,
-                       ucall_status_name(completed.outcome.status));
+    expect_true(completed.outcome.status == ucall_status_success_k && completed.response, "{}: {}", target,
+                ucall_status_name(completed.outcome.status));
     return completed;
 }
 inline std::string_view response_body(ucall_received_http_response_t response) {
@@ -508,16 +511,13 @@ inline std::string_view response_header(ucall_received_http_response_t response,
 }
 
 /** Checks @p completed answered @p status with @p body, then frees its response. */
-inline std::size_t check_answer(ucall_completed_call_t const& completed, ucall_http_status_t status,
-                                std::string_view body) {
-    if (!completed.response) return 1;
-    std::size_t failures = 0;
+inline void check_answer(ucall_completed_call_t const& completed, ucall_http_status_t status, std::string_view body) {
+    if (!expect_true(completed.response, "no response to check")) return;
     auto const answered = response_body(completed.response);
-    failures += expect(ucall_client_response_status(completed.response) == status, "answered {} rather than {}",
-                       ucall_client_response_status(completed.response), status);
-    failures += expect(answered == body, "a {}-byte body rather than {} bytes", answered.size(), body.size());
+    expect_true(ucall_client_response_status(completed.response) == status, "answered {} rather than {}",
+                ucall_client_response_status(completed.response), status);
+    expect_true(answered == body, "a {}-byte body rather than {} bytes", answered.size(), body.size());
     ucall_client_response_free(completed.response);
-    return failures;
 }
 
 /** One counter of event loop zero, read from any thread. */
@@ -534,28 +534,28 @@ inline ucall_event_loop_statistics_t loop_statistics(fixture_t& fixture) {
 /** Sends @p request whole, reads until the server closes in order, never with a reset, and
  *  answers the first response. */
 inline wire_response_t exchange_until_close(raw_client_t& client, std::string_view request, std::size_t max_chunk,
-                                            random_generator_t& generator, std::size_t& failures) {
+                                            split_mix_generator_t& generator) {
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
-    failures += expect(client.write(uc::byte_span(request), max_chunk, generator, deadline),
-                       "the server stopped reading");
+    expect_true(client.write(uc::byte_span(request), max_chunk, generator, deadline), "the server stopped reading");
     auto const end = client.read_until_close(deadline);
     int const error = end == read_end_t::failed_k ? errno : 0;
     auto const response = parse_response(client.received);
-    failures += expect(end == read_end_t::closed_k && response.length, "the read ended as {} after {} bytes, errno {}",
-                       static_cast<int>(end), client.received.size(), error);
+    expect_true(end == read_end_t::closed_k && response.length, "the read ended as {} after {} bytes, errno {}",
+                static_cast<int>(end), client.received.size(), error);
     return response;
 }
 
 /** Waits until the background loops hold @p count requests at @c /gate. */
-inline std::size_t await_held_in_background(fixture_t& fixture, std::size_t count) {
+inline bool await_held_in_background(fixture_t& fixture, std::size_t count) {
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (fixture.held_count() != count && steady_clock::now() < deadline) std::this_thread::sleep_for(1ms);
-    return expect(fixture.held_count() == count, "the server holds {} of {} requests", fixture.held_count(), count);
+    return expect_true(fixture.held_count() == count, "the server holds {} of {} requests", fixture.held_count(),
+                       count);
 }
 
 /** Calls @c /gate with @p verb and polls until the server holds the request, which it answers. */
 inline ucall_received_http_request_t hold_call(fixture_t& fixture, ucall_verb_t verb, ucall_security_t security,
-                                               std::size_t& failures, std::string_view target = "/gate") {
+                                               std::string_view target = "/gate") {
     std::string const url = fmt::format("{}{}", fixture.url, target);
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
@@ -566,8 +566,8 @@ inline ucall_received_http_request_t hold_call(fixture_t& fixture, ucall_verb_t 
     call.options.security = security;
     call.options.noise_peer_key = &fixture.server_public;
     ucall_client_call(&call);
-    failures += expect(outcome.status == ucall_status_success_k, "call: {}", ucall_status_name(outcome.status));
-    failures += await_held(fixture, fixture.held_count() + 1);
+    expect_true(outcome.status == ucall_status_success_k, "call: {}", ucall_status_name(outcome.status));
+    await_held(fixture, fixture.held_count() + 1);
     return fixture.take_held();
 }
 
@@ -585,10 +585,10 @@ inline ucall_status_t await_outcome(fixture_t& fixture, ucall_outcome_t& outcome
 }
 
 /** Checks @p outcome turns final as @p expected, polling the server while it is deferred. */
-inline std::size_t expect_outcome(fixture_t& fixture, ucall_outcome_t& outcome, ucall_status_t expected) {
+inline bool expect_outcome(fixture_t& fixture, ucall_outcome_t& outcome, ucall_status_t expected) {
     ucall_status_t const status = await_outcome(fixture, outcome);
-    return expect(status == expected, "the outcome turned {} rather than {}", ucall_status_name(status),
-                  ucall_status_name(expected));
+    return expect_true(status == expected, "the outcome turned {} rather than {}", ucall_status_name(status),
+                       ucall_status_name(expected));
 }
 #endif // UCALL_OS_POSIX_
 
@@ -598,14 +598,24 @@ using counted_network_t = uc::network::serial_network<uc::io_engines_t, counting
 namespace network {
 using namespace unum::ucall::network;
 
-std::size_t check_network(settings_t const& settings);
-std::size_t check_exchanges(sweep_cell_t const& cell, settings_t const& settings);
-std::size_t check_serving(sweep_cell_t const& cell, settings_t const& settings);
-std::size_t check_replies(sweep_cell_t const& cell, settings_t const& settings);
-std::size_t check_client(sweep_cell_t const& cell, settings_t const& settings);
-std::size_t check_resolving(sweep_cell_t const& cell, settings_t const& settings);
-std::size_t check_metrics(sweep_cell_t const& cell, settings_t const& settings);
-std::size_t check_loops(sweep_cell_t const& cell, settings_t const& settings);
+/** Every cell of the diagonal sweep as one case, beside the cases of it that may skip. */
+void run_network_cases();
+
+/** The cases each area runs inside one cell's case, which never skip. */
+void test_exchanges_cell(sweep_cell_t const& cell, split_mix_generator_t& generator);
+void test_serving_cell(sweep_cell_t const& cell, split_mix_generator_t& generator);
+void test_replies_cell(sweep_cell_t const& cell, split_mix_generator_t& generator);
+void test_client_cell(sweep_cell_t const& cell, split_mix_generator_t& generator);
+void test_resolving_cell(sweep_cell_t const& cell);
+void test_metrics_cell(sweep_cell_t const& cell);
+void test_loops_cell(sweep_cell_t const& cell, split_mix_generator_t& generator);
+
+/** The cases each area runs apart from its cell's case, labelled @p cell_label then the case. */
+void run_exchanges_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
+void run_serving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
+void run_replies_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
+void run_resolving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
+void run_loops_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
 } // namespace network
 
 } // namespace unum::ucall::test

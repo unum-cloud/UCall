@@ -9,7 +9,7 @@
 
 #include <string_view> // `std::string_view`
 
-#include "harness.hpp" // `expect`, `require`, `scale_iterations`
+#include "harness.hpp" // `expect_true`, `scaled_iterations`
 
 #include "ucall/tunnel/crypto.hpp"        // `secure_tunnel_crypto`, the serial kits
 #include "ucall/tunnel/secure_tunnel.hpp" // `secure_tunnel_t`
@@ -165,22 +165,21 @@ struct connected_pair_t {
     keypair_t client_keys, server_keys;
     secure_tunnel_t client, server;
 
-    /** Completes a handshake in @p mode, counting a failure that names the pattern and outcome. */
-    [[nodiscard]] std::size_t connect(secure_tunnel_mode_t mode, std::size_t max_payload = 0) {
+    /** Completes a handshake in @p mode, checking it settles, or naming the pattern and outcome. */
+    bool connect(secure_tunnel_mode_t mode, std::size_t max_payload = 0) {
         handshake_outcome_t const outcome = attempt(mode, max_payload);
-        return expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+        return expect_true(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
     }
 
     /** Whether @c attempt draws fresh static keys or uses the ones already in place. */
     enum class keys_t : bool { fresh_k, supplied_k };
 
     /** Reconnects on keys the caller already holds, for the cases about identity reuse. */
-    [[nodiscard]] std::size_t connect_with(secure_tunnel_mode_t mode, keypair_t const& client_identity,
-                                           keypair_t const& server_identity) {
+    bool connect_with(secure_tunnel_mode_t mode, keypair_t const& client_identity, keypair_t const& server_identity) {
         client_keys = client_identity;
         server_keys = server_identity;
         handshake_outcome_t const outcome = attempt(mode, 0, keys_t::supplied_k);
-        return expect(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
+        return expect_true(outcome == handshake_outcome_t::settled_k, "{} handshake {}", mode, outcome);
     }
 
     [[nodiscard]] handshake_outcome_t attempt(secure_tunnel_mode_t mode, std::size_t max_payload,
@@ -213,13 +212,16 @@ struct connected_pair_t {
     }
 };
 
-/** Seals one payload into @p wire, in place, as a driver would, counting a refusal as a failure. */
-[[nodiscard]] inline std::size_t seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_t& wire) {
+/** Seals one payload into @p wire, in place, as a driver would, checking the tunnel takes it. */
+inline bool seal_into(secure_tunnel_t& tunnel, span<byte_t const> payload, wire_t& wire) {
     span<byte_t> const window = tunnel.payload_window(wire.whole());
-    require(0, window.size() >= payload.size(), "a {}-byte window cannot hold {} bytes", window.size(), payload.size());
+    if (!expect_true(window.size() >= payload.size(), "a {}-byte window cannot hold {} bytes", window.size(),
+                     payload.size()))
+        return false;
     if (payload.size()) std::memcpy(window.data(), payload.data(), payload.size());
     wire.length = tunnel.seal(wire.whole(), payload.size()).size();
-    return expect(wire.length > 0u, "the tunnel refused a {}-byte payload with {}", payload.size(), tunnel.fault());
+    return expect_true(wire.length > 0u, "the tunnel refused a {}-byte payload with {}", payload.size(),
+                       tunnel.fault());
 }
 
 /** Opens one whole record from a wire buffer, in place,

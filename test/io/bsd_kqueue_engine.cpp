@@ -4,20 +4,26 @@
  *  @date October 19, 2026
  *  @brief The kqueue engine under every admitted CPU class.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include "ucall/io/bsd_kqueue_engine.hpp" // `bsd_kqueue_engine_t`
 
-#include "io/engines.hpp" // `check_engine`, `test_engine_duplex`, `test_accept_batch`, `test_direct_files`
+#include "io/engines.hpp" // `run_engine_cases`, `test_engine_duplex`, `test_accept_batch`, `test_direct_files`
 
 namespace unum::ucall::test::io {
 
-std::size_t check_bsd_kqueue_engine(settings_t const& settings) {
-    return check_engine<bsd_kqueue_engine_t>(ucall_io_backend_bsd_kqueue_k, settings,
-                                             []<typename engine_type_>(random_generator_t& generator) {
-                                                 std::size_t failures = test_engine_duplex<engine_type_>(generator);
-                                                 failures += test_accept_batch<engine_type_>();
-                                                 failures += test_direct_files<engine_type_>();
-                                                 return failures;
-                                             });
+void run_bsd_kqueue_engine_cases() {
+    run_engine_cases<bsd_kqueue_engine_t>(
+        ucall_io_backend_bsd_kqueue_k, []<typename engine_type_>(sz::string_t const& label) {
+            run_test_case(called("test_engine_cell", label).c_str(), [] {
+                return keeping_descriptors([] {
+                    split_mix_generator_t generator {case_stream_key()};
+                    test_engine_duplex<engine_type_>(generator);
+                    test_accept_batch<engine_type_>();
+                });
+            });
+            run_cell_case(label, "test_direct_files", test_direct_files<engine_type_>);
+        });
 }
 
 } // namespace unum::ucall::test::io

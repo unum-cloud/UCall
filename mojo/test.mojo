@@ -40,6 +40,28 @@ from ucall import (
 )
 
 
+# region Shared Testing
+def _skipped(reason: String):
+    """Announces a skipped test, so a run shows what it left out rather than passing in silence."""
+    print("skipped:", reason)
+
+
+def _split_mix_bits(value: UInt64) -> UInt64:
+    """SplitMix64's finalizer, a bijection that spreads every input bit over all 64 output bits."""
+    var mixed = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9
+    mixed = (mixed ^ (mixed >> 27)) * 0x94D049BB133111EB
+    return mixed ^ (mixed >> 31)
+
+
+def _stream_key(seed: UInt64, name: String, index: UInt64 = 0) -> UInt64:
+    """The `index`-th stream of the family `name` under `seed`, identical in C, C++, Rust and Python."""
+    var hashed: UInt64 = 0xCBF29CE484222325
+    for byte in name.as_bytes():
+        hashed = (hashed ^ UInt64(byte)) * 0x100000001B3
+    return _split_mix_bits(_split_mix_bits(seed ^ hashed) + index)
+# endregion Shared Testing
+
+
 def _text(bytes: Span[Byte, _]) -> String:
     """The bytes as a string, for comparing a body against the text expected."""
     return String(unsafe_from_utf8=bytes)
@@ -395,8 +417,8 @@ def say_hello(var request: Request) raises:
     request^.reply(HTTPStatus.OK, greeting)
 
 
-def test_quickstart() raises:
-    """Mirrors the Quickstart of `mojo/README.md`, held equal by `test/quickstart.py`: the docstrings
+def test_readme_quickstart() raises:
+    """Mirrors the Quickstart of `mojo/README.md`, held equal by `test/readme.py`: the docstrings
     are added, and `main` is named as a test.
     """
     var server = Server(Library(), [Interface("127.0.0.1:0")])
@@ -427,5 +449,5 @@ def main() raises:
     suite.test[test_server_answers_a_bound_client]()
     suite.test[test_streamed_bodies_download_past_the_response_cap]()
     suite.test[test_noise_authorizers_admit_and_reject]()
-    suite.test[test_quickstart]()
+    suite.test[test_readme_quickstart]()
     suite^.run()

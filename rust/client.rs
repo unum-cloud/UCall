@@ -793,12 +793,9 @@ impl Drop for Response {
 
 #[cfg(test)]
 mod tests {
-    use core::pin::pin;
-    use core::task::Waker;
-
     use super::*;
     use crate::server::{Request, Server};
-    use crate::testing::{client, loopback, pattern, serving};
+    use crate::testing::{block_on, client, loopback, pattern, serving};
 
     #[test]
     fn streamed_bodies_download_past_the_response_cap() {
@@ -839,16 +836,9 @@ mod tests {
             assert!(pulled == body);
 
             let mut response = client.call(streamed.clone()).unwrap();
-            let mut context = Context::from_waker(Waker::noop());
             pulled.clear();
             loop {
-                let mut pull = pin!(response.next_body_chunk());
-                let chunk = loop {
-                    match pull.as_mut().poll(&mut context) {
-                        Poll::Ready(chunk) => break chunk.unwrap(),
-                        Poll::Pending => std::thread::yield_now(),
-                    }
-                };
+                let chunk = block_on(response.next_body_chunk()).unwrap();
                 if chunk.is_empty() {
                     break;
                 }

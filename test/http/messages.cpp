@@ -5,9 +5,11 @@
  *  @brief Seeded fragmentation of the request framing and of URLs and redirects, through the
  *      oracles the libFuzzer harnesses share.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include <string> // `std::string`
 
-#include "harness.hpp"    // `expect`, `scale_iterations`, `mutate`
+#include "harness.hpp"    // `expect_true`, `scaled_iterations`, `mutate`
 #include "properties.hpp" // `check_http_fragmentation`, `check_url`, `check_redirect_join`
 
 namespace unum::ucall::test::http {
@@ -26,9 +28,8 @@ static constexpr std::string_view request_seeds_k[] {
     "GET /echo HTTP/1.0\r\nConnection: keep-alive\r\n\r\n",
 };
 
-static std::size_t test_framing_fragmentation(random_generator_t& generator) {
-    std::size_t failures = 0;
-    for (std::size_t iteration = 0; iteration != scale_iterations(20000); ++iteration) {
+static void test_framing_fragmentation(split_mix_generator_t& generator) {
+    for (std::size_t iteration = 0; iteration != scaled_iterations(20000); ++iteration) {
         std::string const wire = mutate(std::string(request_seeds_k[generator.below(std::size(request_seeds_k))]),
                                         generator);
         std::size_t cuts[8];
@@ -41,39 +42,36 @@ static std::size_t test_framing_fragmentation(random_generator_t& generator) {
             cuts[slot] = cut;
         }
         std::size_t const found = check_http_fragmentation(byte_span(wire), {cuts, count}, http_role_t::request_k);
-        failures += expect(!found, "{} disagreements framing {:?} cut at {} points", found, wire, count);
+        expect_true(!found, "{} disagreements framing {:?} cut at {} points", found, wire, count);
         if (found) break;
     }
-    return failures;
 }
 
 #if UCALL_OS_POSIX_
-static std::size_t test_url_and_redirect(random_generator_t& generator) {
+static void test_url_and_redirect(split_mix_generator_t& generator) {
     static constexpr std::string_view url_seeds_k[] {
         "http://127.0.0.1:8080/a/b?q=1#f", "http+noise://[::1]:9/", "http://host", "http://h:1?x", "http://h#frag",
     };
     static constexpr std::string_view location_seeds_k[] {"/c", "c/d", "?only", "../up", "#frag", ":9/x", "@evil/x"};
-    std::size_t failures = 0;
-    for (std::size_t iteration = 0; iteration != scale_iterations(20000); ++iteration) {
+    for (std::size_t iteration = 0; iteration != scaled_iterations(20000); ++iteration) {
         std::string const url = mutate(std::string(url_seeds_k[generator.below(std::size(url_seeds_k))]), generator);
         std::string const location = mutate(std::string(location_seeds_k[generator.below(std::size(location_seeds_k))]),
                                             generator);
         std::size_t const found = check_url(url) + check_redirect_join("http://127.0.0.1:8080/a/b?q=1", location);
-        failures += expect(!found, "{} broken promises parsing {:?} or joining {:?}", found, url, location);
+        expect_true(!found, "{} broken promises parsing {:?} or joining {:?}", found, url, location);
         if (found) break;
     }
-    return failures;
 }
 #endif // UCALL_OS_POSIX_
 
-std::size_t check_http_messages(settings_t const& settings) {
-    if (!settings.filter.selects("http messages")) return 0;
-    random_generator_t generator {stream_key(settings.seed, "http messages")};
-    std::size_t failures = test_framing_fragmentation(generator);
+void run_http_messages_cases() {
+    run_test_case("run_http_messages_cases", [] {
+        split_mix_generator_t generator {case_stream_key()};
+        test_framing_fragmentation(generator);
 #if UCALL_OS_POSIX_
-    failures += test_url_and_redirect(generator);
+        test_url_and_redirect(generator);
 #endif
-    return report("http messages", failures);
+    });
 }
 
 } // namespace unum::ucall::test::http

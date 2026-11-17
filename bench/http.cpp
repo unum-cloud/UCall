@@ -4,28 +4,30 @@
  *  @date October 19, 2026
  *  @brief HTTP exchanges from application-owned ForkUnion workers, closed-loop or at a fixed rate.
  *
- *  One table names every flag: it parses the command line, prints the usage, and reads each default
- *  from a @c UCALL_BENCH_ variable named after the flag, so @c --time-limit defaults to
- *  @c UCALL_BENCH_TIME_LIMIT and the command line overrides it.
+ *  One table names every flag: it validates the command line and prints the usage, and each flag
+ *  overrides the variable of the same name, so @c --time-limit overrides @c UCALL_TIME_LIMIT.
  */
-#include <cctype>  // `std::toupper`
-#include <cmath>   // `std::ceil`
+#include <cmath>   // `std::ceil`, `std::isfinite`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `stdout`, `stderr`, `std::fwrite`
-#include <cstdlib> // `std::getenv`
-#include <cstring> // `std::memcmp`
+#include <cstdlib> // `std::getenv`, `std::exit`
+#include <cstring> // `std::memcmp`, `std::strcmp`
 
-#include <algorithm>   // `std::find_if`, `std::any_of`
-#include <array>       // `std::array`
-#include <bit>         // `std::bit_width`
-#include <bitset>      // `std::bitset`
-#include <chrono>      // `std::chrono::steady_clock`
-#include <limits>      // `std::numeric_limits`
-#include <string>      // `std::string`
-#include <string_view> // `std::string_view`
-#include <thread>      // `std::this_thread::sleep_for`
-#include <tuple>       // `std::tuple`
-#include <vector>      // `std::vector`
+#include <algorithm>    // `std::find_if`, `std::any_of`
+#include <array>        // `std::array`
+#include <bit>          // `std::bit_width`
+#include <charconv>     // `std::from_chars`
+#include <chrono>       // `std::chrono::steady_clock`
+#include <limits>       // `std::numeric_limits`
+#include <optional>     // `std::optional`
+#include <random>       // `std::random_device`
+#include <regex>        // `std::regex`, `std::regex_search`
+#include <string>       // `std::string`
+#include <string_view>  // `std::string_view`
+#include <system_error> // `std::errc`
+#include <thread>       // `std::this_thread::sleep_for`
+#include <tuple>        // `std::tuple`
+#include <vector>       // `std::vector`
 
 #include <fmt/format.h>          // `fmt::print`, `fmt::format_to`, `fmt::format_to_n`, `fmt::basic_memory_buffer`
 #include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_for_threads`
@@ -33,9 +35,179 @@
 
 #include "ucall/utilities/types.hpp" // `bytes_view`
 
-#include "arguments.hpp" // `parse_count`, `parse_duration`, `parse_seed`, `parse_key`, `process_clocks_t`
+#include "arguments.hpp" // `parse_count`, `parse_key`, `process_clocks_t`
 
 namespace unum::ucall::bench {
+
+#pragma region Shared Settings
+
+/** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
+[[noreturn]] inline void exit_unparsed(char const* variable, char const* text, char const* expected) noexcept {
+    std::fprintf(stderr, "%s=\"%s\" does not parse, expected %s\n", variable, text, expected);
+    std::exit(1);
+}
+
+/** The text of a setting: its @p flag when given, else its environment @p variable , else null. */
+inline char const* setting_text(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    for (int index = 1; index < argc; ++index) {
+        std::string_view const argument {argv[index]};
+        if (argument == flag)
+            return index + 1 < argc && std::strncmp(argv[index + 1], "--", 2) != 0 ? argv[index + 1] : "1";
+        if (argument.size() > flag.size() && argument.starts_with(flag) && argument[flag.size()] == '=')
+            return argv[index] + flag.size() + 1;
+    }
+    char const* text = std::getenv(variable);
+    return text && *text ? text : nullptr;
+}
+
+/** A switch, @p fallback when unset: 0, false, off and no turn it off, anything else on. */
+inline bool read_flag_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                              bool fallback = false) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    for (char const* off : {"0", "false", "off", "no"})
+        if (std::strcmp(text, off) == 0) return false;
+    return true;
+}
+
+/** A whole number, @p fallback when unset. */
+inline std::size_t read_count_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                                      std::size_t fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    std::string_view const spelled {text};
+    std::size_t count = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), count);
+    if (error != std::errc {} || end != spelled.data() + spelled.size())
+        exit_unparsed(variable, text, "a whole number");
+    return count;
+}
+
+/** A positive real, @p fallback when unset. */
+inline double read_real_setting(int argc, char** argv, char const* variable, std::string_view flag,
+                                double fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    char* end = nullptr;
+    double const value = std::strtod(text, &end);
+    if (*end != '\0' || !(value > 0) || !std::isfinite(value))
+        exit_unparsed(variable, text, "a positive number like 0.1 or 10");
+    return value;
+}
+
+/** A positive duration such as 200ms, 10s or 2m, @p fallback when unset. */
+inline std::chrono::milliseconds read_duration_setting(int argc, char** argv, char const* variable,
+                                                       std::string_view flag,
+                                                       std::chrono::milliseconds fallback) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return fallback;
+    std::string_view const spelled {text};
+    std::uint32_t count = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), count);
+    std::string_view const unit = spelled.substr(static_cast<std::size_t>(end - spelled.data()));
+    if (error == std::errc {} && count != 0) {
+        if (unit == "ms") return std::chrono::milliseconds(count);
+        if (unit == "s") return std::chrono::seconds(count);
+        if (unit == "m") return std::chrono::minutes(count);
+    }
+    exit_unparsed(variable, text, "a duration like 200ms, 10s or 2m");
+}
+
+/** The run's seed: 42 when unset, drawn afresh for @c random , else any unsigned 64-bit value. */
+inline std::uint64_t read_seed_setting(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return 42;
+    std::string_view const spelled {text};
+    if (spelled == "random") {
+        std::random_device device;
+        return (static_cast<std::uint64_t>(device()) << 32) ^ device();
+    }
+    std::uint64_t seed = 0;
+    auto const [end, error] = std::from_chars(spelled.data(), spelled.data() + spelled.size(), seed);
+    if (error != std::errc {} || end != spelled.data() + spelled.size())
+        exit_unparsed(variable, text, "an unsigned integer or random");
+    return seed;
+}
+
+/** Which labels a run selects: a regex search when the pattern compiles, else a substring. */
+struct filter_t {
+    std::string pattern;
+    std::optional<std::regex> regex;
+
+    bool selects(std::string_view label) const noexcept {
+        if (pattern.empty()) return true;
+        if (regex) return std::regex_search(label.begin(), label.end(), *regex);
+        return label.find(pattern) != std::string_view::npos;
+    }
+};
+
+/** The filter a setting spells, compiled once; empty, selecting everything, when unset. */
+inline filter_t read_filter_setting(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    filter_t filter;
+    char const* text = setting_text(argc, argv, variable, flag);
+    if (!text) return filter;
+    filter.pattern = text;
+#if defined(__cpp_exceptions) && __cpp_exceptions
+    try {
+        filter.regex.emplace(filter.pattern);
+    }
+    catch (std::regex_error const&) {
+    }
+#else
+    filter.regex.emplace(filter.pattern);
+#endif
+    return filter;
+}
+
+/** What every suite and bench reads before its own settings; @c program starts the rerun lines. */
+struct common_settings_t {
+    std::uint64_t seed = 42;
+    filter_t filter;
+    char const* program = "";
+};
+
+/** SplitMix64's finalizer, a bijection that spreads every input bit over all 64 output bits. */
+constexpr std::uint64_t split_mix_bits(std::uint64_t value) noexcept {
+    value = (value ^ (value >> 30)) * 0xBF58476D1CE4E5B9ull;
+    value = (value ^ (value >> 27)) * 0x94D049BB133111EBull;
+    return value ^ (value >> 31);
+}
+
+/** The @p index -th stream of the family @p name under @p seed , identical in every language. */
+constexpr std::uint64_t stream_key(std::uint64_t seed, std::string_view name, std::uint64_t index = 0) noexcept {
+    std::uint64_t hashed = 0xCBF29CE484222325ull;
+    for (char const character : name) hashed = (hashed ^ static_cast<std::uint8_t>(character)) * 0x100000001B3ull;
+    return split_mix_bits(split_mix_bits(seed ^ hashed) + index);
+}
+
+/**
+ *  @brief SplitMix64 over one 64-bit state, seeded by a @ref stream_key , bit-identical to the
+ *      JavaScript generator NumKong ships.
+ *
+ *  Distributions are not specified to draw the same sequence on every standard library, so a
+ *  failure would stop reproducing from its seed when the toolchain changed; @ref below is the
+ *  portable bounded draw.
+ */
+struct split_mix_generator_t {
+    using result_type = std::uint64_t;
+    std::uint64_t state = 0;
+
+    explicit split_mix_generator_t(std::uint64_t key) noexcept : state(key) {}
+    static constexpr result_type(min)() noexcept { return 0; }
+    static constexpr result_type(max)() noexcept { return ~result_type {0}; }
+    result_type operator()() noexcept { return split_mix_bits(state += 0x9E3779B97F4A7C15ull); }
+
+    /** A uniform draw below @p bound , zero for an empty bound, without the bias of a modulo. */
+    std::uint64_t below(std::uint64_t bound) noexcept {
+        if (bound == 0) return 0;
+        std::uint64_t const rejection_floor = (0u - bound) % bound;
+        std::uint64_t draw = (*this)();
+        while (draw < rejection_floor) draw = (*this)();
+        return draw % bound;
+    }
+};
+
+#pragma endregion Shared Settings
 
 using clock_t = std::chrono::steady_clock;
 using time_point_t = clock_t::time_point;
@@ -64,12 +236,12 @@ static constexpr std::size_t unlimited_k = (std::numeric_limits<std::size_t>::ma
 static constexpr double nanoseconds_per_microsecond_k = std::chrono::nanoseconds(std::chrono::microseconds(1)).count();
 static constexpr double bytes_per_gigabyte_k = std::giga::num;
 
-struct settings_t {
+/** What a run reads: the shared seed, its phases' bounds, then the workload. */
+struct bench_settings_t : common_settings_t {
+    std::chrono::milliseconds warmup {}, time_limit {};
     std::vector<std::string> urls;
     std::size_t requests {}, warmup_requests {}, connections = 64, in_flight = 64, threads = 1, bytes = 1024;
     std::size_t rate {}, pipeline_depth = 1, response_bytes {};
-    std::chrono::nanoseconds warmup {}, time_limit {};
-    std::uint64_t seed = 42;
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
     ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
     ucall_verb_t verb = ucall_verb_post_k;
@@ -83,9 +255,7 @@ struct settings_t {
 
 using tools::admit_any_peer;
 using tools::parse_count;
-using tools::parse_duration;
 using tools::parse_key;
-using tools::parse_seed;
 using tools::process_clocks_t;
 
 /** A switch: present, "1" or "true" select @p on, and "0" or "false" the zero enumerator. */
@@ -97,110 +267,113 @@ static bool parse_switch(std::string_view text, mode_type_& value, mode_type_ on
     return true;
 }
 
-/** One flag: its name, its placeholder, empty for a switch, a help line, and its destination. */
+/** One flag: its name, the variable it overrides, its placeholder, empty for a switch, a help line,
+ *  and its destination, which is empty for a setting the shared readers parse. */
 struct flag_t {
-    std::string_view name, placeholder, help;
-    bool (*assign)(std::string_view text, settings_t& settings) noexcept;
+    std::string_view name, variable, placeholder, help;
+    bool (*assign)(std::string_view text, bench_settings_t& settings) noexcept;
 };
 
 static constexpr std::array flags_k {
-    flag_t {"--url", "URL",
+    flag_t {"--url", "UCALL_URL", "URL",
             "http:// or http+noise:// service, repeated for several origins (http://127.0.0.1:8545/echo)",
-            [](std::string_view text, settings_t& settings) noexcept {
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 settings.urls.emplace_back(text);
                 return text.starts_with("http://") || text.starts_with("http+noise://");
             }},
-    flag_t {"--requests", "count", "measured exchanges, or 0 to run until --time-limit (0)",
-            [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.requests); }},
-    flag_t {
-        "--time-limit", "duration", "measured interval like 10s, or 0s for --requests alone (0s)",
-        [](std::string_view text, settings_t& settings) noexcept { return parse_duration(text, settings.time_limit); }},
-    flag_t {"--warmup-requests", "count", "unmeasured exchanges ahead of the measured ones (0)",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--requests", "UCALL_REQUESTS", "count", "measured exchanges, or 0 to run until --time-limit (0)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
+                return parse_count(text, settings.requests);
+            }},
+    flag_t {"--time-limit", "UCALL_TIME_LIMIT", "duration",
+            "measured interval like 200ms, 10s or 2m, unset for --requests alone", nullptr},
+    flag_t {"--warmup-requests", "UCALL_WARMUP_REQUESTS", "count",
+            "unmeasured exchanges ahead of the measured ones (0)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_count(text, settings.warmup_requests);
             }},
-    flag_t {"--warmup", "duration", "unmeasured interval like 1s, ending early at --warmup-requests (0s)",
-            [](std::string_view text, settings_t& settings) noexcept { return parse_duration(text, settings.warmup); }},
-    flag_t {"--rate", "count", "open-loop arrivals per second across workers, or 0 for closed-loop (0)",
-            [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.rate); }},
-    flag_t {"--connections", "count", "maximum open connections (64)",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--warmup", "UCALL_WARMUP", "duration", "unmeasured interval like 1s, ending early at --warmup-requests",
+            nullptr},
+    flag_t {
+        "--rate", "UCALL_RATE", "count", "open-loop arrivals per second across workers, or 0 for closed-loop (0)",
+        [](std::string_view text, bench_settings_t& settings) noexcept { return parse_count(text, settings.rate); }},
+    flag_t {"--connections", "UCALL_CONNECTIONS", "count", "maximum open connections (64)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_count(text, settings.connections, 1);
             }},
-    flag_t {
-        "--in-flight", "count", "maximum outstanding calls across all clients (64)",
-        [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.in_flight, 1); }},
-    flag_t {"--pipeline-depth", "count", "calls one connection carries before awaiting a response (1)",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--in-flight", "UCALL_IN_FLIGHT", "count", "maximum outstanding calls across all clients (64)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
+                return parse_count(text, settings.in_flight, 1);
+            }},
+    flag_t {"--pipeline-depth", "UCALL_PIPELINE_DEPTH", "count",
+            "calls one connection carries before awaiting a response (1)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_count(text, settings.pipeline_depth, 1);
             }},
+    flag_t {"--threads", "UCALL_THREADS", "count", "application-owned ForkUnion workers, the caller included (1)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
+                return parse_count(text, settings.threads, 1);
+            }},
     flag_t {
-        "--threads", "count", "application-owned ForkUnion workers, the caller included (1)",
-        [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.threads, 1); }},
-    flag_t {"--bytes", "count", "request body bytes (1024)",
-            [](std::string_view text, settings_t& settings) noexcept { return parse_count(text, settings.bytes); }},
-    flag_t {"--backend", "name", "automatic, posix, linux-epollaio, linux-uring612, linux-uring618, ... (automatic)",
-            [](std::string_view text, settings_t& settings) noexcept {
+        "--bytes", "UCALL_BYTES", "count", "request body bytes (1024)",
+        [](std::string_view text, bench_settings_t& settings) noexcept { return parse_count(text, settings.bytes); }},
+    flag_t {"--backend", "UCALL_BACKEND", "name",
+            "automatic, posix, linux-epollaio, linux-uring612, linux-uring618, ... (automatic)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return tools::parse_backend(text, settings.backend);
             }},
-    flag_t {"--cpu-class-ceiling", "name", "unknown, serial, intel-haswell, aws-g2, aws-g5, ... (unknown)",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--cpu-class-ceiling", "UCALL_CPU_CLASS_CEILING", "name",
+            "unknown, serial, intel-haswell, aws-g2, aws-g5, ... (unknown)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return tools::parse_cpu_class(text, settings.cpu_class_ceiling);
             }},
-    flag_t {"--verb", "name", "post, get or put (post)",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--verb", "UCALL_VERB", "name", "post, get or put (post)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 settings.verb = text == "get" ? ucall_verb_get_k : text == "put" ? ucall_verb_put_k : ucall_verb_post_k;
                 return text == "post" || text == "get" || text == "put";
             }},
-    flag_t {"--verify-echo", "", "require identical request and response bodies",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--verify-echo", "UCALL_VERIFY_ECHO", "", "require identical request and response bodies",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_switch(text, settings.body_check, body_check_t::echo_k);
             }},
-    flag_t {"--response-bytes", "count", "require response bodies of this many bytes, like 2 from /sum",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--response-bytes", "UCALL_RESPONSE_BYTES", "count",
+            "require response bodies of this many bytes, like 2 from /sum",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 settings.body_check = body_check_t::length_k;
                 return parse_count(text, settings.response_bytes);
             }},
-    flag_t {"--client-key", "hex", "64-digit client static private key, required by http+noise:// URLs",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--client-key", "UCALL_CLIENT_KEY", "hex",
+            "64-digit client static private key, required by http+noise:// URLs",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 ucall_noise_key_t key {};
                 settings.client_key = text;
                 return parse_key(text, key);
             }},
-    flag_t {"--server-key", "hex", "64-digit server public key, selecting Noise IK instead of XX",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--server-key", "UCALL_SERVER_KEY", "hex", "64-digit server public key, selecting Noise IK instead of XX",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 ucall_noise_key_t key {};
                 settings.server_key = text;
                 return parse_key(text, key);
             }},
-    flag_t {"--reorder", "", "paired retained replies at /echo/reordered, implying --verify-echo",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--reorder", "UCALL_REORDER", "", "paired retained replies at /echo/reordered, implying --verify-echo",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_switch(text, settings.reply_order, reply_order_t::reordered_k);
             }},
-    flag_t {"--close", "", "request connection: close for connection churn",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--close", "UCALL_CLOSE", "", "request connection: close for connection churn",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_switch(text, settings.connection_reuse, connection_reuse_t::close_k);
             }},
-    flag_t {"--pin", "", "pin each ForkUnion worker to its own core where the OS allows",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--pin", "UCALL_PIN", "", "pin each ForkUnion worker to its own core where the OS allows",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_switch(text, settings.placement, thread_placement_t::pinned_k);
             }},
-    flag_t {"--seed", "number", "seed of the request body bytes (42)",
-            [](std::string_view text, settings_t& settings) noexcept { return parse_seed(text, settings.seed); }},
-    flag_t {"--format", "name", "human or json, one object per row (human)",
-            [](std::string_view text, settings_t& settings) noexcept {
+    flag_t {"--seed", "UCALL_SEED", "number", "seed of the request body bytes, or random (42)", nullptr},
+    flag_t {"--format", "UCALL_FORMAT", "name", "human or json, one object per row (human)",
+            [](std::string_view text, bench_settings_t& settings) noexcept {
                 settings.format = text == "json" ? output_format_t::json_k : output_format_t::human_k;
                 return text == "json" || text == "human";
             }},
 };
-
-/** The variable that sets @p flag's default: `--time-limit` reads `UCALL_BENCH_TIME_LIMIT`. */
-static std::string environment_variable(flag_t const& flag) {
-    std::string variable = "UCALL_BENCH_";
-    for (char letter : flag.name.substr(2))
-        variable += letter == '-' ? '_' : static_cast<char>(std::toupper(static_cast<unsigned char>(letter)));
-    return variable;
-}
 
 static void usage(char const* binary) {
     constexpr int column_k = 28;
@@ -208,45 +381,50 @@ static void usage(char const* binary) {
     for (auto const& flag : flags_k) {
         auto width = static_cast<int>(flag.name.size() + (flag.placeholder.empty() ? 0 : flag.placeholder.size() + 1));
         fmt::print("  {}{}{}{:{}}{} [env: {}]\n", flag.name, flag.placeholder.empty() ? "" : " ", flag.placeholder, "",
-                   fu::max_of(column_k - width, 1), flag.help, environment_variable(flag));
+                   fu::max_of(column_k - width, 1), flag.help, flag.variable);
     }
     fmt::print("  --help{:{}}print this usage\n", "", column_k - 6);
 }
 
-static bool parse(int argc, char** argv, settings_t& settings) {
-    std::bitset<flags_k.size()> given;
+/** Reads every setting, each flag over its variable, refusing an unknown flag; @c --url repeats. */
+static bool parse(int argc, char** argv, bench_settings_t& settings) {
+    settings.seed = read_seed_setting(argc, argv, "UCALL_SEED", "--seed");
+    settings.warmup = read_duration_setting(argc, argv, "UCALL_WARMUP", "--warmup", {});
+    settings.time_limit = read_duration_setting(argc, argv, "UCALL_TIME_LIMIT", "--time-limit", {});
+    std::vector<std::string_view> urls;
     for (int i = 1; i != argc; ++i) {
-        std::string_view argument = argv[i];
-        auto equal = argument.find('=');
-        auto name = argument.substr(0, equal);
+        std::string_view const argument = argv[i];
+        auto const name = argument.substr(0, argument.find('='));
         auto found = std::find_if(flags_k.begin(), flags_k.end(),
                                   [&](flag_t const& flag) { return flag.name == name; });
         if (found == flags_k.end()) {
             fmt::print(stderr, "{} is not a flag, see --help\n", name);
             return false;
         }
-        std::string_view value;
-        if (equal != argument.npos) value = argument.substr(equal + 1);
-        else if (!found->placeholder.empty()) {
-            if (i + 1 == argc) {
-                fmt::print(stderr, "{} requires a value\n", name);
-                return false;
-            }
-            value = argv[++i];
+        bool const joined = name.size() != argument.size();
+        if (joined || found->placeholder.empty()) {
+            if (name == "--url") urls.push_back(argument.substr(name.size() + 1));
+            continue;
         }
-        if (!found->assign(value, settings)) {
-            fmt::print(stderr, "Invalid argument: {}={}\n", name, value);
+        if (i + 1 == argc) {
+            fmt::print(stderr, "{} requires a value\n", name);
             return false;
         }
-        given.set(static_cast<std::size_t>(found - flags_k.begin()));
+        if (name == "--url") urls.push_back(argv[i + 1]);
+        ++i;
     }
-    for (std::size_t index = 0; index != flags_k.size(); ++index) {
-        if (given[index]) continue;
-        auto variable = environment_variable(flags_k[index]);
-        char const* value = std::getenv(variable.c_str());
-        if (!value || !*value || flags_k[index].assign(value, settings)) continue;
-        fmt::print(stderr, "{}=\"{}\" does not parse\n", variable, value);
-        return false;
+    if (char const* text = setting_text(argc, argv, "UCALL_URL", "--url"); text && urls.empty()) urls.push_back(text);
+    for (auto const& flag : flags_k) {
+        if (!flag.assign) continue;
+        char const* const expected = flag.placeholder.empty() ? "0, 1, false or true" : flag.placeholder.data();
+        if (flag.name == "--url") {
+            for (std::string_view const url : urls)
+                if (!flag.assign(url, settings))
+                    exit_unparsed(flag.variable.data(), std::string {url}.c_str(), expected);
+            continue;
+        }
+        char const* text = setting_text(argc, argv, flag.variable.data(), flag.name);
+        if (text && !flag.assign(text, settings)) exit_unparsed(flag.variable.data(), text, expected);
     }
     if (settings.reply_order == reply_order_t::reordered_k) settings.body_check = body_check_t::echo_k;
     if (!settings.requests && !settings.time_limit.count()) {
@@ -370,13 +548,14 @@ struct worker_t {
     bool ready {}, valid {};
 
     /** When this worker's arrival @p arrival is due, its turn on the one global schedule. */
-    time_point_t arrival_time(settings_t const& settings, time_point_t begin, std::size_t arrival) const noexcept {
+    time_point_t arrival_time(bench_settings_t const& settings, time_point_t begin,
+                              std::size_t arrival) const noexcept {
         double const global = static_cast<double>(index + arrival * workers);
         return begin + std::chrono::duration_cast<std::chrono::nanoseconds>(
                            std::chrono::duration<double> {global / static_cast<double>(settings.rate)});
     }
 
-    bool phase(settings_t const& settings, std::string const& payload, schedule_t schedule,
+    bool phase(bench_settings_t const& settings, std::string const& payload, schedule_t schedule,
                ucall_noise_key_t const* server_key) {
         successful = failures = response_bytes = rejected = 0;
         first_error = nullptr;
@@ -580,7 +759,7 @@ struct resources_t {
 
 struct run_t {
     resources_t& resources;
-    settings_t const& settings;
+    bench_settings_t const& settings;
     std::string const& payload;
     ucall_noise_key_t const* client_key {}; // Null without --client-key, and so is `server_key`.
     ucall_noise_key_t const* server_key {};
@@ -632,7 +811,7 @@ static void print_json_string(row_type_& row, std::string_view text) {
     row.push_back('"');
 }
 
-static int run(settings_t const& settings) {
+static int run(bench_settings_t const& settings) {
     resources_t resources;
     auto width = settings.reply_order == reply_order_t::reordered_k ? 2u : 1u;
     auto clients = fu::min_of(settings.threads, fu::min_of(settings.connections / settings.urls.size() / width,
@@ -922,6 +1101,6 @@ int main(int argc, char** argv) {
             usage(argv[0]);
             return 0;
         }
-    settings_t settings;
+    bench_settings_t settings;
     return parse(argc, argv, settings) ? run(settings) : 1;
 }
