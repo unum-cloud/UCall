@@ -5,9 +5,11 @@
     {
       "name": "base",
       "hidden": true,
-      "description": "A build tree named after the preset, with the compiler launchers from the environment, so exporting CMAKE_CXX_COMPILER_LAUNCHER=ccache caches objects.",
+      "description": "Ninja, a build tree named after the preset, a compilation database, and the compiler launchers from the environment, so exporting CMAKE_CXX_COMPILER_LAUNCHER=ccache caches objects.",
+      "generator": "Ninja",
       "binaryDir": "${sourceDir}/build_${presetName}",
       "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": "ON",
         "UCALL_BUILD_TEST": "ON",
         "CMAKE_C_COMPILER_LAUNCHER": "$env{CMAKE_C_COMPILER_LAUNCHER}",
         "CMAKE_CXX_COMPILER_LAUNCHER": "$env{CMAKE_CXX_COMPILER_LAUNCHER}"

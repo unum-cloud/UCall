@@ -12,7 +12,6 @@ project(
     HOMEPAGE_URL "https://www.unum.cloud/docs/ucall"
 )
 
-set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 # Each UCall target declares its own language level, so fetched dependencies build at the standard they pick.
 set(CMAKE_CXX_EXTENSIONS NO)
 # No target uses C++20 modules, and a Clang installed without `clang-scan-deps` would fail every C++ unit.
@@ -29,6 +28,13 @@ foreach (facility_ UCALL_WITH_POSIX UCALL_WITH_LINUX_EPOLLAIO UCALL_WITH_BSD_KQU
         CACHE STRING "Compile the engine: AUTO, ON or OFF"
     )
     set_property(CACHE ${facility_} PROPERTY STRINGS "AUTO;ON;OFF")
+    if (${facility_} STREQUAL "AUTO")
+        continue()
+    elseif (${facility_})
+        list(APPEND ucall_facility_definitions_ ${facility_}=1)
+    else ()
+        list(APPEND ucall_facility_definitions_ ${facility_}=0)
+    endif ()
 endforeach ()
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     set(ucall_linux_ ON)
@@ -63,7 +69,8 @@ if (NOT MSVC)
 endif ()
 
 # Make Release by default
-if (NOT CMAKE_BUILD_TYPE)
+get_property(ucall_multi_config_ GLOBAL PROPERTY GENERATOR_IS_MULTI_CONFIG)
+if (NOT ucall_multi_config_ AND NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif ()
 
@@ -147,15 +154,7 @@ function (ucall_setup_library target_ scope_)
     )
     target_compile_features(${target_} ${scope_} cxx_std_20)
     target_compile_definitions(${target_} PRIVATE UCALL_VERSION_NAME="${ucall_version_name_}")
-    target_compile_definitions(
-        ${target_}
-        ${scope_}
-        $<$<NOT:$<STREQUAL:${UCALL_WITH_POSIX},AUTO>>:UCALL_WITH_POSIX=$<BOOL:${UCALL_WITH_POSIX}>>
-        $<$<NOT:$<STREQUAL:${UCALL_WITH_LINUX_EPOLLAIO},AUTO>>:UCALL_WITH_LINUX_EPOLLAIO=$<BOOL:${UCALL_WITH_LINUX_EPOLLAIO}>>
-        $<$<NOT:$<STREQUAL:${UCALL_WITH_BSD_KQUEUE},AUTO>>:UCALL_WITH_BSD_KQUEUE=$<BOOL:${UCALL_WITH_BSD_KQUEUE}>>
-        $<$<NOT:$<STREQUAL:${UCALL_WITH_WINDOWS_IOCP},AUTO>>:UCALL_WITH_WINDOWS_IOCP=$<BOOL:${UCALL_WITH_WINDOWS_IOCP}>>
-        $<$<NOT:$<STREQUAL:${UCALL_WITH_WINDOWS_RIO},AUTO>>:UCALL_WITH_WINDOWS_RIO=$<BOOL:${UCALL_WITH_WINDOWS_RIO}>>
-    )
+    target_compile_definitions(${target_} ${scope_} ${ucall_facility_definitions_})
     target_link_libraries(
         ${target_}
         PUBLIC ucall_header

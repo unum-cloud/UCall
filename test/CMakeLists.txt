@@ -1,14 +1,3 @@
-# Adds @p ARGN to @p target_ where the kernel facility the condition names exists.
-function (ucall_engine_sources target_ facility_)
-    if (facility_ STREQUAL "LINUX" AND CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
-        target_sources(${target_} PRIVATE ${ARGN})
-    elseif (facility_ STREQUAL "LINUX_URING" AND UCALL_WITH_LINUX_URING)
-        target_sources(${target_} PRIVATE ${ARGN})
-    elseif (facility_ STREQUAL "BSD" AND (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD"))
-        target_sources(${target_} PRIVATE ${ARGN})
-    endif ()
-endfunction ()
-
 # The suites drive the serial kits directly, so they compile the serial X25519 unit when no kept class runs it.
 if (NOT ucall_x25519_serial_kept_)
     set(ucall_serial_x25519_sources_ "${PROJECT_SOURCE_DIR}/src/crypto_x25519_serial.cpp")
@@ -31,9 +20,16 @@ add_executable(
     network/loops.cpp
     ${ucall_serial_x25519_sources_}
 )
-ucall_engine_sources(ucall_test LINUX io/linux_epollaio_engine.cpp)
-ucall_engine_sources(ucall_test LINUX_URING io/linux_uring612_engine.cpp io/linux_uring618_engine.cpp)
-ucall_engine_sources(ucall_test BSD io/bsd_kqueue_engine.cpp)
+# The engines of the kernel facilities this system has.
+if (CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
+    target_sources(ucall_test PRIVATE io/linux_epollaio_engine.cpp)
+endif ()
+if (UCALL_WITH_LINUX_URING)
+    target_sources(ucall_test PRIVATE io/linux_uring612_engine.cpp io/linux_uring618_engine.cpp)
+endif ()
+if (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
+    target_sources(ucall_test PRIVATE io/bsd_kqueue_engine.cpp)
+endif ()
 target_include_directories(
     ucall_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tools"
 )

@@ -28,14 +28,18 @@ function (ucall_sibling name_ override_ repository_ tag_)
     FetchContent_MakeAvailable(${name_})
 endfunction ()
 
-# The siblings build for the floor, the build kind and the sanitizer UCall builds for.
-# ThreadSanitizer then sees their barriers, and ForkUnion leaves out the instructions it cannot see.
-# A sibling this project never adds leaves its switches unread.
-foreach (sibling_ IN ITEMS NUMKONG STRINGZILLA FORKUNION SMASHTABLE)
-    set(${sibling_}_MARCH "${UCALL_MARCH}")
-    set(${sibling_}_MULTIVERSIONED "${UCALL_MULTIVERSIONED}")
-    set(${sibling_}_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
-endforeach ()
+# The siblings build for the floor, the build kind and the sanitizer UCall builds for, each taking only the
+# switches it reads. ThreadSanitizer then sees their barriers, and ForkUnion leaves out the instructions it cannot see.
+set(NUMKONG_MARCH "${UCALL_MARCH}")
+set(NUMKONG_MULTIVERSIONED "${UCALL_MULTIVERSIONED}")
+set(NUMKONG_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
+set(STRINGZILLA_MARCH "${UCALL_MARCH}")
+set(STRINGZILLA_MULTIVERSIONED "${UCALL_MULTIVERSIONED}")
+set(STRINGZILLA_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
+set(FORKUNION_MARCH "${UCALL_MARCH}")
+set(FORKUNION_MULTIVERSIONED "${UCALL_MULTIVERSIONED}")
+set(FORKUNION_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
+set(SMASHTABLE_BUILD_SANITIZERS "${UCALL_BUILD_SANITIZERS}")
 
 # Everything below is this project's own: the siblings it builds on, at the commits their submodules pin.
 
