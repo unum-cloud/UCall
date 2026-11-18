@@ -877,12 +877,13 @@ static bool stall_on_file(fixture_t& fixture, raw_client_t& peer, int file, ucal
 /** Whether the server reset @p peer by @p deadline, learned without reading, since a read would
  *  let its stalled reply flow again. */
 static bool reset_unread(raw_client_t const& peer, steady_clock::time_point deadline) {
-    auto const left = std::chrono::duration_cast<std::chrono::milliseconds>(deadline - steady_clock::now());
-    pollfd watched {peer.descriptor, 0, 0};
-    if (::poll(&watched, 1, static_cast<int>(fu::max_of<long long>(left.count(), 0))) <= 0) return false;
+    // Darwin's poll reports no POLLHUP or POLLERR to a descriptor watching no events.
     int error = 0;
     socklen_t length = sizeof(error);
-    return getsockopt(peer.descriptor, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error == ECONNRESET;
+    while (getsockopt(peer.descriptor, SOL_SOCKET, SO_ERROR, &error, &length) == 0 && error != ECONNRESET &&
+           steady_clock::now() < deadline)
+        std::this_thread::sleep_for(1ms);
+    return error == ECONNRESET;
 }
 
 /** At its connection budget, with every connection held by a peer that stopped reading its reply,
@@ -989,7 +990,12 @@ static case_result_t test_stop_resets_held_replies(sweep_cell_t const& cell) {
             ucall_server_stop(fixture.server);
             fixture.stop();
         }
-        auto const end = client.read_until_close(stopping + 1s);
+        auto end = client.read_until_close(stopping + 1s);
+        if (end == read_end_t::timed_out_k) {
+            char const probe = 0;
+            end = ::send(client.descriptor, &probe, 1, MSG_NOSIGNAL) == 1 ? client.read_until_close(stopping + 2s)
+                                                                          : read_end_t::failed_k;
+        }
         auto const ended = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - stopping);
         expect_true(end == read_end_t::failed_k || end == read_end_t::closed_k, "the read ended as {} after {} ms",
                     static_cast<int>(end), ended.count());
