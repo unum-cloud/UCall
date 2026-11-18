@@ -146,11 +146,11 @@ struct epoll_readiness {
     ucall_status_t open(std::size_t capacity) noexcept {
         if (st::failed(events.resize(capacity))) return ucall_status_out_of_memory_k;
         rebound_allocator<byte_t> const allocator {events.get_allocator()};
-        st::expected<watches_t> made_watches = watches_t::make(capacity, allocator);
-        st::expected<watch_index_t> made_index = watch_index_t::make(capacity, {}, allocator);
-        if (!made_watches || !made_index) return ucall_status_out_of_memory_k;
-        watches = std::move(*made_watches);
-        watch_index = std::move(*made_index);
+        auto [new_watches, watches_status] = watches_t::make(capacity, allocator);
+        auto [new_index, index_status] = watch_index_t::make(capacity, {}, allocator);
+        if (st::failed(watches_status) || st::failed(index_status)) return ucall_status_out_of_memory_k;
+        watches = std::move(new_watches);
+        watch_index = std::move(new_index);
         if (descriptor < 0) descriptor = epoll_create1(EPOLL_CLOEXEC);
         return descriptor < 0 ? ucall_status_io_k : ucall_status_success_k;
     }

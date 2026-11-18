@@ -9,6 +9,7 @@
 #![allow(dead_code, reason = "the Shared Testing region is the same in every sibling library, used or not")]
 
 use std::fs::{File, OpenOptions};
+#[cfg(not(target_vendor = "apple"))]
 use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{self, Receiver};
@@ -183,7 +184,12 @@ pub fn direct_directory(name: &str) -> ScratchDirectory {
 
 /// Opens `path` for the unbuffered reads a file part requires.
 pub fn open_direct(path: &Path) -> File {
-    OpenOptions::new().read(true).custom_flags(libc::O_DIRECT).open(path).unwrap()
+    let mut options = OpenOptions::new();
+    options.read(true);
+    // Darwin has no `O_DIRECT`: queuing the part sets `F_NOCACHE` on the descriptor itself.
+    #[cfg(not(target_vendor = "apple"))]
+    options.custom_flags(libc::O_DIRECT);
+    options.open(path).unwrap()
 }
 
 /// `length` bytes cycling through a prime period, so a misplaced range shows.

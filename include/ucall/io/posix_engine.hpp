@@ -70,10 +70,10 @@ struct poll_readiness {
         clear();
         if (st::failed(polled.reserve(capacity)) || st::failed(waiters.reserve(capacity)))
             return ucall_status_out_of_memory_k;
-        st::expected<position_index_t> made = position_index_t::make(
-            capacity, {}, rebound_allocator<byte_t> {polled.get_allocator()});
-        if (!made) return ucall_status_out_of_memory_k;
-        positions = std::move(*made);
+        auto [fresh_positions, status] = position_index_t::make(capacity, {},
+                                                                rebound_allocator<byte_t> {polled.get_allocator()});
+        if (st::failed(status)) return ucall_status_out_of_memory_k;
+        positions = std::move(fresh_positions);
         return ucall_status_success_k;
     }
 
