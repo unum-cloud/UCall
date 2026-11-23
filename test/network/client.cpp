@@ -113,7 +113,7 @@ struct scripted_server_t {
                                                connection, answered++);
                     answered_bytes += length;
                     if (!answer.bytes.empty())
-                        open = peer.write(uc::byte_span(answer.bytes), answer.bytes.size(), generator,
+                        open = peer.write(byte_span(answer.bytes), answer.bytes.size(), generator,
                                           steady_clock::now() + wait_limit_k);
                     if (answer.after != after_answer_t::close_k) continue;
                     ::shutdown(peer.descriptor, SHUT_WR);
@@ -142,7 +142,7 @@ static bool submit(fixture_t& fixture, scripted_call_t& planned) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(planned.url);
+    call.url = bytes_view(planned.url);
     call.verb = planned.verb;
     call.context = &planned;
     call.headers = planned.header.length ? &planned.header : nullptr;
@@ -214,11 +214,10 @@ static void test_caller_close_mid_pipeline(sweep_cell_t const& cell, split_mix_g
     if (!expect_true(fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
                      ucall_status_name(fixture.status)))
         return;
-    std::array<scripted_call_t, 4> plan {
-        {{server.url("/a"), ucall_verb_get_k, "/a"},
-         {server.url("/b"), ucall_verb_get_k, "/b", uc::bytes_view("Connection: close")},
-         {server.url("/c"), ucall_verb_get_k, "/c"},
-         {server.url("/d"), ucall_verb_get_k, "/d"}}};
+    std::array<scripted_call_t, 4> plan {{{server.url("/a"), ucall_verb_get_k, "/a"},
+                                          {server.url("/b"), ucall_verb_get_k, "/b", bytes_view("Connection: close")},
+                                          {server.url("/c"), ucall_verb_get_k, "/c"},
+                                          {server.url("/d"), ucall_verb_get_k, "/d"}}};
     exchange_all(fixture, plan);
     server.stop();
     expect_true(server.requests_per_connection == (std::vector<std::size_t> {2, 2}),
@@ -395,7 +394,7 @@ static void test_client_log_lines(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_get_k;
     call.options.max_retries = 1;
     ucall_client_call(&call);
@@ -473,11 +472,9 @@ static void test_client_response_fields(sweep_cell_t const& cell, split_mix_gene
     submit(fixture, planned);
     auto const completed = fixture.wait();
     if (!expect_true(completed.response, "the call completed {}", ucall_status_name(completed.outcome.status))) return;
-    std::size_t count = 0;
+    std::size_t const count = ucall_client_response_fields_count(completed.response);
     ucall_outcome_t outcome {};
-    ucall_client_response_fields_count_t counting {completed.response, &outcome, &count};
-    ucall_client_response_fields_count(&counting);
-    expect_true(outcome.status == ucall_status_success_k && count == 4, "{} fields", count);
+    expect_true(count == 4, "{} fields", count);
     std::string read;
     for (std::size_t index = 0; index <= count; ++index) {
         ucall_bytes_view_t name {}, value {};
@@ -488,7 +485,7 @@ static void test_client_response_fields(sweep_cell_t const& cell, split_mix_gene
                         ucall_status_name(outcome.status));
             break;
         }
-        read += fmt::format("{}={};", uc::text_view(name), uc::text_view(value));
+        read += fmt::format("{}={};", text_view(name), text_view(value));
     }
     expect_true(read == "set-cookie=a=1;content-length=2;x-mixed=spaced;set-cookie=b=2;", "read {}", read);
     ucall_client_response_free(completed.response);
@@ -543,22 +540,21 @@ static void test_receive_follows_early_response(sweep_cell_t const& cell, split_
         };
         std::size_t const head = read_head(0);
         std::string const early = answer_ok("early").bytes, late = answer_ok("late").bytes;
-        if (head == std::string::npos || !peer.write(uc::byte_span(early), early.size(), peer_generator, deadline))
-            return;
+        if (head == std::string::npos || !peer.write(byte_span(early), early.size(), peer_generator, deadline)) return;
         // The client reads the response and arms its next receive before the request ends.
         std::this_thread::sleep_for(100ms);
         if (peer.read(head + body.size(), deadline) != read_end_t::filled_k) return;
         if (read_head(head + body.size()) == std::string::npos) return;
-        [[maybe_unused]] bool const written = peer.write(uc::byte_span(late), late.size(), peer_generator, deadline);
+        [[maybe_unused]] bool const written = peer.write(byte_span(late), late.size(), peer_generator, deadline);
     }};
     auto call = [&](ucall_verb_t verb, std::string_view sent, std::string_view expected) {
         ucall_outcome_t outcome {};
         ucall_client_call_t arguments {};
         arguments.client = fixture.client;
         arguments.outcome = &outcome;
-        arguments.url = uc::bytes_view(url);
+        arguments.url = bytes_view(url);
         arguments.verb = verb;
-        arguments.body = uc::bytes_view(sent);
+        arguments.body = bytes_view(sent);
         ucall_client_call(&arguments);
         expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
         auto const completed = fixture.wait();
@@ -587,7 +583,7 @@ static ucall_client_t counted_client(allocation_ledger_t& ledger, sweep_cell_t c
     config.max_concurrent_connections = 1;
     config.backend = cell.backend;
     ucall_client_init_t init {&client, &outcome, &config, nullptr};
-    counted_network_t::client_t::client_init(&init, counting_allocator<uc::byte_t> {ledger});
+    counted_network_t::client_t::client_init(&init, counting_allocator<byte_t> {ledger});
     return outcome.status == ucall_status_success_k ? client : nullptr;
 }
 
@@ -597,7 +593,7 @@ static ucall_completed_call_t counted_call(ucall_client_t client, std::string co
     ucall_client_call_t call {};
     call.client = client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_get_k;
     ucall_client_call(&call);
     ucall_completed_call_t completed {};
@@ -617,7 +613,7 @@ struct bound_front_t {
     ucall_client_t bound {};
     std::string upstream_url {};
     ucall_received_http_request_t held {};
-    static void forward(ucall_received_http_request_t request, void* context) {
+    static void forward(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& front = *static_cast<bound_front_t*>(context);
         expect_true(!front.held, "a second request arrived while one is held");
         front.held = request;
@@ -625,9 +621,9 @@ struct bound_front_t {
         ucall_client_call_t call {};
         call.client = front.bound;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(front.upstream_url);
+        call.url = bytes_view(front.upstream_url);
         call.verb = ucall_verb_post_k;
-        call.body = uc::bytes_view("upstream says hi");
+        call.body = bytes_view("upstream says hi");
         ucall_client_call(&call);
         expect_true(outcome.status == ucall_status_success_k, "the bound call was refused: {}",
                     ucall_status_name(outcome.status));
@@ -642,7 +638,7 @@ static void test_bound_client_calls_from_handler(sweep_cell_t const& cell) {
     front.upstream_url = fmt::format("{}/echo/1", upstream.url);
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
     ucall_server_options_t config {}, resolved {};
     config.interfaces = &network_interface;
@@ -652,7 +648,7 @@ static void test_bound_client_calls_from_handler(sweep_cell_t const& cell) {
     ucall_server_init_t init {&front.server, &outcome, &config, &resolved};
     ucall_server_init(&init);
     if (!expect_true(outcome.status == ucall_status_success_k, "front: {}", ucall_status_name(outcome.status))) return;
-    ucall_server_add_http_endpoint_t add {front.server,           &outcome, uc::bytes_view("/front"), ucall_verb_any_k,
+    ucall_server_add_http_endpoint_t add {front.server,           &outcome, bytes_view("/front"), ucall_verb_any_k,
                                           bound_front_t::forward, &front};
     ucall_server_add_http_endpoint(&add);
     expect_true(outcome.status == ucall_status_success_k);
@@ -673,11 +669,11 @@ static void test_bound_client_calls_from_handler(sweep_cell_t const& cell) {
     ucall_server_free(front.server);
     expect_true(front.bound, "the server freed under its bound client");
     if (front.bound) {
-        std::string const url = fmt::format("http://{}/front", uc::text_view(resolved.interfaces[0].address));
+        std::string const url = fmt::format("http://{}/front", text_view(resolved.interfaces[0].address));
         ucall_client_call_t call {};
         call.client = upstream.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_get_k;
         ucall_client_call(&call);
         expect_true(outcome.status == ucall_status_success_k);
@@ -699,7 +695,7 @@ static void test_bound_client_calls_from_handler(sweep_cell_t const& cell) {
             }
             expect_true(front.held && upstream_answer.outcome.status == ucall_status_success_k,
                         "the upstream call ended with {}", ucall_status_name(upstream_answer.outcome.status));
-            ucall_server_reply_content_t reply {front.server, &outcome, front.held, ucall_http_status_ok_k,
+            ucall_server_reply_content_t reply {front.server, &outcome, &front.held, ucall_http_status_ok_k,
                                                 nullptr,      0,        body};
             ucall_server_reply_content(&reply);
             expect_true(outcome.status == ucall_status_success_k);
@@ -712,7 +708,7 @@ static void test_bound_client_calls_from_handler(sweep_cell_t const& cell) {
             ucall_bytes_view_t body {};
             ucall_client_response_body_t get {answered.response, &outcome, &body};
             ucall_client_response_body(&get);
-            expect_true(uc::text_view(body) == "upstream says hi", "the front answered {}", uc::text_view(body));
+            expect_true(text_view(body) == "upstream says hi", "the front answered {}", text_view(body));
             ucall_client_response_free(answered.response);
         }
         ucall_client_free(front.bound);
@@ -786,7 +782,7 @@ static bool submit_streamed(fixture_t& fixture, std::string const& url, ucall_se
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = verb;
     call.context = context;
     call.options.security = security;
@@ -847,20 +843,20 @@ struct download_t {
     }
 
     /** Replies with the whole body behind its <tt>content-length</tt>. */
-    static void length(ucall_received_http_request_t request, void* context) {
+    static void length(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& download = *static_cast<download_t*>(context);
         ucall_outcome_t outcome {};
         ucall_server_reply_content_t reply {
-            download.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view(download.body)};
+            download.server, &outcome, &request, ucall_http_status_ok_k, nullptr, 0, bytes_view(download.body)};
         ucall_server_reply_content(&reply);
         expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
     }
 
     /** Replies with the body in chunks of every size in @c parts. */
-    static void chunked(ucall_received_http_request_t request, void* context) {
+    static void chunked(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& download = *static_cast<download_t*>(context);
         ucall_outcome_t outcome {};
-        ucall_server_reply_begin_t begin {download.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0};
+        ucall_server_reply_begin_t begin {download.server, &outcome, &request, ucall_http_status_ok_k, nullptr, 0};
         ucall_server_reply_begin(&begin);
         expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
         ucall_server_reply_append_t append {download.server, &outcome, request, download.parts.data(),
@@ -868,7 +864,7 @@ struct download_t {
         ucall_server_reply_append(&append);
         expect_true(outcome.status == ucall_status_success_k, "append: {}", ucall_status_name(outcome.status));
         ucall_outcome_t ended {};
-        ucall_server_reply_end_t end {download.server, &ended, request};
+        ucall_server_reply_end_t end {download.server, &ended, &request};
         ucall_server_reply_end(&end);
         expect_true(ended.status == ucall_status_success_k, "end: {}", ucall_status_name(ended.status));
     }
@@ -885,7 +881,7 @@ static void test_streamed_download(sweep_cell_t const& cell, split_mix_generator
     for (auto [route, callback] :
          {std::pair {"/download/length", &download_t::length}, std::pair {"/download/chunked", &download_t::chunked}}) {
         ucall_outcome_t outcome {};
-        ucall_server_add_http_endpoint_t add {fixture.server,   &outcome, uc::bytes_view(route),
+        ucall_server_add_http_endpoint_t add {fixture.server,   &outcome, bytes_view(route),
                                               ucall_verb_get_k, callback, &download};
         ucall_server_add_http_endpoint(&add);
         if (!expect_true(outcome.status == ucall_status_success_k, "route: {}", ucall_status_name(outcome.status)))

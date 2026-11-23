@@ -25,7 +25,7 @@ static case_result_t test_slice_waits_a_round() {
         if (!expect_true(descriptor >= 0)) return {};
         sockets.client = -1;
         byte_t const message[16] {byte_t {7}};
-        auto deadline = deadline_after(1000000);
+        auto deadline = util::deadline_after(1000000);
         io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = descriptor};
         io_completion_t completed[2] {};
         engine.submit(receiving);
@@ -79,13 +79,13 @@ static case_result_t test_paused_receive() {
         engine.submit(receiving);
         if (!expect_true(send_all(held.peer, span<byte_t const> {payload}.first(original)))) return {};
         io_completion_t completed[2] {};
-        if (!expect_true(engine.poll(completed, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return {};
+        if (!expect_true(engine.poll(completed, io_wait_t::blocking_k, util::deadline_after(1000000)) == 1)) return {};
         if (!expect_true(completed[0].result > 0, "receiving ended with {}", completed[0].result)) return {};
         auto received = static_cast<std::size_t>(completed[0].result);
         expect_true(std::memcmp(completed[0].data, payload.data(), received) == 0);
 
         auto* owner = engine.socket_slots.find(first);
-        auto deadline = deadline_after(1000000);
+        auto deadline = util::deadline_after(1000000);
         while (owner->backlog.empty()) {
             auto const spare = span<io_completion_t> {completed}.subspan(1);
             expect_true(engine.poll(spare, io_wait_t::nonblocking_k) == 0);
@@ -123,7 +123,7 @@ static case_result_t test_paused_receive() {
         expect_true(completed[0].request == &independent && completed[0].result == -ECANCELED && !completed[0].lease);
 
         while (received != payload.size()) {
-            receiving.deadline = deadline_after(1000000);
+            receiving.deadline = util::deadline_after(1000000);
             engine.submit(receiving);
             if (!expect_true(engine.poll(completed, io_wait_t::blocking_k, receiving.deadline) == 1)) return {};
             if (!expect_true(completed[0].request == &receiving && completed[0].result > 0, "receiving ended with {}",

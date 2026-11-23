@@ -94,6 +94,9 @@ struct transport {
     /** Why the transport closes, as the last @c fail set it; success until then. */
     ucall_status_t status {ucall_status_success_k};
 
+    /** The tunnel fault's static name when the failure was a tunnel's, else null. */
+    char const* note {};
+
     /** When the requests it emits time out, or zero: a client's connect or oldest call, a server's
      *  linger or release. */
     std::uint64_t deadline {};
@@ -174,6 +177,7 @@ struct transport {
         deadline = 0;
         peer_stream = peer_stream_t::writing_k;
         auto fault = tunnel.make(config);
+        note = fault != secure_tunnel_fault_t::none_k ? tunnel::secure_tunnel_fault_name(fault) : nullptr;
         if (fault != secure_tunnel_fault_t::none_k) return ucall_status_handshake_failed_k;
         if (!page_size()) return ucall_status_io_k;
         return ucall_status_success_k;
@@ -436,6 +440,9 @@ struct transport {
         if (interface_statistics && error == ucall_status_handshake_failed_k)
             tally<atomic_ref>(interface_statistics->handshake_failures);
         status = error;
+        note = error == ucall_status_handshake_failed_k && tunnel.fault() != secure_tunnel_fault_t::none_k
+                   ? tunnel::secure_tunnel_fault_name(tunnel.fault())
+                   : nullptr;
         // A close already submitted or done keeps its stage, and only the status is newer.
         if (stage != transport_stage_t::closing_socket_k && stage != transport_stage_t::closed_holding_k &&
             stage != transport_stage_t::closed_k)

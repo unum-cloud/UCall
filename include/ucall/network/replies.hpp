@@ -33,6 +33,7 @@ using tunnel::secure_tunnel_geometry_t;
 using tunnel::secure_tunnel_overhead_k;
 using utilities::allocate_unique;
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::close_native_file;
 using utilities::descriptor_t;
 using utilities::direct_alignment_of;
@@ -337,9 +338,11 @@ struct replies {
         exchange.declared = exchange.streamed = 0;
         exchange.framing = reply_framing_t::bodiless_k;
         exchange.reply_head = reply_head_t::pushed_k;
+        // A peer that left takes no body, so the reply ends here, as a whole reply's would.
         if ((state.load(std::memory_order_acquire) & detached_k) ||
             formatting_t::server_stage(exchange) == server_stage_t::cutting_k) {
-            state.set_bits(detached_k, std::memory_order_release);
+            state.set_bits(detached_k | replied_k, std::memory_order_release);
+            abandon_reply(exchange);
             return ucall_status_connection_closed_k;
         }
         std::optional<std::uint64_t> declared;

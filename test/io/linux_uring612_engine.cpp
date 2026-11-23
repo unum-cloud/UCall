@@ -30,7 +30,7 @@ static case_result_t test_provides_past_two_buffers() {
         std::vector<byte_t> chunk(65536, byte_t {7});
         std::vector<io_completion_t> lent;
         io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = socket};
-        auto const deadline = deadline_after(10000000);
+        auto const deadline = util::deadline_after(10000000);
         while (provided.provided_buffers == 2) {
             if (!expect_true(send_all(sockets.peer, chunk))) return {};
             for (std::size_t landed = 0; landed != chunk.size();) {

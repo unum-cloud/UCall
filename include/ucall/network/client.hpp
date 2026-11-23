@@ -44,6 +44,7 @@ using tunnel::secure_tunnel_tailroom_k;
 using utilities::allocate_unique;
 using utilities::allocator_delete;
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::bytes_view;
 using utilities::deadline_after;
 using utilities::largest_receive_buffer;
@@ -662,13 +663,14 @@ struct client : ucall_client_handle_t {
                                                                             : ucall_status_success_k;
     }
     static void finish_exchange(client_t& client, client_exchange_t& exchange, ucall_status_t status,
-                                response_t* response = nullptr) noexcept {
+                                response_t* response = nullptr, char const* note = nullptr) noexcept {
         // Every completed call was admitted, and admission stops at the ring's capacity.
         [[maybe_unused]] st::status_t const pushed = client.completed.push(
-            st::assume_reserved,
-            ucall_completed_call_t {exchange.arguments.context,
-                                    {status, status == ucall_status_success_k ? nullptr : ucall_status_name(status)},
-                                    response ? &response->received : nullptr});
+            st::assume_reserved, ucall_completed_call_t {exchange.arguments.context,
+                                                         {status, status == ucall_status_success_k ? nullptr
+                                                                  : note ? note
+                                                                         : ucall_status_name(status)},
+                                                         response ? &response->received : nullptr});
         exchange.address_index = 0;
         exchange.redirect.clear();
         exchange.redirect_headers.clear();
@@ -1098,7 +1100,8 @@ struct client : ucall_client_handle_t {
             result = dial_connection(client, connection, exchange);
             if (result != ucall_status_success_k) pop_call(connection);
         }
-        if (result != ucall_status_success_k) finish_exchange(client, exchange, result);
+        if (result != ucall_status_success_k)
+            finish_exchange(client, exchange, result, nullptr, connection.transport.note);
         credit_room(client, connection);
     }
 
@@ -1511,7 +1514,9 @@ struct client : ucall_client_handle_t {
                 exchange.address_index = 0;
                 queue_call(client, exchange);
             }
-            if (exchange.stage != client_exchange_stage_t::waiting_k) finish_exchange(client, exchange, outcome);
+            if (exchange.stage != client_exchange_stage_t::waiting_k)
+                finish_exchange(client, exchange, outcome, nullptr,
+                                outcome == status ? connection.transport.note : nullptr);
         }
     }
 
@@ -1905,6 +1910,46 @@ struct client : ucall_client_handle_t {
         ++client.admitted;
         publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
     }
+
+    /** Whether the caller's thread drives @p client: it owns its engine, which has not failed, as
+     *  a bound client's loop advances it instead. */
+    static bool drives(client_t const& client) noexcept {
+        return client.failure == ucall_status_success_k && client.binding == client_binding_t::owned_k;
+    }
+
+    /** One poll of an owned client's engine, waiting for I/O when @p wait blocks, until @p deadline
+     *  or the client's own @p next_deadline, either zero meaning none, which it then advances. An
+     *  engine failure ends every call, so their completions are queued. */
+    static void poll_round(client_t& client, io_wait_t wait, std::uint64_t deadline,
+                           std::uint64_t& next_deadline) noexcept {
+        auto round_deadline = deadline && next_deadline ? fu::min_of(next_deadline, deadline)
+                              : deadline                ? deadline
+                                                        : next_deadline;
+        int count = client.engine->poll(span<io_completion_t> {client.completions}, wait, round_deadline);
+        if (count < 0) {
+            client.failure = ucall_status_io_k;
+            client.owned_engine.stop();
+            abandon_calls(client);
+            return;
+        }
+        for (int i = 0; i != count; ++i) step_completion(client, client.completions[static_cast<std::size_t>(i)]);
+        next_deadline = client_progress(client);
+    }
+
+    /** Moves the oldest finished call submitted with @p context into @p call, the calls finished
+     *  before it keeping their order, and answers whether one was there. */
+    static bool take_finished(client_t& client, void* context, ucall_completed_call_t& call) noexcept {
+        for (std::size_t index = 0; index != client.completed.size(); ++index) {
+            if (client.completed[index].context != context) continue;
+            call = client.completed[index];
+            for (; index; --index) client.completed[index] = client.completed[index - 1];
+            client.completed.pop();
+            --client.admitted;
+            return true;
+        }
+        return false;
+    }
+
     static void client_take_completed(ucall_client_take_completed_t* arguments) noexcept {
         if (arguments->count) *arguments->count = 0;
         if (!arguments->count || (arguments->capacity && !arguments->calls)) {
@@ -1914,26 +1959,14 @@ struct client : ucall_client_handle_t {
         auto& client = *static_cast<client_t*>(arguments->client);
         auto deadline = arguments->timeout_microseconds ? deadline_after(arguments->timeout_microseconds) : 0;
         // A bound client's loop advances it, so taking only pops what it finished.
-        if (client.failure == ucall_status_success_k && client.binding == client_binding_t::owned_k) {
+        if (drives(client)) {
             auto next_deadline = client_progress(client);
             do {
-                auto round_deadline = deadline && next_deadline ? fu::min_of(next_deadline, deadline)
-                                      : deadline                ? deadline
-                                                                : next_deadline;
                 auto wait = arguments->timeout_microseconds && client.admitted && client.completed.empty()
                                 ? io_wait_t::blocking_k
                                 : io_wait_t::nonblocking_k;
-                int count = client.engine->poll(span<io_completion_t> {client.completions}, wait, round_deadline);
-                if (count < 0) {
-                    client.failure = ucall_status_io_k;
-                    client.owned_engine.stop();
-                    abandon_calls(client);
-                    break;
-                }
-                for (int i = 0; i != count; ++i)
-                    step_completion(client, client.completions[static_cast<std::size_t>(i)]);
-                next_deadline = client_progress(client);
-            } while (client.completed.empty() && client.admitted && arguments->timeout_microseconds &&
+                poll_round(client, wait, deadline, next_deadline);
+            } while (client.completed.empty() && client.admitted && drives(client) && arguments->timeout_microseconds &&
                      monotonic_ns() < deadline);
         }
         std::size_t const count = client.completed.pop_many({arguments->calls, arguments->capacity});
@@ -1941,9 +1974,31 @@ struct client : ucall_client_handle_t {
         *arguments->count = count;
         publish<atomic_ref>(arguments->outcome, count ? ucall_status_success_k : client.failure);
     }
+    static void client_take_completed_call(ucall_client_take_completed_call_t* arguments) noexcept {
+        if (!arguments->call) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
+            return;
+        }
+        auto& client = *static_cast<client_t*>(arguments->client);
+        auto deadline = arguments->timeout_microseconds ? deadline_after(arguments->timeout_microseconds) : 0;
+        bool taken = take_finished(client, arguments->context, *arguments->call);
+        if (!taken && drives(client)) {
+            auto next_deadline = client_progress(client);
+            // Every admitted call finishes by its own deadline, so the wait needs none of its own.
+            while (!taken && client.admitted != client.completed.size() && drives(client) &&
+                   (!deadline || monotonic_ns() < deadline)) {
+                poll_round(client, io_wait_t::blocking_k, deadline, next_deadline);
+                taken = take_finished(client, arguments->context, *arguments->call);
+            }
+        }
+        if (taken) return publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
+        publish<atomic_ref>(arguments->outcome, client.admitted != client.completed.size() ? ucall_status_would_block_k
+                                                                                           : ucall_status_not_found_k);
+    }
 
     /** The C entry points every client handle dispatches through. */
-    inline static client_api_t const client_api_k {&client_free, &client_call, &client_take_completed};
+    inline static client_api_t const client_api_k {&client_free, &client_call, &client_take_completed,
+                                                   &client_take_completed_call};
 };
 
 } // namespace unum::ucall::network

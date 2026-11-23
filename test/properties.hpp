@@ -32,7 +32,15 @@
 #include "ucall/network.hpp"         // `serial_network`
 #endif
 
+namespace uc = unum::ucall;
+
 namespace unum::ucall::test {
+
+using util::byte_span;
+using util::byte_t;
+using util::bytes_view;
+using util::span;
+using util::text_view;
 
 /** A heap copy of @p input sized to it, so reading one byte past it is an ASan report. */
 struct exact_copy_t {
@@ -221,7 +229,7 @@ inline std::size_t reference_route(std::vector<reference_route_t> const& routes,
  */
 [[nodiscard]] inline std::size_t check_route_match(span<std::string_view const> templates,
                                                    span<ucall_verb_t const> verbs, span<std::string_view const> paths) {
-    uc::http::route_trie_t trie {st::default_allocator<uc::byte_t> {}};
+    uc::http::route_trie_t trie {st::default_allocator<byte_t> {}};
     if (trie.init() != ucall_status_success_k) return 1;
     std::vector<std::string> copies;
     copies.reserve(templates.size() + paths.size());
@@ -258,7 +266,7 @@ using property_message_t =
  *  @c / and keeps no fragment, a host, and a port in range. */
 [[nodiscard]] inline std::size_t check_url(std::string_view url) {
     exact_copy_t const copy {byte_span(url)};
-    property_exchange_t first {st::default_allocator<uc::byte_t> {}};
+    property_exchange_t first {st::default_allocator<byte_t> {}};
     first.arguments.url = {reinterpret_cast<ucall_byte_t const*>(copy.bytes.get()), copy.size};
     if (property_client_t::parse_url(first) != ucall_status_success_k) return 0;
     std::string_view const authority = uc::http::text_view(first.authority), target = uc::http::text_view(first.target);
@@ -266,7 +274,7 @@ using property_message_t =
                                 uc::http::text_view(first.host).size() <= 1 || !first.port;
     std::string const spelled = fmt::format("{}://{}{}", url.substr(0, url.find("://")),
                                             authority.substr(0, authority.size() - 1), target);
-    property_exchange_t second {st::default_allocator<uc::byte_t> {}};
+    property_exchange_t second {st::default_allocator<byte_t> {}};
     second.arguments.url = bytes_view(spelled);
     disagreements += property_client_t::parse_url(second) != ucall_status_success_k ||
                      uc::http::text_view(second.authority) != authority ||
@@ -291,7 +299,7 @@ using property_message_t =
     // The client reads the field trimmed, so a reference counts as relative by what it reads.
     std::string_view const read = message.header(response, "location");
     if (read.find("://") != std::string_view::npos || read.starts_with("//")) return 0;
-    property_exchange_t exchange {st::default_allocator<uc::byte_t> {}};
+    property_exchange_t exchange {st::default_allocator<byte_t> {}};
     exchange.arguments.url = bytes_view(base);
     if (property_client_t::parse_url(exchange) != ucall_status_success_k) return 1;
     std::string const authority {uc::http::text_view(exchange.authority)};

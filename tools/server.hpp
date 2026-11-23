@@ -10,22 +10,28 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint16_t`, `std::uint64_t`
 #include <cstdio>  // `stdout`, `stderr`, `std::fflush`
+#include <cstring> // `std::memcpy`
 
-#include <algorithm>        // `std::min`, `std::find_if`
-#include <chrono>           // `std::chrono::milliseconds`
+#include <algorithm>        // `std::find_if`
+#include <chrono>           // `std::chrono::milliseconds`, `std::chrono::microseconds`
 #include <initializer_list> // `std::initializer_list`
 #include <limits>           // `std::numeric_limits`
+#include <span>             // `std::span`
 #include <string_view>      // `std::string_view`
 #include <thread>           // `std::this_thread::sleep_for`
+#include <utility>          // `std::move`
 
 #include <fmt/format.h>          // `fmt::print`, `fmt::format_to_n`, `fmt::format_to`, `fmt::basic_memory_buffer`
 #include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`, `fu_pool_capabilities`
 
-#include "ucall/utilities/types.hpp" // `bytes_view`, `st::status_t`
+#include "ucall/ucall.hpp"           // `server_t`, `request_t`, `batch_endpoint_t`, `status_t`
+#include "ucall/utilities/types.hpp" // `bytes_view`, `st::vector`
 
-#include "arguments.hpp" // `parse_count`, `parse_key`, `admit_any_peer`, `process_clocks_t`
+#include "arguments.hpp" // `parse_count`, `parse_key`, `process_clocks_t`
 
 namespace unum::ucall::tools {
+
+using util::bytes_view;
 
 /** Set by the first SIGINT or SIGTERM, or by a failing loop; the main thread checks it every
  *  100 ms, and the server answers what it holds before the process exits. */
@@ -38,24 +44,6 @@ inline void request_stop(int) noexcept {
     std::signal(SIGTERM, SIG_DFL);
 }
 
-/** Answers @p request with an error @p status and @p message as its body. */
-inline void reply_error(ucall_server_t server, ucall_received_http_request_t request, ucall_http_status_t status,
-                        std::string_view message) noexcept {
-    ucall_outcome_t outcome {};
-    ucall_server_reply_error_t reply {server, &outcome, request, status, bytes_view(message)};
-    ucall_server_reply_error(&reply);
-}
-
-/** Answers a failed storage @p status, 409 for a conflict a retry can overcome and 503 for
- *  the rest; true once it replied. */
-inline bool reply_error(ucall_server_t server, ucall_received_http_request_t request, st::status_t status) noexcept {
-    if (st::succeeded(status)) return false;
-    if (st::conflicted(status))
-        reply_error(server, request, ucall_http_status_conflict_k, "Concurrent transaction; read and retry\n");
-    else reply_error(server, request, ucall_http_status_service_unavailable_k, "Storage unavailable\n");
-    return true;
-}
-
 /** Human-readable lines, or one JSON object, for the counters printed at exit. */
 enum class statistics_format_t { human_k, json_k };
 
@@ -65,48 +53,50 @@ struct count_flag_t {
     std::size_t& value;
 };
 
+/** The flags, the server and the polling threads every native service shares: @c init parses the
+ *  command line and starts the server, the service registers its routes on @c server, and @c run
+ *  polls every event loop and batch endpoint until a signal. */
 struct server_t {
     fu_pool_t pool {};
     fu_generation_t generation {};
-    st::vector<ucall_outcome_t> outcomes;
-    ucall_server_t server {};
+    st::vector<status_t> statuses;
+    ucall::server_t server {};
     std::size_t event_loops {};
     std::size_t connections {1024}, pipelined_requests {1};
 
-    /** Each gets its own polling thread. */
-    st::vector<ucall_http_batch_endpoint_t> batch_endpoints;
-    std::size_t min_batch_size {}, max_batch_size {}, max_latency_microseconds {}; // Zeros take the defaults.
+    /** The command line's batch budgets, which zeros leave to the library. */
+    batching_t batching {};
+
+    /** Each gets its own polling thread, named once @c run starts. */
+    std::span<batch_endpoint_t const> batch_endpoints {};
     statistics_format_t statistics_format {statistics_format_t::human_k};
 
     /** Read when the loops start, so the report spans the server's life. */
     process_clocks_t serving {};
-    ucall_network_interface_t network_interface {};
+    interface_t network_interface {};
     ucall_bytes_view_t reply_directory {};
     ucall_noise_key_t private_key {};
     char address[sizeof("[ffff:ffff:ffff:ffff:ffff:ffff:255.255.255.255]:65535")] {};
 
-    static bool succeeded(ucall_outcome_t const& outcome) {
-        if (outcome.status == ucall_status_success_k) return true;
-        fmt::print(stderr, "{}{}{}\n", ucall_status_name(outcome.status), outcome.message ? ": " : "",
-                   outcome.message ? outcome.message : "");
+    /** Admits every client key, as Noise XX needs a vetter and the services trust any. */
+    struct any_peer_t {
+        bool operator()(ucall_noise_key_t const&) const noexcept { return true; }
+    } any_peer {};
+
+    static bool succeeded(status_t status) {
+        if (!status.failed()) return true;
+        std::string_view const name = status_name(status.code);
+        fmt::print(stderr, "{}{}{}\n", name, status.note ? ": " : "", status.note ? status.note : "");
         return false;
     }
-    static void health(ucall_received_http_request_t request, void* context) {
-        ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {*static_cast<ucall_server_t*>(context),
-                                            &outcome,
-                                            request,
-                                            ucall_http_status_ok_k,
-                                            nullptr,
-                                            0,
-                                            bytes_view("ready\n")};
-        ucall_server_reply_content(&reply);
+    static void health(request_t request) noexcept {
+        [[maybe_unused]] status_t const replied = std::move(request).reply(ucall_http_status_ok_k, {}, "ready\n");
     }
     int init(int argc, char** argv, std::initializer_list<count_flag_t> counts = {}) {
-        ucall_server_options_t config {};
-        config.cpu_class_ceiling = ucall_cpu_class_serial_k;
+        server_options_t options {.cpu_class_ceiling = ucall_cpu_class_serial_k};
         std::size_t threads = 1;
         std::size_t port = 8545;
+        std::size_t latency_microseconds = 0;
         std::string_view host {"127.0.0.1"};
         std::string_view key {};
         for (int i = 1; i != argc; ++i) {
@@ -138,7 +128,6 @@ struct server_t {
             }
             else if (i + 1 != argc) value = argv[++i];
             bool valid {};
-            ucall_bytes_view_t const name = bytes_view(value);
             std::initializer_list<count_flag_t>::iterator const extra = std::find_if(
                 counts.begin(), counts.end(), [&](count_flag_t const& count) { return count.name == flag; });
             if (flag == "--port")
@@ -151,12 +140,12 @@ struct server_t {
             else if (flag == "--connections") valid = parse_count(value, connections, 1);
             else if (flag == "--pipelined-requests") valid = parse_count(value, pipelined_requests, 1);
             else if (flag == "--reply-directory") {
-                reply_directory = name;
+                reply_directory = bytes_view(value);
                 valid = !value.empty();
             }
-            else if (flag == "--batch-min") valid = parse_count(value, min_batch_size, 1);
-            else if (flag == "--batch-max") valid = parse_count(value, max_batch_size, 1);
-            else if (flag == "--batch-latency-us") valid = parse_count(value, max_latency_microseconds, 1);
+            else if (flag == "--batch-min") valid = parse_count(value, batching.min_batch_size, 1);
+            else if (flag == "--batch-max") valid = parse_count(value, batching.max_batch_size, 1);
+            else if (flag == "--batch-latency-us") valid = parse_count(value, latency_microseconds, 1);
             else if (flag == "--key") {
                 key = value;
                 valid = parse_key(value, private_key);
@@ -171,34 +160,27 @@ struct server_t {
                 valid = value == "human" || value == "json";
                 statistics_format = value == "json" ? statistics_format_t::json_k : statistics_format_t::human_k;
             }
-            else if (flag == "--backend") valid = parse_backend(value, config.backend);
-            else if (flag == "--cpu-class-ceiling") valid = parse_cpu_class(value, config.cpu_class_ceiling);
+            else if (flag == "--backend") valid = parse_backend(value, options.backend);
+            else if (flag == "--cpu-class-ceiling") valid = parse_cpu_class(value, options.cpu_class_ceiling);
             else if (extra != counts.end()) valid = parse_count(value, extra->value);
             if (!valid) {
                 fmt::print(stderr, "Invalid argument: {}={}\n", flag, value);
                 return -1;
             }
         }
+        batching.max_latency = std::chrono::microseconds(latency_microseconds);
         if (network_interface.security != ucall_security_none_k) {
-            ucall_noise_key_t public_key {};
-            ucall_outcome_t outcome {};
-            if (!key.empty()) {
-                ucall_noise_key_derive_t derive {&outcome, &private_key, &public_key};
-                ucall_noise_key_derive(&derive);
-            }
-            else {
-                ucall_noise_key_generate_t generate {&outcome, &private_key, &public_key};
-                ucall_noise_key_generate(&generate);
-            }
-            if (outcome.status != ucall_status_success_k) {
-                fmt::print(stderr, "The server key is unavailable: {}\n", outcome.message ? outcome.message : "");
+            auto [keypair, keypair_status] = key.empty() ? noise_key_generate() : noise_key_derive(private_key);
+            if (keypair_status.failed()) {
+                fmt::print(stderr, "The server key is unavailable: {}\n",
+                           keypair_status.note ? keypair_status.note : "");
                 return -1;
             }
+            std::memcpy(private_key, keypair.private_key, sizeof(ucall_noise_key_t));
             fmt::print("Server public key: ");
-            print_key(stdout, public_key);
+            print_key(stdout, keypair.public_key);
             network_interface.noise_private_key = &private_key;
-            if (network_interface.security == ucall_security_noise_xx_k)
-                network_interface.peer_authorizer = admit_any_peer;
+            if (network_interface.security == ucall_security_noise_xx_k) network_interface.peer_authorizer = any_peer;
         }
         std::signal(SIGINT, request_stop);
         std::signal(SIGTERM, request_stop);
@@ -206,80 +188,38 @@ struct server_t {
         bool const bracketed = host.find(':') != host.npos;
         auto const written = bracketed ? fmt::format_to_n(address, sizeof(address) - 1, "[{}]:{}", host, port)
                                        : fmt::format_to_n(address, sizeof(address) - 1, "{}:{}", host, port);
-        *written.out = '\0';
-        network_interface.address = bytes_view(address);
+        network_interface.address = {address, written.out};
         network_interface.max_concurrent_connections = connections;
         network_interface.max_pipelined_requests = pipelined_requests;
         network_interface.event_loops = fu::min_of(threads, connections);
-        if (reply_directory.length) {
-            network_interface.reply_directories = &reply_directory;
-            network_interface.reply_directories_count = 1;
-        }
-        config.interfaces = &network_interface;
-        config.interfaces_count = 1;
-        ucall_outcome_t outcome {};
-        ucall_server_options_t resolved {};
-        ucall_server_init_t init {&server, &outcome, &config, &resolved};
-        ucall_server_init(&init);
-        if (!succeeded(outcome)) return -1;
-        if (!add_endpoint("/health", ucall_verb_get_k, health, &server)) return -1;
-        event_loops = resolved.interfaces[0].event_loops;
-        std::string_view const bound = text_view(resolved.interfaces[0].address);
+        if (reply_directory.length) network_interface.reply_directories = {&reply_directory, 1};
+        interface_t const interfaces[] {network_interface};
+        auto [started, started_status] = ucall::server_t::make(interfaces, options);
+        if (!succeeded(started_status) || !succeeded(started.get<health>("/health"))) return -1;
+        server = std::move(started);
+        event_loops = server.event_loops();
+        auto [bound, bound_status] = server.address(0);
+        if (!succeeded(bound_status)) return -1;
         fmt::print("Listening on {} using {}, {}, {} application-owned serving loops\n", bound,
-                   ucall_io_backend_name(resolved.backend), ucall_cpu_class_name(resolved.cpu_class_ceiling),
-                   event_loops);
+                   io_backend_name(server.backend()), cpu_class_name(server.cpu_class_ceiling()), event_loops);
         std::fflush(stdout); // Scripts read the public key and the address before the server exits.
         return 0;
     }
-
-    /** Registers an individual endpoint, answered on the polling loop that parsed each request. */
-    bool add_endpoint(std::string_view uri_template, ucall_verb_t verb, ucall_received_http_request_callback_t callback,
-                      void* context) {
-        ucall_outcome_t outcome {};
-        ucall_server_add_http_endpoint_t add {server, &outcome, bytes_view(uri_template), verb, callback, context};
-        ucall_server_add_http_endpoint(&add);
-        return succeeded(outcome);
-    }
-
-    /** Registers a batch endpoint under the command line's budgets, drained by its own thread. */
-    bool add_batch_endpoint(std::string_view uri_template, ucall_verb_t verb,
-                            ucall_received_http_batch_callback_t callback, void* context) {
-        ucall_outcome_t outcome {};
-        if (st::failed(batch_endpoints.emplace_back())) return false;
-        ucall_server_add_http_batch_endpoint_t add {server,
-                                                    &outcome,
-                                                    bytes_view(uri_template),
-                                                    verb,
-                                                    callback,
-                                                    context,
-                                                    min_batch_size,
-                                                    max_batch_size,
-                                                    max_latency_microseconds,
-                                                    &batch_endpoints.back()};
-        ucall_server_add_http_batch_endpoint(&add);
-        bool const added = succeeded(outcome);
-        // An endpoint the server refused gets no polling thread.
-        if (!added) batch_endpoints.pop_back();
-        return added;
-    }
     static void serve(void* context, std::size_t index, std::size_t) {
         server_t& application = *static_cast<server_t*>(context);
-        ucall_outcome_t& outcome = application.outcomes[index];
-        if (index < application.event_loops) {
-            ucall_server_take_calls_t serving {application.server, &outcome, index};
-            ucall_server_take_calls(&serving);
-        }
-        else {
-            ucall_http_batch_endpoint_t const endpoint = application.batch_endpoints[index - application.event_loops];
-            ucall_server_take_batches_t draining {application.server, &outcome, endpoint};
-            ucall_server_take_batches(&draining);
-        }
-        if (outcome.status != ucall_status_success_k) stop_requested = 1;
+        status_t& status = application.statuses[index];
+        if (index < application.event_loops) status = application.server.take_calls(index);
+        else status = application.batch_endpoints[index - application.event_loops].take_batches();
+        if (status.failed()) stop_requested = 1;
     }
-    int run() {
+
+    /** Polls every event loop and each of @p batches on a thread of its own until a signal, then
+     *  reports the counters. */
+    int run(std::span<batch_endpoint_t const> batches = {}) {
+        batch_endpoints = batches;
         serving = process_clocks_t::now();
         std::size_t const threads = event_loops + batch_endpoints.size();
-        if (st::failed(outcomes.resize(threads))) {
+        if (st::failed(statuses.resize(threads))) {
             fmt::print(stderr, "No memory for {} polling threads\n", threads);
             return 1;
         }
@@ -294,12 +234,12 @@ struct server_t {
         }
         if (fu_pool_unsafe_for_threads(pool, serve, this, &generation) != fu_success_k) return 1;
         while (!stop_requested) std::this_thread::sleep_for(std::chrono::milliseconds {100});
-        ucall_server_stop(server);
+        server.stop();
         fu_pool_unsafe_join(pool, generation);
         // Every loop drained cleanly only when a signal, not a failure, stopped them.
         int result = exit_stopped_k;
-        for (ucall_outcome_t const& outcome : outcomes)
-            if (!succeeded(outcome)) result = 1;
+        for (status_t const& polled : statuses)
+            if (!succeeded(polled)) result = 1;
         return report() ? result : 1;
     }
 
@@ -340,7 +280,6 @@ struct server_t {
             {"authorizer_refusals", "authorizer refusals", &ucall_event_loop_statistics_t::authorizer_refusals},
             {"shed_connections", "shed connections", &ucall_event_loop_statistics_t::shed_connections},
             {"windows_unpinned", "unpinned windows", &ucall_event_loop_statistics_t::windows_unpinned}};
-        ucall_outcome_t outcome {};
         // Each row composes on the stack and leaves in one write, so no log line splits a row.
         fmt::basic_memory_buffer<char, 4096> row;
         auto emit = [&] {
@@ -349,10 +288,8 @@ struct server_t {
         };
         if (json) fmt::format_to(fmt::appender(row), "{{\"event_loops\":[");
         for (std::size_t index = 0; index != event_loops; ++index) {
-            ucall_event_loop_statistics_t counters {};
-            ucall_server_event_loop_statistics_t query {server, &outcome, index, &counters};
-            ucall_server_event_loop_statistics(&query);
-            if (!succeeded(outcome)) return false;
+            auto [counters, counters_status] = server.event_loop_statistics(index);
+            if (!succeeded(counters_status)) return false;
             if (json) fmt::format_to(fmt::appender(row), "{}{{\"index\":{}", index ? "," : "", index);
             else fmt::format_to(fmt::appender(row), "Event loop {}:", index);
             char const* separator = " ";
@@ -367,10 +304,8 @@ struct server_t {
         }
         if (json) fmt::format_to(fmt::appender(row), "],\"batch_endpoints\":[");
         for (std::size_t index = 0; index != batch_endpoints.size(); ++index) {
-            ucall_batch_endpoint_statistics_t counters {};
-            ucall_server_batch_endpoint_statistics_t query {server, &outcome, batch_endpoints[index], &counters};
-            ucall_server_batch_endpoint_statistics(&query);
-            if (!succeeded(outcome)) return false;
+            auto [counters, counters_status] = batch_endpoints[index].statistics();
+            if (!succeeded(counters_status)) return false;
             if (json)
                 fmt::format_to(fmt::appender(row),
                                "{}{{\"index\":{},\"batches\":{},\"requests\":{},\"filled_batches\":{}," //
@@ -395,10 +330,9 @@ struct server_t {
         return true;
     }
     ~server_t() {
-        ucall_server_stop(server);
+        server.stop();
         if (generation) fu_pool_unsafe_join(pool, generation);
         fu_pool_delete(pool);
-        ucall_server_free(server);
     }
 };
 

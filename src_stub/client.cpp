@@ -9,11 +9,14 @@
  */
 #include "lib.hpp"
 
+namespace util = unum::ucall::utilities;
+
 using namespace unum::ucall;
 using namespace unum::ucall::stub;
 
-using utilities::allocate_unique;
-using utilities::allocator_delete;
+using util::allocate_unique;
+using util::allocator_delete;
+using util::text_view;
 
 /** Whether @p url names a scheme and an authority the engine would parse; @p known reports whether
  *  the scheme is one it speaks. */
@@ -155,6 +158,15 @@ void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     else publish(arguments->outcome, ucall_status_success_k);
 }
 
+void ucall_client_take_completed_call(ucall_client_take_completed_call_t* arguments) {
+    if (!arguments) return;
+    if (arguments->call) *arguments->call = {};
+    if (!admit(arguments->client, arguments->outcome)) return;
+    // No call is ever admitted, so none runs or waits under any context.
+    if (!arguments->call) publish(arguments->outcome, ucall_status_invalid_argument_k);
+    else publish(arguments->outcome, ucall_status_not_found_k);
+}
+
 /*  No call is admitted, so no response exists: past their documented checks, the accessors below
  *  refuse any response handle with @c ucall_status_invalid_argument_k. */
 
@@ -168,11 +180,7 @@ void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     refuse_exchange(valid ? arguments->response : nullptr, arguments->outcome);
 }
 
-void ucall_client_response_fields_count(ucall_client_response_fields_count_t* arguments) {
-    if (!arguments) return;
-    if (arguments->count) *arguments->count = 0;
-    refuse_exchange(arguments->count ? arguments->response : nullptr, arguments->outcome);
-}
+size_t ucall_client_response_fields_count(ucall_received_http_response_t) { return 0; }
 
 void ucall_client_response_field(ucall_client_response_field_t* arguments) {
     if (!arguments) return;

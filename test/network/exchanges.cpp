@@ -23,9 +23,9 @@ static void test_exchanges(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_post_k;
-    call.body = uc::bytes_view(payload);
+    call.body = bytes_view(payload);
     call.options.security = cell.security;
     call.options.noise_peer_key = &fixture.server_public;
     auto exchange = [&](std::string_view expected) {
@@ -74,10 +74,10 @@ static void test_exchanges(sweep_cell_t const& cell) {
     }
     auto named_url = url;
     named_url.replace(named_url.find("127.0.0.1"), std::strlen("127.0.0.1"), "localhost");
-    call.url = uc::bytes_view(named_url);
+    call.url = bytes_view(named_url);
     exchange(payload);
-    call.url = uc::bytes_view(url);
-    ucall_bytes_view_t close = uc::bytes_view("Connection: close");
+    call.url = bytes_view(url);
+    ucall_bytes_view_t close = bytes_view("Connection: close");
     call.headers = &close;
     call.headers_count = 1;
     exchange(payload);
@@ -106,9 +106,9 @@ static void test_echo_completions(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_post_k;
-    call.body = uc::bytes_view(payload);
+    call.body = bytes_view(payload);
     call.options.security = cell.security;
     call.options.noise_peer_key = &fixture.server_public;
     auto echo = [&] {
@@ -149,7 +149,7 @@ static void test_server_kk_wrong_initiator(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_get_k;
     call.options.security = ucall_security_noise_kk_k;
     call.options.noise_peer_key = &fixture.server_public;
@@ -174,7 +174,7 @@ static case_result_t test_multiloop_retention(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(gate_url);
+    call.url = bytes_view(gate_url);
     call.verb = ucall_verb_post_k;
     call.context = &gate_url;
     ucall_client_call(&call);
@@ -186,7 +186,7 @@ static case_result_t test_multiloop_retention(sweep_cell_t const& cell) {
         expect_true(!fixture.poll(completed));
         if (!expect_true(steady_clock::now() < deadline, "the gated request never arrived")) return {};
     }
-    call.url = uc::bytes_view(echo_url);
+    call.url = bytes_view(echo_url);
     call.context = &echo_url;
     ucall_client_call(&call);
     expect_true(outcome.status == ucall_status_success_k);
@@ -225,9 +225,9 @@ static void test_cross_thread_replies(sweep_cell_t const& cell) {
             ucall_client_call_t call {};
             call.client = fixture.client;
             call.outcome = &outcome;
-            call.url = uc::bytes_view(gate_url);
+            call.url = bytes_view(gate_url);
             call.verb = ucall_verb_post_k;
-            call.body = uc::bytes_view(bodies[i]);
+            call.body = bytes_view(bodies[i]);
             call.context = &bodies[i];
             ucall_client_call(&call);
             expect_true(outcome.status == ucall_status_success_k);
@@ -261,9 +261,9 @@ static void test_pipelined_calls(sweep_cell_t const& cell) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(gate_url);
+        call.url = bytes_view(gate_url);
         call.verb = ucall_verb_put_k;
-        call.body = uc::bytes_view(bodies[i]);
+        call.body = bytes_view(bodies[i]);
         call.context = &bodies[i];
         call.options.security = cell.security;
         call.options.noise_peer_key = &fixture.server_public;
@@ -303,9 +303,9 @@ static void test_client_dials_for_depth(sweep_cell_t const& cell) {
             ucall_client_call_t call {};
             call.client = fixture.client;
             call.outcome = &outcome;
-            call.url = uc::bytes_view(url);
+            call.url = bytes_view(url);
             call.verb = ucall_verb_put_k;
-            call.body = uc::bytes_view(bodies[i]);
+            call.body = bytes_view(bodies[i]);
             call.context = &bodies[i];
             ucall_client_call(&call);
             expect_true(outcome.status == ucall_status_success_k);
@@ -331,7 +331,7 @@ static void test_pipelined_call_loss(sweep_cell_t const& cell) {
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     std::string const gate_url = fmt::format("{}/gate", fixture.url), post_url = fmt::format("{}/echo/3", fixture.url),
                       get_url = fmt::format("{}/echo/4", fixture.url);
-    ucall_bytes_view_t const close = uc::bytes_view("Connection: close");
+    ucall_bytes_view_t const close = bytes_view("Connection: close");
     struct planned_call_t {
         std::string const* url;
         ucall_verb_t verb;
@@ -346,7 +346,7 @@ static void test_pipelined_call_loss(sweep_cell_t const& cell) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(*planned.url);
+        call.url = bytes_view(*planned.url);
         call.verb = planned.verb;
         call.context = &planned;
         if (&planned == &plan[1]) {
@@ -395,7 +395,7 @@ static void test_bodiless_responses_keep_connection(sweep_cell_t const& cell) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(planned.url);
+        call.url = bytes_view(planned.url);
         call.verb = ucall_verb_get_k;
         call.context = &planned;
         ucall_client_call(&call);
@@ -431,7 +431,7 @@ static void stream_reply(ucall_server_t server, ucall_received_http_request_t re
                          std::vector<std::string> const& chunks, std::vector<ucall_bytes_view_t> headers = {},
                          ucall_status_t ended = ucall_status_success_k) {
     ucall_outcome_t outcome {};
-    ucall_server_reply_begin_t begin {server, &outcome, request, 0, headers.data(), headers.size()};
+    ucall_server_reply_begin_t begin {server, &outcome, &request, 0, headers.data(), headers.size()};
     ucall_server_reply_begin(&begin);
     expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
@@ -441,7 +441,7 @@ static void stream_reply(ucall_server_t server, ucall_received_http_request_t re
         append_when_room(append, deadline);
         expect_true(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
     }
-    ucall_server_reply_end_t end {server, &outcome, request};
+    ucall_server_reply_end_t end {server, &outcome, &request};
     ucall_server_reply_end(&end);
     expect_true(outcome.status == ended, "end: {}", ucall_status_name(outcome.status));
 }
@@ -480,7 +480,7 @@ static void test_streamed_reply(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_get_k;
     call.options.security = cell.security;
     call.options.noise_peer_key = &fixture.server_public;
@@ -507,7 +507,7 @@ static void test_pipelined_streams(sweep_cell_t const& cell) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_get_k;
         call.context = &url;
         call.options.security = cell.security;
@@ -551,12 +551,12 @@ static void test_head_replies(sweep_cell_t const& cell) {
     auto const chunks = stream_chunks(20, 'h');
     std::string const length = fmt::format("Content-Length: {}", joined(chunks).size());
     for (std::vector<ucall_bytes_view_t> headers :
-         {std::vector<ucall_bytes_view_t> {}, std::vector<ucall_bytes_view_t> {uc::bytes_view(length)}}) {
+         {std::vector<ucall_bytes_view_t> {}, std::vector<ucall_bytes_view_t> {bytes_view(length)}}) {
         ucall_outcome_t outcome {};
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_head_k;
         ucall_client_call(&call);
         await_held(fixture, 1);
@@ -577,7 +577,7 @@ static void test_head_replies(sweep_cell_t const& cell) {
 /** A listener the caller hands over is served by an engine accepting from any listener: an
  *  automatic server passes over Registered I/O, and one naming it is refused, saying why. */
 static void test_borrowed_listener_backend(sweep_cell_t const& cell) {
-    uc::utilities::descriptor_t const listener = uc::utilities::socket_open(AF_INET);
+    util::descriptor_t const listener = util::socket_open(AF_INET);
     sockaddr_in bound {};
     bound.sin_family = AF_INET;
     bound.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
@@ -608,7 +608,7 @@ static void test_borrowed_listener_backend(sweep_cell_t const& cell) {
                     "a borrowed listener: {} on {}", ucall_status_name(outcome.status),
                     ucall_io_backend_name(resolved.backend));
     ucall_server_free(server);
-    uc::utilities::socket_close(listener);
+    util::socket_close(listener);
 }
 
 #pragma endregion Library Clients
@@ -674,7 +674,7 @@ static void test_megabyte_echo_delivery(sweep_cell_t const& cell, split_mix_gene
     if (!expect_true(client.connect(fixture.address))) return;
     auto const response = exchange_until_close(client, request, 65536, generator);
     expect_true(response.status == 200, "answered {}", response.status);
-    expect_equal_bytes(uc::byte_span(response.body), uc::byte_span(std::string_view {request}.substr(headers_length)));
+    expect_equal_bytes(byte_span(response.body), byte_span(std::string_view {request}.substr(headers_length)));
     fixture.stop();
 }
 
@@ -715,7 +715,7 @@ static void test_smuggling(sweep_cell_t const& cell, split_mix_generator_t& gene
         auto const dispatched = fixture.dispatched.load();
         raw_client_t client;
         if (!expect_true(client.connect(fixture.address))) return;
-        expect_true(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + wait_limit_k),
+        expect_true(client.write(byte_span(row.request), 0, generator, steady_clock::now() + wait_limit_k),
                     "{} was cut short", row.name);
         auto const response = exchange_until_close(client, unread, 4096, generator);
         expect_true(response.status == row.expected_status && response.length == client.received.size(),
@@ -783,7 +783,7 @@ static void test_method_routing(sweep_cell_t const& cell, split_mix_generator_t&
     };
     for (auto const& row : rows) {
         std::size_t const offset = client.received.size();
-        expect_true(client.write(uc::byte_span(row.request), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(client.write(byte_span(row.request), 0, generator, steady_clock::now() + wait_limit_k));
         auto const response = read_response(client, offset);
         std::string_view const head = std::string_view {client.received}.substr(offset, response.length);
         expect_true(response.status == row.status && head.find(row.header) != std::string_view::npos &&
@@ -807,14 +807,14 @@ static void test_reply_connection_header_refused(sweep_cell_t const& cell) {
     auto* held = fixture.take_held();
     if (!expect_true(held)) return;
     ucall_outcome_t outcome {};
-    ucall_bytes_view_t const header = uc::bytes_view("Connection: close");
-    ucall_server_reply_content_t refused {fixture.server,     &outcome, held, ucall_http_status_ok_k, &header, 1,
-                                          uc::bytes_view("x")};
+    ucall_bytes_view_t const header = bytes_view("Connection: close");
+    ucall_server_reply_content_t refused {fixture.server, &outcome, &held,          ucall_http_status_ok_k,
+                                          &header,        1,        bytes_view("x")};
     ucall_server_reply_content(&refused);
     expect_true(outcome.status == ucall_status_invalid_argument_k, "a reply's connection field answered {}",
                 ucall_status_name(outcome.status));
-    ucall_server_reply_content_t reply {fixture.server,     &outcome, held, ucall_http_status_ok_k, nullptr, 0,
-                                        uc::bytes_view("x")};
+    ucall_server_reply_content_t reply {fixture.server, &outcome, &held,          ucall_http_status_ok_k,
+                                        nullptr,        0,        bytes_view("x")};
     ucall_server_reply_content(&reply);
     expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
     auto const response = read_response(client, 0);
@@ -853,8 +853,8 @@ static void held_request(sweep_cell_t const& cell, std::string_view wire, inspec
     if (!expect_true(request)) return;
     inspect(fixture.server, request);
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {fixture.server,      &outcome, request, ucall_http_status_ok_k, nullptr, 0,
-                                        uc::bytes_view("ok")};
+    ucall_server_reply_content_t reply {fixture.server, &outcome, &request,        ucall_http_status_ok_k,
+                                        nullptr,        0,        bytes_view("ok")};
     ucall_server_reply_content(&reply);
     expect_true(read_response(client, 0).body == "ok");
     fixture.stop();
@@ -865,11 +865,9 @@ static void held_request(sweep_cell_t const& cell, std::string_view wire, inspec
 static void test_request_fields_in_order(sweep_cell_t const& cell) {
     std::string_view const wire = "GET /gate HTTP/1.1\r\nHost: a\r\nX-B:  two \r\nx-a:one\r\nX-B: again\r\n\r\n";
     held_request(cell, wire, [](ucall_server_t server, ucall_received_http_request_t request) {
-        std::size_t count = 0;
+        std::size_t const count = ucall_server_request_fields_count(server, request);
         ucall_outcome_t outcome {};
-        ucall_server_request_fields_count_t counting {server, &outcome, request, &count};
-        ucall_server_request_fields_count(&counting);
-        expect_true(outcome.status == ucall_status_success_k && count == 4, "{} fields", count);
+        expect_true(count == 4, "{} fields", count);
         std::string read;
         for (std::size_t index = 0; index <= count; ++index) {
             ucall_bytes_view_t name {}, value {};
@@ -880,7 +878,7 @@ static void test_request_fields_in_order(sweep_cell_t const& cell) {
                             ucall_status_name(outcome.status));
                 break;
             }
-            read += fmt::format("{}={};", uc::text_view(name), uc::text_view(value));
+            read += fmt::format("{}={};", text_view(name), text_view(value));
         }
         expect_true(read == "host=a;x-b=two;x-a=one;x-b=again;", "read {}", read);
         return;
@@ -895,8 +893,8 @@ static void test_request_query(sweep_cell_t const& cell) {
             ucall_bytes_view_t query {};
             ucall_server_request_query_t get {server, &outcome, request, &query};
             ucall_server_request_query(&get);
-            return expect_true(outcome.status == ucall_status_success_k && uc::text_view(query) == expected, "{}: {:?}",
-                               ucall_status_name(outcome.status), uc::text_view(query));
+            return expect_true(outcome.status == ucall_status_success_k && text_view(query) == expected, "{}: {:?}",
+                               ucall_status_name(outcome.status), text_view(query));
         };
     };
     held_request(cell, "GET /gate?b=2&a=%20&b=?x HTTP/1.1\r\nHost: a\r\n\r\n", query_is("b=2&a=%20&b=?x"));
@@ -912,7 +910,7 @@ static void test_cross_thread_teardown_delivery(sweep_cell_t const& cell, split_
     raw_client_t client;
     if (!expect_true(client.connect(fixture.address))) return;
     std::string_view const request = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-    expect_true(client.write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
+    expect_true(client.write(byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
     expect_true(read_response(client, 0).status == 200, "the keep-alive request was not served");
     fixture.stop();
     // A hang here is the failure, so a stuck free ends the process instead of the case.
@@ -947,7 +945,7 @@ static void test_pipelined_burst(sweep_cell_t const& cell, split_mix_generator_t
         bool written = false;
         std::thread writer {[&] {
             split_mix_generator_t chunks {generator};
-            written = client.write(uc::byte_span(burst), burst.size(), chunks, steady_clock::now() + wait_limit_k);
+            written = client.write(byte_span(burst), burst.size(), chunks, steady_clock::now() + wait_limit_k);
         }};
         std::size_t offset = 0, answered = 0;
         for (; answered != count; ++answered) {
@@ -973,7 +971,7 @@ static void test_orphaned_exchanges_bounded(sweep_cell_t const& cell, split_mix_
         raw_client_t leaving;
         if (!expect_true(leaving.connect(fixture.address))) return;
         std::string_view const gate = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
-        expect_true(leaving.write(uc::byte_span(gate), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(leaving.write(byte_span(gate), 0, generator, steady_clock::now() + wait_limit_k));
         await_held_in_background(fixture, left + 1);
         // A reset rather than a FIN, which the server would answer on the half-closed connection.
         linger const abrupt {1, 0};
@@ -982,19 +980,20 @@ static void test_orphaned_exchanges_bounded(sweep_cell_t const& cell, split_mix_
     raw_client_t next;
     if (!expect_true(next.connect(fixture.address))) return;
     std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-    expect_true(next.write(uc::byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
+    expect_true(next.write(byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
     auto const refused = read_response(next, 0);
     expect_true(refused.status == 503, "a request past the abandoned budget answered {}", refused.status);
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {fixture.server, &outcome, fixture.take_held(),   ucall_http_status_ok_k,
-                                        nullptr,        0,        uc::bytes_view("late")};
+    ucall_received_http_request_t taken = fixture.take_held();
+    ucall_server_reply_content_t reply {fixture.server,    &outcome, &taken, ucall_http_status_ok_k, nullptr, 0,
+                                        bytes_view("late")};
     ucall_server_reply_content(&reply);
     expect_true(outcome.status == ucall_status_success_k || outcome.status == ucall_status_connection_closed_k,
                 "the abandoned reply answered {}", ucall_status_name(outcome.status));
-    expect_true(next.write(uc::byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
+    expect_true(next.write(byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
     auto const served = read_response(next, refused.length);
     expect_true(served.status == 200, "a request after the abandoned one was answered got {}", served.status);
-    reply.request = fixture.take_held();
+    taken = fixture.take_held();
     ucall_server_reply_content(&reply);
     fixture.stop();
 }
@@ -1006,7 +1005,7 @@ static case_result_t test_request_peer_ipv6(sweep_cell_t const& cell) {
         ucall_peer_address_t address {};
     } captured;
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("[::1]:0");
+    network_interface.address = bytes_view("[::1]:0");
     network_interface.max_concurrent_connections = 1;
     ucall_server_options_t config {}, resolved {};
     config.interfaces = &network_interface;
@@ -1019,7 +1018,7 @@ static case_result_t test_request_peer_ipv6(sweep_cell_t const& cell) {
     if (outcome.status == ucall_status_connection_failed_k) return case_result_t::skipped(ipv6_refused_k);
     if (!expect_true(outcome.status == ucall_status_success_k, "setup: {}", ucall_status_name(outcome.status)))
         return {};
-    auto capture = [](ucall_received_http_request_t request, void* context) {
+    auto capture = [](ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& into = *static_cast<captured_t*>(context);
         ucall_outcome_t queried {};
         std::size_t network_interface_index = 0;
@@ -1027,11 +1026,11 @@ static case_result_t test_request_peer_ipv6(sweep_cell_t const& cell) {
         ucall_server_request_peer_t peer {into.server, &queried,     request, &network_interface_index,
                                           &key,        &into.address};
         ucall_server_request_peer(&peer);
-        ucall_server_reply_content_t reply {
-            into.server, &queried, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("seen")};
+        ucall_server_reply_content_t reply {into.server, &queried, &request,          ucall_http_status_ok_k,
+                                            nullptr,     0,        bytes_view("seen")};
         ucall_server_reply_content(&reply);
     };
-    ucall_server_add_http_endpoint_t add {captured.server,  &outcome, uc::bytes_view("/peer"),
+    ucall_server_add_http_endpoint_t add {captured.server,  &outcome, bytes_view("/peer"),
                                           ucall_verb_any_k, capture,  &captured};
     ucall_server_add_http_endpoint(&add);
     expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
@@ -1040,7 +1039,7 @@ static case_result_t test_request_peer_ipv6(sweep_cell_t const& cell) {
         ucall_server_take_calls_t serving {captured.server, &served, 0};
         ucall_server_take_calls(&serving);
     }};
-    std::string_view const bound = uc::text_view(resolved.interfaces[0].address);
+    std::string_view const bound = text_view(resolved.interfaces[0].address);
     sockaddr_in6 target {};
     target.sin6_family = AF_INET6;
     target.sin6_addr = in6addr_loopback;
@@ -1076,7 +1075,7 @@ static void test_interface_listen_descriptor(sweep_cell_t const& cell, split_mix
         std::atomic<std::uint8_t> family {};
         std::thread poller {};
     };
-    auto echo = [](ucall_received_http_request_t request, void* context) {
+    auto echo = [](ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& into = *static_cast<served_t*>(context);
         ucall_outcome_t outcome {};
         std::size_t network_interface_index = 0;
@@ -1088,7 +1087,7 @@ static void test_interface_listen_descriptor(sweep_cell_t const& cell, split_mix
         ucall_bytes_view_t body {};
         ucall_server_request_body_t extract {into.server, &outcome, request, &body};
         ucall_server_request_body(&extract);
-        ucall_server_reply_content_t reply {into.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, body};
+        ucall_server_reply_content_t reply {into.server, &outcome, &request, ucall_http_status_ok_k, nullptr, 0, body};
         ucall_server_reply_content(&reply);
     };
     // Serves `listener` on `event_loops` loops, answering whether the server started.
@@ -1107,7 +1106,7 @@ static void test_interface_listen_descriptor(sweep_cell_t const& cell, split_mix
         ucall_server_init_t init {&served.server, &outcome, &config, &served.resolved};
         ucall_server_init(&init);
         if (outcome.status != ucall_status_success_k) return outcome.status;
-        ucall_server_add_http_endpoint_t add {served.server,    &outcome, uc::bytes_view("/echo"),
+        ucall_server_add_http_endpoint_t add {served.server,    &outcome, bytes_view("/echo"),
                                               ucall_verb_any_k, echo,     &served};
         ucall_server_add_http_endpoint(&add);
         if (outcome.status != ucall_status_success_k) return outcome.status;
@@ -1135,7 +1134,7 @@ static void test_interface_listen_descriptor(sweep_cell_t const& cell, split_mix
         std::string const request = fmt::format("POST /echo HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}",
                                                 body.size(), body);
         std::size_t const offset = client.received.size();
-        expect_true(client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k));
+        expect_true(client.write(byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k));
         auto const response = read_response(client, offset);
         expect_true(response.status == 200 && response.body == body, "echoed {} with {} of {} bytes", response.status,
                     response.body.size(), body.size());
@@ -1156,8 +1155,8 @@ static void test_interface_listen_descriptor(sweep_cell_t const& cell, split_mix
         ucall_status_t const started = serve(served, listener, UCALL_OS_WINDOWS_ ? 1 : 2);
         expect_true(started == ucall_status_success_k, "a handed TCP listener: {}", ucall_status_name(started));
         if (started == ucall_status_success_k) {
-            expect_true(uc::text_view(served.resolved.interfaces[0].address) == address, "reported {}",
-                        uc::text_view(served.resolved.interfaces[0].address));
+            expect_true(text_view(served.resolved.interfaces[0].address) == address, "reported {}",
+                        text_view(served.resolved.interfaces[0].address));
             raw_client_t clients[3];
             for (auto& client : clients) {
                 expect_true(client.connect(address), "no connection to {}", address);
@@ -1187,8 +1186,8 @@ static void test_interface_listen_descriptor(sweep_cell_t const& cell, split_mix
         ucall_status_t const started = serve(served, listener, 1);
         expect_true(started == ucall_status_success_k, "a handed AF_UNIX listener: {}", ucall_status_name(started));
         if (started == ucall_status_success_k) {
-            expect_true(uc::text_view(served.resolved.interfaces[0].address) == path, "reported {}",
-                        uc::text_view(served.resolved.interfaces[0].address));
+            expect_true(text_view(served.resolved.interfaces[0].address) == path, "reported {}",
+                        text_view(served.resolved.interfaces[0].address));
             raw_client_t client;
             client.descriptor = ::socket(AF_UNIX, SOCK_STREAM, 0);
             expect_true(::connect(client.descriptor, reinterpret_cast<sockaddr*>(&bound), sizeof(bound)) == 0,
@@ -1222,14 +1221,14 @@ static void test_drain_closes_listener(sweep_cell_t const& cell, split_mix_gener
     raw_client_t late;
     if (late.connect(fixture.address)) {
         std::string_view const probe = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-        [[maybe_unused]] bool const written = late.write(uc::byte_span(probe), 0, generator, steady_clock::now() + 1s);
+        [[maybe_unused]] bool const written = late.write(byte_span(probe), 0, generator, steady_clock::now() + 1s);
         auto const end = late.read(1, steady_clock::now() + 1s);
         expect_true(end == read_end_t::failed_k || end == read_end_t::closed_k,
                     "a peer connecting after the stop waited as {}", static_cast<int>(end));
     }
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {fixture.server,           &outcome, held, ucall_http_status_ok_k, nullptr, 0,
-                                        uc::bytes_view("drained")};
+    ucall_server_reply_content_t reply {fixture.server,       &outcome, &held, ucall_http_status_ok_k, nullptr, 0,
+                                        bytes_view("drained")};
     ucall_server_reply_content(&reply);
     expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
     auto const response = read_response(busy, 0);
@@ -1294,9 +1293,9 @@ static void test_streamed_reply_would_block(sweep_cell_t const& cell) {
     std::size_t const chunk_length = 64 * 1024, chunks_count = 512;
     std::string chunk(chunk_length, '\0');
     std::string const length = fmt::format("Content-Length: {}", chunk_length * chunks_count);
-    ucall_bytes_view_t const header = uc::bytes_view(length);
+    ucall_bytes_view_t const header = bytes_view(length);
     ucall_outcome_t outcome {};
-    ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, &header, 1};
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, &held, 0, &header, 1};
     ucall_server_reply_begin(&begin);
     expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
     auto fill = [&](std::size_t index) {
@@ -1330,7 +1329,7 @@ static void test_streamed_reply_would_block(sweep_cell_t const& cell) {
         append_when_room(append, steady_clock::now() + wait_limit_k);
         expect_true(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
     }
-    ucall_server_reply_end_t end {fixture.server, &outcome, held};
+    ucall_server_reply_end_t end {fixture.server, &outcome, &held};
     ucall_server_reply_end(&end);
     expect_true(outcome.status == ucall_status_success_k, "end: {}", ucall_status_name(outcome.status));
     reader.join();
@@ -1351,7 +1350,7 @@ static void test_streamed_reply_detach(sweep_cell_t const& cell) {
     auto* held = fixture.take_held();
     if (!expect_true(held)) return;
     ucall_outcome_t outcome {};
-    ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, nullptr, 0};
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, &held, 0, nullptr, 0};
     ucall_server_reply_begin(&begin);
     expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
     std::string const chunk(4096, 'd');
@@ -1367,7 +1366,7 @@ static void test_streamed_reply_detach(sweep_cell_t const& cell) {
     } while (outcome.status != ucall_status_connection_closed_k && steady_clock::now() < deadline);
     expect_true(outcome.status == ucall_status_connection_closed_k, "chunk after the close: {}",
                 ucall_status_name(outcome.status));
-    ucall_server_reply_end_t end {fixture.server, &outcome, held};
+    ucall_server_reply_end_t end {fixture.server, &outcome, &held};
     ucall_server_reply_end(&end);
     expect_true(outcome.status == ucall_status_connection_closed_k, "end: {}", ucall_status_name(outcome.status));
     raw_client_t other;
@@ -1417,7 +1416,7 @@ static void test_streamed_reply_identity(sweep_cell_t const& cell) {
     raw_client_t client;
     if (!expect_true(client.connect(fixture.address))) return;
     std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
-    ucall_bytes_view_t const header = uc::bytes_view("Content-Length: 10");
+    ucall_bytes_view_t const header = bytes_view("Content-Length: 10");
     auto send_and_take = [&] {
         expect_true(::send(client.descriptor, request.data(), request.size(), 0) ==
                     static_cast<ssize_t>(request.size()));
@@ -1433,14 +1432,14 @@ static void test_streamed_reply_identity(sweep_cell_t const& cell) {
     };
     auto* held = send_and_take();
     if (!expect_true(held)) return;
-    ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, &header, 1};
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, &held, 0, &header, 1};
     ucall_server_reply_begin(&begin);
     expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
     expect_true(chunk(held, "hello") == ucall_status_success_k);
     expect_true(chunk(held, "worldwide!") == ucall_status_overflow_k, "past the length: {}",
                 ucall_status_name(outcome.status));
     expect_true(chunk(held, "world") == ucall_status_success_k);
-    ucall_server_reply_end_t end {fixture.server, &outcome, held};
+    ucall_server_reply_end_t end {fixture.server, &outcome, &held};
     ucall_server_reply_end(&end);
     expect_true(outcome.status == ucall_status_success_k, "end: {}", ucall_status_name(outcome.status));
     auto const response = read_response(client, 0);
@@ -1448,10 +1447,8 @@ static void test_streamed_reply_identity(sweep_cell_t const& cell) {
                 response.body);
     held = send_and_take();
     if (!expect_true(held)) return;
-    begin.request = held;
     ucall_server_reply_begin(&begin);
     expect_true(chunk(held, "short") == ucall_status_success_k);
-    end.request = held;
     ucall_server_reply_end(&end);
     expect_true(outcome.status == ucall_status_malformed_k, "a short end: {}", ucall_status_name(outcome.status));
     auto const closed = client.read_until_close(steady_clock::now() + wait_limit_k);
@@ -1473,7 +1470,7 @@ static void test_configuration_byte_views(sweep_cell_t const& cell) {
     keeping_descriptors([&] {
         std::string_view const carved = "127.0.0.1:0trailing";
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view(carved.substr(0, 11));
+        network_interface.address = bytes_view(carved.substr(0, 11));
         network_interface.max_concurrent_connections = 1;
         ucall_server_options_t config {}, resolved {};
         config.interfaces = &network_interface;
@@ -1487,13 +1484,13 @@ static void test_configuration_byte_views(sweep_cell_t const& cell) {
         if (!expect_true(outcome.status == ucall_status_success_k, "a carved address: {}",
                          ucall_status_name(outcome.status)))
             return;
-        std::string_view const bound = uc::text_view(resolved.interfaces[0].address);
+        std::string_view const bound = text_view(resolved.interfaces[0].address);
         expect_true(bound.starts_with("127.0.0.1:") && bound.size() > 10, "bound {}", bound);
         raw_client_t client;
         expect_true(client.connect(bound), "no connection to {}", bound);
         client.close();
         ucall_server_free(server);
-        network_interface.device_name = uc::bytes_view(std::string_view {"lo\0x", 4});
+        network_interface.device_name = bytes_view(std::string_view {"lo\0x", 4});
         ucall_server_init(&init);
         expect_true(outcome.status == ucall_status_invalid_argument_k, "a zero byte in a device: {}",
                     ucall_status_name(outcome.status));
@@ -1543,7 +1540,7 @@ static std::string pull_body(fixture_t& fixture, ucall_received_http_request_t r
             return body;
         }
         if (!data.length) return body;
-        body += uc::text_view(data);
+        body += text_view(data);
     }
 }
 
@@ -1551,8 +1548,8 @@ static std::string pull_body(fixture_t& fixture, ucall_received_http_request_t r
 static bool reply_length(fixture_t& fixture, ucall_received_http_request_t request, std::size_t length) {
     std::string const answer = fmt::format("{}", length);
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {fixture.server,        &outcome, request, ucall_http_status_ok_k, nullptr, 0,
-                                        uc::bytes_view(answer)};
+    ucall_server_reply_content_t reply {fixture.server, &outcome, &request,          ucall_http_status_ok_k,
+                                        nullptr,        0,        bytes_view(answer)};
     ucall_server_reply_content(&reply);
     return expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
 }
@@ -1573,9 +1570,8 @@ static void test_streamed_body(sweep_cell_t const& cell, split_mix_generator_t& 
         raw_client_t client;
         if (!expect_true(client.connect(fixture.address))) return;
         bool written = false;
-        std::thread writer {[&] {
-            written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k);
-        }};
+        std::thread writer {
+            [&] { written = client.write(byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k); }};
         await_held_in_background(fixture, 1);
         auto* held = fixture.take_held();
         if (!held) {
@@ -1595,7 +1591,7 @@ static void test_streamed_body(sweep_cell_t const& cell, split_mix_generator_t& 
         writer.join();
         expect_true(written, "the request was not written");
         expect_true(pulls > 1, "{} pulls took a mebibyte", pulls);
-        expect_equal_bytes(uc::byte_span(received), uc::byte_span(body));
+        expect_equal_bytes(byte_span(received), byte_span(body));
         reply_length(fixture, held, received.size());
         auto const response = read_response(client, 0);
         expect_true(response.status == 200 && response.body == fmt::format("{}", body.size()), "answered {} {}",
@@ -1631,9 +1627,9 @@ static void test_streamed_body_noise(sweep_cell_t const& cell) {
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(stream_url);
+    call.url = bytes_view(stream_url);
     call.verb = ucall_verb_post_k;
-    call.body = uc::bytes_view(body);
+    call.body = bytes_view(body);
     call.options.security = ucall_security_noise_xx_k;
     ucall_client_call(&call);
     expect_true(outcome.status == ucall_status_success_k);
@@ -1648,15 +1644,15 @@ static void test_streamed_body_noise(sweep_cell_t const& cell) {
     }};
     ucall_completed_call_t completed = client_wait(fixture);
     puller.join();
-    expect_equal_bytes(uc::byte_span(received), uc::byte_span(body));
+    expect_equal_bytes(byte_span(received), byte_span(body));
     expect_true(completed.outcome.status == ucall_status_success_k && completed.response, "{}",
                 ucall_status_name(completed.outcome.status));
     if (completed.response) ucall_client_response_free(completed.response);
     std::string const parts_url = fmt::format("{}/parts", fixture.url);
     std::string_view const parts_body = "--zz\r\nContent-Disposition: form-data; name=\"k\"\r\n\r\nv\r\n--zz--";
-    ucall_bytes_view_t const type = uc::bytes_view("Content-Type: multipart/form-data; boundary=zz");
-    call.url = uc::bytes_view(parts_url);
-    call.body = uc::bytes_view(parts_body);
+    ucall_bytes_view_t const type = bytes_view("Content-Type: multipart/form-data; boundary=zz");
+    call.url = bytes_view(parts_url);
+    call.body = bytes_view(parts_body);
     call.headers = &type;
     call.headers_count = 1;
     ucall_client_call(&call);
@@ -1666,7 +1662,7 @@ static void test_streamed_body_noise(sweep_cell_t const& cell) {
         ucall_client_response_body_t get {completed.response, &outcome, &answer};
         ucall_client_response_body(&get);
     }
-    expect_true(uc::text_view(answer) == "1;k==v;", "the parts answered `{}`", uc::text_view(answer));
+    expect_true(text_view(answer) == "1;k==v;", "the parts answered `{}`", text_view(answer));
     if (completed.response) ucall_client_response_free(completed.response);
     fixture.stop();
 }
@@ -1683,7 +1679,7 @@ static void test_streamed_body_slow_puller(sweep_cell_t const& cell, split_mix_g
     if (!expect_true(slow.connect(fixture.address) && quick.connect(fixture.address))) return;
     bool written = false;
     std::thread writer {
-        [&] { written = slow.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k); }};
+        [&] { written = slow.write(byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k); }};
     await_held_in_background(fixture, 1);
     auto* held = fixture.take_held();
     std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
@@ -1727,12 +1723,12 @@ static void test_body_chunk_would_block_on_polling_thread(sweep_cell_t const& ce
                 ucall_status_name(answered));
     bool written = false;
     std::thread writer {
-        [&] { written = client.write(uc::byte_span(body), 65536, generator, steady_clock::now() + wait_limit_k); }};
+        [&] { written = client.write(byte_span(body), 65536, generator, steady_clock::now() + wait_limit_k); }};
     std::size_t pulls = 0;
     std::string const received = pull_body(fixture, held, pulls);
     writer.join();
     expect_true(written, "the body was not written");
-    expect_equal_bytes(uc::byte_span(received), uc::byte_span(body));
+    expect_equal_bytes(byte_span(received), byte_span(body));
     reply_length(fixture, held, received.size());
     auto const response = read_response(client, 0);
     expect_true(response.status == 200 && response.body == fmt::format("{}", body.size()), "answered {} {}",
@@ -1755,9 +1751,8 @@ static void test_streamed_body_barrier(sweep_cell_t const& cell, split_mix_gener
         raw_client_t client;
         if (!expect_true(client.connect(fixture.address))) return;
         bool written = false;
-        std::thread writer {[&] {
-            written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k);
-        }};
+        std::thread writer {
+            [&] { written = client.write(byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k); }};
         await_held_in_background(fixture, 1);
         auto* held = fixture.take_held();
         std::this_thread::sleep_for(20ms);
@@ -1815,7 +1810,7 @@ static void test_streamed_chunk_line_bounded(sweep_cell_t const& cell, split_mix
     raw_client_t client;
     if (!expect_true(client.connect(fixture.address))) return;
     std::thread writer {[&] {
-        [[maybe_unused]] bool const written = client.write(uc::byte_span(request), 65536, generator,
+        [[maybe_unused]] bool const written = client.write(byte_span(request), 65536, generator,
                                                            steady_clock::now() + wait_limit_k);
     }};
     await_held_in_background(fixture, 1);
@@ -1832,7 +1827,7 @@ static void test_streamed_chunk_line_bounded(sweep_cell_t const& cell, split_mix
         expect_true(end == read_end_t::closed_k || end == read_end_t::failed_k, "the connection ended as {}",
                     static_cast<int>(end));
         // The connection is gone, so the reply only releases the request.
-        ucall_server_reply_content_t reply {fixture.server, &outcome, held, ucall_http_status_ok_k, nullptr, 0, {}};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, &held, ucall_http_status_ok_k, nullptr, 0, {}};
         ucall_server_reply_content(&reply);
     }
     writer.join();
@@ -1848,7 +1843,7 @@ static void test_expect_continue(sweep_cell_t const& cell, split_mix_generator_t
     fixture.serve_in_background();
     std::string_view const interim = "HTTP/1.1 100 Continue\r\n\r\n";
     auto send = [&](raw_client_t& client, std::string_view bytes) {
-        expect_true(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(client.write(byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
     };
     auto await_interim = [&](raw_client_t& client) {
         auto const end = client.read(interim.size(), steady_clock::now() + 500ms);
@@ -1882,7 +1877,7 @@ static void test_expect_continue(sweep_cell_t const& cell, split_mix_generator_t
         send(client, "hello");
         expect_true(ucall_outcome_wait(&pulled) == ucall_status_success_k, "the pull ended with {}",
                     ucall_status_name(pulled.status));
-        std::string body {uc::text_view(data)};
+        std::string body {text_view(data)};
         std::size_t pulls = 1;
         body += pull_body(fixture, held, pulls);
         expect_true(body == "hello", "the stream pulled {:?}", body);
@@ -1914,9 +1909,8 @@ static void test_oversized_request_refused(sweep_cell_t const& cell, split_mix_g
         raw_client_t client;
         if (!expect_true(client.connect(fixture.address))) return;
         bool written = false;
-        std::thread writer {[&] {
-            written = client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k);
-        }};
+        std::thread writer {
+            [&] { written = client.write(byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k); }};
         auto const response = read_response(client, 0);
         expect_true(response.status == 413, "answered {}", response.status);
         expect_true(client.read_until_close(steady_clock::now() + wait_limit_k) == read_end_t::closed_k,

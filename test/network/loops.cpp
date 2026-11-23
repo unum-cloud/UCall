@@ -31,7 +31,7 @@ static case_result_t test_ring_refused_at_init_falls_back() {
         ucall_server_t server {};
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = connections;
         ucall_server_options_t config {}, resolved {};
         config.interfaces = &network_interface;
@@ -143,12 +143,12 @@ static case_result_t test_origin_reuse_and_fairness() {
         ucall_client_call_t call {};
         call.client = handle;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_get_k;
         ucall_client_call(&call);
         expect_true(outcome.status == ucall_status_success_k);
     }
-    std::array<uc::descriptor_t, 3> descriptors {};
+    std::array<descriptor_t, 3> descriptors {};
     for (std::size_t i = 0; i != client.connections.size(); ++i) {
         auto& connection = *client.connections[i];
         connection.origin = client.exchanges[i == 1 ? 2 : 0].origin;
@@ -217,7 +217,7 @@ static case_result_t test_client_batches_sends() {
         ucall_client_call_t call {};
         call.client = handle;
         call.outcome = &outcome;
-        call.url = uc::bytes_view("http://127.0.0.1:18545/");
+        call.url = bytes_view("http://127.0.0.1:18545/");
         call.verb = ucall_verb_put_k;
         ucall_client_call(&call);
         expect_true(outcome.status == ucall_status_success_k);
@@ -287,7 +287,7 @@ static case_result_t test_backend_parity(sweep_cell_t const& cell) {
         for (std::string_view request : {"GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n",
                                          "POST /echo/2 HTTP/1.1\r\nHost: a\r\nContent-Length: 6\r\n\r\nposted",
                                          "GET /missing HTTP/1.1\r\nHost: a\r\n\r\n"}) {
-            expect_true(client.write(uc::byte_span(request), 16, generator, steady_clock::now() + wait_limit_k));
+            expect_true(client.write(byte_span(request), 16, generator, steady_clock::now() + wait_limit_k));
             offset += read_response(client, offset).length;
         }
         exchange_until_close(client,
@@ -322,7 +322,7 @@ static case_result_t test_admission_across_loops(sweep_cell_t const& cell) {
     raw_client_t clients[3];
     for (std::size_t i = 0; i != 3; ++i) {
         if (!expect_true(clients[i].connect(fixture.address), "client {} could not connect", i)) return {};
-        expect_true(clients[i].write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(clients[i].write(byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
         if (i != 2) expect_true(read_response(clients[i], 0).status == 200, "client {} was not served", i);
     }
     expect_true(read_response(clients[2], 0).status == 200, "the third client was not served");
@@ -346,7 +346,7 @@ static void test_accept_exhaustion_sheds(sweep_cell_t const& cell, split_mix_gen
     // A served request proves the loop opened its engine, which needs descriptors of its own.
     raw_client_t fresh;
     if (!expect_true(fresh.connect(fixture.address))) return;
-    expect_true(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
+    expect_true(fresh.write(byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
     expect_true(read_response(fresh, 0).status == 200, "the first client was not served");
     sockaddr_in target {};
     target.sin_family = AF_INET;
@@ -370,8 +370,7 @@ static void test_accept_exhaustion_sheds(sweep_cell_t const& cell, split_mix_gen
     expect_true(::setrlimit(RLIMIT_NOFILE, &original) == 0, "the descriptor limit stayed lowered");
     for (auto& client : clients) {
         // A shed peer may be gone before it writes, so only what it reads decides.
-        [[maybe_unused]] bool const written = client.write(uc::byte_span(request), 0, generator,
-                                                           steady_clock::now() + 2s);
+        [[maybe_unused]] bool const written = client.write(byte_span(request), 0, generator, steady_clock::now() + 2s);
         auto const deadline = steady_clock::now() + 2s;
         read_end_t end = read_end_t::filled_k;
         wire_response_t response = parse_response(client.received);
@@ -386,7 +385,7 @@ static void test_accept_exhaustion_sheds(sweep_cell_t const& cell, split_mix_gen
     }
     fresh.received.clear();
     if (!expect_true(fresh.connect(fixture.address))) return;
-    expect_true(fresh.write(uc::byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
+    expect_true(fresh.write(byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
     expect_true(read_response(fresh, 0).status == 200, "a fresh client was not served");
     bool const rings = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
                        fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
@@ -405,13 +404,13 @@ struct echo_route_t {
     ucall_server_t server {};
     ucall_status_t replied {ucall_status_success_k};
 
-    static void echo(ucall_received_http_request_t request, void* context) {
+    static void echo(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& route = *static_cast<echo_route_t*>(context);
         ucall_outcome_t outcome {};
         ucall_bytes_view_t body {};
         ucall_server_request_body_t get {route.server, &outcome, request, &body};
         ucall_server_request_body(&get);
-        ucall_server_reply_content_t reply {route.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, body};
+        ucall_server_reply_content_t reply {route.server, &outcome, &request, ucall_http_status_ok_k, nullptr, 0, body};
         ucall_server_reply_content(&reply);
         route.replied = outcome.status;
     }
@@ -419,7 +418,7 @@ struct echo_route_t {
     /** Registers @c echo under the echo route with one path parameter, answering the outcome. */
     ucall_status_t add() {
         ucall_outcome_t outcome {};
-        ucall_server_add_http_endpoint_t add {server, &outcome, uc::bytes_view("/echo/{id}"), ucall_verb_post_k,
+        ucall_server_add_http_endpoint_t add {server, &outcome, bytes_view("/echo/{id}"), ucall_verb_post_k,
                                               echo,   this};
         ucall_server_add_http_endpoint(&add);
         return outcome.status;
@@ -452,13 +451,13 @@ static ucall_completed_call_t complete_call(echo_route_t const& route, ucall_cli
 }
 
 static void test_allocator_propagation(sweep_cell_t const& cell) {
-    using allocator_t = counting_allocator<uc::byte_t>;
+    using allocator_t = counting_allocator<byte_t>;
     allocation_ledger_t ledger;
     allocator_t allocator {ledger};
     echo_route_t route;
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
     ucall_server_options_t server_config {}, resolved {};
     server_config.interfaces = &network_interface;
@@ -480,14 +479,14 @@ static void test_allocator_propagation(sweep_cell_t const& cell) {
     ledger.refuse_from = (std::numeric_limits<std::size_t>::max)();
     counted_network_t::client_t::client_init(&client_init, allocator);
     if (!expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status))) return;
-    std::string url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));
+    std::string url = fmt::format("http://{}/echo/1", text_view(resolved.interfaces[0].address));
     std::string payload(1024, '\0');
     ucall_client_call_t call {};
     call.client = client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_post_k;
-    call.body = uc::bytes_view(payload);
+    call.body = bytes_view(payload);
     ucall_client_call(&call);
     expect_true(outcome.status == ucall_status_success_k);
     auto completed = complete_call(route, client, steady_clock::now() + wait_limit_k);
@@ -518,14 +517,14 @@ static void test_allocation_failure(sweep_cell_t const& cell) {
         echo_route_t route;
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 1;
         ucall_server_options_t server_config {}, resolved {};
         server_config.interfaces = &network_interface;
         server_config.interfaces_count = 1;
         server_config.backend = cell.backend;
         ucall_server_init_t server_init {&route.server, &outcome, &server_config, &resolved};
-        counted_network_t::server_t::server_init(&server_init, counting_allocator<uc::byte_t> {ledger});
+        counted_network_t::server_t::server_init(&server_init, counting_allocator<byte_t> {ledger});
         if (outcome.status == ucall_status_success_k) outcome.status = route.add();
         ucall_status_t completion = outcome.status;
         if (outcome.status == ucall_status_success_k) {
@@ -536,13 +535,13 @@ static void test_allocation_failure(sweep_cell_t const& cell) {
             ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
             ucall_client_init(&client_init);
             if (!expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status))) return;
-            std::string url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));
+            std::string url = fmt::format("http://{}/echo/1", text_view(resolved.interfaces[0].address));
             ucall_client_call_t call {};
             call.client = client;
             call.outcome = &outcome;
-            call.url = uc::bytes_view(url);
+            call.url = bytes_view(url);
             call.verb = ucall_verb_post_k;
-            call.body = uc::bytes_view(payload);
+            call.body = bytes_view(payload);
             ucall_client_call(&call);
             expect_true(outcome.status == ucall_status_success_k);
             auto completed = complete_call(route, client, steady_clock::now() + 500ms);
@@ -581,7 +580,7 @@ static case_result_t test_engine_faults() {
         echo_route_t route;
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 4;
         network_interface.max_pipelined_requests = 2;
         ucall_server_options_t config {}, resolved {};
@@ -603,14 +602,14 @@ static case_result_t test_engine_faults() {
         std::size_t offset = 0;
         for (std::size_t round = 0; round != scaled_iterations(400); ++round) {
             if (client.descriptor < 0) {
-                if (!expect_true(client.connect(uc::text_view(resolved.interfaces[0].address)))) return {};
+                if (!expect_true(client.connect(text_view(resolved.interfaces[0].address)))) return {};
                 client.received.clear();
                 offset = 0;
             }
             std::string const body = fmt::format("round {}", round);
             std::string const request = fmt::format("POST /echo/{} HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}",
                                                     round, body.size(), body);
-            bool const written = client.write(uc::byte_span(request), request.size(), generator,
+            bool const written = client.write(byte_span(request), request.size(), generator,
                                               steady_clock::now() + wait_limit_k);
             auto const response = written ? read_response(client, offset) : wire_response_t {};
             if (response.status == 200 && response.body == body) {
@@ -647,7 +646,7 @@ static case_result_t test_bound_client_counts_into_its_loop() {
     echo_route_t route;
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 2;
     ucall_server_options_t server_config {}, resolved {};
     server_config.interfaces = &network_interface;
@@ -663,14 +662,14 @@ static case_result_t test_bound_client_counts_into_its_loop() {
     ucall_client_init_t client_init {&client, &outcome, &client_config, nullptr};
     ucall_client_init(&client_init);
     if (!expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status))) return {};
-    std::string const url = fmt::format("http://{}/echo/1", uc::text_view(resolved.interfaces[0].address));
+    std::string const url = fmt::format("http://{}/echo/1", text_view(resolved.interfaces[0].address));
     std::string const payload(1024, 'b');
     ucall_client_call_t call {};
     call.client = client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_post_k;
-    call.body = uc::bytes_view(payload);
+    call.body = bytes_view(payload);
     ucall_client_call(&call);
     expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status));
     ucall_completed_call_t completed {};

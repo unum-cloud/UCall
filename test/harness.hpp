@@ -113,6 +113,12 @@ struct fmt::formatter<sz::string_t> : fmt::formatter<std::string_view> {
 namespace unum::ucall::test {
 
 using tools::exit_stopped_k;
+using util::byte_span;
+using util::byte_t;
+using util::bytes_view;
+using util::descriptor_t;
+using util::span;
+using util::text_view;
 
 /** Stops in an attached debugger, or dumps core without one; SIGTRAP skips the crash handlers. */
 inline void trap_into_debugger() noexcept {

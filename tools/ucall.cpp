@@ -38,7 +38,8 @@
 #include "landing.hpp"               // `landed_file_t`
 
 namespace tools = unum::ucall::tools;
-namespace st = unum::ucall::st;
+namespace st = ashvardanian::smashtable;
+namespace util = unum::ucall::utilities;
 
 enum exit_code_t : int { exit_success_k = 0, exit_failure_k = 1, exit_usage_k = 2 };
 
@@ -170,14 +171,12 @@ static void write_head(std::FILE* output, ucall_received_http_response_t respons
     fmt::basic_memory_buffer<char, 4096> head;
     fmt::format_to(fmt::appender(head), "HTTP/1.1 {}\n", status);
     ucall_outcome_t outcome {};
-    std::size_t count = 0;
-    ucall_client_response_fields_count_t counting {response, &outcome, &count};
-    ucall_client_response_fields_count(&counting);
+    std::size_t const count = ucall_client_response_fields_count(response);
     for (std::size_t index = 0; index != count; ++index) {
         ucall_bytes_view_t name {}, value {};
         ucall_client_response_field_t field {response, &outcome, index, &name, &value};
         ucall_client_response_field(&field);
-        fmt::format_to(fmt::appender(head), "{}: {}\n", uc::text_view(name), uc::text_view(value));
+        fmt::format_to(fmt::appender(head), "{}: {}\n", util::text_view(name), util::text_view(value));
     }
     head.push_back('\n');
     std::fwrite(head.data(), 1, head.size(), output);
@@ -350,7 +349,7 @@ struct proxy_t {
             if (std::memcmp(admitted.key, *peer_static_key, sizeof(admitted.key)) == 0) return ucall_status_success_k;
         return ucall_status_peer_rejected_k;
     }
-    static void forward(ucall_received_http_request_t request, void* context) {
+    static void forward(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& proxy = *static_cast<proxy_t*>(context);
         if (!proxy.submit(request)) proxy.reply_failure(request, "the upstream call was refused");
     }
@@ -358,7 +357,7 @@ struct proxy_t {
     bool open() {
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view(listen);
+        network_interface.address = util::bytes_view(listen);
         network_interface.event_loops = 1;
         network_interface.max_concurrent_connections = proxy_connections_k;
         network_interface.security = security;
@@ -373,7 +372,7 @@ struct proxy_t {
         if (outcome.status != ucall_status_success_k) return report("server init", outcome), false;
         // A greedy wildcard takes at least one segment, so the root has its own route.
         for (std::string_view const route : {"/", "/{*path}"}) {
-            ucall_server_add_http_endpoint_t add {server,           &outcome, uc::bytes_view(route),
+            ucall_server_add_http_endpoint_t add {server,           &outcome, util::bytes_view(route),
                                                   ucall_verb_any_k, forward,  this};
             ucall_server_add_http_endpoint(&add);
             if (outcome.status != ucall_status_success_k) return report("endpoint", outcome), false;
@@ -392,7 +391,7 @@ struct proxy_t {
             [[maybe_unused]] st::status_t const placed = forwards.emplace_back(st::assume_reserved);
             forwards.back().next_free = std::exchange(free_forwards, &forwards.back());
         }
-        fmt::print("Proxying {} to {}\n", uc::text_view(resolved.interfaces[0].address), to);
+        fmt::print("Proxying {} to {}\n", util::text_view(resolved.interfaces[0].address), to);
         std::fflush(stdout);
         return true;
     }
@@ -415,12 +414,12 @@ struct proxy_t {
         for (std::size_t index = 0; index != count; ++index) {
             ucall_bytes_view_t name {}, value {};
             read(index, name, value);
-            if (uc::text_view(name) == "connection") connection = uc::text_view(value);
+            if (util::text_view(name) == "connection") connection = util::text_view(value);
         }
         for (std::size_t index = 0; index != count; ++index) {
             ucall_bytes_view_t name {}, value {};
             read(index, name, value);
-            if (!forwarded(uc::text_view(name))) continue;
+            if (!forwarded(util::text_view(name))) continue;
             ++kept;
             bytes += name.length + 2 + value.length;
         }
@@ -430,13 +429,13 @@ struct proxy_t {
         for (std::size_t index = 0; index != count; ++index) {
             ucall_bytes_view_t name {}, value {};
             read(index, name, value);
-            if (!forwarded(uc::text_view(name))) continue;
+            if (!forwarded(util::text_view(name))) continue;
             std::size_t const start = slot.head.size();
-            if (!append(slot.head, uc::text_view(name)) || !append(slot.head, ": ") ||
-                !append(slot.head, uc::text_view(value)))
+            if (!append(slot.head, util::text_view(name)) || !append(slot.head, ": ") ||
+                !append(slot.head, util::text_view(value)))
                 return false;
             [[maybe_unused]] st::status_t const viewed = slot.lines.push_back(
-                st::assume_reserved, uc::bytes_view({slot.head.data() + start, slot.head.size() - start}));
+                st::assume_reserved, util::bytes_view({slot.head.data() + start, slot.head.size() - start}));
         }
         return true;
     }
@@ -458,13 +457,11 @@ struct proxy_t {
         std::string_view base = to;
         if (base.ends_with('/')) base.remove_suffix(1);
         slot->head.clear();
-        if (!append(slot->head, base) || !append(slot->head, uc::text_view(path)) ||
-            (query.length && (!append(slot->head, "?") || !append(slot->head, uc::text_view(query)))))
+        if (!append(slot->head, base) || !append(slot->head, util::text_view(path)) ||
+            (query.length && (!append(slot->head, "?") || !append(slot->head, util::text_view(query)))))
             return false;
         std::size_t const url_length = slot->head.size();
-        std::size_t count = 0;
-        ucall_server_request_fields_count_t counting {server, &outcome, request, &count};
-        ucall_server_request_fields_count(&counting);
+        std::size_t const count = ucall_server_request_fields_count(server, request);
         auto const read = [&](std::size_t index, ucall_bytes_view_t& name, ucall_bytes_view_t& value) {
             ucall_server_request_field_t field {server, &outcome, request, index, &name, &value};
             ucall_server_request_field(&field);
@@ -473,7 +470,7 @@ struct proxy_t {
         ucall_client_call_t call {};
         call.client = client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view({slot->head.data(), url_length});
+        call.url = util::bytes_view({slot->head.data(), url_length});
         call.verb = ucall_server_request_verb(server, request);
         call.headers = slot->lines.data();
         call.headers_count = slot->lines.size();
@@ -490,9 +487,9 @@ struct proxy_t {
         return true;
     }
 
-    void reply_failure(ucall_received_http_request_t request, std::string_view message) {
-        ucall_server_reply_error_t reply {server, &reply_outcome, request, ucall_http_status_bad_gateway_k,
-                                          uc::bytes_view(message)};
+    void reply_failure(ucall_received_http_request_t& request, std::string_view message) {
+        ucall_server_reply_error_t reply {server, &reply_outcome, &request, ucall_http_status_bad_gateway_k,
+                                          util::bytes_view(message)};
         ucall_server_reply_error(&reply);
     }
 
@@ -513,9 +510,7 @@ struct proxy_t {
             reply_failure(slot.request, ucall_status_name(completed.outcome.status));
         else {
             ucall_outcome_t outcome {};
-            std::size_t count = 0;
-            ucall_client_response_fields_count_t counting {response, &outcome, &count};
-            ucall_client_response_fields_count(&counting);
+            std::size_t const count = ucall_client_response_fields_count(response);
             auto const read = [&](std::size_t index, ucall_bytes_view_t& name, ucall_bytes_view_t& value) {
                 ucall_client_response_field_t field {response, &outcome, index, &name, &value};
                 ucall_client_response_field(&field);
@@ -525,7 +520,7 @@ struct proxy_t {
             ucall_client_response_body_t read_body {response, &outcome, &body};
             ucall_client_response_body(&read_body);
             ucall_server_reply_content_t reply {
-                server, &reply_outcome, slot.request, ucall_client_response_status(response), slot.lines.data(), 0,
+                server, &reply_outcome, &slot.request, ucall_client_response_status(response), slot.lines.data(), 0,
                 body};
             if (!forward_fields(slot, count, read, reply_written_k))
                 reply_outcome.status = ucall_status_out_of_memory_k;
@@ -533,8 +528,8 @@ struct proxy_t {
                 reply.headers = slot.lines.data(), reply.headers_count = slot.lines.size();
                 ucall_server_reply_content(&reply);
             }
-            if (reply_outcome.status != ucall_status_success_k && reply_outcome.status != ucall_status_deferred_k)
-                reply_failure(slot.request, ucall_status_name(reply_outcome.status));
+            // A reply that took the request cleared it, so one still held was refused.
+            if (slot.request) reply_failure(slot.request, ucall_status_name(reply_outcome.status));
         }
         ucall_client_response_free(response);
         slot.request = {};

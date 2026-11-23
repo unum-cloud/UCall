@@ -123,7 +123,7 @@ if (UCALL_BUILD_TEST
     include(cmake/fmt.cmake)
 endif ()
 
-# Both flavors compile the same units, and their C interface lives in `c/ucall`, which `ucall::header` names alone.
+# Both flavors compile the same units, and their C interface lives in `c/ucall`, which `ucall::abi` names alone.
 if (NOT UCALL_BUILD_SHARED)
     set(ucall_library_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
@@ -132,18 +132,18 @@ add_library(ucall_static STATIC ${ucall_sources_})
 add_library(ucall_shared SHARED ${ucall_library_exclusion_} ${ucall_sources_})
 add_library(ucall::static ALIAS ucall_static)
 add_library(ucall::shared ALIAS ucall_shared)
-add_library(ucall_header INTERFACE)
-add_library(ucall::header ALIAS ucall_header)
+add_library(ucall_abi INTERFACE)
+add_library(ucall::abi ALIAS ucall_abi)
 set_target_properties(ucall_static PROPERTIES EXPORT_NAME static)
 set_target_properties(ucall_shared PROPERTIES EXPORT_NAME shared)
-set_target_properties(ucall_header PROPERTIES EXPORT_NAME header)
+set_target_properties(ucall_abi PROPERTIES EXPORT_NAME abi)
 # MSVC reads BOM-less UTF-8 in the system code page, so consumers of these Unicode-commented headers need `/utf-8`.
 target_compile_options(
-    ucall_header INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
+    ucall_abi INTERFACE "$<$<OR:$<COMPILE_LANG_AND_ID:C,MSVC>,$<COMPILE_LANG_AND_ID:CXX,MSVC>>:/utf-8>"
 )
 target_include_directories(
-    ucall_header INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c>
-                           $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+    ucall_abi INTERFACE $<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/c>
+                        $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
 # The archive passes the native interface in `include/` and its siblings on to the tests, tools and bindings built here,
@@ -157,7 +157,7 @@ function (ucall_setup_library target_ scope_)
     target_compile_definitions(${target_} ${scope_} ${ucall_facility_definitions_})
     target_link_libraries(
         ${target_}
-        PUBLIC ucall_header
+        PUBLIC ucall_abi
         PRIVATE Threads::Threads $<BUILD_INTERFACE:ucall_sanitizers> $<BUILD_INTERFACE:ucall_warnings>
                 $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
     )
@@ -318,7 +318,9 @@ if (UCALL_BUILD_EXAMPLES)
     foreach (example_ echo ledger redis inference)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
-        target_link_libraries(ucall_example_${example_} PRIVATE ucall_static forkunion::static fmt::fmt ucall_warnings)
+        target_link_libraries(
+            ucall_example_${example_} PRIVATE ucall::cpp ucall_static forkunion::static fmt::fmt ucall_warnings
+        )
     endforeach ()
     target_link_libraries(ucall_example_inference PRIVATE numkong::static)
     add_executable(ucall_example_hello examples/hello.c)
@@ -338,6 +340,7 @@ if (UCALL_BUILD_BENCH)
         target_include_directories(${bench_} PRIVATE tools)
         target_link_libraries(${bench_} PRIVATE ucall_static forkunion::static fmt::fmt ucall_warnings)
     endforeach ()
+    target_link_libraries(ucall_bench_server PRIVATE ucall::cpp)
 endif ()
 if (UCALL_BUILD_PYTHON)
     include(cmake/yyjson.cmake)
@@ -352,16 +355,18 @@ if (UCALL_BUILD_TEST)
     add_subdirectory(test)
     add_subdirectory(c)
 endif ()
+add_subdirectory(cpp)
 
-# `find_package(ucall)` names the libraries `ucall::static` and, when built, `ucall::shared`, both in the `sdk` component
-# with the `ucall` command-line client. The archive's consumers link the liburing it was built with, installed beside it
-# as `ucall::uring`.
+# `find_package(ucall)` names the C headers `ucall::abi`, the C++ SDK carrying them and the archive `ucall::cpp`, and
+# the libraries `ucall::static` and, when built, `ucall::shared`, all in the `sdk` component with the `ucall`
+# command-line client. The archive's consumers link the liburing it was built with, installed beside it as
+# `ucall::uring`.
 if (TARGET uring)
     set(ucall_installed_uring_ uring)
 endif ()
 if (UCALL_BUILD_SHARED)
     set(ucall_installed_shared_ ucall_shared)
 endif ()
-set(ucall_install_sdk_targets_ ucall_header ucall_static ${ucall_installed_uring_} ${ucall_installed_shared_})
+set(ucall_install_sdk_targets_ ucall_abi ucall_cpp ucall_static ${ucall_installed_uring_} ${ucall_installed_shared_})
 set(ucall_install_programs_ ucall_cli)
 include(cmake/ucall_install.cmake)

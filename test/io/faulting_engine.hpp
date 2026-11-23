@@ -24,7 +24,7 @@ using namespace unum::ucall::io;
  *  It keeps the seam's rule under both: every request submitted completes exactly once. The
  *  pattern is fixed by the count of transfers, so a failing run repeats.
  */
-template <typename allocator_type_ = uc::st::default_allocator<uc::byte_t>,
+template <typename allocator_type_ = uc::st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = uc::fu::standard_atomic_ref,
           typename row_kit_type_ = uc::st::serial_row_kit_t>
 struct faulting_engine {
@@ -39,7 +39,7 @@ struct faulting_engine {
      *  with it. */
     struct held_t {
         io_request_t* request {};
-        uc::descriptor_t result {};
+        descriptor_t result {};
     };
 
     inner_t inner;
@@ -48,15 +48,13 @@ struct faulting_engine {
     std::size_t transfers {};
 
     explicit faulting_engine(allocator_t const& allocator = {}) noexcept : inner(allocator) {}
-    uc::descriptor_t open_socket(int family) noexcept { return inner.open_socket(family); }
-    uc::descriptor_t import_socket(uc::descriptor_t descriptor) noexcept { return inner.import_socket(descriptor); }
-    int close_socket(uc::descriptor_t descriptor) noexcept { return inner.close_socket(descriptor); }
-    [[nodiscard]] ucall_status_t reset_on_close(uc::descriptor_t descriptor) noexcept {
+    descriptor_t open_socket(int family) noexcept { return inner.open_socket(family); }
+    descriptor_t import_socket(descriptor_t descriptor) noexcept { return inner.import_socket(descriptor); }
+    int close_socket(descriptor_t descriptor) noexcept { return inner.close_socket(descriptor); }
+    [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return inner.reset_on_close(descriptor);
     }
-    memory_registration_t register_memory(uc::span<uc::byte_t> memory) noexcept {
-        return inner.register_memory(memory);
-    }
+    memory_registration_t register_memory(span<byte_t> memory) noexcept { return inner.register_memory(memory); }
     void release(io_completion_t const& completion) noexcept { inner.release(completion); }
     ucall_status_t open(std::size_t depth, std::size_t capacity,
                         io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k) noexcept {
@@ -79,7 +77,7 @@ struct faulting_engine {
             }
         return inner.cancel(request);
     }
-    int poll(uc::span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
+    int poll(span<io_completion_t> completions, io_wait_t wait_policy, std::uint64_t deadline = 0) noexcept {
         std::size_t count = 0;
         std::vector<held_t> due;
         due.swap(held);

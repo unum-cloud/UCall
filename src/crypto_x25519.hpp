@@ -46,8 +46,8 @@
 namespace unum::ucall {
 
 using tunnel::x25519_key_size_k;
-using utilities::byte_t;
-using utilities::span;
+using util::byte_t;
+using util::span;
 
 #pragma region Compiler Shims
 

@@ -38,16 +38,16 @@ struct polling_fixture_t {
         ucall_server_request_body_t extract {server, &outcome, request, &body};
         ucall_server_request_body(&extract);
         expect_true(outcome.status == ucall_status_success_k);
-        ucall_server_reply_content_t response {server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, body};
+        ucall_server_reply_content_t response {server, &outcome, &request, ucall_http_status_ok_k, nullptr, 0, body};
         ucall_server_reply_content(&response);
         expect_true(outcome.status == ucall_status_success_k);
     }
-    static void echo(ucall_received_http_request_t request, void* context) {
+    static void echo(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<polling_fixture_t*>(context);
         ++fixture.echoes;
         fixture.reply(request);
     }
-    static void hold(ucall_received_http_request_t request, void* context) {
+    static void hold(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<polling_fixture_t*>(context);
         expect_true(!fixture.held, "a second request arrived while one is held");
         fixture.held = request;
@@ -56,7 +56,7 @@ struct polling_fixture_t {
                       void* batch_context = nullptr) {
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 2;
         ucall_server_options_t config {};
         config.interfaces = &network_interface;
@@ -67,10 +67,10 @@ struct polling_fixture_t {
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        address = fmt::format("http://{}", uc::text_view(resolved.interfaces[0].address));
+        address = fmt::format("http://{}", text_view(resolved.interfaces[0].address));
         using route_t = std::pair<char const*, ucall_received_http_request_callback_t>;
         for (auto [route, callback] : {route_t {"/echo", echo}, route_t {"/hold", hold}}) {
-            ucall_server_add_http_endpoint_t add {server,   &outcome, uc::bytes_view(route), ucall_verb_post_k,
+            ucall_server_add_http_endpoint_t add {server,   &outcome, bytes_view(route), ucall_verb_post_k,
                                                   callback, this};
             ucall_server_add_http_endpoint(&add);
             if ((status = outcome.status) != ucall_status_success_k) return;
@@ -87,7 +87,7 @@ struct polling_fixture_t {
         }
         if (batch_callback) {
             ucall_server_add_http_batch_endpoint_t add {
-                server, &outcome, uc::bytes_view("/batch"), ucall_verb_post_k, batch_callback, batch_context, 2,
+                server, &outcome, bytes_view("/batch"), ucall_verb_post_k, batch_callback, batch_context, 2,
                 2,      100000,   &batch_endpoint};
             ucall_server_add_http_batch_endpoint(&add);
             status = outcome.status;
@@ -148,9 +148,9 @@ struct call_t {
         ucall_client_call_t call {};
         call.client = fixture.clients[client];
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_post_k;
-        call.body = uc::bytes_view("echo");
+        call.body = bytes_view("echo");
         call.context = this;
         call.options.timeout_microseconds = timeout;
         ucall_client_call(&call);
@@ -236,8 +236,8 @@ static void test_timeout_and_cancel(sweep_cell_t const& cell) {
         ucall_server_stop(fixture.server);
         ucall_server_stop(fixture.server);
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t detached {
-            fixture.server, &outcome, fixture.held, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("closed")};
+        ucall_server_reply_content_t detached {fixture.server, &outcome, &fixture.held,       ucall_http_status_ok_k,
+                                               nullptr,        0,        bytes_view("closed")};
         ucall_server_reply_content(&detached);
         expect_true(outcome.status == ucall_status_connection_closed_k);
         fixture.held = nullptr;
@@ -263,6 +263,27 @@ static void test_take_call_reports_retired(sweep_cell_t const& cell) {
                 ucall_status_name(outcome.status));
 }
 
+/** A caller polling a loop another thread polls finishes @c ucall_status_contended_k without
+ *  running, while the owner keeps the loop until it retires. */
+static void test_second_poller_is_refused(sweep_cell_t const& cell) {
+    polling_fixture_t fixture {cell};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    std::thread owner {[&] {
+        ucall_outcome_t owned {};
+        ucall_server_take_calls_t take {fixture.server, &owned, 0};
+        ucall_server_take_calls(&take);
+    }};
+    ucall_outcome_t outcome {};
+    ucall_server_take_call_t second {fixture.server, &outcome, 0, 0};
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
+    do ucall_server_take_call(&second);
+    while (outcome.status == ucall_status_success_k && steady_clock::now() <= deadline);
+    expect_true(outcome.status == ucall_status_contended_k, "a second poller answered {}",
+                ucall_status_name(outcome.status));
+    ucall_server_stop(fixture.server);
+    owner.join();
+}
+
 #pragma endregion Progress
 
 #pragma region Batches
@@ -273,9 +294,10 @@ struct batch_context_t {
     std::array<std::size_t, 2> sizes {};
     std::atomic<std::size_t> completed {};
 
-    static void receive(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
+    static void receive(ucall_server_t, ucall_received_http_request_t const* requests, std::size_t count,
+                        void* context) {
         auto& state = *static_cast<batch_context_t*>(context);
-        uc::span<ucall_received_http_request_t const> const batch {requests, count};
+        span<ucall_received_http_request_t const> const batch {requests, count};
         expect_true(!batch.empty() && batch.size() <= state.requests.size(), "a batch of {}", batch.size());
         if (batch.empty() || batch.size() > state.requests.size()) return;
         for (std::size_t i = 0; i != batch.size(); ++i) {
@@ -319,7 +341,7 @@ static void test_application_batches(sweep_cell_t const& cell) {
     ucall_http_batch_endpoint_t prompt {};
     ucall_server_add_http_batch_endpoint_t add {fixture.server,
                                                 &outcome,
-                                                uc::bytes_view("/prompt"),
+                                                bytes_view("/prompt"),
                                                 ucall_verb_post_k,
                                                 batch_context_t::receive,
                                                 &batches,
@@ -391,7 +413,7 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
     ucall_client_t client {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 4;
     network_interface.event_loops = 2;
     ucall_server_options_t config {}, resolved {};
@@ -407,7 +429,7 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
     batch_context_t batches;
     ucall_http_batch_endpoint_t endpoint {};
     ucall_server_add_http_batch_endpoint_t add {
-        server,   &outcome, uc::bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 4, 4,
+        server,   &outcome, bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 4, 4,
         10000000, &endpoint};
     ucall_server_add_http_batch_endpoint(&add);
     expect_true(outcome.status == ucall_status_success_k);
@@ -420,14 +442,14 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
     expect_true(outcome.status == ucall_status_success_k);
     auto poller = poll_batches(server, endpoint);
     // Each loop owns two of the four connections, so each receives exactly half of the batch.
-    std::string url = fmt::format("http://{}/batch", uc::text_view(resolved.interfaces[0].address));
+    std::string url = fmt::format("http://{}/batch", text_view(resolved.interfaces[0].address));
     for (std::size_t i = 0; i != 4; ++i) {
         ucall_client_call_t call {};
         call.client = client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_post_k;
-        call.body = uc::bytes_view("echo");
+        call.body = bytes_view("echo");
         ucall_client_call(&call);
         expect_true(outcome.status == ucall_status_success_k);
     }
@@ -454,8 +476,8 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
                 batches.completed.load(), batches.sizes[0]);
     if (batches.completed == 1)
         for (auto request : batches.requests) {
-            ucall_server_reply_content_t response {
-                server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("echo")};
+            ucall_server_reply_content_t response {server,  &outcome, &request,          ucall_http_status_ok_k,
+                                                   nullptr, 0,        bytes_view("echo")};
             ucall_server_reply_content(&response);
             expect_true(outcome.status == ucall_status_success_k);
         }
@@ -484,7 +506,7 @@ static case_result_t test_setup_failure_ends_batch_polling(sweep_cell_t const&) 
     ucall_server_t server {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 2;
     network_interface.event_loops = 2;
     ucall_server_options_t config {};
@@ -497,7 +519,7 @@ static case_result_t test_setup_failure_ends_batch_polling(sweep_cell_t const&) 
     batch_context_t batches;
     ucall_http_batch_endpoint_t endpoint {};
     ucall_server_add_http_batch_endpoint_t add {
-        server, &outcome, uc::bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 1, 1,
+        server, &outcome, bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 1, 1,
         0,      &endpoint};
     ucall_server_add_http_batch_endpoint(&add);
     if (!expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status))) return {};
@@ -540,7 +562,7 @@ static case_result_t test_setup_failure_ends_batch_polling(sweep_cell_t const&) 
 struct relay_t {
     std::array<std::atomic<ucall_received_http_request_t>, 2> requests {};
 
-    static void first(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
+    static void first(ucall_server_t, ucall_received_http_request_t const* requests, std::size_t count, void* context) {
         auto& relay = *static_cast<relay_t*>(context);
         relay.requests[0].store(requests[0], std::memory_order_release);
         steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
@@ -549,7 +571,8 @@ struct relay_t {
         expect_true(count == 1 && relay.requests[1].load(std::memory_order_acquire),
                     "the second endpoint's batch waited behind the first's callback");
     }
-    static void second(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
+    static void second(ucall_server_t, ucall_received_http_request_t const* requests, std::size_t count,
+                       void* context) {
         auto& relay = *static_cast<relay_t*>(context);
         expect_true(count == 1);
         relay.requests[1].store(requests[0], std::memory_order_release);
@@ -565,16 +588,9 @@ static void test_batch_endpoints_poll_apart(sweep_cell_t const& cell) {
     std::array<ucall_http_batch_endpoint_t, 2> endpoints {};
     for (std::size_t i = 0; i != routes.size(); ++i) {
         ucall_outcome_t outcome {};
-        ucall_server_add_http_batch_endpoint_t add {fixture.server,
-                                                    &outcome,
-                                                    uc::bytes_view(routes[i].first),
-                                                    ucall_verb_post_k,
-                                                    routes[i].second,
-                                                    &relay,
-                                                    1,
-                                                    1,
-                                                    0,
-                                                    &endpoints[i]};
+        ucall_server_add_http_batch_endpoint_t add {
+            fixture.server, &outcome, bytes_view(routes[i].first), ucall_verb_post_k, routes[i].second, &relay, 1, 1, 0,
+            &endpoints[i]};
         ucall_server_add_http_batch_endpoint(&add);
         if (!expect_true(outcome.status == ucall_status_success_k && endpoints[i], "{}",
                          ucall_status_name(outcome.status)))
@@ -665,7 +681,7 @@ static case_result_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const&
     ucall_server_t server {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
     network_interface.max_pipelined_requests = 4;
     ucall_server_options_t config {}, resolved {};
@@ -681,7 +697,7 @@ static case_result_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const&
     batch_context_t batches;
     ucall_http_batch_endpoint_t endpoint {};
     ucall_server_add_http_batch_endpoint_t add {
-        server,   &outcome, uc::bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 4, 4,
+        server,   &outcome, bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 4, 4,
         10000000, &endpoint};
     ucall_server_add_http_batch_endpoint(&add);
     expect_true(outcome.status == ucall_status_success_k);
@@ -696,9 +712,8 @@ static case_result_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const&
     for (std::size_t i = 0; i != 4; ++i)
         burst += fmt::format("POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\n{}", i);
     raw_client_t client;
-    bool const written = client.connect(uc::text_view(resolved.interfaces[0].address)) &&
-                         client.write(uc::byte_span(burst), burst.size(), generator,
-                                      steady_clock::now() + wait_limit_k);
+    bool const written = client.connect(text_view(resolved.interfaces[0].address)) &&
+                         client.write(byte_span(burst), burst.size(), generator, steady_clock::now() + wait_limit_k);
     expect_true(written, "the burst was not written");
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
     while (written && !batches.completed.load(std::memory_order_acquire) && steady_clock::now() <= deadline)
@@ -713,7 +728,7 @@ static case_result_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const&
             expect_true(outcome.status == ucall_status_success_k && body.length == 1 && body.data[0] == '0' + i,
                         "request {} of the batch", i);
             ucall_server_reply_content_t response {
-                server, &outcome, batches.requests[i], ucall_http_status_ok_k, nullptr, 0, body};
+                server, &outcome, &batches.requests[i], ucall_http_status_ok_k, nullptr, 0, body};
             ucall_server_reply_content(&response);
             expect_true(outcome.status == ucall_status_success_k);
         }
@@ -744,7 +759,7 @@ static case_result_t test_batches_skip_abandoned([[maybe_unused]] sweep_cell_t c
     ucall_server_t server {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 2;
     // A second request slot keeps a receive armed behind the deposited one, so the reset is seen.
     network_interface.max_pipelined_requests = 2;
@@ -759,7 +774,7 @@ static case_result_t test_batches_skip_abandoned([[maybe_unused]] sweep_cell_t c
     batch_context_t batches;
     ucall_http_batch_endpoint_t endpoint {};
     ucall_server_add_http_batch_endpoint_t add {
-        server, &outcome, uc::bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 2, 2,
+        server, &outcome, bytes_view("/batch"), ucall_verb_post_k, batch_context_t::receive, &batches, 2, 2,
         200000, &endpoint};
     ucall_server_add_http_batch_endpoint(&add);
     expect_true(outcome.status == ucall_status_success_k);
@@ -778,8 +793,8 @@ static case_result_t test_batches_skip_abandoned([[maybe_unused]] sweep_cell_t c
     };
     std::string_view const request = "POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx";
     raw_client_t leaving;
-    bool const written = leaving.connect(uc::text_view(resolved.interfaces[0].address)) &&
-                         leaving.write(uc::byte_span(request), request.size(), generator,
+    bool const written = leaving.connect(text_view(resolved.interfaces[0].address)) &&
+                         leaving.write(byte_span(request), request.size(), generator,
                                        steady_clock::now() + wait_limit_k);
     expect_true(written, "the request was not written");
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
@@ -820,7 +835,7 @@ static void test_keepalive_eviction(sweep_cell_t const& cell, split_mix_generato
     std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
     std::string_view const gate = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
     auto send = [&](raw_client_t& client, std::string_view bytes) {
-        expect_true(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(client.write(byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
     };
     {
         raw_client_t first, second, third;
@@ -848,13 +863,14 @@ static void test_keepalive_eviction(sweep_cell_t const& cell, split_mix_generato
         await_held_in_background(fixture, 2);
         if (!expect_true(third.connect(fixture.address))) return;
         // A probe armed while a connection was idle may close this peer, so its write may fail.
-        [[maybe_unused]] bool const written = third.write(uc::byte_span(echo), 0, generator, steady_clock::now() + 1s);
+        [[maybe_unused]] bool const written = third.write(byte_span(echo), 0, generator, steady_clock::now() + 1s);
         expect_true(third.read(1, steady_clock::now() + 300ms) != read_end_t::filled_k,
                     "a peer was served past a budget of busy connections");
         for (std::size_t held = 0; held != 2; ++held) {
             ucall_outcome_t outcome {};
-            ucall_server_reply_content_t reply {fixture.server, &outcome, fixture.take_held(),   ucall_http_status_ok_k,
-                                                nullptr,        0,        uc::bytes_view("held")};
+            ucall_received_http_request_t taken = fixture.take_held();
+            ucall_server_reply_content_t reply {fixture.server,    &outcome, &taken, ucall_http_status_ok_k, nullptr, 0,
+                                                bytes_view("held")};
             ucall_server_reply_content(&reply);
             expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
         }
@@ -873,7 +889,7 @@ static void test_stalled_stream_eviction(sweep_cell_t const& cell, split_mix_gen
     std::string_view const stalled = "POST /stream HTTP/1.1\r\nHost: a\r\nContent-Length: 1000\r\n\r\n";
     std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
     auto send = [&](raw_client_t& client, std::string_view bytes) {
-        expect_true(client.write(uc::byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(client.write(byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
     };
     raw_client_t dribbler, idle, waiting;
     if (!expect_true(dribbler.connect(fixture.address))) return;
@@ -892,8 +908,9 @@ static void test_stalled_stream_eviction(sweep_cell_t const& cell, split_mix_gen
     expect_true(idle.read(idle.received.size() + 1, steady_clock::now() + 100ms) == read_end_t::timed_out_k,
                 "the idle client was evicted ahead of the stalled stream");
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {fixture.server, &outcome, fixture.take_held(),   ucall_http_status_ok_k,
-                                        nullptr,        0,        uc::bytes_view("late")};
+    ucall_received_http_request_t taken = fixture.take_held();
+    ucall_server_reply_content_t reply {fixture.server,    &outcome, &taken, ucall_http_status_ok_k, nullptr, 0,
+                                        bytes_view("late")};
     ucall_server_reply_content(&reply);
     expect_true(outcome.status == ucall_status_success_k || outcome.status == ucall_status_connection_closed_k,
                 "the evicted stream's reply answered {}", ucall_status_name(outcome.status));
@@ -909,6 +926,7 @@ void test_serving_cell(sweep_cell_t const& cell, split_mix_generator_t& generato
         test_completion_credits(cell);
         test_timeout_and_cancel(cell);
         test_take_call_reports_retired(cell);
+        test_second_poller_is_refused(cell);
         test_application_batches(cell);
         test_batch_endpoints_poll_apart(cell);
         test_batch_timeout_sleeps(cell);

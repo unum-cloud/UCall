@@ -16,18 +16,18 @@
 
 #include "ucall/utilities/sockets.hpp" // `linux_open_how_t`, `linux_statx_t`
 
-namespace ucu = unum::ucall::utilities;
+namespace util = unum::ucall::utilities;
 
 #if __has_include(<linux/openat2.h>)
-static_assert(sizeof(ucu::linux_open_how_t) == sizeof(struct open_how),
+static_assert(sizeof(util::linux_open_how_t) == sizeof(struct open_how),
               "struct open_how is the kernel's; ours must match it");
-static_assert(offsetof(ucu::linux_open_how_t, resolve) == offsetof(struct open_how, resolve),
+static_assert(offsetof(util::linux_open_how_t, resolve) == offsetof(struct open_how, resolve),
               "struct open_how is the kernel's; ours must match it");
 #endif
 
 #if defined(STATX_DIOALIGN)
-static_assert(sizeof(ucu::linux_statx_t) == sizeof(struct statx), "struct statx is the kernel's; ours must match it");
-static_assert(offsetof(ucu::linux_statx_t, dio_offset_align) == offsetof(struct statx, stx_dio_offset_align),
+static_assert(sizeof(util::linux_statx_t) == sizeof(struct statx), "struct statx is the kernel's; ours must match it");
+static_assert(offsetof(util::linux_statx_t, dio_offset_align) == offsetof(struct statx, stx_dio_offset_align),
               "struct statx is the kernel's; ours must match it");
 #endif
 

@@ -2,12 +2,12 @@
 #
 # The root names what installs before including this file, as each project ships its own set of libraries:
 #
-# - `ucall_install_sdk_targets_`: the libraries of the `sdk` component, exported as `ucallTargets`;
-# - `ucall_install_static_targets_`: the archives of the `static` component, exported as `ucallStaticTargets`;
-# - `ucall_install_programs_`: the executables the `sdk` component ships beside its libraries, exported by neither.
+# - `ucall_install_sdk_targets_`: the targets of the `sdk` component, exported as `ucallTargets`;
+# - `ucall_install_programs_`: the executables the `sdk` component ships beside its libraries, outside the export set.
 #
-# An empty list installs nothing for its component, and `cmake/ucallConfig.cmake.in` loads the export sets the prefix
-# holds. A component no list covers, like a header-only core, installs from the root after this file.
+# One export set holds `ucall::abi`, `ucall::cpp` and both libraries, because `ucall::cpp` links `ucall::abi` and
+# `ucall::static`. An empty list installs nothing, and a component no list covers installs from the root after this
+# file.
 
 if (UCALL_INSTALL)
     include(GNUInstallDirs)
@@ -27,20 +27,6 @@ if (UCALL_INSTALL)
             NAMESPACE ucall::
             DESTINATION ${ucall_config_install_dir_}
             COMPONENT sdk
-        )
-    endif ()
-    if (ucall_install_static_targets_)
-        install(
-            TARGETS ${ucall_install_static_targets_}
-            EXPORT ucallStaticTargets
-            COMPONENT static
-            ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}
-        )
-        install(
-            EXPORT ucallStaticTargets
-            NAMESPACE ucall::
-            DESTINATION ${ucall_config_install_dir_}
-            COMPONENT static
         )
     endif ()
     if (ucall_install_programs_)

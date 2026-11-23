@@ -29,7 +29,7 @@ static case_result_t test_epollaio_reads() {
     if (!expect_true(file >= 0)) return {};
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected())) return {};
-    auto const deadline = uc::utilities::deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
 
     {
         engine_type_ engine;
@@ -58,13 +58,13 @@ static case_result_t test_epollaio_reads() {
         engine.submit(reads[i]);
     }
     std::size_t landed = 0;
-    while (landed != reads.size() && uc::utilities::monotonic_ns() < deadline) {
+    while (landed != reads.size() && util::monotonic_ns() < deadline) {
         io_completion_t completed[4] {};
         int const count = engine.poll(completed, io_wait_t::blocking_k, deadline);
         if (!expect_true(count >= 0, "polling ended with {}", count)) return {};
         for (int i = 0; i != count; ++i) {
             auto const index = static_cast<std::size_t>(completed[i].request - reads.data());
-            expect_true(index < reads.size() && completed[i].result == static_cast<uc::descriptor_t>(alignment) &&
+            expect_true(index < reads.size() && completed[i].result == static_cast<descriptor_t>(alignment) &&
                             std::memcmp(windows[index].data, files.content.data() + (2 * index + 1) * alignment,
                                         alignment) == 0,
                         "read {} ended with {}", index, completed[i].result);
@@ -85,8 +85,8 @@ static case_result_t test_epollaio_reads() {
     engine.submit(reads[0]);
     engine.submit(reads[1]);
     expect_true(engine.cancel(reads[1]) == ucall_status_success_k && engine.cancel(reads[0]) == ucall_status_success_k);
-    std::array<uc::descriptor_t, 2> cancelled {0, 0};
-    for (std::size_t count = 0; count != cancelled.size() && uc::utilities::monotonic_ns() < deadline;) {
+    std::array<descriptor_t, 2> cancelled {0, 0};
+    for (std::size_t count = 0; count != cancelled.size() && util::monotonic_ns() < deadline;) {
         io_completion_t completed[2] {};
         int const polled = engine.poll(completed, io_wait_t::blocking_k, deadline);
         if (!expect_true(polled >= 0, "polling ended with {}", polled)) return {};
@@ -95,7 +95,7 @@ static case_result_t test_epollaio_reads() {
     }
     expect_true(cancelled[0] == -ECANCELED && cancelled[1] == -ECANCELED, "the reads ended with {} and {}",
                 cancelled[0], cancelled[1]);
-    expect_true(await(engine, reads[0], deadline) == static_cast<uc::descriptor_t>(large.size) &&
+    expect_true(await(engine, reads[0], deadline) == static_cast<descriptor_t>(large.size) &&
                 std::memcmp(large.data, files.content.data(), large.size) == 0);
     ::close(file);
     return {};
@@ -111,16 +111,16 @@ static case_result_t test_epollaio_zero_copy_sends() {
     if (opened == ucall_status_unsupported_k) return case_result_t::skipped(aio_refused_k);
     if (!expect_true(opened == ucall_status_success_k)) return {};
     loopback_pair_t sockets = loopback_pair();
-    if (!expect_true(sockets.connected() && uc::utilities::nonblocking(sockets.client) == ucall_status_success_k &&
-                     uc::utilities::nonblocking(sockets.peer) == ucall_status_success_k))
+    if (!expect_true(sockets.connected() && util::nonblocking(sockets.client) == ucall_status_success_k &&
+                     util::nonblocking(sockets.peer) == ucall_status_success_k))
         return {};
     aligned_bytes_t window {16384};
     for (std::size_t i = 0; i != window.size; ++i) window.data[i] = file_byte(i);
-    auto const deadline = uc::utilities::deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
     std::string received;
     auto drain = [&](std::size_t expected) {
         char buffer[16384];
-        while (received.size() < expected && uc::utilities::monotonic_ns() < deadline)
+        while (received.size() < expected && util::monotonic_ns() < deadline)
             if (ssize_t const length = recv(sockets.peer, buffer, sizeof(buffer), 0); length > 0)
                 received.append(buffer, static_cast<std::size_t>(length));
         return received.size() == expected && std::memcmp(received.data(), window.data, received.size()) == 0;
@@ -133,7 +133,7 @@ static case_result_t test_epollaio_zero_copy_sends() {
                           .data = window.data,
                           .length = window.size,
                           .release_request = &release};
-    uc::descriptor_t const sent = await(engine, sending, deadline);
+    descriptor_t const sent = await(engine, sending, deadline);
     expect_true(sent > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
                 engine.statistics.zero_copy_sends);
     engine.submit(release);
@@ -143,7 +143,7 @@ static case_result_t test_epollaio_zero_copy_sends() {
     expect_true(drain(static_cast<std::size_t>(sent)));
 
     received.clear();
-    uc::descriptor_t const copied = await(engine, sending, deadline);
+    descriptor_t const copied = await(engine, sending, deadline);
     expect_true(copied > 0 && engine.statistics.zero_copy_sends == 1);
     expect_true(await(engine, release, deadline) == 0);
     expect_true(drain(static_cast<std::size_t>(copied)));

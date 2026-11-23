@@ -41,7 +41,7 @@ struct ucall_server_handle_t {
         void (*request_path_parameter)(ucall_server_request_path_parameter_t*);
         void (*request_query_parameter)(ucall_server_request_query_parameter_t*);
         void (*request_header)(ucall_server_request_header_t*);
-        void (*request_fields_count)(ucall_server_request_fields_count_t*);
+        std::size_t (*request_fields_count)(ucall_server_t, ucall_received_http_request_t);
         void (*request_field)(ucall_server_request_field_t*);
         void (*request_query)(ucall_server_request_query_t*);
         void (*request_peer)(ucall_server_request_peer_t*);
@@ -74,6 +74,7 @@ struct ucall_client_handle_t {
         void (*free)(ucall_client_t);
         void (*call)(ucall_client_call_t*);
         void (*take_completed)(ucall_client_take_completed_t*);
+        void (*take_completed_call)(ucall_client_take_completed_call_t*);
     };
 
     /** The verbs of the instantiation that created this client, set once at initialization. */
@@ -85,6 +86,7 @@ namespace unum::ucall::network {
 using io::close_mode_t;
 using io::listing_t;
 using utilities::byte_t;
+using utilities::native_file_t;
 using server_api_t = ucall_server_handle_t::api_t;
 using client_api_t = ucall_client_handle_t::api_t;
 

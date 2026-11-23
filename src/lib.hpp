@@ -362,7 +362,7 @@ constexpr fu::capabilities_t forkunion_capabilities_of(cpu_class_t cpu) noexcept
 
 /** Whether @p rung fits under @p ceiling: its compiled string kernels, its waiter's mask and its
  *  atomic reference's entire mask, so RCpc with LSE, need nothing the ceiling lacks. */
-constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
+constexpr bool cpu_rung_fits(cpu_class_t rung, util::cpu_ceiling_t ceiling) noexcept {
     sz_capability_t const strings = stringzilla_capabilities_of(rung) & sz_capabilities_compiled_cpu_mask();
     return (strings & ~ceiling.strings) == 0 && (forkunion_capabilities_of(rung) & ~ceiling.sync) == 0;
 }
@@ -372,11 +372,11 @@ constexpr bool cpu_rung_fits(cpu_class_t rung, cpu_ceiling_t ceiling) noexcept {
  *  A value no class takes answers @c ucall_status_invalid_argument_k, and an intersection no
  *  compiled class fits, like one below a monoversioned build's masks, answers
  *  @c ucall_status_unsupported_k. The one caller of StringZilla's and ForkUnion's detection. */
-inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t class_ceiling, cpu_ceiling_t& ceiling) noexcept {
+inline ucall_status_t pick_cpu_ceiling(ucall_cpu_class_t class_ceiling, util::cpu_ceiling_t& ceiling) noexcept {
     bool known = class_ceiling == ucall_cpu_class_unknown_k;
     for (ucall_cpu_class_t const cpu_class : cpu_classes_k) known |= cpu_class == class_ceiling;
     if (!known) return ucall_status_invalid_argument_k;
-    cpu_ceiling_t picked;
+    util::cpu_ceiling_t picked;
     if (sz_capabilities_detected_cpu(&picked.strings) != sz_success_k) picked.strings = sz_cap_serial_k;
     picked.sync = fu::cpu_capabilities();
     if (class_ceiling != ucall_cpu_class_unknown_k) {
@@ -422,7 +422,7 @@ inline constexpr cpu_class_t cpu_ladder_floor_k = cpu_class_t::serial_k;
 
 /** The class @ref make_network builds for @p ceiling on @p ladder. */
 template <cpu_class_t... classes_>
-cpu_class_t built_class(cpu_ladder<classes_...>, cpu_ceiling_t ceiling) noexcept {
+cpu_class_t built_class(cpu_ladder<classes_...>, util::cpu_ceiling_t ceiling) noexcept {
     cpu_class_t built = cpu_class_t::serial_k;
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
@@ -436,7 +436,7 @@ cpu_class_t built_class(cpu_ladder<classes_...>, cpu_ceiling_t ceiling) noexcept
 /** Builds the network on the newest rung of @p ladder the build compiled and @p ceiling fits, one
  *  of which @ref pick_cpu_ceiling made sure of; a compiled class must advance past its parent. */
 template <cpu_class_t... classes_, typename init_type_>
-void make_network(cpu_ladder<classes_...>, init_type_* arguments, cpu_ceiling_t ceiling) noexcept {
+void make_network(cpu_ladder<classes_...>, init_type_* arguments, util::cpu_ceiling_t ceiling) noexcept {
     bool picked = false;
     auto rung = [&]<cpu_class_t class_>() noexcept {
         if constexpr (cpu_class_compiled(class_) && class_advances<class_>()) {
@@ -469,7 +469,7 @@ host_verbs_t host_verbs_of() noexcept {
     using wait_t = typename traits_t::waiter_t;
     return {
         [](ucall_outcome_t* outcome, ucall_status_t status, char const* message) noexcept {
-            utilities::publish<traits_t::template atomic_ref>(outcome, status, message);
+            util::publish<traits_t::template atomic_ref>(outcome, status, message);
         },
         [](ucall_outcome_t const* outcome) noexcept {
             return status_reader_t {outcome->status}.load(std::memory_order_acquire);
@@ -490,7 +490,7 @@ host_verbs_t host_verbs_of() noexcept {
 /** The row of the newest class this machine admits, picked once by the ladder walk. */
 inline host_verbs_t const& host_verbs() noexcept {
     static host_verbs_t const picked = []<cpu_class_t... classes_>(cpu_ladder<classes_...>) noexcept {
-        cpu_ceiling_t ceiling {};
+        util::cpu_ceiling_t ceiling {};
         if (pick_cpu_ceiling(ucall_cpu_class_unknown_k, ceiling) != ucall_status_success_k) ceiling = {};
         host_verbs_t row = host_verbs_of<cpu_ladder_floor_k>();
         bool found = false;

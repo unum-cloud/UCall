@@ -24,9 +24,10 @@ foreach (target_ ucall_shared_stub ucall_static_stub)
     target_compile_definitions(${target_} PRIVATE UCALL_VERSION_NAME="${ucall_version_name_}")
     target_link_libraries(
         ${target_}
-        PUBLIC ucall_header
-        PRIVATE $<BUILD_INTERFACE:ucall_sanitizers> $<BUILD_INTERFACE:ucall_warnings> $<BUILD_INTERFACE:forkunion::header>
-                $<BUILD_INTERFACE:smashtable::header> $<BUILD_INTERFACE:stringzilla::header>
+        PUBLIC ucall_abi
+        PRIVATE $<BUILD_INTERFACE:ucall_sanitizers> $<BUILD_INTERFACE:ucall_warnings>
+                $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
+                $<BUILD_INTERFACE:stringzilla::header>
     )
     if (WIN32)
         target_link_libraries(${target_} PRIVATE bcrypt ws2_32)

@@ -38,7 +38,7 @@ ctest --preset debug
 The `relwithdebinfo` and `release` presets build the same suites with optimization, `asan` and `tsan` build them under a sanitizer, and `check` builds every target with Clang and `UCALL_WERROR=ON`.
 Tests, examples and benchmarks are off unless a preset or a `-D` switch asks for them.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
-The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, and `ucall::header`, the C headers alone.
+The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, `ucall::abi`, the C headers alone, and `ucall::cpp`, the C++ SDK linking the C headers and the archive.
 `UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each engine where the target operating system has it, and the header refuses one forced on elsewhere.
 `UCALL_WITH_LINUX_URING`, on for Linux, also links liburing, and a library or subproject build serves whichever compiled engine the host admits first.
 CPU probes select separate instantiation units, each compiled at the floor like the dispatch code.
@@ -56,7 +56,7 @@ They share the command-line, polling and shutdown helpers in `tools/`, which eve
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust) describe.
 
-`cmake --install` installs `ucall::static`, the `ucall` command-line client, the C headers, a CMake package and the license.
+`cmake --install` installs `ucall::abi`, `ucall::static`, `ucall::cpp`, the `ucall` command-line client, the C and C++ headers, a CMake package and the license.
 `UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build, and installs it beside the archive with a `ucall.pc`.
 The shared library exports the `ucall_*` C interface alone, and the `release` preset remaps the source directory out of every binary.
 A C program links either library, as CI's install job does with `examples/hello.c` through `find_package(ucall)` and through `pkg-config`.
@@ -161,6 +161,12 @@ A library leaves out the ones it cannot answer but never renumbers the rest, and
 Every enum the C interface names, statuses included, has a `ucall_*_name` answering "unrecognized" for a value it does not know and a `ucall_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
 CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
 `ucall_version_name` answers the full version, pre-release suffix included, in the engine and in the stub alike.
+
+### Notes
+
+A failure's C outcome carries a static message: the static name of what broke, such as a tunnel fault's name, else the status's own `ucall_status_name`.
+The SDK in `cpp/` keeps the same `status_t {code, note}` as the other `U*` SDKs, so a status reads alike everywhere: recovery branches on the code, and the note names the broken invariant, step or resource for logs.
+A note is 2 to 8 words in sentence case with no closing period, never restates the code, and never carries a value that differs per call, such as a path, an error number, a size or an identifier.
 
 ### Refusals
 
@@ -502,7 +508,7 @@ Nothing in a binding takes a lock, sends a notification or adds synchronization 
 The object that submitted a deferred call is the only one that polls its outcome, so no other thread ever waits on it, and whatever a second caller asks, the library answers.
 A blocking `wait` calls `ucall_outcome_wait`.
 An asynchronous bridge never parks a thread: it reads `ucall_outcome_status` and, while the call is deferred, yields to its runtime.
-A runtime with a timer pauses between reads with a backoff growing from about 1 µs to 1 ms, like Python's `asyncio.sleep`, Swift's `Task.sleep`, JavaScript's `setTimeout` and C#'s `Task.Delay`.
+A runtime that can reschedule a task reads again on its next turn with no sleep, like Python's `loop.call_soon`, a C++ scheduler's `post(poll, state)` and Mojo's runtime, while one that resumes only on a timer pauses with a backoff growing from about 1 µs to 1 ms, like Swift's `Task.sleep`, JavaScript's `setTimeout` and C#'s `Task.Delay`.
 A Rust future yields only: `poll` reads the status and, while it is deferred, calls `wake_by_ref` and returns `Poll::Pending`, with no sleep and no timer thread.
 
 A callback never raises into the library.
@@ -518,7 +524,7 @@ Where a binding's own types carry two lengths, like a slice of keys beside a mat
 
 Each verb has one body, which fills the C struct and calls the library with no layers in between.
 What it returns is read from the struct's output slot, a trampoline receives the handler itself as its state with no hub around it, and whether a call blocks or defers follows from the type of the receiver it is called on, never from a flag.
-Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle.
+Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle, and C++ writes each handle and its receivers as one class template over what the receiver holds, so the handle carries the verbs as Rust's `&Handle` does.
 
 A typed binding takes the scalar as a type parameter of each call, like USearch's `search::<f32>`, rather than letting a handle's type fix one.
 A deferred Rust call owns what it lends the library until the call is final, since the borrow checker cannot see the library holding it.
@@ -528,6 +534,10 @@ A dynamic binding publishes every field of every report the library fills.
 A type the binding hands to C by cast, like a slice of parts lent as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
 Tests never restate a struct's layout that the compiler already pins: no `offset_of!`, `size_of`, `MemoryLayout` or `Marshal.SizeOf` asserts against the C structs; `offsetof` tables that declare members are declarations, not tests.
 Tests of how names print and parse, and of an engine run again through the binding, stay.
+A binding test asserts a status, or the exception or error type mapped from it, and never the wording of a message or note, in any language: no pytest `match=`, no comparison of `error.message`, `err.Error()` or a note's text, and no substring search in them, since engines refine their notes over time.
+
+A callback crosses as the C struct it lowers to, built by one generic constructor per handler shape with a trampoline made per handler type, never a trait object, a box or an enum.
+A reply that may finish after the handler returns lends a slot the caller keeps, a `deferred` in C++ and a pinned `Deferred` in Rust, so the polling thread never blocks on it and nothing is boxed.
 
 `.githooks/pre-commit` refuses locks in binding sources, throwing callback types, caught unwinds and kept exceptions.
 

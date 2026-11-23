@@ -27,6 +27,8 @@
 
 namespace unum::ucall::tools {
 
+using util::bytes_view;
+
 /** The exit status of a run a signal stopped, as shells report a command SIGINT ended. */
 inline constexpr int exit_stopped_k = 130;
 

@@ -12,9 +12,13 @@
 
 #include "lib.hpp" // `cpu_classes_k`
 
+namespace util = unum::ucall::utilities;
+
 using namespace unum::ucall;
 
-static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept { return spelling == text_view(name); }
+static bool named(std::string_view spelling, ucall_bytes_view_t name) noexcept {
+    return spelling == util::text_view(name);
+}
 
 /** Writes the entry of @p values that @p name_of spells as @p name into @p value, else nothing. */
 template <typename value_type_, std::size_t count_>

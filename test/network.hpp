@@ -60,7 +60,7 @@ inline constexpr char const* loops_refused_k = "several loops on one interface a
 inline ucall_reply_part_t bytes_part(std::string_view data) {
     ucall_reply_part_t part {};
     part.kind = ucall_reply_part_bytes_k;
-    part.data.bytes = uc::bytes_view(data);
+    part.data.bytes = bytes_view(data);
     return part;
 }
 
@@ -130,7 +130,7 @@ struct fixture_t {
     std::string query(ucall_received_http_request_t request, std::string_view name) {
         ucall_outcome_t outcome {};
         ucall_bytes_view_t value {};
-        ucall_server_request_query_parameter_t get {server, &outcome, request, uc::bytes_view(name), &value};
+        ucall_server_request_query_parameter_t get {server, &outcome, request, bytes_view(name), &value};
         ucall_server_request_query_parameter(&get);
         return outcome.status == ucall_status_success_k
                    ? std::string {reinterpret_cast<char const*>(value.data), value.length}
@@ -144,16 +144,16 @@ struct fixture_t {
     }
 
     /** Replies 201 with five parts, two of them empty, behind two headers. */
-    static void vectored(ucall_received_http_request_t request, void* context) {
+    static void vectored(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         static std::string const middle(100 * 1024, 'v');
-        ucall_bytes_view_t const headers[] {uc::bytes_view("X-UCall: passed"),
-                                            uc::bytes_view("Content-Type: application/octet-stream")};
+        ucall_bytes_view_t const headers[] {bytes_view("X-UCall: passed"),
+                                            bytes_view("Content-Type: application/octet-stream")};
         ucall_reply_part_t const parts[] {bytes_part(""), bytes_part("first|"), bytes_part(middle), bytes_part(""),
                                           bytes_part("|last")};
         ucall_outcome_t outcome {};
-        ucall_server_reply_vectored_t reply {fixture.server, &outcome, request, ucall_http_status_created_k,
-                                             headers,        2,        parts,   5};
+        ucall_server_reply_vectored_t reply {fixture.server, &outcome, &request, ucall_http_status_created_k,
+                                             headers,        2,        parts,    5};
         ucall_server_reply_vectored(&reply);
         expect_true(outcome.status == ucall_status_success_k, "vectored: {}", ucall_status_name(outcome.status));
     }
@@ -181,17 +181,17 @@ struct fixture_t {
         ucall_server_request_body_t extract {server, &outcome, request, &body};
         ucall_server_request_body(&extract);
         expect_true(outcome.status == ucall_status_success_k);
-        ucall_bytes_view_t header = uc::bytes_view("X-UCall: passed");
-        ucall_server_reply_content_t reply {server, &outcome, request, ucall_http_status_ok_k, &header, 1, body};
+        ucall_bytes_view_t header = bytes_view("X-UCall: passed");
+        ucall_server_reply_content_t reply {server, &outcome, &request, ucall_http_status_ok_k, &header, 1, body};
         ucall_server_reply_content(&reply);
         expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
     }
-    static void echo(ucall_received_http_request_t request, void* context) {
+    static void echo(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         fixture.dispatched.fetch_add(1, std::memory_order_relaxed);
         fixture.reply_echo(request);
     }
-    static void gate(ucall_received_http_request_t request, void* context) {
+    static void gate(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         std::lock_guard lock {fixture.held_mutex};
         fixture.held.push_back(request);
@@ -199,7 +199,7 @@ struct fixture_t {
 
     /** Pulls once on the polling thread, keeping what the pull answered, then retains the request
      *  like @c gate. */
-    static void pulling_gate(ucall_received_http_request_t request, void* context) {
+    static void pulling_gate(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         ucall_outcome_t outcome {};
         ucall_bytes_view_t data {};
@@ -211,7 +211,7 @@ struct fixture_t {
     }
 
     /** Replies with the path and what four lookups found, each followed by a semicolon. */
-    static void lookup(ucall_received_http_request_t request, void* context) {
+    static void lookup(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         fixture.dispatched.fetch_add(1, std::memory_order_relaxed);
         ucall_outcome_t path_outcome {};
@@ -224,7 +224,7 @@ struct fixture_t {
         for (std::string_view name : {"Content-TYPE", "X-~", "x-^", "X-Absent"}) {
             ucall_outcome_t outcome {};
             ucall_bytes_view_t value {};
-            ucall_server_request_header_t get {fixture.server, &outcome, request, uc::bytes_view(name), &value};
+            ucall_server_request_header_t get {fixture.server, &outcome, request, bytes_view(name), &value};
             ucall_server_request_header(&get);
             if (outcome.status == ucall_status_success_k)
                 answer.append(reinterpret_cast<char const*>(value.data), value.length);
@@ -232,15 +232,15 @@ struct fixture_t {
             answer += ';';
         }
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {
-            fixture.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view(answer)};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, &request,          ucall_http_status_ok_k,
+                                            nullptr,        0,        bytes_view(answer)};
         ucall_server_reply_content(&reply);
         expect_true(outcome.status == ucall_status_success_k);
     }
 
     /** Replies with the part count, then each multipart part as <tt>name=type=data</tt>, all
      *  <tt>;</tt>-ended. */
-    static void parts(ucall_received_http_request_t request, void* context) {
+    static void parts(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         std::size_t const count = ucall_server_request_parts_count(fixture.server, request);
         std::string answer = fmt::format("{};", count);
@@ -251,7 +251,7 @@ struct fixture_t {
             ucall_server_request_part(&get);
             expect_true(outcome.status == ucall_status_success_k, "part {}: {}", index,
                         ucall_status_name(outcome.status));
-            answer += fmt::format("{}={}={};", uc::text_view(name), uc::text_view(type), uc::text_view(data));
+            answer += fmt::format("{}={}={};", text_view(name), text_view(type), text_view(data));
         }
         ucall_outcome_t probe {};
         ucall_bytes_view_t name {}, type {}, data {};
@@ -259,25 +259,25 @@ struct fixture_t {
         ucall_server_request_part(&past);
         if (probe.status == ucall_status_malformed_k) answer += "malformed;";
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {
-            fixture.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view(answer)};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, &request,          ucall_http_status_ok_k,
+                                            nullptr,        0,        bytes_view(answer)};
         ucall_server_reply_content(&reply);
         expect_true(outcome.status == ucall_status_success_k);
     }
 
     /** Replies with no body and the status the <tt>{code}</tt> segment names. */
-    static void status_only(ucall_received_http_request_t request, void* context) {
+    static void status_only(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& fixture = *static_cast<fixture_t*>(context);
         fixture.dispatched.fetch_add(1, std::memory_order_relaxed);
         ucall_outcome_t outcome {};
         ucall_bytes_view_t code {};
-        ucall_server_request_path_parameter_t get {fixture.server, &outcome, request, uc::bytes_view("code"), &code};
+        ucall_server_request_path_parameter_t get {fixture.server, &outcome, request, bytes_view("code"), &code};
         ucall_server_request_path_parameter(&get);
         expect_true(outcome.status == ucall_status_success_k);
         ucall_http_status_t status {};
         std::from_chars(reinterpret_cast<char const*>(code.data),
                         reinterpret_cast<char const*>(code.data) + code.length, status);
-        ucall_server_reply_content_t reply {fixture.server, &outcome, request, status, nullptr, 0, {}};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, &request, status, nullptr, 0, {}};
         ucall_server_reply_content(&reply);
         expect_true(outcome.status == ucall_status_success_k, "reply {}: {}", status,
                     ucall_status_name(outcome.status));
@@ -308,7 +308,7 @@ struct fixture_t {
         ucall_noise_key_derive(&derive);
         if ((status = outcome.status) != ucall_status_success_k) return;
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.event_loops = settings.event_loops;
         network_interface.max_concurrent_connections = settings.connections;
         network_interface.max_pipelined_requests = settings.pipelined_requests;
@@ -318,7 +318,7 @@ struct fixture_t {
         if (cell.security == ucall_security_noise_kk_k) network_interface.noise_peer_key = &client_public;
         network_interface.peer_authorizer = authorize;
         network_interface.peer_authorizer_context = client_public;
-        ucall_bytes_view_t const directory = uc::bytes_view(settings.directory);
+        ucall_bytes_view_t const directory = bytes_view(settings.directory);
         network_interface.reply_directories = &directory;
         network_interface.reply_directories_count = settings.directory.empty() ? 0 : 1;
         ucall_server_options_t config {};
@@ -328,8 +328,8 @@ struct fixture_t {
         config.cpu_class_ceiling = cell.cpu_class_ceiling;
         config.log = settings.log;
         if (!settings.metrics_address.empty()) {
-            config.metrics_address = uc::bytes_view(settings.metrics_address);
-            config.metrics_prefix = uc::bytes_view("probe");
+            config.metrics_address = bytes_view(settings.metrics_address);
+            config.metrics_prefix = bytes_view("probe");
             config.metrics_tags = metrics_tags_k;
             config.metrics_tags_count = 2;
             config.metrics_interval_microseconds = 10'000;
@@ -341,25 +341,25 @@ struct fixture_t {
         for (auto [route, callback] :
              {route_t {"/echo/{id}", echo}, route_t {"/gate", gate}, route_t {"/headers", lookup},
               route_t {"/status/{code}", status_only}, route_t {"/vectored", vectored}}) {
-            ucall_server_add_http_endpoint_t add {server,           &outcome, uc::bytes_view(route),
+            ucall_server_add_http_endpoint_t add {server,           &outcome, bytes_view(route),
                                                   ucall_verb_any_k, callback, this};
             ucall_server_add_http_endpoint(&add);
             if ((status = outcome.status) != ucall_status_success_k) return;
         }
-        ucall_server_add_http_endpoint_t only_get {server,           &outcome, uc::bytes_view("/only-get"),
+        ucall_server_add_http_endpoint_t only_get {server,           &outcome, bytes_view("/only-get"),
                                                    ucall_verb_get_k, echo,     this};
         ucall_server_add_http_endpoint(&only_get);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        ucall_server_add_http_endpoint_t parts_route {server,           &outcome, uc::bytes_view("/parts"),
+        ucall_server_add_http_endpoint_t parts_route {server,           &outcome, bytes_view("/parts"),
                                                       ucall_verb_any_k, parts,    this};
         ucall_server_add_http_endpoint(&parts_route);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        ucall_server_add_http_endpoint_t stream {server, &outcome, uc::bytes_view("/stream"),     ucall_verb_any_k,
+        ucall_server_add_http_endpoint_t stream {server, &outcome, bytes_view("/stream"),         ucall_verb_any_k,
                                                  gate,   this,     ucall_body_delivery_streamed_k};
         ucall_server_add_http_endpoint(&stream);
         if ((status = outcome.status) != ucall_status_success_k) return;
         ucall_server_add_http_endpoint_t pulling {
-            server,       &outcome, uc::bytes_view("/stream/pull"), ucall_verb_any_k,
+            server,       &outcome, bytes_view("/stream/pull"),    ucall_verb_any_k,
             pulling_gate, this,     ucall_body_delivery_streamed_k};
         ucall_server_add_http_endpoint(&pulling);
         if ((status = outcome.status) != ucall_status_success_k) return;
@@ -379,7 +379,7 @@ struct fixture_t {
         ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};
         ucall_client_init(&client_init);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        address = uc::text_view(resolved.interfaces[0].address);
+        address = text_view(resolved.interfaces[0].address);
         url = fmt::format("{}{}", cell.security == ucall_security_none_k ? "http://" : "http+noise://", address);
     }
     ~fixture_t() {
@@ -455,7 +455,7 @@ inline void check_response(ucall_received_http_response_t response, std::string_
                 body.length, expected.size());
     expect_true(body.length != expected.size() || !body.length ||
                 std::memcmp(body.data, expected.data(), body.length) == 0);
-    ucall_client_response_header_t get_header {response, &outcome, uc::bytes_view("X-UCALL"), &header};
+    ucall_client_response_header_t get_header {response, &outcome, bytes_view("X-UCALL"), &header};
     ucall_client_response_header(&get_header);
     expect_true(outcome.status == ucall_status_success_k && header.length == 6 &&
                 std::memcmp(header.data, "passed", 6) == 0);
@@ -484,7 +484,7 @@ inline ucall_completed_call_t call_and_wait(fixture_t& fixture, ucall_verb_t ver
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = verb;
     call.options.security = security;
     call.options.noise_peer_key = &fixture.server_public;
@@ -505,7 +505,7 @@ inline std::string_view response_body(ucall_received_http_response_t response) {
 inline std::string_view response_header(ucall_received_http_response_t response, std::string_view name) {
     ucall_outcome_t outcome {};
     ucall_bytes_view_t value {};
-    ucall_client_response_header_t get {response, &outcome, uc::bytes_view(name), &value};
+    ucall_client_response_header_t get {response, &outcome, bytes_view(name), &value};
     ucall_client_response_header(&get);
     return {reinterpret_cast<char const*>(value.data), value.length};
 }
@@ -536,7 +536,7 @@ inline ucall_event_loop_statistics_t loop_statistics(fixture_t& fixture) {
 inline wire_response_t exchange_until_close(raw_client_t& client, std::string_view request, std::size_t max_chunk,
                                             split_mix_generator_t& generator) {
     steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
-    expect_true(client.write(uc::byte_span(request), max_chunk, generator, deadline), "the server stopped reading");
+    expect_true(client.write(byte_span(request), max_chunk, generator, deadline), "the server stopped reading");
     auto const end = client.read_until_close(deadline);
     int const error = end == read_end_t::failed_k ? errno : 0;
     auto const response = parse_response(client.received);
@@ -561,7 +561,7 @@ inline ucall_received_http_request_t hold_call(fixture_t& fixture, ucall_verb_t 
     ucall_client_call_t call {};
     call.client = fixture.client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = verb;
     call.options.security = security;
     call.options.noise_peer_key = &fixture.server_public;
@@ -593,7 +593,7 @@ inline bool expect_outcome(fixture_t& fixture, ucall_outcome_t& outcome, ucall_s
 #endif // UCALL_OS_POSIX_
 
 /** The serial network over every compiled engine, drawing each allocation from a counter. */
-using counted_network_t = uc::network::serial_network<uc::io_engines_t, counting_allocator<uc::byte_t>>;
+using counted_network_t = uc::network::serial_network<uc::io_engines_t, counting_allocator<byte_t>>;
 
 namespace network {
 using namespace unum::ucall::network;

@@ -49,23 +49,23 @@ void test_engine_duplex(split_mix_generator_t& generator) {
     // A send buffer far below a mebibyte keeps the send pending until the peer drains it, yet above
     // a page, as FreeBSD acknowledges each small segment only after its 40 ms delayed-ACK timer.
     int const send_buffer = static_cast<int>(16 * fixture_buffer_bytes_k);
-    if (!expect_true(uc::utilities::nonblocking(sockets.client) == ucall_status_success_k &&
-                     uc::utilities::nonblocking(sockets.peer) == ucall_status_success_k &&
-                     uc::utilities::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer,
-                                                  sizeof(send_buffer)) == 0))
+    if (!expect_true(util::nonblocking(sockets.client) == ucall_status_success_k &&
+                     util::nonblocking(sockets.peer) == ucall_status_success_k &&
+                     util::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) ==
+                         0))
         return;
     auto const owned = engine.import_socket(std::exchange(sockets.client, -1));
     if (!expect_true(owned >= 0, "importing ended with {}", owned)) return;
     int const peer = sockets.peer;
 
-    std::vector<uc::byte_t> payload(std::size_t {1} << 20), drained(payload.size());
-    for (auto& byte : payload) byte = static_cast<uc::byte_t>(generator());
-    uc::span<uc::byte_t const> const message = uc::byte_span("receive");
-    std::array<uc::byte_t, fixture_buffer_bytes_k> buffer {};
-    io_vector_t room {buffer.data(), sizeof(buffer)};
+    std::vector<util::byte_t> payload(std::size_t {1} << 20), drained(payload.size());
+    for (auto& byte : payload) byte = static_cast<util::byte_t>(generator());
+    span<util::byte_t const> const message = util::byte_span("receive");
+    std::array<util::byte_t, fixture_buffer_bytes_k> buffer {};
+    util::io_vector_t room {buffer.data(), sizeof(buffer)};
     io_request_t receiving {.operation = io_operation_t::receive_k,
                             .descriptor = owned,
-                            .data = reinterpret_cast<uc::byte_t*>(&room),
+                            .data = reinterpret_cast<util::byte_t*>(&room),
                             .length = 1};
     io_request_t sending {.operation = io_operation_t::send_k,
                           .descriptor = owned,
@@ -77,14 +77,14 @@ void test_engine_duplex(split_mix_generator_t& generator) {
     std::size_t received = 0, sent = 0, read = 0;
     bool written = false;
     io_completion_t completions[2] {};
-    auto const deadline = uc::utilities::deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
     while (!received || sent != payload.size() || read != payload.size()) {
         // Nothing drains the peer before the receive completes,
         // so the send stays pending throughout.
         auto const wait = written && !received ? io_wait_t::blocking_k : io_wait_t::nonblocking_k;
-        int const count = engine.poll(uc::span<io_completion_t> {completions}, wait, deadline);
+        int const count = engine.poll(span<io_completion_t> {completions}, wait, deadline);
         if (!expect_true(count >= 0, "polling ended with {}", count)) return;
-        for (auto const& completed : uc::span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+        for (auto const& completed : span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
             if (completed.request == &sending) {
                 if (!expect_true(completed.result > 0, "sending ended with {}", completed.result)) return;
                 sent += static_cast<std::size_t>(completed.result);
@@ -96,7 +96,7 @@ void test_engine_duplex(split_mix_generator_t& generator) {
                 if (!expect_true(completed.request == &receiving, "a completion named neither request")) return;
                 if (!expect_true(completed.result > 0, "receiving ended with {}", completed.result)) return;
                 received = static_cast<std::size_t>(completed.result);
-                uc::span<uc::byte_t const> const delivered {completed.data ? completed.data : buffer.data(), received};
+                span<util::byte_t const> const delivered {completed.data ? completed.data : buffer.data(), received};
                 expect_equal_bytes(delivered, message);
                 expect_true(sent != payload.size(), "the send finished before the peer read");
             }
@@ -113,8 +113,8 @@ void test_engine_duplex(split_mix_generator_t& generator) {
             if (length > 0) read += static_cast<std::size_t>(length);
             else if (!expect_true(length < 0 && io_pending(-errno), "draining ended with {}", length)) return;
         }
-        if (!expect_true(uc::utilities::monotonic_ns() < deadline, "{} received, {} sent and {} read of {}", received,
-                         sent, read, payload.size()))
+        if (!expect_true(util::monotonic_ns() < deadline, "{} received, {} sent and {} read of {}", received, sent,
+                         read, payload.size()))
             return;
     }
     expect_true(drained == payload);
@@ -137,15 +137,14 @@ void test_accept_batch() {
     socklen_t address_length = sizeof(address);
     if (!expect_true(listener >= 0 && ::bind(listener, reinterpret_cast<sockaddr*>(&address), address_length) == 0 &&
                      ::getsockname(listener, reinterpret_cast<sockaddr*>(&address), &address_length) == 0 &&
-                     ::listen(listener, connections_k) == 0 &&
-                     uc::utilities::nonblocking(listener) == ucall_status_success_k))
+                     ::listen(listener, connections_k) == 0 && util::nonblocking(listener) == ucall_status_success_k))
         return;
     auto const owned = engine.import_socket(listener);
     if (!expect_true(owned >= 0, "importing the listener ended with {}", owned)) return;
     std::array<io_peer_address_t, connections_k> peers {};
     io_request_t accepting {.operation = io_operation_t::accept_k,
                             .descriptor = owned,
-                            .data = reinterpret_cast<uc::byte_t*>(peers.data()),
+                            .data = reinterpret_cast<util::byte_t*>(peers.data()),
                             .length = connections_k};
     engine.submit(accepting);
 
@@ -160,18 +159,18 @@ void test_accept_batch() {
             return;
         ports.push_back(ntohs(local.sin_port));
     }
-    std::vector<uc::descriptor_t> accepted;
+    std::vector<util::descriptor_t> accepted;
     std::size_t endings = 0;
     // Room past every connection, so a readiness engine never ends the accept for want of it.
     io_completion_t completions[4 * connections_k] {};
-    auto const deadline = uc::utilities::deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
     while (!endings) {
         // Every client connected, so a request still pending afterwards only ends once cancelled.
         if (accepted.size() == connections_k && accepting.length)
             if (!expect_true(engine.cancel(accepting) == ucall_status_success_k)) return;
-        int const count = engine.poll(uc::span<io_completion_t> {completions}, io_wait_t::blocking_k, deadline);
+        int const count = engine.poll(span<io_completion_t> {completions}, io_wait_t::blocking_k, deadline);
         if (!expect_true(count >= 0, "polling ended with {}", count)) return;
-        for (auto const& completed : uc::span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+        for (auto const& completed : span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
             if (!expect_true(completed.request == &accepting, "a completion named another request")) return;
             expect_true(!endings, "a completion followed the one that ended the accept");
             endings += completed.continuation == io_continuation_t::ended_k;
@@ -187,12 +186,11 @@ void test_accept_batch() {
             expect_true(peer.ss_family == AF_INET && found != ports.end(), "a peer at port {} connected", port);
             if (found != ports.end()) ports.erase(found);
         }
-        if (!expect_true(uc::utilities::monotonic_ns() < deadline, "{} of {} accepted", accepted.size(), connections_k))
-            return;
+        if (!expect_true(util::monotonic_ns() < deadline, "{} of {} accepted", accepted.size(), connections_k)) return;
     }
     expect_true(accepted.size() == connections_k && ports.empty(), "{} of {} accepted", accepted.size(), connections_k);
     expect_true(endings == 1 && !accepting.length, "{} completions ended the accept", endings);
-    expect_true(engine.poll(uc::span<io_completion_t> {completions}, io_wait_t::nonblocking_k) == 0,
+    expect_true(engine.poll(span<io_completion_t> {completions}, io_wait_t::nonblocking_k) == 0,
                 "the accept completed after it ended");
     for (auto descriptor : accepted) expect_true(engine.close_socket(descriptor) == 0);
     expect_true(engine.close_socket(owned) == 0);
@@ -209,15 +207,15 @@ inline constexpr int direct_flag_k = O_DIRECT;
 /** Polls @p engine until @p request completes, answering its result, or @c -ETIMEDOUT once
  *  @p deadline passes; other completions are dropped. */
 template <typename engine_type_>
-uc::descriptor_t finish(engine_type_& engine, io_request_t const& request, std::uint64_t deadline) {
+util::descriptor_t finish(engine_type_& engine, io_request_t const& request, std::uint64_t deadline) {
     io_completion_t completed[1] {};
-    while (uc::utilities::monotonic_ns() < deadline)
+    while (util::monotonic_ns() < deadline)
         if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
             return completed[0].result;
     return -ETIMEDOUT;
 }
 template <typename engine_type_>
-uc::descriptor_t await(engine_type_& engine, io_request_t& request, std::uint64_t deadline) {
+util::descriptor_t await(engine_type_& engine, io_request_t& request, std::uint64_t deadline) {
     engine.submit(request);
     return finish(engine, request, deadline);
 }
@@ -249,23 +247,22 @@ case_result_t test_direct_files() {
     if (!expect_true(files.fill())) return {};
     std::size_t const alignment = files.directory.alignment;
     loopback_pair_t sockets = loopback_pair();
-    if (!expect_true(sockets.connected() && uc::utilities::nonblocking(sockets.client) == ucall_status_success_k))
-        return {};
+    if (!expect_true(sockets.connected() && util::nonblocking(sockets.client) == ucall_status_success_k)) return {};
     auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
-    auto const deadline = uc::utilities::deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
 
     int file = -1;
     for (std::string_view path : {"data.bin", "fifo", "subdir", "absolute", "../data.bin", "missing"}) {
         std::string terminated {path};
         io_request_t opening {.operation = io_operation_t::file_open_k,
                               .descriptor = socket,
-                              .data = reinterpret_cast<uc::byte_t*>(terminated.data()),
+                              .data = reinterpret_cast<util::byte_t*>(terminated.data()),
                               .length = terminated.size() + 1,
                               .file = {0, files.directory.descriptor}};
-        uc::descriptor_t const opened = await(engine, opening, deadline);
+        util::descriptor_t const opened = await(engine, opening, deadline);
         if (path == "data.bin") {
-            uc::utilities::file_geometry_t const geometry = opened >= 0 ? uc::utilities::direct_alignment_of(opened)
-                                                                        : uc::utilities::file_geometry_t {};
+            util::file_geometry_t const geometry = opened >= 0 ? util::direct_alignment_of(opened)
+                                                               : util::file_geometry_t {};
             expect_true(opened >= 0 && !geometry.error && geometry.size == files.content.size(),
                         "{} opened as {} measuring {}", path, opened, geometry.size);
             file = static_cast<int>(opened);
@@ -277,9 +274,9 @@ case_result_t test_direct_files() {
     }
     if (!expect_true(file >= 0)) return {};
 
-    uc::utilities::native_file_t buffered = ::open(files.directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC);
-    expect_true(uc::utilities::file_direct_switch(buffered) == ucall_status_success_k &&
-                    uc::utilities::file_direct_switch(buffered) == ucall_status_success_k &&
+    util::native_file_t buffered = ::open(files.directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC);
+    expect_true(util::file_direct_switch(buffered) == ucall_status_success_k &&
+                    util::file_direct_switch(buffered) == ucall_status_success_k &&
                     (fcntl(buffered, F_GETFL) & direct_flag_k),
                 "the switch left flags {:#x}", fcntl(buffered, F_GETFL));
     ::close(buffered);
@@ -291,19 +288,19 @@ case_result_t test_direct_files() {
                           .data = window.data,
                           .length = 2 * alignment,
                           .file = {3 * alignment, file}};
-    expect_true(await(engine, reading, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+    expect_true(await(engine, reading, deadline) == static_cast<util::descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, files.content.data() + 3 * alignment, 2 * alignment) == 0);
     reading.file.offset = 64 * alignment;
     reading.length = alignment;
     expect_true(await(engine, reading, deadline) == 123 &&
                 std::memcmp(window.data, files.content.data() + 64 * alignment, 123) == 0);
-    uc::utilities::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
+    util::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
     io_request_t scattering {.operation = io_operation_t::file_read_vectors_k,
                              .descriptor = socket,
-                             .data = reinterpret_cast<uc::byte_t*>(vectors),
+                             .data = reinterpret_cast<util::byte_t*>(vectors),
                              .length = 2,
                              .file = {5 * alignment, file}};
-    expect_true(await(engine, scattering, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+    expect_true(await(engine, scattering, deadline) == static_cast<util::descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, files.content.data() + 5 * alignment, alignment) == 0 &&
                 std::memcmp(window.data + 2 * alignment, files.content.data() + 6 * alignment, alignment) == 0);
     expect_true(engine.statistics.file_reads_asynchronous + engine.statistics.file_reads_blocking == 3);
@@ -317,10 +314,8 @@ case_result_t test_direct_files() {
 #if UCALL_WITH_LINUX_URING
 #pragma region Rings
 
-using namespace unum::ucall::utilities;
-
 /** Sends all of @p bytes through @p descriptor, blocking. */
-[[nodiscard]] inline bool send_all(int descriptor, span<byte_t const> bytes) noexcept {
+[[nodiscard]] inline bool send_all(int descriptor, span<util::byte_t const> bytes) noexcept {
     while (!bytes.empty()) {
         ssize_t const count = ::send(descriptor, bytes.data(), bytes.size(), MSG_NOSIGNAL);
         if (count <= 0) return false;
@@ -331,7 +326,7 @@ using namespace unum::ucall::utilities;
 
 /** Checks the registered socket @p handle has @c TCP_NODELAY, through a descriptor it installs. */
 template <typename engine_type_>
-void expect_nodelay(engine_type_& engine, descriptor_t handle) {
+void expect_nodelay(engine_type_& engine, util::descriptor_t handle) {
     auto* submission = engine.queue.entry();
     if (!expect_true(submission)) return;
     engine.queue.control.result.reset();
@@ -340,9 +335,9 @@ void expect_nodelay(engine_type_& engine, descriptor_t handle) {
     auto descriptor = engine.wait_control();
     if (!expect_true(descriptor >= 0, "installing failed with {}", descriptor)) return;
     int enabled {};
-    socket_length_t length = sizeof(enabled);
+    util::socket_length_t length = sizeof(enabled);
     expect_true(getsockopt(descriptor, IPPROTO_TCP, TCP_NODELAY, &enabled, &length) == 0 && enabled == 1);
-    socket_close(descriptor);
+    util::socket_close(descriptor);
 }
 
 template <typename engine_type_>
@@ -361,7 +356,7 @@ case_result_t test_failed_submission() {
     if (!expect_true(owned >= 0)) return {};
     sockets.client = -1;
     expect_nodelay(engine, owned);
-    byte_t content[1] {byte_t {42}};
+    util::byte_t content[1] {util::byte_t {42}};
     io_request_t sending {.operation = io_operation_t::send_k,
                           .descriptor = owned,
                           .data = content,
@@ -370,7 +365,7 @@ case_result_t test_failed_submission() {
     engine.submit(sending);
     engine.submit(receiving);
     if (!expect_true(engine.queue.enter(0, 0) >= 0)) return {};
-    byte_t received {};
+    util::byte_t received {};
     expect_true(recv(sockets.peer, &received, sizeof(received), 0) == 1 && received == content[0]);
 
     io_request_t unsubmitted {.operation = io_operation_t::send_k,
@@ -408,12 +403,12 @@ case_result_t test_streamed_transmit() {
     auto owned = engine.import_socket(sockets.client);
     if (!expect_true(owned >= 0)) return {};
     sockets.client = -1;
-    if (!expect_true(nonblocking(sockets.peer) == ucall_status_success_k)) return {};
-    std::vector<byte_t> payload(65536, byte_t {85}), received(payload.size());
+    if (!expect_true(util::nonblocking(sockets.peer) == ucall_status_success_k)) return {};
+    std::vector<util::byte_t> payload(65536, util::byte_t {85}), received(payload.size());
     std::size_t sent {}, read {};
     bool pending {};
     io_request_t sending {.operation = io_operation_t::send_k, .descriptor = owned};
-    auto deadline = deadline_after(1000000);
+    auto deadline = util::deadline_after(1000000);
     while (sent != payload.size() || read != payload.size()) {
         if (!pending && sent != payload.size()) {
             sending.data = payload.data() + sent;
@@ -435,7 +430,8 @@ case_result_t test_streamed_transmit() {
             if (count > 0) read += static_cast<std::size_t>(count);
             else if (!expect_true(count < 0 && io_pending(-errno), "receiving ended with {}", count)) return {};
         }
-        if (!expect_true(monotonic_ns() < deadline, "{} sent and {} read of {}", sent, read, payload.size())) return {};
+        if (!expect_true(util::monotonic_ns() < deadline, "{} sent and {} read of {}", sent, read, payload.size()))
+            return {};
     }
     expect_true(received == payload);
     expect_true(engine.close_socket(owned) == 0);
@@ -445,9 +441,9 @@ case_result_t test_streamed_transmit() {
 /** A receive on @p handle answering @p expected, leaving its slice lent; @p completed names it. */
 template <typename engine_type_>
 void expect_slice(engine_type_& engine, io_request_t& receiving, io_completion_t& completed,
-                  span<byte_t const> expected) {
+                  span<util::byte_t const> expected) {
     engine.submit(receiving);
-    if (!expect_true(engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return;
+    if (!expect_true(engine.poll({&completed, 1}, io_wait_t::blocking_k, util::deadline_after(1000000)) == 1)) return;
     expect_true(completed.request == &receiving && completed.result > 0 && completed.lease, "receiving ended with {}",
                 completed.result);
     expect_true(completed.result > 0 && static_cast<std::size_t>(completed.result) == expected.size() &&
@@ -468,19 +464,20 @@ case_result_t test_end_of_stream() {
     auto const second = engine.import_socket(std::exchange(staying.client, -1));
     if (!expect_true(first >= 0 && second >= 0)) return {};
     auto& provided = engine.queue.provided;
-    byte_t const bytes[4] {byte_t {1}, byte_t {2}, byte_t {3}, byte_t {4}};
+    util::byte_t const bytes[4] {util::byte_t {1}, util::byte_t {2}, util::byte_t {3}, util::byte_t {4}};
     io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = first};
     io_request_t other {.operation = io_operation_t::receive_k, .descriptor = second};
     io_completion_t completed {};
     if (!expect_true(send_all(leaving.peer, bytes))) return {};
     expect_slice(engine, receiving, completed, bytes);
-    byte_t const* const landed = completed.data;
+    util::byte_t const* const landed = completed.data;
     engine.release(completed);
     unsigned const before = provided.available_buffers;
 
     if (!expect_true(::shutdown(leaving.peer, SHUT_WR) == 0)) return {};
     engine.submit(receiving);
-    if (!expect_true(engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return {};
+    if (!expect_true(engine.poll({&completed, 1}, io_wait_t::blocking_k, util::deadline_after(1000000)) == 1))
+        return {};
     expect_true(completed.result == 0 && !completed.lease && !completed.data, "the end answered {}", completed.result);
     engine.release(completed);
     expect_true(provided.available_buffers == before && provided.newest_buffer != engine.absent_k &&
@@ -507,8 +504,9 @@ case_result_t test_sockets_interleave() {
     auto const first = engine.import_socket(std::exchange(left.client, -1));
     auto const second = engine.import_socket(std::exchange(right.client, -1));
     if (!expect_true(first >= 0 && second >= 0)) return {};
-    byte_t const left_bytes[3] {byte_t {11}, byte_t {12}, byte_t {13}};
-    byte_t const right_bytes[5] {byte_t {21}, byte_t {22}, byte_t {23}, byte_t {24}, byte_t {25}};
+    util::byte_t const left_bytes[3] {util::byte_t {11}, util::byte_t {12}, util::byte_t {13}};
+    util::byte_t const right_bytes[5] {util::byte_t {21}, util::byte_t {22}, util::byte_t {23}, util::byte_t {24},
+                                       util::byte_t {25}};
     io_request_t left_receive {.operation = io_operation_t::receive_k, .descriptor = first};
     io_request_t right_receive {.operation = io_operation_t::receive_k, .descriptor = second};
     io_completion_t lent[4] {};
@@ -556,14 +554,14 @@ case_result_t test_registered_direct_files() {
     if (!expect_true(sockets.connected())) return {};
     auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
     if (!expect_true(socket >= 0)) return {};
-    auto const deadline = deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
     io_completion_t completed[1] {};
     auto await = [&](io_request_t& request) {
         engine.submit(request);
-        while (monotonic_ns() < deadline)
+        while (util::monotonic_ns() < deadline)
             if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
                 return completed[0].result;
-        return descriptor_t {-ETIMEDOUT};
+        return util::descriptor_t {-ETIMEDOUT};
     };
 
     int file = -1;
@@ -571,12 +569,13 @@ case_result_t test_registered_direct_files() {
         std::string terminated {path};
         io_request_t opening {.operation = io_operation_t::file_open_k,
                               .descriptor = socket,
-                              .data = reinterpret_cast<byte_t*>(terminated.data()),
+                              .data = reinterpret_cast<util::byte_t*>(terminated.data()),
                               .length = terminated.size() + 1,
                               .file = {0, directory.descriptor}};
-        descriptor_t const opened = await(opening);
+        util::descriptor_t const opened = await(opening);
         if (path == "data.bin") {
-            file_geometry_t const geometry = opened >= 0 ? direct_alignment_of(opened) : file_geometry_t {};
+            util::file_geometry_t const geometry = opened >= 0 ? util::direct_alignment_of(opened)
+                                                               : util::file_geometry_t {};
             std::size_t const measured = fu::max_of(geometry.memory_alignment, geometry.offset_alignment);
             expect_true(opened >= 0 && !geometry.error && geometry.size == content.size() && measured == alignment,
                         "{} opened as {} measuring {} bytes aligned to {}", path, opened, geometry.size, measured);
@@ -589,9 +588,9 @@ case_result_t test_registered_direct_files() {
     }
     if (!expect_true(file >= 0)) return {};
 
-    native_file_t buffered = ::open(directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
-    expect_true(file_direct_switch(buffered) == ucall_status_success_k &&
-                    file_direct_switch(buffered) == ucall_status_success_k &&
+    util::native_file_t buffered = ::open(directory.name("data.bin").c_str(), O_RDONLY | O_CLOEXEC | O_NONBLOCK);
+    expect_true(util::file_direct_switch(buffered) == ucall_status_success_k &&
+                    util::file_direct_switch(buffered) == ucall_status_success_k &&
                     (fcntl(buffered, F_GETFL) & (O_DIRECT | O_NONBLOCK)) == O_DIRECT,
                 "the switch left flags {:#x}", fcntl(buffered, F_GETFL));
     ::close(buffered);
@@ -602,7 +601,7 @@ case_result_t test_registered_direct_files() {
                           .data = window.data,
                           .length = 2 * alignment,
                           .file = {3 * alignment, file}};
-    expect_true(await(reading) == static_cast<descriptor_t>(2 * alignment) &&
+    expect_true(await(reading) == static_cast<util::descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, content.data() + 3 * alignment, 2 * alignment) == 0);
     reading.file.offset = 64 * alignment;
     reading.length = alignment;
@@ -614,18 +613,18 @@ case_result_t test_registered_direct_files() {
     reading.registered_memory = registration.index;
     reading.file.offset = 7 * alignment;
     reading.length = 3 * alignment;
-    expect_true(await(reading) == static_cast<descriptor_t>(3 * alignment) &&
+    expect_true(await(reading) == static_cast<util::descriptor_t>(3 * alignment) &&
                 std::memcmp(window.data, content.data() + 7 * alignment, 3 * alignment) == 0);
 
     std::memset(window.data, 0, window.size);
-    io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
+    util::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
     io_request_t scattering {.operation = io_operation_t::file_read_vectors_k,
                              .registered_memory = registration.index,
                              .descriptor = socket,
-                             .data = reinterpret_cast<byte_t*>(vectors),
+                             .data = reinterpret_cast<util::byte_t*>(vectors),
                              .length = 2,
                              .file = {5 * alignment, file}};
-    expect_true(await(scattering) == static_cast<descriptor_t>(2 * alignment) &&
+    expect_true(await(scattering) == static_cast<util::descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, content.data() + 5 * alignment, alignment) == 0 &&
                 std::memcmp(window.data + 2 * alignment, content.data() + 6 * alignment, alignment) == 0);
     expect_true(engine.statistics.file_reads_asynchronous == 4 && !engine.statistics.file_reads_blocking);
@@ -644,28 +643,28 @@ case_result_t test_zero_copy_sends() {
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
     loopback_pair_t sockets = loopback_pair();
-    if (!expect_true(sockets.connected() && nonblocking(sockets.peer) == ucall_status_success_k)) return {};
+    if (!expect_true(sockets.connected() && util::nonblocking(sockets.peer) == ucall_status_success_k)) return {};
     auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
     if (!expect_true(socket >= 0)) return {};
     aligned_bytes_t window {16384};
     for (std::size_t i = 0; i != window.size; ++i) window.data[i] = file_byte(i);
     memory_registration_t const registration = engine.register_memory(window.bytes());
-    auto const deadline = deadline_after(5000000);
+    auto const deadline = util::deadline_after(5000000);
     io_completion_t completed[1] {};
     auto finish = [&](io_request_t& request) {
-        while (monotonic_ns() < deadline)
+        while (util::monotonic_ns() < deadline)
             if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
                 return completed[0].result;
-        return descriptor_t {-ETIMEDOUT};
+        return util::descriptor_t {-ETIMEDOUT};
     };
     auto await = [&](io_request_t& request) {
         engine.submit(request);
         return finish(request);
     };
-    std::vector<byte_t> received;
+    std::vector<util::byte_t> received;
     auto drain = [&](std::size_t expected) {
-        byte_t buffer[16384];
-        while (received.size() < expected && monotonic_ns() < deadline)
+        util::byte_t buffer[16384];
+        while (received.size() < expected && util::monotonic_ns() < deadline)
             if (ssize_t const length = recv(sockets.peer, buffer, sizeof(buffer), 0); length > 0)
                 received.insert(received.end(), buffer, buffer + length);
         return received.size() == expected;
@@ -679,7 +678,7 @@ case_result_t test_zero_copy_sends() {
                           .data = window.data,
                           .length = window.size,
                           .release_request = &release};
-    descriptor_t const sent = await(sending);
+    util::descriptor_t const sent = await(sending);
     expect_true(sent > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
                 engine.statistics.zero_copy_sends);
     engine.submit(release);
@@ -690,7 +689,7 @@ case_result_t test_zero_copy_sends() {
                 std::memcmp(received.data(), window.data, received.size()) == 0);
 
     received.clear();
-    descriptor_t const copied = await(sending);
+    util::descriptor_t const copied = await(sending);
     expect_true(copied > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", copied,
                 engine.statistics.zero_copy_sends);
     expect_true(await(release) == 0);
@@ -709,7 +708,7 @@ case_result_t test_zero_copy_sends() {
 
 /** @p engine_type_ rebound to the atomic reference and row kit of @p cpu_class_. */
 template <cpu_class_t cpu_class_, typename engine_type_>
-using rebound_engine_t = typename engine_type_::template rebind<st::default_allocator<byte_t>,
+using rebound_engine_t = typename engine_type_::template rebind<st::default_allocator<util::byte_t>,
                                                                 atomic_ref_for_cpu_class<cpu_class_>::template type,
                                                                 typename row_kit_for_cpu_class<cpu_class_>::type>;
 

@@ -218,12 +218,12 @@ static ucall_client_t resolving_client(sweep_cell_t const& cell, uc::dns::resolv
 static ucall_status_t resolved_call(ucall_client_t client, std::string const& url) {
     ucall_outcome_t outcome {};
     ucall_client_call_t call {};
-    ucall_bytes_view_t const closing = uc::bytes_view("Connection: close");
+    ucall_bytes_view_t const closing = bytes_view("Connection: close");
     call.headers = &closing;
     call.headers_count = 1;
     call.client = client;
     call.outcome = &outcome;
-    call.url = uc::bytes_view(url);
+    call.url = bytes_view(url);
     call.verb = ucall_verb_get_k;
     ucall_client_call(&call);
     if (outcome.status != ucall_status_success_k) return outcome.status;

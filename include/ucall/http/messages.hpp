@@ -65,6 +65,7 @@ struct ucall_received_http_response_handle_t {};
 namespace unum::ucall::http {
 
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::highest_kit;
 using utilities::span;
 using utilities::text_view;

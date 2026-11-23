@@ -30,11 +30,13 @@
 #include <numkong/vector.hpp>          // `nk::vector_view`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`, `st::default_allocator`
 
+#include "ucall/ucall.hpp" // `uc::request_t`, `uc::batch_t`, `uc::status_t`
 #include "server.hpp"
 
 namespace fu = ashvardanian::forkunion;
 namespace nk = ashvardanian::numkong;
 namespace st = ashvardanian::smashtable;
+namespace uc = unum::ucall;
 
 using query_t = nk::i8_t;
 using score_t = query_t::dot_result_t;
@@ -147,7 +149,7 @@ static void score_slices(void* context, std::size_t thread, std::size_t) {
 struct batch_scratch_t {
 
     /** The requests whose bodies were valid queries, in batch order. */
-    st::vector<ucall_received_http_request_t> requests;
+    st::vector<uc::request_t> requests;
 
     /** Their queries, one dense `requests × dimensions` matrix for the packed GEMM. */
     st::vector<query_t> queries;
@@ -156,8 +158,12 @@ struct batch_scratch_t {
     st::vector<top_rows_t> tops;
 };
 
+/** Answers @p request with an error @p status and a plain-text @p message. */
+static void reply_error(uc::request_t request, ucall_http_status_t status, std::string_view message) noexcept {
+    [[maybe_unused]] uc::status_t const replied = std::move(request).reply_error(status, message);
+}
+
 struct service_t {
-    ucall_server_t server {};
     std::size_t rows = 100'000, dimensions = 1024, seed = 42, slow_batch_microseconds = 5000;
     fu_pool_t pool {}; // Only the `/infer/batch` drain dispatches it, so no call ever finds it busy.
     st::vector<model_slice_t> slices;
@@ -208,18 +214,11 @@ struct service_t {
         return true;
     }
 
-    /** The body as one query, or an empty view after replying 400 to a body of another size. */
-    nk::vector_view<query_t> query_of(ucall_received_http_request_t request) const noexcept {
-        ucall_outcome_t outcome {};
-        ucall_bytes_view_t body {};
-        ucall_server_request_body_t extract {server, &outcome, request, &body};
-        ucall_server_request_body(&extract);
-        std::string_view const bytes = uc::text_view(body);
-        if (outcome.status == ucall_status_success_k && bytes.size() == dimensions)
-            return {bytes.data(), bytes.size(), sizeof(query_t)};
-        uc::tools::reply_error(server, request, ucall_http_status_bad_request_k,
-                               "The body must be exactly one i8 query of --dimensions bytes\n");
-        return {};
+    /** The body as one query, or an empty view for a body of another size or none buffered. */
+    nk::vector_view<query_t> query_of(uc::request_t const& request) const noexcept {
+        auto [bytes, bytes_status] = request.body();
+        if (bytes_status.failed() || bytes.size() != dimensions) return {};
+        return {bytes.data(), bytes.size(), sizeof(query_t)};
     }
 
     /** Scores one query against every slice in turn, on the calling thread with stack scratch. */
@@ -258,78 +257,74 @@ struct service_t {
         return true;
     }
 
-    void refuse(ucall_received_http_request_t request) const noexcept {
-        uc::tools::reply_error(server, request, ucall_http_status_internal_error_k,
-                               "The model failed to score the query\n");
+    void refuse_query(uc::request_t request) const noexcept {
+        reply_error(std::move(request), ucall_http_status_bad_request_k,
+                    "The body must be exactly one i8 query of --dimensions bytes\n");
     }
 
-    void reply(ucall_received_http_request_t request, top_rows_t const& top) const noexcept {
-        ucall_byte_t bytes[results_per_query_k * sizeof(scored_row_t)] {};
-        ucall_byte_t* output = bytes;
+    void refuse(uc::request_t request) const noexcept {
+        reply_error(std::move(request), ucall_http_status_internal_error_k, "The model failed to score the query\n");
+    }
+
+    void reply(uc::request_t request, top_rows_t const& top) const noexcept {
+        char bytes[results_per_query_k * sizeof(scored_row_t)] {};
+        char* output = bytes;
         for (scored_row_t const& scored : top.rows)
             for (std::uint32_t const word : {scored.row, static_cast<std::uint32_t>(scored.score.raw())})
                 for (std::size_t byte = 0; byte != sizeof(word); ++byte)
-                    *output++ = static_cast<ucall_byte_t>(word >> (8 * byte));
-        ucall_outcome_t outcome {};
-        ucall_server_reply_content_t content {
-            server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, {bytes, sizeof(bytes)}};
-        ucall_server_reply_content(&content);
+                    *output++ = static_cast<char>(word >> (8 * byte));
+        [[maybe_unused]] uc::status_t const replied = std::move(request).reply(ucall_http_status_ok_k, {},
+                                                                               {bytes, sizeof(bytes)});
+    }
+
+    void infer(uc::request_t request) noexcept {
+        nk::vector_view<query_t> const query = query_of(request);
+        if (query.empty()) return refuse_query(std::move(request));
+        top_rows_t top;
+        if (!score_query(query, top)) return refuse(std::move(request));
+        reply(std::move(request), top);
+    }
+
+    void infer_batch(uc::batch_t batch) noexcept {
+        scratch.requests.clear();
+        st::status_t const grown = st::first_failure(scratch.requests.reserve(batch.size()),
+                                                     scratch.queries.resize(batch.size() * dimensions));
+        if (st::failed(grown)) {
+            for (uc::request_t request : batch)
+                reply_error(std::move(request), ucall_http_status_service_unavailable_k, "Storage unavailable\n");
+            return;
+        }
+        for (uc::request_t request : batch) {
+            nk::vector_view<query_t> const query = query_of(request);
+            if (query.empty()) {
+                refuse_query(std::move(request));
+                continue;
+            }
+            std::memcpy(scratch.queries.data() + scratch.requests.size() * dimensions, query.data(),
+                        dimensions * sizeof(query_t));
+            [[maybe_unused]] st::status_t const reserved = scratch.requests.push_back(st::assume_reserved,
+                                                                                      std::move(request));
+        }
+        std::size_t const scored = scratch.requests.size();
+        if (!scored) return;
+        if (st::status_t const resized = scratch.tops.resize(scored); st::failed(resized)) {
+            for (uc::request_t& request : scratch.requests)
+                reply_error(std::move(request), ucall_http_status_service_unavailable_k, "Storage unavailable\n");
+            return;
+        }
+        bool const answered = score_batch({scratch.queries.data(), scored, dimensions}, scratch.tops);
+        for (std::size_t query = 0; query != scored; ++query)
+            if (answered) reply(std::move(scratch.requests[query]), scratch.tops[query]);
+            else refuse(std::move(scratch.requests[query]));
+    }
+
+    void slow_batch(uc::batch_t batch) noexcept {
+        std::this_thread::sleep_for(std::chrono::microseconds(slow_batch_microseconds));
+        for (uc::request_t request : batch) {
+            [[maybe_unused]] uc::status_t const replied = std::move(request).reply(ucall_http_status_ok_k, {}, {});
+        }
     }
 };
-
-static void infer(ucall_received_http_request_t request, void* context) {
-    service_t const& service = *static_cast<service_t const*>(context);
-    nk::vector_view<query_t> const query = service.query_of(request);
-    if (query.empty()) return;
-    top_rows_t top;
-    if (service.score_query(query, top)) service.reply(request, top);
-    else service.refuse(request);
-}
-
-static void infer_batch(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
-    std::span<ucall_received_http_request_t const> const batch {requests, count};
-    service_t& service = *static_cast<service_t*>(context);
-    batch_scratch_t& scratch = service.scratch;
-    std::size_t const dimensions = service.dimensions;
-    scratch.requests.clear();
-    st::status_t const grown = st::first_failure(scratch.requests.reserve(batch.size()),
-                                                 scratch.queries.resize(batch.size() * dimensions));
-    if (st::failed(grown)) {
-        for (ucall_received_http_request_t const request : batch)
-            uc::tools::reply_error(service.server, request, grown);
-        return;
-    }
-    for (ucall_received_http_request_t const request : batch) {
-        nk::vector_view<query_t> const query = service.query_of(request);
-        if (query.empty()) continue;
-        std::memcpy(scratch.queries.data() + scratch.requests.size() * dimensions, query.data(),
-                    dimensions * sizeof(query_t));
-        [[maybe_unused]] st::status_t const reserved = scratch.requests.push_back(
-            st::assume_reserved, ucall_received_http_request_t {request});
-    }
-    std::size_t const scored = scratch.requests.size();
-    if (!scored) return;
-    if (st::status_t const resized = scratch.tops.resize(scored); st::failed(resized)) {
-        for (ucall_received_http_request_t const request : scratch.requests)
-            uc::tools::reply_error(service.server, request, resized);
-        return;
-    }
-    bool const answered = service.score_batch({scratch.queries.data(), scored, dimensions}, scratch.tops);
-    for (std::size_t query = 0; query != scored; ++query)
-        if (answered) service.reply(scratch.requests[query], scratch.tops[query]);
-        else service.refuse(scratch.requests[query]);
-}
-
-static void slow_batch(ucall_received_http_request_t const* requests, std::size_t count, void* context) {
-    std::span<ucall_received_http_request_t const> const batch {requests, count};
-    service_t& service = *static_cast<service_t*>(context);
-    std::this_thread::sleep_for(std::chrono::microseconds(service.slow_batch_microseconds));
-    for (ucall_received_http_request_t const request : batch) {
-        ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {service.server, &outcome, request, ucall_http_status_ok_k, nullptr, 0, {}};
-        ucall_server_reply_content(&reply);
-    }
-}
 
 int main(int argc, char** argv) {
     service_t service;
@@ -346,13 +341,16 @@ int main(int argc, char** argv) {
         std::fputs("--rows must fit a u32 index and --rows times --dimensions a size\n", stderr);
         return 1;
     }
-    service.server = application.server;
     if (!service.load()) return 1;
     std::printf("Serving a model of %zu rows of %zu i8 dimensions, seed %zu, in %zu packed slices on %zu threads\n",
                 service.rows, service.dimensions, service.seed, service.slices.size(), service.pool_scratch.size());
-    if (!application.add_endpoint("/infer", ucall_verb_post_k, infer, &service) ||
-        !application.add_batch_endpoint("/infer/batch", ucall_verb_post_k, infer_batch, &service) ||
-        !application.add_batch_endpoint("/slow/batch", ucall_verb_post_k, slow_batch, &service))
+    uc::server_t& server = application.server;
+    auto [infer, infer_status] = server.batch<&service_t::infer_batch>("/infer/batch", ucall_verb_post_k,
+                                                                       application.batching, service);
+    auto [slow, slow_status] = server.batch<&service_t::slow_batch>("/slow/batch", ucall_verb_post_k,
+                                                                    application.batching, service);
+    if (server.post<&service_t::infer>("/infer", service).failed() || infer_status.failed() || slow_status.failed())
         return 1;
-    return application.run();
+    uc::batch_endpoint_t const batches[] {infer, slow};
+    return application.run(batches);
 }

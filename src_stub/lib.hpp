@@ -36,7 +36,12 @@
 #include "ucall/utilities/sockets.hpp" // `receive_queues_count`, `socket_duplicate_listener`
 #include "ucall/utilities/types.hpp"   // `publish`, `allocate_unique`, `text_view`
 
+namespace uc = unum::ucall;
+namespace util = unum::ucall::utilities;
+
 namespace unum::ucall::stub {
+
+using util::byte_t;
 
 /** The serial class's atomic reference, as @c src/lib.hpp picks it, since the stand-in runs no
  *  other class. */
@@ -60,7 +65,7 @@ inline constexpr char const* no_exchange_k = "the stub receives no request or re
 
 /** The one final write to @p outcome, through the serial class's reference. */
 inline void publish(ucall_outcome_t* outcome, ucall_status_t status, char const* message) noexcept {
-    utilities::publish<atomic_ref>(outcome, status, message);
+    util::publish<atomic_ref>(outcome, status, message);
 }
 inline void publish(ucall_outcome_t* outcome, ucall_status_t status) noexcept {
     publish(outcome, status, ucall_status_name(status));
@@ -175,10 +180,10 @@ struct ucall_server_handle_t {
     ~ucall_server_handle_t() noexcept {
         for (auto& keys : keys) uc::stub::secure_zero(keys.private_key);
         while (templates)
-            uc::utilities::allocator_delete<ucall_stub_template_t, uc::stub::allocator_t> {allocator}(
+            util::allocator_delete<ucall_stub_template_t, uc::stub::allocator_t> {allocator}(
                 std::exchange(templates, templates->next));
         while (batch_endpoints)
-            uc::utilities::allocator_delete<ucall_http_batch_endpoint_handle_t, uc::stub::allocator_t> {allocator}(
+            util::allocator_delete<ucall_http_batch_endpoint_handle_t, uc::stub::allocator_t> {allocator}(
                 std::exchange(batch_endpoints, batch_endpoints->next));
     }
 };

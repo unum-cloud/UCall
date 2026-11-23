@@ -33,8 +33,8 @@ static int failed(ucall_outcome_t const* outcome) {
     return 1;
 }
 
-static void hello(ucall_received_http_request_t request, void* context) {
-    ucall_server_t server = *(ucall_server_t*)context;
+static void hello(ucall_server_t server, ucall_received_http_request_t request, void* context) {
+    char const* greeting = (char const*)context;
     ucall_outcome_t outcome = {0};
     ucall_bytes_view_t name = {0};
     ucall_server_request_path_parameter_t parameter = {.server = server,
@@ -44,15 +44,17 @@ static void hello(ucall_received_http_request_t request, void* context) {
                                                        .value = &name};
     ucall_server_request_path_parameter(&parameter);
     ucall_reply_part_t parts[2] = {
-        {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)"Hello, ", 7}},
+        {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)greeting, strlen(greeting)}},
         {.kind = ucall_reply_part_bytes_k, .data.bytes = name}};
     ucall_server_reply_vectored_t reply = {.server = server,
                                            .outcome = &outcome,
-                                           .request = request,
+                                           .request = &request,
                                            .parts = parts,
                                            .parts_count = 2};
     ucall_server_reply_vectored(&reply);
 }
+
+static char greeting[] = "Hello, ";
 
 int main(void) {
     ucall_network_interface_t listener = {.address = {(ucall_byte_t const*)"127.0.0.1:0", 11},
@@ -68,7 +70,7 @@ int main(void) {
                                               .uri_template = {(ucall_byte_t const*)"/hello/{name}", 13},
                                               .verb = ucall_verb_get_k,
                                               .callback = hello,
-                                              .context = &server};
+                                              .context = greeting};
     ucall_server_add_http_endpoint(&route);
     if (failed(&outcome)) return 1;
 
@@ -89,19 +91,14 @@ int main(void) {
     if (failed(&outcome)) return 1;
 
     ucall_completed_call_t completed = {0};
-    size_t count = 0;
     ucall_server_take_call_t poll = {.server = server, .outcome = &outcome, .timeout_microseconds = 1000};
-    ucall_client_take_completed_t take = {.client = client,
-                                          .outcome = &outcome,
-                                          .calls = &completed,
-                                          .capacity = 1,
-                                          .count = &count};
-    while (count == 0) {
+    ucall_client_take_completed_call_t take = {.client = client, .outcome = &outcome, .call = &completed};
+    do {
         ucall_server_take_call(&poll);
         if (failed(&outcome)) return 1;
-        ucall_client_take_completed(&take);
-    }
-    if (failed(&completed.outcome)) return 1;
+        ucall_client_take_completed_call(&take);
+    } while (outcome.status == ucall_status_would_block_k);
+    if (failed(&outcome) || failed(&completed.outcome)) return 1;
     ucall_bytes_view_t body = {0};
     ucall_client_response_body_t body_read = {.response = completed.response, .outcome = &outcome, .body = &body};
     ucall_client_response_body(&body_read);
@@ -141,7 +138,7 @@ Each request can be replied to independently, including after the callback retur
 `ucall_server_request_fields_count()` and `ucall_server_request_field()` walk the header fields in arrival order, names lowercased and values trimmed, beside the by-name `ucall_server_request_header()`; responses offer the same pair.
 `ucall_server_request_peer()` reports which configured interface a request arrived on, the peer's authenticated Noise static key, zero on plaintext interfaces, and its `ucall_peer_address_t`: IPv4, IPv6 with its scope, or AF_UNIX.
 Multipart bodies are read part by part through `ucall_server_request_parts_count()` and `ucall_server_request_part()`.
-A reply to a disconnected request reports connection closure and consumes the handle.
+Every reply takes a pointer to the request handle and clears it once it took the request, on success, on connection closure, or with a reply left deferred, so a caller holding a non-null handle knows it still owes a reply.
 All byte views carry an explicit length, including empty and binary values.
 
 ## Files & Streams
@@ -149,13 +146,13 @@ All byte views carry an explicit length, including empty and binary values.
 A streamed reply opens with `ucall_server_reply_begin()`, takes any number of `ucall_server_reply_append()` calls, and closes with exactly one `ucall_server_reply_end()`:
 
 ```c
-static void rows(ucall_received_http_request_t request, void* context) {
-    ucall_server_t server = *(ucall_server_t*)context;
+static void rows(ucall_server_t server, ucall_received_http_request_t request, void* context) {
     ucall_outcome_t outcome = {0};
     ucall_bytes_view_t headers[1] = {{(ucall_byte_t const*)"content-type: text/csv", 22}};
     ucall_server_reply_begin_t begin = {
-        .server = server, .outcome = &outcome, .request = request, .headers = headers, .headers_count = 1};
+        .server = server, .outcome = &outcome, .request = &request, .headers = headers, .headers_count = 1};
     ucall_server_reply_begin(&begin);
+    if (outcome.status != ucall_status_success_k) return; // a closed connection already ended the reply
     for (int row = 0; row != 3 && outcome.status == ucall_status_success_k; ++row) {
         char line[32];
         int length = snprintf(line, sizeof line, "%d,%d\n", row, row * row);
@@ -165,7 +162,7 @@ static void rows(ucall_received_http_request_t request, void* context) {
             .server = server, .outcome = &outcome, .request = request, .parts = &part, .parts_count = 1};
         ucall_server_reply_append(&append);
     }
-    ucall_server_reply_end_t end = {.server = server, .outcome = &outcome, .request = request};
+    ucall_server_reply_end_t end = {.server = server, .outcome = &outcome, .request = &request};
     ucall_server_reply_end(&end);
 }
 ```
@@ -183,7 +180,7 @@ ucall_reply_part_t parts[2] = {
     {.kind = ucall_reply_part_path_k, .data.path = {.directory_index = 0, .relative_path = name}},
 };
 ucall_server_reply_vectored_t reply = {
-    .server = server, .outcome = &sent, .request = request, .parts = parts, .parts_count = 2};
+    .server = server, .outcome = &sent, .request = &request, .parts = parts, .parts_count = 2};
 ucall_server_reply_vectored(&reply);
 if (ucall_outcome_wait(&sent) != ucall_status_success_k)
     fprintf(stderr, "%s: %s\n", ucall_status_name(sent.status), sent.message);
@@ -196,7 +193,7 @@ Replies leave through zero-copy sends where the backend has them, so a connectio
 
 ## Batches
 
-Batch callbacks receive a counted array of retained request handles, followed by the registered context.
+Batch callbacks receive the server, a counted array of retained request handles, and the registered context, as request callbacks receive the server, one request and the context.
 The array is borrowed only during the callback; copy its handles into application-owned storage to defer work without copying request bytes.
 Every loop deposits into one queue per batch endpoint, so batches mix requests from all loops, and partial batches flush at their configured deadline.
 
@@ -261,6 +258,7 @@ ucall_client_free(client);
 ```
 
 Success of `ucall_client_call()` guarantees exactly one completion, and refusal produces none.
+`ucall_client_take_completed_call()` waits for the one call submitted with a given context, as a blocking call does, leaving every other completion queued for the next `ucall_client_take_completed()`.
 Keep the borrowed URL, headers, body, and security-key inputs alive until completion retrieval, which also returns the call's admission credit.
 The connection budget must be positive; a zero call budget uses the connection budget times `max_pipelined_calls`.
 Retrieved responses belong to the caller until `ucall_client_response_free()`, and stay readable after the client is freed; client teardown discards unretrieved results.
@@ -346,7 +344,7 @@ An authorizer returning any status but success refuses the peer, and that status
 
 ## Errors
 
-Every verb that can fail writes a `ucall_outcome_t`: a `ucall_status_t` to branch on, and a static `message` with the detail it cannot carry, never freed and `NULL` exactly on success.
+Every verb that can fail writes a `ucall_outcome_t`: a `ucall_status_t` to branch on, and a static `message` naming what broke, else the status's own name, never freed and `NULL` exactly on success.
 Statuses 0 to 19 are numbered as in every Unum library, and 20 up are UCall's own, from `ucall_status_connection_failed_k` to `ucall_status_would_block_k`.
 `ucall_status_name()` spells a status in lowercase with dashes, as in "already-exists", and `ucall_status_from_name()` reads it back.
 

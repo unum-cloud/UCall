@@ -242,12 +242,13 @@ static bool expect_outcome_at(ucall_outcome_t const* outcome, ucall_status_t exp
 
 /*  No row polls a loop or dials a peer, so the callbacks below are registered and never run. */
 
-static void on_request(ucall_received_http_request_t request, void* context) {
-    expect_at(!request && !context, __FILE__, __LINE__, "no request reaches this suite");
+static void on_request(ucall_server_t server, ucall_received_http_request_t request, void* context) {
+    expect_at(!server && !request && !context, __FILE__, __LINE__, "no request reaches this suite");
 }
 
-static void on_batch(ucall_received_http_request_t const* requests, size_t count, void* context) {
-    expect_at(!requests && !count && !context, __FILE__, __LINE__, "no batch reaches this suite");
+static void on_batch(ucall_server_t server, ucall_received_http_request_t const* requests, size_t count,
+                     void* context) {
+    expect_at(!server && !requests && !count && !context, __FILE__, __LINE__, "no batch reaches this suite");
 }
 
 static ucall_status_t admit_peer(ucall_noise_key_t const* peer_static_key, void* context) {
@@ -532,8 +533,6 @@ static void test_handle_refusals(void) {
     expect_call_(ucall_status_uninitialized_k, ucall_server_request_header, .server = NULL, .value = &view);
     expect_call_(ucall_status_invalid_argument_k, ucall_server_request_header, .server = server,
                  .name = view_of_("Host"), .value = &view);
-    expect_call_(ucall_status_uninitialized_k, ucall_server_request_fields_count, .server = NULL, .count = &count);
-    expect_call_(ucall_status_invalid_argument_k, ucall_server_request_fields_count, .server = server, .count = &count);
     expect_call_(ucall_status_uninitialized_k, ucall_server_request_field, .server = NULL, .name = &view,
                  .value = &view);
     expect_call_(ucall_status_invalid_argument_k, ucall_server_request_field, .server = server, .name = &view,
@@ -564,6 +563,8 @@ static void test_handle_refusals(void) {
     expect_(ucall_server_request_verb(NULL, NULL) == ucall_verb_unknown_k);
     expect_(ucall_server_request_path_segments_count(NULL, NULL) == 0);
     expect_(ucall_server_request_parts_count(NULL, NULL) == 0);
+    expect_(ucall_server_request_fields_count(NULL, NULL) == 0);
+    expect_(ucall_server_request_fields_count(server, NULL) == 0);
 
     ucall_client_options_t base_client_options;
     memset(&base_client_options, 0, sizeof(base_client_options));
@@ -650,11 +651,13 @@ static void test_handle_refusals(void) {
     expect_call_(ucall_status_success_k, ucall_client_take_completed, .client = client, .calls = completed,
                  .capacity = 2, .count = &count);
     expect_(count == 0);
+    expect_call_(ucall_status_uninitialized_k, ucall_client_take_completed_call, .client = NULL, .call = completed);
+    expect_call_(ucall_status_invalid_argument_k, ucall_client_take_completed_call, .client = client, .call = NULL);
+    expect_call_(ucall_status_not_found_k, ucall_client_take_completed_call, .client = client, .context = &count,
+                 .call = completed);
 
     expect_call_(ucall_status_invalid_argument_k, ucall_client_response_header, .response = NULL,
                  .name = view_of_("Date"), .value = &view);
-    expect_call_(ucall_status_invalid_argument_k, ucall_client_response_fields_count, .response = NULL,
-                 .count = &count);
     expect_call_(ucall_status_invalid_argument_k, ucall_client_response_field, .response = NULL, .name = &view,
                  .value = &view);
     expect_call_(ucall_status_invalid_argument_k, ucall_client_response_body, .response = NULL, .body = &view);
@@ -663,6 +666,7 @@ static void test_handle_refusals(void) {
                  .data = &view);
     expect_call_(ucall_status_invalid_argument_k, ucall_client_response_body_chunk, .client = client, .data = NULL);
     expect_(ucall_client_response_status(NULL) == 0);
+    expect_(ucall_client_response_fields_count(NULL) == 0);
     ucall_client_response_free(NULL);
 
     ucall_client_free(client);

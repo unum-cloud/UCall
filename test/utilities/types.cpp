@@ -12,8 +12,6 @@
 
 namespace unum::ucall::test::utilities {
 
-using namespace unum::ucall::utilities;
-
 /** A waiter blocked in @c ucall_outcome_wait sees the library's publish from another thread, and
  *  every write made before it. */
 static void test_outcomes() {
@@ -22,7 +20,7 @@ static void test_outcomes() {
     int output = 0;
     std::thread producer([&] {
         output = 42;
-        publish<fu::standard_atomic_ref>(&outcome, ucall_status_success_k);
+        util::publish<fu::standard_atomic_ref>(&outcome, ucall_status_success_k);
     });
     expect_true(ucall_outcome_wait(&outcome) == ucall_status_success_k);
     expect_true(output == 42 && outcome.message == nullptr);

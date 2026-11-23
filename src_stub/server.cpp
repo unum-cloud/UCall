@@ -17,11 +17,15 @@
 
 #include "lib.hpp"
 
+namespace util = unum::ucall::utilities;
+
 using namespace unum::ucall;
 using namespace unum::ucall::stub;
 
-using utilities::allocate_unique;
-using utilities::allocator_delete;
+using util::allocate_unique;
+using util::allocator_delete;
+using util::descriptor_t;
+using util::text_view;
 
 /** Whether @p text may stand in a metric name or tag: no separator StatsD lines use. */
 static bool metrics_text_valid(std::string_view text, std::string_view banned) noexcept {
@@ -34,16 +38,16 @@ static bool metrics_text_valid(std::string_view text, std::string_view banned) n
 static std::size_t interface_event_loops(ucall_network_interface_t const& network_interface) noexcept {
     std::size_t const loops = network_interface.event_loops ? network_interface.event_loops
                               : network_interface.device_name.length
-                                  ? utilities::receive_queues_count(text_view(network_interface.device_name))
+                                  ? util::receive_queues_count(text_view(network_interface.device_name))
                                   : 1;
     return fu::min_of(loops, network_interface.max_concurrent_connections);
 }
 
 /** Whether @p descriptor is a listening stream socket, as the engine vets a borrowed listener. */
 static bool listener_valid(std::intptr_t descriptor) noexcept {
-    descriptor_t const duplicate = utilities::socket_duplicate_listener(descriptor);
+    descriptor_t const duplicate = util::socket_duplicate_listener(descriptor);
     if (duplicate < 0) return false;
-    utilities::socket_close(duplicate);
+    util::socket_close(duplicate);
     return true;
 }
 
@@ -365,6 +369,8 @@ size_t ucall_server_request_path_segments_count(ucall_server_t, ucall_received_h
 
 size_t ucall_server_request_parts_count(ucall_server_t, ucall_received_http_request_t) { return 0; }
 
+size_t ucall_server_request_fields_count(ucall_server_t, ucall_received_http_request_t) { return 0; }
+
 void ucall_server_request_path(ucall_server_request_path_t* arguments) {
     if (!arguments) return;
     if (arguments->path) *arguments->path = {};
@@ -411,13 +417,6 @@ void ucall_server_request_header(ucall_server_request_header_t* arguments) {
     refuse_exchange(valid ? arguments->request : nullptr, arguments->outcome);
 }
 
-void ucall_server_request_fields_count(ucall_server_request_fields_count_t* arguments) {
-    if (!arguments) return;
-    if (arguments->count) *arguments->count = 0;
-    if (!admit(arguments->server, arguments->outcome)) return;
-    refuse_exchange(arguments->count ? arguments->request : nullptr, arguments->outcome);
-}
-
 void ucall_server_request_field(ucall_server_request_field_t* arguments) {
     if (!arguments) return;
     if (arguments->name) *arguments->name = {};
@@ -462,22 +461,22 @@ void ucall_server_request_part(ucall_server_request_part_t* arguments) {
 
 void ucall_server_reply_content(ucall_server_reply_content_t* arguments) {
     if (!arguments || !admit(arguments->server, arguments->outcome)) return;
-    refuse_exchange(arguments->request, arguments->outcome);
+    refuse_exchange(arguments->request ? *arguments->request : nullptr, arguments->outcome);
 }
 
 void ucall_server_reply_error(ucall_server_reply_error_t* arguments) {
     if (!arguments || !admit(arguments->server, arguments->outcome)) return;
-    refuse_exchange(arguments->request, arguments->outcome);
+    refuse_exchange(arguments->request ? *arguments->request : nullptr, arguments->outcome);
 }
 
 void ucall_server_reply_vectored(ucall_server_reply_vectored_t* arguments) {
     if (!arguments || !admit(arguments->server, arguments->outcome)) return;
-    refuse_exchange(arguments->request, arguments->outcome);
+    refuse_exchange(arguments->request ? *arguments->request : nullptr, arguments->outcome);
 }
 
 void ucall_server_reply_begin(ucall_server_reply_begin_t* arguments) {
     if (!arguments || !admit(arguments->server, arguments->outcome)) return;
-    refuse_exchange(arguments->request, arguments->outcome);
+    refuse_exchange(arguments->request ? *arguments->request : nullptr, arguments->outcome);
 }
 
 void ucall_server_reply_append(ucall_server_reply_append_t* arguments) {
@@ -487,7 +486,7 @@ void ucall_server_reply_append(ucall_server_reply_append_t* arguments) {
 
 void ucall_server_reply_end(ucall_server_reply_end_t* arguments) {
     if (!arguments || !admit(arguments->server, arguments->outcome)) return;
-    refuse_exchange(arguments->request, arguments->outcome);
+    refuse_exchange(arguments->request ? *arguments->request : nullptr, arguments->outcome);
 }
 
 } // extern "C"

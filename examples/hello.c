@@ -15,8 +15,8 @@ static int failed(ucall_outcome_t const* outcome) {
     return 1;
 }
 
-static void hello(ucall_received_http_request_t request, void* context) {
-    ucall_server_t server = *(ucall_server_t*)context;
+static void hello(ucall_server_t server, ucall_received_http_request_t request, void* context) {
+    char const* greeting = (char const*)context;
     ucall_outcome_t outcome = {0};
     ucall_bytes_view_t name = {0};
     ucall_server_request_path_parameter_t parameter = {.server = server,
@@ -26,15 +26,17 @@ static void hello(ucall_received_http_request_t request, void* context) {
                                                        .value = &name};
     ucall_server_request_path_parameter(&parameter);
     ucall_reply_part_t parts[2] = {
-        {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)"Hello, ", 7}},
+        {.kind = ucall_reply_part_bytes_k, .data.bytes = {(ucall_byte_t const*)greeting, strlen(greeting)}},
         {.kind = ucall_reply_part_bytes_k, .data.bytes = name}};
     ucall_server_reply_vectored_t reply = {.server = server,
                                            .outcome = &outcome,
-                                           .request = request,
+                                           .request = &request,
                                            .parts = parts,
                                            .parts_count = 2};
     ucall_server_reply_vectored(&reply);
 }
+
+static char greeting[] = "Hello, ";
 
 int main(void) {
     ucall_network_interface_t listener = {.address = {(ucall_byte_t const*)"127.0.0.1:0", 11},
@@ -50,7 +52,7 @@ int main(void) {
                                               .uri_template = {(ucall_byte_t const*)"/hello/{name}", 13},
                                               .verb = ucall_verb_get_k,
                                               .callback = hello,
-                                              .context = &server};
+                                              .context = greeting};
     ucall_server_add_http_endpoint(&route);
     if (failed(&outcome)) return 1;
 
@@ -71,19 +73,14 @@ int main(void) {
     if (failed(&outcome)) return 1;
 
     ucall_completed_call_t completed = {0};
-    size_t count = 0;
     ucall_server_take_call_t poll = {.server = server, .outcome = &outcome, .timeout_microseconds = 1000};
-    ucall_client_take_completed_t take = {.client = client,
-                                          .outcome = &outcome,
-                                          .calls = &completed,
-                                          .capacity = 1,
-                                          .count = &count};
-    while (count == 0) {
+    ucall_client_take_completed_call_t take = {.client = client, .outcome = &outcome, .call = &completed};
+    do {
         ucall_server_take_call(&poll);
         if (failed(&outcome)) return 1;
-        ucall_client_take_completed(&take);
-    }
-    if (failed(&completed.outcome)) return 1;
+        ucall_client_take_completed_call(&take);
+    } while (outcome.status == ucall_status_would_block_k);
+    if (failed(&outcome) || failed(&completed.outcome)) return 1;
     ucall_bytes_view_t body = {0};
     ucall_client_response_body_t body_read = {.response = completed.response, .outcome = &outcome, .body = &body};
     ucall_client_response_body(&body_read);

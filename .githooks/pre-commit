@@ -1217,7 +1217,12 @@ check_include_groups() {
                     while (sub(/[^\/.][^\/]*\/\.\.\//, "", beside)) {}
                     search = "git ls-files \":(glob)**/" header "\""
                     if (touched && !system("git cat-file -e \":" beside "\" 2>/dev/null")) found = beside
-                    else if (touched) { search | getline found; close(search) }
+                    # A name both public and private, like `cpp/ucall/server.hpp` beside `tools/server.hpp`, is the private one.
+                    else if (touched) {
+                        while ((search | getline candidate) > 0)
+                            if (found == "" || found ~ "^(c|cpp|include)/" project "/") found = candidate
+                        close(search)
+                    }
                     if (touched && found == "")
                         printf "line %d: \"%s\" is not in this repository - write <%s>\n", FNR, header, header
                     if (match(found, "^(c|cpp|include)/" project "/"))
@@ -4418,7 +4423,7 @@ check_qualified_namespace() {
     spelled=$(printf '%s\n' "$staged_added_text" |
         grep -vE '^\+[[:space:]]*(\*|//|/\*)' |
         grep -vE 'namespace [a-z_]+ = unum::ucall(::[a-z_]+)*;|(using )?namespace unum::ucall(::[a-z_]+)*( \{|;)$|^\+\} // namespace unum::ucall' |
-        grep -vE 'struct (std|fmt)::[A-Za-z_]+<unum::ucall::|operator\(\)\(unum::ucall::' |
+        grep -vE 'struct (std|fmt)::[A-Za-z_]+<([^<>]*, *)?unum::ucall::|using type = typename unum::ucall::|operator\(\)\(unum::ucall::' |
         grep -E 'unum::ucall::' || true)
     [ -z "$spelled" ] || reject_with_reason "$spelled" \
         "$staged_path spells unum::ucall:: in full - the name is already in scope through an alias like \`us\`," \
@@ -4516,6 +4521,21 @@ check_redundant_nodiscard() {
         "            marked [[nodiscard]] themselves, so drop the annotation:"
 }
 
+# A two-way structured binding is an `expected` taken apart, so its halves read `[thing, status]`:
+# the status half is `status` or `<verb>_status`, never a participle, and the payload half never
+# carries the suffix. A `std::pair` binds under the same rule; `[first, second]` says nothing either.
+# The standard conversions answer an end and an `std::errc`, not a status, so `[end, error]` stays.
+check_expected_bindings() {
+    local participle suffixed
+    participle=$(printf '%s\n' "$staged_added_text" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E 'auto( const)?&? \[[a-z_]+, [a-z_]+\] =' | grep -vE '\b(from_chars|to_chars|format_to_n)\(' |
+        grep -vE 'auto( const)?&? \[[a-z_]+, (status|[a-z]+(_[a-z]+)*_status)\] =' || true)
+    suffixed=$(printf '%s\n' "$staged_added_text" | grep -vE '^\+[[:space:]]*(//|/\*|\*( |/|$))' |
+        grep -E 'auto( const)?&? \[[a-z_]+_status, ' || true)
+    [ -z "$participle$suffixed" ] || reject_with_reason "$participle$suffixed" \
+        "$staged_path binds an expected as [payload, participle] - the status half is \`status\` or \`<verb>_status\`:"
+}
+
 # C's limit macros, `INFINITY`, `NAN`, `SIZE_MAX`, `PTRDIFF_MAX`, `FLT_MAX` and kin, name what
 # `std::numeric_limits` spells per type, so a C++ line writes `lowest()`, `(…::max)()`, `quiet_NaN()`
 # or `infinity()`. Preprocessor lines, comments and string literals stay out; the C sources keep the
@@ -4601,6 +4621,28 @@ check_call_chained_call() {
     chained=$(printf '%s\n' "$staged_added_text" | grep -E '[A-Za-z0-9_>]\(\)\(' | grep -v 'operator()(' || true)
     [ -z "$chained" ] || reject_with_reason "$chained" \
         "$staged_path calls a call result - slice an owning tensor directly, or name the first result:"
+}
+
+# Rejects `.value` read straight off a call's result, as `parse(text).value`, because an unchecked unwrap hides the
+# failure that the status code reports: bind the result with `auto [value, status] = parse(text);` and check `status`.
+# A trait's `::value` and a call to `.value(...)` are not member reads and pass.
+check_call_value_unwrap() {
+    local unwrapped
+    unwrapped=$(grep -E '\)\.value\b([^(]|$)' "$staged_added_code_path" || true)
+    [ -z "$unwrapped" ] || reject_with_reason "$unwrapped" \
+        "$staged_path unwraps a call result with .value; bind it as auto [value, status] = call(...)," \
+        "            and check the status:"
+}
+
+# Rejects a local declared as `expected<...>` from a call, because it spells the return type twice: bind the result
+# with `auto [value, status] = call(...);`. Return types and parameters have no `=` or `{` after the name, and a member's
+# default like `{{}, status}` builds the value rather than calling anything.
+check_expected_local_binding() {
+    local declared
+    declared=$(grep -E '^\+[[:space:]]*([A-Za-z_]+::)?expected<.*>([[:space:]]+const)?[[:space:]]+[A-Za-z_][A-Za-z0-9_]*[[:space:]]*(=|\{)[[:space:]]*[A-Za-z_]' "$staged_added_code_path" |
+        grep -vE '^\+[[:space:]]*(return|using|typedef|template)\b' || true)
+    [ -z "$declared" ] || reject_with_reason "$declared" \
+        "$staged_path declares an expected<…> local; bind it as auto [value, status] = call(...):"
 }
 
 # The `&*iterator` antipattern: laundering an iterator through a reference into a pointer. Take the
@@ -4792,11 +4834,14 @@ run_project_checks() {
         check_c_limit_macros
         check_requires_clauses
         check_redundant_nodiscard
+        check_expected_bindings
         check_stl_streams
         check_range_reconstruction
         check_data_null_probe
         check_call_chained_subscript
         check_call_chained_call
+        check_call_value_unwrap
+        check_expected_local_binding
         check_gcc_atomics
         check_mutable_and_const_cast
         ;;

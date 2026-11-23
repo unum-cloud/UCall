@@ -24,6 +24,7 @@ using tunnel::secure_tunnel_geometry_t;
 using utilities::allocator_delete;
 using utilities::byte_t;
 using utilities::close_native_file;
+using utilities::polling_thread_t;
 using utilities::publish;
 using utilities::text_view;
 
@@ -59,6 +60,9 @@ struct batch_endpoint : ucall_http_batch_endpoint_handle_t {
 
     /** Whether the polling owner sleeps on @c wake, so a depositor knows to notify it. */
     wake_state_t wake_state {wake_state_t::awake_k};
+
+    /** The thread inside take_batch or take_batches, empty while none polls. */
+    polling_thread_t polling_thread {};
 
     /** What a deposit or a stop notifies to wake a sleeping polling owner. */
     wake_channel_t wake {};

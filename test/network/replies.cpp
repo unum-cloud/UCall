@@ -89,7 +89,7 @@ static ucall_reply_part_t path_part(std::string_view path, std::uint64_t offset 
                                     std::size_t directory = 0) {
     ucall_reply_part_t part {};
     part.kind = ucall_reply_part_path_k;
-    part.data.path = {directory, uc::bytes_view(path), offset, length};
+    part.data.path = {directory, bytes_view(path), offset, length};
     return part;
 }
 
@@ -98,7 +98,7 @@ static bool reply_parts(fixture_t& fixture, ucall_received_http_request_t reques
                         std::vector<ucall_reply_part_t> const& parts,
                         std::vector<ucall_bytes_view_t> const& headers = {},
                         ucall_status_t expected = ucall_status_deferred_k) {
-    ucall_server_reply_vectored_t reply {fixture.server, &outcome,       request,      0,
+    ucall_server_reply_vectored_t reply {fixture.server, &outcome,       &request,     0,
                                          headers.data(), headers.size(), parts.data(), parts.size()};
     ucall_server_reply_vectored(&reply);
     ucall_status_t const status = ucall_outcome_status(&outcome);
@@ -183,12 +183,12 @@ static case_result_t test_misaligned_ranges(sweep_cell_t const& cell) {
                 auto* chunked = hold_call(fixture, ucall_verb_get_k, cell.security);
                 if (!expect_true(chunked)) return {};
                 ucall_outcome_t begun {}, appended {}, ended {};
-                ucall_server_reply_begin_t begin {fixture.server, &begun, chunked, 0, nullptr, 0};
+                ucall_server_reply_begin_t begin {fixture.server, &begun, &chunked, 0, nullptr, 0};
                 ucall_server_reply_begin(&begin);
                 ucall_reply_part_t const part = file_part(file, offset, length ? length : size - offset);
                 ucall_server_reply_append_t append {fixture.server, &appended, chunked, &part, 1};
                 ucall_server_reply_append(&append);
-                ucall_server_reply_end_t finish {fixture.server, &ended, chunked};
+                ucall_server_reply_end_t finish {fixture.server, &ended, &chunked};
                 ucall_server_reply_end(&finish);
                 expect_true(begun.status == ucall_status_success_k && appended.status == ucall_status_success_k,
                             "begin {}, append {}", ucall_status_name(begun.status), ucall_status_name(appended.status));
@@ -265,7 +265,7 @@ static case_result_t test_path_refusals(sweep_cell_t const& cell) {
         ucall_outcome_t outcome {};
         reply_parts(fixture, request, outcome, {file_part(kept), refused}, {}, ucall_status_invalid_argument_k);
         expect_true(open_descriptor(kept), "a refused reply closed the caller's descriptor");
-        ucall_server_reply_error_t error {fixture.server, &outcome, request, 400, uc::bytes_view("refused")};
+        ucall_server_reply_error_t error {fixture.server, &outcome, &request, 400, bytes_view("refused")};
         ucall_server_reply_error(&error);
         expect_true(outcome.status == ucall_status_success_k);
         check_answer(fixture.wait(), ucall_http_status_bad_request_k, "refused");
@@ -291,12 +291,12 @@ static case_result_t test_unbufferable_descriptor_refused(sweep_cell_t const& ce
         ucall_outcome_t outcome {};
         reply_parts(fixture, vectored, outcome, {bytes_part("never"), file_part(socket_descriptor)}, {},
                     ucall_status_invalid_argument_k);
-        ucall_server_reply_error_t error {fixture.server, &outcome, vectored, 400, uc::bytes_view("refused")};
+        ucall_server_reply_error_t error {fixture.server, &outcome, &vectored, 400, bytes_view("refused")};
         ucall_server_reply_error(&error);
         check_answer(fixture.wait(), ucall_http_status_bad_request_k, "refused");
         auto* streamed = hold_call(fixture, ucall_verb_get_k, ucall_security_none_k);
         if (!expect_true(streamed)) return {};
-        ucall_server_reply_begin_t begin {fixture.server, &outcome, streamed, 0, nullptr, 0};
+        ucall_server_reply_begin_t begin {fixture.server, &outcome, &streamed, 0, nullptr, 0};
         ucall_server_reply_begin(&begin);
         std::vector<ucall_reply_part_t> const refused {bytes_part("never"), file_part(socket_descriptor)};
         ucall_server_reply_append_t append {fixture.server, &outcome, streamed, refused.data(), refused.size()};
@@ -307,7 +307,7 @@ static case_result_t test_unbufferable_descriptor_refused(sweep_cell_t const& ce
         ucall_server_reply_append_t again {fixture.server, &outcome, streamed, &kept, 1};
         ucall_server_reply_append(&again);
         ucall_outcome_t ended {};
-        ucall_server_reply_end_t end {fixture.server, &ended, streamed};
+        ucall_server_reply_end_t end {fixture.server, &ended, &streamed};
         ucall_server_reply_end(&end);
         check_answer(fixture.wait(), ucall_http_status_ok_k, "kept");
         expect_true(open_descriptor(socket_descriptor), "the refused descriptor was closed");
@@ -329,7 +329,7 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
             /** Outlives the callback, as the loop makes it final later. */
             ucall_outcome_t deferred {};
         } state;
-        auto answer = [](ucall_received_http_request_t request, void* context) {
+        auto answer = [](ucall_server_t, ucall_received_http_request_t request, void* context) {
             auto& owner = *static_cast<state_t*>(context);
             ucall_outcome_t outcome {};
             std::size_t network_interface_index = 0;
@@ -340,7 +340,7 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
             ucall_server_request_peer(&peer);
             ucall_reply_part_t const part = path_part("hello.txt");
             ucall_outcome_t& replied = network_interface_index ? outcome : owner.deferred;
-            ucall_server_reply_vectored_t reply {owner.server, &replied, request, 0, nullptr, 0, &part, 1};
+            ucall_server_reply_vectored_t reply {owner.server, &replied, &request, 0, nullptr, 0, &part, 1};
             ucall_server_reply_vectored(&reply);
             if (network_interface_index == 0) {
                 expect_true(ucall_outcome_status(&replied) == ucall_status_deferred_k, "{}",
@@ -348,13 +348,13 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
                 return;
             }
             expect_true(outcome.status == ucall_status_invalid_argument_k, "{}", ucall_status_name(outcome.status));
-            ucall_server_reply_error_t error {owner.server, &outcome, request, 400, uc::bytes_view("no directory")};
+            ucall_server_reply_error_t error {owner.server, &outcome, &request, 400, bytes_view("no directory")};
             ucall_server_reply_error(&error);
         };
-        ucall_bytes_view_t directory = uc::bytes_view(tree.served);
+        ucall_bytes_view_t directory = bytes_view(tree.served);
         ucall_network_interface_t interfaces[2] {};
         for (auto& network_interface : interfaces) {
-            network_interface.address = uc::bytes_view("127.0.0.1:0");
+            network_interface.address = bytes_view("127.0.0.1:0");
             network_interface.max_concurrent_connections = 2;
         }
         interfaces[0].reply_directories = &directory;
@@ -371,8 +371,8 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
         if (!expect_true(outcome.status == ucall_status_success_k, "init: {}", ucall_status_name(outcome.status)))
             return {};
         expect_true(resolved.interfaces[0].reply_directories_count == 1 &&
-                    uc::text_view(resolved.interfaces[0].reply_directories[0]) == tree.served);
-        ucall_server_add_http_endpoint_t add {state.server,     &outcome, uc::bytes_view("/file"),
+                    text_view(resolved.interfaces[0].reply_directories[0]) == tree.served);
+        ucall_server_add_http_endpoint_t add {state.server,     &outcome, bytes_view("/file"),
                                               ucall_verb_get_k, answer,   &state};
         ucall_server_add_http_endpoint(&add);
         std::thread serving {[&] {
@@ -383,7 +383,7 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
         std::string_view const request = "GET /file HTTP/1.1\r\nHost: a\r\n\r\n";
         for (std::size_t index : {0, 1}) {
             raw_client_t client;
-            if (!client.connect(uc::text_view(resolved.interfaces[index].address))) {
+            if (!client.connect(text_view(resolved.interfaces[index].address))) {
                 expect_true(false, "connecting to interface {}", index);
                 continue;
             }
@@ -401,7 +401,7 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
                     ucall_status_name(state.deferred.status));
         // A directory that cannot be opened fails initialization with its cause.
         std::string const missing = fmt::format("{}/absent", tree.served);
-        directory = uc::bytes_view(missing);
+        directory = bytes_view(missing);
         ucall_server_t refused {};
         ucall_server_init_t again {&refused, &outcome, &config, nullptr};
         ucall_server_init(&again);
@@ -417,7 +417,7 @@ static case_result_t test_path_beyond_interface(sweep_cell_t const& cell) {
 static void stream_parts(fixture_t& fixture, ucall_received_http_request_t request, int file, ucall_outcome_t& ended,
                          std::vector<ucall_bytes_view_t> const& headers = {}) {
     ucall_outcome_t outcome {};
-    ucall_server_reply_begin_t begin {fixture.server, &outcome, request, 0, headers.data(), headers.size()};
+    ucall_server_reply_begin_t begin {fixture.server, &outcome, &request, 0, headers.data(), headers.size()};
     ucall_server_reply_begin(&begin);
     expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
     std::vector<std::vector<ucall_reply_part_t>> const chunks {
@@ -430,7 +430,7 @@ static void stream_parts(fixture_t& fixture, ucall_received_http_request_t reque
         append_when_room(append, steady_clock::now() + wait_limit_k);
         expect_true(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
     }
-    ucall_server_reply_end_t end {fixture.server, &ended, request};
+    ucall_server_reply_end_t end {fixture.server, &ended, &request};
     ucall_server_reply_end(&end);
     ucall_status_t const status = ucall_outcome_status(&ended);
     expect_true(status == ucall_status_deferred_k || status == ucall_status_success_k, "end: {}",
@@ -458,7 +458,7 @@ static case_result_t test_mixed_stream(sweep_cell_t const& cell) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &outcome;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_get_k;
         call.context = &url;
         call.options.security = cell.security;
@@ -541,9 +541,9 @@ static case_result_t test_mixed_stream_framing(sweep_cell_t const& cell) {
                     static_cast<ssize_t>(request.size()));
         await_held_in_background(fixture, 1);
         auto* held = fixture.take_held();
-        ucall_bytes_view_t const declared = uc::bytes_view(length);
+        ucall_bytes_view_t const declared = bytes_view(length);
         ucall_outcome_t outcome {};
-        ucall_server_reply_begin_t begin {fixture.server, &outcome, held, 0, &declared, 1};
+        ucall_server_reply_begin_t begin {fixture.server, &outcome, &held, 0, &declared, 1};
         ucall_server_reply_begin(&begin);
         int const file = tree.open("hello.txt");
         ucall_reply_part_t const unsized = file_part(file);
@@ -557,7 +557,7 @@ static case_result_t test_mixed_stream_framing(sweep_cell_t const& cell) {
         ucall_server_reply_append(&append);
         expect_true(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
         ucall_outcome_t ended {};
-        ucall_server_reply_end_t end {fixture.server, &ended, held};
+        ucall_server_reply_end_t end {fixture.server, &ended, &held};
         ucall_server_reply_end(&end);
         auto const response = read_response(identity, 0);
         expect_true(response.status == 200 && response.body == body, "identity answered {} with {} bytes",
@@ -608,21 +608,21 @@ static case_result_t test_noise_record_boundaries(sweep_cell_t const& cell) {
             ucall_client_call_t call {};
             call.client = fixture.client;
             call.outcome = &called;
-            call.url = uc::bytes_view(echo_url);
+            call.url = bytes_view(echo_url);
             call.verb = ucall_verb_post_k;
-            call.body = uc::bytes_view(body);
+            call.body = bytes_view(body);
             call.options.security = cell.security;
             call.options.noise_peer_key = &fixture.server_public;
             ucall_client_call(&call);
             check_answer(fixture.wait(), ucall_http_status_ok_k, body);
             auto* streamed = hold_call(fixture, ucall_verb_get_k, cell.security);
             if (!expect_true(streamed)) return {};
-            ucall_server_reply_begin_t begin {fixture.server, &outcome, streamed, 0, nullptr, 0};
+            ucall_server_reply_begin_t begin {fixture.server, &outcome, &streamed, 0, nullptr, 0};
             ucall_server_reply_begin(&begin);
             ucall_reply_part_t const chunk = bytes_part(body);
             ucall_server_reply_append_t append {fixture.server, &outcome, streamed, &chunk, 1};
             ucall_server_reply_append(&append);
-            ucall_server_reply_end_t end {fixture.server, &outcome, streamed};
+            ucall_server_reply_end_t end {fixture.server, &outcome, &streamed};
             ucall_server_reply_end(&end);
             check_answer(fixture.wait(), ucall_http_status_ok_k, body);
             if (test_run.failed_checks.load() != failed_before) { break; }
@@ -1020,7 +1020,7 @@ static void test_client_free_on_another_ring_thread(sweep_cell_t const& cell) {
         ucall_client_call_t call {};
         call.client = fixture.client;
         call.outcome = &pending;
-        call.url = uc::bytes_view(url);
+        call.url = bytes_view(url);
         call.verb = ucall_verb_get_k;
         ucall_client_call(&call);
         expect_true(pending.status == ucall_status_success_k, "call: {}", ucall_status_name(pending.status));
@@ -1089,8 +1089,9 @@ static case_result_t test_linger_then_reset(sweep_cell_t const& cell) {
     bool const copies = cell.backend == ucall_io_backend_posix_k || cell.backend == ucall_io_backend_bsd_kqueue_k;
     std::string const body(copies ? 12000 : std::size_t {1} << 20, 'l');
     ucall_outcome_t outcome {};
-    ucall_server_reply_content_t reply {fixture.server, &outcome, fixture.take_held(), ucall_http_status_ok_k,
-                                        nullptr,        0,        uc::bytes_view(body)};
+    ucall_received_http_request_t taken = fixture.take_held();
+    ucall_server_reply_content_t reply {fixture.server, &outcome, &taken,          ucall_http_status_ok_k,
+                                        nullptr,        0,        bytes_view(body)};
     auto const replied = steady_clock::now();
     ucall_server_reply_content(&reply);
     expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
@@ -1134,7 +1135,7 @@ static case_result_t test_zero_copy_pins_past_memlock(sweep_cell_t const& cell) 
         raw_client_t warm;
         if (!expect_true(warm.connect(fixture.address))) return {};
         std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok";
-        expect_true(warm.write(uc::byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(warm.write(byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
         expect_true(read_response(warm, 0).status == 200, "the warm-up echo failed");
     }
     raw_client_t client;
@@ -1147,7 +1148,7 @@ static case_result_t test_zero_copy_pins_past_memlock(sweep_cell_t const& cell) 
     rlimit lowered = original;
     lowered.rlim_cur = 0;
     expect_true(::setrlimit(RLIMIT_MEMLOCK, &lowered) == 0, "the locked-memory limit stayed");
-    expect_true(client.write(uc::byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k));
+    expect_true(client.write(byte_span(request), 65536, generator, steady_clock::now() + wait_limit_k));
     auto const response = read_response(client, 0);
     expect_true(::setrlimit(RLIMIT_MEMLOCK, &original) == 0, "the locked-memory limit stayed lowered");
     expect_true(response.status == 200 && response.body.size() == body_length, "answered {} with {} bytes",
@@ -1173,7 +1174,7 @@ static void test_many_lingers_expire(sweep_cell_t const& cell, split_mix_generat
     auto const started = steady_clock::now();
     for (auto& client : clients) {
         if (!expect_true(client.connect(fixture.address))) return;
-        expect_true(client.write(uc::byte_span(closing), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(client.write(byte_span(closing), 0, generator, steady_clock::now() + wait_limit_k));
     }
     for (auto& client : clients) {
         auto const end = client.read_until_close(started + 3s);
@@ -1183,7 +1184,7 @@ static void test_many_lingers_expire(sweep_cell_t const& cell, split_mix_generat
     raw_client_t last;
     if (!expect_true(last.connect(fixture.address))) return;
     std::string_view const echo = "GET /echo/2 HTTP/1.1\r\nHost: a\r\n\r\n";
-    expect_true(last.write(uc::byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
+    expect_true(last.write(byte_span(echo), 0, generator, steady_clock::now() + wait_limit_k));
     expect_true(read_response(last, 0).status == 200, "the peer behind the lingers was not served");
     auto const served = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - started);
     expect_true(served < 3s, "the peer behind the lingers was served after {} ms", served.count());
@@ -1291,21 +1292,21 @@ static case_result_t test_warm_file_reply_allocates_nothing(sweep_cell_t const& 
             ucall_server_t server {};
             std::array<ucall_outcome_t, 3> deferred {};
             std::size_t replies {};
-            static void serve(ucall_received_http_request_t request, void* context) {
+            static void serve(ucall_server_t, ucall_received_http_request_t request, void* context) {
                 auto& route = *static_cast<route_t*>(context);
                 ucall_reply_part_t const parts[] {bytes_part("head|"), path_part("big.bin", 3, 600000)};
                 // The first request only warms the connection's receive buffer.
                 ucall_server_reply_vectored_t reply {
-                    route.server, &route.deferred[route.replies], request, 0, nullptr, 0,
+                    route.server, &route.deferred[route.replies], &request, 0, nullptr, 0,
                     parts,        route.replies ? 2u : 1u};
                 ++route.replies;
                 ucall_server_reply_vectored(&reply);
             }
         } route;
         allocation_ledger_t ledger;
-        ucall_bytes_view_t const directory = uc::bytes_view(tree.served);
+        ucall_bytes_view_t const directory = bytes_view(tree.served);
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.max_concurrent_connections = 1;
         network_interface.reply_directories = &directory;
         network_interface.reply_directories_count = 1;
@@ -1315,14 +1316,14 @@ static case_result_t test_warm_file_reply_allocates_nothing(sweep_cell_t const& 
         config.backend = cell.backend;
         ucall_outcome_t outcome {};
         ucall_server_init_t init {&route.server, &outcome, &config, &resolved};
-        counted_network_t::server_t::server_init(&init, counting_allocator<uc::byte_t> {ledger});
+        counted_network_t::server_t::server_init(&init, counting_allocator<byte_t> {ledger});
         if (!expect_true(outcome.status == ucall_status_success_k, "init: {}", ucall_status_name(outcome.status)))
             return {};
-        ucall_server_add_http_endpoint_t add {route.server,     &outcome,       uc::bytes_view("/file"),
+        ucall_server_add_http_endpoint_t add {route.server,     &outcome,       bytes_view("/file"),
                                               ucall_verb_get_k, route_t::serve, &route};
         ucall_server_add_http_endpoint(&add);
         raw_client_t client;
-        if (!expect_true(client.connect(uc::text_view(resolved.interfaces[0].address)))) return {};
+        if (!expect_true(client.connect(text_view(resolved.interfaces[0].address)))) return {};
         std::string const file_body = fmt::format("head|{}", file_tree_t::big(3, 600000));
         std::string_view const request = "GET /file HTTP/1.1\r\nHost: a\r\n\r\n";
         std::size_t warm_allocations = 0;

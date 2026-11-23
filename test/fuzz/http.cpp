@@ -6,14 +6,20 @@
  *
  *  The first byte picks how many cuts follow, each next byte is one cut, and the rest is the wire.
  */
+#undef NDEBUG // ! A test's oracle must stay live in every build
+
 #include <cstdlib> // `std::abort`
 
 #include <algorithm> // `std::sort`
 
 #include "properties.hpp" // `check_http_fragmentation`
 
+namespace util = unum::ucall::utilities;
+
 extern "C" int LLVMFuzzerTestOneInput(std::uint8_t const* data, std::size_t size) {
     using namespace unum::ucall;
+    using util::byte_t;
+    using util::span;
     if (size < 2) return 0;
     std::size_t cuts[8];
     std::size_t const count = fu::min_of<std::size_t>(data[0] % 9, size - 1);

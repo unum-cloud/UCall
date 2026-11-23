@@ -37,6 +37,7 @@ using tunnel::secure_tunnel_role_t;
 using utilities::accept_failure_t;
 using utilities::allocate_unique;
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::bytes_view;
 using utilities::deadline_after;
 using utilities::io_vector_t;
@@ -406,7 +407,7 @@ struct serving {
         // not grow them.
         if (event_loop.orphaned_exchanges >= event_loop.max_exchanges)
             return refuse(connection, *exchange, 503, "Too many abandoned requests", {});
-        if (endpoint->callback) return endpoint->callback(exchange, endpoint->context);
+        if (endpoint->callback) return endpoint->callback(&server, exchange, endpoint->context);
         auto& batch = *endpoint->batch;
         auto tail = atomic_ref<std::uint64_t> {batch.tail};
         // Exchanges of closed connections outlive their admission, so this check alone bounds it.
@@ -469,7 +470,7 @@ struct serving {
         }
         exchange->body_stage = body_stage_t::streaming_k;
         connection.streaming = exchange;
-        endpoint->callback(exchange, endpoint->context);
+        endpoint->callback(event_loop.server, exchange, endpoint->context);
     }
 
     /** Hands a waiting pull @c body_chunk, or the end of the body, and makes its outcome final. */

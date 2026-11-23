@@ -176,7 +176,7 @@ struct echo_upstream_t {
     ucall_server_t server {};
     std::string address {};
     std::thread poller {};
-    static void echo_head(ucall_received_http_request_t request, void* context) {
+    static void echo_head(ucall_server_t, ucall_received_http_request_t request, void* context) {
         auto& upstream = *static_cast<echo_upstream_t*>(context);
         ucall_outcome_t outcome {};
         ucall_bytes_view_t path {}, query {};
@@ -186,25 +186,23 @@ struct echo_upstream_t {
         ucall_server_request_query(&get_query);
         std::string answer = fmt::format("{} {}?{}|",
                                          static_cast<int>(ucall_server_request_verb(upstream.server, request)),
-                                         uc::text_view(path), uc::text_view(query));
-        std::size_t count = 0;
-        ucall_server_request_fields_count_t counting {upstream.server, &outcome, request, &count};
-        ucall_server_request_fields_count(&counting);
+                                         text_view(path), text_view(query));
+        std::size_t const count = ucall_server_request_fields_count(upstream.server, request);
         for (std::size_t index = 0; index != count; ++index) {
             ucall_bytes_view_t name {}, value {};
             ucall_server_request_field_t field {upstream.server, &outcome, request, index, &name, &value};
             ucall_server_request_field(&field);
-            answer += fmt::format("{}={};", uc::text_view(name), uc::text_view(value));
+            answer += fmt::format("{}={};", text_view(name), text_view(value));
         }
-        ucall_bytes_view_t const header = uc::bytes_view("X-Upstream: answered");
-        ucall_server_reply_content_t reply {
-            upstream.server, &outcome, request, ucall_http_status_ok_k, &header, 1, uc::bytes_view(answer)};
+        ucall_bytes_view_t const header = bytes_view("X-Upstream: answered");
+        ucall_server_reply_content_t reply {upstream.server, &outcome, &request,          ucall_http_status_ok_k,
+                                            &header,         1,        bytes_view(answer)};
         ucall_server_reply_content(&reply);
     }
     bool start() {
         ucall_outcome_t outcome {};
         ucall_network_interface_t network_interface {};
-        network_interface.address = uc::bytes_view("127.0.0.1:0");
+        network_interface.address = bytes_view("127.0.0.1:0");
         network_interface.event_loops = 1;
         network_interface.max_concurrent_connections = 4;
         ucall_server_options_t config {}, resolved {};
@@ -213,8 +211,8 @@ struct echo_upstream_t {
         ucall_server_init_t init {&server, &outcome, &config, &resolved};
         ucall_server_init(&init);
         if (outcome.status != ucall_status_success_k) return false;
-        address = uc::text_view(resolved.interfaces[0].address);
-        ucall_server_add_http_endpoint_t add {server,           &outcome,  uc::bytes_view("/{*path}"),
+        address = text_view(resolved.interfaces[0].address);
+        ucall_server_add_http_endpoint_t add {server,           &outcome,  bytes_view("/{*path}"),
                                               ucall_verb_any_k, echo_head, this};
         ucall_server_add_http_endpoint(&add);
         if (outcome.status != ucall_status_success_k) return false;

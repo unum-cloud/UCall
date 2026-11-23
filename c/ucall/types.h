@@ -465,11 +465,10 @@ typedef enum ucall_status_t {
  */
 typedef ucall_status_t (*ucall_peer_authorizer_t)(ucall_noise_key_t const* peer_static_key, void* context);
 
-/** Outcome of one call: a status to branch on, and a static message with the detail it cannot
- *  carry.
- *
- *  The message has static storage, is never freed, and is @c NULL exactly when the status is @c
- *  ucall_status_success_k. Every verb struct points at one. */
+/** Outcome of one call: the status word a deferred call completes through and every binding
+ *  branches on, and a static message naming what broke, a library invariant or a rule of this
+ *  call, else the status's own @ref ucall_status_name. Messages are never freed, and are
+ *  @c NULL exactly when the status is @c ucall_status_success_k. */
 typedef struct ucall_outcome_t {
 
     /** The final status, or ucall_status_deferred_k while a submitted call is unfinished. */

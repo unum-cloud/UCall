@@ -45,10 +45,10 @@ void test_polled_file_reads() {
     if (!expect_true(file >= 0)) return;
     polled_file_reads<> reads;
     if (!expect_true(reads.reserve(8) == ucall_status_success_k)) return;
-    std::unordered_map<unsigned, uc::descriptor_t> landed;
-    auto settle = [&](unsigned owner, uc::descriptor_t result) { landed[owner] = result; };
+    std::unordered_map<unsigned, descriptor_t> landed;
+    auto settle = [&](unsigned owner, descriptor_t result) { landed[owner] = result; };
     auto await_all = [&] {
-        for (auto const deadline = uc::utilities::deadline_after(5000000); reads.in_flight();) {
+        for (auto const deadline = util::deadline_after(5000000); reads.in_flight();) {
             reads.reap(settle);
             if (monotonic_ns() > deadline) break;
         }
@@ -57,7 +57,7 @@ void test_polled_file_reads() {
     std::size_t const single_bytes = 65536;
     std::string single(single_bytes, '\0');
     io_vector_t single_vector {single.data(), single_bytes};
-    uc::descriptor_t result = -1;
+    descriptor_t result = -1;
     if (!reads.start(0, file, {&single_vector, 1}, 4096, result)) landed[0] = result;
     std::string scattered(40 * 1000, '\0');
     io_vector_t vectors[40];

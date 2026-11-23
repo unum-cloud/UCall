@@ -25,6 +25,11 @@
 
 namespace unum::ucall::io {
 
+using utilities::byte_t;
+using utilities::descriptor_t;
+using utilities::native_file_t;
+using utilities::span;
+
 #if UCALL_OS_POSIX_
 
 /** The longest batch one @c lio_listio takes, where the platform names none. */

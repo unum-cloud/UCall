@@ -43,9 +43,9 @@ static void test_statsd_metrics(sweep_cell_t const& cell) {
         if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
             return;
         auto const& resolved = fixture.resolved;
-        expect_true(uc::text_view(resolved.metrics_prefix) == "probe" && resolved.metrics_sample_rate == 1.f &&
-                        resolved.metrics_tags_count == 2 && uc::text_view(resolved.metrics_tags[1]) == "team:core",
-                    "resolved prefix `{}` at rate {}", uc::text_view(resolved.metrics_prefix),
+        expect_true(text_view(resolved.metrics_prefix) == "probe" && resolved.metrics_sample_rate == 1.f &&
+                        resolved.metrics_tags_count == 2 && text_view(resolved.metrics_tags[1]) == "team:core",
+                    "resolved prefix `{}` at rate {}", text_view(resolved.metrics_prefix),
                     resolved.metrics_sample_rate);
         std::string const echo_url = fmt::format("{}/echo/1", fixture.url),
                           missing_url = fmt::format("{}/missing", fixture.url);
@@ -55,9 +55,9 @@ static void test_statsd_metrics(sweep_cell_t const& cell) {
             ucall_client_call_t call {};
             call.client = fixture.client;
             call.outcome = &outcome;
-            call.url = uc::bytes_view(url);
+            call.url = bytes_view(url);
             call.verb = ucall_verb_post_k;
-            call.body = uc::bytes_view(body);
+            call.body = bytes_view(body);
             ucall_client_call(&call);
             auto completed = fixture.wait();
             if (completed.response) ucall_client_response_free(completed.response);
@@ -97,14 +97,14 @@ static void test_statsd_metrics(sweep_cell_t const& cell) {
         fixture.stop();
     }
     ucall_network_interface_t network_interface {};
-    network_interface.address = uc::bytes_view("127.0.0.1:0");
+    network_interface.address = bytes_view("127.0.0.1:0");
     network_interface.max_concurrent_connections = 1;
-    ucall_bytes_view_t const bad_tag = uc::bytes_view("a,b");
+    ucall_bytes_view_t const bad_tag = bytes_view("a,b");
     for (std::string_view const case_name : {"a rate past one", "a tag holding a comma"}) {
         ucall_server_options_t config {};
         config.interfaces = &network_interface;
         config.interfaces_count = 1;
-        config.metrics_address = uc::bytes_view(address);
+        config.metrics_address = bytes_view(address);
         if (case_name == "a rate past one") config.metrics_sample_rate = 1.5f;
         else config.metrics_tags = &bad_tag, config.metrics_tags_count = 1;
         ucall_server_t server {};
@@ -135,7 +135,7 @@ static void test_statsd_skips_refused_batch(sweep_cell_t const& cell) {
         fixture_t fixture {cell, {.metrics_address = address}};
         if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
             return;
-        auto const ignore = [](ucall_received_http_request_t const*, std::size_t, void*) {};
+        auto const ignore = [](ucall_server_t, ucall_received_http_request_t const*, std::size_t, void*) {};
         using added_t = std::pair<std::string_view, ucall_status_t>;
         // Listed newest first, so the refused one comes ahead of the registered one.
         for (auto [uri_template, expected] :
@@ -143,7 +143,7 @@ static void test_statsd_skips_refused_batch(sweep_cell_t const& cell) {
             ucall_outcome_t outcome {};
             ucall_http_batch_endpoint_t endpoint {};
             ucall_server_add_http_batch_endpoint_t add {
-                fixture.server, &outcome, uc::bytes_view(uri_template), ucall_verb_post_k, +ignore, nullptr, 1, 4,
+                fixture.server, &outcome, bytes_view(uri_template), ucall_verb_post_k, +ignore, nullptr, 1, 4,
                 1000,           &endpoint};
             ucall_server_add_http_batch_endpoint(&add);
             expect_true(outcome.status == expected, "{} answered {}", uri_template, ucall_status_name(outcome.status));
@@ -214,8 +214,8 @@ static void test_statsd_metrics_while_draining(sweep_cell_t const& cell) {
         expect_true(reported.find("probe.connections:1|g") != std::string::npos, "no datagram reported the drain: {:?}",
                     reported);
         ucall_outcome_t outcome {};
-        ucall_server_reply_content_t reply {
-            fixture.server, &outcome, held, ucall_http_status_ok_k, nullptr, 0, uc::bytes_view("drained")};
+        ucall_server_reply_content_t reply {fixture.server,       &outcome, &held, ucall_http_status_ok_k, nullptr, 0,
+                                            bytes_view("drained")};
         ucall_server_reply_content(&reply);
         expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
         expect_true(read_response(client, 0).status == 200, "the held reply did not arrive");

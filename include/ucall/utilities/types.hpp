@@ -41,6 +41,9 @@
 namespace unum::ucall {
 namespace fu = ashvardanian::forkunion;
 namespace st = ashvardanian::smashtable;
+} // namespace unum::ucall
+
+namespace unum::ucall::utilities {
 
 /** The base Linux adds to syscall numbers on MIPS and Alpha, so mirrored numbers add it too. */
 #if defined(_MIPS_SIM) && _MIPS_SIM == _ABIO32
@@ -54,10 +57,6 @@ inline constexpr long linux_syscall_offset_k = 110;
 #else
 inline constexpr long linux_syscall_offset_k = 0;
 #endif
-} // namespace unum::ucall
-namespace uc = unum::ucall;
-
-namespace unum::ucall::utilities {
 
 /** What one server or client may use: the StringZilla kernels its kits run and the ForkUnion
  *  atomics it synchronizes with, picked once at init. */
@@ -206,18 +205,5 @@ inline span<byte_t const> byte_span(std::string_view text) noexcept { return std
 } // namespace unum::ucall::utilities
 
 namespace unum::ucall {
-
-/*  The views, descriptors, outcomes, allocations and CPU ceilings every folder and the entry
- *  points share. */
-using utilities::byte_span;
-using utilities::byte_t;
-using utilities::bytes_of;
-using utilities::bytes_view;
-using utilities::cpu_ceiling_t;
-using utilities::descriptor_t;
-using utilities::elements_of;
-using utilities::native_file_t;
-using utilities::span;
-using utilities::text_view;
-
+namespace util = utilities;
 } // namespace unum::ucall

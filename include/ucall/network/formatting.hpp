@@ -29,6 +29,7 @@ using tunnel::secure_tunnel_geometry_t;
 using tunnel::secure_tunnel_mode_t;
 using tunnel::secure_tunnel_role_t;
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::bytes_view;
 using utilities::descriptor_t;
 using utilities::file_direct_switch;

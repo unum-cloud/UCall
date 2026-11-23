@@ -26,6 +26,7 @@ using utilities::allocate_unique;
 using utilities::allocated_ptr;
 using utilities::allocator_delete;
 using utilities::byte_t;
+using utilities::bytes_of;
 using utilities::close_native_file;
 using utilities::descriptor_t;
 using utilities::largest_receive_buffer;

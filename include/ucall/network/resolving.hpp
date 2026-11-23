@@ -22,6 +22,8 @@
 
 namespace unum::ucall::network {
 
+using utilities::bytes_of;
+
 /** Whether an origin's addresses are unknown, being asked, known until @c expires, or known not to
  *  exist until then. */
 enum class resolution_t : std::uint8_t { unresolved_k, resolving_k, resolved_k, refused_k };

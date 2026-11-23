@@ -29,6 +29,9 @@ using http::serial_fold_kit_t;
 using http::serial_hash_kit_t;
 using tunnel::secure_tunnel_fault_t;
 using tunnel::secure_tunnel_generate_keypair;
+using util::bytes_view;
+using util::cpu_ceiling_t;
+using util::text_view;
 
 /** Responses outlive their client and its CPU class, so reading one takes the serial kits. */
 using response_http_t =
@@ -178,6 +181,13 @@ void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     arguments->client->api->take_completed(arguments);
 }
 
+void ucall_client_take_completed_call(ucall_client_take_completed_call_t* arguments) {
+    if (!arguments) return;
+    if (arguments->call) *arguments->call = {};
+    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
+    arguments->client->api->take_completed_call(arguments);
+}
+
 void ucall_server_free(ucall_server_t server) {
     if (!server) return;
     server->api->free(server);
@@ -220,11 +230,6 @@ void ucall_server_request_header(ucall_server_request_header_t* arguments) {
     if (!arguments) return;
     if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
     arguments->server->api->request_header(arguments);
-}
-void ucall_server_request_fields_count(ucall_server_request_fields_count_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_fields_count(arguments);
 }
 void ucall_server_request_field(ucall_server_request_field_t* arguments) {
     if (!arguments) return;
@@ -276,18 +281,12 @@ void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     *arguments->value = bytes_view(value);
     publish(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
 }
-void ucall_client_response_fields_count(ucall_client_response_fields_count_t* arguments) {
-    if (!arguments) return;
-    if (arguments->count) *arguments->count = 0;
-    if (!arguments->response || !arguments->count) {
-        publish(arguments->outcome, ucall_status_invalid_argument_k);
-        return;
-    }
-    auto& response = *static_cast<received_response_t*>(arguments->response);
+size_t ucall_client_response_fields_count(ucall_received_http_response_t response) {
+    if (!response) return 0;
+    auto& received = *static_cast<received_response_t*>(response);
     response_http_t::http_message_t message {};
-    message.headers_length = response.headers_length;
-    *arguments->count = message.fields_count(text_view(response.bytes()));
-    publish(arguments->outcome, ucall_status_success_k);
+    message.headers_length = received.headers_length;
+    return message.fields_count(text_view(received.bytes()));
 }
 void ucall_client_response_field(ucall_client_response_field_t* arguments) {
     if (!arguments) return;
@@ -339,6 +338,9 @@ ucall_verb_t ucall_server_request_verb(ucall_server_t server, ucall_received_htt
 }
 size_t ucall_server_request_path_segments_count(ucall_server_t server, ucall_received_http_request_t request) {
     return server ? server->api->request_path_segments_count(server, request) : 0;
+}
+size_t ucall_server_request_fields_count(ucall_server_t server, ucall_received_http_request_t request) {
+    return server ? server->api->request_fields_count(server, request) : 0;
 }
 ucall_http_status_t ucall_client_response_status(ucall_received_http_response_t response) {
     return response ? static_cast<received_response_t*>(response)->status : 0;

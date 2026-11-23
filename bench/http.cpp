@@ -260,6 +260,7 @@ using tools::admit_any_peer;
 using tools::parse_count;
 using tools::parse_key;
 using tools::process_clocks_t;
+using utilities::bytes_view;
 
 /** A switch: present, "1" or "true" select @p on, and "0" or "false" the zero enumerator. */
 template <typename mode_type_>

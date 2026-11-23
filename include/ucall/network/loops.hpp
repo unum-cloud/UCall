@@ -28,6 +28,7 @@ using utilities::byte_t;
 using utilities::close_native_file;
 using utilities::descriptor_t;
 using utilities::is_current_thread;
+using utilities::native_file_t;
 using utilities::polling_thread_t;
 using utilities::socket_close;
 using utilities::span;

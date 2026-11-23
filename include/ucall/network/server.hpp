@@ -787,6 +787,17 @@ struct server : ucall_server_handle_t {
         bound_progress(event_loop);
         return atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire);
     }
+
+    /** Makes this thread the one polling @p owner's loop or endpoint, refusing while any thread,
+     *  this one included, already polls it. */
+    static bool claim_polling(polling_thread_t& owner) noexcept {
+        polling_thread_t empty {};
+        return atomic_ref<polling_thread_t> {owner}.compare_exchange_strong(
+            empty, current_polling_thread(), std::memory_order_acq_rel, std::memory_order_acquire);
+    }
+    static void release_polling(polling_thread_t& owner) noexcept {
+        atomic_ref<polling_thread_t> {owner}.store({}, std::memory_order_release);
+    }
     static void server_take_call(ucall_server_take_call_t* arguments) noexcept {
         auto& server = *static_cast<server_t*>(arguments->server);
         if (arguments->event_loop_index >= server.event_loops.size()) {
@@ -796,13 +807,15 @@ struct server : ucall_server_handle_t {
         auto wait = arguments->timeout_microseconds ? io_wait_t::blocking_k : io_wait_t::nonblocking_k;
         auto deadline = arguments->timeout_microseconds ? deadline_after(arguments->timeout_microseconds) : 0;
         auto& event_loop = *server.event_loops[arguments->event_loop_index];
-        auto polling_thread = atomic_ref<polling_thread_t> {event_loop.polling_thread};
-        polling_thread.store(current_polling_thread(), std::memory_order_relaxed);
+        if (!claim_polling(event_loop.polling_thread)) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_contended_k);
+            return;
+        }
         ucall_status_t status = server_poll(server, event_loop, wait, deadline);
         // A caller polling in slices learns here that the loop has nothing left to take.
         if (status == ucall_status_success_k && event_loop.stage == event_loop_stage_t::retired_k)
             status = ucall_status_connection_closed_k;
-        polling_thread.store({}, std::memory_order_relaxed);
+        release_polling(event_loop.polling_thread);
         publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_take_calls(ucall_server_take_calls_t* arguments) noexcept {
@@ -812,12 +825,14 @@ struct server : ucall_server_handle_t {
             return;
         }
         auto& event_loop = *server.event_loops[arguments->event_loop_index];
+        if (!claim_polling(event_loop.polling_thread)) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_contended_k);
+            return;
+        }
         ucall_status_t status = ucall_status_success_k;
-        auto polling_thread = atomic_ref<polling_thread_t> {event_loop.polling_thread};
-        polling_thread.store(current_polling_thread(), std::memory_order_relaxed);
         while (event_loop.stage != event_loop_stage_t::retired_k && status == ucall_status_success_k)
             status = server_poll(server, event_loop, io_wait_t::blocking_k);
-        polling_thread.store({}, std::memory_order_relaxed);
+        release_polling(event_loop.polling_thread);
         publish<atomic_ref>(arguments->outcome, status);
     }
 
@@ -872,7 +887,7 @@ struct server : ucall_server_handle_t {
 
     /** Hands the pending batch to its callback and counts it under @p trigger, the counter of why
      *  it fired, or detaches it while stopping, firing and counting nothing. */
-    static ucall_status_t flush_collected(batch_endpoint_t& endpoint, server_stage_t stage,
+    static ucall_status_t flush_collected(server_t& server, batch_endpoint_t& endpoint, server_stage_t stage,
                                           std::uint64_t& trigger) noexcept {
         if (endpoint.collected.empty()) return ucall_status_would_block_k;
         if (stage == server_stage_t::cutting_k)
@@ -881,7 +896,7 @@ struct server : ucall_server_handle_t {
             tally<atomic_ref>(endpoint.statistics.batches);
             tally<atomic_ref>(endpoint.statistics.requests, endpoint.collected.size());
             tally<atomic_ref>(trigger);
-            endpoint.callback(endpoint.collected.data(), endpoint.collected.size(), endpoint.context);
+            endpoint.callback(&server, endpoint.collected.data(), endpoint.collected.size(), endpoint.context);
         }
         endpoint.collected.clear();
         return stage != server_stage_t::cutting_k ? ucall_status_success_k : ucall_status_would_block_k;
@@ -906,7 +921,7 @@ struct server : ucall_server_handle_t {
     /** One round of one batch endpoint: moves its deposits to @c collected, invokes the batch
      *  if due, and sets @p expiry to when the waiting remainder falls due, or zero when nothing
      *  waits. Succeeds when the callback fired, or reports @c ucall_status_would_block_k. */
-    static ucall_status_t collect_deposits(batch_endpoint_t& endpoint, server_stage_t stage,
+    static ucall_status_t collect_deposits(server_t& server, batch_endpoint_t& endpoint, server_stage_t stage,
                                            std::uint64_t& expiry) noexcept {
         auto tail = atomic_ref<std::uint64_t> {endpoint.tail}.load(std::memory_order_acquire);
         ucall_status_t flushed = ucall_status_would_block_k;
@@ -928,7 +943,7 @@ struct server : ucall_server_handle_t {
             if (abandoned(*exchange)) continue;
             [[maybe_unused]] st::status_t const queued = endpoint.collected.push_back(st::assume_reserved, exchange);
             if (endpoint.collected.size() == endpoint.max_batch_size &&
-                flush_collected(endpoint, stage, endpoint.statistics.filled_batches) == ucall_status_success_k)
+                flush_collected(server, endpoint, stage, endpoint.statistics.filled_batches) == ucall_status_success_k)
                 flushed = ucall_status_success_k;
         }
         atomic_ref<std::uint64_t> {endpoint.head}.store(head, std::memory_order_release);
@@ -942,7 +957,8 @@ struct server : ucall_server_handle_t {
         auto ready = endpoint.collected.size() >= endpoint.min_batch_size;
         if (stage != server_stage_t::serving_k || ready || monotonic_ns() >= due) {
             auto& trigger = ready ? endpoint.statistics.ready_batches : endpoint.statistics.expired_batches;
-            if (flush_collected(endpoint, stage, trigger) == ucall_status_success_k) flushed = ucall_status_success_k;
+            if (flush_collected(server, endpoint, stage, trigger) == ucall_status_success_k)
+                flushed = ucall_status_success_k;
         }
         else expiry = due;
         return flushed;
@@ -974,15 +990,20 @@ struct server : ucall_server_handle_t {
         }
         auto& server = *static_cast<server_t*>(arguments->server);
         auto& endpoint = *static_cast<batch_endpoint_t*>(arguments->endpoint);
+        if (!claim_polling(endpoint.polling_thread)) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_contended_k);
+            return;
+        }
         auto deadline = arguments->timeout_microseconds ? deadline_after(arguments->timeout_microseconds) : 0;
         for (;;) {
             std::uint64_t expiry {};
             auto stage = serving_t::server_stage(server);
-            if (collect_deposits(endpoint, stage, expiry) == ucall_status_success_k || batches_ended(server, stage) ||
-                monotonic_ns() >= deadline)
+            if (collect_deposits(server, endpoint, stage, expiry) == ucall_status_success_k ||
+                batches_ended(server, stage) || monotonic_ns() >= deadline)
                 break;
             wait_for_deposits(server, endpoint, expiry ? fu::min_of(expiry, deadline) : deadline);
         }
+        release_polling(endpoint.polling_thread);
         publish<atomic_ref>(arguments->outcome,
                             atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
     }
@@ -993,13 +1014,18 @@ struct server : ucall_server_handle_t {
         }
         auto& server = *static_cast<server_t*>(arguments->server);
         auto& endpoint = *static_cast<batch_endpoint_t*>(arguments->endpoint);
+        if (!claim_polling(endpoint.polling_thread)) {
+            publish<atomic_ref>(arguments->outcome, ucall_status_contended_k);
+            return;
+        }
         for (;;) {
             std::uint64_t expiry {};
             auto stage = serving_t::server_stage(server);
-            collect_deposits(endpoint, stage, expiry);
+            collect_deposits(server, endpoint, stage, expiry);
             if (batches_ended(server, stage)) break;
             wait_for_deposits(server, endpoint, expiry);
         }
+        release_polling(endpoint.polling_thread);
         publish<atomic_ref>(arguments->outcome,
                             atomic_ref<ucall_status_t> {server.failure}.load(std::memory_order_acquire));
     }
@@ -1252,15 +1278,10 @@ struct server : ucall_server_handle_t {
         *arguments->value = bytes_view(value);
         publish<atomic_ref>(arguments->outcome, value.data() ? ucall_status_success_k : ucall_status_not_found_k);
     }
-    static void server_request_fields_count(ucall_server_request_fields_count_t* arguments) noexcept {
-        if (arguments->count) *arguments->count = 0;
-        if (!arguments->request || !arguments->count) {
-            publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
-            return;
-        }
-        auto& exchange = *static_cast<server_exchange_t*>(arguments->request);
-        *arguments->count = exchange.message.fields_count(exchange.text());
-        publish<atomic_ref>(arguments->outcome, ucall_status_success_k);
+    static std::size_t server_request_fields_count(ucall_server_t, ucall_received_http_request_t request) noexcept {
+        if (!request) return 0;
+        auto& exchange = *static_cast<server_exchange_t*>(request);
+        return exchange.message.fields_count(exchange.text());
     }
     static void server_request_field(ucall_server_request_field_t* arguments) noexcept {
         if (arguments->name) *arguments->name = {};
@@ -1421,53 +1442,67 @@ struct server : ucall_server_handle_t {
         // The loop reads on and finishes the pull as bytes arrive.
         replies_t::list_replied(exchange);
     }
+
+    /** Gives the caller's @p request up once a reply answering @p status took it: a whole reply
+     *  takes it whenever it marked the exchange replied, which every other status undid. */
+    static void taken_by_reply(ucall_received_http_request_t* request, ucall_status_t status) noexcept {
+        if (status == ucall_status_success_k || status == ucall_status_deferred_k ||
+            status == ucall_status_connection_closed_k)
+            *request = nullptr;
+    }
     static void server_reply_content(ucall_server_reply_content_t* arguments) noexcept {
-        if (!arguments->request || !http_t::valid_view(arguments->body) ||
+        if (!arguments->request || !*arguments->request || !http_t::valid_view(arguments->body) ||
             (arguments->headers_count && !arguments->headers)) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         ucall_reply_part_t part {};
         part.data.bytes = arguments->body;
-        publish<atomic_ref>(arguments->outcome,
-                            replies_t::reply(*static_cast<server_exchange_t*>(arguments->request), nullptr,
-                                             arguments->http_status ? arguments->http_status : 200,
-                                             {arguments->headers, arguments->headers_count}, {&part, 1}));
+        ucall_status_t const status = replies_t::reply(*static_cast<server_exchange_t*>(*arguments->request), nullptr,
+                                                       arguments->http_status ? arguments->http_status : 200,
+                                                       {arguments->headers, arguments->headers_count}, {&part, 1});
+        taken_by_reply(arguments->request, status);
+        publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_reply_error(ucall_server_reply_error_t* arguments) noexcept {
-        if (!arguments->request || !http_t::valid_view(arguments->message) || arguments->http_status < 400) {
+        if (!arguments->request || !*arguments->request || !http_t::valid_view(arguments->message) ||
+            arguments->http_status < 400) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         ucall_bytes_view_t const header = bytes_view("content-type: text/plain");
         ucall_reply_part_t part {};
         part.data.bytes = arguments->message;
-        publish<atomic_ref>(arguments->outcome,
-                            replies_t::reply(*static_cast<server_exchange_t*>(arguments->request), nullptr,
-                                             arguments->http_status, {&header, 1}, {&part, 1}));
+        ucall_status_t const status = replies_t::reply(*static_cast<server_exchange_t*>(*arguments->request), nullptr,
+                                                       arguments->http_status, {&header, 1}, {&part, 1});
+        taken_by_reply(arguments->request, status);
+        publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_reply_vectored(ucall_server_reply_vectored_t* arguments) noexcept {
-        if (!arguments->request || (arguments->headers_count && !arguments->headers) ||
+        if (!arguments->request || !*arguments->request || (arguments->headers_count && !arguments->headers) ||
             (arguments->parts_count && !arguments->parts)) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
         // A deferred outcome was published before the loop could see the reply, which owns it now.
         ucall_status_t const status = replies_t::reply(
-            *static_cast<server_exchange_t*>(arguments->request), arguments->outcome,
+            *static_cast<server_exchange_t*>(*arguments->request), arguments->outcome,
             arguments->http_status ? arguments->http_status : 200, {arguments->headers, arguments->headers_count},
             {arguments->parts, arguments->parts_count});
+        taken_by_reply(arguments->request, status);
         if (status != ucall_status_deferred_k) publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_reply_begin(ucall_server_reply_begin_t* arguments) noexcept {
-        if (!arguments->request || (arguments->headers_count && !arguments->headers)) {
+        if (!arguments->request || !*arguments->request || (arguments->headers_count && !arguments->headers)) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        publish<atomic_ref>(arguments->outcome,
-                            replies_t::begin_reply(*static_cast<server_exchange_t*>(arguments->request),
-                                                   arguments->http_status ? arguments->http_status : 200,
-                                                   {arguments->headers, arguments->headers_count}));
+        ucall_status_t const status = replies_t::begin_reply(*static_cast<server_exchange_t*>(*arguments->request),
+                                                             arguments->http_status ? arguments->http_status : 200,
+                                                             {arguments->headers, arguments->headers_count});
+        // A closed connection ended the reply, which only an open one keeps for its appends.
+        if (status == ucall_status_connection_closed_k) *arguments->request = nullptr;
+        publish<atomic_ref>(arguments->outcome, status);
     }
     static void server_reply_append(ucall_server_reply_append_t* arguments) noexcept {
         if (!arguments->request || (arguments->parts_count && !arguments->parts)) {
@@ -1479,12 +1514,14 @@ struct server : ucall_server_handle_t {
                                                           {arguments->parts, arguments->parts_count}));
     }
     static void server_reply_end(ucall_server_reply_end_t* arguments) noexcept {
-        if (!arguments->request) {
+        if (!arguments->request || !*arguments->request) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;
         }
-        ucall_status_t const status = replies_t::end_reply(*static_cast<server_exchange_t*>(arguments->request),
+        ucall_status_t const status = replies_t::end_reply(*static_cast<server_exchange_t*>(*arguments->request),
                                                            arguments->outcome);
+        // Only a reply that was never open, or already ended, leaves the request.
+        if (status != ucall_status_invalid_argument_k) *arguments->request = nullptr;
         if (status != ucall_status_deferred_k) publish<atomic_ref>(arguments->outcome, status);
     }
 
