@@ -1,9 +1,9 @@
 /**
- *  @file test/io/engines.hpp
+ *  @file test/io/queues.hpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief The engine cases every engine runs, each templated on the engine, and the sweep that
- *      runs an engine rebound to every admitted CPU class's atomic reference and row kit.
+ *  @brief The queue cases every queue runs, each templated on the queue, and the sweep that
+ *      runs a queue rebound to every admitted CPU class's atomic reference and row kit.
  */
 #pragma once
 #include <cstring> // `std::memcmp`
@@ -19,8 +19,8 @@
 #include "ucall/io/types.hpp"          // `io_request_t`, `io_completion_t`, `io_wait_t`
 #include "ucall/utilities/sockets.hpp" // `nonblocking`, `monotonic_ns`, `deadline_after`
 #if UCALL_WITH_LINUX_URING
-#include "ucall/io/linux_uring612_engine.hpp" // `linux_uring612_engine`
-#include "ucall/io/linux_uring618_engine.hpp" // `linux_uring618_engine`
+#include "ucall/io/linux_uring612_queue.hpp" // `linux_uring612_queue`
+#include "ucall/io/linux_uring618_queue.hpp" // `linux_uring618_queue`
 #endif
 
 #include "harness.hpp" // `expect_true`, `run_test_case`, `loopback_pair`, `direct_directory_t`, `file_byte`
@@ -30,19 +30,19 @@ namespace unum::ucall::test::io {
 
 using namespace unum::ucall::io;
 
-/** Why a ring case skips on a kernel older than the generation its engine drives. */
+/** Why a ring case skips on a kernel older than the generation its queue drives. */
 inline constexpr char const* generation_refused_k = "this io_uring generation is refused on this machine";
 
 #if UCALL_OS_POSIX_
 
-#pragma region Every Engine
+#pragma region Every Queue
 
-/** The engine keeps a mebibyte send and a receive pending on one socket
+/** The queue keeps a mebibyte send and a receive pending on one socket
  *  at once, and each completes as its own request. */
-template <typename engine_type_>
-void test_engine_duplex(split_mix_generator_t& generator) {
-    engine_type_ engine;
-    auto const status = engine.open(2, 2);
+template <typename queue_type_>
+void test_queue_duplex(split_mix_generator_t& generator) {
+    queue_type_ queue;
+    auto const status = queue.open(2, 2);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return;
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected())) return;
@@ -54,7 +54,7 @@ void test_engine_duplex(split_mix_generator_t& generator) {
                      uc::utilities::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer,
                                                   sizeof(send_buffer)) == 0))
         return;
-    auto const owned = engine.import_socket(std::exchange(sockets.client, -1));
+    auto const owned = queue.import_socket(std::exchange(sockets.client, -1));
     if (!expect_true(owned >= 0, "importing ended with {}", owned)) return;
     int const peer = sockets.peer;
 
@@ -71,8 +71,8 @@ void test_engine_duplex(split_mix_generator_t& generator) {
                           .descriptor = owned,
                           .data = payload.data(),
                           .length = payload.size()};
-    engine.submit(receiving);
-    engine.submit(sending);
+    queue.submit(receiving);
+    queue.submit(sending);
 
     std::size_t received = 0, sent = 0, read = 0;
     bool written = false;
@@ -82,7 +82,7 @@ void test_engine_duplex(split_mix_generator_t& generator) {
         // Nothing drains the peer before the receive completes,
         // so the send stays pending throughout.
         auto const wait = written && !received ? io_wait_t::blocking_k : io_wait_t::nonblocking_k;
-        int const count = engine.poll(uc::span<io_completion_t> {completions}, wait, deadline);
+        int const count = queue.poll(uc::span<io_completion_t> {completions}, wait, deadline);
         if (!expect_true(count >= 0, "polling ended with {}", count)) return;
         for (auto const& completed : uc::span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
             if (completed.request == &sending) {
@@ -90,7 +90,7 @@ void test_engine_duplex(split_mix_generator_t& generator) {
                 sent += static_cast<std::size_t>(completed.result);
                 sending.data = payload.data() + sent;
                 sending.length = payload.size() - sent;
-                if (sent != payload.size()) engine.submit(sending);
+                if (sent != payload.size()) queue.submit(sending);
             }
             else {
                 if (!expect_true(completed.request == &receiving, "a completion named neither request")) return;
@@ -100,7 +100,7 @@ void test_engine_duplex(split_mix_generator_t& generator) {
                 expect_equal_bytes(delivered, message);
                 expect_true(sent != payload.size(), "the send finished before the peer read");
             }
-            engine.release(completed);
+            queue.release(completed);
         }
         if (!written && !count) {
             if (!expect_true(::send(peer, message.data(), message.size(), MSG_NOSIGNAL) ==
@@ -118,17 +118,17 @@ void test_engine_duplex(split_mix_generator_t& generator) {
             return;
     }
     expect_true(drained == payload);
-    expect_true(engine.close_socket(owned) == 0);
+    expect_true(queue.close_socket(owned) == 0);
 }
 
-/** One accept of the engine takes every queued connection, each completing with its own peer and
+/** One accept of the queue takes every queued connection, each completing with its own peer and
  *  saying the request stays pending, and exactly one last completion ends it, however many of them
  *  one poll hands over together. */
-template <typename engine_type_>
+template <typename queue_type_>
 void test_accept_batch() {
     constexpr std::size_t connections_k = 8;
-    engine_type_ engine;
-    auto const status = engine.open(64, 64);
+    queue_type_ queue;
+    auto const status = queue.open(64, 64);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return;
     int const listener = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in address {};
@@ -140,14 +140,14 @@ void test_accept_batch() {
                      ::listen(listener, connections_k) == 0 &&
                      uc::utilities::nonblocking(listener) == ucall_status_success_k))
         return;
-    auto const owned = engine.import_socket(listener);
+    auto const owned = queue.import_socket(listener);
     if (!expect_true(owned >= 0, "importing the listener ended with {}", owned)) return;
     std::array<io_peer_address_t, connections_k> peers {};
     io_request_t accepting {.operation = io_operation_t::accept_k,
                             .descriptor = owned,
                             .data = reinterpret_cast<uc::byte_t*>(peers.data()),
                             .length = connections_k};
-    engine.submit(accepting);
+    queue.submit(accepting);
 
     std::string const target = fmt::format("127.0.0.1:{}", ntohs(address.sin_port));
     std::array<raw_client_t, connections_k> clients;
@@ -162,14 +162,14 @@ void test_accept_batch() {
     }
     std::vector<uc::descriptor_t> accepted;
     std::size_t endings = 0;
-    // Room past every connection, so a readiness engine never ends the accept for want of it.
+    // Room past every connection, so a readiness queue never ends the accept for want of it.
     io_completion_t completions[4 * connections_k] {};
     auto const deadline = uc::utilities::deadline_after(5000000);
     while (!endings) {
         // Every client connected, so a request still pending afterwards only ends once cancelled.
         if (accepted.size() == connections_k && accepting.length)
-            if (!expect_true(engine.cancel(accepting) == ucall_status_success_k)) return;
-        int const count = engine.poll(uc::span<io_completion_t> {completions}, io_wait_t::blocking_k, deadline);
+            if (!expect_true(queue.cancel(accepting) == ucall_status_success_k)) return;
+        int const count = queue.poll(uc::span<io_completion_t> {completions}, io_wait_t::blocking_k, deadline);
         if (!expect_true(count >= 0, "polling ended with {}", count)) return;
         for (auto const& completed : uc::span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
             if (!expect_true(completed.request == &accepting, "a completion named another request")) return;
@@ -192,10 +192,10 @@ void test_accept_batch() {
     }
     expect_true(accepted.size() == connections_k && ports.empty(), "{} of {} accepted", accepted.size(), connections_k);
     expect_true(endings == 1 && !accepting.length, "{} completions ended the accept", endings);
-    expect_true(engine.poll(uc::span<io_completion_t> {completions}, io_wait_t::nonblocking_k) == 0,
+    expect_true(queue.poll(uc::span<io_completion_t> {completions}, io_wait_t::nonblocking_k) == 0,
                 "the accept completed after it ended");
-    for (auto descriptor : accepted) expect_true(engine.close_socket(descriptor) == 0);
-    expect_true(engine.close_socket(owned) == 0);
+    for (auto descriptor : accepted) expect_true(queue.close_socket(descriptor) == 0);
+    expect_true(queue.close_socket(owned) == 0);
 }
 
 /** The status flag @c F_GETFL reads back from a descriptor switched to unbuffered reads: Darwin's
@@ -206,24 +206,24 @@ inline constexpr int direct_flag_k = 0x40000;
 inline constexpr int direct_flag_k = O_DIRECT;
 #endif
 
-/** Polls @p engine until @p request completes, answering its result, or @c -ETIMEDOUT once
+/** Polls @p queue until @p request completes, answering its result, or @c -ETIMEDOUT once
  *  @p deadline passes; other completions are dropped. */
-template <typename engine_type_>
-uc::descriptor_t finish(engine_type_& engine, io_request_t const& request, std::uint64_t deadline) {
+template <typename queue_type_>
+uc::descriptor_t finish(queue_type_& queue, io_request_t const& request, std::uint64_t deadline) {
     io_completion_t completed[1] {};
     while (uc::utilities::monotonic_ns() < deadline)
-        if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+        if (queue.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
             return completed[0].result;
     return -ETIMEDOUT;
 }
-template <typename engine_type_>
-uc::descriptor_t await(engine_type_& engine, io_request_t& request, std::uint64_t deadline) {
-    engine.submit(request);
-    return finish(engine, request, deadline);
+template <typename queue_type_>
+uc::descriptor_t await(queue_type_& queue, io_request_t& request, std::uint64_t deadline) {
+    queue.submit(request);
+    return finish(queue, request, deadline);
 }
 
-/** A disk-backed directory holding <tt>data.bin</tt>, 64 alignments and 123 bytes of patterned content,
- *  beside a FIFO, a subdirectory and a symlink out of it. */
+/** A disk-backed directory holding <tt>data.bin</tt>, 64 alignments and 123 bytes of patterned
+ *  content, beside a FIFO, a subdirectory and a symlink out of it. */
 struct direct_files_t {
     direct_directory_t directory;
     std::string content;
@@ -238,20 +238,20 @@ struct direct_files_t {
 
 /** Opens beneath a directory for unbuffered reads, refusing escapes, FIFOs and directories without
  *  waiting on a writer; switches a buffered descriptor, twice; then reads aligned extents, a short
- *  tail and vectors, counting each read as asynchronous or blocking as the engine performed it. */
-template <typename engine_type_>
+ *  tail and vectors, counting each read as asynchronous or blocking as the queue performed it. */
+template <typename queue_type_>
 case_result_t test_direct_files() {
     direct_files_t files;
     if (char const* reason = files.directory.unusable()) return case_result_t::skipped(reason);
-    engine_type_ engine;
-    ucall_status_t const opened = engine.open(4, 4);
+    queue_type_ queue;
+    ucall_status_t const opened = queue.open(4, 4);
     if (!expect_true(opened == ucall_status_success_k)) return {};
     if (!expect_true(files.fill())) return {};
     std::size_t const alignment = files.directory.alignment;
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected() && uc::utilities::nonblocking(sockets.client) == ucall_status_success_k))
         return {};
-    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    auto const socket = queue.import_socket(std::exchange(sockets.client, -1));
     auto const deadline = uc::utilities::deadline_after(5000000);
 
     int file = -1;
@@ -262,7 +262,7 @@ case_result_t test_direct_files() {
                               .data = reinterpret_cast<uc::byte_t*>(terminated.data()),
                               .length = terminated.size() + 1,
                               .file = {0, files.directory.descriptor}};
-        uc::descriptor_t const opened = await(engine, opening, deadline);
+        uc::descriptor_t const opened = await(queue, opening, deadline);
         if (path == "data.bin") {
             uc::utilities::file_geometry_t const geometry = opened >= 0 ? uc::utilities::direct_alignment_of(opened)
                                                                         : uc::utilities::file_geometry_t {};
@@ -285,17 +285,17 @@ case_result_t test_direct_files() {
     ::close(buffered);
 
     aligned_bytes_t window {4 * alignment};
-    expect_true(engine.register_memory(window.bytes()).pinning() == range_pinning_t::unpinned_k);
+    expect_true(queue.register_memory(window.bytes()).pinning() == range_pinning_t::unpinned_k);
     io_request_t reading {.operation = io_operation_t::file_read_k,
                           .descriptor = socket,
                           .data = window.data,
                           .length = 2 * alignment,
                           .file = {3 * alignment, file}};
-    expect_true(await(engine, reading, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+    expect_true(await(queue, reading, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, files.content.data() + 3 * alignment, 2 * alignment) == 0);
     reading.file.offset = 64 * alignment;
     reading.length = alignment;
-    expect_true(await(engine, reading, deadline) == 123 &&
+    expect_true(await(queue, reading, deadline) == 123 &&
                 std::memcmp(window.data, files.content.data() + 64 * alignment, 123) == 0);
     uc::utilities::io_vector_t vectors[2] {{window.data, alignment}, {window.data + 2 * alignment, alignment}};
     io_request_t scattering {.operation = io_operation_t::file_read_vectors_k,
@@ -303,16 +303,16 @@ case_result_t test_direct_files() {
                              .data = reinterpret_cast<uc::byte_t*>(vectors),
                              .length = 2,
                              .file = {5 * alignment, file}};
-    expect_true(await(engine, scattering, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
+    expect_true(await(queue, scattering, deadline) == static_cast<uc::descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, files.content.data() + 5 * alignment, alignment) == 0 &&
                 std::memcmp(window.data + 2 * alignment, files.content.data() + 6 * alignment, alignment) == 0);
-    expect_true(engine.statistics.file_reads_asynchronous + engine.statistics.file_reads_blocking == 3);
+    expect_true(queue.statistics.file_reads_asynchronous + queue.statistics.file_reads_blocking == 3);
     ::close(file);
-    expect_true(engine.close_socket(socket) == 0);
+    expect_true(queue.close_socket(socket) == 0);
     return {};
 }
 
-#pragma endregion Every Engine
+#pragma endregion Every Queue
 
 #if UCALL_WITH_LINUX_URING
 #pragma region Rings
@@ -330,14 +330,14 @@ using namespace unum::ucall::utilities;
 }
 
 /** Checks the registered socket @p handle has @c TCP_NODELAY, through a descriptor it installs. */
-template <typename engine_type_>
-void expect_nodelay(engine_type_& engine, descriptor_t handle) {
-    auto* submission = engine.queue.entry();
+template <typename queue_type_>
+void expect_nodelay(queue_type_& queue, descriptor_t handle) {
+    auto* submission = queue.state.entry();
     if (!expect_true(submission)) return;
-    engine.queue.control.result.reset();
+    queue.state.control.result.reset();
     io_uring_prep_fixed_fd_install(submission, static_cast<int>(registered_socket_t::index_of(handle)), 0);
-    io_uring_sqe_set_data64(submission, engine.queue.tag(&engine.queue.control, uring_control_tag_k));
-    auto descriptor = engine.wait_control();
+    io_uring_sqe_set_data64(submission, queue.state.tag(&queue.state.control, uring_control_tag_k));
+    auto descriptor = queue.wait_control();
     if (!expect_true(descriptor >= 0, "installing failed with {}", descriptor)) return;
     int enabled {};
     socket_length_t length = sizeof(enabled);
@@ -345,31 +345,31 @@ void expect_nodelay(engine_type_& engine, descriptor_t handle) {
     socket_close(descriptor);
 }
 
-template <typename engine_type_>
+template <typename queue_type_>
 case_result_t test_failed_submission() {
-    engine_type_ engine;
-    auto status = engine.open(8, 4);
+    queue_type_ queue;
+    auto status = queue.open(8, 4);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
-    auto direct = engine.open_socket(AF_INET);
+    auto direct = queue.open_socket(AF_INET);
     if (!expect_true(direct >= 0)) return {};
-    expect_nodelay(engine, direct);
-    expect_true(engine.close_socket(direct) == 0);
+    expect_nodelay(queue, direct);
+    expect_true(queue.close_socket(direct) == 0);
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected())) return {};
-    auto owned = engine.import_socket(sockets.client);
+    auto owned = queue.import_socket(sockets.client);
     if (!expect_true(owned >= 0)) return {};
     sockets.client = -1;
-    expect_nodelay(engine, owned);
+    expect_nodelay(queue, owned);
     byte_t content[1] {byte_t {42}};
     io_request_t sending {.operation = io_operation_t::send_k,
                           .descriptor = owned,
                           .data = content,
                           .length = sizeof(content)};
     io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = owned};
-    engine.submit(sending);
-    engine.submit(receiving);
-    if (!expect_true(engine.queue.enter(0, 0) >= 0)) return {};
+    queue.submit(sending);
+    queue.submit(receiving);
+    if (!expect_true(queue.state.enter(0, 0) >= 0)) return {};
     byte_t received {};
     expect_true(recv(sockets.peer, &received, sizeof(received), 0) == 1 && received == content[0]);
 
@@ -377,35 +377,35 @@ case_result_t test_failed_submission() {
                               .descriptor = owned,
                               .data = content,
                               .length = sizeof(content)};
-    engine.submit(unsubmitted);
-    auto descriptor = engine.queue.ring.ring_fd;
-    auto enter_descriptor = engine.queue.ring.enter_ring_fd;
-    engine.queue.ring.ring_fd = -1;
-    engine.queue.ring.enter_ring_fd = -1;
-    auto failure = engine.queue.enter(0, 0);
+    queue.submit(unsubmitted);
+    auto descriptor = queue.state.ring.ring_fd;
+    auto enter_descriptor = queue.state.ring.enter_ring_fd;
+    queue.state.ring.ring_fd = -1;
+    queue.state.ring.enter_ring_fd = -1;
+    auto failure = queue.state.enter(0, 0);
     expect_true(failure < 0);
-    engine.queue.ring.ring_fd = descriptor;
-    engine.queue.ring.enter_ring_fd = enter_descriptor;
-    engine.queue.fault = failure;
-    engine.stop();
+    queue.state.ring.ring_fd = descriptor;
+    queue.state.ring.enter_ring_fd = enter_descriptor;
+    queue.state.fault = failure;
+    queue.stop();
 
-    expect_true(!engine.is_open() && engine.queue.file_registration == uring_registration_t::unregistered_k &&
-                engine.queue.buffer_registration == uring_registration_t::unregistered_k);
-    expect_true(!engine.queue.provided.receive_ring && engine.queue.storage);
-    expect_true(!engine.has_kernel_work());
+    expect_true(!queue.is_open() && queue.state.file_registration == uring_registration_t::unregistered_k &&
+                queue.state.buffer_registration == uring_registration_t::unregistered_k);
+    expect_true(!queue.state.provided.receive_ring && queue.state.storage);
+    expect_true(!queue.has_kernel_work());
     expect_true(recv(sockets.peer, &received, sizeof(received), 0) == 0);
     return {};
 }
 
-template <typename engine_type_>
+template <typename queue_type_>
 case_result_t test_streamed_transmit() {
-    engine_type_ engine;
-    auto status = engine.open(1, 1);
+    queue_type_ queue;
+    auto status = queue.open(1, 1);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected())) return {};
-    auto owned = engine.import_socket(sockets.client);
+    auto owned = queue.import_socket(sockets.client);
     if (!expect_true(owned >= 0)) return {};
     sockets.client = -1;
     if (!expect_true(nonblocking(sockets.peer) == ucall_status_success_k)) return {};
@@ -419,11 +419,11 @@ case_result_t test_streamed_transmit() {
             sending.data = payload.data() + sent;
             sending.length = payload.size() - sent;
             sending.deadline = deadline;
-            engine.submit(sending);
+            queue.submit(sending);
             pending = true;
         }
         io_completion_t completed {};
-        if (engine.poll(span<io_completion_t> {&completed, &completed + 1}, io_wait_t::nonblocking_k)) {
+        if (queue.poll(span<io_completion_t> {&completed, &completed + 1}, io_wait_t::nonblocking_k)) {
             if (!expect_true(completed.request == &sending && completed.result > 0, "sending ended with {}",
                              completed.result))
                 return {};
@@ -438,111 +438,114 @@ case_result_t test_streamed_transmit() {
         if (!expect_true(monotonic_ns() < deadline, "{} sent and {} read of {}", sent, read, payload.size())) return {};
     }
     expect_true(received == payload);
-    expect_true(engine.close_socket(owned) == 0);
+    expect_true(queue.close_socket(owned) == 0);
     return {};
 }
 
-/** A receive on @p handle answering @p expected, leaving its slice lent; @p completed names it. */
-template <typename engine_type_>
-void expect_slice(engine_type_& engine, io_request_t& receiving, io_completion_t& completed,
+/** A receive on @p handle answering @p expected, leaving its slice unreleased;
+ *  @p completed names it. */
+template <typename queue_type_>
+void expect_slice(queue_type_& queue, io_request_t& receiving, io_completion_t& completed,
                   span<byte_t const> expected) {
-    engine.submit(receiving);
-    if (!expect_true(engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return;
-    expect_true(completed.request == &receiving && completed.result > 0 && completed.lease, "receiving ended with {}",
-                completed.result);
+    queue.submit(receiving);
+    if (!expect_true(queue.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return;
+    expect_true(completed.request == &receiving && completed.result > 0 && completed.release_token,
+                "receiving ended with {}", completed.result);
     expect_true(completed.result > 0 && static_cast<std::size_t>(completed.result) == expected.size() &&
                 std::memcmp(completed.data, expected.data(), expected.size()) == 0);
 }
 
 /** An end of stream names the buffer being filled and consumes none of it, so the next socket's
  *  bytes land right behind the last ones. */
-template <typename engine_type_>
+template <typename queue_type_>
 case_result_t test_end_of_stream() {
-    engine_type_ engine;
-    auto status = engine.open(8, 8);
+    queue_type_ queue;
+    auto status = queue.open(8, 8);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
     loopback_pair_t leaving = loopback_pair(), staying = loopback_pair();
     if (!expect_true(leaving.connected() && staying.connected())) return {};
-    auto const first = engine.import_socket(std::exchange(leaving.client, -1));
-    auto const second = engine.import_socket(std::exchange(staying.client, -1));
+    auto const first = queue.import_socket(std::exchange(leaving.client, -1));
+    auto const second = queue.import_socket(std::exchange(staying.client, -1));
     if (!expect_true(first >= 0 && second >= 0)) return {};
-    auto& provided = engine.queue.provided;
+    auto& provided = queue.state.provided;
     byte_t const bytes[4] {byte_t {1}, byte_t {2}, byte_t {3}, byte_t {4}};
     io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = first};
     io_request_t other {.operation = io_operation_t::receive_k, .descriptor = second};
     io_completion_t completed {};
     if (!expect_true(send_all(leaving.peer, bytes))) return {};
-    expect_slice(engine, receiving, completed, bytes);
+    expect_slice(queue, receiving, completed, bytes);
     byte_t const* const landed = completed.data;
-    engine.release(completed);
+    queue.release(completed);
     unsigned const before = provided.available_buffers;
 
     if (!expect_true(::shutdown(leaving.peer, SHUT_WR) == 0)) return {};
-    engine.submit(receiving);
-    if (!expect_true(engine.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return {};
-    expect_true(completed.result == 0 && !completed.lease && !completed.data, "the end answered {}", completed.result);
-    engine.release(completed);
-    expect_true(provided.available_buffers == before && provided.newest_buffer != engine.absent_k &&
+    queue.submit(receiving);
+    if (!expect_true(queue.poll({&completed, 1}, io_wait_t::blocking_k, deadline_after(1000000)) == 1)) return {};
+    expect_true(completed.result == 0 && !completed.release_token && !completed.data, "the end answered {}",
+                completed.result);
+    queue.release(completed);
+    expect_true(provided.available_buffers == before && provided.newest_buffer != queue.absent_k &&
                     provided.records[provided.newest_buffer].consumed_bytes == sizeof(bytes),
                 "{} buffers left of {}", provided.available_buffers, before);
 
     if (!expect_true(send_all(staying.peer, bytes))) return {};
-    expect_slice(engine, other, completed, bytes);
+    expect_slice(queue, other, completed, bytes);
     expect_true(completed.data == landed + sizeof(bytes));
-    engine.release(completed);
-    expect_true(engine.close_socket(first) == 0 && engine.close_socket(second) == 0);
+    queue.release(completed);
+    expect_true(queue.close_socket(first) == 0 && queue.close_socket(second) == 0);
     return {};
 }
 
-/** Two sockets take turns in one buffer, and neither slice moves while the other is lent. */
-template <typename engine_type_>
+/** Two sockets take turns in one buffer, and neither slice moves while the other is unreleased. */
+template <typename queue_type_>
 case_result_t test_sockets_interleave() {
-    engine_type_ engine;
-    auto status = engine.open(8, 8);
+    queue_type_ queue;
+    auto status = queue.open(8, 8);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
     loopback_pair_t left = loopback_pair(), right = loopback_pair();
     if (!expect_true(left.connected() && right.connected())) return {};
-    auto const first = engine.import_socket(std::exchange(left.client, -1));
-    auto const second = engine.import_socket(std::exchange(right.client, -1));
+    auto const first = queue.import_socket(std::exchange(left.client, -1));
+    auto const second = queue.import_socket(std::exchange(right.client, -1));
     if (!expect_true(first >= 0 && second >= 0)) return {};
     byte_t const left_bytes[3] {byte_t {11}, byte_t {12}, byte_t {13}};
     byte_t const right_bytes[5] {byte_t {21}, byte_t {22}, byte_t {23}, byte_t {24}, byte_t {25}};
     io_request_t left_receive {.operation = io_operation_t::receive_k, .descriptor = first};
     io_request_t right_receive {.operation = io_operation_t::receive_k, .descriptor = second};
-    io_completion_t lent[4] {};
+    io_completion_t unreleased[4] {};
     if (!expect_true(send_all(left.peer, left_bytes))) return {};
-    expect_slice(engine, left_receive, lent[0], left_bytes);
+    expect_slice(queue, left_receive, unreleased[0], left_bytes);
     if (!expect_true(send_all(right.peer, right_bytes))) return {};
-    expect_slice(engine, right_receive, lent[1], right_bytes);
+    expect_slice(queue, right_receive, unreleased[1], right_bytes);
     if (!expect_true(send_all(left.peer, left_bytes))) return {};
-    expect_slice(engine, left_receive, lent[2], left_bytes);
+    expect_slice(queue, left_receive, unreleased[2], left_bytes);
     if (!expect_true(send_all(right.peer, right_bytes))) return {};
-    expect_slice(engine, right_receive, lent[3], right_bytes);
-    expect_true(lent[1].data == lent[0].data + sizeof(left_bytes) &&
-                lent[2].data == lent[1].data + sizeof(right_bytes) &&
-                lent[3].data == lent[2].data + sizeof(left_bytes));
-    expect_true(std::memcmp(lent[0].data, left_bytes, sizeof(left_bytes)) == 0 &&
-                std::memcmp(lent[1].data, right_bytes, sizeof(right_bytes)) == 0);
-    auto& provided = engine.queue.provided;
+    expect_slice(queue, right_receive, unreleased[3], right_bytes);
+    expect_true(unreleased[1].data == unreleased[0].data + sizeof(left_bytes) &&
+                unreleased[2].data == unreleased[1].data + sizeof(right_bytes) &&
+                unreleased[3].data == unreleased[2].data + sizeof(left_bytes));
+    expect_true(std::memcmp(unreleased[0].data, left_bytes, sizeof(left_bytes)) == 0 &&
+                std::memcmp(unreleased[1].data, right_bytes, sizeof(right_bytes)) == 0);
+    auto& provided = queue.state.provided;
     auto const& record = provided.records[provided.newest_buffer];
-    expect_true(record.leased_slices == 4 && record.consumed_bytes == 2 * sizeof(left_bytes) + 2 * sizeof(right_bytes));
-    for (auto const& completed : lent) engine.release(completed);
-    expect_true(!record.leased_slices && provided.available_buffers == provided.provided_buffers);
-    expect_true(engine.close_socket(first) == 0 && engine.close_socket(second) == 0);
+    expect_true(record.slices_awaiting_release == 4 &&
+                record.consumed_bytes == 2 * sizeof(left_bytes) + 2 * sizeof(right_bytes));
+    for (auto const& completed : unreleased) queue.release(completed);
+    expect_true(!record.slices_awaiting_release && provided.available_buffers == provided.provided_buffers);
+    expect_true(queue.close_socket(first) == 0 && queue.close_socket(second) == 0);
     return {};
 }
 
 /** Opens beneath a directory with @c OPENAT2 for unbuffered reads, refusing escapes; switches a
  *  buffered descriptor, twice; then reads aligned extents, a short tail, a registered buffer
  *  through @c READ_FIXED, and vectors that @c READV or @c READV_FIXED scatter into. */
-template <typename engine_type_>
+template <typename queue_type_>
 case_result_t test_registered_direct_files() {
     direct_directory_t directory;
     if (char const* reason = directory.unusable()) return case_result_t::skipped(reason);
-    engine_type_ engine;
-    auto status = engine.open(8, 8);
+    queue_type_ queue;
+    auto status = queue.open(8, 8);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
     std::size_t const alignment = directory.alignment;
@@ -554,14 +557,14 @@ case_result_t test_registered_direct_files() {
         return {};
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected())) return {};
-    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    auto const socket = queue.import_socket(std::exchange(sockets.client, -1));
     if (!expect_true(socket >= 0)) return {};
     auto const deadline = deadline_after(5000000);
     io_completion_t completed[1] {};
     auto await = [&](io_request_t& request) {
-        engine.submit(request);
+        queue.submit(request);
         while (monotonic_ns() < deadline)
-            if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+            if (queue.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
                 return completed[0].result;
         return descriptor_t {-ETIMEDOUT};
     };
@@ -608,7 +611,7 @@ case_result_t test_registered_direct_files() {
     reading.length = alignment;
     expect_true(await(reading) == 123 && std::memcmp(window.data, content.data() + 64 * alignment, 123) == 0);
 
-    memory_registration_t const registration = engine.register_memory(window.bytes());
+    memory_registration_t const registration = queue.register_memory(window.bytes());
     expect_true(registration.pinning() == range_pinning_t::pinned_k && registration.index != io_unregistered_k,
                 "pinning {} bytes was refused", window.size);
     reading.registered_memory = registration.index;
@@ -628,38 +631,38 @@ case_result_t test_registered_direct_files() {
     expect_true(await(scattering) == static_cast<descriptor_t>(2 * alignment) &&
                 std::memcmp(window.data, content.data() + 5 * alignment, alignment) == 0 &&
                 std::memcmp(window.data + 2 * alignment, content.data() + 6 * alignment, alignment) == 0);
-    expect_true(engine.statistics.file_reads_asynchronous == 4 && !engine.statistics.file_reads_blocking);
+    expect_true(queue.statistics.file_reads_asynchronous == 4 && !queue.statistics.file_reads_blocking);
     ::close(file);
-    expect_true(engine.close_socket(socket) == 0);
+    expect_true(queue.close_socket(socket) == 0);
     return {};
 }
 
 /** A zero-copy send completes once the socket took its bytes, and its release only once the
  *  kernel's notification arrived; loopback copies, so that notification demotes the socket, whose
  *  next zero-copy send copies and whose next release completes at once. */
-template <typename engine_type_>
+template <typename queue_type_>
 case_result_t test_zero_copy_sends() {
-    engine_type_ engine;
-    auto status = engine.open(8, 8);
+    queue_type_ queue;
+    auto status = queue.open(8, 8);
     if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
     if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
     loopback_pair_t sockets = loopback_pair();
     if (!expect_true(sockets.connected() && nonblocking(sockets.peer) == ucall_status_success_k)) return {};
-    auto const socket = engine.import_socket(std::exchange(sockets.client, -1));
+    auto const socket = queue.import_socket(std::exchange(sockets.client, -1));
     if (!expect_true(socket >= 0)) return {};
     aligned_bytes_t window {16384};
     for (std::size_t i = 0; i != window.size; ++i) window.data[i] = file_byte(i);
-    memory_registration_t const registration = engine.register_memory(window.bytes());
+    memory_registration_t const registration = queue.register_memory(window.bytes());
     auto const deadline = deadline_after(5000000);
     io_completion_t completed[1] {};
     auto finish = [&](io_request_t& request) {
         while (monotonic_ns() < deadline)
-            if (engine.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
+            if (queue.poll(completed, io_wait_t::blocking_k, deadline) == 1 && completed[0].request == &request)
                 return completed[0].result;
         return descriptor_t {-ETIMEDOUT};
     };
     auto await = [&](io_request_t& request) {
-        engine.submit(request);
+        queue.submit(request);
         return finish(request);
     };
     std::vector<byte_t> received;
@@ -671,7 +674,7 @@ case_result_t test_zero_copy_sends() {
         return received.size() == expected;
     };
 
-    engine.reserve_releases(1);
+    queue.reserve_releases(1);
     io_request_t release {.operation = io_operation_t::zero_copy_release_k};
     io_request_t sending {.operation = io_operation_t::send_zero_copy_k,
                           .registered_memory = registration.index,
@@ -680,23 +683,23 @@ case_result_t test_zero_copy_sends() {
                           .length = window.size,
                           .release_request = &release};
     descriptor_t const sent = await(sending);
-    expect_true(sent > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
-                engine.statistics.zero_copy_sends);
-    engine.submit(release);
-    expect_true(engine.cancel(release) == ucall_status_success_k);
-    expect_true(finish(release) == 0 && engine.statistics.zero_copy_fallbacks == 1,
-                "the release completed with {} fallbacks counted", engine.statistics.zero_copy_fallbacks);
+    expect_true(sent > 0 && queue.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
+                queue.statistics.zero_copy_sends);
+    queue.submit(release);
+    expect_true(queue.cancel(release) == ucall_status_success_k);
+    expect_true(finish(release) == 0 && queue.statistics.zero_copy_fallbacks == 1,
+                "the release completed with {} fallbacks counted", queue.statistics.zero_copy_fallbacks);
     expect_true(drain(static_cast<std::size_t>(sent)) &&
                 std::memcmp(received.data(), window.data, received.size()) == 0);
 
     received.clear();
     descriptor_t const copied = await(sending);
-    expect_true(copied > 0 && engine.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", copied,
-                engine.statistics.zero_copy_sends);
+    expect_true(copied > 0 && queue.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", copied,
+                queue.statistics.zero_copy_sends);
     expect_true(await(release) == 0);
     expect_true(drain(static_cast<std::size_t>(copied)) &&
                 std::memcmp(received.data(), window.data, received.size()) == 0);
-    expect_true(engine.close_socket(socket) == 0);
+    expect_true(queue.close_socket(socket) == 0);
     return {};
 }
 
@@ -707,74 +710,75 @@ case_result_t test_zero_copy_sends() {
 
 #pragma region Class Sweep
 
-/** @p engine_type_ rebound to the atomic reference and row kit of @p cpu_class_. */
-template <cpu_class_t cpu_class_, typename engine_type_>
-using rebound_engine_t = typename engine_type_::template rebind<st::default_allocator<byte_t>,
-                                                                atomic_ref_for_cpu_class<cpu_class_>::template type,
-                                                                typename row_kit_for_cpu_class<cpu_class_>::type>;
+/** @p queue_type_ rebound to the atomic reference and row kit of @p cpu_class_. */
+template <cpu_class_t cpu_class_, typename queue_type_>
+using rebound_queue_t = typename queue_type_::template rebind<st::default_allocator<byte_t>,
+                                                              atomic_ref_for_cpu_class<cpu_class_>::template type,
+                                                              typename row_kit_for_cpu_class<cpu_class_>::type>;
 
-/** Visits @p engine_type_ rebound to the class @p cpu_class names. */
-template <typename engine_type_, typename visit_type_>
+/** Visits @p queue_type_ rebound to the class @p cpu_class names. */
+template <typename queue_type_, typename visit_type_>
 void visit_rebound(ucall_cpu_class_t cpu_class, visit_type_&& visit) {
     switch (cpu_class) {
     case ucall_cpu_class_intel_haswell_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_haswell_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::intel_haswell_k, queue_type_>>();
     case ucall_cpu_class_intel_skylake_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_skylake_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::intel_skylake_k, queue_type_>>();
     case ucall_cpu_class_intel_icelake_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_icelake_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::intel_icelake_k, queue_type_>>();
     case ucall_cpu_class_intel_alder_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::intel_alder_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::intel_alder_k, queue_type_>>();
     case ucall_cpu_class_aws_g2_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::aws_g2_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::aws_g2_k, queue_type_>>();
     case ucall_cpu_class_aws_g5_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::aws_g5_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::aws_g5_k, queue_type_>>();
     case ucall_cpu_class_apple_m4_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::apple_m4_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::apple_m4_k, queue_type_>>();
     case ucall_cpu_class_alibaba_c930_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::alibaba_c930_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::alibaba_c930_k, queue_type_>>();
     case ucall_cpu_class_ibm_power10_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::ibm_power10_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::ibm_power10_k, queue_type_>>();
     case ucall_cpu_class_monoversioned_k:
-        return visit.template operator()<rebound_engine_t<cpu_class_t::monoversioned_k, engine_type_>>();
-    default: return visit.template operator()<rebound_engine_t<cpu_class_t::serial_k, engine_type_>>();
+        return visit.template operator()<rebound_queue_t<cpu_class_t::monoversioned_k, queue_type_>>();
+    default: return visit.template operator()<rebound_queue_t<cpu_class_t::serial_k, queue_type_>>();
     }
 }
 
-/** Why an engine's cells skip on a host that refuses it. */
-inline constexpr char const* engine_refused_k = "the engine is refused on this machine";
+/** Why a queue's cells skip on a host that refuses it. */
+inline constexpr char const* queue_refused_k = "the queue is refused on this machine";
 
 /**
- *  @brief One cell per admitted CPU class, labelled like <tt>test_engine_cell(posix_k, aws_g2_k)</tt>:
- *  @p cases over @p engine_type_ rebound to that class, or a skip when the host refuses the engine.
+ *  @brief One cell per admitted CPU class, labelled like
+ *      <tt>test_queue_cell(posix_k, aws_g2_k)</tt>: @p cases over @p queue_type_ rebound to that
+ *      class, or a skip when the host refuses the queue.
  *
- *  @p cases is a generic lambda templated on the rebound engine and taking the cell's label, which
+ *  @p cases is a generic lambda templated on the rebound queue and taking the cell's label, which
  *  runs the cell's case and, apart from it, each case that may skip.
  */
-template <typename engine_type_, typename cases_type_>
-void run_engine_cases(ucall_io_backend_t backend, cases_type_&& cases) {
+template <typename queue_type_, typename cases_type_>
+void run_queue_cases(ucall_io_backend_t backend, cases_type_&& cases) {
     test_settings_t const& settings = test_run.settings;
     if (settings.backend != ucall_io_backend_automatic_k && settings.backend != backend) return;
     for (ucall_cpu_class_t const cpu_class : admitted_classes()) {
         if (settings.cpu_class_ceiling != ucall_cpu_class_unknown_k && settings.cpu_class_ceiling != cpu_class)
             continue;
         sz::string_t const label = formatted("{}, {}", backend_constant(backend), cpu_class_constant(cpu_class));
-        if (engine_type_ {}.open(2, 2) != ucall_status_success_k) {
-            run_test_case(called("test_engine_cell", label).c_str(),
-                          [] { return case_result_t::skipped(engine_refused_k); });
+        if (queue_type_ {}.open(2, 2) != ucall_status_success_k) {
+            run_test_case(called("test_queue_cell", label).c_str(),
+                          [] { return case_result_t::skipped(queue_refused_k); });
             continue;
         }
-        visit_rebound<engine_type_>(cpu_class,
-                                    [&]<typename rebound_type_>() { cases.template operator()<rebound_type_>(label); });
+        visit_rebound<queue_type_>(cpu_class,
+                                   [&]<typename rebound_type_>() { cases.template operator()<rebound_type_>(label); });
     }
 }
 
 #pragma endregion Class Sweep
 
-void run_posix_engine_cases();
-void run_linux_epollaio_engine_cases();
-void run_linux_uring612_engine_cases();
-void run_linux_uring618_engine_cases();
-void run_bsd_kqueue_engine_cases();
+void run_posix_queue_cases();
+void run_linux_epollaio_queue_cases();
+void run_linux_uring612_queue_cases();
+void run_linux_uring618_queue_cases();
+void run_bsd_kqueue_queue_cases();
 
 } // namespace unum::ucall::test::io

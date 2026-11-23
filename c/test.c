@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date October 19, 2026
  *  @brief A C caller of the linked library: names, versions, outcomes and Noise keys, then every
- *      documented refusal reachable without a peer, against the engine and the stand-in alike.
+ *      documented refusal reachable without a peer, against the queue and the stand-in alike.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 #include <stdio.h>
@@ -413,6 +413,7 @@ static void test_handle_refusals(void) {
                  .resolved = &resolved);
     expect_(server != NULL && resolved.interfaces_count == 1 && resolved.interfaces[0].event_loops == 1);
     expect_(resolved.interfaces[0].max_pipelined_requests == 1 && resolved.metrics_sample_rate == 1.f);
+    expect_(resolved.interfaces[0].memory_domain == -1);
 
     ucall_event_loop_statistics_t loop_statistics;
     ucall_batch_endpoint_statistics_t batch_statistics;

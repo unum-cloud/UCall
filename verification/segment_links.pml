@@ -82,7 +82,7 @@ proctype loop(byte t) {
     :: adopted == segments -> break
     :: else ->
         // The wake: the loop blocks until a queueing it has not drained, which it reads like the
-        // wake channel's syscall does, newest first.
+        // pollable wakeup's syscall does, newest first.
         (newest_value(queued) > drained);
         read_modify_write(t, queued, order_acquire, count, count);
         drained++;

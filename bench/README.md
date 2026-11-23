@@ -95,7 +95,7 @@ taskset -c 8,10 build_release/ucall_bench_http --url http://127.0.0.1:8545/echo 
     --threads 2 --connections 64 --in-flight 256 --warmup 1s --time-limit 8s --format json
 ```
 
-The gRPC server carries the same bytes in `ucall.bench.Payload.data`:
+The gRPC server sends the same bytes in `ucall.bench.Payload.data`:
 
 ```sh
 PYTHONPATH=build_proto python - <<'PY'
@@ -273,8 +273,8 @@ done
 | Intel i9-13950HX, 8P+16E cores, 1 domain      | `serial`   |          64 |    16 |    361,575 |   2,884 |   3,146 |                    3.4 | 2026-10-27 |
 | Intel i9-13950HX, 8P+16E cores, 1 domain      | `serial`   |          64 |    64 |    369,662 |  11,534 |  12,583 |                    3.4 | 2026-10-27 |
 
-A depth of 4 lets one connection carry 2.3 times the requests of a depth of 1 on both machines, while deeper pipelines mostly add latency.
-The client composes every call a connection may still carry into one send, and dials another connection only while an origin waits for more calls than its open ones have room for.
+A depth of 4 lets one connection serve 2.3 times the requests of a depth of 1 on both machines, while deeper pipelines mostly add latency.
+The client composes every call a connection may still take into one send, and dials another connection only while an origin waits for more calls than its open ones have room for.
 
 ## Noise Cost
 
@@ -464,7 +464,7 @@ For the key-value example, seed a value first and use its URL with `--verb get -
 Adding `--server-key`, the server's public key in the same spelling, switches them to Noise IK.
 
 `--close` requests connection closure after every response, measuring connection churn separately from keep-alive reuse.
-`--pipeline-depth N` lets each connection carry up to `N` calls before their responses arrive, through the client's `max_pipelined_calls`; the default of 1 waits a round trip per call.
+`--pipeline-depth N` lets each connection send up to `N` calls before their responses arrive, through the client's `max_pipelined_calls`; the default of 1 waits a round trip per call.
 Only idempotent calls pipeline: a POST, or a call whose headers close the connection, waits for every call ahead of it.
 The server answers pipelined requests in order at any depth, and its interface's `max_pipelined_requests` decides how many of them it dispatches at once.
 
@@ -472,7 +472,7 @@ The server answers pipelined requests in order at any depth, and its interface's
 
 By default each in-flight slot sends its next call as soon as the previous one completes, a closed loop that slows down with the server and hides queueing delay.
 `--rate N` instead follows one fixed arrival schedule of `N` requests per second, interleaved across workers, so each worker issues at its share of it.
-Latency is then measured from each call's __intended__ send time, so a call delayed by a busy slot or a slow server carries that delay, and coordinated omission stays visible in the tail.
+Latency is then measured from each call's __intended__ send time, so a call delayed by a busy slot or a slow server counts that delay, and coordinated omission stays visible in the tail.
 A worker without an idle slot keeps its due arrivals queued, and sleeps when it has nothing in flight and the next arrival is in the future.
 
 ```sh
@@ -492,7 +492,7 @@ Process CPU: 1.284000 s
 ```
 
 `--stats json` prints the same counters as one JSON object instead, with `event_loops` and `batch_endpoints` arrays in loop and registration order and the process's `cpu_seconds` last.
-A batch endpoint counts its callbacks and the requests they carried, and why each fired: __filled__ on reaching `--batch-max`, __ready__ on reaching `--batch-min` below it, and __expired__ below `--batch-min` once `--batch-latency-us` passed.
+A batch endpoint counts its callbacks and the requests they took, and why each fired: __filled__ on reaching `--batch-max`, __ready__ on reaching `--batch-min` below it, and __expired__ below `--batch-min` once `--batch-latency-us` passed.
 
 The counters cover the server's whole life, warmup included, so divide them by its own `requests` rather than by the driver's measured count:
 
@@ -557,7 +557,7 @@ A 30-second interval covers wrk2's calibration period:
 wrk -t2 -c64 -d30s -R10000 --latency -s bench/http.lua http://127.0.0.1:8545/echo -- 1024
 ```
 
-The application work matches across drivers, while the wire protocols differ: native HTTP and FastAPI carry an HTTP/1.1 body, and gRPC adds protobuf serialization, gRPC framing, and HTTP/2 multiplexing.
+The application work matches across drivers, while the wire protocols differ: native HTTP and FastAPI send an HTTP/1.1 body, and gRPC adds protobuf serialization, gRPC framing, and HTTP/2 multiplexing.
 A gRPC connection multiplexes concurrent streams, while a native HTTP/1.1 connection pipelines up to `--pipeline-depth` calls and receives their responses in order.
 wrk, ghz, both gRPC clients and the native driver without `--rate` are closed-loop drivers; wrk2 and the native driver with `--rate` schedule an offered rate and charge delayed sends to latency.
 Report those load models separately, and inspect saturation and errors before reading their percentiles together.

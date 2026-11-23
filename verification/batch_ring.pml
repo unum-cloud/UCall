@@ -57,7 +57,7 @@
 byte handed[deposits]; // ghost: exchanges the application received
 byte ended[deposits];  // ghost: exchanges the owner ended unanswered
 bit left[deposits];    // ghost: exchanges whose peer left
-byte channel;          // ghost: wake channel writes not yet read
+byte channel;          // ghost: pollable wakeup writes not yet read
 
 /** A sequentially consistent load: every write to the words it reads is sequentially consistent
  *  too, so it reads the newest. */

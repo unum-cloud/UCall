@@ -15,9 +15,9 @@
  *  constant-time discipline that sits badly beside code compiled for maximum throughput.
  *
  *  So each kit lives in one translation unit rather than a dependency, with the field arithmetic
- *  transcribed from a machine-verified implementation - fiat-crypto's generated C carries a proof
- *  of both functional correctness and constant-time behaviour, and is what BoringSSL and NSS ship.
- *  A subtly wrong field multiply still produces a shared secret that looks random.
+ *  transcribed from a machine-verified implementation - fiat-crypto's generated C comes with a
+ *  proof of both functional correctness and constant-time behaviour, and is what BoringSSL and NSS
+ *  ship. A subtly wrong field multiply still produces a shared secret that looks random.
  *
  *  @section x25519_kits Kits
  *

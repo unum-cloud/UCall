@@ -671,7 +671,7 @@ static case_result_t test_short_file_reset(sweep_cell_t const& cell) {
         expect_true(end == read_end_t::failed_k && error == ECONNRESET, "the read ended as {} with errno {}",
                     static_cast<int>(end), error);
         expect_outcome(fixture, outcome, ucall_status_io_k);
-        expect_true(open_descriptor(shrinking), "the borrowed descriptor was closed");
+        expect_true(open_descriptor(shrinking), "the caller-owned descriptor was closed");
         ::close(shrinking);
         fixture.stop();
         return {};
@@ -1063,7 +1063,7 @@ static void test_server_free_off_its_polling_owner(sweep_cell_t const& cell) {
 /** A peer that stops reading after a reply that closes the connection holds it for at most two
  *  linger periods: the close lingers for the peer's FIN and for the kernel to let go of what it
  *  sent without copying, resets once the deadline passes with the reply still unread, and frees the
- *  one connection slot for the next peer. A copying engine closes in order. */
+ *  one connection slot for the next peer. A copying queue closes in order. */
 static case_result_t test_linger_then_reset(sweep_cell_t const& cell) {
 #if UCALL_OS_POSIX_
     fixture_t fixture {cell, {}};
@@ -1078,8 +1078,8 @@ static case_result_t test_linger_then_reset(sweep_cell_t const& cell) {
     std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
     expect_true(::send(silent.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
     await_held_in_background(fixture, 1);
-    // Zero-copy engines take one send far past the peer's window, so its release waits on the peer,
-    // while a copying engine, POSIX or kqueue, takes only what fits its socket buffer.
+    // Zero-copy queues take one send far past the peer's window, so its release waits on the peer,
+    // while a copying queue, POSIX or kqueue, takes only what fits its socket buffer.
     bool const copies = cell.backend == ucall_io_backend_posix_k || cell.backend == ucall_io_backend_bsd_kqueue_k;
     std::string const body(copies ? 12000 : std::size_t {1} << 20, 'l');
     ucall_outcome_t outcome {};

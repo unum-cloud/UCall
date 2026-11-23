@@ -200,12 +200,12 @@ elseif (CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android|FreeBSD)$")
     file(WRITE "${PROJECT_BINARY_DIR}/ucall_shared.map" "{\n  global: ucall_*;\n  local: *;\n};\n")
     target_link_options(ucall_shared PRIVATE "LINKER:--version-script=${PROJECT_BINARY_DIR}/ucall_shared.map")
 endif ()
-# `SOVERSION` carries the major alone, the only break the C ABI admits.
+# `SOVERSION` holds the major alone, the only break the C ABI admits.
 set_target_properties(ucall_shared PROPERTIES VERSION ${PROJECT_VERSION} SOVERSION ${PROJECT_VERSION_MAJOR})
 
 # One compiled class per distinct native kernel bundle, declared over every StringZilla and ForkUnion capability its
 # kits and atomics use, oldest first, `serial` over none. A class exists when each of them is compiled. Its unit
-# compiles at the floor: StringZilla's header-only kernels carry their own target pragmas and ForkUnion spells its
+# compiles at the floor: StringZilla's header-only kernels declare their own target pragmas and ForkUnion spells its
 # instructions in assembly, so no shared inline function is emitted with a class's instruction set. A multiversioned
 # build keeps every class that exists. A monoversioned one keeps none of them, serial included, and compiles the
 # `monoversioned` class instead, over every capability the libraries enabled. Every gate is `UCALL_TARGET_<CLASS>`. A

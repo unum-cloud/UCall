@@ -10,7 +10,7 @@
 
 #include <smashtable/atomic_intrusive_stack.hpp> // `atomic_intrusive_stack`
 
-#include "ucall/io/types.hpp"          // `io_request_t`, `wake_channel_t`
+#include "ucall/io/types.hpp"          // `io_request_t`, `pollable_wakeup_t`
 #include "ucall/network/types.hpp"     // `exchange_stage_t`, `body_stage_t`, `parts_state_t`, `request_part_t`
 #include "ucall/tunnel/types.hpp"      // `secure_tunnel_geometry_t`
 #include "ucall/utilities/sockets.hpp" // `close_native_file`
@@ -19,7 +19,7 @@
 namespace unum::ucall::network {
 
 using io::io_request_t;
-using io::wake_channel_t;
+using io::pollable_wakeup_t;
 using tunnel::secure_tunnel_geometry_t;
 using utilities::allocator_delete;
 using utilities::byte_t;
@@ -61,7 +61,7 @@ struct batch_endpoint : ucall_http_batch_endpoint_handle_t {
     wake_state_t wake_state {wake_state_t::awake_k};
 
     /** What a deposit or a stop notifies to wake a sleeping polling owner. */
-    wake_channel_t wake {};
+    pollable_wakeup_t wake {};
 
     /** Takes each batch of @c collected on the polling owner's thread. */
     ucall_received_http_batch_callback_t callback {};
@@ -165,11 +165,11 @@ struct exchange_release {
     /** Bytes the socket took from sends naming it; at half the send buffer, it is submitted. */
     std::size_t held_bytes {};
 
-    /** Whether sends named it, and whether it is with the engine. */
+    /** Whether sends named it, and whether it is with the queue. */
     release_state_t state {};
 };
 
-/** A link of an event loop's replied queue, naming the exchange it carries, or none for the
+/** A link of an event loop's replied queue, naming the exchange it holds, or none for the
  *  loop's own stub. */
 template <typename network_type_>
 struct replied_link {

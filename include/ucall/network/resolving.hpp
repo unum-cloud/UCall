@@ -6,7 +6,7 @@
  *      Eyeballs order of the addresses they answer.
  *
  *  A lookup asks AAAA and A for each search name of its origin, each question on a connected UDP
- *  socket the client's engine drives, one operation at a time: the query's send, then its
+ *  socket the client's queue drives, one operation at a time: the query's send, then its
  *  answer's receive, or over TCP a connect, the send and as many receives as the answer takes.
  *  Answers and refusals are cached on the origin until their TTL passes.
  */
@@ -29,7 +29,7 @@ enum class resolution_t : std::uint8_t { unresolved_k, resolving_k, resolved_k, 
 /** Whether an origin waits on the client's free list or serves calls on its live one. */
 enum class origin_list_t : std::uint8_t { free_k, live_k };
 
-/** Addresses of each family an origin keeps: answers carry more, and the first few fail over. */
+/** Addresses of each family an origin keeps: answers list more, and the first few fail over. */
 inline constexpr std::size_t origin_addresses_k = 8;
 
 /** One origin's lookup: its two questions and the search name they ask; cold, one a connection. */
@@ -50,7 +50,7 @@ struct client_lookup {
     client_lookup(client_lookup&&) = delete;
     client_lookup& operator=(client_lookup&&) = delete;
 
-    /** Unasked, waiting for its UDP answer, carried over TCP after a truncated one, or done. */
+    /** Unasked, waiting for its UDP answer, retried over TCP after a truncated one, or done. */
     enum class question_stage_t : std::uint8_t { idle_k, asking_k, streaming_k, answered_k };
     struct question_t {
 
@@ -334,7 +334,7 @@ struct resolving {
         auto const length = static_cast<utilities::socket_length_t>(server.ss_family == AF_INET6 ? sizeof(sockaddr_in6)
                                                                                                  : sizeof(sockaddr_in));
         descriptor_t const opened = utilities::datagram_open(reinterpret_cast<sockaddr const*>(&server), length);
-        question.descriptor = opened < 0 ? opened : client.engine->import_socket(opened);
+        question.descriptor = opened < 0 ? opened : client.queue->import_socket(opened);
         if (question.descriptor < 0) return retry(client, lookup, question);
         byte_t id[2] {};
         // An ID nobody can guess is what tells the nameserver's answer from a forged one.
@@ -365,14 +365,14 @@ struct resolving {
         submit(client, question, question.send_request);
     }
 
-    /** Carries @p question over TCP to the same nameserver, once no other question streams. */
+    /** Sends @p question over TCP to the same nameserver, once no other question streams. */
     static void stream(client_t& client, client_lookup_t& lookup, question_t& question) noexcept {
         question.stage = question_stage_t::streaming_k;
         question_t const& other = &question == &lookup.questions[0] ? lookup.questions[1] : lookup.questions[0];
         if (other.stage == question_stage_t::streaming_k && other.descriptor >= 0) return;
         // The connect request names the address it dials, so it reads the client's own copy.
         sockaddr_storage& server = client.resolver.nameservers[question.nameserver];
-        question.descriptor = client.engine->open_socket(server.ss_family);
+        question.descriptor = client.queue->open_socket(server.ss_family);
         if (question.descriptor < 0) return retry(client, lookup, question);
         lookup.stream.clear();
         std::uint64_t const deadline = deadline_after(std::size_t {options(client).timeout_seconds} * 1'000'000);
@@ -392,12 +392,12 @@ struct resolving {
     }
 
     static void submit(client_t& client, question_t& question, io_request_t& request) noexcept {
-        client.engine->submit(request);
+        client.queue->submit(request);
         question.operation = operation_state_t::submitted_k;
     }
 
     static void close(client_t& client, question_t& question) noexcept {
-        if (question.descriptor >= 0) client.engine->close_socket(std::exchange(question.descriptor, -1));
+        if (question.descriptor >= 0) client.queue->close_socket(std::exchange(question.descriptor, -1));
     }
 
     /** Asks @p question of the next nameserver, rotating through them for @c attempts rounds,

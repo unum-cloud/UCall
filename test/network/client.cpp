@@ -7,7 +7,7 @@
 #undef NDEBUG // ! A test's oracle must stay live in every build
 #include <network.hpp>
 
-#include "variants.hpp" // `io_engines_t`
+#include "variants.hpp" // `io_queues_t`
 
 namespace unum::ucall::test::network {
 
@@ -201,7 +201,7 @@ static void test_lengthless_head_keeps_connection(sweep_cell_t const& cell, spli
     plan[1].expected = "/get";
     exchange_all(fixture, plan);
     server.stop();
-    expect_true(server.requests_per_connection == (std::vector<std::size_t> {2}), "{} connections carried the calls",
+    expect_true(server.requests_per_connection == (std::vector<std::size_t> {2}), "{} connections sent the calls",
                 server.requests_per_connection.size());
     fixture.stop();
 }
@@ -1052,7 +1052,7 @@ static void test_streamed_barrier(sweep_cell_t const& cell, split_mix_generator_
     }
     check_answer(fixture.wait());
     server.stop();
-    expect_true(server.requests_per_connection == (std::vector<std::size_t> {2}), "{} connections carried the calls",
+    expect_true(server.requests_per_connection == (std::vector<std::size_t> {2}), "{} connections sent the calls",
                 server.requests_per_connection.size());
     fixture.stop();
 }
@@ -1112,7 +1112,7 @@ static void test_streamed_free_mid_body(sweep_cell_t const& cell, split_mix_gene
         ucall_client_response_free(second.response);
     }
     server.stop();
-    expect_true(server.requests_per_connection == (std::vector<std::size_t> {2, 1}), "{} connections carried the calls",
+    expect_true(server.requests_per_connection == (std::vector<std::size_t> {2, 1}), "{} connections sent the calls",
                 server.requests_per_connection.size());
     fixture.stop();
 }

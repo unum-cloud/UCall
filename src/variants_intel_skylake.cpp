@@ -2,7 +2,7 @@
  *  @file src/variants_intel_skylake.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief Intel skylake network variants for every enabled native I/O engine.
+ *  @brief Intel skylake network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

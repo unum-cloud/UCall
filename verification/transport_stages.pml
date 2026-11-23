@@ -38,8 +38,8 @@
 #endif
 
 byte stage = open;
-bit receiving = 1;    // the receive is with the engine
-bit transmitting;     // a send, the FIN or the close record is with the engine
+bit receiving = 1;    // the receive is with the queue
+bit transmitting;     // a send, the FIN or the close record is with the queue
 bit cancelled;        // what was in flight was asked to cancel
 byte releases;        // zero-copy releases the kernel still owes
 bit reset;            // the close purges what the kernel held
@@ -68,7 +68,7 @@ active proctype connection() {
     do
     :: stage == idle -> break
 
-    /* The engine answers what it holds. */
+    /* The queue answers what it holds. */
     :: receiving && stage != closing_socket ->
         receiving = 0;
         if

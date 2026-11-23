@@ -389,7 +389,7 @@ struct client : ucall_client_handle_t {
     using network_t = network_type_;
     using allocator_t = typename network_t::allocator_t;
     using row_kit_t = typename network_t::row_kit_t;
-    using engine_t = typename network_t::engine_t;
+    using queue_t = typename network_t::queue_t;
     using crypto_t = typename network_t::crypto_t;
     using http_t = typename network_t::http_t;
     using http_message_t = typename network_t::http_message_t;
@@ -419,7 +419,7 @@ struct client : ucall_client_handle_t {
     allocator_t allocator;
 
     explicit client(allocator_t const& allocator) noexcept
-        : allocator(allocator), owned_engine(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
+        : allocator(allocator), owned_queue(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
           completed(rebound_allocator<ucall_completed_call_t> {allocator}),
           connections(rebound_allocator<owner<client_connection_t>> {allocator}),
           hosts(rebound_allocator<char> {allocator}) {}
@@ -428,11 +428,11 @@ struct client : ucall_client_handle_t {
     client(client&&) = delete;
     client& operator=(client&&) = delete;
 
-    /** The engine it polls when it runs on its own; never opened for a bound client. */
-    engine_t owned_engine {};
+    /** The queue it polls when it runs on its own; never opened for a bound client. */
+    queue_t owned_queue {};
 
-    /** Its own engine, or the one of the server event loop it is bound to. */
-    engine_t* engine {&owned_engine};
+    /** Its own queue, or the one of the server event loop it is bound to. */
+    queue_t* queue {&owned_queue};
 
     /** How it is driven; once bound, only its free and that loop write it. */
     client_binding_t binding {};
@@ -440,13 +440,13 @@ struct client : ucall_client_handle_t {
     /** Links its loop's bound clients. */
     client_t* next_bound {};
 
-    /** Where a poll of @c owned_engine lands, one per engine slot. */
+    /** Where a poll of @c owned_queue lands, one per queue slot. */
     vector<io_completion_t> completions {};
 
     /** Finished calls waiting for the caller to take them, room for every admitted call. */
     completed_ring_t completed {};
 
-    /** Success until its engine fails or its loop retires it, then what every call ends with. */
+    /** Success until its queue fails or its loop retires it, then what every call ends with. */
     ucall_status_t failure {ucall_status_success_k};
 
     /** The options with defaults filled, as @c client_init reports them. */
@@ -512,16 +512,16 @@ struct client : ucall_client_handle_t {
     /** Connections whose @c streaming is set, which each round checks for a freed response. */
     std::size_t streaming_connections {};
     ~client() noexcept {
-        owned_engine.stop();
+        owned_queue.stop();
         crypto_t::secure_zero(private_key);
         for (auto& connection : connections)
             if (connection) {
                 auto& transport = connection->transport;
-                if (transport.descriptor >= 0) engine->close_socket(transport.descriptor);
+                if (transport.descriptor >= 0) queue->close_socket(transport.descriptor);
             }
         for (auto& lookup : lookups)
             for (auto& question : lookup.questions)
-                if (question.descriptor >= 0) engine->close_socket(question.descriptor);
+                if (question.descriptor >= 0) queue->close_socket(question.descriptor);
         for (std::size_t i = 0; i != completed.size(); ++i) ucall_client_response_free(completed[i].response);
         // After the frees above, so a body freed there returns here.
         for (auto& connection : connections) {
@@ -762,7 +762,7 @@ struct client : ucall_client_handle_t {
         client_origin_t const& origin = *connection.origin;
         while (exchange.address_index < resolving_t::addresses_count(origin)) {
             auto const target_length = resolving_t::target(origin, exchange.address_index, connection.target);
-            auto descriptor = client.engine->open_socket(connection.target.ss_family);
+            auto descriptor = client.queue->open_socket(connection.target.ss_family);
             if (descriptor < 0) {
                 ++exchange.address_index;
                 continue;
@@ -773,11 +773,11 @@ struct client : ucall_client_handle_t {
                                                       options.noise_peer_key);
             auto result = transport.configure(config, &connection);
             if (result != ucall_status_success_k) {
-                client.engine->close_socket(descriptor);
+                client.queue->close_socket(descriptor);
                 return result;
             }
             transport.descriptor = descriptor;
-            transport.receive_memory = client.engine->receive_memory();
+            transport.receive_memory = client.queue->receive_memory();
             connection.answered_exchanges = 0;
             transport.output_offset = 0;
             transport.sending = nullptr;
@@ -959,7 +959,7 @@ struct client : ucall_client_handle_t {
                (connection.transport.transmitting == transmit_state_t::sending_k ? 1u : 0u);
     }
 
-    /** Whether @p connection carries no call, so a call of any origin may take it,
+    /** Whether @p connection holds no call, so a call of any origin may take it,
      *  though an open connection keeps a receive posted meanwhile. */
     static bool connection_vacant(client_connection_t const& connection) noexcept {
         auto stage = connection.transport.stage;
@@ -968,7 +968,7 @@ struct client : ucall_client_handle_t {
                 stage == transport_stage_t::closed_k);
     }
 
-    /** Calls @p connection could take on top of those it carries, by @c accepts_another_exchange,
+    /** Calls @p connection could take on top of those it holds, by @c accepts_another_exchange,
      *  counting a connection still dialing at its full depth. */
     static std::size_t connection_room(client_t const& client, client_connection_t const& connection) noexcept {
         auto& transport = connection.transport;
@@ -1087,7 +1087,7 @@ struct client : ucall_client_handle_t {
         return result;
     }
 
-    /** Dials @p connection, which carries no call, for the call of @p origin due first. */
+    /** Dials @p connection, which holds no call, for the call of @p origin due first. */
     static void dial_call(client_t& client, client_connection_t& connection, client_origin_t& origin) noexcept {
         assign_origin(client, connection, origin);
         client_exchange_t& exchange = unqueue_call(origin);
@@ -1305,7 +1305,7 @@ struct client : ucall_client_handle_t {
     }
 
     /** Composes into @p connection's requests every waiting call of its origin that
-     *  @c accepts_another_exchange lets it carry, rule C2 of @c call_open, and starts sending them
+     *  @c accepts_another_exchange lets it hold, rule C2 of @c call_open, and starts sending them
      *  once any call joined. */
     static void compose_requests(client_t& client, client_connection_t& connection) noexcept {
         auto& transport = connection.transport;
@@ -1329,7 +1329,7 @@ struct client : ucall_client_handle_t {
         transport.output_offset = 0;
     }
 
-    /** Steps an open client connection, answering its next engine request or null, by these rules
+    /** Steps an open client connection, answering its next queue request or null, by these rules
      *  in order:
      *  C1 responses: while reading and a sent call awaits, each whole response answers the oldest
      *     call, a redirect queueing it again as a fresh call; a response without keep-alive, or to
@@ -1341,8 +1341,8 @@ struct client : ucall_client_handle_t {
      *     its response closes the connection, ending every call behind it with
      *     @c ucall_status_connection_closed_k, never sent again, and a close cuts it short.
      *  C2 requests: while reading, an idle transmit side composes every call of the origin's queue
-     *     that @c accepts_another_exchange lets this connection carry into @c output, appending
-     *     each to the FIFO, so one send takes them all.
+     *     that @c accepts_another_exchange lets this connection take into @c output, appending each
+     *     to the FIFO, so one send takes them all.
      *  C3 emit: while reading, the next chunk of those requests while its send is idle, else a
      *     receive, posted even with no call so a peer close is seen before reuse.
      *  C4 done: a peer close, or bytes no call asked for, close the connection, losing any call
@@ -1363,9 +1363,9 @@ struct client : ucall_client_handle_t {
                (connection.streaming || awaits_response(connection))) {
             if (connection.streaming) {
                 if (stream_body(client, connection) == http_parse_t::complete_k) continue;
-                // An engine prefetching into a shared ring parks what an unpulled body holds there.
+                // A queue prefetching into a shared ring parks what an unpulled body holds there.
                 if (connection.streaming && !connection.streaming->body_chunk.empty())
-                    client.engine->receive_pause(transport.descriptor);
+                    client.queue->receive_pause(transport.descriptor);
                 break;
             }
             auto role = connection.oldest_exchange->arguments.verb == ucall_verb_head_k ? http_role_t::head_response_k
@@ -1494,7 +1494,7 @@ struct client : ucall_client_handle_t {
             auto& exchange = pop_call(connection);
             ucall_status_t outcome = oldest ? status : ucall_status_connection_closed_k;
             if (status == ucall_status_connection_failed_k) {
-                // A connection carries no second call before it opens, so this request never left.
+                // A connection holds no second call before it opens, so this request never left.
                 std::uint32_t const addresses = resolving_t::addresses_count(*exchange.origin);
                 if (++exchange.address_index >= addresses && exchange.attempts++ < retry_budget(exchange))
                     exchange.address_index = 0;
@@ -1532,15 +1532,15 @@ struct client : ucall_client_handle_t {
                 next = call_open(client, connection);
             }
             if (!next) break;
-            client.engine->submit(*next);
+            client.queue->submit(*next);
             transport.submitted(*next);
         }
         // The close waits until the other direction's operation completes or is cancelled.
         if (transport.stage == transport_stage_t::closing_k) {
             if (transport.receive_operation == operation_state_t::submitted_k)
-                client.engine->cancel(transport.receive_request);
+                client.queue->cancel(transport.receive_request);
             if (transport.transmit_operation == operation_state_t::submitted_k)
-                client.engine->cancel(transport.transmit_request);
+                client.queue->cancel(transport.transmit_request);
         }
         if (connection.streaming && transport.stage != transport_stage_t::open_k)
             end_body(client, connection, ucall_status_connection_closed_k);
@@ -1554,13 +1554,13 @@ struct client : ucall_client_handle_t {
         if (transport.stage != transport_stage_t::connecting_k) connection.race_deadline = 0;
         list_connection(client, connection);
     }
-    static void advance_completion(engine_t& engine, io_completion_t const& completion) noexcept {
+    static void advance_completion(queue_t& queue, io_completion_t const& completion) noexcept {
         auto& connection = *static_cast<client_connection_t*>(completion.request->context);
         transport_t& transport = connection.transport;
         bool const connected = transport.stage == transport_stage_t::connecting_k && completion.result >= 0;
         transport.complete(completion, connection.client->config.max_response_bytes);
         if (connected && connection.oldest_exchange) transport.deadline = connection.oldest_exchange->deadline;
-        engine.release(completion);
+        queue.release(completion);
     }
     static void step_ready_connections(client_t& client, std::uint64_t now) noexcept {
         for (client_connection_t* connection = std::exchange(client.ready, nullptr); connection;) {
@@ -1643,16 +1643,16 @@ struct client : ucall_client_handle_t {
         return !deadline || (earliest && earliest < deadline) ? earliest : deadline;
     }
 
-    /** Engine slots a client needs: each connection an operation per direction, and each lookup one
+    /** Queue slots a client needs: each connection an operation per direction, and each lookup one
      *  per question. */
-    static std::size_t engine_slots(ucall_client_options_t const& config) noexcept {
+    static std::size_t queue_slots(ucall_client_options_t const& config) noexcept {
         return 4 * config.max_concurrent_connections;
     }
 
-    /** Makes a client over its own engine, or over @p bound, a server event loop's engine that loop
+    /** Makes a client over its own queue, or over @p bound, a server event loop's queue that loop
      *  advances it with. */
     static void client_init(ucall_client_init_t* arguments, allocator_t const& allocator = {},
-                            engine_t* bound = nullptr) noexcept {
+                            queue_t* bound = nullptr) noexcept {
         if (!arguments) return;
         if (arguments->client) *arguments->client = nullptr;
         if (!arguments->client || !arguments->outcome || !arguments->options ||
@@ -1683,7 +1683,7 @@ struct client : ucall_client_handle_t {
         }
         if (!config.max_pipelined_calls) config.max_pipelined_calls = 1;
         if (!config.max_concurrent_calls) {
-            // Every connection may carry its full pipeline at once.
+            // Every connection may hold its full pipeline at once.
             if (config.max_concurrent_connections >
                 (std::numeric_limits<std::size_t>::max)() / config.max_pipelined_calls) {
                 publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
@@ -1699,7 +1699,7 @@ struct client : ucall_client_handle_t {
             publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
             return;
         }
-        auto slots = engine_slots(config);
+        auto slots = queue_slots(config);
         if (config.noise_private_key) {
             std::memcpy(client->private_key, *config.noise_private_key, sizeof(client->private_key));
             config.noise_private_key = &client->private_key;
@@ -1762,18 +1762,18 @@ struct client : ucall_client_handle_t {
         }
         client->origin_index = std::move(*origin_index);
         if (bound) {
-            client->engine = bound;
+            client->queue = bound;
             client->binding = client_binding_t::bound_k;
         }
-        else if (auto status = client->owned_engine.open(config.backend, slots, slots,
-                                                         io::io_issuer_scope_t::any_thread_k);
+        else if (auto status = client->owned_queue.open(config.backend, slots, slots,
+                                                        io::io_issuer_scope_t::any_thread_k);
                  status != ucall_status_success_k) {
-            // An engine refused by a host setting names the setting to raise.
-            char const* refusal = client->owned_engine.refusal();
+            // A queue refused by a host setting names the setting to raise.
+            char const* refusal = client->owned_queue.refusal();
             publish<atomic_ref>(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
             return;
         }
-        else config.backend = client->owned_engine.backend();
+        else config.backend = client->owned_queue.backend();
         for (auto& connection : client->connections) {
             connection = allocate_unique<client_connection_t>(allocator, allocator);
             if (!connection) {
@@ -1810,7 +1810,7 @@ struct client : ucall_client_handle_t {
         }
     }
 
-    /** Whether a retiring client left nothing in its loop's engine, so the loop may delete it. */
+    /** Whether a retiring client left nothing in its loop's queue, so the loop may delete it. */
     static bool retired(client_t const& client) noexcept {
         for (auto const& connection : client.connections) {
             auto const stage = connection->transport.stage;
@@ -1841,15 +1841,15 @@ struct client : ucall_client_handle_t {
             if (exchange.stage != client_exchange_stage_t::idle_k) finish_exchange(client, exchange, client.failure);
     }
 
-    /** Records one completion of @p client's, from its own engine or its bound loop's. */
+    /** Records one completion of @p client's, from its own queue or its bound loop's. */
     static void step_completion(client_t& client, io_completion_t const& completion) noexcept {
         if (resolving_t::owns(client, completion.request)) {
             resolving_t::complete(client, completion);
-            client.engine->release(completion);
+            client.queue->release(completion);
             return;
         }
         auto& connection = *static_cast<client_connection_t*>(completion.request->context);
-        advance_completion(*client.engine, completion);
+        advance_completion(*client.queue, completion);
         mark_ready(client, connection);
     }
     static void client_call(ucall_client_call_t* arguments) noexcept {
@@ -1923,10 +1923,10 @@ struct client : ucall_client_handle_t {
                 auto wait = arguments->timeout_microseconds && client.admitted && client.completed.empty()
                                 ? io_wait_t::blocking_k
                                 : io_wait_t::nonblocking_k;
-                int count = client.engine->poll(span<io_completion_t> {client.completions}, wait, round_deadline);
+                int count = client.queue->poll(span<io_completion_t> {client.completions}, wait, round_deadline);
                 if (count < 0) {
                     client.failure = ucall_status_io_k;
-                    client.owned_engine.stop();
+                    client.owned_queue.stop();
                     abandon_calls(client);
                     break;
                 }

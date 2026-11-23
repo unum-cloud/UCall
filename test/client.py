@@ -136,7 +136,7 @@ def test_streamed_bodies_download_past_the_response_cap(backend, loopback, servi
         response = client.get(f"{base}/large", body_delivery=ucall.BodyDelivery.STREAMED)
         assert asyncio.run(drain(response)) == payload
 
-        # A bodiless response is pulled too, before its connection carries the next call.
+        # A bodiless response is pulled too, before its connection takes the next call.
         response = client.get(f"{base}/empty", body_delivery=ucall.BodyDelivery.STREAMED)
         assert list(response.body_chunks()) == []
         response = client.get(f"{base}/empty")

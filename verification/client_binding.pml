@@ -6,7 +6,7 @@
  *      @c retire in @c include/ucall/network/client.hpp against @c bound_progress in
  *      @c include/ucall/network/server.hpp.
  *
- *  A bound client's connections live in its loop's engine, so only the loop may touch them. Its
+ *  A bound client's connections live in its loop's queue, so only the loop may touch them. Its
  *  owner frees it from any thread with one release store of the binding word. The loop steps the
  *  client every round, acquires the word, fails the connections of a freed client itself, and
  *  deletes the client once its last connection closed.

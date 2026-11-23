@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/io/linux_epollaio_engine.hpp
+ *  @file include/ucall/io/linux_epollaio_queue.hpp
  *  @author Ash Vardanian
  *  @date January 13, 2025
  *  @brief epoll readiness for sockets and Linux AIO for files, completing in one epoll set.
@@ -138,7 +138,7 @@ struct epoll_readiness {
     /** Where @c wait collects the kernel's events, one per record. */
     st::vector<epoll_event, rebound_allocator<epoll_event>> events {};
 
-    /** One watch per registered descriptor, whose handle each of its events carries. */
+    /** One watch per registered descriptor, whose handle each of its events holds. */
     watches_t watches {};
 
     /** The watch of each registered descriptor. */
@@ -244,7 +244,7 @@ struct epoll_readiness {
     }
 };
 
-/** AIO events one engine keeps in flight; <tt>fs.aio-max-nr</tt>, 65536 by default, bounds the sum
+/** AIO events one queue keeps in flight; <tt>fs.aio-max-nr</tt>, 65536 by default, bounds the sum
  *  on a host, so a 64-loop server reserves 4096 of them. */
 inline constexpr std::uint32_t linux_aio_depth_k = 64;
 
@@ -345,10 +345,10 @@ struct linux_aio_t {
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
-struct linux_epollaio_engine {
+struct linux_epollaio_queue {
     using allocator_t = allocator_type_;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = linux_epollaio_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
+    using rebind = linux_epollaio_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
@@ -358,7 +358,7 @@ struct linux_epollaio_engine {
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     struct operation_t {
 
-        /** The request the record carries, or null while it is free. */
+        /** The request the record holds, or null while it is free. */
         io_request_t* request {};
 
         /** The next record on whichever free, ready, landed or waiting list holds this one. */
@@ -433,17 +433,17 @@ struct linux_epollaio_engine {
     /** Why @c open answered @c ucall_status_unsupported_k, naming the setting to raise. */
     char const* refusal {};
 
-    /** The counters the engine advances for its polling owner. */
+    /** The counters the queue advances for its polling owner. */
     io_statistics_t statistics {};
 
-    explicit linux_epollaio_engine(allocator_t const& allocator = {}) noexcept
+    explicit linux_epollaio_queue(allocator_t const& allocator = {}) noexcept
         : operations(rebound_allocator<operation_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
           runs(rebound_allocator<zero_copy_run_t> {allocator}), readiness(allocator) {}
-    linux_epollaio_engine(linux_epollaio_engine const&) = delete;
-    linux_epollaio_engine& operator=(linux_epollaio_engine const&) = delete;
-    linux_epollaio_engine(linux_epollaio_engine&&) = delete;
-    linux_epollaio_engine& operator=(linux_epollaio_engine&&) = delete;
-    ~linux_epollaio_engine() noexcept { stop(); }
+    linux_epollaio_queue(linux_epollaio_queue const&) = delete;
+    linux_epollaio_queue& operator=(linux_epollaio_queue const&) = delete;
+    linux_epollaio_queue(linux_epollaio_queue&&) = delete;
+    linux_epollaio_queue& operator=(linux_epollaio_queue&&) = delete;
+    ~linux_epollaio_queue() noexcept { stop(); }
 
     descriptor_t open_socket(int family) noexcept { return socket_open(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return descriptor; }
@@ -797,7 +797,7 @@ struct linux_epollaio_engine {
         }
     }
 };
-using linux_epollaio_engine_t = linux_epollaio_engine<>;
+using linux_epollaio_queue_t = linux_epollaio_queue<>;
 
 } // namespace unum::ucall::io
 

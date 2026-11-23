@@ -116,7 +116,7 @@ inline constexpr std::size_t linger_microseconds_k = 1'000'000;
 /** Linux's default receive buffer, @c tcp_rmem, bounds what a peer has in flight at our FIN. */
 inline constexpr std::size_t linger_bytes_k = 128 * 1024;
 
-/** Whether a direction's one engine request is in flight; only submission and completion
+/** Whether a direction's one queue request is in flight; only submission and completion
  *  write it. */
 enum class operation_state_t : std::uint8_t { idle_k, submitted_k };
 
@@ -319,7 +319,8 @@ struct file_window_t {
     /** Read ahead of the range, below the alignment. */
     std::uint16_t skipped {};
 
-    /** Where the window is in its borrow, from the read until the kernel let go of its sends. */
+    /** Where the window is in its use by a stream, from the read until the kernel let go of its
+     *  sends. */
     file_window_stage_t stage {};
 };
 static_assert(sizeof(file_window_t) == 20);
@@ -327,12 +328,12 @@ static_assert(sizeof(file_window_t) == 20);
 /** Whether the peer still writes, or sent its FIN or Noise close record. */
 enum class peer_stream_t : std::uint8_t { writing_k, closed_k };
 
-/** Whether a client polls its own engine, is advanced by the server event loop it is bound to,
+/** Whether a client polls its own queue, is advanced by the server event loop it is bound to,
  *  was freed while bound, by any thread, or waits for that loop to end the connections it then
  *  failed; only the free and the loop write it once bound. */
 enum class client_binding_t : std::uint8_t { owned_k, bound_k, freed_k, retiring_k };
 
-/** Whether an event loop, or a batch endpoint's polling owner, runs, sleeps on its wake channel,
+/** Whether an event loop, or a batch endpoint's polling owner, runs, sleeps on its pollable wakeup,
  *  or was notified since it last did either; only waking a sleeper writes the channel. */
 enum class wake_state_t : std::uint32_t { awake_k, sleeping_k, notified_k };
 
@@ -356,13 +357,13 @@ struct order_link_t {
     std::uint32_t previous {absent_k};
 };
 
-/** The event loop's own counters beside its engine's, on lines no other thread writes. */
+/** The event loop's own counters beside its queue's, on lines no other thread writes. */
 struct alignas(fu::default_alignment_k) event_loop_statistics_t {
 
-    /** Engine polls the loop issued, each taking zero or more completions. */
+    /** Queue polls the loop issued, each taking zero or more completions. */
     std::uint64_t polls {};
 
-    /** Engine polls that took no completion. */
+    /** Queue polls that took no completion. */
     std::uint64_t empty_polls {};
 
     /** Peers admitted to one of the loop's idle connections. */
@@ -371,16 +372,16 @@ struct alignas(fu::default_alignment_k) event_loop_statistics_t {
     /** Requests handed to an exchange, whether an endpoint or a refusal answers them. */
     std::uint64_t requests {};
 
-    /** Bytes the engine received for the loop's sockets and bound clients, lingers included. */
+    /** Bytes the queue received for the loop's sockets and bound clients, lingers included. */
     std::uint64_t bytes_received {};
 
-    /** Bytes the engine sent from the loop's connections and bound clients. */
+    /** Bytes the queue sent from the loop's connections and bound clients. */
     std::uint64_t bytes_sent {};
 
-    /** Bytes the loop copied: engine-held receives, handshakes, requests, reply bodies. */
+    /** Bytes the loop copied: queue-held receives, handshakes, requests, reply bodies. */
     std::uint64_t bytes_copied {};
 
-    /** Bytes the engine read from files into the loop's file windows. */
+    /** Bytes the queue read from files into the loop's file windows. */
     std::uint64_t bytes_read {};
 
     /** File reads submitted while an earlier window of the stream waited to send or sent. */
@@ -398,7 +399,7 @@ struct alignas(fu::default_alignment_k) event_loop_statistics_t {
     /** Peers refused while the process was out of descriptors, once their refusal is done. */
     std::uint64_t shed_connections {};
 
-    /** Windows added unpinned, as the engine pins none or declined to pin their run. */
+    /** Windows added unpinned, as the queue pins none or declined to pin their run. */
     std::uint64_t windows_unpinned {};
 };
 

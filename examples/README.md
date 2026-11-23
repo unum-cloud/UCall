@@ -15,7 +15,7 @@ Every example also answers `GET /health` with `ready`.
 Each one is a single `server.cpp` over the flag parsing, polling loops, error replies and shutdown of `tools/server.hpp`, which the native benchmark server shares.
 [`hello.c`](hello.c), the C quickstart, is smaller than all of them: one `GET /hello/{name}` route on a free loopback port, called by a client bound to the server's event loop on one thread, taking no flags.
 
-Each batch callback receives a borrowed array of request handles and its count, and views them once as a `std::span`; the echo, key-value, and ledger callbacks reuse the individual handler for each request.
+Each batch callback receives an array of request handles, valid only during the callback, and its count, and views them once as a `std::span`; the echo, key-value, and ledger callbacks reuse the individual handler for each request.
 These routes coalesce requests from every polling loop under the `--batch-min`, `--batch-max`, and `--batch-latency-us` budgets.
 Every batch endpoint gets a pool thread of its own that polls it through the handle its registration returned, so batch callbacks never run on a polling loop and a slow endpoint never holds another's batches.
 The inference example's `/infer/batch` scores a whole batch with one NumKong packed GEMM across a ForkUnion pool, and `/slow/batch` sleeps in its callback to test that isolation.

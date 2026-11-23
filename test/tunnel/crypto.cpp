@@ -140,7 +140,7 @@ static x25519_backend_t const x25519_backends_k[] = {
 /** The backend every other one is checked against: the one always built and always runnable. */
 static x25519_backend_t const& x25519_reference_k = x25519_backends_k[0];
 
-/** Whether this build carries @p backend and this machine can execute it. */
+/** Whether this build includes @p backend and this machine can execute it. */
 [[nodiscard]] static bool runnable_here(x25519_backend_t const& backend) noexcept {
     sz_capability_t detected = sz_cap_serial_k;
     if (sz_capabilities_detected_cpu(&detected) != sz_success_k) detected = sz_cap_serial_k;

@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/io/windows_iocp_engine.hpp
+ *  @file include/ucall/io/windows_iocp_queue.hpp
  *  @author Ash Vardanian
  *  @date January 13, 2025
  *  @brief Overlapped sockets and files completing through an I/O completion port.
@@ -66,14 +66,14 @@ enum class windows_operation_stage_t : std::uint8_t {
 /** Bytes @c AcceptEx writes per address, which it asks to exceed the largest by 16. */
 inline constexpr DWORD windows_accept_address_bytes_k = sizeof(sockaddr_storage) + 16;
 
-/** The completion key every handle an engine binds to its port carries; anything else posted there
- *  is a notification another component of the engine armed. */
+/** The completion key every handle a queue binds to its port holds; anything else posted there
+ *  is a notification another component of the queue armed. */
 inline constexpr ULONG_PTR windows_overlapped_key_k = 0;
 
 /** The completion key the port's own timer posts with, apart from Registered I/O's notification. */
 inline constexpr ULONG_PTR windows_timer_key_k = 2;
 
-/** The Winsock extensions accepts and connects go through, loaded once per engine. */
+/** The Winsock extensions accepts and connects go through, loaded once per queue. */
 struct windows_extensions_t {
 
     /** @c AcceptEx, which arms one accept into a socket created beforehand. */
@@ -152,14 +152,14 @@ struct windows_scatter_pages {
     }
 };
 
-/** One overlapped operation: the request it carries, the socket or file it was issued on, and an
+/** One overlapped operation: the request it holds, the socket or file it was issued on, and an
  *  accept's socket and the addresses @c AcceptEx writes. */
 struct windows_operation_t {
 
     /** What the kernel tracks the operation by, first so a packet's pointer names the record. */
     OVERLAPPED overlapped {};
 
-    /** The request the record carries, or null while it is free; an accept's records share one. */
+    /** The request the record holds, or null while it is free; an accept's records share one. */
     io_request_t* request {};
 
     /** The socket or file the operation was issued on; an accept's records name the listener. */
@@ -222,7 +222,7 @@ struct windows_overlapped {
         if (port) CloseHandle(port);
     }
 
-    /** The completion port every handle of the engine is bound to. */
+    /** The completion port every handle of the queue is bound to. */
     HANDLE port {};
 
     /** The high-resolution timer a blocking poll sets for its nearest deadline. */
@@ -725,20 +725,20 @@ struct windows_overlapped {
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
-struct windows_iocp_engine {
+struct windows_iocp_queue {
     using allocator_t = allocator_type_;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = windows_iocp_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
+    using rebind = windows_iocp_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_windows_iocp_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
 
-    explicit windows_iocp_engine(allocator_t const& allocator = {}) noexcept
+    explicit windows_iocp_queue(allocator_t const& allocator = {}) noexcept
         : overlapped(allocator), scatter(allocator) {}
-    windows_iocp_engine(windows_iocp_engine const&) = delete;
-    windows_iocp_engine& operator=(windows_iocp_engine const&) = delete;
-    windows_iocp_engine(windows_iocp_engine&&) = delete;
-    windows_iocp_engine& operator=(windows_iocp_engine&&) = delete;
-    ~windows_iocp_engine() noexcept { stop(); }
+    windows_iocp_queue(windows_iocp_queue const&) = delete;
+    windows_iocp_queue& operator=(windows_iocp_queue const&) = delete;
+    windows_iocp_queue(windows_iocp_queue&&) = delete;
+    windows_iocp_queue& operator=(windows_iocp_queue&&) = delete;
+    ~windows_iocp_queue() noexcept { stop(); }
 
     /** The port, its records and its timer. */
     windows_overlapped<allocator_t, atomic_ref_template_> overlapped;
@@ -749,7 +749,7 @@ struct windows_iocp_engine {
     /** The page lists vectored file reads scatter through. */
     windows_scatter_pages<allocator_t> scatter;
 
-    /** The counters the engine advances for its polling owner. */
+    /** The counters the queue advances for its polling owner. */
     io_statistics_t statistics {};
 
     ucall_status_t open(std::size_t, std::size_t capacity,
@@ -774,11 +774,11 @@ struct windows_iocp_engine {
     memory_registration_t register_memory(span<byte_t>) noexcept { return {}; }
     void release(io_completion_t const&) noexcept {}
 
-    /** Why the engine ended, which every later poll answers; zero while it runs. */
+    /** Why the queue ended, which every later poll answers; zero while it runs. */
     int fault {};
 
     void submit(io_request_t& request) noexcept {
-        // The records cover what the loops hold at once, so only a miscount ends the engine here.
+        // The records cover what the loops hold at once, so only a miscount ends the queue here.
         if (overlapped.submit(request, static_cast<SOCKET>(request.descriptor), extensions, scatter, statistics) !=
             ucall_status_success_k)
             fault = -ENOBUFS;
@@ -794,7 +794,7 @@ struct windows_iocp_engine {
         fault = 0;
     }
 };
-using windows_iocp_engine_t = windows_iocp_engine<>;
+using windows_iocp_queue_t = windows_iocp_queue<>;
 
 } // namespace unum::ucall::io
 

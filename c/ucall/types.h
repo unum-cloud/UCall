@@ -74,7 +74,7 @@
  *  which the target linking the dependency sets; each refuses an operating system lacking it. */
 #pragma region Facilities
 
-/** Whether the portable engine over nonblocking POSIX calls and @c poll is compiled, as 1 or 0. */
+/** Whether the portable queue over nonblocking POSIX calls and @c poll is compiled, as 1 or 0. */
 #if !defined(UCALL_WITH_POSIX)
 #define UCALL_WITH_POSIX UCALL_OS_POSIX_
 #endif
@@ -82,7 +82,7 @@
 #error "UCALL_WITH_POSIX needs a POSIX system"
 #endif
 
-/** Whether the engine over epoll and Linux AIO is compiled, as 1 or 0. */
+/** Whether the queue over epoll and Linux AIO is compiled, as 1 or 0. */
 #if !defined(UCALL_WITH_LINUX_EPOLLAIO)
 #define UCALL_WITH_LINUX_EPOLLAIO UCALL_OS_LINUX_
 #endif
@@ -90,7 +90,7 @@
 #error "UCALL_WITH_LINUX_EPOLLAIO needs Linux"
 #endif
 
-/** Whether the io_uring engines are compiled, as 1 or 0, which the target linking liburing sets. */
+/** Whether the io_uring queues are compiled, as 1 or 0, which the target linking liburing sets. */
 #if !defined(UCALL_WITH_LINUX_URING)
 #define UCALL_WITH_LINUX_URING 0
 #endif
@@ -98,7 +98,7 @@
 #error "UCALL_WITH_LINUX_URING needs Linux"
 #endif
 
-/** Whether the kqueue engine is compiled, as 1 or 0. */
+/** Whether the kqueue queue is compiled, as 1 or 0. */
 #if !defined(UCALL_WITH_BSD_KQUEUE)
 #define UCALL_WITH_BSD_KQUEUE (UCALL_OS_APPLE_ || UCALL_OS_FREEBSD_)
 #endif
@@ -106,7 +106,7 @@
 #error "UCALL_WITH_BSD_KQUEUE needs Darwin or FreeBSD"
 #endif
 
-/** Whether the I/O completion port engine is compiled, as 1 or 0. */
+/** Whether the I/O completion port queue is compiled, as 1 or 0. */
 #if !defined(UCALL_WITH_WINDOWS_IOCP)
 #define UCALL_WITH_WINDOWS_IOCP UCALL_OS_WINDOWS_
 #endif
@@ -114,7 +114,7 @@
 #error "UCALL_WITH_WINDOWS_IOCP needs Windows"
 #endif
 
-/** Whether the Registered I/O engine is compiled, as 1 or 0. */
+/** Whether the Registered I/O queue is compiled, as 1 or 0. */
 #if !defined(UCALL_WITH_WINDOWS_RIO)
 #define UCALL_WITH_WINDOWS_RIO UCALL_OS_WINDOWS_
 #endif
@@ -172,9 +172,11 @@ extern "C" {
 /** One byte of raw storage shared by views and cryptographic keys. */
 typedef uint8_t ucall_byte_t;
 
-/** A borrowed run of bytes; text is bytes that happen to decode.
+/**
+ *  @brief A run of bytes owned elsewhere; text is bytes that happen to decode.
  *
- *  Empty is {NULL, 0}. Length never requests a null-terminator lookup. */
+ *  Empty is {NULL, 0}. Length never requests a null-terminator lookup.
+ */
 typedef struct ucall_bytes_view_t {
 
     /** First byte of the run. */
@@ -405,7 +407,7 @@ typedef enum ucall_status_t {
     /** The peer supplied bytes that cannot be decoded as the expected protocol. */
     ucall_status_malformed_k = 9,
 
-    /** The engine violated its contract, which points at a defect. */
+    /** The library violated its contract, which points at a defect. */
     ucall_status_internal_k = 10,
 
     /** The requested size exceeds the representable range. */
@@ -465,11 +467,13 @@ typedef enum ucall_status_t {
  */
 typedef ucall_status_t (*ucall_peer_authorizer_t)(ucall_noise_key_t const* peer_static_key, void* context);
 
-/** Outcome of one call: a status to branch on, and a static message with the detail it cannot
- *  carry.
+/**
+ *  @brief Outcome of one call: a status to branch on, and a static message with the detail the
+ *      status cannot express.
  *
  *  The message has static storage, is never freed, and is @c NULL exactly when the status is @c
- *  ucall_status_success_k. Every verb struct points at one. */
+ *  ucall_status_success_k. Every verb struct points at one.
+ */
 typedef struct ucall_outcome_t {
 
     /** The final status, or ucall_status_deferred_k while a submitted call is unfinished. */
@@ -576,7 +580,7 @@ typedef enum ucall_address_family_t {
 } ucall_address_family_t;
 
 /** A peer's socket address: IPv4 in the first 4 @c bytes, IPv6 in all 16, both in network order,
- *  the port in host order and the IPv6 scope; AF_UNIX peers carry only the family. */
+ *  the port in host order and the IPv6 scope; AF_UNIX peers fill only the family. */
 typedef struct ucall_peer_address_t {
 
     /** The address in network order: IPv4 in the first 4 bytes, IPv6 in all 16. */
@@ -793,7 +797,7 @@ typedef enum ucall_percent_mode_t {
 
 /**
  *  @brief Decodes the %XX escapes of @p encoded, and '+' as a space in query mode.
- *  @param[in] encoded A path or a query value, as a request lends it.
+ *  @param[in] encoded A path or a query value, as it appears in a request.
  *  @param[out] decoded At least @c encoded.length bytes; may alias @c encoded.data.
  *  @param[out] length The decoded length.
  *  @param[in] mode Whether a '+' is itself or a space.

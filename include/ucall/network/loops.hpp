@@ -20,9 +20,9 @@ using io::io_completion_t;
 using io::io_operation_t;
 using io::io_peer_address_t;
 using io::io_request_t;
+using io::pollable_wakeup_t;
 using io::range_pinning_t;
 using io::registered_memory_t;
-using io::wake_channel_t;
 using utilities::allocator_delete;
 using utilities::byte_t;
 using utilities::close_native_file;
@@ -122,7 +122,7 @@ struct interface_acceptor {
     /** The accept on the listener, whose @c length counts down the peers it still takes. */
     io_request_t request {};
 
-    /** Where the engine writes the addresses of the peers one accept takes, one each, as many as
+    /** Where the queue writes the addresses of the peers one accept takes, one each, as many as
      *  the loop's share of the interface admits. */
     vector<io_peer_address_t> peer_addresses {};
 
@@ -159,9 +159,9 @@ struct interface_acceptor {
 
 /** One event loop's windows, after UStore's @c registered_memory_arena: each a page of headroom and
  *  four record strides, grown on demand up to @c max_windows in runs filling the allocator's page,
- *  each run registered with the engine once while the engine pins them, and never shrunk. Streams
- *  borrow windows in file order, and each comes back once the kernel let go of it, to serve the
- *  oldest stream waiting. */
+ *  each run registered with the queue once while the queue pins them, and never shrunk. Streams
+ *  take windows in file order, and each returns to the pool once the kernel let go of it, to serve
+ *  the oldest stream waiting. */
 template <typename network_type_>
 struct file_window_pool {
     using network_t = network_type_;
@@ -199,7 +199,7 @@ struct file_window_pool {
     /** Each window's record, by index; reserved to @c max_windows at open, never moved. */
     vector<file_window_t> windows {};
 
-    /** Parallel to @c windows, and engines hold pointers into it; each names the engine buffer
+    /** Parallel to @c windows, and queues hold pointers into it; each names the queue buffer
      *  its window's sends lie in as its @c registered_memory. */
     vector<io_request_t> release_requests {};
 
@@ -230,7 +230,7 @@ struct file_window_pool {
 };
 
 /** Whether a loop is not yet opened by its first poll, serving, draining or cutting after a stop
- *  as its server's stage, or retired with its engine stopped once nothing was left in flight. */
+ *  as its server's stage, or retired with its queue stopped once nothing was left in flight. */
 enum class event_loop_stage_t { unopened_k, serving_k, draining_k, cutting_k, retired_k };
 
 /** One loop's admitted connections of one interface that hold no exchange, least recently
@@ -283,7 +283,7 @@ struct loop_metrics {
     /** The send of @c sending to the StatsD socket, which its @c descriptor holds while open. */
     io_request_t send_request {};
 
-    /** Whether the StatsD socket is open, and whether @c send_request is with the engine. */
+    /** Whether the StatsD socket is open, and whether @c send_request is with the queue. */
     metrics_state_t state {};
 
     /** When counters are next due; folded into the poll deadline, as the oldest linger's is. */
@@ -298,7 +298,7 @@ struct loop_metrics {
     /** Where latency lines and counter deltas append, up to @c metrics_datagram_bytes. */
     vector<byte_t> composing {};
 
-    /** The datagram with the engine, swapped from @c composing; empty while none is sending. */
+    /** The datagram with the queue, swapped from @c composing; empty while none is sending. */
     vector<byte_t> sending {};
 
     /** The counter totals the last delivered datagram reported, the base of the next deltas. */
@@ -324,7 +324,7 @@ template <typename network_type_>
 struct event_loop {
     using network_t = network_type_;
     using allocator_t = typename network_t::allocator_t;
-    using engine_t = typename network_t::engine_t;
+    using queue_t = typename network_t::queue_t;
     using connection_t = typename network_t::server_connection_t;
     using replied_link_t = typename network_t::replied_link_t;
     using server_exchange_t = typename network_t::server_exchange_t;
@@ -345,7 +345,7 @@ struct event_loop {
     /** The server's allocator, which the loop's connections, exchanges and windows take. */
     allocator_t allocator;
     explicit event_loop(allocator_t const& allocator) noexcept
-        : allocator(allocator), engine(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
+        : allocator(allocator), queue(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
           connections(rebound_allocator<owner<connection_t>> {allocator}),
           interface_statistics(rebound_allocator<interface_statistics_t> {allocator}),
           interface_orders(rebound_allocator<interface_order_t> {allocator}), metrics(allocator),
@@ -355,13 +355,13 @@ struct event_loop {
     event_loop(event_loop&&) = delete;
     event_loop& operator=(event_loop&&) = delete;
 
-    /** The loop's own engine, which bound clients share. */
-    engine_t engine {};
+    /** The loop's own queue, which bound clients share. */
+    queue_t queue {};
 
     /** What wakes a sleeping poll when another thread lists an exchange or stops the server. */
-    wake_channel_t wake {};
+    pollable_wakeup_t wake {};
 
-    /** Where one poll lands its completions, sized to the engine's slots when the loop opens. */
+    /** Where one poll lands its completions, sized to the queue's slots when the loop opens. */
     vector<io_completion_t> completions {};
 
     /** The server owning the loop, set at initialization. */
@@ -395,10 +395,10 @@ struct event_loop {
     /** Connections off the idle list, so a stopping loop knows when it is done. */
     std::size_t open_connections {};
 
-    /** Clients this loop advances, linked through @c next_bound, and the engine slots they take. */
+    /** Clients this loop advances, linked through @c next_bound, and the queue slots they take. */
     client_t* bound_clients {};
 
-    /** Engine slots the bound clients add to the loop's own, counted before the loop opens. */
+    /** Queue slots the bound clients add to the loop's own, counted before the loop opens. */
     std::size_t bound_slots {};
 
     /** Every exchange the loop allocated, linked through @c next, freed only with the loop. */
@@ -407,7 +407,7 @@ struct event_loop {
     /** Exchanges ready for a new request, linked through @c next_queued. */
     server_exchange_t* free_exchanges {};
 
-    /** Why opening the loop or growing its engine for a client failed; later polls return it. */
+    /** Why opening the loop or growing its queue for a client failed; later polls return it. */
     ucall_status_t setup_status {ucall_status_success_k};
 
     /** Vyukov's intrusive queue of listed exchanges: any replying thread exchanges the tail,
@@ -423,7 +423,7 @@ struct event_loop {
     /** Whether the polling thread runs, sleeps on @c wake, or was notified since. */
     alignas(fu::default_alignment_k) wake_state_t wake_state {wake_state_t::awake_k};
 
-    /** The loop's own counters, which @c loop_totals adds to the engine's. */
+    /** The loop's own counters, which @c loop_totals adds to the queue's. */
     event_loop_statistics_t statistics {};
 
     /** The loop's place among its server's loops; loop zero binds listeners and reports batches. */
@@ -467,15 +467,15 @@ struct event_loop {
         return is_current_thread(atomic_ref<polling_thread_t const> {polling_thread}.load(std::memory_order_relaxed));
     }
     ~event_loop() noexcept {
-        engine.stop();
-        if (wake.descriptors[0] < 0 && wake.request.descriptor >= 0) engine.close_socket(wake.request.descriptor);
-        if (metrics.state != metrics_state_t::closed_k) engine.close_socket(metrics.send_request.descriptor);
+        queue.stop();
+        if (wake.descriptors[0] < 0 && wake.request.descriptor >= 0) queue.close_socket(wake.request.descriptor);
+        if (metrics.state != metrics_state_t::closed_k) queue.close_socket(metrics.send_request.descriptor);
         for (auto& order : interface_orders)
             for (descriptor_t waiting : {order.parked, order.queued})
-                if (waiting >= 0) engine.close_socket(waiting);
+                if (waiting >= 0) queue.close_socket(waiting);
         for (auto& connection : connections)
             if (connection && connection->transport.descriptor >= 0)
-                engine.close_socket(connection->transport.descriptor);
+                queue.close_socket(connection->transport.descriptor);
         while (exchanges) {
             auto* next = exchanges->next;
             allocator_delete<server_exchange_t, allocator_t> {allocator}(exchanges);
@@ -488,10 +488,10 @@ struct event_loop {
             if (acceptor.request.descriptor >= 0) {
                 if (acceptor.stage == interface_acceptor_t::stage_t::unimported_k)
                     socket_close(acceptor.request.descriptor);
-                else engine.close_socket(acceptor.request.descriptor);
+                else queue.close_socket(acceptor.request.descriptor);
             }
             if (acceptor.stage == interface_acceptor_t::stage_t::shedding_refusal_k)
-                engine.close_socket(acceptor.shed_request.descriptor);
+                queue.close_socket(acceptor.shed_request.descriptor);
             if (acceptor.reserve_descriptor >= 0) socket_close(acceptor.reserve_descriptor);
             std::destroy_at(&acceptor);
         }

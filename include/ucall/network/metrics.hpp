@@ -90,7 +90,7 @@ struct metrics {
         return status;
     }
 
-    /** Hands the composing datagram to the engine, when the previous one left. */
+    /** Hands the composing datagram to the queue, when the previous one left. */
     static void send_metrics(event_loop_t& event_loop) noexcept {
         auto& metrics = event_loop.metrics;
         if (metrics.state != metrics_state_t::idle_k || metrics.composing.empty()) return;
@@ -98,7 +98,7 @@ struct metrics {
         metrics.composing.clear();
         metrics.send_request.data = metrics.sending.data();
         metrics.send_request.length = metrics.sending.size();
-        event_loop.engine.submit(metrics.send_request);
+        event_loop.queue.submit(metrics.send_request);
         metrics.state = metrics_state_t::sending_k;
     }
 

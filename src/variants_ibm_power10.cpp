@@ -2,7 +2,7 @@
  *  @file src/variants_ibm_power10.cpp
  *  @author Ash Vardanian
  *  @date November 14, 2026
- *  @brief IBM POWER10 network variants for every enabled native I/O engine.
+ *  @brief IBM POWER10 network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

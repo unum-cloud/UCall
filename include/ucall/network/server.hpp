@@ -56,7 +56,7 @@ struct server : ucall_server_handle_t {
     using crypto_t = typename network_t::crypto_t;
     using waiter_t = typename network_t::waiter_t;
     using allocator_t = typename network_t::allocator_t;
-    using engine_t = typename network_t::engine_t;
+    using queue_t = typename network_t::queue_t;
     using connection_t = typename network_t::server_connection_t;
     using batch_endpoint_t = typename network_t::batch_endpoint_t;
     using endpoint_t = typename network_t::endpoint_t;
@@ -96,7 +96,7 @@ struct server : ucall_server_handle_t {
     server(server&&) = delete;
     server& operator=(server&&) = delete;
 
-    /** Success until an engine or a listener breaks and cuts the server, then the I/O fault. */
+    /** Success until a queue or a listener breaks and cuts the server, then the I/O fault. */
     ucall_status_t failure {ucall_status_success_k};
 
     /** The options with defaults filled, viewing @c resolved and the metrics copies. */
@@ -208,7 +208,7 @@ struct server : ucall_server_handle_t {
     }
 
     /** Copies the metric prefix and tags into @p server, resolves the StatsD address, and measures
-     *  the datagram its path carries, on a socket of its own. */
+     *  the datagram its path sends, on a socket of its own. */
     static ucall_status_t resolve_metrics(server_t& server, ucall_server_options_t const& config) noexcept {
         float const rate = config.metrics_sample_rate;
         if (!(rate >= 0.f && rate <= 1.f) || !http_t::valid_view(config.metrics_address) ||
@@ -352,6 +352,7 @@ struct server : ucall_server_handle_t {
                 publish<atomic_ref>(arguments->outcome, opened);
                 return;
             }
+            settings.memory_domain = utilities::device_memory_domain(device);
             if (!settings.event_loops) settings.event_loops = formatting_t::interface_event_loops(device);
             if (!settings.event_loops) {
                 publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
@@ -376,7 +377,7 @@ struct server : ucall_server_handle_t {
             }
 #endif
             event_loops_count = fu::max_of(event_loops_count, settings.event_loops);
-            if (settings.listen_descriptor) listeners = io::io_listeners_t::borrowed_k;
+            if (settings.listen_descriptor) listeners = io::io_listeners_t::caller_k;
             network_interface.send_buffer_bytes = formatting_t::listener_send_buffer(network_interface);
             if (settings.noise_private_key)
                 x25519_derive_public<typename crypto_t::x25519_kit_t>(
@@ -452,8 +453,8 @@ struct server : ucall_server_handle_t {
                 }
             }
         }
-        // Each engine opens before its loop's listeners, the later loops on the backend the first
-        // one resolved, so loop zero's listeners and the sockets they accept carry its engine's
+        // Each queue opens before its loop's listeners, the later loops on the backend the first
+        // one resolved, so loop zero's listeners and the sockets they accept inherit its queue's
         // flags, and the later loops accept on duplicates of them; a ring serves the thread that
         // first polls it.
         ucall_io_backend_t backend = requested->backend;
@@ -461,18 +462,18 @@ struct server : ucall_server_handle_t {
             std::size_t windows = 0, slots = 0;
             ucall_status_t status = event_loop_slots(*event_loop, windows, slots);
             if (status == ucall_status_success_k)
-                status = event_loop->engine.open(backend, slots, slots, io::io_issuer_scope_t::one_thread_k, listeners);
+                status = event_loop->queue.open(backend, slots, slots, io::io_issuer_scope_t::one_thread_k, listeners);
             if (status != ucall_status_success_k) {
-                // An engine refused by a host setting or a borrowed listener names what to change.
-                char const* refusal = event_loop->engine.refusal();
+                // A queue refused by a host setting or a caller-owned listener names the change.
+                char const* refusal = event_loop->queue.refusal();
                 publish<atomic_ref>(arguments->outcome, status, refusal ? refusal : ucall_status_name(status));
                 return;
             }
             reserve_releases(*event_loop, windows);
-            backend = event_loop->engine.backend();
+            backend = event_loop->queue.backend();
             for (auto& acceptor : event_loop->interface_acceptors) {
                 ucall_status_t result;
-                if (!event_loop->index) result = formatting_t::bind_acceptor(acceptor, event_loop->engine);
+                if (!event_loop->index) result = formatting_t::bind_acceptor(acceptor, event_loop->queue);
 #if UCALL_OS_POSIX_
                 else {
                     auto network_interface_index = static_cast<std::size_t>(acceptor.network_interface -
@@ -535,7 +536,7 @@ struct server : ucall_server_handle_t {
         server_stop(&server);
     }
 
-    /** Opens the loop's StatsD socket through its engine, with every buffer a datagram needs. */
+    /** Opens the loop's StatsD socket through its queue, with every buffer a datagram needs. */
     static ucall_status_t open_metrics(server_t& server, event_loop_t& event_loop) noexcept {
         if (!server.metrics_destination_length) return ucall_status_success_k;
         auto& metrics = event_loop.metrics;
@@ -550,7 +551,7 @@ struct server : ucall_server_handle_t {
             return ucall_status_out_of_memory_k;
         descriptor_t const opened = datagram_open(reinterpret_cast<sockaddr const*>(&server.metrics_destination),
                                                   server.metrics_destination_length);
-        descriptor_t const descriptor = opened < 0 ? opened : event_loop.engine.import_socket(opened);
+        descriptor_t const descriptor = opened < 0 ? opened : event_loop.queue.import_socket(opened);
         if (descriptor < 0) return ucall_status_connection_failed_k;
         metrics.send_request = {.operation = io_operation_t::send_k, .descriptor = descriptor, .context = &metrics};
         metrics.state = metrics_state_t::idle_k;
@@ -558,7 +559,7 @@ struct server : ucall_server_handle_t {
         return ucall_status_success_k;
     }
 
-    /** The file windows @p event_loop may hold and the engine slots it opens: each connection one
+    /** The file windows @p event_loop may hold and the queue slots it opens: each connection one
      *  operation per direction and one for files, each acceptor one, as its accept and the refusal
      *  of a peer it sheds never overlap, each window one release, each pipelined exchange two, and
      *  the wakeup and the metrics socket one each. */
@@ -578,28 +579,28 @@ struct server : ucall_server_handle_t {
         return ucall_status_success_k;
     }
 
-    /** Grows @p event_loop's engine to its present size, as only a loop not yet polled may: a ring
-     *  keeps the size and the locked memory initialization proved, and other engines lock none. */
-    static ucall_status_t grow_engine(event_loop_t& event_loop) noexcept {
+    /** Grows @p event_loop's queue to its present size, as only a loop not yet polled may: a ring
+     *  keeps the size and the locked memory initialization proved, and other queues lock none. */
+    static ucall_status_t grow_queue(event_loop_t& event_loop) noexcept {
         std::size_t windows = 0, slots = 0;
         if (ucall_status_t const sized = event_loop_slots(event_loop, windows, slots); sized != ucall_status_success_k)
             return sized;
-        ucall_status_t const grown = event_loop.engine.grow(slots);
+        ucall_status_t const grown = event_loop.queue.grow(slots);
         if (grown == ucall_status_success_k) reserve_releases(event_loop, windows);
         return grown;
     }
 
     /** Sets aside what the windows and exchanges of @p event_loop can name, within its slots. */
     static void reserve_releases(event_loop_t& event_loop, std::size_t windows) noexcept {
-        event_loop.engine.reserve_releases(windows + 2 * event_loop.max_exchanges);
+        event_loop.queue.reserve_releases(windows + 2 * event_loop.max_exchanges);
     }
 
-    /** Makes a client of @c options->server's loop @c options->event_loop, sharing its engine,
+    /** Makes a client of @c options->server's loop @c options->event_loop, sharing its queue,
      *  whose tables grow by the client's slots, which only a loop not yet polled allows. */
     static void bind_client(ucall_client_init_t* arguments) noexcept {
         auto options = *arguments->options;
         auto& server = *static_cast<server_t*>(options.server);
-        // A bound client runs on its loop's engine and kits, so a backend naming another or a
+        // A bound client runs on its loop's queue and kits, so a backend naming another or a
         // ceiling picking another class is refused.
         if (options.event_loop >= server.event_loops.size() ||
             server.event_loops[options.event_loop]->stage != event_loop_stage_t::unopened_k ||
@@ -614,23 +615,23 @@ struct server : ucall_server_handle_t {
         options.cpu_class_ceiling = server.config.cpu_class_ceiling;
         ucall_client_init_t bound = *arguments;
         bound.options = &options;
-        client_t::client_init(&bound, server.allocator, &event_loop.engine);
+        client_t::client_init(&bound, server.allocator, &event_loop.queue);
         if (ucall_status_t const made = arguments->outcome->status; made != ucall_status_success_k) return;
         auto* client = static_cast<client_t*>(*arguments->client);
-        std::size_t const slots = client_t::engine_slots(client->config);
+        std::size_t const slots = client_t::queue_slots(client->config);
         event_loop.bound_slots += slots;
-        if (ucall_status_t const grown = grow_engine(event_loop); grown != ucall_status_success_k) {
+        if (ucall_status_t const grown = grow_queue(event_loop); grown != ucall_status_success_k) {
             event_loop.bound_slots -= slots;
             allocator_delete<client_t, allocator_t> {client->allocator}(client);
             *arguments->client = nullptr;
             // The refusal of the attempt whose status is published, read before the next one.
-            char const* refusal = event_loop.engine.refusal();
+            char const* refusal = event_loop.queue.refusal();
             // The loop keeps serving at its former size, or reports why not from its first poll.
-            event_loop.setup_status = grow_engine(event_loop);
+            event_loop.setup_status = grow_queue(event_loop);
             publish<atomic_ref>(arguments->outcome, grown, refusal ? refusal : ucall_status_name(grown));
             return;
         }
-        // Its traffic runs through the loop's engine, so it counts into the loop's counters too.
+        // Its traffic runs through the loop's queue, so it counts into the loop's counters too.
         for (auto& connection : client->connections) connection->transport.statistics = &event_loop.statistics;
         client->next_bound = std::exchange(event_loop.bound_clients, client);
     }
@@ -681,15 +682,15 @@ struct server : ucall_server_handle_t {
             return ucall_status_out_of_memory_k;
         event_loop.stage = event_loop_stage_t::serving_k;
         if (st::failed(event_loop.completions.resize(slots))) return ucall_status_out_of_memory_k;
-        auto descriptor = event_loop.engine.import_socket(std::exchange(event_loop.wake.descriptors[0], -1));
+        auto descriptor = event_loop.queue.import_socket(std::exchange(event_loop.wake.descriptors[0], -1));
         if (descriptor < 0) return ucall_status_io_k;
         event_loop.wake.request.descriptor = descriptor;
-        event_loop.engine.submit(event_loop.wake.request);
+        event_loop.queue.submit(event_loop.wake.request);
         if (ucall_status_t const opened = open_metrics(*event_loop.server, event_loop);
             opened != ucall_status_success_k)
             return opened;
         for (auto& acceptor : event_loop.interface_acceptors) {
-            acceptor.request.descriptor = event_loop.engine.import_socket(acceptor.request.descriptor);
+            acceptor.request.descriptor = event_loop.queue.import_socket(acceptor.request.descriptor);
             if (acceptor.request.descriptor < 0) return ucall_status_io_k;
             acceptor.stage = interface_acceptor_t::stage_t::idle_k;
             acceptor.reserve_descriptor = socket_open(acceptor.network_interface->family);
@@ -697,10 +698,10 @@ struct server : ucall_server_handle_t {
         }
         return ucall_status_success_k;
     }
-    static void advance_completion(engine_t& engine, io_completion_t const& completion) noexcept {
+    static void advance_completion(queue_t& queue, io_completion_t const& completion) noexcept {
         if (completion.request->operation == io_operation_t::accept_k) serving_t::accepted(completion);
         else static_cast<connection_t*>(completion.request->context)->complete(completion);
-        engine.release(completion);
+        queue.release(completion);
     }
     static ucall_status_t server_poll(server_t& server, event_loop_t& event_loop, io_wait_t wait,
                                       std::uint64_t deadline = 0) noexcept {
@@ -733,7 +734,7 @@ struct server : ucall_server_handle_t {
         if (wait == io_wait_t::blocking_k &&
             wake_state.exchange(wake_state_t::sleeping_k, std::memory_order_acq_rel) == wake_state_t::notified_k)
             serving_t::server_progress(server, event_loop);
-        int count = event_loop.engine.poll(span<io_completion_t> {event_loop.completions}, wait, deadline);
+        int count = event_loop.queue.poll(span<io_completion_t> {event_loop.completions}, wait, deadline);
         // Acquiring, so the listings of notifies that found the channel already written are seen.
         if (wait == io_wait_t::blocking_k) {
             [[maybe_unused]] wake_state_t const slept = wake_state.exchange(wake_state_t::awake_k,
@@ -750,28 +751,28 @@ struct server : ucall_server_handle_t {
         for (int i = 0; i != count; ++i) {
             auto& completion = event_loop.completions[static_cast<std::size_t>(i)];
             if (completion.request == &event_loop.wake.request) {
-                event_loop.engine.release(completion);
-                event_loop.engine.submit(event_loop.wake.request);
+                event_loop.queue.release(completion);
+                event_loop.queue.submit(event_loop.wake.request);
             }
             else if (completion.request == &event_loop.metrics.send_request) {
                 metrics_t::complete_metrics(event_loop, completion);
-                event_loop.engine.release(completion);
+                event_loop.queue.release(completion);
             }
             else if (completion.request->operation == io_operation_t::accept_k)
-                advance_completion(event_loop.engine, completion);
+                advance_completion(event_loop.queue, completion);
             else if (completion.request->operation == io_operation_t::zero_copy_release_k) {
                 replies_t::complete_release(event_loop, completion);
-                event_loop.engine.release(completion);
+                event_loop.queue.release(completion);
             }
             else if (auto* const acceptor = serving_t::shedding_acceptor(event_loop, completion.request)) {
                 serving_t::shed_sent(event_loop, *acceptor);
-                event_loop.engine.release(completion);
+                event_loop.queue.release(completion);
             }
             else if (client_t* const client = bound_client(event_loop, completion))
                 client_t::step_completion(*client, completion);
             else {
                 auto& connection = *static_cast<connection_t*>(completion.request->context);
-                advance_completion(event_loop.engine, completion);
+                advance_completion(event_loop.queue, completion);
                 bool const file_read = completion.request == &connection.file_read_request;
                 if (!file_read && completion.request->operation == io_operation_t::send_zero_copy_k)
                     replies_t::complete_zero_copy_send(event_loop, connection, completion);
@@ -824,28 +825,28 @@ struct server : ucall_server_handle_t {
     /** Every counter of @p event_loop, as any thread may read them while the loop runs. */
     static ucall_event_loop_statistics_t loop_totals(event_loop_t& event_loop) noexcept {
         auto& loop = event_loop.statistics;
-        auto& engine = event_loop.engine.statistics();
+        auto& queue = event_loop.queue.statistics();
         auto read = [](std::uint64_t& counter) noexcept {
             return atomic_ref<std::uint64_t> {counter}.load(std::memory_order_relaxed);
         };
         ucall_event_loop_statistics_t totals {.polls = read(loop.polls),
                                               .empty_polls = read(loop.empty_polls),
-                                              .kernel_enters = read(engine.kernel_enters),
-                                              .submissions = read(engine.submissions),
-                                              .completions = read(engine.completions),
-                                              .kernel_entries = read(engine.kernel_entries),
-                                              .cancellations = read(engine.cancellations),
+                                              .kernel_enters = read(queue.kernel_enters),
+                                              .submissions = read(queue.submissions),
+                                              .completions = read(queue.completions),
+                                              .kernel_entries = read(queue.kernel_entries),
+                                              .cancellations = read(queue.cancellations),
                                               .accepts = read(loop.accepts),
                                               .requests = read(loop.requests),
-                                              .receive_rearms = read(engine.receive_rearms),
+                                              .receive_rearms = read(queue.receive_rearms),
                                               .bytes_received = read(loop.bytes_received),
                                               .bytes_sent = read(loop.bytes_sent),
-                                              .bytes_copied = read(loop.bytes_copied) + read(engine.bytes_copied),
-                                              .zero_copy_sends = read(engine.zero_copy_sends),
-                                              .zero_copy_fallbacks = read(engine.zero_copy_fallbacks),
-                                              .copying_sends = read(engine.copying_sends),
-                                              .file_reads_asynchronous = read(engine.file_reads_asynchronous),
-                                              .file_reads_blocking = read(engine.file_reads_blocking),
+                                              .bytes_copied = read(loop.bytes_copied) + read(queue.bytes_copied),
+                                              .zero_copy_sends = read(queue.zero_copy_sends),
+                                              .zero_copy_fallbacks = read(queue.zero_copy_fallbacks),
+                                              .copying_sends = read(queue.copying_sends),
+                                              .file_reads_asynchronous = read(queue.file_reads_asynchronous),
+                                              .file_reads_blocking = read(queue.file_reads_blocking),
                                               .bytes_read = read(loop.bytes_read),
                                               .file_window_overlaps = read(loop.file_window_overlaps),
                                               .linger_resets = read(loop.linger_resets),
@@ -956,9 +957,9 @@ struct server : ucall_server_handle_t {
         return retired == server.event_loops.size();
     }
 
-    /** Sleeps on the endpoint's wake channel until a deposit, a stop, or @p deadline, zero meaning
-     *  none. Depositors wake only a sleeping polling owner, so it announces sleep before its last
-     *  look at the queue. */
+    /** Sleeps on the endpoint's pollable wakeup until a deposit, a stop, or @p deadline, zero
+     *  meaning none. Depositors wake only a sleeping polling owner, so it announces sleep before
+     *  its last look at the queue. */
     static void wait_for_deposits(server_t& server, batch_endpoint_t& endpoint, std::uint64_t deadline) noexcept {
         auto wake_state = atomic_ref<wake_state_t> {endpoint.wake_state};
         wake_state.store(wake_state_t::sleeping_k, std::memory_order_seq_cst);
@@ -1022,7 +1023,7 @@ struct server : ucall_server_handle_t {
     static void server_free(ucall_server_t handle) noexcept {
         if (!handle) return;
         auto& server = *static_cast<server_t*>(handle);
-        // A bound client still in use shares a loop's engine, so the server outlives it.
+        // A bound client still in use shares a loop's queue, so the server outlives it.
         for (auto& event_loop : server.event_loops)
             for (client_t* client = event_loop->bound_clients; client; client = client->next_bound)
                 if (client->binding == client_binding_t::bound_k) return;
@@ -1032,10 +1033,10 @@ struct server : ucall_server_handle_t {
                    event_loop->stage != event_loop_stage_t::retired_k &&
                    event_loop->setup_status == ucall_status_success_k)
                 if (server_poll(server, *event_loop, io_wait_t::blocking_k) != ucall_status_success_k) break;
-        // Freed clients the loops did not finish are deleted once their engines hold
+        // Freed clients the loops did not finish are deleted once their queues hold
         // nothing of them.
         for (auto& event_loop : server.event_loops) {
-            event_loop->engine.stop();
+            event_loop->queue.stop();
             while (client_t* const client = event_loop->bound_clients) {
                 event_loop->bound_clients = client->next_bound;
                 allocator_delete<client_t, allocator_t> {client->allocator}(client);
@@ -1085,7 +1086,7 @@ struct server : ucall_server_handle_t {
         }
         endpoint->next = server.endpoints;
         server.endpoints = endpoint;
-        // Trie edges may already borrow the path of a refused template, so the endpoint stays
+        // Trie edges may already point into the path of a refused template, so the endpoint stays
         // listed, but it is no batch endpoint: nothing deposits into it and nothing reports it.
         if (auto status = server.routes.insert(endpoint->path, endpoint->verb, endpoint);
             status != ucall_status_success_k) {

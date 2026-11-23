@@ -2,7 +2,7 @@
  *  @file src/variants_aws_g5.cpp
  *  @author Ash Vardanian
  *  @date November 14, 2026
- *  @brief AWS G5 network variants for every enabled native I/O engine.
+ *  @brief AWS G5 network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

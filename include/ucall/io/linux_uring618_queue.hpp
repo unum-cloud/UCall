@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/io/linux_uring618_engine.hpp
+ *  @file include/ucall/io/linux_uring618_queue.hpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
  *  @brief Registered sockets and multishot receive streams for Linux 6.18 io_uring.
@@ -9,7 +9,7 @@
 #include <smashtable/basic_vector.hpp> // `vector`
 #include <smashtable/row_search.hpp>   // `serial_row_kit_t`
 
-#include "ucall/io/linux_uring612_engine.hpp" // `uring_operation`, `registered_socket_t`
+#include "ucall/io/linux_uring612_queue.hpp" // `uring_operation`, `registered_socket_t`
 #include "ucall/io/types.hpp"          // `operation_list_t`, `zero_copy_stage_t`, `io_statistics_t`, `io_completion_t`
 #include "ucall/utilities/sockets.hpp" // `open_files_limit`, `monotonic_ns`
 #include "ucall/utilities/types.hpp"   // `byte_t`, `descriptor_t`, `span`
@@ -26,14 +26,14 @@ using utilities::span;
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
-struct linux_uring618_engine {
+struct linux_uring618_queue {
     using allocator_t = allocator_type_;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
     template <typename other_allocator_type_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = linux_uring618_engine<other_allocator_type_, other_atomic_ref_, other_row_kit_>;
+    using rebind = linux_uring618_queue<other_allocator_type_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     enum class receive_stage_t : std::uint8_t {
@@ -72,7 +72,7 @@ struct linux_uring618_engine {
     };
     struct alignas(8) socket_slot_t {
 
-        /** The slot's index in the registered file table, which its handle carries. */
+        /** The slot's index in the registered file table, which its handle holds. */
         unsigned index {};
 
         /** The next vacant slot while vacant, or the next on @c rearming_socket_slots. */
@@ -117,8 +117,9 @@ struct linux_uring618_engine {
         /** Whether the next stream is the socket's first, or a re-arm. */
         stream_start_t stream_start {stream_start_t::first_k};
 
-        /** Whether a completion lent @c backlog from @c backlog_offset on. */
-        uring_lease_t backlog_lease {uring_lease_t::returned_k};
+        /** Whether a completion named @c backlog from @c backlog_offset on and @c release has not
+         *  run for it. */
+        receive_slice_state_t backlog_slice_state {receive_slice_state_t::released_k};
 
         /** Whether the slot is on @c rearming_socket_slots, linked through @c next. */
         listing_t rearm_listing {listing_t::unlisted_k};
@@ -136,7 +137,7 @@ struct linux_uring618_engine {
             return receive_stage == receive_stage_t::submitted_k || receive_stage == receive_stage_t::cancelling_k;
         }
     };
-    using queue_t = uring_queue<allocator_t, atomic_ref_template_>;
+    using state_t = uring_state<allocator_t, atomic_ref_template_>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
     using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_>;
@@ -148,13 +149,13 @@ struct linux_uring618_engine {
         IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD, IORING_OP_OPENAT2,
         IORING_OP_SEND_ZC,      IORING_OP_READ_FIXED,   IORING_OP_READV,     IORING_OP_READV_FIXED};
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_uring618_k;
-    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::engine_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_k;
 
-    /** The counters the engine and its components advance for its polling owner. */
+    /** The counters the queue and its components advance for its polling owner. */
     io_statistics_t statistics {};
 
     /** The ring, its registered tables and its receive pool. */
-    queue_t queue;
+    state_t state;
 
     /** The registered sockets, each with its receive stream and backlog. */
     socket_slots_t socket_slots;
@@ -183,17 +184,17 @@ struct linux_uring618_engine {
     /** Why @c open answered @c ucall_status_unsupported_k, naming the setting to raise. */
     char const* refusal {};
 
-    explicit linux_uring618_engine(allocator_t const& instance = {}) noexcept
-        : queue(instance, statistics), socket_slots(instance), operations(instance), zero_copy(statistics) {}
-    linux_uring618_engine(linux_uring618_engine const&) = delete;
-    linux_uring618_engine& operator=(linux_uring618_engine const&) = delete;
-    linux_uring618_engine(linux_uring618_engine&&) = delete;
-    linux_uring618_engine& operator=(linux_uring618_engine&&) = delete;
-    ~linux_uring618_engine() noexcept { stop(); }
+    explicit linux_uring618_queue(allocator_t const& instance = {}) noexcept
+        : state(instance, statistics), socket_slots(instance), operations(instance), zero_copy(statistics) {}
+    linux_uring618_queue(linux_uring618_queue const&) = delete;
+    linux_uring618_queue& operator=(linux_uring618_queue const&) = delete;
+    linux_uring618_queue(linux_uring618_queue&&) = delete;
+    linux_uring618_queue& operator=(linux_uring618_queue&&) = delete;
+    ~linux_uring618_queue() noexcept { stop(); }
 
-    bool is_open() const noexcept { return queue.is_open(); }
+    bool is_open() const noexcept { return state.is_open(); }
     bool has_kernel_work() const noexcept {
-        return !queue.control.result || operations.outstanding_operations || zero_copy.outstanding_notifications ||
+        return !state.control.result || operations.outstanding_operations || zero_copy.outstanding_notifications ||
                socket_slots.closing() || receiving_socket_slots != 0;
     }
 
@@ -201,18 +202,18 @@ struct linux_uring618_engine {
                         io_issuer_scope_t scope = io_issuer_scope_t::one_thread_k) noexcept {
         if (!depth || !capacity) return ucall_status_invalid_argument_k;
         if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
-        if (queue.stage != uring_engine_stage_t::idle_k) return ucall_status_invalid_argument_k;
+        if (state.stage != uring_queue_stage_t::idle_k) return ucall_status_invalid_argument_k;
         // Releases take no file, and the kernel registers no more files than descriptors.
         std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
-        if (ucall_status_t const reserved = queue.reserve(capacity); reserved != ucall_status_success_k)
+        if (ucall_status_t const reserved = state.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
-            socket_slots.open(sockets, queue.allocator) != ucall_status_success_k)
+            socket_slots.open(sockets, state.allocator) != ucall_status_success_k)
             return ucall_status_out_of_memory_k;
-        ucall_status_t const opened = queue.open(depth, sockets, opcodes_k, scope);
+        ucall_status_t const opened = state.open(depth, sockets, opcodes_k, scope);
         if (opened == ucall_status_success_k) return opened;
         // Only ring setup fails before the ring opens.
-        if (queue.is_open()) stop();
+        if (state.is_open()) stop();
         else refusal = uring_setup_refusal_k;
         return opened;
     }
@@ -224,19 +225,19 @@ struct linux_uring618_engine {
     }
     int wait_control() noexcept { return uring_wait_control(*this); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept {
-        return socket_slots.import_socket(descriptor, queue);
+        return socket_slots.import_socket(descriptor, state);
     }
     descriptor_t open_socket(int family) noexcept { return uring_open_socket(*this, family); }
 
-    /** Takes back what @p completion lent: a slice of the pool, or a socket's backlog past it. */
+    /** Releases what @p completion named: a slice of the pool, or a socket's backlog past it. */
     void release(io_completion_t const& completion) noexcept {
-        if (!queue.is_open() || !completion.lease) return;
-        std::size_t const pool = queue.provided.memory.size();
-        if (completion.lease <= pool)
-            return queue.provided.return_slice({completion.data, static_cast<std::size_t>(completion.result)});
-        socket_slot_t& owner = socket_slots.records[completion.lease - pool - 1];
-        if (owner.backlog_lease != uring_lease_t::leased_k) return;
-        owner.backlog_lease = uring_lease_t::returned_k;
+        if (!state.is_open() || !completion.release_token) return;
+        std::size_t const pool = state.provided.memory.size();
+        if (completion.release_token <= pool)
+            return state.provided.release_slice({completion.data, static_cast<std::size_t>(completion.result)});
+        socket_slot_t& owner = socket_slots.records[completion.release_token - pool - 1];
+        if (owner.backlog_slice_state != receive_slice_state_t::awaiting_release_k) return;
+        owner.backlog_slice_state = receive_slice_state_t::released_k;
         owner.backlog_offset += static_cast<std::size_t>(completion.result);
         if (owner.backlog_offset == owner.backlog.size()) {
             owner.backlog.clear();
@@ -247,9 +248,10 @@ struct linux_uring618_engine {
         else retire(owner);
     }
 
-    /** Slides what a paused socket still holds to the front of its backlog, unless it is lent. */
+    /** Slides what a paused socket still holds to the front of its backlog, unless a completion
+     *  still names it. */
     void park_receive(socket_slot_t& owner) noexcept {
-        if (owner.backlog_lease == uring_lease_t::leased_k || !owner.backlog_offset) return;
+        if (owner.backlog_slice_state == receive_slice_state_t::awaiting_release_k || !owner.backlog_offset) return;
         auto remaining = owner.backlog.size() - owner.backlog_offset;
         if (remaining) std::memmove(owner.backlog.data(), owner.backlog.data() + owner.backlog_offset, remaining);
         tally<atomic_ref_template_>(statistics.bytes_copied, remaining);
@@ -263,7 +265,7 @@ struct linux_uring618_engine {
         spill_slice(*owner);
         park_receive(*owner);
         if (owner->receive_stage == receive_stage_t::submitted_k) {
-            if (cancel_stream(*owner) != ucall_status_success_k) queue.fault = -EIO;
+            if (cancel_stream(*owner) != ucall_status_success_k) state.fault = -EIO;
             else owner->receive_stage = receive_stage_t::cancelling_k;
         }
     }
@@ -271,19 +273,19 @@ struct linux_uring618_engine {
     /** Copies @p slice to the end of @p owner's backlog and gives the pool its bytes back,
      *  cancelling the stream of a socket past its fair share of the pool. */
     void append_backlog(socket_slot_t& owner, span<byte_t> slice) noexcept {
-        uring_provided_buffers<allocator_t>& provided = queue.provided;
+        uring_provided_buffers<allocator_t>& provided = state.provided;
         std::size_t const previous = owner.backlog.size();
-        if (st::failed(owner.backlog.resize(st::assume_uninitialized, previous + slice.size()))) queue.fault = -ENOMEM;
+        if (st::failed(owner.backlog.resize(st::assume_uninitialized, previous + slice.size()))) state.fault = -ENOMEM;
         else std::memcpy(owner.backlog.data() + previous, slice.data(), slice.size());
         tally<atomic_ref_template_>(statistics.bytes_copied, slice.size());
-        provided.return_slice(slice);
+        provided.release_slice(slice);
         assert(socket_slots.records.size() > socket_slots.vacant_socket_slots);
         std::size_t const share = fu::min_of(
             provided.buffer_bytes(),
             provided.memory.size() / (socket_slots.records.size() - socket_slots.vacant_socket_slots));
         if (owner.backlog.size() - owner.backlog_offset >= share &&
             owner.receive_stage == receive_stage_t::submitted_k) {
-            if (cancel_stream(owner) != ucall_status_success_k) queue.fault = -EIO;
+            if (cancel_stream(owner) != ucall_status_success_k) state.fault = -EIO;
             else owner.receive_stage = receive_stage_t::cancelling_k;
         }
     }
@@ -304,7 +306,7 @@ struct linux_uring618_engine {
     /** Hands @p slice straight to the receive waiting on @p owner. */
     void deliver_slice(socket_slot_t& owner, span<byte_t> slice) noexcept {
         operation_t& operation = operations[std::exchange(owner.receive_operation, absent_k)];
-        operation.buffer = static_cast<unsigned>(queue.provided.offset_of(slice));
+        operation.buffer = static_cast<unsigned>(state.provided.offset_of(slice));
         operation.result = static_cast<descriptor_t>(slice.size());
         unlist_timed(operation);
         operations.complete(operation);
@@ -314,11 +316,11 @@ struct linux_uring618_engine {
         if (!owner.waiting_slice.empty()) return deliver_slice(owner, std::exchange(owner.waiting_slice, {}));
         auto& operation = operations[owner.receive_operation];
         if (owner.backlog_offset != owner.backlog.size()) {
-            if (owner.backlog_lease == uring_lease_t::leased_k) return;
+            if (owner.backlog_slice_state == receive_slice_state_t::awaiting_release_k) return;
             operation.receive_source = uring_receive_source_t::backlog_k;
             operation.result = static_cast<descriptor_t>(fu::min_of<std::size_t>(
                 owner.backlog.size() - owner.backlog_offset, (std::numeric_limits<descriptor_t>::max)()));
-            owner.backlog_lease = uring_lease_t::leased_k;
+            owner.backlog_slice_state = receive_slice_state_t::awaiting_release_k;
         }
         else if (owner.receive_stage == receive_stage_t::ended_k) operation.result = owner.terminal;
         else return;
@@ -336,15 +338,15 @@ struct linux_uring618_engine {
      *  which @c maintain then offers again. */
     ucall_status_t start_receive(socket_slot_t& owner) noexcept {
         if (owner.receive_stage != receive_stage_t::idle_k || owner.receive_flow == receive_flow_t::paused_k ||
-            !uring_serves(owner.stage) || queue.stage != uring_engine_stage_t::running_k ||
-            !queue.provided.available_buffers)
+            !uring_serves(owner.stage) || state.stage != uring_queue_stage_t::running_k ||
+            !state.provided.available_buffers)
             return ucall_status_success_k;
-        auto* submission = queue.entry();
+        auto* submission = state.entry();
         if (!submission) return ucall_status_io_k;
         io_uring_prep_recv_multishot(submission, static_cast<int>(owner.index), nullptr, 0, 0);
         submission->flags |= IOSQE_FIXED_FILE | IOSQE_BUFFER_SELECT;
         submission->buf_group = 0;
-        io_uring_sqe_set_data64(submission, queue.tag(&owner, uring_receive_tag_k));
+        io_uring_sqe_set_data64(submission, state.tag(&owner, uring_receive_tag_k));
         owner.receive_stage = receive_stage_t::submitted_k;
         ++receiving_socket_slots;
         if (owner.stream_start == stream_start_t::rearm_k) tally<atomic_ref_template_>(statistics.receive_rearms);
@@ -352,19 +354,19 @@ struct linux_uring618_engine {
         return ucall_status_success_k;
     }
     ucall_status_t cancel_stream(socket_slot_t& owner) noexcept {
-        auto* submission = queue.entry();
+        auto* submission = state.entry();
         if (!submission) return ucall_status_io_k;
-        io_uring_prep_cancel64(submission, queue.tag(&owner, uring_receive_tag_k), 0);
+        io_uring_prep_cancel64(submission, state.tag(&owner, uring_receive_tag_k), 0);
         io_uring_sqe_set_data64(submission, uring_cancel_tag_k);
         tally<atomic_ref_template_>(statistics.cancellations);
         return ucall_status_success_k;
     }
 
-    memory_registration_t register_memory(span<byte_t> memory) noexcept { return queue.register_memory(memory); }
+    memory_registration_t register_memory(span<byte_t> memory) noexcept { return state.register_memory(memory); }
     void submit(io_request_t& request) noexcept {
         tally<atomic_ref_template_>(statistics.submissions);
         if (request.operation == io_operation_t::zero_copy_release_k) {
-            if (!zero_copy.submit_release(request, operations, socket_slots)) queue.fault = -ENOBUFS;
+            if (!zero_copy.submit_release(request, operations, socket_slots)) state.fault = -ENOBUFS;
             return;
         }
         auto* operation = uring_take(*this, request);
@@ -387,8 +389,8 @@ struct linux_uring618_engine {
     void start_operation(operation_t& operation) noexcept {
         auto& request = *operation.request;
         if (request.operation == io_operation_t::accept_k)
-            return operations.arm_accepts(operation, queue, socket_slots);
-        auto* submission = operations.entry(operation, queue);
+            return operations.arm_accepts(operation, state, socket_slots);
+        auto* submission = operations.entry(operation, state);
         if (!submission) return operations.push(operations.waiting_operations, operation);
         if (request.operation == io_operation_t::file_read_vectors_k) {
             if (request.registered_memory != io_unregistered_k)
@@ -400,8 +402,8 @@ struct linux_uring618_engine {
                                     static_cast<unsigned>(request.length), request.file.offset);
             tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
         }
-        else uring_prepare(submission, operation, queue, operations, zero_copy);
-        operations.submit(submission, operation, queue);
+        else uring_prepare(submission, operation, state, operations, zero_copy);
+        operations.submit(submission, operation, state);
     }
 
     /** Marks the close of @p descriptor to send a reset rather than a FIN, without a round trip. */
@@ -415,8 +417,8 @@ struct linux_uring618_engine {
         tally<atomic_ref_template_>(statistics.cancellations);
         if (operations.carrying(*operation.request) == &operation &&
             operation.request->operation == io_operation_t::accept_k)
-            return operations.end_accepts(operation, queue);
-        if (operation.in_flight()) return operations.cancel_in_flight(operation, queue);
+            return operations.end_accepts(operation, state);
+        if (operation.in_flight()) return operations.cancel_in_flight(operation, state);
         auto& owner = *operation.socket_slot;
         if (owner.receive_operation != operations.index_of(operation))
             operations.unlink(operations.waiting_operations, operation);
@@ -430,19 +432,19 @@ struct linux_uring618_engine {
         return ucall_status_success_k;
     }
     void retire(socket_slot_t& owner) noexcept {
-        if (queue.stage == uring_engine_stage_t::recovering_k) return;
+        if (state.stage == uring_queue_stage_t::recovering_k) return;
         if (uring_serves(owner.stage)) {
             uring_abandon(*this, owner);
             if (owner.receive_stage == receive_stage_t::submitted_k) {
-                if (cancel_stream(owner) != ucall_status_success_k) queue.fault = -EIO;
+                if (cancel_stream(owner) != ucall_status_success_k) state.fault = -EIO;
                 else owner.receive_stage = receive_stage_t::cancelling_k;
             }
         }
         if (owner.stage == uring_socket_stage_t::abandoned_k || owner.receive_in_flight() ||
             owner.stage == uring_socket_stage_t::closing_k || operations.owns_in_flight(owner))
             return;
-        if (owner.stage != uring_socket_stage_t::closed_k) socket_slots.submit_close(owner, queue);
-        else if (owner.backlog_lease == uring_lease_t::returned_k) finish_close(owner);
+        if (owner.stage != uring_socket_stage_t::closed_k) socket_slots.submit_close(owner, state);
+        else if (owner.backlog_slice_state == receive_slice_state_t::released_k) finish_close(owner);
     }
     int close_socket(descriptor_t descriptor) noexcept { return uring_close_socket(*this, descriptor); }
     void finish_close(socket_slot_t& owner) noexcept {
@@ -454,9 +456,9 @@ struct linux_uring618_engine {
                     break;
                 }
         owner.receive_operation = absent_k;
-        if (!owner.waiting_slice.empty()) queue.provided.return_slice(std::exchange(owner.waiting_slice, {}));
+        if (!owner.waiting_slice.empty()) state.provided.release_slice(std::exchange(owner.waiting_slice, {}));
         owner.backlog.clear();
-        if (owner.backlog.capacity() > queue.page_bytes) owner.backlog = vector<byte_t> {queue.allocator};
+        if (owner.backlog.capacity() > state.page_bytes) owner.backlog = vector<byte_t> {state.allocator};
         owner.backlog_offset = 0;
         owner.terminal = 0;
         owner.receive_stage = receive_stage_t::idle_k;
@@ -471,11 +473,11 @@ struct linux_uring618_engine {
                                                 ~std::uintptr_t {7});
         if (kind == uring_cancel_tag_k) return;
         if (kind == uring_control_tag_k) {
-            queue.control.result = completion.res;
+            state.control.result = completion.res;
             return;
         }
         if (kind == uring_close_tag_k) {
-            if (auto* closed = socket_slots.settle_close(*static_cast<socket_slot_t*>(pointer), completion.res, queue))
+            if (auto* closed = socket_slots.settle_close(*static_cast<socket_slot_t*>(pointer), completion.res, state))
                 retire(*closed);
             return;
         }
@@ -489,7 +491,7 @@ struct linux_uring618_engine {
             return;
         }
         auto& operation = *static_cast<operation_t*>(pointer);
-        if (auto* accepted = operations.settle(operation, completion, queue, socket_slots)) retire(*accepted);
+        if (auto* accepted = operations.settle(operation, completion, state, socket_slots)) retire(*accepted);
         if (!uring_serves(operation.socket_slot->stage)) retire(*operation.socket_slot);
     }
     void settle_receive(socket_slot_t& owner, io_uring_cqe const& completion) noexcept {
@@ -497,12 +499,12 @@ struct linux_uring618_engine {
             if (owner.receive_in_flight()) --receiving_socket_slots;
             owner.receive_stage = receive_stage_t::idle_k;
         }
-        uring_provided_buffers<allocator_t>& provided = queue.provided;
+        uring_provided_buffers<allocator_t>& provided = state.provided;
         if (completion.res > 0 && (completion.flags & IORING_CQE_F_BUFFER)) {
-            span<byte_t> const slice = provided.lease_slice(completion.flags >> IORING_CQE_BUFFER_SHIFT,
-                                                            static_cast<std::size_t>(completion.res));
-            if (!uring_serves(owner.stage) || queue.stage != uring_engine_stage_t::running_k)
-                provided.return_slice(slice);
+            span<byte_t> const slice = provided.take_received_slice(completion.flags >> IORING_CQE_BUFFER_SHIFT,
+                                                                    static_cast<std::size_t>(completion.res));
+            if (!uring_serves(owner.stage) || state.stage != uring_queue_stage_t::running_k)
+                provided.release_slice(slice);
             else if (owner.receive_operation != absent_k && owner.backlog_offset == owner.backlog.size())
                 deliver_slice(owner, slice);
             else if (owner.waiting_slice.empty() && owner.backlog_offset == owner.backlog.size() &&
@@ -534,11 +536,11 @@ struct linux_uring618_engine {
         while (count != output.size()) {
             auto* operation = operations.pop(operations.completed_operations);
             if (!operation) break;
-            io_completion_t completed = operations.completion_of(*operation, queue, socket_slots);
+            io_completion_t completed = operations.completion_of(*operation, state, socket_slots);
             if (operation->receive_source == uring_receive_source_t::backlog_k) {
                 auto& owner = *operation->socket_slot;
                 completed.data = owner.backlog.data() + owner.backlog_offset;
-                completed.lease = static_cast<std::uint32_t>(queue.provided.memory.size() + 1 + owner.index);
+                completed.release_token = static_cast<std::uint32_t>(state.provided.memory.size() + 1 + owner.index);
             }
             output[count++] = completed;
             operations.vacate(*operation);
@@ -547,7 +549,7 @@ struct linux_uring618_engine {
         return static_cast<int>(count);
     }
     void maintain() noexcept {
-        if (queue.fault) return;
+        if (state.fault) return;
         if (!timed_operations.empty() && monotonic_ns() >= earliest_timed) {
             auto now = monotonic_ns();
             earliest_timed = 0;
@@ -570,16 +572,16 @@ struct linux_uring618_engine {
             index = owner.next;
             owner.rearm_listing = listing_t::unlisted_k;
             if (owner.receive_operation == absent_k || owner.receive_in_flight()) continue;
-            if (start_receive(owner) != ucall_status_success_k || !queue.provided.available_buffers) rearm(owner);
+            if (start_receive(owner) != ucall_status_success_k || !state.provided.available_buffers) rearm(owner);
         }
     }
     int poll(span<io_completion_t> output, io_wait_t policy, std::uint64_t deadline = 0) noexcept {
-        if (!queue.is_open()) return -EBADF;
+        if (!state.is_open()) return -EBADF;
         for (;;) {
             spill_waiting_slices();
             reap();
             maintain();
-            if (queue.fault) return queue.fault;
+            if (state.fault) return state.fault;
             int count = collect(output);
             if (count) return count;
             spill_waiting_slices();
@@ -588,7 +590,7 @@ struct linux_uring618_engine {
             if (!timed_operations.empty())
                 wait_deadline = !wait_deadline ? earliest_timed : fu::min_of(wait_deadline, earliest_timed);
             unsigned wait = policy == io_wait_t::blocking_k && (!wait_deadline || now < wait_deadline) ? 1 : 0;
-            int result = queue.enter(wait, wait_deadline);
+            int result = state.enter(wait, wait_deadline);
             // A kernel short of request memory took nothing; the submissions wait in the ring.
             if (result < 0 && result != -EAGAIN) return result;
             reap();
@@ -600,7 +602,7 @@ struct linux_uring618_engine {
     }
     void discard(std::uint64_t user_data) noexcept {
         if ((static_cast<std::uintptr_t>(user_data) & 7) != uring_receive_tag_k)
-            return uring_discard(user_data, queue, operations, socket_slots, zero_copy);
+            return uring_discard(user_data, state, operations, socket_slots, zero_copy);
         auto& owner = *reinterpret_cast<socket_slot_t*>(static_cast<std::uintptr_t>(user_data) & ~std::uintptr_t {7});
         if (owner.receive_in_flight()) {
             owner.receive_stage = receive_stage_t::idle_k;
@@ -611,11 +613,11 @@ struct linux_uring618_engine {
     [[nodiscard]] ucall_status_t drain_after_fault() noexcept { return uring_drain_after_fault(*this); }
     void reserve_releases(std::size_t count) noexcept { operations.reserve_releases(count); }
     [[nodiscard]] ucall_status_t grow(std::size_t capacity) noexcept {
-        return uring_grow(*this, capacity, queue.allocator);
+        return uring_grow(*this, capacity, state.allocator);
     }
     void stop() noexcept { uring_stop(*this); }
 };
 
-using linux_uring618_engine_t = linux_uring618_engine<>;
+using linux_uring618_queue_t = linux_uring618_queue<>;
 
 } // namespace unum::ucall::io

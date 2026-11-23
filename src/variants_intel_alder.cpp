@@ -2,7 +2,7 @@
  *  @file src/variants_intel_alder.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief Intel alder network variants for every enabled native I/O engine.
+ *  @brief Intel alder network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

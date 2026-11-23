@@ -2,7 +2,7 @@
  *  @file src/variants_alibaba_c930.cpp
  *  @author Ash Vardanian
  *  @date November 14, 2026
- *  @brief Alibaba C930 network variants for every enabled native I/O engine.
+ *  @brief Alibaba C930 network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

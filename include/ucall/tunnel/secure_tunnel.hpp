@@ -46,7 +46,7 @@ class secure_tunnel {
     using secure_tunnel_pattern_t = typename crypto_t::secure_tunnel_pattern_t;
 
     /**
-     *  @brief Whether one direction can carry a record, and why not when it cannot.
+     *  @brief Whether one direction can send a record, and why not when it cannot.
      *
      *  Private, and the caller never sees it: @c may_seal and @c may_open are the questions worth
      *  asking, and @c state and @c fault already say publicly why a connection stopped. Its job is
@@ -90,7 +90,7 @@ class secure_tunnel {
      *  @brief The mode's state, deliberately left uninitialised.
      *
      *  No default member initialiser, so constructing a pool of connections does not write these
-     *  pages and a reservation that never carries a Noise tunnel is never faulted in.
+     *  pages and a reservation that never hosts a Noise tunnel is never faulted in.
      */
     alignas(secure_tunnel_noise_t) byte_t storage_[sizeof(secure_tunnel_noise_t)];
 
@@ -269,12 +269,13 @@ class secure_tunnel {
      *      and the one caller does one thing with it: run the authorizer, or not.
      *
      *  A copy rather than a view, because this is the one answer that crosses the C ABI into code
-     *  with no way to learn when a borrowed pointer went stale. A fixed extent rather than a
-     *  dynamic span, because a parameter can carry one and a struct member cannot - so the width is
-     *  checked by the compiler here and by @c make there, and neither is assumed. A key merely
-     *  supplied by configuration - as @c IK and @c KK both do - is assumed, not proven, and is not
-     *  reported here until the exchange completes. Nor is one a handshake that later broke sent:
-     *  its tag proves only that the sender held the handshake key, not the key's private half.
+     *  with no way to learn when a pointer into the caller's buffer was freed or went stale. A
+     *  fixed extent rather than a dynamic span, because a parameter can have one and a struct
+     *  member cannot - so the width is checked by the compiler here and by @c make there, and
+     *  neither is assumed. A key merely supplied by configuration - as @c IK and @c KK both do - is
+     *  assumed, not proven, and is not reported here until the exchange completes. Nor is one a
+     *  handshake that later broke sent: its tag proves only that the sender held the handshake key,
+     *  not the key's private half.
      */
     [[nodiscard]] bool peer_key(span<byte_t, secure_tunnel_key_size_k> out) const noexcept {
         if (!encrypts() || state_ != secure_tunnel_state_t::ready_k) return false;
@@ -314,7 +315,7 @@ class secure_tunnel {
         if (state_ == secure_tunnel_state_t::broken_k) return step;
 
         // A plaintext tunnel has no handshake to drive and no close record to send. Its only
-        // control action is shutting both directions at once: TCP's own half-close is the engine's
+        // control action is shutting both directions at once: TCP's own half-close is the queue's
         // business, and inventing an in-band signal here would add a framing this mode lacks.
         if (!encrypts()) {
             if (request == secure_tunnel_request_t::close_k) {
@@ -459,7 +460,7 @@ class secure_tunnel {
      *
      *  The buffer and a length rather than a descriptor, because a record's layout is entirely
      *  determined by those two: the payload sits one headroom in, and the framing wraps it. A
-     *  four-pointer window would carry the same information and invite a caller to hand back one
+     *  four-pointer window would hold the same information and invite a caller to hand back one
      *  that did not come from @c payload_window.
      */
     [[nodiscard]] span<byte_t const> seal(span<byte_t> record, std::size_t filled) noexcept {
@@ -576,7 +577,7 @@ class secure_tunnel {
         switch (kind) {
         case secure_tunnel_record_t::application_k: break;
         case secure_tunnel_record_t::close_k:
-            // A close carries nothing. Allowing a payload would give a peer a second, unnumbered
+            // A close contains nothing. Allowing a payload would give a peer a second, unnumbered
             // way to deliver bytes that the protocol above never sees.
             if (payload_size) return fail(secure_tunnel_fault_t::malformed_k);
             receiving_ = direction_t::shut_k;

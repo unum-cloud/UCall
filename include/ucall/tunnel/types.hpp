@@ -91,7 +91,7 @@ enum class secure_tunnel_role_t : std::uint8_t { initiator_k, responder_k };
  */
 enum class secure_tunnel_request_t : std::uint8_t {
 
-    /** Carry on: finish the handshake, or do nothing because it is finished. */
+    /** Continue: finish the handshake, or do nothing because it is finished. */
     proceed_k,
 
     /** Produce a close record and shut this side's sending direction. */
@@ -180,7 +180,7 @@ enum class secure_tunnel_fault_t : std::uint8_t {
     /** Nothing has failed. */
     none_k,
 
-    /** Configuration is wrong - a missing key, or a pattern this build does not carry. */
+    /** Configuration is wrong - a missing key, or a pattern this build does not include. */
     misconfigured_k,
 
     /** A length, a kind byte, or a record shape the wire format does not allow. */
@@ -213,7 +213,7 @@ enum class secure_tunnel_fault_t : std::uint8_t {
 [[nodiscard]] inline auto format_as(secure_tunnel_fault_t value) noexcept { return secure_tunnel_fault_name(value); }
 
 /**
- *  @brief What a record carries, from the byte sealed inside its authenticated encryption.
+ *  @brief What a record contains, from the byte sealed inside its authenticated encryption.
  *
  *  Named for records rather than messages, because a message in a tunnel is what @c advance writes
  *  during a handshake, and the two are framed alike but mean nothing alike.
@@ -257,7 +257,7 @@ static constexpr std::size_t secure_tunnel_tailroom_k = 1 + 16;
 static constexpr std::size_t secure_tunnel_overhead_k = secure_tunnel_headroom_k + secure_tunnel_tailroom_k;
 
 /**
- *  @brief Largest payload the wire format can carry, whatever a configuration asks for.
+ *  @brief Largest payload the wire format can hold, whatever a configuration asks for.
  *
  *  A two-byte length prefix names at most 65535 bytes, and the kind and tag come out of that
  *  budget. This is the ceiling @c secure_tunnel_config_t::max_payload is clamped down to.
@@ -273,7 +273,7 @@ static constexpr std::size_t secure_tunnel_payload_ceiling_k = 65535 - secure_tu
 static constexpr std::size_t secure_tunnel_max_record_k = secure_tunnel_payload_ceiling_k + secure_tunnel_overhead_k;
 
 /**
- *  @brief How much room this connection needs around a payload, and how much payload it carries.
+ *  @brief How much room this connection needs around a payload, and how much payload fits.
  *
  *  One value rather than three accessors, because a caller wanting any of these usually wants the
  *  sum. Per connection rather than per mode: the payload cap is policy in every mode - a loopback
@@ -288,7 +288,7 @@ struct secure_tunnel_geometry_t {
     /** Bytes written behind it. Zero when the mode frames nothing. */
     std::size_t tailroom {};
 
-    /** Largest payload a single record carries on this connection. */
+    /** Largest payload a single record holds on this connection. */
     std::size_t max_payload {};
 
     /** Bytes one whole record occupies, which is what a caller must reserve. */
@@ -339,7 +339,7 @@ struct secure_tunnel_config_t {
      *
      *  @note Spans rather than bare pointers throughout this struct.
      *
-     *  A member cannot carry a fixed extent the way a parameter can, so a pointer would make the
+     *  A member cannot have a fixed extent the way a parameter can, so a pointer would make the
      *  width an assumption no one could check; a span of the wrong width is @c misconfigured_k
      *  instead of silent memory the tunnel reads past. Empty means absent, so no separate flag can
      *  disagree with the bytes beside it.
@@ -364,7 +364,7 @@ struct secure_tunnel_config_t {
     span<byte_t const> peer_public {};
 
     /**
-     *  @brief Largest payload one record may carry, or zero for @c secure_tunnel_default_payload_k.
+     *  @brief Largest payload one record may hold, or zero for @c secure_tunnel_default_payload_k.
      *
      *  Clamped downwards to @c secure_tunnel_payload_ceiling_k, never upwards, so asking for more
      *  than the wire format allows yields the wire format's answer rather than a failure. Set it
@@ -409,10 +409,10 @@ struct secure_tunnel_step_t {
  *
  *  @c consumed is zero if and only if the record could not be opened, with @c fault() saying why.
  *      That is the same idiom @c seal uses, and it is unambiguous in a way an empty @c payload
- *      would not be: a close record legitimately carries no payload, while a record that opened at
+ *      would not be: a close record legitimately contains no payload, while a record that opened at
  *      all consumed at least its own framing.
  *
- *  Carries no state of its own. A peer's close leaves the tunnel @c ready_k with @c may_open()
+ *  Holds no state of its own. A peer's close leaves the tunnel @c ready_k with @c may_open()
  *  false, so a caller must read @c kind regardless, and a mirrored state field would be a second
  *  authority that says nothing the first does not.
  */

@@ -68,7 +68,7 @@ inline void print_key(std::FILE* file, ucall_noise_key_t const& key) noexcept {
     fmt::print(file, "{:02x}\n", fmt::join(key, ""));
 }
 
-/** An engine name as @c ucall_io_backend_name spells it, left untouched when it names none. */
+/** A backend name as @c ucall_io_backend_name spells it, left untouched when it names none. */
 inline bool parse_backend(std::string_view text, ucall_io_backend_t& backend) noexcept {
     return ucall_io_backend_from_name(bytes_view(text), &backend) == ucall_status_success_k;
 }

@@ -480,7 +480,7 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
  *  still ends the batch polling once the other loop drained. */
 static case_result_t test_setup_failure_ends_batch_polling(sweep_cell_t const&) {
 #if UCALL_WITH_POSIX && !UCALL_OS_WINDOWS_
-    using network_t = serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>>;
+    using network_t = serial_network<uc::io::io_queue_variant<uc::io::posix_queue_t>>;
     ucall_server_t server {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};

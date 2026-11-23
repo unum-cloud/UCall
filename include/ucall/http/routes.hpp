@@ -99,7 +99,8 @@ inline bool parse_segment(std::string_view segment, parsed_segment_t& parsed) no
            search_type_::find(parsed.content, '}') == std::string_view::npos;
 }
 
-/** Template strings remain borrowed; complete registration before concurrent matching begins. */
+/** The caller keeps template strings allocated until the routes are freed; complete registration
+ *  before concurrent matching begins. */
 template <typename search_type_ = route_search_t, typename allocator_type_ = st::default_allocator<byte_t>>
 class route_trie {
     template <typename element_type_>

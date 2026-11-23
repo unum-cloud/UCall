@@ -46,6 +46,11 @@ typedef struct ucall_network_interface_t {
     /** Encryption for connections accepted here. Default: ucall_security_none_k. */
     ucall_security_t security;
 
+    /** The NUMA node the kernel ties @c device_name to, or -1 for none, an unnamed device or an
+     *  operating system that reports none; filled only in the resolved options. UCall places
+     *  nothing by it: the caller should init and poll from threads on that node. */
+    int32_t memory_domain;
+
     /** Server identity for handshakes. Required when @c security is not none. */
     ucall_noise_key_t const* noise_private_key;
 
@@ -272,25 +277,25 @@ UCALL_EXPORT void ucall_server_take_calls(ucall_server_take_calls_t* arguments);
  *  never the copies the kernel makes between socket buffers and user memory. */
 typedef struct ucall_event_loop_statistics_t {
 
-    /** Engine polls the loop issued, each taking zero or more completions. */
+    /** Queue polls the loop issued, each taking zero or more completions. */
     uint64_t polls;
 
-    /** Engine polls that took no completion. */
+    /** Queue polls that took no completion. */
     uint64_t empty_polls;
 
     /** System calls: io_uring enters, or other backends' waits, registrations and socket calls. */
     uint64_t kernel_enters;
 
-    /** Operations the loop asked of its engine. */
+    /** Operations the loop asked of its queue. */
     uint64_t submissions;
 
-    /** Results the loop took from its engine, each connection of an accept among them. */
+    /** Results the loop took from its queue, each connection of an accept among them. */
     uint64_t completions;
 
     /** Submission entries io_uring filled and completion entries it reaped; zero elsewhere. */
     uint64_t kernel_entries;
 
-    /** Pending operations, or io_uring multishot receives, the engine asked to cancel. */
+    /** Pending operations, or io_uring multishot receives, the queue asked to cancel. */
     uint64_t cancellations;
 
     /** Connections accepted and handed to this loop. */
@@ -354,7 +359,7 @@ typedef struct ucall_event_loop_statistics_t {
      *  Noise. */
     uint64_t shed_connections;
 
-    /** File windows the engine left unpinned, as it pins none, or the locked-memory cap or a full
+    /** File windows the queue left unpinned, as it pins none, or the locked-memory cap or a full
      *  table refused; their sends pin or copy on their own. */
     uint64_t windows_unpinned;
 
@@ -545,7 +550,7 @@ typedef struct ucall_server_add_http_endpoint_t {
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c callback is @c NULL, the @c verb is unknown, or
- *    the template is empty, lacks its leading slash, carries a query, a fragment or a malformed
+ *    the template is empty, lacks its leading slash, has a query, a fragment or a malformed
  *    segment, or names a placeholder another template names differently at the same position.
  *  - @c ucall_status_contended_k A loop of the server was already polled.
  *  - @c ucall_status_already_exists_k An endpoint of the same @c verb has the same or an equivalent
@@ -555,7 +560,8 @@ UCALL_EXPORT void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_
 
 /**
  *  @brief Callback type for handling batched requests on the server side.
- *  @param[in] requests Borrowed array of retained request handles; copy the handles to defer work.
+ *  @param[in] requests The library's array of retained request handles, valid only during the
+ *      callback; copy the handles to defer work.
  *  @param[in] count Number of requests in the array; always positive.
  *  @param[in] context User-defined context pointer.
  *  @note The array is valid only during the callback. Each request stays valid until a reply
@@ -626,10 +632,9 @@ typedef struct ucall_server_add_http_batch_endpoint_t {
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
- *  - @c ucall_status_invalid_argument_k The @c endpoint output or the @c callback is @c NULL, the
- *    minimum batch size exceeds the maximum, the @c verb is unknown, or the template is empty,
- *    lacks its leading slash, carries a query, a fragment or a malformed segment, or names a
- *    placeholder another template names differently at the same position.
+ *  - @c ucall_status_invalid_argument_k The @c endpoint output or @c callback is @c NULL, the batch
+ *    bounds are inverted, the @c verb is unknown, or the template is empty, lacks its leading
+ *    slash, has a query, a fragment or a malformed segment, or names a conflicting placeholder.
  *  - @c ucall_status_contended_k A loop of the server was already polled.
  *  - @c ucall_status_already_exists_k An endpoint of the same @c verb has the same or an equivalent
  *    template.
@@ -660,7 +665,8 @@ typedef struct ucall_server_request_path_t {
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Output for a borrowed view of the path. */
+    /** Output for a view into the request's bytes holding the path, valid until the request is
+     *  released. */
     ucall_bytes_view_t* path;
 
 } ucall_server_request_path_t;
@@ -692,7 +698,8 @@ typedef struct ucall_server_request_query_t {
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Output for a borrowed view of the query. */
+    /** Output for a view into the request's bytes holding the query, valid until the request is
+     *  released. */
     ucall_bytes_view_t* query;
 
 } ucall_server_request_query_t;
@@ -735,7 +742,8 @@ typedef struct ucall_server_request_path_segment_t {
     /** The zero-based index of the path component to extract. */
     size_t index;
 
-    /** Output for a borrowed view of the path component. */
+    /** Output for a view into the request's bytes holding the path component, valid until the
+     *  request is released. */
     ucall_bytes_view_t* segment;
 
 } ucall_server_request_path_segment_t;
@@ -769,7 +777,8 @@ typedef struct ucall_server_request_path_parameter_t {
     /** The @b case-sensitive placeholder name, without braces. */
     ucall_bytes_view_t name;
 
-    /** Output for a borrowed view of the captured value. */
+    /** Output for a view into the request's bytes holding the captured value, valid until the
+     *  request is released. */
     ucall_bytes_view_t* value;
 
 } ucall_server_request_path_parameter_t;
@@ -806,7 +815,8 @@ typedef struct ucall_server_request_query_parameter_t {
     /** The @b case-sensitive name of the parameter to extract. */
     ucall_bytes_view_t name;
 
-    /** Output for a borrowed view of the parameter value. */
+    /** Output for a view into the request's bytes holding the parameter value, valid until the
+     *  request is released. */
     ucall_bytes_view_t* value;
 
 } ucall_server_request_query_parameter_t;
@@ -842,7 +852,8 @@ typedef struct ucall_server_request_header_t {
     /** The name of the HTTP header to extract (case-insensitive). */
     ucall_bytes_view_t name;
 
-    /** Output for a borrowed view of the header value. */
+    /** Output for a view into the request's bytes holding the header value, valid until the request
+     *  is released. */
     ucall_bytes_view_t* value;
 
 } ucall_server_request_header_t;
@@ -903,10 +914,12 @@ typedef struct ucall_server_request_field_t {
     /** Which field line, below @c ucall_server_request_fields_count(). */
     size_t index;
 
-    /** Output for a borrowed view of its name, lowercased as the parser keeps every field name. */
+    /** Output for a view into the request's bytes holding its name, lowercased as the parser keeps
+     *  every field name, valid until the request is released. */
     ucall_bytes_view_t* name;
 
-    /** Output for a borrowed view of its value, without surrounding whitespace. */
+    /** Output for a view into the request's bytes holding its value, without surrounding
+     *  whitespace, valid until the request is released. */
     ucall_bytes_view_t* value;
 
 } ucall_server_request_field_t;
@@ -975,7 +988,8 @@ typedef struct ucall_server_request_body_t {
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Output for a borrowed view of the body. */
+    /** Output for a view into the request's bytes holding the body, valid until the request is
+     *  released. */
     ucall_bytes_view_t* body;
 
 } ucall_server_request_body_t;
@@ -1008,8 +1022,8 @@ typedef struct ucall_server_request_body_chunk_t {
     /** The received request inside the @c ucall_received_http_request_callback_t. */
     ucall_received_http_request_t request;
 
-    /** Output for a borrowed view of the bytes decoded since the last pull, valid until the next
-     *  pull and written once the outcome is final; empty once the body ended. */
+    /** Output for a view into the response's bytes decoded since the last pull, valid until the
+     *  next pull and written once the outcome is final; empty once the body ended. */
     ucall_bytes_view_t* data;
 
 } ucall_server_request_body_chunk_t;
@@ -1129,8 +1143,8 @@ typedef struct ucall_server_reply_content_t {
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c request is @c NULL, a view is invalid, a 204 or 304
- *    carries a body, the @c http_status is outside 200 to 599, or a header line is malformed or
- *    sets a length, a transfer encoding, a date, a server name or a connection.
+ *    has a body, the @c http_status is outside 200 to 599, or a header line is malformed or sets a
+ *    length, a transfer encoding, a date, a server name or a connection.
  *  - @c ucall_status_already_exists_k The request was already answered.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
  *  - @c ucall_status_overflow_k The reply's length overflows its counter.
@@ -1195,11 +1209,12 @@ typedef enum ucall_reply_part_kind_t {
  *  after any synchronous refusal. */
 typedef struct ucall_file_range_t {
 
-    /** A regular file, borrowed. Queuing it switches the open file description the caller shares
-     *  to unbuffered, blocking reads: @c O_DIRECT on and @c O_NONBLOCK off on Linux and FreeBSD,
-     *  @c F_NOCACHE on macOS. On Windows it is a CRT descriptor of a disk file, which the loop
-     *  reopens once for its own unbuffered, overlapped reads, leaving the caller's untouched. A
-     *  descriptor that cannot switch is refused with @c ucall_status_invalid_argument_k. */
+    /** A regular file the caller owns and keeps open until the reply is final. Queuing it switches
+     *  the open file description the caller shares to unbuffered, blocking reads: @c O_DIRECT on
+     *  and @c O_NONBLOCK off on Linux and FreeBSD, @c F_NOCACHE on macOS. On Windows it is a CRT
+     *  descriptor of a disk file, which the loop reopens once for its own unbuffered, overlapped
+     *  reads, leaving the caller's untouched. A descriptor that cannot switch is refused with @c
+     *  ucall_status_invalid_argument_k. */
     int file_descriptor;
 
     /** The range's first byte. */
@@ -1344,7 +1359,7 @@ typedef struct ucall_server_reply_begin_t {
  *  any other failure leaves the request unanswered. The body is chunked for HTTP/1.1 peers.
  *  Supplying @c Content-Length switches to identity encoding, which is what @c Range responses
  *  need, and @c ucall_server_reply_end() checks the chunks summed to it. An HTTP/1.0 peer without
- *  it gets a body delimited by closing the connection. A @c HEAD request, @c 204 and @c 304 carry
+ *  it gets a body delimited by closing the connection. A @c HEAD request, @c 204 and @c 304 have
  *  no body: chunks for a @c HEAD request are accepted and dropped.
  *
  *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.

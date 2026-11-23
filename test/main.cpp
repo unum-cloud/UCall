@@ -2,7 +2,7 @@
  *  @file test/main.cpp
  *  @author Ash Vardanian
  *  @date November 12, 2026
- *  @brief The library suite's entry point: the outcome word, every engine under every admitted CPU
+ *  @brief The library suite's entry point: the outcome word, every queue under every admitted CPU
  *      class, and the network cells.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build

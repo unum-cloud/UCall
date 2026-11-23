@@ -39,7 +39,7 @@ static std::size_t interface_event_loops(ucall_network_interface_t const& networ
     return fu::min_of(loops, network_interface.max_concurrent_connections);
 }
 
-/** Whether @p descriptor is a listening stream socket, as the engine vets a borrowed listener. */
+/** Whether @p descriptor is a listening stream socket, as the library vets a caller's listener. */
 static bool listener_valid(std::intptr_t descriptor) noexcept {
     descriptor_t const duplicate = utilities::socket_duplicate_listener(descriptor);
     if (duplicate < 0) return false;
@@ -86,8 +86,8 @@ static bool interface_valid(ucall_network_interface_t const& network_interface) 
     return address_valid(text_view(settings.address));
 }
 
-/** What this build cannot serve: a device outside Linux, several loops on Windows, or a borrowed
- *  listener under Registered I/O. */
+/** What this build cannot serve: a device outside Linux, several loops on Windows, or a
+ *  caller-owned listener under Registered I/O. */
 static bool interface_supported(ucall_network_interface_t const& network_interface,
                                 ucall_io_backend_t backend) noexcept {
     if (!UCALL_OS_LINUX_ && network_interface.device_name.length) return false;
@@ -166,7 +166,8 @@ static ucall_status_t resolve(ucall_server_handle_t& server, ucall_server_option
         network_interface.address = keep_text(server, offset, text_view(network_interface.address));
         network_interface.device_name = keep_text(server, offset, text_view(network_interface.device_name));
         network_interface.event_loops = interface_event_loops(options.interfaces[i]);
-        // The engine reports a borrowed listener only through the call's own copy of the options.
+        network_interface.memory_domain = utilities::device_memory_domain(text_view(network_interface.device_name));
+        // The library reports a caller-owned listener only through the call's copy of the options.
         network_interface.listen_descriptor = nullptr;
         network_interface.max_pipelined_requests = fu::max_of<std::size_t>(network_interface.max_pipelined_requests, 1);
         if (network_interface.noise_private_key) {
@@ -225,7 +226,7 @@ static void add_endpoint(arguments_type_* arguments, ucall_http_batch_endpoint_t
         publish(arguments->outcome, ucall_status_out_of_memory_k);
         return;
     }
-    // The trie may borrow segments of a template it then refuses, so the copy stays either way.
+    // The trie may point into segments of a template it then refuses, so the copy stays either way.
     ucall_stub_template_t* const copy = kept.release();
     copy->next = std::exchange(server.templates, copy);
     ucall_status_t const inserted = server.routes.insert(http::text_view(copy->text), arguments->verb, copy);
@@ -289,7 +290,7 @@ void ucall_server_init(ucall_server_init_t* arguments) {
 
 void ucall_server_free(ucall_server_t server) {
     if (!server) return;
-    // A bound client keeps its server, as the engine shares a loop's engine with it.
+    // A bound client keeps its server, as the library shares a loop's queue with it.
     if (atomic_ref<std::size_t> {server->bound_clients}.load(std::memory_order_acquire)) return;
     allocator_delete<ucall_server_handle_t, allocator_t> {server->allocator}(server);
 }

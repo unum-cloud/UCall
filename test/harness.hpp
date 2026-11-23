@@ -22,7 +22,7 @@
  *  - <tt>UCALL_TRAP_ON_FAILURE</tt> : Traps on the first failed check, to stop there under a
  *    debugger.
  *  - <tt>UCALL_NO_SKIPS</tt> : Exits with 3 when any case skipped.
- *  - <tt>UCALL_BACKEND</tt> : The one engine a sweep keeps; unset keeps every compiled one.
+ *  - <tt>UCALL_BACKEND</tt> : The one queue a sweep keeps; unset keeps every compiled one.
  *  - <tt>UCALL_CPU_CLASS_CEILING</tt> : The one CPU class ceiling a sweep keeps; unset keeps every
  *    class this machine runs.
  *  - <tt>UCALL_TEST_DIRECT_DIRECTORY</tt> : Where cases reading files with @c O_DIRECT make their
@@ -135,7 +135,7 @@ struct machine_t {
     st::vector<ucall_io_backend_t> compiled_backends;
 };
 
-/** Probes the classes this machine admits and the engines this build compiled; defined later. */
+/** Probes the classes this machine admits and the queues this build compiled; defined later. */
 inline machine_t probe_machine() noexcept;
 
 /** Prints the version line, the classes admitted and the backends compiled. */
@@ -311,7 +311,7 @@ struct split_mix_generator_t {
 
 #pragma endregion Shared Settings
 
-/** What the suites read: the run's settings, then the engine and class a sweep keeps and where
+/** What the suites read: the run's settings, then the queue and class a sweep keeps and where
  *  unbuffered file cases make their directories. */
 struct test_settings_t : common_settings_t {
     double scale = 1.0;
@@ -333,7 +333,7 @@ inline test_settings_t read_test_settings(int argc, char** argv) noexcept {
     settings.program = argc != 0 ? argv[0] : "";
     if (char const* text = setting_text(argc, argv, "UCALL_BACKEND", "--backend");
         text && !tools::parse_backend(text, settings.backend))
-        exit_unparsed("UCALL_BACKEND", text, "an engine name such as posix or linux-uring618");
+        exit_unparsed("UCALL_BACKEND", text, "a queue name such as posix or linux-uring618");
     if (char const* text = setting_text(argc, argv, "UCALL_CPU_CLASS_CEILING", "--cpu-class-ceiling");
         text && !tools::parse_cpu_class(text, settings.cpu_class_ceiling))
         exit_unparsed("UCALL_CPU_CLASS_CEILING", text, "a CPU class name such as serial or aws-g2");
@@ -543,7 +543,7 @@ inline constexpr std::size_t fixture_buffer_bytes_k = 4096;
 /** Fills a range with one repeated value, keeping its pointer and length together. */
 inline void fill_with(span<byte_t> bytes, byte_t value) noexcept {
     // `memset` with a null destination is undefined even when it writes no bytes, and an empty
-    // span carries one - the same hazard `array::append_n` guards against.
+    // span may have one - the same hazard `array::append_n` guards against.
     if (bytes.size()) std::memset(bytes.data(), std::to_integer<int>(value), bytes.size());
 }
 
@@ -1222,7 +1222,7 @@ void run_cell_case(sz::string_t const& cell_arguments, char const* stem, test_ty
     run_test_case(label.c_str(), [&] { return keeping_descriptors([&] { return test(arguments...); }); });
 }
 
-/** One cell of a suite's sweep: the engine it runs on, the CPU class ceiling, how it encrypts. */
+/** One cell of a suite's sweep: the queue it runs on, the CPU class ceiling, how it encrypts. */
 struct sweep_cell_t {
     ucall_io_backend_t backend = ucall_io_backend_automatic_k;
     ucall_cpu_class_t cpu_class_ceiling = ucall_cpu_class_unknown_k;
@@ -1246,13 +1246,13 @@ struct sweep_cell_t {
                                                         resolved.cpu_class_ceiling == cell.cpu_class_ceiling);
 }
 
-/** The engines this build compiled, in the order of @c ucall_io_backend_t. */
+/** The queues this build compiled, in the order of @c ucall_io_backend_t. */
 [[nodiscard]] inline st::vector<ucall_io_backend_t> compiled_backends() noexcept {
-    struct engine_t {
+    struct queue_t {
         ucall_io_backend_t backend;
         bool compiled;
     };
-    engine_t const engines[] {
+    queue_t const queues[] {
         {ucall_io_backend_posix_k, UCALL_WITH_POSIX},
         {ucall_io_backend_linux_epollaio_k, UCALL_WITH_LINUX_EPOLLAIO},
         {ucall_io_backend_linux_uring612_k, UCALL_WITH_LINUX_URING},
@@ -1262,8 +1262,8 @@ struct sweep_cell_t {
         {ucall_io_backend_windows_rio_k, UCALL_WITH_WINDOWS_RIO},
     };
     st::vector<ucall_io_backend_t> backends;
-    for (engine_t const& engine : engines)
-        if (engine.compiled && st::failed(backends.push_back(ucall_io_backend_t {engine.backend}))) std::abort();
+    for (queue_t const& queue : queues)
+        if (queue.compiled && st::failed(backends.push_back(ucall_io_backend_t {queue.backend}))) std::abort();
     return backends;
 }
 

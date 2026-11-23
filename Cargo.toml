@@ -34,7 +34,7 @@ path = "rust/lib.rs"
 
 [dependencies]
 # CMake builds each crate's tree in place of downloading the revision the submodule pins.
-forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "2105dd71bbbe3e22c92cf4a4f332a579abb8b780", default-features = false }
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "6bd10ce124b3804719ca297ac61092ac5773d627", default-features = false }
 smashtable = { version = "1.0.0-rc.1", git = "https://github.com/ashvardanian/SmashTable", rev = "30e349dcd1e582896386d959d4a36badce061787" }
 stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", rev = "4ac15c46016516fd8d22bf453126c70d9a88bb81", default-features = false }
 
