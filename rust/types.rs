@@ -9,16 +9,16 @@
 // The C mirror keeps the C spelling of every name.
 #![allow(non_camel_case_types, non_upper_case_globals)]
 
+use core::cell::UnsafeCell;
 use core::ffi::{CStr, c_char, c_int, c_void};
 use core::fmt;
-use core::future::{Future, IntoFuture};
-use core::marker::PhantomData;
+use core::future::Future;
+use core::marker::{PhantomData, PhantomPinned};
 use core::pin::Pin;
-use core::ptr::{self, NonNull};
+use core::ptr;
 use core::str::FromStr;
 use core::task::{Context, Poll};
 use core::time::Duration;
-use std::sync::Arc;
 
 // region: Raw Declarations
 
@@ -37,11 +37,6 @@ pub(crate) type ucall_percent_mode_t = c_int;
 
 pub(crate) const ucall_status_success_k: ucall_status_t = 0;
 pub(crate) const ucall_status_deferred_k: ucall_status_t = 1;
-pub(crate) const ucall_status_out_of_memory_k: ucall_status_t = 2;
-pub(crate) const ucall_status_uninitialized_k: ucall_status_t = 12;
-pub(crate) const ucall_status_invalid_argument_k: ucall_status_t = 17;
-pub(crate) const ucall_status_already_exists_k: ucall_status_t = 19;
-pub(crate) const ucall_status_connection_closed_k: ucall_status_t = 21;
 pub(crate) const ucall_status_peer_rejected_k: ucall_status_t = 24;
 
 #[repr(C)]
@@ -281,53 +276,66 @@ impl Default for ucall_outcome_t {
     }
 }
 
-/// A reply still sending a file or path part: it owns the outcome the event loop makes final,
-/// and the descriptors its parts borrow stay open for `'f`, until it is final.
+/// A caller-lent slot for a reply that may still send a file or path part after it returns: the
+/// event loop makes its outcome final in place, so the slot is pinned, and the descriptors its
+/// parts borrow stay open for `'f`.
 ///
+/// A new slot is final, and each reply lent to it waits for the slot's previous one only while
+/// that still sends, so a server keeps a ring of slots rather than one per request.
 /// [`Deferred::status`] polls without blocking, [`Deferred::wait`] blocks until the reply is
-/// final, and `.await` polls it from async code. Dropping one that is not final waits for it, so
-/// it belongs off the polling thread, which is the one finishing it.
+/// final, and `.await` re-polls it from async code. Dropping one that is not final waits for it,
+/// so it belongs off the polling thread, which is the one finishing it.
 #[must_use = "dropping a deferred reply waits for it"]
 pub struct Deferred<'f> {
-    // A raw heap address rather than a `Box`, as the event loop writes it while this moves.
-    outcome: NonNull<ucall_outcome_t>,
+    // The library writes the outcome through a raw pointer while a reply sends.
+    outcome: UnsafeCell<ucall_outcome_t>,
     files: PhantomData<Descriptor<'f>>,
+    _pinned: PhantomPinned,
 }
 
-// The outcome moves with the `Deferred`, and until it is final only the library writes it.
+// Until a reply is lent to it the slot is plain data, and afterwards only the library writes it.
 unsafe impl Send for Deferred<'_> {}
 
+impl Default for Deferred<'_> {
+    fn default() -> Self {
+        Deferred::new()
+    }
+}
+
 impl Deferred<'_> {
-    /// An outcome at a stable heap address, for a verb that may finish after it returns.
-    pub(crate) fn pending() -> Self {
-        Deferred { outcome: NonNull::from(Box::leak(Box::new(ucall_outcome_t::default()))), files: PhantomData }
+    /// An empty slot, final from the start.
+    pub fn new() -> Self {
+        Deferred { outcome: UnsafeCell::new(ucall_outcome_t::default()), files: PhantomData, _pinned: PhantomPinned }
     }
 
-    /// The outcome to hand the verb.
-    pub(crate) fn raw(&self) -> *mut ucall_outcome_t {
-        self.outcome.as_ptr()
+    /// Waits only while the slot's previous reply still sends, then lends its outcome afresh.
+    pub(crate) fn reuse(self: Pin<&mut Self>) -> *mut ucall_outcome_t {
+        let outcome = self.outcome.get();
+        unsafe {
+            ucall_outcome_wait(outcome);
+            outcome.write(ucall_outcome_t::default());
+        }
+        outcome
     }
 
     /// `Err(Status::Deferred)` until the reply is final, then its final status, read without
     /// blocking through `ucall_outcome_status`.
     pub fn status(&self) -> core::result::Result<(), Status> {
-        Status::from_raw(unsafe { ucall_outcome_status(self.raw()) })
+        Status::from_raw(unsafe { ucall_outcome_status(self.outcome.get()) })
     }
 
     /// Blocks until the reply is final, through `ucall_outcome_wait`, and reports how it ended.
-    pub fn wait(self) -> Result<()> {
-        unsafe { ucall_outcome_wait(self.raw()) };
-        check(unsafe { *self.raw() })
+    pub fn wait(&self) -> Result<()> {
+        unsafe {
+            ucall_outcome_wait(self.outcome.get());
+            check(*self.outcome.get())
+        }
     }
 }
 
 impl Drop for Deferred<'_> {
     fn drop(&mut self) {
-        // Once final, the library touches the outcome no more, so it is freed here.
-        unsafe {
-            ucall_outcome_wait(self.raw());
-            drop(Box::from_raw(self.raw()));
-        }
+        unsafe { ucall_outcome_wait(self.outcome.get()) };
     }
 }
 
@@ -337,38 +345,18 @@ impl fmt::Debug for Deferred<'_> {
     }
 }
 
-impl<'f> IntoFuture for Deferred<'f> {
-    type Output = Result<()>;
-    type IntoFuture = Wait<'f>;
-
-    fn into_future(self) -> Wait<'f> {
-        Wait(Some(self))
-    }
-}
-
-/// A [`Deferred`] being awaited: every poll reads its status through `ucall_outcome_status`, and
-/// one not yet final yields to the executor, asking to be polled again.
-///
-/// The library has no wake-up, so an executor re-polls it while other tasks run, and no poll
-/// waits on the library; [`Deferred::wait`] does, on the CPU class's waiter.
-#[must_use = "an awaited reply does nothing unless polled"]
-pub struct Wait<'f>(Option<Deferred<'f>>);
-
-impl Future for Wait<'_> {
+/// Every poll reads the status through `ucall_outcome_status`, and one not yet final yields to the
+/// executor, asking to be polled again: the library has no wake-up, so no poll waits on it.
+impl Future for Deferred<'_> {
     type Output = Result<()>;
 
     fn poll(self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
-        let awaited = &mut self.get_mut().0;
-        match awaited.take() {
-            None => Poll::Ready(Err(fail(Status::InvalidArgument, "the reply was already awaited"))),
-            Some(deferred) if deferred.status() == Err(Status::Deferred) => {
-                *awaited = Some(deferred);
-                context.waker().wake_by_ref();
-                Poll::Pending
-            }
-            // A final outcome returns from the wait at once.
-            Some(deferred) => Poll::Ready(deferred.wait()),
+        if self.status() == Err(Status::Deferred) {
+            context.waker().wake_by_ref();
+            return Poll::Pending;
         }
+        // A final outcome returns from the wait at once.
+        Poll::Ready(self.wait())
     }
 }
 
@@ -836,29 +824,45 @@ impl Security {
     }
 }
 
-/// Decides whether a peer presenting an authenticated static key may proceed past the handshake.
+/// Decides whether a peer presenting an authenticated static key may proceed past the handshake:
+/// a handler borrowed for `'handler`, lent to the library as its C callback and context.
 ///
 /// A server runs it on the polling thread completing the handshake, and a client on its owner
 /// thread inside [`Client::take_completed`](crate::Client::take_completed). A panic aborts the
 /// process.
-pub type PeerAuthorizer = dyn Fn(&NoiseKey) -> bool + Send + Sync;
+#[derive(Clone, Copy)]
+pub struct PeerAuthorizer<'handler> {
+    callback: ucall_peer_authorizer_t,
+    context: *mut c_void,
+    handler: PhantomData<&'handler ()>,
+}
 
-/// Lends an optional authorizer as the C callback and the context it is called with.
-///
-/// The context points at `authorizer` itself, which must stay in place until the handle is freed.
-pub(crate) fn lend_authorizer(authorizer: &Option<Arc<PeerAuthorizer>>) -> (ucall_peer_authorizer_t, *mut c_void) {
-    match authorizer {
-        Some(authorizer) => (Some(authorize_trampoline), ptr::from_ref(authorizer).cast_mut().cast()),
-        None => (None, ptr::null_mut()),
+// The handler is `Sync`, so any thread may call it through the shared reference it was lent as.
+unsafe impl Send for PeerAuthorizer<'_> {}
+unsafe impl Sync for PeerAuthorizer<'_> {}
+
+impl<'handler> PeerAuthorizer<'handler> {
+    /// Admits a peer exactly when `handler` answers `true` for its key.
+    pub fn new<F: Fn(&NoiseKey) -> bool + Sync>(handler: &'handler F) -> Self {
+        let context = ptr::from_ref(handler).cast_mut().cast();
+        PeerAuthorizer { callback: Some(authorize_trampoline::<F>), context, handler: PhantomData }
+    }
+
+    /// The C callback and context of an optional authorizer.
+    pub(crate) fn raw(authorizer: Option<PeerAuthorizer<'_>>) -> (ucall_peer_authorizer_t, *mut c_void) {
+        authorizer.map_or((None, ptr::null_mut()), |authorizer| (authorizer.callback, authorizer.context))
     }
 }
 
 /// # Safety
-/// `context` must address a live `Arc<PeerAuthorizer>`, and `key` a 32-byte key.
-unsafe extern "C" fn authorize_trampoline(key: *const ucall_noise_key_t, context: *mut c_void) -> ucall_status_t {
-    let (authorizer, key) = unsafe { (&*context.cast::<Arc<PeerAuthorizer>>(), &*key) };
+/// `context` must address a live `F`, and `key` a 32-byte key.
+unsafe extern "C" fn authorize_trampoline<F: Fn(&NoiseKey) -> bool + Sync>(
+    key: *const ucall_noise_key_t,
+    context: *mut c_void,
+) -> ucall_status_t {
+    let (handler, key) = unsafe { (&*context.cast::<F>(), &*key) };
     // A panic cannot unwind through this C frame, so it aborts the process.
-    if authorizer(key) { ucall_status_success_k } else { ucall_status_peer_rejected_k }
+    if handler(key) { ucall_status_success_k } else { ucall_status_peer_rejected_k }
 }
 
 /// When a body is handed over: once it is buffered, or at headers time, with the body pulled
@@ -917,41 +921,48 @@ pub enum LogFormat {
     JSON,
 }
 
-/// Receives one formatted log line, without a trailing newline, on whichever thread produced it,
-/// polling threads included; it should return quickly, and a panic aborts the process.
-pub type LogCallback = dyn Fn(LogLevel, &[u8]) + Send + Sync;
-
-/// The one log sink of a server or a client; without one, the library writes nothing anywhere.
-#[derive(Clone)]
-pub struct Log {
-    /// Receives every line at or above `level`.
-    pub callback: Arc<LogCallback>,
-    /// The line format.
-    pub format: LogFormat,
-    /// Lines below this severity are never formatted.
-    pub level: LogLevel,
+/// The one log sink of a server or a client: a handler borrowed for `'handler`, which receives
+/// each formatted line, without a trailing newline, on whichever thread produced it, polling
+/// threads included. It should return quickly, and a panic aborts the process; without a sink,
+/// the library writes nothing anywhere.
+#[derive(Clone, Copy)]
+pub struct Log<'handler> {
+    raw: ucall_log_t,
+    handler: PhantomData<&'handler ()>,
 }
 
-/// Lends an optional sink as the C log, whose context points at the callback inside `log`, which
-/// must stay in place until the handle is freed.
-pub(crate) fn lend_log(log: &Option<Box<Log>>) -> ucall_log_t {
-    match log {
-        Some(log) => ucall_log_t {
-            callback: Some(log_trampoline),
-            context: ptr::from_ref(&log.callback).cast_mut().cast(),
-            format: log.format as ucall_log_format_t,
-            level: log.level as ucall_log_level_t,
-        },
-        None => ucall_log_t { callback: None, context: ptr::null_mut(), format: 0, level: 0 },
+// The handler is `Sync`, so any thread may call it through the shared reference it was lent as.
+unsafe impl Send for Log<'_> {}
+unsafe impl Sync for Log<'_> {}
+
+impl<'handler> Log<'handler> {
+    /// Hands `handler` every line at or above `level`, formatted as `format` says.
+    pub fn new<F: Fn(LogLevel, &[u8]) + Sync>(handler: &'handler F, format: LogFormat, level: LogLevel) -> Self {
+        let raw = ucall_log_t {
+            callback: Some(log_trampoline::<F>),
+            context: ptr::from_ref(handler).cast_mut().cast(),
+            format: format as ucall_log_format_t,
+            level: level as ucall_log_level_t,
+        };
+        Log { raw, handler: PhantomData }
+    }
+
+    /// The C log of an optional sink, logging nothing without one.
+    pub(crate) fn raw(log: Option<Log<'_>>) -> ucall_log_t {
+        log.map_or(ucall_log_t { callback: None, context: ptr::null_mut(), format: 0, level: 0 }, |log| log.raw)
     }
 }
 
 /// # Safety
-/// `context` must address a live `Arc<LogCallback>`, and `line` a valid view.
-unsafe extern "C" fn log_trampoline(level: ucall_log_level_t, line: ucall_bytes_view_t, context: *mut c_void) {
-    let (callback, line) = unsafe { (&*context.cast::<Arc<LogCallback>>(), viewed(line)) };
+/// `context` must address a live `F`, and `line` a valid view.
+unsafe extern "C" fn log_trampoline<F: Fn(LogLevel, &[u8]) + Sync>(
+    level: ucall_log_level_t,
+    line: ucall_bytes_view_t,
+    context: *mut c_void,
+) {
+    let (handler, line) = unsafe { (&*context.cast::<F>(), viewed(line)) };
     // A panic cannot unwind through this C frame, so it aborts the process.
-    callback(LogLevel::from_raw(level), line);
+    handler(LogLevel::from_raw(level), line);
 }
 
 // region: Tests

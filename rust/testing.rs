@@ -123,7 +123,7 @@ pub(crate) fn block_on<F: core::future::Future>(future: F) -> F::Output {
 // endregion Shared Testing
 
 /// Stops the server when dropped, so a failed assertion still releases the polling threads.
-pub struct Stopping<'server>(pub &'server Server);
+pub struct Stopping<'server>(pub &'server Server<'server>);
 
 impl Drop for Stopping<'_> {
     fn drop(&mut self) {
@@ -133,7 +133,7 @@ impl Drop for Stopping<'_> {
 
 /// Runs `calls` on this thread while one scoped thread drives each event loop, then stops the
 /// server and checks every loop finished cleanly.
-pub fn serving(server: &Server, calls: impl FnOnce()) {
+pub fn serving(server: &Server<'_>, calls: impl FnOnce()) {
     std::thread::scope(|scope| {
         let polling: Vec<_> =
             (0..server.event_loops()).map(|event_loop| scope.spawn(move || server.take_calls(event_loop))).collect();
@@ -147,12 +147,12 @@ pub fn serving(server: &Server, calls: impl FnOnce()) {
 }
 
 /// One event loop on a free loopback port, admitting `connections` at once.
-pub fn loopback(connections: usize) -> Interface {
+pub fn loopback(connections: usize) -> Interface<'static> {
     Interface::new("127.0.0.1:0").connections(connections).event_loops(1)
 }
 
 /// A plaintext client holding up to `connections` open at once.
-pub fn client(connections: usize) -> Client {
+pub fn client(connections: usize) -> Client<'static> {
     Client::new(ClientOptions { connections, ..Default::default() }).unwrap()
 }
 

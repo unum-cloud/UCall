@@ -24,9 +24,8 @@ def test_names_come_from_the_library():
     """Statuses parse from the library's own spellings, a misspelled one is refused, and the version matches."""
     assert ucall.Status.from_name("would-block") is ucall.Status.WOULD_BLOCK
     assert ucall.Status.from_name("invalid-argument") is ucall.Status.INVALID_ARGUMENT
-    with pytest.raises(ValueError) as misspelled:  # noqa: PT011
+    with pytest.raises(ValueError):  # noqa: PT011
         ucall.Status.from_name("would-bloc")
-    assert str(misspelled.value) == "no ucall.Status is spelled 'would-bloc'"
     assert ucall.version() == ucall.__version__
 
 

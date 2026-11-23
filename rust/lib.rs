@@ -7,12 +7,13 @@
 //! ```
 //! use ucall::*;
 //!
-//! let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
-//! server.get("/hello/{name}", |request: Request| {
+//! let greet = |request: Request| {
 //!     let name = request.path_parameter("name").unwrap_or_default();
 //!     let greeting = [b"Hello, ", name].concat();
 //!     let _ = request.reply(HTTPStatus::OK, &["content-type: text/plain".into()], &greeting);
-//! })?;
+//! };
+//! let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
+//! server.get("/hello/{name}", &greet)?;
 //! let address = server.address(0).unwrap().to_owned();
 //!
 //! let mut client = Client::new(ClientOptions { connections: 1, ..Default::default() })?;
@@ -20,7 +21,7 @@
 //!     scope.spawn(|| server.take_calls(0));
 //!     let response = client.get(format!("http://{address}/hello/world"));
 //!     server.stop();
-//!     assert_eq!(response?.body(), b"Hello, world");
+//!     assert_eq!(response?.body()?, b"Hello, world");
 //!     Ok::<(), Error>(())
 //! })?;
 //! # Ok::<(), ucall::Error>(())
@@ -50,7 +51,7 @@ pub use server::{
 #[cfg(windows)]
 pub use types::CrtDescriptor;
 pub use types::{
-    Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, Error, HTTPStatus, Log, LogCallback, LogFormat,
-    LogLevel, NoiseKey, PeerAuthorizer, PercentMode, Result, Security, Status, Verb, Wait, decode_percent,
-    derive_noise_public_key, generate_noise_keypair, version,
+    Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, Error, HTTPStatus, Log, LogFormat, LogLevel,
+    NoiseKey, PeerAuthorizer, PercentMode, Result, Security, Status, Verb, decode_percent, derive_noise_public_key,
+    generate_noise_keypair, version,
 };

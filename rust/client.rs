@@ -13,22 +13,21 @@
 
 use core::ffi::c_void;
 use core::future::Future;
+use core::marker::PhantomData;
 use core::pin::Pin;
 use core::ptr;
 use core::task::{Context, Poll};
 use core::time::Duration;
 use std::borrow::Cow;
-use std::collections::VecDeque;
 use std::sync::Arc;
 use std::thread::{self, ThreadId};
 
 use crate::server::{Server, ServerCore};
 use crate::types::{
     Backend, BodyDelivery, CPUClass, HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb, check,
-    fail, lend_authorizer, lend_log, microseconds, ucall_body_delivery_t, ucall_bytes_view_t, ucall_client_t,
-    ucall_cpu_class_t, ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t,
-    ucall_peer_authorizer_t, ucall_received_http_response_t, ucall_security_t, ucall_server_t, ucall_verb_t, view,
-    viewed,
+    fail, microseconds, ucall_body_delivery_t, ucall_bytes_view_t, ucall_client_t, ucall_cpu_class_t,
+    ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t, ucall_peer_authorizer_t,
+    ucall_received_http_response_t, ucall_security_t, ucall_server_t, ucall_verb_t, view, viewed,
 };
 
 // region: Raw Declarations
@@ -103,18 +102,20 @@ struct ucall_client_take_completed_t {
 }
 
 #[repr(C)]
+struct ucall_client_take_completed_call_t {
+    client: ucall_client_t,
+    outcome: *mut ucall_outcome_t,
+    context: *mut c_void,
+    call: *mut ucall_completed_call_t,
+    timeout_microseconds: usize,
+}
+
+#[repr(C)]
 struct ucall_client_response_header_t {
     response: ucall_received_http_response_t,
     outcome: *mut ucall_outcome_t,
     name: ucall_bytes_view_t,
     value: *mut ucall_bytes_view_t,
-}
-
-#[repr(C)]
-struct ucall_client_response_fields_count_t {
-    response: ucall_received_http_response_t,
-    outcome: *mut ucall_outcome_t,
-    count: *mut usize,
 }
 
 #[repr(C)]
@@ -146,9 +147,10 @@ unsafe extern "C" {
     fn ucall_client_free(client: ucall_client_t);
     fn ucall_client_call(arguments: *mut ucall_client_call_t);
     fn ucall_client_take_completed(arguments: *mut ucall_client_take_completed_t);
+    fn ucall_client_take_completed_call(arguments: *mut ucall_client_take_completed_call_t);
     fn ucall_client_response_status(response: ucall_received_http_response_t) -> ucall_http_status_t;
     fn ucall_client_response_header(arguments: *mut ucall_client_response_header_t);
-    fn ucall_client_response_fields_count(arguments: *mut ucall_client_response_fields_count_t);
+    fn ucall_client_response_fields_count(response: ucall_received_http_response_t) -> usize;
     fn ucall_client_response_field(arguments: *mut ucall_client_response_field_t);
     fn ucall_client_response_body(arguments: *mut ucall_client_response_body_t);
     fn ucall_client_response_body_chunk(arguments: *mut ucall_client_response_body_chunk_t);
@@ -159,9 +161,10 @@ unsafe extern "C" {
 
 /// What a client may hold open at once, how long it waits, and who it is under Noise.
 ///
-/// `connections` is required; every other zero field takes its documented default.
+/// `connections` is required; every other zero field takes its documented default. The client
+/// borrows the authorizer's and the log's handlers and the bound server for `'handlers`.
 #[derive(Default)]
-pub struct ClientOptions<'server> {
+pub struct ClientOptions<'handlers> {
     /// Connections open at once; zero fails with [`Status::InvalidArgument`].
     pub connections: usize,
     /// Calls one connection may carry at once; zero means one.
@@ -176,21 +179,21 @@ pub struct ClientOptions<'server> {
     /// The client identity for Noise handshakes.
     pub noise_private_key: Option<NoiseKey>,
     /// Vets each server's authenticated static key; required for Noise XX calls.
-    pub peer_authorizer: Option<Arc<PeerAuthorizer>>,
+    pub peer_authorizer: Option<PeerAuthorizer<'handlers>>,
     /// The requested I/O backend.
     pub backend: Backend,
     /// A ceiling on the CPU class, intersected with what the constructing thread's CPU runs: the
     /// newest compiled class fitting both runs, and `None` sets no ceiling.
     pub cpu_class_ceiling: Option<CPUClass>,
     /// Where log lines go; `None` keeps the client silent.
-    pub log: Option<Log>,
+    pub log: Option<Log<'handlers>>,
     /// The largest response a call buffers, past which it fails with `Status::Overflow`; zero
     /// takes the largest receive buffer the kernel grants a socket.
     pub max_response_bytes: usize,
     /// A server whose event loop drives this client through that loop's polling, sharing its
     /// engine; bound before the loop first polls, used only on its polling thread, and its
     /// [`Client::take_completed`] only hands out what the loop finished.
-    pub server: Option<&'server Server>,
+    pub server: Option<&'handlers Server<'handlers>>,
     /// Which of `server`'s event loops; ignored without `server`.
     pub event_loop: usize,
 }
@@ -266,13 +269,10 @@ impl ClientCall {
     }
 }
 
-/// The library's client handle and the authorizer and log it calls back into.
+/// The library's client handle and the server a bound one keeps alive.
 struct ClientCore {
     raw: ucall_client_t,
-    // The callback contexts and a bound client's server must outlive the handle, which `Drop`
-    // frees before its fields.
-    authorizer: Option<Arc<PeerAuthorizer>>,
-    log: Option<Box<Log>>,
+    // A bound client's server must outlive the handle, which `Drop` frees before its fields.
     server: Option<Arc<ServerCore>>,
 }
 
@@ -299,11 +299,12 @@ struct Call {
 /// ```
 /// use std::time::Duration;
 /// use ucall::*;
-/// # let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
-/// # server.post("/echo", |request: Request| {
+/// # let echo = |request: Request| {
 /// #     let body = request.body().to_vec();
 /// #     let _ = request.reply(HTTPStatus::OK, &[], &body);
-/// # })?;
+/// # };
+/// # let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
+/// # server.post("/echo", &echo)?;
 /// # let address = server.address(0).unwrap().to_owned();
 /// # std::thread::scope(|scope| {
 /// # scope.spawn(|| server.take_calls(0));
@@ -317,14 +318,15 @@ struct Call {
 /// let mut answered = 0;
 /// while answered < 8 {
 ///     for done in client.take_completed(&mut completed, Duration::from_secs(1))? {
-///         assert_eq!(done.response.as_ref().map(Response::body), Ok([done.context as u8].as_slice()));
+///         let response = done.response.as_ref().map_err(|error| *error)?;
+///         assert_eq!(response.body()?, [done.context as u8]);
 ///         answered += 1;
 ///     }
 /// }
 ///
 /// let response = client.post(format!("http://{address}/echo"), b"blocking".as_slice())?;
 /// drop(client);
-/// assert_eq!(response.body(), b"blocking");
+/// assert_eq!(response.body()?, b"blocking");
 /// # Ok(())
 /// # };
 /// # let result = calls();
@@ -333,29 +335,20 @@ struct Call {
 /// # })?;
 /// # Ok::<(), ucall::Error>(())
 /// ```
-pub struct Client {
-    // Completions the blocking calls retrieved for other calls, handed out by the next
-    // `take_completed`; at most one per admitted call, so the queue never outgrows its capacity.
-    kept: VecDeque<Completed>,
-    // Dropped before `calls`: the library never reads call inputs once nobody polls it. Boxed, as
-    // the library keeps the address of its authorizer.
-    core: Box<ClientCore>,
+pub struct Client<'handlers> {
+    // Dropped before `calls`: the library never reads call inputs once nobody polls it.
+    core: ClientCore,
     calls: Vec<Call>,
     free: Vec<usize>,
     retrieved: Vec<ucall_completed_call_t>,
-    call_timeout: Duration,
+    handlers: PhantomData<&'handlers ()>,
 }
 
-impl Client {
+impl<'handlers> Client<'handlers> {
     /// Starts a client; it holds no connection until the first call is polled.
-    pub fn new(options: ClientOptions<'_>) -> Result<Client> {
-        let mut core = Box::new(ClientCore {
-            raw: ptr::null_mut(),
-            authorizer: options.peer_authorizer,
-            log: options.log.map(Box::new),
-            server: options.server.map(Server::core),
-        });
-        let (peer_authorizer, peer_authorizer_context) = lend_authorizer(&core.authorizer);
+    pub fn new(options: ClientOptions<'handlers>) -> Result<Client<'handlers>> {
+        let mut core = ClientCore { raw: ptr::null_mut(), server: options.server.map(Server::core) };
+        let (peer_authorizer, peer_authorizer_context) = PeerAuthorizer::raw(options.peer_authorizer);
         let config = ucall_client_options_t {
             max_concurrent_connections: options.connections,
             max_pipelined_calls: options.pipelined_calls,
@@ -364,7 +357,7 @@ impl Client {
             noise_private_key: options.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
             peer_authorizer,
             peer_authorizer_context,
-            log: lend_log(&core.log),
+            log: Log::raw(options.log),
             max_concurrent_calls: options.calls,
             backend: options.backend.to_raw(),
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
@@ -390,12 +383,11 @@ impl Client {
             response: ptr::null_mut(),
         };
         Ok(Client {
-            kept: VecDeque::with_capacity(capacity),
             core,
             calls: (0..capacity).map(|_| Call::default()).collect(),
             free: (0..capacity).rev().collect(),
             retrieved: vec![empty; capacity],
-            call_timeout: Duration::from_micros(resolved.call_timeout_microseconds as u64),
+            handlers: PhantomData,
         })
     }
 
@@ -485,55 +477,43 @@ impl Client {
     /// Drives every admitted call on this thread and fills the front of `completed` with finished
     /// ones, waiting up to `timeout` for the first; zero performs one nonblocking round.
     ///
-    /// Answers the filled prefix, empty when nothing finished in time. Completions kept by
-    /// [`Client::call`], [`Client::get`] or [`Client::post`] come first, without waiting.
+    /// Answers the filled prefix, empty when nothing finished in time.
     pub fn take_completed<'completed>(
         &mut self,
         completed: &'completed mut [Completed],
         timeout: Duration,
     ) -> Result<&'completed mut [Completed]> {
-        let count = match self.kept.is_empty() {
-            false => {
-                let count = completed.len().min(self.kept.len());
-                for (entry, kept) in completed.iter_mut().zip(self.kept.drain(..count)) {
-                    *entry = kept;
-                }
-                count
-            }
-            true => {
-                let count = self.retrieve(completed.len(), timeout)?;
-                for (position, entry) in completed[..count].iter_mut().enumerate() {
-                    *entry = self.complete(self.retrieved[position]);
-                }
-                count
-            }
-        };
+        let count = self.retrieve(completed.len(), timeout)?;
+        for (position, entry) in completed[..count].iter_mut().enumerate() {
+            *entry = self.complete(self.retrieved[position]);
+        }
         Ok(&mut completed[..count])
     }
 
-    /// Submits `request` and polls until it finishes, keeping other calls' completions for the
-    /// next [`Client::take_completed`].
+    /// Submits `request` and polls until it finishes, leaving other calls' completions queued in
+    /// the library for the next [`Client::take_completed`].
     ///
     /// The response arrives whatever its HTTP status; a failed exchange answers its [`Error`].
     ///
     /// [`Error`]: crate::Error
     pub fn call(&mut self, request: ClientCall) -> Result<Response> {
         let index = self.admit(request, 0)?;
-        loop {
-            let count = self.retrieve(self.retrieved.len(), self.call_timeout)?;
-            let mut answer = None;
-            for position in 0..count {
-                let raw = self.retrieved[position];
-                let completed = self.complete(raw);
-                match raw.context as usize == index {
-                    true => answer = Some(completed.response),
-                    false => self.kept.push_back(completed),
-                }
-            }
-            if let Some(response) = answer {
-                return response;
-            }
-        }
+        let mut taken = ucall_completed_call_t {
+            context: ptr::null_mut(),
+            outcome: ucall_outcome_t::default(),
+            response: ptr::null_mut(),
+        };
+        let mut outcome = ucall_outcome_t::default();
+        let mut arguments = ucall_client_take_completed_call_t {
+            client: self.core.raw,
+            outcome: &mut outcome,
+            context: index as *mut c_void,
+            call: &mut taken,
+            timeout_microseconds: 0,
+        };
+        unsafe { ucall_client_take_completed_call(&mut arguments) };
+        check(outcome)?;
+        self.complete(taken).response
     }
 
     /// Fetches `url` and polls until the response arrives.
@@ -589,10 +569,11 @@ impl Default for Completed {
 ///
 /// ```
 /// use ucall::*;
-/// # let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
-/// # server.get("/missing", |request: Request| {
+/// # let missing = |request: Request| {
 /// #     let _ = request.reply(HTTPStatus::NOT_FOUND, &["x-reason: gone".into()], b"no such page");
-/// # })?;
+/// # };
+/// # let mut server = Server::new(&[Interface::new("127.0.0.1:0")])?;
+/// # server.get("/missing", &missing)?;
 /// # let address = server.address(0).unwrap().to_owned();
 /// # std::thread::scope(|scope| {
 /// # scope.spawn(|| server.take_calls(0));
@@ -604,7 +585,7 @@ impl Default for Completed {
 /// let reader = std::thread::spawn(move || {
 ///     assert_eq!(response.status_code(), HTTPStatus::NOT_FOUND);
 ///     assert_eq!(response.header("X-Reason"), Some(b"gone".as_slice()));
-///     assert_eq!(response.body(), b"no such page");
+///     assert_eq!(response.body(), Ok(b"no such page".as_slice()));
 /// });
 /// reader.join().unwrap();
 /// # Ok(())
@@ -634,14 +615,14 @@ impl Response {
         HTTPStatus(unsafe { ucall_client_response_status(self.raw) })
     }
 
-    /// The response body, decoded from chunked framing if it arrived that way; empty for a
-    /// streamed call, whose body [`Response::body_chunk`] pulls.
-    pub fn body(&self) -> &[u8] {
+    /// The response body, decoded from chunked framing if it arrived that way; a streamed call,
+    /// whose body [`Response::body_chunk`] pulls, fails with [`Status::InvalidArgument`].
+    pub fn body(&self) -> Result<&[u8]> {
         let mut body = view(&[]);
         let mut outcome = ucall_outcome_t::default();
         let mut arguments = ucall_client_response_body_t { response: self.raw, outcome: &mut outcome, body: &mut body };
         unsafe { ucall_client_response_body(&mut arguments) };
-        unsafe { viewed(body) }
+        check(outcome).map(|()| unsafe { viewed(body) })
     }
 
     /// The value of header `name`, matched case-insensitively.
@@ -661,11 +642,7 @@ impl Response {
     /// Every header field line in arrival order, repeated names apart: each name lowercased as
     /// the parser keeps it, and its value trimmed.
     pub fn fields(&self) -> impl Iterator<Item = (&[u8], &[u8])> + '_ {
-        let mut count = 0;
-        let mut outcome = ucall_outcome_t::default();
-        let mut arguments =
-            ucall_client_response_fields_count_t { response: self.raw, outcome: &mut outcome, count: &mut count };
-        unsafe { ucall_client_response_fields_count(&mut arguments) };
+        let count = unsafe { ucall_client_response_fields_count(self.raw) };
         (0..count).map_while(move |index| {
             let (mut name, mut value) = (view(&[]), view(&[]));
             let mut outcome = ucall_outcome_t::default();
@@ -800,18 +777,15 @@ mod tests {
     #[test]
     fn streamed_bodies_download_past_the_response_cap() {
         let body = pattern(4 << 20);
+        let large = |request: Request| {
+            let _ = request.reply(HTTPStatus::OK, &[], &body);
+        };
+        let empty = |request: Request| {
+            let _ = request.reply(HTTPStatus::NO_CONTENT, &[], &[]);
+        };
         let mut server = Server::new(&[loopback(1)]).unwrap();
-        let large = body.clone();
-        server
-            .get("/large", move |request: Request| {
-                let _ = request.reply(HTTPStatus::OK, &[], &large);
-            })
-            .unwrap();
-        server
-            .get("/empty", |request: Request| {
-                let _ = request.reply(HTTPStatus::NO_CONTENT, &[], &[]);
-            })
-            .unwrap();
+        server.get("/large", &large).unwrap();
+        server.get("/empty", &empty).unwrap();
         let address = server.address(0).unwrap().to_owned();
         serving(&server, || {
             let mut client =
@@ -824,7 +798,7 @@ mod tests {
 
             let mut response = client.call(streamed.clone()).unwrap();
             assert_eq!(response.status_code(), HTTPStatus::OK);
-            assert_eq!(response.body(), b"");
+            assert_eq!(response.body().unwrap_err().status, Status::InvalidArgument);
             let mut pulled = Vec::new();
             loop {
                 let chunk = response.body_chunk().unwrap();
@@ -859,15 +833,15 @@ mod tests {
         });
     }
 
-    fn echo_server() -> Server {
+    fn echo(request: Request) {
+        // The reply consumes the request, so the bytes it sends cannot borrow from it.
+        let body = request.body().to_vec();
+        let _ = request.reply(HTTPStatus::OK, &[], &body);
+    }
+
+    fn echo_server() -> Server<'static> {
         let mut server = Server::new(&[loopback(1).pipelined_requests(2)]).unwrap();
-        server
-            .post("/echo", |request: Request| {
-                // The reply consumes the request, so the bytes it sends cannot borrow from it.
-                let body = request.body().to_vec();
-                let _ = request.reply(HTTPStatus::OK, &[], &body);
-            })
-            .unwrap();
+        server.post("/echo", &echo).unwrap();
         server
     }
 
@@ -881,7 +855,7 @@ mod tests {
             let response = client.post(format!("http://{address}/echo"), body.clone()).unwrap();
             drop(client);
             assert_eq!(response.status_code(), HTTPStatus::OK);
-            assert_eq!(response.body(), body.as_slice());
+            assert_eq!(response.body().unwrap(), body.as_slice());
         });
     }
 
@@ -893,12 +867,12 @@ mod tests {
             let mut client = Client::new(ClientOptions { connections: 1, calls: 2, ..Default::default() }).unwrap();
             client.submit(ClientCall::post(format!("http://{address}/echo"), b"first".as_slice()), 7).unwrap();
             let blocking = client.post(format!("http://{address}/echo"), b"second".as_slice()).unwrap();
-            assert_eq!(blocking.body(), b"second");
+            assert_eq!(blocking.body().unwrap(), b"second");
             let mut completed: [Completed; 2] = Default::default();
             let kept = client.take_completed(&mut completed, Duration::ZERO).unwrap();
             assert_eq!(kept.len(), 1);
             assert_eq!(kept[0].context, 7);
-            assert_eq!(kept[0].response.as_ref().unwrap().body(), b"first");
+            assert_eq!(kept[0].response.as_ref().unwrap().body().unwrap(), b"first");
         });
     }
 

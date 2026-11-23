@@ -49,7 +49,8 @@ comptime RequestVerb = def(Address, Address) thin abi("C") -> c_int
 """`ucall_server_request_verb`: the method of a received request."""
 
 comptime RequestCount = def(Address, Address) thin abi("C") -> c_size_t
-"""`ucall_server_request_path_segments_count` and `ucall_server_request_parts_count`."""
+"""`ucall_server_request_path_segments_count`, `ucall_server_request_parts_count` and
+`ucall_server_request_fields_count`."""
 
 comptime ServerInit = Entry[ServerInitArguments]
 """`ucall_server_init`."""
@@ -75,8 +76,6 @@ comptime ServerRequestPathSegment = Entry[ServerRequestPathSegmentArguments]
 """`ucall_server_request_path_segment`."""
 comptime ServerRequestNamed = Entry[ServerRequestNamedArguments]
 """`ucall_server_request_path_parameter`, `_query_parameter` and `_header`, which share one layout."""
-comptime ServerRequestFieldsCount = Entry[ServerRequestFieldsCountArguments]
-"""`ucall_server_request_fields_count`."""
 comptime ServerRequestField = Entry[ServerRequestFieldArguments]
 """`ucall_server_request_field`."""
 comptime ServerRequestPeer = Entry[ServerRequestPeerArguments]
@@ -268,16 +267,6 @@ struct ServerRequestNamedArguments(ImplicitlyCopyable):
 
 
 @fieldwise_init
-struct ServerRequestFieldsCountArguments(ImplicitlyCopyable):
-    """`ucall_server_request_fields_count_t`, laid out as the ABI declares it."""
-
-    var server: Address
-    var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var request: Address
-    var count: Pointer[c_size_t, MutUntrackedOrigin]
-
-
-@fieldwise_init
 struct ServerRequestFieldArguments(ImplicitlyCopyable):
     """`ucall_server_request_field_t`, laid out as the ABI declares it."""
 
@@ -320,7 +309,7 @@ struct ServerReplyContentArguments(ImplicitlyCopyable):
 
     var server: Address
     var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var request: Address
+    var request: Pointer[Address, MutUntrackedOrigin]
     var http_status: HTTPStatus
     var headers: Optional[Pointer[BytesView[ImmUntrackedOrigin], ImmUntrackedOrigin]]
     var headers_count: c_size_t
@@ -333,7 +322,7 @@ struct ServerReplyErrorArguments(ImplicitlyCopyable):
 
     var server: Address
     var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var request: Address
+    var request: Pointer[Address, MutUntrackedOrigin]
     var http_status: HTTPStatus
     var message: BytesView[ImmUntrackedOrigin]
 
@@ -344,7 +333,7 @@ struct ServerReplyVectoredArguments(ImplicitlyCopyable):
 
     var server: Address
     var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var request: Address
+    var request: Pointer[Address, MutUntrackedOrigin]
     var http_status: HTTPStatus
     var headers: Optional[Pointer[BytesView[ImmUntrackedOrigin], ImmUntrackedOrigin]]
     var headers_count: c_size_t
@@ -358,7 +347,7 @@ struct ServerReplyBeginArguments(ImplicitlyCopyable):
 
     var server: Address
     var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var request: Address
+    var request: Pointer[Address, MutUntrackedOrigin]
     var http_status: HTTPStatus
     var headers: Optional[Pointer[BytesView[ImmUntrackedOrigin], ImmUntrackedOrigin]]
     var headers_count: c_size_t
@@ -381,7 +370,7 @@ struct ServerReplyEndArguments(ImplicitlyCopyable):
 
     var server: Address
     var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var request: Address
+    var request: Pointer[Address, MutUntrackedOrigin]
 
 
 def _lend[T: Copyable](ref value: Optional[T]) -> Optional[Pointer[T, ImmUntrackedOrigin]]:
@@ -676,9 +665,16 @@ def _view_in[
     return view
 
 
+def _handle_in[origin: MutOrigin](slot: Pointer[Address, origin], request: Address) -> Pointer[Address, MutAnyOrigin]:
+    """Holds `request` in a slot the caller allocated, which a reply clears once it took the request."""
+    var handle = slot.unsafe_origin_cast[MutAnyOrigin]()
+    handle[unsafe_offset=0] = request
+    return handle
+
+
 def _route_trampoline[
     handler: def(var Request) thin raises -> None
-](request: Address, context: Pointer[Server, MutAnyOrigin]) abi("C"):
+](server: Address, request: Address, context: Pointer[Server, MutAnyOrigin]) abi("C"):
     """The `ucall_received_http_request_callback_t` of one route, instantiated per handler.
 
     The handler owns the request, so one it raised past or left unreplied answers 500 as it drops.
@@ -692,11 +688,12 @@ def _route_trampoline[
 def _answer_internal(core: _ServerCore, request: Address, message: StringSlice):
     """Answers 500 with `message` for a request its handler left unreplied, consuming it."""
     var outcome = _outcome_in(stack_allocation[1, Outcome]())
+    var handle = _handle_in(stack_allocation[1, Address](), request)
     _cross(
         ServerReplyErrorArguments(
             core.handle,
             outcome.unsafe_origin_cast[MutUntrackedOrigin](),
-            request,
+            handle.unsafe_origin_cast[MutUntrackedOrigin](),
             HTTPStatus.INTERNAL_ERROR,
             BytesView.of(message).arguments(),
         ),
@@ -1054,7 +1051,7 @@ struct _BatchState(Movable):
 
 def _batch_trampoline[
     handler: def(Batch) thin raises -> None
-](requests: Pointer[Address, ImmUntrackedOrigin], count: c_size_t, context: Pointer[_BatchState, MutAnyOrigin]) abi("C"):
+](server: Address, requests: Pointer[Address, ImmUntrackedOrigin], count: c_size_t, context: Pointer[_BatchState, MutAnyOrigin]) abi("C"):
     """The `ucall_received_http_batch_callback_t` of one batch endpoint, instantiated per handler."""
     context[].taken.clear()
     context[].taken.resize(Int(count), False)
@@ -1315,24 +1312,11 @@ trait RequestReads:
             return value.span[ImmOrigin(origin_of(self))]()
         return None
 
-    def fields_count(self) raises Error -> Int:
+    def fields_count(self) -> Int:
         """Header field lines in arrival order, repeated names included.
         Calls `ucall_server_request_fields_count`."""
         var core = self._core()
-        var count = stack_allocation[1, c_size_t]().unsafe_origin_cast[MutAnyOrigin]()
-        count[unsafe_offset=0] = c_size_t(0)
-        var outcome = _outcome_in(stack_allocation[1, Outcome]())
-        _cross(
-            ServerRequestFieldsCountArguments(
-                core[].handle,
-                outcome.unsafe_origin_cast[MutUntrackedOrigin](),
-                self._raw(),
-                count.unsafe_origin_cast[MutUntrackedOrigin](),
-            ),
-            core[].library.symbols().server_request_fields_count,
-        )
-        core[].library._check(outcome[unsafe_offset=0], "ucall_server_request_fields_count")
-        return Int(count[unsafe_offset=0])
+        return Int(core[].library.symbols().server_request_fields_count(core[].handle, self._raw()))
 
     def field(ref self, index: Int) raises Error -> Tuple[Span[Byte, ImmOrigin(origin_of(self))], Span[Byte, ImmOrigin(origin_of(self))]]:
         """Header field line `index`: its name, lowercased as the parser keeps it, and its trimmed value.
@@ -1451,11 +1435,12 @@ def _reply_content[
 ](core: _ServerCore, request: Address, status: HTTPStatus, headers: Span[BytesView[origin], _], body: Span[Byte, _]) -> Outcome:
     """Crosses `ucall_server_reply_content`, final on return."""
     var outcome = _outcome_in(stack_allocation[1, Outcome]())
+    var handle = _handle_in(stack_allocation[1, Address](), request)
     _cross(
         ServerReplyContentArguments(
             core.handle,
             outcome.unsafe_origin_cast[MutUntrackedOrigin](),
-            request,
+            handle.unsafe_origin_cast[MutUntrackedOrigin](),
             status,
             _headers(headers),
             c_size_t(len(headers)),
@@ -1469,11 +1454,12 @@ def _reply_content[
 def _reply_error(core: _ServerCore, request: Address, status: HTTPStatus, message: StringSlice) -> Outcome:
     """Crosses `ucall_server_reply_error`, final on return."""
     var outcome = _outcome_in(stack_allocation[1, Outcome]())
+    var handle = _handle_in(stack_allocation[1, Address](), request)
     _cross(
         ServerReplyErrorArguments(
             core.handle,
             outcome.unsafe_origin_cast[MutUntrackedOrigin](),
-            request,
+            handle.unsafe_origin_cast[MutUntrackedOrigin](),
             status,
             BytesView.of(message).arguments(),
         ),
@@ -1569,8 +1555,9 @@ struct DetachedRequest(Movable, RequestReads):
     `reply_parts`, `reply_stream` and `body_chunk`.
 
     It reads like the `Request` it came from, moves to any thread, and answers 500 when dropped
-    unreplied. Its replies hand back a `Deferred` while a file or path part still sends, and waiting
-    on one belongs off the polling thread, as that thread is the one sending it.
+    unreplied. Its replies hand back a `Deferred`, which stays deferred while a file or path part
+    still sends, and waiting on one belongs off the polling thread, as that thread is the one
+    sending it.
     """
 
     var _shared: ArcPointer[_ServerCore]
@@ -1640,7 +1627,8 @@ struct DetachedRequest(Movable, RequestReads):
         status: HTTPStatus,
         headers: Span[BytesView[headers_origin], _],
         parts: Span[ReplyPart[parts_origin], _],
-    ) raises Error -> Optional[Deferred]:
+        out deferred: Deferred,
+    ) raises Error:
         """Replies with `status`, full header lines, and `parts` concatenated into the body, its
         Content-Length measured. Calls `ucall_server_reply_vectored`.
 
@@ -1648,18 +1636,20 @@ struct DetachedRequest(Movable, RequestReads):
         `Deferred` reports the cause. A refusal on return answers 500 before raising.
 
         Returns:
-            `None` once final, and a `Deferred` while a file or path part still sends.
+            The reply, final at once for bytes alone and `DEFERRED` while a file or path part still
+            sends, constructed in the caller's place.
 
         Raises:
-            `Error` if the reply is refused or fails.
+            `Error` if the reply is refused or fails at once.
         """
         ref core = self._shared[]
-        var deferred = Deferred(core.library, "ucall_server_reply_vectored")
+        deferred = Deferred(core.library, "ucall_server_reply_vectored")
+        var handle = _handle_in(stack_allocation[1, Address](), self._request)
         _cross(
             ServerReplyVectoredArguments(
                 core.handle,
                 deferred._outcome().unsafe_origin_cast[MutUntrackedOrigin](),
-                self._request,
+                handle.unsafe_origin_cast[MutUntrackedOrigin](),
                 status,
                 _headers(headers),
                 c_size_t(len(headers)),
@@ -1668,9 +1658,8 @@ struct DetachedRequest(Movable, RequestReads):
             ),
             core.library.symbols().server_reply_vectored,
         )
-        var result = _finish(core, self._request, deferred^)
+        _finish(core, self._request, deferred)
         _ = self._shared^
-        return result^
 
     def reply_stream[
         origin: ImmOrigin
@@ -1678,8 +1667,8 @@ struct DetachedRequest(Movable, RequestReads):
         """Sends the status line and header lines, and opens a body appended part by part: chunked,
         or of the length a Content-Length header declares. Calls `ucall_server_reply_begin`.
 
-        A closed connection still ends the stream and raises `CONNECTION_CLOSED`; any other failure
-        answers 500 before raising.
+        A closed connection ends the reply and raises `CONNECTION_CLOSED`; any other failure answers
+        500 before raising.
 
         Returns:
             The open stream, which ends once dropped or `end` is called.
@@ -1689,11 +1678,12 @@ struct DetachedRequest(Movable, RequestReads):
         """
         ref core = self._shared[]
         var outcome = _outcome_in(stack_allocation[1, Outcome]())
+        var handle = _handle_in(stack_allocation[1, Address](), self._request)
         _cross(
             ServerReplyBeginArguments(
                 core.handle,
                 outcome.unsafe_origin_cast[MutUntrackedOrigin](),
-                self._request,
+                handle.unsafe_origin_cast[MutUntrackedOrigin](),
                 status,
                 _headers(headers),
                 c_size_t(len(headers)),
@@ -1704,9 +1694,7 @@ struct DetachedRequest(Movable, RequestReads):
         var library = core.library
         if begun == Status.SUCCESS:
             return ReplyStream(self._shared^, self._request)
-        if begun == Status.CONNECTION_CLOSED:
-            _ = ReplyStream(self._shared, self._request)
-        else:
+        if begun != Status.CONNECTION_CLOSED:
             _answer_internal(core, self._request, "The reply was refused")
         _ = self._shared^
         library._check(outcome[unsafe_offset=0], "ucall_server_reply_begin")
@@ -1742,10 +1730,10 @@ struct DetachedRequest(Movable, RequestReads):
         return data[unsafe_offset=0].span[ImmOrigin(origin_of(self))]()
 
 
-def _finish(core: _ServerCore, request: Address, var deferred: Deferred) raises Error -> Optional[Deferred]:
+def _finish(core: _ServerCore, request: Address, deferred: Deferred) raises Error:
     """Settles a reply that may finish later: the refusals that queued nothing answer 500, and a final
     outcome is checked at once."""
-    var status = Status.of(core.library.symbols().outcome_status(deferred._outcome()))
+    var status = deferred.status()
     if (
         status == Status.UNINITIALIZED
         or status == Status.INVALID_ARGUMENT
@@ -1753,10 +1741,8 @@ def _finish(core: _ServerCore, request: Address, var deferred: Deferred) raises 
         or status == Status.OUT_OF_MEMORY
     ):
         _answer_internal(core, request, "The reply was refused")
-    if status == Status.DEFERRED:
-        return deferred^
-    deferred^.wait()
-    return None
+    if status != Status.DEFERRED:
+        deferred.wait()
 
 
 # endregion Requests
@@ -1868,8 +1854,7 @@ struct ReplyStream(Movable):
         """Ends the body, waiting for its file parts. Calls `ucall_server_reply_end`."""
         try:
             var ended = _end(self._shared[], self._request)
-            if ended:
-                ended.take().wait()
+            ended.wait()
         except:
             pass
         _ = self._shared^
@@ -1895,30 +1880,34 @@ struct ReplyStream(Movable):
         )
         core.library._check(outcome[unsafe_offset=0], "ucall_server_reply_append")
 
-    def end(deinit self) raises Error -> Optional[Deferred]:
+    def end(deinit self, out deferred: Deferred) raises Error:
         """Ends the body, consuming the request whatever the outcome. Calls `ucall_server_reply_end`.
 
         Returns:
-            `None` once final, and a `Deferred` while file or path parts still send.
+            The end, `DEFERRED` while file or path parts still send, constructed in the caller's
+            place.
 
         Raises:
             `Error` with `MALFORMED` for a body short of its declared Content-Length.
         """
         var shared = self._shared^
-        return _end(shared[], self._request)
+        deferred = _end(shared[], self._request)
 
 
-def _end(core: _ServerCore, request: Address) raises Error -> Optional[Deferred]:
-    """Crosses `ucall_server_reply_end`, answering the outcome while it is deferred."""
-    var deferred = Deferred(core.library, "ucall_server_reply_end")
+def _end(core: _ServerCore, request: Address, out deferred: Deferred) raises Error:
+    """Crosses `ucall_server_reply_end`, checking a final outcome at once."""
+    deferred = Deferred(core.library, "ucall_server_reply_end")
+    var handle = _handle_in(stack_allocation[1, Address](), request)
     _cross(
-        ServerReplyEndArguments(core.handle, deferred._outcome().unsafe_origin_cast[MutUntrackedOrigin](), request),
+        ServerReplyEndArguments(
+            core.handle,
+            deferred._outcome().unsafe_origin_cast[MutUntrackedOrigin](),
+            handle.unsafe_origin_cast[MutUntrackedOrigin](),
+        ),
         core.library.symbols().server_reply_end,
     )
-    if Status.of(core.library.symbols().outcome_status(deferred._outcome())) == Status.DEFERRED:
-        return deferred^
-    deferred^.wait()
-    return None
+    if deferred.status() != Status.DEFERRED:
+        deferred.wait()
 
 
 # endregion Replies

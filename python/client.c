@@ -259,10 +259,7 @@ static char const doc_Response_fields[] =                                       
 
 static PyObject* Response_fields(Response* self, [[maybe_unused]] PyObject* unused) {
     ucall_outcome_t outcome = {0};
-    size_t count = 0;
-    ucall_client_response_fields_count_t counting = {self->handle, &outcome, &count};
-    ucall_client_response_fields_count(&counting);
-    if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
+    size_t const count = ucall_client_response_fields_count(self->handle);
     PyObject* const fields = PyList_New((Py_ssize_t)count);
     for (size_t index = 0; fields && index != count; ++index) {
         ucall_bytes_view_t name = {0}, value = {0};

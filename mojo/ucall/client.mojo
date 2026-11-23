@@ -49,8 +49,8 @@ comptime ClientTakeCompleted = Entry[ClientTakeCompletedArguments]
 """`ucall_client_take_completed`."""
 comptime ClientResponseHeader = Entry[ClientResponseHeaderArguments]
 """`ucall_client_response_header`."""
-comptime ClientResponseFieldsCount = Entry[ClientResponseFieldsCountArguments]
-"""`ucall_client_response_fields_count`."""
+comptime ClientResponseFieldsCount = def(Address) thin abi("C") -> c_size_t
+"""`ucall_client_response_fields_count`: the header field lines of a received response."""
 comptime ClientResponseField = Entry[ClientResponseFieldArguments]
 """`ucall_client_response_field`."""
 comptime ClientResponseBody = Entry[ClientResponseBodyArguments]
@@ -150,15 +150,6 @@ struct ClientResponseHeaderArguments(ImplicitlyCopyable):
     var outcome: Pointer[Outcome, MutUntrackedOrigin]
     var name: BytesView[ImmUntrackedOrigin]
     var value: Pointer[BytesView[ImmUntrackedOrigin], MutUntrackedOrigin]
-
-
-@fieldwise_init
-struct ClientResponseFieldsCountArguments(ImplicitlyCopyable):
-    """`ucall_client_response_fields_count_t`, laid out as the ABI declares it."""
-
-    var response: Address
-    var outcome: Pointer[Outcome, MutUntrackedOrigin]
-    var count: Pointer[c_size_t, MutUntrackedOrigin]
 
 
 @fieldwise_init
@@ -655,7 +646,9 @@ struct Response(Movable):
         var outcome = _outcome_in(stack_allocation[1, Outcome]())
         _cross(
             ClientResponseBodyArguments(
-                self.handle, outcome.unsafe_origin_cast[MutUntrackedOrigin](), body.unsafe_origin_cast[MutUntrackedOrigin]()
+                self.handle,
+                outcome.unsafe_origin_cast[MutUntrackedOrigin](),
+                body.unsafe_origin_cast[MutUntrackedOrigin](),
             ),
             self.library.symbols().client_response_body,
         )
@@ -680,22 +673,14 @@ struct Response(Movable):
             return None
         return value[unsafe_offset=0].span[ImmOrigin(origin_of(self))]()
 
-    def fields_count(self) raises Error -> Int:
+    def fields_count(self) -> Int:
         """Header field lines in arrival order, repeated names included.
         Calls `ucall_client_response_fields_count`."""
-        var count = stack_allocation[1, c_size_t]().unsafe_origin_cast[MutAnyOrigin]()
-        count[unsafe_offset=0] = c_size_t(0)
-        var outcome = _outcome_in(stack_allocation[1, Outcome]())
-        _cross(
-            ClientResponseFieldsCountArguments(
-                self.handle, outcome.unsafe_origin_cast[MutUntrackedOrigin](), count.unsafe_origin_cast[MutUntrackedOrigin]()
-            ),
-            self.library.symbols().client_response_fields_count,
-        )
-        self.library._check(outcome[unsafe_offset=0], "ucall_client_response_fields_count")
-        return Int(count[unsafe_offset=0])
+        return Int(self.library.symbols().client_response_fields_count(self.handle))
 
-    def field(ref self, index: Int) raises Error -> Tuple[Span[Byte, ImmOrigin(origin_of(self))], Span[Byte, ImmOrigin(origin_of(self))]]:
+    def field(
+        ref self, index: Int
+    ) raises Error -> Tuple[Span[Byte, ImmOrigin(origin_of(self))], Span[Byte, ImmOrigin(origin_of(self))]]:
         """Header field line `index`: its lowercased name and its trimmed value.
         Calls `ucall_client_response_field`.
 
@@ -716,7 +701,10 @@ struct Response(Movable):
             self.library.symbols().client_response_field,
         )
         self.library._check(outcome[unsafe_offset=0], "ucall_client_response_field")
-        return (name[unsafe_offset=0].span[ImmOrigin(origin_of(self))](), value[unsafe_offset=0].span[ImmOrigin(origin_of(self))]())
+        return (
+            name[unsafe_offset=0].span[ImmOrigin(origin_of(self))](),
+            value[unsafe_offset=0].span[ImmOrigin(origin_of(self))](),
+        )
 
     def body_chunk(ref self) raises Error -> Span[Byte, ImmOrigin(origin_of(self))]:
         """Pulls the body bytes decoded since the last pull, advancing the client until they arrive;

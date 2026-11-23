@@ -124,7 +124,7 @@ def rows(var request: Request) raises:
     for row in range(3):
         var line = String(row, ",", row * row, "\n")
         stream.append([ReplyPart.bytes(line.as_bytes())])
-    _ = stream^.end()  # `None`, as no file or path part is left to send
+    _ = stream^.end()  # final at once, as no file or path part is left to send
 ```
 
 A reply with a path part resolves it beneath the interface's `reply_directories`, and is sent by the polling thread, so a worker thread waits for it:
@@ -133,15 +133,15 @@ A reply with a path part resolves it beneath the interface's `reply_directories`
 def send_clip(var detached: DetachedRequest) raises:
     var no_headers = List[BytesView[ImmUntrackedOrigin]]()
     var parts = [ReplyPart.bytes("frame:".as_bytes()), ReplyPart.path(0, "clip.bin")]
-    var deferred = detached^.reply_parts(HTTPStatus.OK, no_headers, parts)
-    if deferred:
-        deferred.take().wait()  # raises the reply's failure, such as `NOT_FOUND` after a 404
+    var sent = detached^.reply_parts(HTTPStatus.OK, no_headers, parts)  # constructed in place
+    sent.wait()  # raises the reply's failure, such as `NOT_FOUND` after a 404
 ```
 
 `ReplyPart.file` takes a `FileRange` of a descriptor the caller opened with `O_DIRECT` and keeps open until the reply is final.
 `append` raises `WOULD_BLOCK`, queueing nothing, while the peer lags behind what is queued, and a stream dropped without `end` ends itself.
 `body_chunk` pulls a streamed body, waiting for the next bytes; on a buffered route the first pull is the whole body.
-A `Deferred` reads `DEFERRED` from `status` until the reply is final, and dropping an unfinished one waits for it.
+A `Deferred` holds its outcome inline and never moves, so `reply_parts` and `end` construct it in the caller's place and allocate nothing.
+It reads `DEFERRED` from `status` until the reply is final, and dropping an unfinished one waits for it.
 
 ## Batches
 

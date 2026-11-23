@@ -44,7 +44,6 @@ from ucall.server import (
     ServerReplyError,
     ServerReplyVectored,
     ServerRequestField,
-    ServerRequestFieldsCount,
     ServerRequestNamed,
     ServerRequestPart,
     ServerRequestPathSegment,
@@ -196,7 +195,7 @@ struct Symbols:
     """`ucall_server_request_query_parameter`."""
     var server_request_header: ServerRequestNamed
     """`ucall_server_request_header`."""
-    var server_request_fields_count: ServerRequestFieldsCount
+    var server_request_fields_count: RequestCount
     """`ucall_server_request_fields_count`."""
     var server_request_field: ServerRequestField
     """`ucall_server_request_field`."""
@@ -304,9 +303,7 @@ struct Symbols:
             handle, "ucall_server_request_query_parameter"
         )
         self.server_request_header = _resolve[ServerRequestNamed](handle, "ucall_server_request_header")
-        self.server_request_fields_count = _resolve[ServerRequestFieldsCount](
-            handle, "ucall_server_request_fields_count"
-        )
+        self.server_request_fields_count = _resolve[RequestCount](handle, "ucall_server_request_fields_count")
         self.server_request_field = _resolve[ServerRequestField](handle, "ucall_server_request_field")
         self.server_request_peer = _resolve[ServerRequestPeer](handle, "ucall_server_request_peer")
         self.server_request_body = _resolve[ServerRequestView](handle, "ucall_server_request_body")

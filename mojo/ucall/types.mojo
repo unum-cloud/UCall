@@ -27,7 +27,7 @@ Date: November 8, 2026
 """
 
 from std.ffi import c_char, c_int, c_size_t
-from std.memory import OwnedPointer, stack_allocation
+from std.memory import stack_allocation
 
 from ucall.library import Library
 
@@ -718,37 +718,37 @@ def _cross[Arguments: ImplicitlyCopyable & Deinitable, //](arguments: Arguments,
     entry(slot.unsafe_origin_cast[MutAnyOrigin]())
 
 
-struct Deferred(Movable):
-    """A reply still sending a file or path part, which owns the outcome the event loop makes final.
+struct Deferred:
+    """A reply that may still send a file or path part, holding inline the outcome the event loop
+    makes final.
 
-    `status` reads `DEFERRED` until then without blocking, and `wait` blocks until the reply is
-    final and raises its failure. Dropping one that is not final waits for it, so it belongs off the
-    polling thread, which is the one finishing it. The descriptors its parts borrow stay open until
-    it is final.
+    It never moves, as the event loop writes its outcome in place: a reply verb constructs it in the
+    caller's place. `status` reads `DEFERRED` until the reply is final without blocking, and `wait`
+    blocks until then and raises its failure. Dropping one that is not final waits for it, so it
+    belongs off the polling thread, which is the one finishing it. The descriptors its parts borrow
+    stay open until it is final.
     """
 
     var library: Library
     """The loaded library, held so the wait can still reach `ucall_outcome_wait`."""
-    var outcome: OwnedPointer[Outcome]
-    """The outcome the event loop writes, on the heap since it outlives the verb."""
+    var outcome: Outcome
+    """The outcome the event loop writes."""
     var symbol: StaticString
     """The entry point the reply went through, carried into its failure."""
 
     def __init__(out self, library: Library, symbol: StaticString):
-        """A pending outcome at a stable heap address, for a verb that may finish after it returns."""
+        """An outcome for a verb that may finish after it returns, final until one is lent it."""
         self.library = library
-        self.outcome = OwnedPointer(Outcome())
+        self.outcome = Outcome()
         self.symbol = symbol
 
     def __deinit__(deinit self):
-        """Waits until the reply is final, then frees its outcome. Calls `ucall_outcome_wait`."""
+        """Waits until the reply is final. Calls `ucall_outcome_wait`."""
         _ = self.library.symbols().outcome_wait(self._outcome())
-        _ = self.outcome^
-        _ = self.library^
 
     def _outcome(self) -> Pointer[Outcome, MutAnyOrigin]:
-        """The heap outcome, through the origin the event loop's writes need."""
-        return Pointer[Outcome, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=self.outcome[])))
+        """The outcome, through the origin the event loop's writes need."""
+        return Pointer[Outcome, MutAnyOrigin](unsafe_from_address=Int(Pointer(to=self.outcome)))
 
     def status(self) -> Status:
         """`DEFERRED` until the reply is final, then its final status; never blocks. Calls `ucall_outcome_status`.
@@ -758,7 +758,7 @@ struct Deferred(Movable):
         """
         return Status.of(self.library.symbols().outcome_status(self._outcome()))
 
-    def wait(deinit self) raises Error:
+    def wait(self) raises Error:
         """Blocks until the reply is final, and raises its failure. Calls `ucall_outcome_wait`.
 
         Raises:
@@ -766,11 +766,7 @@ struct Deferred(Movable):
         """
         var outcome = self._outcome()
         _ = self.library.symbols().outcome_wait(outcome)
-        var final = outcome[]
-        var library = self.library
-        _ = self.outcome^
-        _ = self.library^
-        library._check(final, self.symbol)
+        self.library._check(outcome[], self.symbol)
 
 
 # endregion Deferred Replies

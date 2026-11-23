@@ -15,14 +15,13 @@ fn query_integer(request: &Request, name: &str) -> Option<i64> {
 fn main() -> ucall::Result<()> {
     let arguments = arguments::parse();
     let interface = Interface::new(format!("127.0.0.1:{}", arguments.port)).event_loops(arguments.threads);
-    let mut server = Server::new(&[interface])?;
-    server.post("/echo", |request: Request| {
+    let echo = |request: Request| {
         // A reply consumes its request, so the body is copied out first.
         let body = request.body().to_vec();
         let headers = [BytesView::from("content-type: application/octet-stream")];
         let _ = request.reply(HTTPStatus::OK, &headers, &body);
-    })?;
-    server.get("/sum", |request: Request| {
+    };
+    let sum = |request: Request| {
         let a = query_integer(&request, "a");
         let b = query_integer(&request, "b");
         let _ = match a.zip(b).and_then(|(a, b)| a.checked_add(b)) {
@@ -32,11 +31,15 @@ fn main() -> ucall::Result<()> {
             }
             None => request.reply_error(HTTPStatus::BAD_REQUEST, "Expected integers a and b\n"),
         };
-    })?;
-    server.get("/health", |request: Request| {
+    };
+    let health = |request: Request| {
         let headers = [BytesView::from("content-type: text/plain")];
         let _ = request.reply(HTTPStatus::OK, &headers, b"ready\n");
-    })?;
+    };
+    let mut server = Server::new(&[interface])?;
+    server.post("/echo", &echo)?;
+    server.get("/sum", &sum)?;
+    server.get("/health", &health)?;
     println!("Listening on 127.0.0.1:{} with {} event loops", arguments.port, server.event_loops());
     std::thread::scope(|scope| {
         for event_loop in 0..server.event_loops() {

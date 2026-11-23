@@ -532,7 +532,7 @@ static ucall_bytes_view_t const json_header_k = {(ucall_byte_t const*)json_heade
 static ucall_status_t reply_failure(ucall_server_t server, ucall_received_http_request_t request,
                                     ucall_http_status_t status, char const* message, size_t length) {
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_error_t reply = {server, &outcome, request, status, {(ucall_byte_t const*)message, length}};
+    ucall_server_reply_error_t reply = {server, &outcome, &request, status, {(ucall_byte_t const*)message, length}};
     ucall_server_reply_error(&reply);
     return outcome.status;
 }
@@ -541,7 +541,7 @@ static ucall_status_t reply_failure(ucall_server_t server, ucall_received_http_r
 static int reply_content(ucall_server_t server, ucall_received_http_request_t request, ucall_http_status_t status,
                          ucall_bytes_view_t const* headers, size_t headers_count, ucall_bytes_view_t body) {
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_content_t reply = {server, &outcome, request, status, headers, headers_count, body};
+    ucall_server_reply_content_t reply = {server, &outcome, &request, status, headers, headers_count, body};
     ucall_server_reply_content(&reply);
     return outcome.status == ucall_status_connection_closed_k ? 0 : ucall_py_raise_outcome(&outcome);
 }
@@ -745,10 +745,7 @@ static char const doc_Request_fields[] =                                        
 static PyObject* Request_fields(Request* self, [[maybe_unused]] PyObject* unused) {
     if (request_live(self) != 0) return NULL;
     ucall_outcome_t outcome = {0};
-    size_t count = 0;
-    ucall_server_request_fields_count_t counting = {self->server->handle, &outcome, self->handle, &count};
-    ucall_server_request_fields_count(&counting);
-    if (ucall_py_raise_outcome(&outcome) != 0) return NULL;
+    size_t const count = ucall_server_request_fields_count(self->server->handle, self->handle);
     PyObject* const fields = PyList_New((Py_ssize_t)count);
     for (size_t index = 0; fields && index != count; ++index) {
         ucall_bytes_view_t name = {0}, value = {0};
@@ -882,29 +879,22 @@ static int request_claim_reply(Request* self, PyObject* body, ucall_bytes_view_t
     return 0;
 }
 
-/** Keeps the request consumed after a reply that delivered it or found its connection closed, and
- *  gives @p handle back otherwise. */
+/** Keeps the request consumed after a reply that took @p handle, which the library then cleared,
+ *  and gives it back, raising the refusal, otherwise. */
 static PyObject* request_finish_reply(Request* self, ucall_received_http_request_t handle, ucall_outcome_t* outcome) {
-    ucall_status_t const status = ucall_outcome_status(outcome);
-    if (status == ucall_status_success_k || status == ucall_status_connection_closed_k) Py_RETURN_NONE;
+    if (!handle) Py_RETURN_NONE;
     request_restore(self, handle);
     ucall_py_raise_outcome(outcome);
     return NULL;
 }
 
-/** Hands @p deferred back once its reply was queued, or gives @p handle back and raises the refusal
+/** Hands @p deferred back once its reply took @p handle, or gives it back and raises the refusal
  *  that queued nothing. */
 static PyObject* request_defer_reply(Request* self, ucall_received_http_request_t handle, Deferred* deferred) {
-    ucall_status_t const status = ucall_outcome_status(&deferred->outcome);
-    // A queued reply may already be final, even failed, so only these refusals
-    // leave the request unanswered.
-    if (status == ucall_status_uninitialized_k || status == ucall_status_invalid_argument_k ||
-        status == ucall_status_already_exists_k || status == ucall_status_out_of_memory_k) {
-        request_restore(self, handle);
-        ucall_py_raise_outcome(&deferred->outcome);
-        return NULL;
-    }
-    return Py_NewRef((PyObject*)deferred);
+    if (!handle) return Py_NewRef((PyObject*)deferred);
+    request_restore(self, handle);
+    ucall_py_raise_outcome(&deferred->outcome);
+    return NULL;
 }
 
 /** Answers @p self with @p body, any bytes-like object or NULL for none, and consumes it. */
@@ -915,13 +905,17 @@ static PyObject* request_send(Request* self, PyObject* body, ucall_http_status_t
     Py_buffer buffer = {0};
     if (body && !own.data && PyObject_GetBuffer(body, &buffer, PyBUF_SIMPLE) != 0) return NULL;
     ucall_bytes_view_t const content = own.data ? own : (ucall_bytes_view_t) {buffer.buf, (size_t)buffer.len};
-    ucall_received_http_request_t const handle = request_take(self);
+    ucall_received_http_request_t handle = request_take(self);
+    if (!handle) {
+        if (buffer.obj) PyBuffer_Release(&buffer);
+        return request_raise_replied();
+    }
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_content_t reply = {self->server->handle, &outcome, handle, status, headers,
+    ucall_server_reply_content_t reply = {self->server->handle, &outcome, &handle, status, headers,
                                           headers_count,        content};
-    if (handle) ucall_server_reply_content(&reply);
+    ucall_server_reply_content(&reply);
     if (buffer.obj) PyBuffer_Release(&buffer);
-    return handle ? request_finish_reply(self, handle, &outcome) : request_raise_replied();
+    return request_finish_reply(self, handle, &outcome);
 }
 
 /** Answers @p self with what a handler returned, serialized by @c serialize_result. */
@@ -998,10 +992,11 @@ static PyObject* Request_reply_error(Request* self, PyObject* const* values, Py_
         return NULL;
     ucall_bytes_view_t own;
     if (request_claim_reply(self, NULL, &own) != 0) return NULL;
-    ucall_received_http_request_t const handle = request_take(self);
+    ucall_received_http_request_t handle = request_take(self);
     if (!handle) return request_raise_replied();
     ucall_outcome_t outcome = {0};
-    ucall_server_reply_error_t reply = {self->server->handle, &outcome, handle, (ucall_http_status_t)http_status, text};
+    ucall_server_reply_error_t reply = {self->server->handle, &outcome, &handle, (ucall_http_status_t)http_status,
+                                        text};
     ucall_server_reply_error(&reply);
     return request_finish_reply(self, handle, &outcome);
 }
@@ -1567,12 +1562,12 @@ static PyObject* DetachedRequest_reply_parts(Request* self, PyObject* const* val
     Deferred* const deferred = files && reply_parts_keep_files(&source, files) == 0 ? deferred_new(files) : NULL;
     Py_XDECREF(files);
     PyObject* answer = NULL;
-    ucall_received_http_request_t const handle = deferred || !source.deferring_count ? request_take(self) : NULL;
+    ucall_received_http_request_t handle = deferred || !source.deferring_count ? request_take(self) : NULL;
     if (handle) {
         ucall_outcome_t final = {0};
         ucall_outcome_t* const outcome = deferred ? &deferred->outcome : &final;
         ucall_server_reply_vectored_t reply = {
-            self->server->handle, outcome,     handle,       (ucall_http_status_t)http_status,
+            self->server->handle, outcome,     &handle,      (ucall_http_status_t)http_status,
             lines.views,          lines.count, source.parts, source.count,
         };
         ucall_server_reply_vectored(&reply);
@@ -1591,7 +1586,7 @@ static char const doc_DetachedRequest_reply_stream[] =                          
     "Answers the request with a body sent in parts, emitting the status line and headers now.\n"   //
     "\n"                                                                                           //
     "The body is chunked for HTTP/1.1 peers, unless `headers` declare Content-Length, which the\n" //
-    "parts must then sum to. A peer that left already still opens the stream, whose parts drop.\n" //
+    "parts must then sum to. A peer that left already ends the reply and raises it.\n"             //
     "\n"                                                                                           //
     "Args:\n"                                                                                      //
     "  status (int, optional): The HTTP status. Defaults to 200.\n"                                //
@@ -1628,20 +1623,20 @@ static PyObject* DetachedRequest_reply_stream(Request* self, PyObject* const* va
         stream->deferring_count = 0;
     }
     PyObject* opened = NULL;
-    ucall_received_http_request_t const handle = stream && stream->files ? request_take(self) : NULL;
+    ucall_received_http_request_t handle = stream && stream->files ? request_take(self) : NULL;
     if (handle) {
         ucall_outcome_t outcome = {0};
         ucall_server_reply_begin_t begin = {
-            self->server->handle, &outcome, handle, (ucall_http_status_t)http_status, lines.views, lines.count,
+            self->server->handle, &outcome, &handle, (ucall_http_status_t)http_status, lines.views, lines.count,
         };
         ucall_server_reply_begin(&begin);
-        ucall_status_t const begun = ucall_outcome_status(&outcome);
-        if (begun == ucall_status_success_k || begun == ucall_status_connection_closed_k) {
+        // A closed connection ended the reply and took the request, which a refusal leaves.
+        if (ucall_outcome_status(&outcome) == ucall_status_success_k) {
             stream->handle = handle;
             opened = Py_NewRef((PyObject*)stream);
         }
         else {
-            request_restore(self, handle);
+            if (handle) request_restore(self, handle);
             ucall_py_raise_outcome(&outcome);
         }
     }
@@ -1690,7 +1685,7 @@ static PyObject* DetachedRequest_body_chunks(Request* self, [[maybe_unused]] PyO
 static void ReplyStream_dealloc(ReplyStream* self) {
     if (self->handle) {
         ucall_outcome_t outcome = {0};
-        ucall_server_reply_end_t end = {self->server->handle, &outcome, self->handle};
+        ucall_server_reply_end_t end = {self->server->handle, &outcome, &self->handle};
         ucall_server_reply_end(&end);
         Py_BEGIN_ALLOW_THREADS;
         ucall_outcome_wait(&outcome);
@@ -1766,7 +1761,7 @@ static PyObject* ReplyStream_end(ReplyStream* self, [[maybe_unused]] PyObject* u
     if (self->deferring_count && !deferred) return NULL;
     ucall_py_section_t section;
     ucall_py_section_begin(&section, (PyObject*)self);
-    ucall_received_http_request_t const handle = self->handle;
+    ucall_received_http_request_t handle = self->handle;
     self->handle = NULL;
     ucall_py_section_end(&section);
     if (!handle) {
@@ -1774,7 +1769,7 @@ static PyObject* ReplyStream_end(ReplyStream* self, [[maybe_unused]] PyObject* u
         return ucall_py_raise_status(ucall_status_already_exists_k, "the stream already ended");
     }
     ucall_outcome_t final = {0};
-    ucall_server_reply_end_t end = {self->server->handle, deferred ? &deferred->outcome : &final, handle};
+    ucall_server_reply_end_t end = {self->server->handle, deferred ? &deferred->outcome : &final, &handle};
     ucall_server_reply_end(&end);
     if (deferred) return (PyObject*)deferred;
     ucall_status_t const status = ucall_outcome_status(&final);
@@ -2260,7 +2255,8 @@ static int reply_result(ucall_server_t server, ucall_received_http_request_t req
 }
 
 /** Runs a handler taking the `Request` itself on the polling thread. */
-static void call_request_endpoint(ucall_received_http_request_t handle, void* context) {
+static void call_request_endpoint([[maybe_unused]] ucall_server_t server, ucall_received_http_request_t handle,
+                                  void* context) {
     PyGILState_STATE const state = PyGILState_Ensure();
     Endpoint* const endpoint = (Endpoint*)context;
     PyObject* const request = request_new(endpoint->server, handle, &RequestType);
@@ -2282,7 +2278,8 @@ static void call_request_endpoint(ucall_received_http_request_t handle, void* co
 }
 
 /** Binds a typed handler's parameters, runs it on the polling thread, and replies. */
-static void call_typed_endpoint(ucall_received_http_request_t request, void* context) {
+static void call_typed_endpoint([[maybe_unused]] ucall_server_t server_handle, ucall_received_http_request_t request,
+                                void* context) {
     PyGILState_STATE const state = PyGILState_Ensure();
     Endpoint* const endpoint = (Endpoint*)context;
     ucall_server_t const server = endpoint->server->handle;
@@ -2514,7 +2511,8 @@ typedef struct BatchEndpoint {
 
 /** Runs a batch endpoint's Python handler on its polling owner's thread with a list of its
  *  requests. */
-static void call_batch_endpoint(ucall_received_http_request_t const* handles, size_t count, void* context) {
+static void call_batch_endpoint([[maybe_unused]] ucall_server_t server, ucall_received_http_request_t const* handles,
+                                size_t count, void* context) {
     PyGILState_STATE const state = PyGILState_Ensure();
     BatchEndpoint* const endpoint = (BatchEndpoint*)context;
     PyObject* const held = PyTuple_New((Py_ssize_t)count);
