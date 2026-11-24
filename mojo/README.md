@@ -56,7 +56,7 @@ def main() raises:
 
 ## Serving
 
-A server takes the interfaces it answers on and its `ServerOptions`; each `Interface` carries its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
+A server takes the interfaces it answers on and its `ServerOptions`; each `Interface` holds its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 
 ```mojo
 def listing(var request: Request) raises:
@@ -109,7 +109,7 @@ def greet(var request: Request) raises:
     request^.reply(HTTPStatus.OK, [BytesView.of("content-type: text/plain")], "Hello!".as_bytes())
 ```
 
-Every read borrows the received bytes with the request's origin.
+Every read points into the received bytes with the request's origin.
 `fields_count` and `field` walk every header line in arrival order, `path_segments_count` and `path_segment` walk the path, `parts_count` and `part` walk a `multipart/form-data` body, and `peer` reports the interface, the authenticated Noise key and the socket address.
 `reply`, `reply_error` and `detach` consume the request, and a request dropped without them answers 500, which is also what a handler raising past it answers.
 
@@ -206,10 +206,10 @@ def download(mut client: Client) raises:
 ```
 
 A call whose `ClientCallOptions.body_delivery` is `BodyDelivery.STREAMED` completes once its head arrived, so a download larger than `max_response_bytes` is pulled through `Response.body_chunk` as it lands, while `Response.body` raises `INVALID_ARGUMENT`.
-Each chunk borrows the response until the next pull, and the bytes decoded before a failure come out before the failure is raised.
+Each chunk points into the response until the next pull, and the bytes decoded before a failure come out before the failure is raised.
 Pulls run on the client's thread and never wait in the library: `body_chunk` advances the client while nothing was decoded.
 A client bound to a server advances only as that server's loop polls, so there `body_chunk` raises `WOULD_BLOCK`, to be pulled again after the next `take_call`.
-Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection carries no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `CONNECTION_CLOSED`.
+Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection holds no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `CONNECTION_CLOSED`.
 Redirects stay buffered so they can be followed, and only the final response streams.
 
 ## Noise Keys
@@ -275,5 +275,5 @@ A client bound to a server's event loop is used only on that loop's polling thre
   Every one of the 55 exported functions is bound, and so are both callback types, the log sink and the peer authorizer; typed JSON handlers stay Python's, and Mojo handlers read and write bytes.
 - __Handlers are compile-time parameters.__
   One `thin abi("C")` trampoline is instantiated per handler, and the context the library passes back addresses the `Server`, which is not `Movable` for that reason.
-- __Pointers keep their types and their borrows.__
-  A C pointer that may be null is an `Optional[Pointer]`, a view carries the origin of what it borrows, and only opaque handles and `void *` state cross as an integer `Address`.
+- __Pointers keep their types and their origins.__
+  A C pointer that may be null is an `Optional[Pointer]`, a view names the origin of the storage it points into, and only opaque handles and `void *` state cross as an integer `Address`.

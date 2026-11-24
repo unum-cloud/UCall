@@ -1,6 +1,6 @@
 //! Vocabulary shared by servers and clients: statuses and errors, deferred outcomes, verbs,
 //! backends, CPU classes, security modes, Noise keys, log sinks, and the byte views header lines
-//! are lent as.
+//! are passed as.
 //!
 //! File: rust/types.rs
 //! Author: Ash Vardanian
@@ -247,7 +247,7 @@ impl fmt::Display for Status {
 pub struct Error {
     /// What went wrong, to branch on.
     pub status: Status,
-    /// The detail the status alone cannot carry.
+    /// The detail the status alone cannot express.
     pub message: &'static str,
 }
 
@@ -382,7 +382,7 @@ pub(crate) unsafe fn static_string(raw: *const c_char) -> &'static str {
     unsafe { core::str::from_utf8_unchecked(CStr::from_ptr(raw).to_bytes()) }
 }
 
-/// Lends a borrowed slice as the view the library reads.
+/// Views a slice as the bytes the library reads, valid while the slice is.
 pub(crate) fn view(bytes: &[u8]) -> ucall_bytes_view_t {
     ucall_bytes_view_t { data: bytes.as_ptr(), length: bytes.len() }
 }
@@ -505,28 +505,28 @@ pub(crate) fn raw_descriptor(descriptor: Descriptor<'_>) -> c_int {
 
 /// Borrows a C descriptor the caller knows stays open for `'f`.
 #[cfg(unix)]
-pub(crate) unsafe fn borrowed_descriptor<'f>(descriptor: c_int) -> Descriptor<'f> {
+pub(crate) unsafe fn descriptor_from_raw<'f>(descriptor: c_int) -> Descriptor<'f> {
     unsafe { std::os::fd::BorrowedFd::borrow_raw(descriptor) }
 }
 /// Borrows a C descriptor the caller knows stays open for `'f`.
 #[cfg(windows)]
-pub(crate) unsafe fn borrowed_descriptor<'f>(descriptor: c_int) -> Descriptor<'f> {
-    unsafe { CrtDescriptor::borrow_raw(descriptor) }
+pub(crate) unsafe fn descriptor_from_raw<'f>(descriptor: c_int) -> Descriptor<'f> {
+    unsafe { CrtDescriptor::from_raw(descriptor) }
 }
 
 #[cfg(windows)]
 impl CrtDescriptor<'_> {
-    /// Borrows `descriptor`.
+    /// Wraps `descriptor`.
     ///
     /// # Safety
     ///
     /// The descriptor stays open for the returned lifetime.
-    pub unsafe fn borrow_raw(descriptor: c_int) -> Self {
+    pub unsafe fn from_raw(descriptor: c_int) -> Self {
         CrtDescriptor { descriptor, file: PhantomData }
     }
 }
 
-/// A borrowed header line, laid out so a slice of them is lent to the library without copying.
+/// A borrowed header line, laid out so a slice of them is the C array the library reads in place.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct BytesView<'bytes> {
@@ -568,7 +568,7 @@ impl<'bytes> BytesView<'bytes> {
         BytesView { raw, bytes: PhantomData }
     }
 
-    /// Lends a run of views as the counted array the library reads.
+    /// Views a run of views as the counted array the library reads.
     pub(crate) fn raw_array(views: &[BytesView<'_>]) -> *const ucall_bytes_view_t {
         views.as_ptr().cast()
     }
@@ -637,7 +637,7 @@ impl HTTPStatus {
 /// An HTTP method, for routing on the server and for calls on the client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Verb {
-    /// Unrecognized; a routed request never carries it.
+    /// Unrecognized; a routed request never has it.
     Unknown,
     /// GET, reading a resource.
     Get,
@@ -843,10 +843,10 @@ impl Security {
 /// process.
 pub type PeerAuthorizer = dyn Fn(&NoiseKey) -> bool + Send + Sync;
 
-/// Lends an optional authorizer as the C callback and the context it is called with.
+/// Names an optional authorizer as the C callback and the context it is called with.
 ///
 /// The context points at `authorizer` itself, which must stay in place until the handle is freed.
-pub(crate) fn lend_authorizer(authorizer: &Option<Arc<PeerAuthorizer>>) -> (ucall_peer_authorizer_t, *mut c_void) {
+pub(crate) fn authorizer_callback(authorizer: &Option<Arc<PeerAuthorizer>>) -> (ucall_peer_authorizer_t, *mut c_void) {
     match authorizer {
         Some(authorizer) => (Some(authorize_trampoline), ptr::from_ref(authorizer).cast_mut().cast()),
         None => (None, ptr::null_mut()),
@@ -932,9 +932,9 @@ pub struct Log {
     pub level: LogLevel,
 }
 
-/// Lends an optional sink as the C log, whose context points at the callback inside `log`, which
+/// Names an optional sink as the C log, whose context points at the callback inside `log`, which
 /// must stay in place until the handle is freed.
-pub(crate) fn lend_log(log: &Option<Box<Log>>) -> ucall_log_t {
+pub(crate) fn log_callback(log: &Option<Box<Log>>) -> ucall_log_t {
     match log {
         Some(log) => ucall_log_t {
             callback: Some(log_trampoline),

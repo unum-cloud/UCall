@@ -40,7 +40,7 @@ typedef struct Interface {
     /** The open-connection budget. */
     Py_ssize_t connections;
 
-    /** The requests one connection carries at once; zero means one. */
+    /** The requests one connection holds at once; zero means one. */
     Py_ssize_t pipelined_requests;
 
     /** The largest request head and buffered body; zero takes the kernel's receive buffer. */
@@ -74,7 +74,7 @@ static char const doc_Interface[] =                                             
     "  event_loops (int, optional): Loops accepting here; 0 takes one for an address and one per\n" //
     "    receive queue for a device.\n"                                                             //
     "  connections (int, optional): Connections open at once. Defaults to 1024.\n"                  //
-    "  pipelined_requests (int, optional): Requests one connection carries before the server\n"     //
+    "  pipelined_requests (int, optional): Requests one connection holds before the server\n"       //
     "    stops reading from it; 0 means one.\n"                                                     //
     "  max_request_bytes (int, optional): The largest request head and buffered body, past which\n" //
     "    the reply is 413; 0 takes the largest receive buffer the kernel grants a socket.\n"        //
@@ -234,7 +234,7 @@ static PyMemberDef Interface_members[] = {
     {"event_loops", Py_T_PYSSIZET, offsetof(Interface, event_loops), Py_READONLY, "Requested loops; 0 chooses."},
     {"connections", Py_T_PYSSIZET, offsetof(Interface, connections), Py_READONLY, "Connections open at once."},
     {"pipelined_requests", Py_T_PYSSIZET, offsetof(Interface, pipelined_requests), Py_READONLY,
-     "Requests one connection carries at once; 0 means one."},
+     "Requests one connection holds at once; 0 means one."},
     {"max_request_bytes", Py_T_PYSSIZET, offsetof(Interface, max_request_bytes), Py_READONLY,
      "The largest request head and buffered body; 0 takes the kernel's receive buffer."},
     {"reply_directories", Py_T_OBJECT_EX, offsetof(Interface, reply_directories), Py_READONLY,
@@ -398,13 +398,14 @@ typedef struct Server {
     /** The largest resolved @c event_loops among the interfaces: the server's parallelism. */
     size_t event_loops;
 
-    /** The @c Interface tuple, keeping each authorizer the C interface borrows alive. */
+    /** The @c Interface tuple, keeping each authorizer the C interface reads alive. */
     PyObject* interfaces;
 
-    /** Every endpoint context the C interface borrows, an @c Endpoint or @c BatchEndpoint. */
+    /** Every endpoint context the C interface reads, an @c Endpoint or @c BatchEndpoint. */
     PyObject* endpoints;
 
-    /** The callable receiving log lines, which the C interface borrows, or NULL. */
+    /** The callable receiving log lines, which the C interface reads and this server keeps alive,
+     *  or NULL. */
     PyObject* log;
 
     /** Advanced by @c stop() from any thread, so every access takes the server's section. */
@@ -476,7 +477,7 @@ typedef struct Deferred {
     /** The outcome the event loop publishes, at an address outliving the reply call. */
     ucall_outcome_t outcome;
 
-    /** The @c File parts whose descriptors the reply borrows until final, a list. */
+    /** The @c File parts whose descriptors the reply reads until final, a list. */
     PyObject* files;
 } Deferred;
 
@@ -489,7 +490,7 @@ typedef struct ReplyStream {
     /** The server that received it, kept alive as long as the stream. */
     Server* server;
 
-    /** The @c File parts appended so far, whose descriptors the reply borrows until final,
+    /** The @c File parts appended so far, whose descriptors the reply reads until final,
      *  a list. */
     PyObject* files;
 
@@ -1308,7 +1309,7 @@ PyTypeObject PathType = {
 /** The parts one reply call lays out on the stack, past which it takes them from the heap. */
 enum { inline_reply_parts_k = 16 };
 
-/** The parts one reply call borrows: the C array, and the buffer of each bytes part. */
+/** The parts one reply call reads: the C array, and the buffer of each bytes part. */
 typedef struct reply_parts_t {
 
     /** The fast sequence of parts, keeping each alive for the call. */
@@ -1494,7 +1495,7 @@ static PyMethodDef Deferred_methods[] = {
 static char const doc_Deferred[] =                                                                    //
     "A reply still sending file or path parts, from `reply_parts` or `ReplyStream.end`.\n"            //
     "\n"                                                                                              //
-    "It owns the reply's outcome and keeps the `File` parts it borrows alive until the outcome is\n"  //
+    "It owns the reply's outcome and keeps the `File` parts it reads alive until the outcome is\n"    //
     "final. `await` it in a coroutine, or call `wait()`; released unfinished, it waits, so keep it\n" //
     "off the polling thread, as `Request.detach` does.\n"                                             //
     "\n"                                                                                              //
@@ -2286,7 +2287,7 @@ static void call_typed_endpoint(ucall_received_http_request_t request, void* con
     PyGILState_STATE const state = PyGILState_Ensure();
     Endpoint* const endpoint = (Endpoint*)context;
     ucall_server_t const server = endpoint->server->handle;
-    // One leading slot lets the callee borrow it, as `PY_VECTORCALL_ARGUMENTS_OFFSET` allows.
+    // One leading slot lets the callee prepend to it, as `PY_VECTORCALL_ARGUMENTS_OFFSET` allows.
     PyObject* arguments[1 + max_parameters_k] = {NULL};
     PyObject** const values = arguments + 1;
     PyObject* document = NULL;

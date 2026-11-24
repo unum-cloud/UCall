@@ -39,8 +39,8 @@ The `relwithdebinfo` and `release` presets build the same suites with optimizati
 Tests, examples and benchmarks are off unless a preset or a `-D` switch asks for them.
 StringZilla, ForkUnion, SmashTable, and the inference example's NumKong resolve from their submodules or pinned fetches; `FETCHCONTENT_SOURCE_DIR_STRINGZILLA`, `FETCHCONTENT_SOURCE_DIR_FORKUNION`, `FETCHCONTENT_SOURCE_DIR_SMASHTABLE`, and `FETCHCONTENT_SOURCE_DIR_NUMKONG` select existing checkouts.
 The build exposes `ucall::static`, which the tests, tools, bindings and the Rust crate link, `ucall::shared`, and `ucall::header`, the C headers alone.
-`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each engine where the target operating system has it, and the header refuses one forced on elsewhere.
-`UCALL_WITH_LINUX_URING`, on for Linux, also links liburing, and a library or subproject build serves whichever compiled engine the host admits first.
+`UCALL_WITH_POSIX`, `UCALL_WITH_LINUX_EPOLLAIO`, `UCALL_WITH_BSD_KQUEUE`, `UCALL_WITH_WINDOWS_IOCP`, and `UCALL_WITH_WINDOWS_RIO` take `AUTO`, `ON`, or `OFF`; `AUTO` leaves `c/ucall/types.h` to compile each queue where the target operating system has it, and the header refuses one forced on elsewhere.
+`UCALL_WITH_LINUX_URING`, on for Linux, also links liburing, and a library or subproject build serves whichever compiled queue the host admits first.
 CPU probes select separate instantiation units, each compiled at the floor like the dispatch code.
 Each class unit compiles when StringZilla compiles and ForkUnion enables every capability it uses.
 `UCALL_MARCH` raises the floor of UCall's own units to an ISA level, `native` or a CPU name like `graniterapids`, and hands the same value to the siblings.
@@ -96,6 +96,14 @@ A value no class takes fails with `invalid_argument`, as a misspelled name does 
 A `cpu_class_ceiling` intersects the named class's masks with the detected ones, so a class the machine lacks caps the pick rather than refusing it, and `unknown` leaves the detected masks alone.
 Construction takes the newest compiled class on the ladder whose masks fit that intersection, and fails with `unsupported` when none does, as a monoversioned build does on an older machine.
 Resolved options report the class picked in the same `cpu_class_ceiling` field.
+
+## Threads and Placement
+
+The application's threads call the poll verbs, and UCall starts none of its own.
+Each event loop owns one queue, which only the thread polling that loop touches.
+Waits happen in the kernel, since a remote peer triggers the events a loop waits on, and a spin would burn a core for nothing.
+UCall reports the network interface's memory domain in `ucall_network_interface_t::memory_domain` and places no thread or buffer itself.
+The application pins its threads and picks their cores.
 
 ## Code Rules
 
@@ -156,7 +164,7 @@ Do not tune constants until one benchmark looks good.
 
 ### Statuses
 
-Statuses 0 to 19 carry the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
+Statuses 0 to 19 keep the same numbers and meanings in every Unum library: success 0, deferred 1, out_of_memory 2, shape_mismatch 3, unsupported_layout 4, unknown_kind 5, read_only 6, io 7, device 8, malformed 9, internal 10, overflow 11, uninitialized 12, config_mismatch 13, contended 14, cancelled 15, unsupported 16, invalid_argument 17, not_found 18, already_exists 19.
 A library leaves out the ones it cannot answer but never renumbers the rest, and numbers its own statuses from 20.
 Every enum the C interface names, statuses included, has a `ucall_*_name` answering "unrecognized" for a value it does not know and a `ucall_*_from_name(view, &out)` answering `invalid_argument` for a name it does not know, leaving `out` as it was.
 CPU and GPU class values are ABI: each class keeps the number USearch gives the same hardware, written explicitly, with unused numbers reserved rather than reused.
@@ -282,6 +290,8 @@ One word names each concept, here and in every Unum project; the right column li
 | a per-capability kernel bundle                                   | kit                                   | trait                                         |
 | a compiled alternative per class, dtype or residency             | variant                               | arm, cell                                     |
 | RAM, VRAM or NVMe                                                | residency                             | home, memory side                             |
+| one thread's kernel transport                                    | queue                                 | engine, lane                                  |
+| memory a view points into                                        | its owner and the call it stays valid until | lend, lent, borrow, loan, lease         |
 | an exported operation and its table entry                        | verb; trampoline                      | …                                             |
 | a fixed-shape collection a verb fills                            | outputs                               | landing, lander                               |
 | a member of a plan, cursor or walk                               | what it holds and when it holds it    | bits, current, state, data, flags, tmp, scratch |
@@ -323,7 +333,7 @@ After a crash, `p test_run` in a core dump names the case in progress and the la
 ### Running
 
 Native suites live in `test/`, mirroring `include/ucall/`, the C caller in `c/test.c`, and benchmark clients in `bench/`.
-`ucall_test` runs the outcome word, every engine and the network cells, `ucall_test_header_only` the parsers and the tunnel, and `ucall_test_tools` the command-line client; each ctest is named after its executable.
+`ucall_test` runs the outcome word, every queue and the network cells, `ucall_test_header_only` the parsers and the tunnel, and `ucall_test_tools` the command-line client; each ctest is named after its executable.
 `UCALL_BUILD_STUB=ON` builds `src_stub/`, a stand-in for the C interface that validates every call and serves no network, and `ucall_test_c_stub`, the same `c/test.c` linked against it; the stand-in runs only the serial CPU class.
 `ucall_test` sweeps a diagonal of cells: every compiled backend at the best CPU class in plaintext, every class the machine runs on the first backend, and each Noise pattern on the first backend.
 `--backend` and `--cpu-class-ceiling` narrow the sweep to one backend or class, and a ceiling above what the host runs skips rather than sweeping the lower class it resolves to.
@@ -411,7 +421,7 @@ UCall drives no accelerators: its suites sweep I/O backends and CPU classes, and
 
 #### Arm on an x86 Host
 
-`cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which carries every feature the Arm CPU classes ask for.
+`cmake/toolchain-aarch64-llvm.cmake` cross-compiles with the host's Clang and LLD, and `ctest` runs each suite under `qemu-aarch64 -cpu max`, which enables every feature the Arm CPU classes ask for.
 `--cpu-class-ceiling` selects one, and `llvm-objdump -d` on its unit, such as `variants_aws_g2.cpp.o`, shows the instruction every atomic lowered to.
 QEMU's user mode has neither io_uring nor Linux AIO, so those cells skip.
 
@@ -453,8 +463,8 @@ Windows and FreeBSD link their test executables; macOS stops at the static libra
 
 These test units include a header the public surface does not cover:
 
-- `test/network.hpp`, `test/network/client.cpp`, `test/network/loops.cpp` and `test/network/resolving.cpp` include `src/variants.hpp` for `io_engines_t` and `network_t`, the engine and network of each CPU class, which the C interface hides behind its handles.
-- `test/io/engines.hpp` includes `src/lib.hpp` for `cpu_class_t` and the kits each class picks, which the engine tests instantiate one class at a time.
+- `test/network.hpp`, `test/network/client.cpp`, `test/network/loops.cpp` and `test/network/resolving.cpp` include `src/variants.hpp` for `io_queues_t` and `network_t`, the queue and network of each CPU class, which the C interface hides behind its handles.
+- `test/io/queues.hpp` includes `src/lib.hpp` for `cpu_class_t` and the kits each class picks, which the queue tests instantiate one class at a time.
 
 ### Fuzzing
 
@@ -514,20 +524,20 @@ A view the library hands back lives until the next call on its arena.
 The library describes where the memory sits, and the caller checks it; the binding neither copies the view to be safe nor checks its residency on the caller's behalf.
 
 Every array a verb reads shares the call's one count, so mismatched shapes cannot be expressed.
-Where a binding's own types carry two lengths, like a slice of keys beside a matrix of values, it checks once that they agree before the call crosses into the library, and nowhere else.
+Where a binding's own types hold two lengths, like a slice of keys beside a matrix of values, it checks once that they agree before the call crosses into the library, and nowhere else.
 
 Each verb has one body, which fills the C struct and calls the library with no layers in between.
 What it returns is read from the struct's output slot, a trampoline receives the handler itself as its state with no hub around it, and whether a call blocks or defers follows from the type of the receiver it is called on, never from a flag.
 Verbs are never shared through a base class; a trait whose default methods hold the one body per verb is fine, like Rust's and Mojo's, since each receiver supplies only its handle.
 
 A typed binding takes the scalar as a type parameter of each call, like USearch's `search::<f32>`, rather than letting a handle's type fix one.
-A deferred Rust call owns what it lends the library until the call is final, since the borrow checker cannot see the library holding it.
+A deferred Rust call owns what the library reads until the call is final, since the borrow checker cannot see the library holding it.
 A C++ wrapper over the C interface is a full typed binding: it has a deferred receiver, `noexcept` callback types and per-call scalar templates.
 
 A dynamic binding publishes every field of every report the library fills.
-A type the binding hands to C by cast, like a slice of parts lent as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
+A type the binding hands to C by cast, like a slice of parts passed as the C array, is a transparent wrapper over the C struct, like Rust's `#[repr(transparent)]` newtype, so the cast is sound by construction and nothing asserts its size or alignment.
 Tests never restate a struct's layout that the compiler already pins: no `offset_of!`, `size_of`, `MemoryLayout` or `Marshal.SizeOf` asserts against the C structs; `offsetof` tables that declare members are declarations, not tests.
-Tests of how names print and parse, and of an engine run again through the binding, stay.
+Tests of how names print and parse, and of a queue run again through the binding, stay.
 
 `.githooks/pre-commit` refuses locks in binding sources, throwing callback types, caught unwinds and kept exceptions.
 
@@ -563,7 +573,7 @@ RUSTDOCFLAGS="-D warnings" cargo doc --no-deps
 - The title reads `<Verb>: <Summary>`, where the verb is one of `Add`, `Break`, `Chore`, `Docs`, `Fix`, `Improve` or `Make`.
 - The summary opens with a capital letter, unless it opens with a code identifier, which keeps its own case.
 - The title runs to at most 80 characters, and a body line to at most 100 columns, unless it holds a URL or is indented code.
-- The message carries no AI-assistant attribution, since authorship is the human who committed.
+- The message includes no AI-assistant attribution, since authorship is the human who committed.
 - `Break` marks a change to what the project offers, such as a dropped modality or binding; `Chore` removes or rearranges without changing it.
 - The body is prose wrapped near 80 columns and explains the change in primary logic, not renames or formatting.
 - One commit per topic, however many files it touches; an intermediate commit may leave the tree unbuildable.

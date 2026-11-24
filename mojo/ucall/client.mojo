@@ -15,7 +15,7 @@ from std.ffi import c_int, c_size_t
 from std.memory import ArcPointer, stack_allocation
 
 from ucall.library import Library
-from ucall.server import Server, _ServerCore, _array, _lend, _outcome_in, _view_in
+from ucall.server import Server, _ServerCore, _array, _outcome_in, _pointer_in, _view_in
 from ucall.types import (
     Address,
     Backend,
@@ -206,7 +206,7 @@ struct ClientOptions(Copyable, Movable):
     var connections: Int
     """Connections open at once; zero fails with `INVALID_ARGUMENT`."""
     var pipelined_calls: Int
-    """Calls one connection may carry at once; zero means one."""
+    """Calls one connection may hold at once; zero means one."""
     var calls: Int
     """Calls admitted at once, unretrieved completions included; zero means `connections` times
     `pipelined_calls`."""
@@ -306,7 +306,7 @@ struct ClientCall(Copyable, Movable):
 
 
 def _copied(bytes: Span[Byte, _]) -> List[Byte]:
-    """An owned copy of borrowed bytes, which a call keeps until it completes."""
+    """An owned copy of bytes owned elsewhere, which a call keeps until it completes."""
     var copy = List[Byte](capacity=len(bytes))
     for byte in bytes:
         copy.append(byte)
@@ -315,7 +315,7 @@ def _copied(bytes: Span[Byte, _]) -> List[Byte]:
 
 @fieldwise_init
 struct _CallSlot(Copyable, Movable):
-    """One admission slot: the caller's context and the inputs the library borrows until completion."""
+    """One admission slot: the caller's context and the inputs the library reads until completion."""
 
     var context: UInt64
     var request: Optional[ClientCall]
@@ -367,7 +367,7 @@ struct Client(Movable):
     """The resolved time budget of one exchange, which `call` waits in."""
 
     def __init__(out self, library: Library, options: ClientOptions) raises Error:
-        """Starts a client with an engine of its own; it holds no connection until a call is polled.
+        """Starts a client with a queue of its own; it holds no connection until a call is polled.
         Calls `ucall_client_init`.
 
         Args:
@@ -381,7 +381,7 @@ struct Client(Movable):
         self = Self(library, options, None, 0)
 
     def __init__(out self, server: Server, options: ClientOptions, *, event_loop: Int = 0) raises Error:
-        """Starts a client driven by one of `server`'s event loops, sharing its engine. Calls `ucall_client_init`.
+        """Starts a client driven by one of `server`'s event loops, sharing its queue. Calls `ucall_client_init`.
 
         Bind it before the loop first polls, and use it only on that loop's polling thread, whose
         `take_call` advances it; its `take_completed` only hands out what the loop finished.
@@ -405,7 +405,7 @@ struct Client(Movable):
             c_size_t(options.pipelined_calls),
             c_size_t(options.connect_timeout_microseconds),
             c_size_t(options.call_timeout_microseconds),
-            _lend(options.noise_private_key),
+            _pointer_in(options.noise_private_key),
             options.peer_authorizer.callback,
             options.peer_authorizer.context,
             options.log,
@@ -446,7 +446,7 @@ struct Client(Movable):
         self.call_timeout_microseconds = Int(resolved.call_timeout_microseconds)
 
     def __deinit__(deinit self):
-        """Cancels the calls in flight and frees the client before the inputs they borrowed.
+        """Cancels the calls in flight and frees the client before the inputs they read.
         Calls `ucall_client_free`."""
         self.library.symbols().client_free(self.handle)
         _ = self.slots^
@@ -480,8 +480,8 @@ struct Client(Movable):
                     c_size_t(call.options.max_retries),
                     c_size_t(call.options.max_redirects),
                     call.options.security,
-                    _lend(call.options.noise_private_key),
-                    _lend(call.options.noise_peer_key),
+                    _pointer_in(call.options.noise_private_key),
+                    _pointer_in(call.options.noise_peer_key),
                     call.options.body_delivery,
                 ),
                 index,
@@ -495,7 +495,7 @@ struct Client(Movable):
         return index
 
     def submit(mut self, var request: ClientCall, context: UInt64 = 0) raises Error:
-        """Admits `request` without driving the network; its completion carries `context`.
+        """Admits `request` without driving the network; its completion includes `context`.
         Calls `ucall_client_call`.
 
         Success guarantees exactly one completion from `take_completed`.
@@ -726,7 +726,7 @@ struct Response(Movable):
         Pull on the client's thread. A client bound to a server advances only as that server's loop
         polls, so a pull finding nothing there raises `WOULD_BLOCK`, to be pulled again after the next
         `take_call`. Every response of a streamed call is pulled to its end or dropped,
-        since its connection carries no other call meanwhile; dropping it early closes that connection
+        since its connection holds no other call meanwhile; dropping it early closes that connection
         and fails the calls pipelined behind it with `CONNECTION_CLOSED`.
 
         Returns:

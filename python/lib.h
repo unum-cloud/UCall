@@ -46,13 +46,13 @@
  *
  *  @c Request.detach moves the handle into a @c DetachedRequest, the only owner of the verbs whose
  *  replies may defer, so by type a @c Deferred, which waits when released, never comes to be on a
- *  polling thread. A @c Deferred keeps its outcome on the heap with the @c File parts it borrows,
- *  and the memoryview of a part or a body chunk counts among its request's exports as @c body does.
+ *  polling thread. A @c Deferred keeps its outcome on the heap with the @c File parts it reads, and
+ *  the memoryview of a part or a body chunk counts among its request's exports as @c body does.
  *
  *  @section python_clients Client Calls
  *
  *  Every accepted call is a @c Completed object whose address is the C cookie. It holds the URL,
- *  headers, body and key the client borrows until retrieval, and links into its client's in-flight
+ *  headers, body and key the client reads until retrieval, and links into its client's in-flight
  *  list so a client freed with calls outstanding can release them after @c ucall_client_free
  *  returns. A blocking call polls until its own @c Completed is retrieved and keeps every other one
  *  for the next @c take_completed.
@@ -124,13 +124,14 @@ enum {
     ucall_py_interrupt_period_microseconds_k = 100000,
 };
 
-/** One argument a verb takes and the slot its borrowed value lands in; a skipped one stays NULL. */
+/** One argument a verb takes and the slot its value lands in, kept alive by the caller; a skipped
+ *  one stays NULL. */
 typedef struct ucall_py_argument_t {
 
     /** The keyword spelling, which also names the argument in every refusal. */
     char const* name;
 
-    /** Where the borrowed value lands. */
+    /** Where the value lands. */
     PyObject** value;
 } ucall_py_argument_t;
 
@@ -159,7 +160,7 @@ int ucall_py_text_from_object(PyObject* object, char const* field, ucall_bytes_v
 /** Copies a 32-byte Noise key out of @p object, refusing any other length. */
 int ucall_py_key_from_object(PyObject* object, char const* field, ucall_noise_key_t key);
 
-/** Header lines a call borrows: the sequence keeping each line alive and the views over them. */
+/** Header lines a call reads: the sequence keeping each line alive and the views over them. */
 typedef struct ucall_py_header_lines_t {
 
     /** The fast sequence of @c str or @c bytes lines, or NULL for none. */

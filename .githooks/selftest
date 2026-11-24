@@ -1263,6 +1263,21 @@ assert_rejects "abbreviation in prose" "abbreviates a word this project spells o
 static inline int probe(int value) { return value; }
 FIXTURE
 
+assert_rejects "hand-over word in a name" "names a thing by a hand-over word" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int lend_log(int sink) noexcept { return sink; }
+FIXTURE
+
+assert_rejects "hand-over word in a Rust name" "names a thing by a hand-over word" rust/probe.rs <<'FIXTURE'
+fn borrowed_descriptor(descriptor: i32) -> i32 { descriptor }
+FIXTURE
+
+assert_accepts "a Rust std borrow and a hand-over word in prose" rust/probe.rs <<'FIXTURE'
+use std::borrow::Cow;
+
+// The borrow checker orders setup before serving.
+fn probe(bytes: &[u8]) -> Cow<'_, [u8]> { Cow::Borrowed(bytes) }
+FIXTURE
+
 assert_accepts "abbreviations inside string literals, raw strings included" include/$project_directory/probe.hpp <<'FIXTURE'
 inline char const *probe_key() noexcept { return "obj"; }
 inline char const *probe_cases() noexcept {
@@ -3149,6 +3164,18 @@ FIXTURE
 
 assert_accepts "span of C strings spelled const char" include/$project_directory/probe.hpp <<'FIXTURE'
 void probe_name(std::span<const char* const> names) noexcept;
+FIXTURE
+
+assert_rejects "executor address comparison" "compares executor addresses" src/probe.cpp <<'FIXTURE'
+std::size_t probe_thread(probe_view_t const& view, probe_state_t const& state) noexcept {
+    return view.executor == state.executor ? view.thread_index : 0;
+}
+FIXTURE
+
+assert_accepts "null executor test and an executor's width" src/probe.cpp <<'FIXTURE'
+std::size_t probe_threads(probe_view_t const& view) noexcept {
+    return view.executor != nullptr && view.executor->size() != 0 ? view.executor->size() : 1;
+}
 FIXTURE
 
 assert_rejects "N-API mutex in a binding" "locks in a binding" javascript/probe.c <<'FIXTURE'

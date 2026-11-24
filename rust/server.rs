@@ -30,7 +30,7 @@ use std::sync::Arc;
 
 use crate::types::{
     Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, HTTPStatus, Log, NoiseKey, PeerAuthorizer,
-    Result, Security, Status, Verb, borrowed_descriptor, check, fail, lend_authorizer, lend_log, microseconds,
+    Result, Security, Status, Verb, authorizer_callback, check, descriptor_from_raw, fail, log_callback, microseconds,
     raw_descriptor, ucall_body_delivery_t, ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t,
     ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t,
     ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t, ucall_security_t, ucall_server_t,
@@ -48,6 +48,7 @@ struct ucall_network_interface_t {
     listen_descriptor: *const isize,
     device_name: ucall_bytes_view_t,
     security: ucall_security_t,
+    memory_domain: i32,
     noise_private_key: *const ucall_noise_key_t,
     noise_peer_key: *const ucall_noise_key_t,
     peer_authorizer: ucall_peer_authorizer_t,
@@ -710,12 +711,13 @@ impl Server {
             .zip(&authorizers)
             .zip(&directories)
             .map(|((interface, authorizer), directories)| {
-                let (peer_authorizer, peer_authorizer_context) = lend_authorizer(authorizer);
+                let (peer_authorizer, peer_authorizer_context) = authorizer_callback(authorizer);
                 ucall_network_interface_t {
                     address: view(interface.address.as_bytes()),
                     listen_descriptor: interface.listen_descriptor.as_ref().map_or(ptr::null(), ptr::from_ref),
                     device_name: view(interface.device_name.as_deref().unwrap_or("").as_bytes()),
                     security: interface.security.to_raw(),
+                    memory_domain: -1,
                     noise_private_key: interface.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
                     noise_peer_key: interface.noise_peer_key.as_ref().map_or(ptr::null(), ptr::from_ref),
                     peer_authorizer,
@@ -735,7 +737,7 @@ impl Server {
         let config = ucall_server_options_t {
             interfaces: raw_interfaces.as_ptr(),
             interfaces_count: raw_interfaces.len(),
-            log: lend_log(&log),
+            log: log_callback(&log),
             metrics_address: view(metrics.address.as_bytes()),
             metrics_sample_rate: metrics.sample_rate,
             metrics_prefix: view(metrics.prefix.as_bytes()),
@@ -973,19 +975,19 @@ impl Drop for Server {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct EventLoopStatistics {
-    /// Engine polls the loop issued, each taking zero or more completions.
+    /// Queue polls the loop issued, each taking zero or more completions.
     pub polls: u64,
-    /// Engine polls that took no completion.
+    /// Queue polls that took no completion.
     pub empty_polls: u64,
     /// System calls: io_uring enters, or other backends' waits, registrations and socket calls.
     pub kernel_enters: u64,
-    /// Operations the loop asked of its engine.
+    /// Operations the loop asked of its queue.
     pub submissions: u64,
-    /// Results the loop took from its engine, each connection of an accept among them.
+    /// Results the loop took from its queue, each connection of an accept among them.
     pub completions: u64,
     /// Submission entries io_uring filled and completion entries it reaped; zero elsewhere.
     pub kernel_entries: u64,
-    /// Pending operations, or io_uring multishot receives, the engine asked to cancel.
+    /// Pending operations, or io_uring multishot receives, the queue asked to cancel.
     pub cancellations: u64,
     /// Connections accepted and handed to this loop.
     pub accepts: u64,
@@ -1030,7 +1032,7 @@ pub struct EventLoopStatistics {
     /// Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under
     /// Noise.
     pub shed_connections: u64,
-    /// File windows the engine left unpinned, as it pins none, or the locked-memory cap or a full
+    /// File windows the queue left unpinned, as it pins none, or the locked-memory cap or a full
     /// table refused; their sends pin or copy on their own.
     pub windows_unpinned: u64,
 }
@@ -1067,17 +1069,17 @@ pub struct BatchEndpointStatistics {
     pub expired_batches: u64,
 }
 
-/// A batch endpoint's handler, the server its requests retain, and the slots it lends them in.
+/// A batch endpoint's handler, the server its requests retain, and the slots it passes them in.
 struct BatchState {
     server: Arc<ServerCore>,
     handler: Box<dyn Fn(Batch<'_>) + Send + Sync>,
-    // Grows to the largest batch once, then lends every later batch without allocating.
+    // Grows to the largest batch once, then reuses it for every later batch without allocating.
     requests: Vec<Option<Request>>,
 }
 
 /// # Safety
 /// `context` must address the [`BatchState`] of the endpoint being polled, which its polling
-/// claim borrows exclusively, and `requests` a counted array of its server's retained handles.
+/// claim holds exclusively, and `requests` a counted array of its server's retained handles.
 unsafe extern "C" fn batch_trampoline(
     requests: *const ucall_received_http_request_t,
     count: usize,
@@ -1200,7 +1202,7 @@ impl Drop for BatchEndpoint {
     }
 }
 
-/// The requests of one due batch, from every event loop, lent to the handler in arrival order.
+/// The requests of one due batch, from every event loop, valid in the handler in arrival order.
 ///
 /// Each request is taken out at most once, by index or by iterating; whatever the handler leaves
 /// answers 500 once it returns.
@@ -1259,7 +1261,7 @@ pub struct Peer {
 /// The socket address a peer connected from, as its connection was accepted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PeerAddress {
-    /// The engine reported no address the library knows.
+    /// The queue reported no address the library knows.
     Unknown,
     /// An IPv4 or IPv6 address and port, with the IPv6 scope.
     Ip(SocketAddr),
@@ -1616,7 +1618,7 @@ pub struct RequestPart<'request> {
 #[repr(transparent)]
 pub struct ReplyPart<'b, 'f> {
     raw: ucall_reply_part_t,
-    borrows: PhantomData<(BytesView<'b>, Descriptor<'f>)>,
+    origins: PhantomData<(BytesView<'b>, Descriptor<'f>)>,
 }
 
 impl<'b, 'f> ReplyPart<'b, 'f> {
@@ -1659,7 +1661,7 @@ impl<'b, 'f> ReplyPart<'b, 'f> {
         (self.raw.kind == ucall_reply_part_file_k).then(|| {
             let file = unsafe { self.raw.data.file };
             FileRange {
-                file: unsafe { borrowed_descriptor(file.file_descriptor) },
+                file: unsafe { descriptor_from_raw(file.file_descriptor) },
                 offset: file.offset,
                 length: file.length,
             }
@@ -1680,7 +1682,7 @@ impl<'b, 'f> ReplyPart<'b, 'f> {
     }
 
     fn wrap(kind: ucall_reply_part_kind_t, data: ucall_reply_part_data_t) -> Self {
-        ReplyPart { raw: ucall_reply_part_t { kind, data }, borrows: PhantomData }
+        ReplyPart { raw: ucall_reply_part_t { kind, data }, origins: PhantomData }
     }
 }
 
@@ -2695,7 +2697,7 @@ mod tests {
             let mut client = client(1);
             let mut datagram = [0; 65536];
             // Each call polls the loop, which sends once the interval passed, and a datagram
-            // carries only the counters that moved since the last one.
+            // includes only the counters that moved since the last one.
             let counted = (0..100).any(|_| {
                 client.get(format!("http://{address}/ping")).unwrap();
                 let length = socket.recv(&mut datagram).unwrap_or(0);

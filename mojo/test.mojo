@@ -81,7 +81,7 @@ def test_names_come_from_the_library() raises:
     assert_equal(library.cpu_class_name(CPUClass.APPLE_M4), "apple-m4")
     assert_true(library.cpu_class_from_name("serial") == CPUClass.SERIAL, "a CPU class reads back")
     assert_equal(library.version()[0], 1, "the binding loads only its own major")
-    assert_true(library.version_name().startswith("1."), "the version name carries the major")
+    assert_true(library.version_name().startswith("1."), "the version name starts with the major")
 
 
 def test_percent_escapes_decode_by_mode() raises:
@@ -112,7 +112,7 @@ def test_generated_noise_keys_derive_back() raises:
 
 
 def _owned(bytes: Span[Byte, _]) -> List[Byte]:
-    """A copy of borrowed bytes, for a reply that consumes the request they borrow from."""
+    """A copy of bytes owned by a request, for a reply that consumes the request."""
     var copy = List[Byte](capacity=len(bytes))
     for byte in bytes:
         copy.append(byte)

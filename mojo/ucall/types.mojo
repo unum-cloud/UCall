@@ -12,7 +12,7 @@ null the ABI asks for and costs nothing to pass. Opaque handles and `void *` sta
 type, so they cross as `Address`, their numeric value. A struct holding an `Optional` is not
 `TrivialRegisterPassable`, so C reads those by address.
 
-Every view that borrows caller storage carries that storage's origin as a struct parameter,
+Every view into caller storage takes that storage's origin as a struct parameter,
 because Mojo destroys a value at its last use rather than at the end of its scope, and an address
 laundered through `Address` is not a use. A verb takes the view with its origin and erases it
 inside, while the view is still alive.
@@ -34,7 +34,7 @@ from ucall.library import Library
 # region Pointers
 
 comptime CString = Pointer[c_char, ImmUntrackedOrigin]
-"""A borrowed null-terminated C string, such as an enumerator's spelling or an outcome's message."""
+"""A null-terminated C string the library owns, such as an enumerator's spelling or an outcome's message."""
 
 comptime Address = Int
 """An opaque handle or a `void *` crossing as its numeric value, zero for null.
@@ -66,7 +66,7 @@ def _address_of[F: TrivialRegisterPassable](function: F) -> Address:
 struct Status(Equatable, ImplicitlyCopyable, TrivialRegisterPassable):
     """Why a call failed, numbered as the library numbers it.
 
-    An `Error` never carries `SUCCESS`, and only a `Deferred` reports `DEFERRED`, until its reply is
+    An `Error` never holds `SUCCESS`, and only a `Deferred` reports `DEFERRED`, until its reply is
     final. `Library.status_name` spells each one as the library does.
     """
 
@@ -154,7 +154,7 @@ struct Error(Copyable, ImplicitlyCopyable, Writable):
     var detail: StaticString
     """The entry point it was about, for a reader rather than for a branch."""
     var message: Optional[CString]
-    """The library's own static message, or `None` when it carried none.
+    """The library's own static message, or `None` when it held none.
 
     Messages are static storage inside the shared object, so keeping the address costs nothing and
     outlives the call. `write_to` walks it; there is nothing to free.
@@ -227,22 +227,22 @@ def text_at(text: Optional[CString]) -> String:
 
 @fieldwise_init
 struct BytesView[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, TrivialRegisterPassable):
-    """A borrowed run of bytes and its length, `ucall_bytes_view_t` in C, never null-terminated.
+    """A run of bytes owned elsewhere and its length, `ucall_bytes_view_t` in C, never null-terminated.
 
     Crosses by value, which the two-word argument class handles on both x86-64 and AArch64.
 
     Parameters:
-        origin: The borrowed storage, named so it outlives every call this view crosses.
+        origin: The storage the view points into, named so it outlives every call this view crosses.
     """
 
     var data: Pointer[Byte, Self.origin]
-    """The first byte, borrowed for the duration of the call."""
+    """The first byte, valid for the duration of the call."""
     var length: c_size_t
     """How many bytes the run covers, since nothing terminates it."""
 
     @staticmethod
     def of[text_origin: ImmOrigin, //](text: StringSlice[text_origin]) -> BytesView[text_origin]:
-        """Borrows a Mojo string's bytes, which the caller keeps alive across the call.
+        """Views a Mojo string's bytes, which the caller keeps alive across the call.
 
         Parameters:
             text_origin: The string's origin, inferred from the argument.
@@ -257,7 +257,7 @@ struct BytesView[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, Tri
 
     @staticmethod
     def of[bytes_origin: ImmOrigin, //](bytes: Span[Byte, bytes_origin]) -> BytesView[bytes_origin]:
-        """Borrows a run of raw bytes, such as a request body.
+        """Views a run of raw bytes, such as a request body.
 
         Parameters:
             bytes_origin: The run's origin, inferred from the argument.
@@ -282,7 +282,7 @@ struct BytesView[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, Tri
         return BytesView.of(StaticString("")).arguments()
 
     def arguments(self) -> BytesView[ImmUntrackedOrigin]:
-        """The same run with its borrow erased, as the one instantiation the ABI signatures name.
+        """The same run with its origin erased, as the one instantiation the ABI signatures name.
 
         Returns:
             A view of the same bytes, whose type no longer keeps their storage alive.
@@ -299,7 +299,7 @@ struct BytesView[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, Tri
             target: The owner whose lifetime bounds the bytes, such as a request or a response.
 
         Returns:
-            The same bytes, borrowed from `target`.
+            The same bytes, owned by `target`.
         """
         return Span[Byte, target](
             unsafe_ptr=Pointer[Byte, target](unsafe_from_address=Int(self.data)), length=Int(self.length)
@@ -595,7 +595,7 @@ struct Log(Defaultable, ImplicitlyCopyable, TrivialRegisterPassable):
 
         Parameters:
             State: The state's type, inferred from the argument.
-            handler: Receives the severity, the line borrowed for the call without a newline, and the state.
+            handler: Receives the severity, the line, valid for the call and without a newline, and the state.
 
         Args:
             state: What `handler` writes into; it must outlive the client or server, which keep its address.
@@ -723,7 +723,7 @@ struct Deferred(Movable):
 
     `status` reads `DEFERRED` until then without blocking, and `wait` blocks until the reply is
     final and raises its failure. Dropping one that is not final waits for it, so it belongs off the
-    polling thread, which is the one finishing it. The descriptors its parts borrow stay open until
+    polling thread, which is the one finishing it. The descriptors its parts name stay open until
     it is final.
     """
 
@@ -732,7 +732,7 @@ struct Deferred(Movable):
     var outcome: OwnedPointer[Outcome]
     """The outcome the event loop writes, on the heap since it outlives the verb."""
     var symbol: StaticString
-    """The entry point the reply went through, carried into its failure."""
+    """The entry point the reply went through, passed into its failure."""
 
     def __init__(out self, library: Library, symbol: StaticString):
         """A pending outcome at a stable heap address, for a verb that may finish after it returns."""

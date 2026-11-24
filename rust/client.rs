@@ -24,11 +24,11 @@ use std::thread::{self, ThreadId};
 
 use crate::server::{Server, ServerCore};
 use crate::types::{
-    Backend, BodyDelivery, CPUClass, HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb, check,
-    fail, lend_authorizer, lend_log, microseconds, ucall_body_delivery_t, ucall_bytes_view_t, ucall_client_t,
-    ucall_cpu_class_t, ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_t,
-    ucall_peer_authorizer_t, ucall_received_http_response_t, ucall_security_t, ucall_server_t, ucall_verb_t, view,
-    viewed,
+    Backend, BodyDelivery, CPUClass, HTTPStatus, Log, NoiseKey, PeerAuthorizer, Result, Security, Status, Verb,
+    authorizer_callback, check, fail, log_callback, microseconds, ucall_body_delivery_t, ucall_bytes_view_t,
+    ucall_client_t, ucall_cpu_class_t, ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t,
+    ucall_outcome_t, ucall_peer_authorizer_t, ucall_received_http_response_t, ucall_security_t, ucall_server_t,
+    ucall_verb_t, view, viewed,
 };
 
 // region: Raw Declarations
@@ -164,7 +164,7 @@ unsafe extern "C" {
 pub struct ClientOptions<'server> {
     /// Connections open at once; zero fails with [`Status::InvalidArgument`].
     pub connections: usize,
-    /// Calls one connection may carry at once; zero means one.
+    /// Calls one connection may hold at once; zero means one.
     pub pipelined_calls: usize,
     /// Calls admitted at once, unretrieved completions included; zero means `connections` times
     /// `pipelined_calls`.
@@ -188,7 +188,7 @@ pub struct ClientOptions<'server> {
     /// takes the largest receive buffer the kernel grants a socket.
     pub max_response_bytes: usize,
     /// A server whose event loop drives this client through that loop's polling, sharing its
-    /// engine; bound before the loop first polls, used only on its polling thread, and its
+    /// queue; bound before the loop first polls, used only on its polling thread, and its
     /// [`Client::take_completed`] only hands out what the loop finished.
     pub server: Option<&'server Server>,
     /// Which of `server`'s event loops; ignored without `server`.
@@ -282,7 +282,7 @@ impl Drop for ClientCore {
     }
 }
 
-/// One admission slot: the caller's context and the inputs the library borrows until completion.
+/// One admission slot: the caller's context and the inputs the library reads until completion.
 #[derive(Default)]
 struct Call {
     context: u64,
@@ -355,7 +355,7 @@ impl Client {
             log: options.log.map(Box::new),
             server: options.server.map(Server::core),
         });
-        let (peer_authorizer, peer_authorizer_context) = lend_authorizer(&core.authorizer);
+        let (peer_authorizer, peer_authorizer_context) = authorizer_callback(&core.authorizer);
         let config = ucall_client_options_t {
             max_concurrent_connections: options.connections,
             max_pipelined_calls: options.pipelined_calls,
@@ -364,7 +364,7 @@ impl Client {
             noise_private_key: options.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
             peer_authorizer,
             peer_authorizer_context,
-            log: lend_log(&core.log),
+            log: log_callback(&core.log),
             max_concurrent_calls: options.calls,
             backend: options.backend.to_raw(),
             cpu_class_ceiling: CPUClass::to_raw(options.cpu_class_ceiling),
@@ -436,7 +436,7 @@ impl Client {
         Ok(index)
     }
 
-    /// Admits `request` without driving the network; its completion carries `context`.
+    /// Admits `request` without driving the network; its completion includes `context`.
     ///
     /// Success guarantees exactly one completion from [`Client::take_completed`]; a full client
     /// refuses with [`Status::Contended`] until completions are retrieved.
@@ -685,11 +685,11 @@ impl Response {
     /// empty once the body ended.
     ///
     /// Every response of a [`BodyDelivery::Streamed`] call is pulled to its end or dropped, since
-    /// its connection carries no other call meanwhile; dropping it early closes that connection
-    /// and fails the calls pipelined behind it with [`Status::ConnectionClosed`]. A body cut
-    /// short fails with [`Status::ConnectionClosed`], a malformed one with [`Status::Malformed`],
-    /// a buffered response or a thread other than the client's with [`Status::InvalidArgument`].
-    /// A client bound to a server advances only as that server's loop polls, so a pull finding
+    /// its connection holds no other call meanwhile; dropping it early closes that connection and
+    /// fails the calls pipelined behind it with [`Status::ConnectionClosed`]. A body cut short
+    /// fails with [`Status::ConnectionClosed`], a malformed one with [`Status::Malformed`], a
+    /// buffered response or a thread other than the client's with [`Status::InvalidArgument`]. A
+    /// client bound to a server advances only as that server's loop polls, so a pull finding
     /// nothing there fails with [`Status::WouldBlock`] instead, to be pulled again after the next
     /// [`Server::take_call`].
     pub fn body_chunk(&mut self) -> Result<&[u8]> {
@@ -728,7 +728,7 @@ impl Response {
     /// Pulls the body bytes decoded since the last pull as a future for async code, answering
     /// what [`Response::body_chunk`] answers without spinning the thread that awaits it.
     ///
-    /// Every poll pulls once and, while nothing was decoded, advances a client with its own engine
+    /// Every poll pulls once and, while nothing was decoded, advances a client with its own queue
     /// and yields to the executor.
     pub fn next_body_chunk(&mut self) -> ResponseBodyChunk<'_> {
         ResponseBodyChunk { response: self }

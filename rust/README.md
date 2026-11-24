@@ -78,7 +78,7 @@ Routing is exact: an empty segment is a segment, so `/users` and `/users/` are d
 A path no endpoint matches answers 404, one whose endpoints take other verbs answers 405 with an `allow` header, a GET endpoint also serves HEAD, and `OPTIONS` answers 204 with the same `allow` list.
 A request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
 
-Log lines reach the callback on whichever thread produced them, and StatsD datagrams carry each loop's counters and sampled request latencies, every second unless `Metrics::interval` says otherwise.
+Log lines reach the callback on whichever thread produced them, and StatsD datagrams report each loop's counters and sampled request latencies, every second unless `Metrics::interval` says otherwise.
 `Server::event_loop_statistics` copies one loop's counters, from any thread while the loop runs: polls, system calls, submissions and completions, accepted connections, requests, and the bytes received, sent and copied.
 Divided by `requests`, they price one call.
 
@@ -231,7 +231,7 @@ std::thread::scope(|scope| {
 
 `Batching` dispatches as soon as `min_size` requests wait, never more than `max_size` at once, and a smaller batch once its oldest request waited `max_latency`; zero fields mean 1, 32 and 10 milliseconds.
 The handler runs on the thread polling the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
-A `Batch` lends its requests in arrival order: `get` and `iter` borrow them, `take` moves one out, and iterating it by value takes them all, forwards or reversed.
+A `Batch` holds its requests in arrival order: `get` and `iter` borrow them, `take` moves one out, and iterating it by value takes them all, forwards or reversed.
 Requests the handler neither replies to nor keeps answer 500 once it returns, and a handler that panics aborts the process.
 Taken requests may be replied to later, from any thread, while their responses still leave each connection in request order.
 
@@ -242,7 +242,7 @@ The queue holds as many requests as the interfaces admit at once, connections ti
 ## Calling
 
 A `Client` submits calls without driving the network, and polls to drive them and collect what finished.
-It holds up to `connections` connections, reusing them across calls, and carries up to `pipelined_calls` calls on each.
+It holds up to `connections` connections, reusing them across calls, and pipelines up to `pipelined_calls` calls on each.
 
 ```rust
 use std::time::Duration;
@@ -274,7 +274,7 @@ println!("{:?} {:?}", response.body(), keep);
 A call admitted once completes exactly once, and a client already holding `calls` unretrieved calls refuses more with `Status::Contended`.
 `take_completed` drives every admitted call and fills a caller-provided buffer with finished ones, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
 `get`, `post`, `put`, `delete`, `patch` and `call` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
-`ClientCall::options` carries the call's own `ClientCallOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
+`ClientCall::options` holds the call's own `ClientCallOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
 
 `ClientOptions::max_response_bytes` caps what a call buffers, failing it with `Status::Overflow` past the cap, and `ClientOptions::log` reports dials that fail every address, refused handshakes and refused redirects.
 Host names resolve through the library's own stub resolver, driven by the client's polling, and connections race the answered addresses as Happy Eyeballs does.
@@ -303,7 +303,7 @@ A call whose `ClientCallOptions::body_delivery` is `BodyDelivery::Streamed` comp
 Each chunk borrows the response until the next pull, and the bytes decoded before a failure come out before the failure is returned.
 Pulls run on the client's thread, failing with `Status::InvalidArgument` on any other, and never wait in the library: `body_chunk` advances the client while nothing was decoded, and each poll of `next_body_chunk` advances it once and yields.
 A client bound to a server advances only as that server's loop polls, so there `body_chunk` fails with `Status::WouldBlock` and `next_body_chunk` yields until the loop polled.
-Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection carries no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `Status::ConnectionClosed`.
+Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection holds no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `Status::ConnectionClosed`.
 Redirects stay buffered so they can be followed, and only the final response streams.
 
 ## Noise Keys
@@ -339,7 +339,7 @@ An `http+noise://` URL implies Noise XX, and a handler reads the client's authen
 
 ## Errors
 
-Every fallible call answers `ucall::Result`, whose `Error` carries the `Status` the library reported and a static message beside it, so nothing allocates on the failure path.
+Every fallible call answers `ucall::Result`, whose `Error` holds the `Status` the library reported and a static message beside it, so nothing allocates on the failure path.
 A mistake the binding catches before calling the library, like polling an event loop the server lacks, reports the status the library would have used.
 `Status` prints its stable spelling, such as "connection-failed", and a status a newer library added reads as `Status::Internal`.
 
@@ -358,11 +358,11 @@ A submitted call that fails completes with `Err` in `Completed::response`: `Stat
 A request lookup that finds nothing answers `None`, and HTTP error statuses are ordinary responses.
 `Backend` and `CPUClass` print and parse their stable names, like "linux-uring618" and "intel-icelake", failing with `Status::InvalidArgument` on a name no value has, and `Status::from_name` reads a status back from its spelling.
 `ucall::version()` spells the linked library's version, candidate suffix included.
-`ucall::decode_percent` decodes a path or a query value, which requests lend still percent-encoded.
+`ucall::decode_percent` decodes a path or a query value, which requests keep percent-encoded.
 
 ## Threads & Polling
 
-The crate starts no threads and needs no async runtime: every callback runs on a thread the application lent to a polling call.
+The crate starts no threads and needs no async runtime: every callback runs on a thread the application runs a polling call on.
 
 - A route handler runs on the thread inside `take_call` or `take_calls` for the event loop that received the request.
 - A batch handler runs on the thread inside `take_batch` or `take_batches` for its endpoint, never on an event loop.
@@ -394,6 +394,6 @@ The crate is a thin layer over UCall's native library, and every rule below foll
   A panic inside a handler, an authorizer or a log callback aborts the process, because it cannot unwind through C and a half-run handler leaves no state worth serving from.
   Report an expected failure as a reply or a rejection instead.
 - __Polling allocates nothing.__
-  A client sizes its tables by its call budget once, and a batch endpoint reuses the slots it lends requests in.
+  A client sizes its tables by its call budget once, and a batch endpoint reuses the slots it passes requests in.
 - __No life of its own.__
   The crate starts no threads, keeps no global state and needs no async runtime, so it drops into any threading model.
