@@ -38,13 +38,13 @@ static char const* spell_log_format(int value) {
     return names[value];
 }
 
-static char const doc_Status[] =                                                  //
-    "Status(value)\n"                                                             //
-    "\n"                                                                          //
-    "The outcome of a verb, which `Error.status` and `Completed.status` carry.\n" //
-    "\n"                                                                          //
-    "Example:\n"                                                                  //
-    "  >>> ucall.Status.CONTENDED.name\n"                                         //
+static char const doc_Status[] =                                                 //
+    "Status(value)\n"                                                            //
+    "\n"                                                                         //
+    "The outcome of a verb, which `Error.status` and `Completed.status` hold.\n" //
+    "\n"                                                                         //
+    "Example:\n"                                                                 //
+    "  >>> ucall.Status.CONTENDED.name\n"                                        //
     "  'CONTENDED'";
 
 static char const doc_Backend[] =                                                                  //

@@ -35,7 +35,7 @@ using utilities::page_size;
 using utilities::span;
 using utilities::text_view;
 
-/** A socket's engine requests, tunnel, buffers and send cursor, shared by both roles. */
+/** A socket's queue requests, tunnel, buffers and send cursor, shared by both roles. */
 template <typename network_type_>
 struct transport {
     using network_t = network_type_;
@@ -43,7 +43,7 @@ struct transport {
     using tunnel_t = typename network_t::tunnel_t;
     using crypto_t = typename network_t::crypto_t;
     using allocator_t = typename network_t::allocator_t;
-    using engine_t = typename network_t::engine_t;
+    using queue_t = typename network_t::queue_t;
     using http_message_t = typename network_t::http_message_t;
     template <typename value_type_>
     using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
@@ -57,23 +57,23 @@ struct transport {
           record(rebound_allocator<byte_t> {allocator}) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(transport) == 1992);
+            static_assert(sizeof(transport) == 2000);
     }
     transport(transport const&) = delete;
     transport& operator=(transport const&) = delete;
     transport(transport&&) = delete;
     transport& operator=(transport&&) = delete;
 
-    /** The receive direction's one engine request: receives, and the close. */
+    /** The receive direction's one queue request: receives, and the close. */
     io_request_t receive_request {};
 
-    /** The transmit direction's one engine request: a connect, sends, the linger's shutdown. */
+    /** The transmit direction's one queue request: a connect, sends, the linger's shutdown. */
     io_request_t transmit_request {};
 
-    /** Whether @c receive_request is with the engine; only submission and completion write it. */
+    /** Whether @c receive_request is with the queue; only submission and completion write it. */
     operation_state_t receive_operation {};
 
-    /** Whether @c transmit_request is with the engine; only submission and completion write it. */
+    /** Whether @c transmit_request is with the queue; only submission and completion write it. */
     operation_state_t transmit_operation {};
 
     /** The socket, or -1 before one is accepted or opened and once its close is submitted. */
@@ -126,7 +126,7 @@ struct transport {
     /** Whether it took a send since the loop last marked it stalled; only a server reads it. */
     transmit_progress_t progress {};
 
-    /** Where its engine lands receives, set with its socket. */
+    /** Where its queue lands receives, set with its socket. */
     io_receive_memory_t receive_memory {};
 
     /** The tail of the receive's destination, which @c receive_request names. */
@@ -154,7 +154,7 @@ struct transport {
     /** Bytes read and dropped while lingering. */
     std::size_t lingered_bytes {};
 
-    /** The counters of the loop that advances it; null on a client with its own engine. */
+    /** The counters of the loop that advances it; null on a client with its own queue. */
     event_loop_statistics_t* statistics {};
 
     /** The counters of its interface on its event loop; null on client connections. */
@@ -223,7 +223,7 @@ struct transport {
             std::size_t const previous = destination.size();
             if (st::failed(destination.resize(st::assume_uninitialized, previous + arrived)))
                 return fail(ucall_status_out_of_memory_k);
-            if (receive_memory == io_receive_memory_t::engine_k) {
+            if (receive_memory == io_receive_memory_t::queue_k) {
                 std::memcpy(destination.data() + previous, completion.data, arrived);
                 if (statistics) tally<atomic_ref>(statistics->bytes_copied, arrived);
             }
@@ -235,7 +235,7 @@ struct transport {
         }
     }
 
-    /** The next engine request of every stage but open,
+    /** The next queue request of every stage but open,
      *  which @c serve_open and @c call_open step. */
     io_request_t* advance(ucall_peer_authorizer_t authorizer, void* authorizer_context) noexcept {
         for (;;) {
@@ -314,7 +314,7 @@ struct transport {
         }
     }
 
-    /** Rewrites @p request for @p operation over @p bytes, keeping what an engine still holding it
+    /** Rewrites @p request for @p operation over @p bytes, keeping what a queue still holding it
      *  finds it by, as an armed receive is re-aimed in place. */
     io_request_t* emit(io_request_t& request, io_operation_t operation, span<byte_t> bytes) noexcept {
         request = {.operation = operation,
@@ -349,7 +349,7 @@ struct transport {
         return emit(receive_request, io_operation_t::receive_k, {reinterpret_cast<byte_t*>(&receive_vector), 1});
     }
 
-    /** Starts sending @p bytes, which lie in engine memory @p registered_memory, without copying
+    /** Starts sending @p bytes, which lie in queue memory @p registered_memory, without copying
      *  them; @p release_request collects the kernel's hold on them once its last send is done. */
     io_request_t* emit_zero_copy(span<byte_t> bytes, io_request_t& release_request,
                                  registered_memory_t registered_memory) noexcept {
@@ -379,7 +379,7 @@ struct transport {
         return &transmit_request;
     }
 
-    /** Marks @p request, one of its two, in flight once the engine took it, and with a close its
+    /** Marks @p request, one of its two, in flight once the queue took it, and with a close its
      *  descriptor too. */
     void submitted(io_request_t const& request) noexcept {
         (&request == &receive_request ? receive_operation : transmit_operation) = operation_state_t::submitted_k;

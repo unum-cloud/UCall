@@ -24,3 +24,5 @@ static ucall_status_t ucall_go_authorize(ucall_noise_key_t const* key, void* con
 ucall_peer_authorizer_t ucall_go_authorizes(void) { return &ucall_go_authorize; }
 
 void* ucall_go_context(uintptr_t handle) { return (void*)handle; }
+
+ucall_noise_key_t const* ucall_go_key(void* key) { return (ucall_noise_key_t const*)key; }

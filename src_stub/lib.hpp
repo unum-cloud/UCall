@@ -11,8 +11,8 @@
  *  A binding, a downstream SDK or a bisect links it in seconds and meets the documented refusals.
  *
  *  It reuses the project's header-only parts rather than restating them: the route trie, the serial
- *  string kits, the socket helpers that read a device's queues and vet a borrowed listener, and the
- *  outcome publisher. It runs the serial CPU class alone, through ForkUnion's standard atomic
+ *  string kits, the socket helpers that read a device's queues and vet a caller-owned listener, and
+ *  the outcome publisher. It runs the serial CPU class alone, through ForkUnion's standard atomic
  *  reference and yielding waiter.
  *
  *  So a server or client under any CPU class ceiling initializes and resolves to serial, the one
@@ -136,8 +136,8 @@ struct ucall_http_batch_endpoint_handle_t {
     ucall_http_batch_endpoint_handle_t* next {};
 };
 
-/** One template the routes borrow, kept until the server is freed, as a refused one may already
- *  lend the trie its segments. */
+/** One template the routes point into, kept until the server is freed, as a refused one may already
+ *  point the trie at its segments. */
 struct ucall_stub_template_t {
     uc::stub::vector<char> text {};
     ucall_stub_template_t* next {};

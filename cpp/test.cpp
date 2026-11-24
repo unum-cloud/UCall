@@ -100,6 +100,27 @@ struct echo_service_t {
     }
 };
 
+/** Counts the peers it admitted, which no two polling loops may do at once. */
+struct counting_authorizer_t {
+    std::size_t admitted = 0;
+    bool operator()(ucall_noise_key_t const&) noexcept { return ++admitted != 0; }
+};
+static_assert(!uc::peer_authorizer<counting_authorizer_t>, "a stateful authorizer races across polling loops");
+
+/** Counts the lines it heard, which no two logging threads may do at once. */
+struct counting_log_handler_t {
+    std::size_t lines = 0;
+    void operator()(ucall_log_level_t, std::string_view) noexcept { ++lines; }
+};
+static_assert(!uc::log_handler<counting_log_handler_t>, "a stateful log handler races across logging threads");
+
+/** Counts the requests it answered, which no two polling loops may do at once. */
+struct counting_request_handler_t {
+    std::size_t answered = 0;
+    void operator()(uc::request_t) noexcept { ++answered; }
+};
+static_assert(!uc::request_handler<counting_request_handler_t>, "a stateful route handler races across polling loops");
+
 static void greet(uc::request_t request) noexcept {
     auto [name, name_status] = request.path_parameter("name");
     if (name_status.failed()) return;
@@ -123,6 +144,9 @@ static void test_greeting_round_trip() {
     auto [address, address_status] = server.address(0);
     check(address_status, "reading the address");
     check(server.event_loops() == 1, "running one event loop");
+    auto [domain, domain_status] = server.memory_domain(0);
+    check(domain_status, "reading the memory domain");
+    check(domain == -1, "reporting no memory domain for loopback");
 
     std::thread polling([&server] { check(server.take_calls(0), "polling"); });
     auto [client, client_status] = uc::client_t::make({.max_concurrent_connections = 2});

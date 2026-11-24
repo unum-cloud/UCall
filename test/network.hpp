@@ -25,12 +25,12 @@
 #include <vector>      // `std::vector`
 
 #include "ucall/ucall.h"
-#include "ucall/io/posix_engine.hpp"   // `posix_engine_t`
+#include "ucall/io/posix_queue.hpp"    // `posix_queue_t`
 #include "ucall/network.hpp"           // `serial_network`
 #include "ucall/utilities/sockets.hpp" // `nonblocking`, `monotonic_ns`, `deadline_after`
 
 #include "harness.hpp"  // `expect_true`, `run_test_case`, `raw_client_t`, `sweep_cell_t`
-#include "variants.hpp" // `uc::io_engines_t`
+#include "variants.hpp" // `uc::io_queues_t`
 
 #if UCALL_OS_POSIX_
 #include <fcntl.h>    // `open`, `fcntl`
@@ -444,7 +444,7 @@ inline void append_when_room(ucall_server_reply_append_t& append, steady_clock::
         std::this_thread::sleep_for(100us);
 }
 
-/** Checks a 200 response carries @p expected and the echo header, then frees it. */
+/** Checks a 200 response contains @p expected and the echo header, then frees it. */
 inline void check_response(ucall_received_http_response_t response, std::string_view expected) {
     expect_true(ucall_client_response_status(response) == ucall_http_status_ok_k);
     ucall_outcome_t outcome {};
@@ -592,8 +592,8 @@ inline bool expect_outcome(fixture_t& fixture, ucall_outcome_t& outcome, ucall_s
 }
 #endif // UCALL_OS_POSIX_
 
-/** The serial network over every compiled engine, drawing each allocation from a counter. */
-using counted_network_t = uc::network::serial_network<uc::io_engines_t, counting_allocator<byte_t>>;
+/** The serial network over every compiled queue, drawing each allocation from a counter. */
+using counted_network_t = uc::network::serial_network<uc::io_queues_t, counting_allocator<byte_t>>;
 
 namespace network {
 using namespace unum::ucall::network;

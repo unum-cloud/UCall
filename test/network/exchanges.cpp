@@ -36,7 +36,7 @@ static void test_exchanges(sweep_cell_t const& cell) {
                     ucall_status_name(completed.outcome.status));
         if (completed.response) check_response(completed.response, expected);
     };
-    // Rings and Registered I/O copy what lands in their pool; other engines land straight in the
+    // Rings and Registered I/O copy what lands in their pool; other queues land straight in the
     // transport's buffers.
     ucall_io_backend_t const backend = fixture.resolved.backend;
     bool const pooled = backend == ucall_io_backend_linux_uring612_k || backend == ucall_io_backend_linux_uring618_k ||
@@ -126,7 +126,7 @@ static void test_echo_completions(sweep_cell_t const& cell) {
     ucall_event_loop_statistics_t const after = loop_statistics(fixture);
     std::uint64_t const spent = after.completions - warm.completions;
     expect_true(spent <= 8 * echoes, "{} completions for {} echoes", spent, echoes);
-    // Every engine counts each reply's send once, copying or not, and only a ring fills entries.
+    // Every queue counts each reply's send once, copying or not, and only a ring fills entries.
     std::uint64_t const sends = after.zero_copy_sends + after.copying_sends - warm.zero_copy_sends - warm.copying_sends;
     expect_true(sends >= echoes && sends <= 2 * echoes, "{} sends counted for {} echoes", sends, echoes);
     bool const ring = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
@@ -574,9 +574,9 @@ static void test_head_replies(sweep_cell_t const& cell) {
     fixture.stop();
 }
 
-/** A listener the caller hands over is served by an engine accepting from any listener: an
+/** A listener the caller hands over is served by a queue accepting from any listener: an
  *  automatic server passes over Registered I/O, and one naming it is refused, saying why. */
-static void test_borrowed_listener_backend(sweep_cell_t const& cell) {
+static void test_caller_listener_backend(sweep_cell_t const& cell) {
     util::descriptor_t const listener = util::socket_open(AF_INET);
     sockaddr_in bound {};
     bound.sin_family = AF_INET;
@@ -602,10 +602,10 @@ static void test_borrowed_listener_backend(sweep_cell_t const& cell) {
     if (cell.backend == ucall_io_backend_windows_rio_k)
         expect_true(outcome.status == ucall_status_unsupported_k && outcome.message &&
                         std::string_view {outcome.message}.find("listen_descriptor") != std::string_view::npos,
-                    "Registered I/O over a borrowed listener: {}", ucall_status_name(outcome.status));
+                    "Registered I/O over a caller-owned listener: {}", ucall_status_name(outcome.status));
     else
         expect_true(outcome.status == ucall_status_success_k && resolved.backend != ucall_io_backend_windows_rio_k,
-                    "a borrowed listener: {} on {}", ucall_status_name(outcome.status),
+                    "a caller-owned listener: {} on {}", ucall_status_name(outcome.status),
                     ucall_io_backend_name(resolved.backend));
     ucall_server_free(server);
     util::socket_close(listener);
@@ -709,7 +709,7 @@ static void test_smuggling(sweep_cell_t const& cell, split_mix_generator_t& gene
     fixture_t fixture {cell, {}};
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     fixture.serve_in_background();
-    // Past what any engine reads ahead, so a server closing without lingering leaves bytes unread.
+    // Past what any queue reads ahead, so a server closing without lingering leaves bytes unread.
     std::string const unread(std::size_t {64} << 10, 'x');
     for (auto const& row : smuggling_rows_k) {
         auto const dispatched = fixture.dispatched.load();
@@ -902,7 +902,7 @@ static void test_request_query(sweep_cell_t const& cell) {
 }
 
 /** Frees a server from a thread other than its poller while a keep-alive peer stays connected.
- *  An engine stopped off its poller hangs there, or leaks its ring storage under LeakSanitizer. */
+ *  A queue stopped off its poller hangs there, or leaks its ring storage under LeakSanitizer. */
 static void test_cross_thread_teardown_delivery(sweep_cell_t const& cell, split_mix_generator_t& generator) {
     fixture_t fixture {cell, {}};
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
@@ -1486,6 +1486,8 @@ static void test_configuration_byte_views(sweep_cell_t const& cell) {
             return;
         std::string_view const bound = text_view(resolved.interfaces[0].address);
         expect_true(bound.starts_with("127.0.0.1:") && bound.size() > 10, "bound {}", bound);
+        expect_true(resolved.interfaces[0].memory_domain == -1 && uc::utilities::device_memory_domain("lo") == -1,
+                    "a device without a memory domain");
         raw_client_t client;
         expect_true(client.connect(bound), "no connection to {}", bound);
         client.close();
@@ -1980,7 +1982,7 @@ void test_exchanges_cell(sweep_cell_t const& cell, split_mix_generator_t& genera
         test_pipelined_call_loss(cell);
         test_bodiless_responses_keep_connection(cell);
         test_head_replies(cell);
-        test_borrowed_listener_backend(cell);
+        test_caller_listener_backend(cell);
     }
 #if UCALL_OS_POSIX_
     if (cell.security == ucall_security_none_k) {

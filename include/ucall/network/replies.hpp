@@ -453,8 +453,8 @@ struct replies {
             end_segment.bytes.clear();
             exchange.message.connection = http_connection_t::close_k;
         }
-        // The loop may still read a borrowed descriptor, so the loop reports how the reply ended,
-        // unless the peer left, when the loop reads none and may have retired.
+        // The loop may still read a caller-owned descriptor, so the loop reports how the reply
+        // ended, unless the peer left, when the loop reads none and may have retired.
         if (!(state.load(std::memory_order_acquire) & detached_k) &&
             atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.load(std::memory_order_acquire)) {
             publish<atomic_ref>(outcome, ucall_status_deferred_k);
@@ -621,7 +621,7 @@ struct replies {
         exchange.oldest_file_segment = &file_segment == exchange.newest_file_segment ? nullptr : file_segment.next;
         if (owns_file(file_segment)) close_native_file(file_segment.file);
         file_segment.file = invalid_native_file_k;
-        // Releasing orders the last use of a borrowed descriptor before a replier sees none unsent.
+        // Releasing orders a caller-owned descriptor's last use before a replier sees none unsent.
         atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.store_sub(1, std::memory_order_release);
         if ((&file_segment == exchange.newest_file_segment || &file_segment.segment == exchange.newest_segment) &&
             replier_links(exchange)) {
@@ -870,7 +870,7 @@ struct replies {
         }
     }
 
-    /** Asks the engine to open @p file_segment's path beneath its directory. */
+    /** Asks the queue to open @p file_segment's path beneath its directory. */
     static io_request_t* submit_file_open(connection_t& connection, file_segment_t& file_segment) noexcept {
         connection.file_reading = file_read_state_t::opening_file_k;
         io_request_t* request = connection.transport.emit(connection.file_read_request, io_operation_t::file_open_k,
@@ -1013,9 +1013,9 @@ struct replies {
         return oldest;
     }
 
-    /** Grows the pool by one run of windows in one allocation, registered with the engine once: as
+    /** Grows the pool by one run of windows in one allocation, registered with the queue once: as
      *  many windows as fill the allocator's page, at least one and at most the pool's limit, so a
-     *  huge page holds many. A run the engine fails to register, rather than declining to pin it,
+     *  huge page holds many. A run the queue fails to register, rather than declining to pin it,
      *  adds no window. */
     static ucall_status_t grow_windows(event_loop_t& event_loop) noexcept {
         auto& pool = event_loop.file_windows;
@@ -1032,9 +1032,9 @@ struct replies {
         if (!run) return ucall_status_out_of_memory_k;
         byte_t* const base = bytes_of(run, 1).data();
         io_request_t release {.operation = io_operation_t::zero_copy_release_k, .context = &pool};
-        // Past the engine's table or its locked-memory cap, sends pin each window themselves.
+        // Past the queue's table or its locked-memory cap, sends pin each window themselves.
         if (pool.pinning == range_pinning_t::pinned_k) {
-            memory_registration_t const registration = event_loop.engine.register_memory(
+            memory_registration_t const registration = event_loop.queue.register_memory(
                 {base, run_windows * window_bytes});
             if (registration.status != ucall_status_success_k) {
                 pages.deallocate(run, run_bytes / page_bytes_k);
@@ -1062,7 +1062,7 @@ struct replies {
 
     /** A vacant window for @p connection's stream: a free one, one of a run the pool grows by while
      *  below its limit, else none, queuing the stream for the next release. */
-    static std::uint32_t borrow_window(event_loop_t& event_loop, connection_t& connection) noexcept {
+    static std::uint32_t take_window(event_loop_t& event_loop, connection_t& connection) noexcept {
         auto& pool = event_loop.file_windows;
         if (pool.free_windows == absent_k && pool.windows.size() != pool.max_windows &&
             grow_windows(event_loop) != ucall_status_success_k)
@@ -1151,10 +1151,9 @@ struct replies {
         return static_cast<std::uint32_t>(fu::max_of<std::size_t>(2, (send_buffer_bytes + buffer - 1) / buffer));
     }
 
-    /** The next file request of the oldest reply: open and measure every file segment of a
-     *  deferred head, then complete it; open and measure the oldest file segment; or read its next
-     *  slice into a borrowed window, while the socket side sends the earlier ones. Null once
-     *  nothing can proceed. */
+    /** The next file request of the oldest reply: open and measure every file segment of a deferred
+     *  head, then complete it; open and measure the oldest file segment; or read its next slice
+     *  into a window while the socket sends the earlier ones. Null once nothing can proceed. */
     static io_request_t* read_reply(event_loop_t& event_loop, connection_t& connection) noexcept {
         auto* exchange = connection.oldest_exchange;
         // Until the loop adopted a segment of the reply, its replier may still be writing the head.
@@ -1182,7 +1181,7 @@ struct replies {
              window = event_loop.file_windows.windows[window].next)
             ++held;
         if (held >= stream_windows_limit(connection.network_interface->send_buffer_bytes)) return nullptr;
-        std::uint32_t const window = borrow_window(event_loop, connection);
+        std::uint32_t const window = take_window(event_loop, connection);
         if (window == absent_k) {
             if (connection.file_reading != file_read_state_t::waiting_window_k)
                 fail_reply(connection, *exchange, ucall_status_out_of_memory_k);
@@ -1300,7 +1299,7 @@ struct replies {
                 (connection.transport.tunnel.encrypts() ? secure_tunnel_overhead_k : 0));
     }
 
-    /** Marks a release @p request in flight once the engine took it: a window leaves its stream for
+    /** Marks a release @p request in flight once the queue took it: a window leaves its stream for
      *  the pool, and an exchange's segments wait for the kernel. */
     static void release_submitted(event_loop_t& event_loop, connection_t& connection,
                                   io_request_t const& request) noexcept {
@@ -1318,7 +1317,7 @@ struct replies {
 
     /** Lands a completed release: a window returns to the pool, waking the oldest waiting stream,
      *  and an exchange hands its segments back, recycling once its connection let go of it. A
-     *  release the engine reports copying demotes the connection's sends, and a close waiting for
+     *  release the queue reports copying demotes the connection's sends, and a close waiting for
      *  the last release goes on. */
     static void complete_release(event_loop_t& event_loop, io_completion_t const& completion) noexcept {
         auto& pool = event_loop.file_windows;

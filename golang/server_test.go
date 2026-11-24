@@ -27,6 +27,13 @@ func serving(t *testing.T, network ucall.Interface, setup func(server *ucall.Ser
 	if !ok {
 		t.Fatal("the server has no address")
 	}
+	domain, ok := server.MemoryDomain(0)
+	if !ok {
+		t.Fatal("the server has no memory domain for its interface")
+	}
+	if network.DeviceName == "" && domain != -1 {
+		t.Fatal("an interface without a device reports a memory domain")
+	}
 	polled := make(chan error)
 	go func() { polled <- server.TakeCalls(0) }()
 	t.Cleanup(func() {

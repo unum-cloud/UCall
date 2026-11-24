@@ -4,7 +4,7 @@
 #
 # It compiles the project's names and serial X25519 kit as they are, and reaches only the header-only siblings: the
 # route trie and the serial string kits, ForkUnion's atomic references and SmashTable's containers. No CPU class
-# variants, no I/O engines, no liburing, so it skips `ucall_setup_library` and sets by hand the properties consumers
+# variants, no I/O queues, no liburing, so it skips `ucall_setup_library` and sets by hand the properties consumers
 # depend on.
 #
 # The file names match the engine's, `libucall_shared` and `libucall_static`, in a directory of their own, so a suite

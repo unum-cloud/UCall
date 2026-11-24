@@ -2,7 +2,7 @@
  *  @file src/variants_apple_m4.cpp
  *  @author Ash Vardanian
  *  @date November 16, 2026
- *  @brief Apple M4 network variants for every enabled native I/O engine.
+ *  @brief Apple M4 network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

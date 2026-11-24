@@ -163,20 +163,20 @@ func NewServer(interfaces []Interface, config *ServerOptions) (*Server, error) {
 	options := configOf(config)
 	metrics := configOf(options.Metrics)
 	server := &Server{}
-	var lent lent[started]
-	arguments := open[C.ucall_server_init_t](&lent)
+	var call callWithResult[started]
+	arguments := open[C.ucall_server_init_t](&call)
 	lowered := make([]C.ucall_network_interface_t, len(interfaces))
 	for position := range interfaces {
-		lowered[position] = server.lower(&lent.call, &interfaces[position])
+		lowered[position] = server.lower(&call.call, &interfaces[position])
 	}
-	tags, tagsCount := lent.texts(metrics.Tags)
-	lent.result.options = C.ucall_server_options_t{
-		interfaces:                    (*C.ucall_network_interface_t)(lent.lend(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))),
+	tags, tagsCount := call.texts(metrics.Tags)
+	call.result.options = C.ucall_server_options_t{
+		interfaces:                    (*C.ucall_network_interface_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))),
 		interfaces_count:              C.size_t(len(lowered)),
 		log:                           options.Log.lowered(&server.handles),
-		metrics_address:               lent.text(metrics.Address),
+		metrics_address:               call.text(metrics.Address),
 		metrics_sample_rate:           C.float(metrics.SampleRate),
-		metrics_prefix:                lent.text(metrics.Prefix),
+		metrics_prefix:                call.text(metrics.Prefix),
 		metrics_tags:                  tags,
 		metrics_tags_count:            tagsCount,
 		metrics_interval_microseconds: microseconds(metrics.Interval),
@@ -184,13 +184,13 @@ func NewServer(interfaces []Interface, config *ServerOptions) (*Server, error) {
 		cpu_class_ceiling:             C.ucall_cpu_class_t(options.CPUClassCeiling),
 	}
 	*arguments = C.ucall_server_init_t{
-		server:   &lent.result.server,
-		outcome:  lent.outcome(),
-		options:  &lent.result.options,
-		resolved: &lent.result.resolved,
+		server:   &call.result.server,
+		outcome:  call.outcome(),
+		options:  &call.result.options,
+		resolved: &call.result.resolved,
 	}
 	C.ucall_server_init(arguments)
-	result, err := block(&lent, nil)
+	result, err := block(&call, nil)
 	if err != nil {
 		server.release()
 		return nil, err
@@ -199,7 +199,7 @@ func NewServer(interfaces []Interface, config *ServerOptions) (*Server, error) {
 	return server, nil
 }
 
-// lower lends one interface's strings, keys and directories until initialization copies them, and
+// lower pins one interface's strings, keys and directories until initialization copies them, and
 // keeps its authorizer behind a handle the server deletes.
 func (server *Server) lower(call *call, network *Interface) C.ucall_network_interface_t {
 	directories, directoriesCount := call.texts(network.ReplyDirectories)
@@ -213,8 +213,8 @@ func (server *Server) lower(call *call, network *Interface) C.ucall_network_inte
 		listen_descriptor:          descriptor,
 		device_name:                call.text(network.DeviceName),
 		security:                   C.ucall_security_t(network.Security),
-		noise_private_key:          call.key(network.NoisePrivateKey),
-		noise_peer_key:             call.key(network.NoisePeerKey),
+		noise_private_key:          C.ucall_go_key(call.key(network.NoisePrivateKey)),
+		noise_peer_key:             C.ucall_go_key(call.key(network.NoisePeerKey)),
 		peer_authorizer:            authorize,
 		peer_authorizer_context:    authorizeContext,
 		event_loops:                C.size_t(network.EventLoops),
@@ -279,6 +279,16 @@ func (server *Server) Address(index uint) (string, bool) {
 	return string(viewed(interfaces[index].address)), true
 }
 
+// MemoryDomain is the NUMA node the kernel ties interface index's device to, or -1, and false past
+// the last interface; init and poll from goroutines locked to threads there.
+func (server *Server) MemoryDomain(index uint) (int32, bool) {
+	interfaces := server.interfaces()
+	if index >= uint(len(interfaces)) {
+		return 0, false
+	}
+	return int32(interfaces[index].memory_domain), true
+}
+
 //export ucallServes
 func ucallServes(server C.ucall_server_t, request C.ucall_received_http_request_t, context unsafe.Pointer) {
 	received := &Request{server: server, request: request}
@@ -305,19 +315,19 @@ func (server *Server) RouteWith(path string, verb Verb, delivery BodyDelivery, h
 	if handler == nil {
 		callback = nil
 	}
-	var lent lent[struct{}]
-	arguments := open[C.ucall_server_add_http_endpoint_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_server_add_http_endpoint_t](&call)
 	*arguments = C.ucall_server_add_http_endpoint_t{
 		server:        server.handle,
-		outcome:       lent.outcome(),
-		uri_template:  lent.text(path),
+		outcome:       call.outcome(),
+		uri_template:  call.text(path),
 		verb:          C.ucall_verb_t(verb),
 		callback:      callback,
 		context:       contextOf(handle),
 		body_delivery: C.ucall_body_delivery_t(delivery),
 	}
 	C.ucall_server_add_http_endpoint(arguments)
-	if _, err := block(&lent, nil); err != nil {
+	if _, err := block(&call, nil); err != nil {
 		handle.Delete()
 		return err
 	}
@@ -364,17 +374,17 @@ const (
 // TakeCall advances one event loop, running the handlers of the requests it completes on this
 // goroutine, and waits up to timeout for progress; zero performs one nonblocking round.
 func (server *Server) TakeCall(eventLoop uint, timeout time.Duration) (Polling, error) {
-	var lent lent[struct{}]
-	arguments := open[C.ucall_server_take_call_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_server_take_call_t](&call)
 	*arguments = C.ucall_server_take_call_t{
 		server:               server.handle,
-		outcome:              lent.outcome(),
+		outcome:              call.outcome(),
 		event_loop_index:     C.size_t(eventLoop),
 		timeout_microseconds: microseconds(timeout),
 	}
 	C.ucall_server_take_call(arguments)
-	_, err := block(&lent, nil)
-	if Status(lent.slots.outcome.status) == StatusConnectionClosed {
+	_, err := block(&call, nil)
+	if Status(call.slots.outcome.status) == StatusConnectionClosed {
 		return PollingRetired, nil
 	}
 	return PollingServing, err
@@ -382,15 +392,15 @@ func (server *Server) TakeCall(eventLoop uint, timeout time.Duration) (Polling, 
 
 // TakeCalls drives one event loop on this goroutine until Server.Stop or an I/O failure.
 func (server *Server) TakeCalls(eventLoop uint) error {
-	var lent lent[struct{}]
-	arguments := open[C.ucall_server_take_calls_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_server_take_calls_t](&call)
 	*arguments = C.ucall_server_take_calls_t{
 		server:           server.handle,
-		outcome:          lent.outcome(),
+		outcome:          call.outcome(),
 		event_loop_index: C.size_t(eventLoop),
 	}
 	C.ucall_server_take_calls(arguments)
-	_, err := block(&lent, nil)
+	_, err := block(&call, nil)
 	return err
 }
 
@@ -433,24 +443,24 @@ type EventLoopStatistics struct {
 
 // EventLoopStatistics copies one loop's counters, from any goroutine while it is polled.
 func (server *Server) EventLoopStatistics(eventLoop uint) (EventLoopStatistics, error) {
-	var lent lent[EventLoopStatistics]
-	arguments := open[C.ucall_server_event_loop_statistics_t](&lent)
+	var call callWithResult[EventLoopStatistics]
+	arguments := open[C.ucall_server_event_loop_statistics_t](&call)
 	*arguments = C.ucall_server_event_loop_statistics_t{
 		server:           server.handle,
-		outcome:          lent.outcome(),
+		outcome:          call.outcome(),
 		event_loop_index: C.size_t(eventLoop),
-		statistics:       (*C.ucall_event_loop_statistics_t)(unsafe.Pointer(lent.result)),
+		statistics:       (*C.ucall_event_loop_statistics_t)(unsafe.Pointer(call.result)),
 	}
 	C.ucall_server_event_loop_statistics(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // endregion: Server
 
 // region: Requests
 
-// Request is one received request, answered at most once. Its reads borrow the received bytes
-// until the reply, which consumes it; a handler that neither replies nor detaches it answers 500.
+// Request is one received request, answered at most once. Its reads view the received bytes until
+// the reply, which consumes it; a handler that neither replies nor detaches it answers 500.
 type Request struct {
 	server  C.ucall_server_t
 	request C.ucall_received_http_request_t
@@ -489,7 +499,7 @@ const (
 	AddressUnix AddressFamily = C.ucall_address_family_unix_k
 )
 
-// RequestPart is one part of a multipart/form-data body, borrowing the received bytes.
+// RequestPart is one part of a multipart/form-data body, viewing the received bytes.
 type RequestPart struct {
 	Name        []byte
 	ContentType []byte
@@ -512,74 +522,74 @@ func (request *Request) Verb() Verb {
 
 // Path is the path as sent, still percent-encoded, without the query.
 func (request *Request) Path() ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_path_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_path_t](&call)
 	*arguments = C.ucall_server_request_path_t{
-		server: request.server, outcome: lent.outcome(), request: request.request, path: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request, path: call.result}
 	C.ucall_server_request_path(arguments)
-	path, err := block(&lent, nil)
+	path, err := block(&call, nil)
 	return viewed(path), err
 }
 
 // QueryString is the query after the first '?', still percent-encoded, or empty without one.
 func (request *Request) QueryString() ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_query_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_query_t](&call)
 	*arguments = C.ucall_server_request_query_t{
-		server: request.server, outcome: lent.outcome(), request: request.request, query: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request, query: call.result}
 	C.ucall_server_request_query(arguments)
-	query, err := block(&lent, nil)
+	query, err := block(&call, nil)
 	return viewed(query), err
 }
 
 // Body is the body, decoded from chunked framing if it arrived that way; a streamed route refuses
 // it, as DetachedRequest.BodyChunk pulls its body.
 func (request *Request) Body() ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_body_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_body_t](&call)
 	*arguments = C.ucall_server_request_body_t{
-		server: request.server, outcome: lent.outcome(), request: request.request, body: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request, body: call.result}
 	C.ucall_server_request_body(arguments)
-	body, err := block(&lent, nil)
+	body, err := block(&call, nil)
 	return viewed(body), err
 }
 
 // PathParameter is the value the route's template captured under name, case-sensitive, failing
 // with StatusNotFound without one.
 func (request *Request) PathParameter(name string) ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_path_parameter_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_path_parameter_t](&call)
 	*arguments = C.ucall_server_request_path_parameter_t{
-		server: request.server, outcome: lent.outcome(), request: request.request,
-		name: lent.text(name), value: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request,
+		name: call.text(name), value: call.result}
 	C.ucall_server_request_path_parameter(arguments)
-	value, err := block(&lent, nil)
+	value, err := block(&call, nil)
 	return viewed(value), err
 }
 
 // Query is the value of query parameter name, case-sensitive and still percent-encoded, failing
 // with StatusNotFound without one.
 func (request *Request) Query(name string) ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_query_parameter_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_query_parameter_t](&call)
 	*arguments = C.ucall_server_request_query_parameter_t{
-		server: request.server, outcome: lent.outcome(), request: request.request,
-		name: lent.text(name), value: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request,
+		name: call.text(name), value: call.result}
 	C.ucall_server_request_query_parameter(arguments)
-	value, err := block(&lent, nil)
+	value, err := block(&call, nil)
 	return viewed(value), err
 }
 
 // Header is the value of header name, matched case-insensitively, failing with StatusNotFound
 // without one.
 func (request *Request) Header(name string) ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_header_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_header_t](&call)
 	*arguments = C.ucall_server_request_header_t{
-		server: request.server, outcome: lent.outcome(), request: request.request,
-		name: lent.text(name), value: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request,
+		name: call.text(name), value: call.result}
 	C.ucall_server_request_header(arguments)
-	value, err := block(&lent, nil)
+	value, err := block(&call, nil)
 	return viewed(value), err
 }
 
@@ -589,13 +599,13 @@ func (request *Request) Fields() iter.Seq2[[]byte, []byte] {
 	return func(yield func(name, value []byte) bool) {
 		count := C.ucall_server_request_fields_count(request.server, request.request)
 		for index := C.size_t(0); index < count; index++ {
-			var lent lent[[2]C.ucall_bytes_view_t]
-			arguments := open[C.ucall_server_request_field_t](&lent)
+			var call callWithResult[[2]C.ucall_bytes_view_t]
+			arguments := open[C.ucall_server_request_field_t](&call)
 			*arguments = C.ucall_server_request_field_t{
-				server: request.server, outcome: lent.outcome(), request: request.request, index: index,
-				name: &lent.result[0], value: &lent.result[1]}
+				server: request.server, outcome: call.outcome(), request: request.request, index: index,
+				name: &call.result[0], value: &call.result[1]}
 			C.ucall_server_request_field(arguments)
-			field, err := block(&lent, nil)
+			field, err := block(&call, nil)
 			if err != nil || !yield(viewed(field[0]), viewed(field[1])) {
 				return
 			}
@@ -606,15 +616,15 @@ func (request *Request) Fields() iter.Seq2[[]byte, []byte] {
 // Peer is the interface the request arrived on, the client's key and its address, readable after
 // its connection closed.
 func (request *Request) Peer() (Peer, error) {
-	var lent lent[Peer]
-	arguments := open[C.ucall_server_request_peer_t](&lent)
+	var call callWithResult[Peer]
+	arguments := open[C.ucall_server_request_peer_t](&call)
 	*arguments = C.ucall_server_request_peer_t{
-		server: request.server, outcome: lent.outcome(), request: request.request,
-		network_interface_index: (*C.size_t)(unsafe.Pointer(&lent.result.NetworkInterfaceIndex)),
-		static_key:              (*C.ucall_noise_key_t)(unsafe.Pointer(&lent.result.StaticKey)),
-		address:                 (*C.ucall_peer_address_t)(unsafe.Pointer(&lent.result.Address))}
+		server: request.server, outcome: call.outcome(), request: request.request,
+		network_interface_index: (*C.size_t)(unsafe.Pointer(&call.result.NetworkInterfaceIndex)),
+		static_key:              (*C.ucall_noise_key_t)(unsafe.Pointer(&call.result.StaticKey)),
+		address:                 (*C.ucall_peer_address_t)(unsafe.Pointer(&call.result.Address))}
 	C.ucall_server_request_peer(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // PathSegmentsCount is how many path components the request has, as sent.
@@ -625,13 +635,13 @@ func (request *Request) PathSegmentsCount() uint {
 // PathSegment is path component index, counting from zero, failing with StatusNotFound past the
 // last one.
 func (request *Request) PathSegment(index uint) ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_path_segment_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_path_segment_t](&call)
 	*arguments = C.ucall_server_request_path_segment_t{
-		server: request.server, outcome: lent.outcome(), request: request.request,
-		index: C.size_t(index), segment: lent.result}
+		server: request.server, outcome: call.outcome(), request: request.request,
+		index: C.size_t(index), segment: call.result}
 	C.ucall_server_request_path_segment(arguments)
-	segment, err := block(&lent, nil)
+	segment, err := block(&call, nil)
 	return viewed(segment), err
 }
 
@@ -642,17 +652,17 @@ func (request *Request) PartsCount() uint {
 
 // Part is part index of a multipart/form-data body, its payload undecoded.
 func (request *Request) Part(index uint) (RequestPart, error) {
-	var lent lent[[3]C.ucall_bytes_view_t]
-	arguments := open[C.ucall_server_request_part_t](&lent)
+	var call callWithResult[[3]C.ucall_bytes_view_t]
+	arguments := open[C.ucall_server_request_part_t](&call)
 	*arguments = C.ucall_server_request_part_t{
-		server: request.server, outcome: lent.outcome(), request: request.request, index: C.size_t(index),
-		name: &lent.result[0], content_type: &lent.result[1], data: &lent.result[2]}
+		server: request.server, outcome: call.outcome(), request: request.request, index: C.size_t(index),
+		name: &call.result[0], content_type: &call.result[1], data: &call.result[2]}
 	C.ucall_server_request_part(arguments)
-	part, err := block(&lent, nil)
+	part, err := block(&call, nil)
 	return RequestPart{Name: viewed(part[0]), ContentType: viewed(part[1]), Data: viewed(part[2])}, err
 }
 
-// taken lends a request handle to a reply, which clears it once it took the request, so a handle
+// taken passes a request handle to a reply, which clears it once it took the request, so a handle
 // still held after a refusal answers 500 when dropped.
 func (call *call) taken(handle *C.ucall_received_http_request_t) *C.ucall_received_http_request_t {
 	return (*C.ucall_received_http_request_t)(call.pin(unsafe.Pointer(handle)))
@@ -661,28 +671,28 @@ func (call *call) taken(handle *C.ucall_received_http_request_t) *C.ucall_receiv
 // Reply answers with status, full header lines like "content-type: text/plain" and body, and
 // consumes the request; the length, date and server lines are generated.
 func (request *Request) Reply(status HTTPStatus, headers []string, body []byte) error {
-	var lent lent[struct{}]
-	lines, linesCount := lent.texts(headers)
-	arguments := open[C.ucall_server_reply_content_t](&lent)
+	var call callWithResult[struct{}]
+	lines, linesCount := call.texts(headers)
+	arguments := open[C.ucall_server_reply_content_t](&call)
 	*arguments = C.ucall_server_reply_content_t{
-		server: request.server, outcome: lent.outcome(), request: lent.taken(&request.request),
+		server: request.server, outcome: call.outcome(), request: call.taken(&request.request),
 		http_status: C.ucall_http_status_t(status), headers: lines, headers_count: linesCount,
-		body: lent.bytes(body)}
+		body: call.bytes(body)}
 	C.ucall_server_reply_content(arguments)
-	_, err := block(&lent, nil)
+	_, err := block(&call, nil)
 	return err
 }
 
 // ReplyError answers with an error status, 400 or above, and a plain-text message, and consumes
 // the request.
 func (request *Request) ReplyError(status HTTPStatus, message string) error {
-	var lent lent[struct{}]
-	arguments := open[C.ucall_server_reply_error_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_server_reply_error_t](&call)
 	*arguments = C.ucall_server_reply_error_t{
-		server: request.server, outcome: lent.outcome(), request: lent.taken(&request.request),
-		http_status: C.ucall_http_status_t(status), message: lent.text(message)}
+		server: request.server, outcome: call.outcome(), request: call.taken(&request.request),
+		http_status: C.ucall_http_status_t(status), message: call.text(message)}
 	C.ucall_server_reply_error(arguments)
-	_, err := block(&lent, nil)
+	_, err := block(&call, nil)
 	return err
 }
 
@@ -752,7 +762,7 @@ func PathPart(path PathRange) ReplyPart {
 	return ReplyPart{kind: C.ucall_reply_part_path_k, directory: path.Directory, path: path.Path, offset: path.Offset, length: path.Length}
 }
 
-// parts lends reply parts as the array the library reads, their bytes and paths until the call is
+// parts passes reply parts as the array the library reads, their bytes and paths until the call is
 // final, writing each part's union member in place, as cgo reads the union only as bytes.
 func (call *call) parts(parts []ReplyPart) (*C.ucall_reply_part_t, C.size_t) {
 	if len(parts) == 0 {
@@ -774,7 +784,7 @@ func (call *call) parts(parts []ReplyPart) (*C.ucall_reply_part_t, C.size_t) {
 			*(*C.ucall_bytes_view_t)(data) = call.bytes(part.bytes)
 		}
 	}
-	return (*C.ucall_reply_part_t)(call.lend(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))), C.size_t(len(lowered))
+	return (*C.ucall_reply_part_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))), C.size_t(len(lowered))
 }
 
 // ReplyParts answers with status, header lines and parts concatenated into the body, its length
@@ -783,12 +793,12 @@ func (call *call) parts(parts []ReplyPart) (*C.ucall_reply_part_t, C.size_t) {
 // replaces the reply with 404, 416 or 500, and the Deferred reports the cause.
 func (detached *DetachedRequest) ReplyParts(status HTTPStatus, headers []string, parts []ReplyPart) (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	lent := &deferred.lent
-	lines, linesCount := lent.texts(headers)
-	lowered, loweredCount := lent.parts(parts)
-	arguments := open[C.ucall_server_reply_vectored_t](lent)
+	call := &deferred.call
+	lines, linesCount := call.texts(headers)
+	lowered, loweredCount := call.parts(parts)
+	arguments := open[C.ucall_server_reply_vectored_t](call)
 	*arguments = C.ucall_server_reply_vectored_t{
-		server: detached.server, outcome: lent.outcome(), request: lent.taken(&detached.request),
+		server: detached.server, outcome: call.outcome(), request: call.taken(&detached.request),
 		http_status: C.ucall_http_status_t(status), headers: lines, headers_count: linesCount,
 		parts: lowered, parts_count: loweredCount}
 	C.ucall_server_reply_vectored(arguments)
@@ -798,14 +808,14 @@ func (detached *DetachedRequest) ReplyParts(status HTTPStatus, headers []string,
 // ReplyStream sends the status line and header lines and opens a body appended part by part, which
 // is chunked unless a Content-Length line declares its length.
 func (detached *DetachedRequest) ReplyStream(status HTTPStatus, headers []string) (*ReplyStream, error) {
-	var lent lent[struct{}]
-	lines, linesCount := lent.texts(headers)
-	arguments := open[C.ucall_server_reply_begin_t](&lent)
+	var call callWithResult[struct{}]
+	lines, linesCount := call.texts(headers)
+	arguments := open[C.ucall_server_reply_begin_t](&call)
 	*arguments = C.ucall_server_reply_begin_t{
-		server: detached.server, outcome: lent.outcome(), request: lent.taken(&detached.request),
+		server: detached.server, outcome: call.outcome(), request: call.taken(&detached.request),
 		http_status: C.ucall_http_status_t(status), headers: lines, headers_count: linesCount}
 	C.ucall_server_reply_begin(arguments)
-	if _, err := block(&lent, nil); err != nil {
+	if _, err := block(&call, nil); err != nil {
 		return nil, err
 	}
 	stream := &ReplyStream{server: detached.server, request: detached.request}
@@ -826,10 +836,10 @@ func (chunk BodyChunk) Bytes() []byte { return viewed(chunk.view) }
 // goroutine finding nothing fails with StatusWouldBlock instead.
 func (detached *DetachedRequest) BodyChunk() (*Deferred[BodyChunk], error) {
 	deferred := new(Deferred[BodyChunk])
-	lent := &deferred.lent
-	arguments := open[C.ucall_server_request_body_chunk_t](lent)
+	call := &deferred.call
+	arguments := open[C.ucall_server_request_body_chunk_t](call)
 	*arguments = C.ucall_server_request_body_chunk_t{
-		server: detached.server, outcome: lent.outcome(), request: detached.request, data: &lent.result.view}
+		server: detached.server, outcome: call.outcome(), request: detached.request, data: &call.result.view}
 	C.ucall_server_request_body_chunk(arguments)
 	return submitted(deferred, nil)
 }
@@ -843,24 +853,24 @@ type ReplyStream struct {
 // Append queues parts on the body together, or none of them, failing with StatusWouldBlock while
 // the peer lags behind the parts already queued.
 func (stream *ReplyStream) Append(parts []ReplyPart) error {
-	var lent lent[struct{}]
-	lowered, loweredCount := lent.parts(parts)
-	arguments := open[C.ucall_server_reply_append_t](&lent)
+	var call callWithResult[struct{}]
+	lowered, loweredCount := call.parts(parts)
+	arguments := open[C.ucall_server_reply_append_t](&call)
 	*arguments = C.ucall_server_reply_append_t{
-		server: stream.server, outcome: lent.outcome(), request: stream.request,
+		server: stream.server, outcome: call.outcome(), request: stream.request,
 		parts: lowered, parts_count: loweredCount}
 	C.ucall_server_reply_append(arguments)
-	_, err := block(&lent, nil)
+	_, err := block(&call, nil)
 	return err
 }
 
 // End ends the body, final once its file parts are sent.
 func (stream *ReplyStream) End() (*Deferred[struct{}], error) {
 	deferred := new(Deferred[struct{}])
-	lent := &deferred.lent
-	arguments := open[C.ucall_server_reply_end_t](lent)
+	call := &deferred.call
+	arguments := open[C.ucall_server_reply_end_t](call)
 	*arguments = C.ucall_server_reply_end_t{
-		server: stream.server, outcome: lent.outcome(), request: lent.taken(&stream.request)}
+		server: stream.server, outcome: call.outcome(), request: call.taken(&stream.request)}
 	C.ucall_server_reply_end(arguments)
 	return submitted(deferred, nil)
 }
@@ -891,7 +901,7 @@ type Batching struct {
 	MaxLatency time.Duration
 }
 
-// Batch lends the requests one batch callback received, in arrival order, each taken once. A
+// Batch holds the requests one batch callback received, in arrival order, each taken once. A
 // request never taken stays unanswered until the server is closed.
 type Batch struct {
 	server   C.ucall_server_t
@@ -926,22 +936,22 @@ func (server *Server) Batch(path string, verb Verb, options Batching, handler fu
 	if handler == nil {
 		callback = nil
 	}
-	var lent lent[C.ucall_http_batch_endpoint_t]
-	arguments := open[C.ucall_server_add_http_batch_endpoint_t](&lent)
+	var call callWithResult[C.ucall_http_batch_endpoint_t]
+	arguments := open[C.ucall_server_add_http_batch_endpoint_t](&call)
 	*arguments = C.ucall_server_add_http_batch_endpoint_t{
 		server:                   server.handle,
-		outcome:                  lent.outcome(),
-		uri_template:             lent.text(path),
+		outcome:                  call.outcome(),
+		uri_template:             call.text(path),
 		verb:                     C.ucall_verb_t(verb),
 		callback:                 callback,
 		context:                  contextOf(handle),
 		min_batch_size:           C.size_t(options.MinSize),
 		max_batch_size:           C.size_t(options.MaxSize),
 		max_latency_microseconds: microseconds(options.MaxLatency),
-		endpoint:                 lent.result,
+		endpoint:                 call.result,
 	}
 	C.ucall_server_add_http_batch_endpoint(arguments)
-	endpoint, err := block(&lent, nil)
+	endpoint, err := block(&call, nil)
 	if err != nil {
 		handle.Delete()
 		return nil, err
@@ -953,24 +963,24 @@ func (server *Server) Batch(path string, verb Verb, options Batching, handler fu
 // TakeBatch runs the handler on this goroutine if a batch is due, waiting up to timeout for one;
 // zero performs one nonblocking round.
 func (endpoint *BatchEndpoint) TakeBatch(timeout time.Duration) error {
-	var lent lent[struct{}]
-	arguments := open[C.ucall_server_take_batch_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_server_take_batch_t](&call)
 	*arguments = C.ucall_server_take_batch_t{
-		server: endpoint.server, outcome: lent.outcome(), endpoint: endpoint.endpoint,
+		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.endpoint,
 		timeout_microseconds: microseconds(timeout)}
 	C.ucall_server_take_batch(arguments)
-	_, err := block(&lent, nil)
+	_, err := block(&call, nil)
 	return err
 }
 
 // TakeBatches runs the handler on this goroutine for every due batch until the server stops.
 func (endpoint *BatchEndpoint) TakeBatches() error {
-	var lent lent[struct{}]
-	arguments := open[C.ucall_server_take_batches_t](&lent)
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_server_take_batches_t](&call)
 	*arguments = C.ucall_server_take_batches_t{
-		server: endpoint.server, outcome: lent.outcome(), endpoint: endpoint.endpoint}
+		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.endpoint}
 	C.ucall_server_take_batches(arguments)
-	_, err := block(&lent, nil)
+	_, err := block(&call, nil)
 	return err
 }
 
@@ -986,13 +996,13 @@ type BatchEndpointStatistics struct {
 
 // Statistics copies the endpoint's counters, from any goroutine while it is polled.
 func (endpoint *BatchEndpoint) Statistics() (BatchEndpointStatistics, error) {
-	var lent lent[BatchEndpointStatistics]
-	arguments := open[C.ucall_server_batch_endpoint_statistics_t](&lent)
+	var call callWithResult[BatchEndpointStatistics]
+	arguments := open[C.ucall_server_batch_endpoint_statistics_t](&call)
 	*arguments = C.ucall_server_batch_endpoint_statistics_t{
-		server: endpoint.server, outcome: lent.outcome(), endpoint: endpoint.endpoint,
-		statistics: (*C.ucall_batch_endpoint_statistics_t)(unsafe.Pointer(lent.result))}
+		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.endpoint,
+		statistics: (*C.ucall_batch_endpoint_statistics_t)(unsafe.Pointer(call.result))}
 	C.ucall_server_batch_endpoint_statistics(arguments)
-	return block(&lent, nil)
+	return block(&call, nil)
 }
 
 // endregion: Batches

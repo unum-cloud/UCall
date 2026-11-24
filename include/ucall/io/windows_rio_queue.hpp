@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/io/windows_rio_engine.hpp
+ *  @file include/ucall/io/windows_rio_queue.hpp
  *  @author Ash Vardanian
  *  @date November 9, 2026
  *  @brief Registered I/O sockets beside overlapped accepts, connects and files on one port.
@@ -9,10 +9,10 @@
 #include <smashtable/basic_vector.hpp> // `vector`
 #include <smashtable/row_search.hpp>   // `serial_row_kit_t`
 
-#include "ucall/io/types.hpp"               // `registered_socket_t`, `io_request_t`, `memory_registration_t`
-#include "ucall/io/windows_iocp_engine.hpp" // `windows_overlapped`, `windows_extensions_t`, `windows_scatter_pages`
-#include "ucall/utilities/sockets.hpp"      // `nonblocking`, `socket_option`, `socket_reset_on_close`
-#include "ucall/utilities/types.hpp"        // `byte_t`, `descriptor_t`, `span`
+#include "ucall/io/types.hpp"              // `registered_socket_t`, `io_request_t`, `memory_registration_t`
+#include "ucall/io/windows_iocp_queue.hpp" // `windows_overlapped`, `windows_extensions_t`, `windows_scatter_pages`
+#include "ucall/utilities/sockets.hpp"     // `nonblocking`, `socket_option`, `socket_reset_on_close`
+#include "ucall/utilities/types.hpp"       // `byte_t`, `descriptor_t`, `span`
 
 #if UCALL_OS_WINDOWS_
 
@@ -72,7 +72,7 @@ struct windows_rio_result_t {
     /** Bytes the operation moved. */
     ULONG bytes {};
 
-    /** What the request queue was created with, the engine's socket index. */
+    /** What the request queue was created with, the queue's socket index. */
     ULONGLONG socket_context {};
 
     /** What the operation was posted with, its direction. */
@@ -158,7 +158,7 @@ inline constexpr std::uint32_t windows_rio_operation_tag_k = std::uint32_t {1} <
 /** Pages of one slice, and slices registered together as one range. */
 inline constexpr std::size_t windows_rio_slice_pages_k = 16, windows_rio_range_slices_k = 16;
 
-/** Where a socket of the engine is: free, open, closed by a cancel or a timeout while the network
+/** Where a socket of the queue is: free, open, closed by a cancel or a timeout while the network
  *  still holds it, or let go by the network with Registered I/O results still due, so its index
  *  waits for them before any reuse. */
 enum class windows_rio_socket_stage_t : std::uint8_t {
@@ -183,18 +183,18 @@ struct windows_rio_operation_t {
     /** The request of this direction, or null while none is in flight. */
     io_request_t* request {};
 
-    /** Its position in the engine's @c timed while its deadline is checked, else @c absent_k. */
+    /** Its position in the queue's @c timed while its deadline is checked, else @c absent_k. */
     unsigned timed {operation_list_t::absent_k};
 
     /** Pending, or cancelling or timing out once its socket was closed for it. */
     windows_operation_stage_t stage {windows_operation_stage_t::pending_k};
 };
 
-/** A stream socket the engine opened or accepted: its request queue where Registered I/O took
- *  it, its receive and send there, the slice each direction holds, and the results still due. */
+/** A stream socket the queue opened or accepted: its request queue where Registered I/O took it,
+ *  its receive and send there, the slice each direction holds, and the results still due. */
 struct windows_rio_socket_t {
 
-    /** The socket, or @c INVALID_SOCKET once the engine closed it. */
+    /** The socket, or @c INVALID_SOCKET once the queue closed it. */
     SOCKET socket {INVALID_SOCKET};
 
     /** Its request queue, or invalid where its family keeps it out of Registered I/O. */
@@ -232,7 +232,7 @@ struct windows_rio_range_t {
 
 /** The registered slices receives land in and unregistered sends leave from, each of
  *  @c windows_rio_slice_pages_k pages, grown a range of @c windows_rio_range_slices_k at a time up
- *  to what @c open sized, and lent until @c release. */
+ *  to what @c open sized, and valid until @c release. */
 template <typename allocator_type_>
 struct windows_rio_slices {
     struct alignas(4096) page_t {
@@ -265,7 +265,8 @@ struct windows_rio_slices {
     /** What ranges allocate from. */
     allocator_type_ allocator;
 
-    /** Reserves the bookkeeping for @p slices lent at once, so growing allocates only ranges. */
+    /** Reserves the bookkeeping for @p slices awaiting @c release at once, so growing
+     *  allocates only ranges. */
     ucall_status_t open(std::size_t slices) noexcept {
         if (st::failed(ranges.reserve((slices + windows_rio_range_slices_k - 1) / windows_rio_range_slices_k)) ||
             st::failed(buffers.reserve(ranges.capacity())) ||
@@ -333,48 +334,49 @@ struct windows_rio_slices {
  *  @brief Registered I/O for the stream sockets it opens and accepts, overlapped operations for
  *      the rest, both on one completion port.
  *
- *  Receives land in registered slices of engine memory, as io_uring's do. A send of a range
+ *  Receives land in registered slices of queue memory, as io_uring's do. A send of a range
  *  registered through @c register_memory leaves with @c RIOSend and no copy, so its completion is
  *  its release; any other send copies up to a slice into one and leaves with @c RIOSend as well, as
  *  such a socket refuses every plain send and receive. A listener hands out only sockets created
- *  with its own flags, so the engine creates its listeners in Registered I/O and serves no borrowed
- *  one. Accepts, connects and files stay overlapped, as do the listener, wakeup and metrics
- *  sockets, which it imports rather than adopts. @c poll drains the completion queue without a
- *  syscall and arms its notification through the port only when it would block with nothing
- *  collected. Registered I/O cannot cancel one operation, so a cancel or a timeout closes the
- *  socket, with a reset when a send stalled, and its index is reused only once every result still
- *  due has arrived.
+ *  with its own flags, so the queue creates its listeners in Registered I/O and serves no
+ *  caller-owned one. Accepts, connects and files stay overlapped, as do the listener, wakeup and
+ *  metrics sockets, which it imports rather than adopts. @c poll drains the completion queue
+ *  without a syscall and arms its notification through the port only when it would block with
+ *  nothing collected. Registered I/O cannot cancel one operation, so a cancel or a timeout closes
+ *  the socket, with a reset when a send stalled, and its index is reused only once every result
+ *  still due has arrived.
  */
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
-struct windows_rio_engine {
+struct windows_rio_queue {
     using allocator_t = allocator_type_;
     using operation_stage_t = windows_operation_stage_t;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_windows_rio_k;
-    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::engine_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_k;
 
-    /** Why the engine refuses a borrowed listener, whose accepted sockets would lack its flags. */
-    static constexpr char const* borrowed_listener_refusal_k =
+    /** Why the queue refuses a caller-owned listener, whose accepted sockets would
+     *  lack its flags. */
+    static constexpr char const* caller_listener_refusal_k =
         "Registered I/O accepts only from listeners it creates; serve a `listen_descriptor` with `windows-iocp`";
     static constexpr unsigned receive_direction_k = static_cast<unsigned>(io_direction_t::receive_k);
     static constexpr unsigned transmit_direction_k = static_cast<unsigned>(io_direction_t::transmit_k);
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = windows_rio_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
+    using rebind = windows_rio_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 
-    explicit windows_rio_engine(allocator_t const& allocator = {}) noexcept
+    explicit windows_rio_queue(allocator_t const& allocator = {}) noexcept
         : overlapped(allocator), scatter(allocator), results(rebound_allocator<windows_rio_result_t> {allocator}),
           sockets(rebound_allocator<windows_rio_socket_t> {allocator}),
           ranges(rebound_allocator<windows_rio_range_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
           slices(allocator) {}
-    windows_rio_engine(windows_rio_engine const&) = delete;
-    windows_rio_engine& operator=(windows_rio_engine const&) = delete;
-    windows_rio_engine(windows_rio_engine&&) = delete;
-    windows_rio_engine& operator=(windows_rio_engine&&) = delete;
-    ~windows_rio_engine() noexcept {
+    windows_rio_queue(windows_rio_queue const&) = delete;
+    windows_rio_queue& operator=(windows_rio_queue const&) = delete;
+    windows_rio_queue(windows_rio_queue&&) = delete;
+    windows_rio_queue& operator=(windows_rio_queue&&) = delete;
+    ~windows_rio_queue() noexcept {
         if (completion_queue == windows_rio_invalid_completion_queue_k) return;
         stop();
         for (windows_rio_socket_t& socket : sockets)
@@ -408,7 +410,7 @@ struct windows_rio_engine {
     /** Where @c dequeue reads results, two per socket. */
     st::vector<windows_rio_result_t, rebound_allocator<windows_rio_result_t>> results;
 
-    /** Socket records, indexed by the index their handles carry. */
+    /** Socket records, indexed by the index their handles hold. */
     st::vector<windows_rio_socket_t, rebound_allocator<windows_rio_socket_t>> sockets;
 
     /** Socket records holding no socket. */
@@ -423,10 +425,10 @@ struct windows_rio_engine {
     /** The slices receives land in and copied sends leave from. */
     windows_rio_slices<allocator_t> slices;
 
-    /** The counters the engine advances for its polling owner. */
+    /** The counters the queue advances for its polling owner. */
     io_statistics_t statistics {};
 
-    /** Why the engine was refused, naming what to change, or null. */
+    /** Why the queue was refused, naming what to change, or null. */
     char const* refusal {};
 
     /** Registered I/O operations whose results are still due. */
@@ -525,16 +527,16 @@ struct windows_rio_engine {
         return {static_cast<registered_memory_t>(ranges.size() - 1)};
     }
 
-    /** Takes back the receive slice a completion lent. */
+    /** Releases the receive slice a completion names. */
     void release(io_completion_t const& completion) noexcept {
-        if (completion.lease) slices.release(static_cast<unsigned>(completion.lease - 1));
+        if (completion.release_token) slices.release(static_cast<unsigned>(completion.release_token - 1));
     }
 
-    /** Why the engine ended, which every later poll answers; zero while it runs. */
+    /** Why the queue ended, which every later poll answers; zero while it runs. */
     int fault {};
 
     void submit(io_request_t& request) noexcept {
-        // The records cover what the loops hold at once, so only a miscount ends the engine here.
+        // The records cover what the loops hold at once, so only a miscount ends the queue here.
         if (start(request) != ucall_status_success_k) fault = -ENOBUFS;
     }
     ucall_status_t start(io_request_t& request) noexcept {
@@ -627,7 +629,7 @@ struct windows_rio_engine {
         overlapped.stop(extensions, statistics);
     }
 
-    /** The socket @p descriptor names, or @c INVALID_SOCKET once the engine closed it. */
+    /** The socket @p descriptor names, or @c INVALID_SOCKET once the queue closed it. */
     SOCKET socket_of(descriptor_t descriptor) const noexcept {
         return registered_socket_t::contains(descriptor) ? sockets[registered_socket_t::index_of(descriptor)].socket
                                                          : static_cast<SOCKET>(descriptor);
@@ -651,8 +653,9 @@ struct windows_rio_engine {
         return registered_socket_t {index}.handle();
     }
 
-    /** Turns what the port completed for a socket of the engine into what the network expects: an
-     *  accepted socket into a handle, a receive outside Registered I/O into a lent slice. */
+    /** Turns what the port completed for a socket of the queue into what the network expects:
+     *  an accepted socket into a handle, a receive outside Registered I/O into a slice valid
+     *  until @c release. */
     void adopt_completion(io_completion_t& completion) noexcept {
         io_request_t const& request = *completion.request;
         if (request.operation == io_operation_t::accept_k && completion.result >= 0) {
@@ -666,13 +669,13 @@ struct windows_rio_engine {
         unsigned const slice = std::exchange(socket.slices[receive_direction_k], absent_k);
         // A socket the network let go of already took its slice back.
         if (slice == absent_k) return;
-        if (completion.result > 0) lend(completion, slice);
+        if (completion.result > 0) fill_received_slice(completion, slice);
         else slices.release(slice);
     }
 
-    void lend(io_completion_t& completion, unsigned slice) noexcept {
+    void fill_received_slice(io_completion_t& completion, unsigned slice) noexcept {
         completion.data = slices.data(slice);
-        completion.lease = slice + 1;
+        completion.release_token = slice + 1;
     }
 
     ucall_status_t receive(unsigned index, io_request_t& request) noexcept {
@@ -816,7 +819,7 @@ struct windows_rio_engine {
             else if (answer < 0 && operation.stage == operation_stage_t::cancelling_k) answer = -ECANCELED;
             io_completion_t completion {&request, answer};
             unsigned const slice = std::exchange(socket.slices[direction], absent_k);
-            if (direction == receive_direction_k && answer > 0) lend(completion, slice);
+            if (direction == receive_direction_k && answer > 0) fill_received_slice(completion, slice);
             else if (slice != absent_k) slices.release(slice);
             if (operation.timed != absent_k) untime(index, direction);
             operation = {};
@@ -829,7 +832,7 @@ struct windows_rio_engine {
         return true;
     }
 };
-using windows_rio_engine_t = windows_rio_engine<>;
+using windows_rio_queue_t = windows_rio_queue<>;
 
 } // namespace unum::ucall::io
 

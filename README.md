@@ -195,7 +195,7 @@ Batch endpoints group independent requests by their configured size and latency 
 Endpoint callbacks run synchronously on the application polling caller; a deadline cannot preempt a callback.
 Registering a batch endpoint returns its `ucall_http_batch_endpoint_t` handle.
 Each batch endpoint has one queue fed by every event loop and one application thread polling that handle through `ucall_server_take_batches()`, so its callback never runs on an event loop.
-With `max_pipelined_requests` on an interface and `max_pipelined_calls` on a client, one connection carries several requests at once, so a single client can fill a batch; replies still leave in request order.
+With `max_pipelined_requests` on an interface and `max_pipelined_calls` on a client, one connection holds several requests at once, so a single client can fill a batch; replies still leave in request order.
 
 ### Caller-Owned Polling
 
@@ -217,7 +217,7 @@ A server sets no deadlines on its peers; a client bounds its own calls with `tim
 `ucall_client_call()` submits an exchange and returns its acceptance result.
 Each accepted call produces one final record through `ucall_client_take_completed()`, which drives I/O and retrieves completion batches.
 Initialize, submit, poll, and free a client on the same owner thread.
-Keep borrowed request inputs alive until their completion is retrieved.
+Keep request inputs allocated and unchanged until their completion is retrieved.
 After retrieval, the caller owns each response until `ucall_client_response_free()`, even past client teardown.
 A response is capped by the client's `max_response_bytes`, which takes the kernel's largest receive buffer by default, as `max_request_bytes` caps a server's requests.
 Stop and join server polling threads before freeing the server.
@@ -268,7 +268,7 @@ Finally, it uses the [SHA-256](https://en.wikipedia.org/wiki/SHA-2) hash functio
 
 Why choose AES-256-GCM and SHA-256?
 Both primitives ship in [StringZilla][stringzilla], so the transport shares the engine's capability-selected kernels rather than maintaining a separate cryptographic backend.
-The selected CPU class carries matching string searches, AES-GCM, SHA-256, and atomic operations together.
+The selected CPU class selects matching string searches, AES-GCM, SHA-256, and atomic operations together.
 The implemented x86 and Arm kernels use the available cryptographic instruction paths, with serial fallbacks for the baseline class.
 
 Noise itself sits __beneath__ HTTP, independently of the socket backend.
@@ -372,7 +372,7 @@ Only the Noise transport and application peer-authorization callbacks are implem
 The shared connection automata consume completions and emit I/O requests for POSIX, Linux epoll with AIO, Linux io_uring 6.12 or 6.18, kqueue, IOCP, and Registered I/O.
 HTTP framing, routing, and Noise stay in templated headers under `include/ucall/`.
 One library exposes the C ABI once; server and client configuration select the backend and a compiled CPU class.
-Per-CPU instantiation units specialize every enabled native engine, while ordinary C calls use their handle's fixed operation table.
+Per-CPU instantiation units specialize every enabled native queue, while ordinary C calls use their handle's fixed operation table.
 
 The implementation uses:
 
@@ -470,8 +470,8 @@ The most common approaches for uploads and downloads are sadly not symmetric.
 
 Streaming multipart is another upload design, but continuation after a failure requires an application-level protocol rather than multipart framing alone.
 
-Replies can carry byte ranges of files, as descriptors or as paths beneath directories an interface registers, which is what a `Range` response needs.
-The event loop reads them with `O_DIRECT`, past the page cache, into windows borrowed from its pool, reading the next window while the previous one sends.
+Replies can include byte ranges of files, as descriptors or as paths beneath directories an interface registers, which is what a `Range` response needs.
+The event loop reads them with `O_DIRECT`, past the page cache, into windows taken from its pool, reading the next window while the previous one sends.
 Every reply leaves through zero-copy sends wherever the kernel offers them, and a window returns to the pool once the kernel let go of it.
 Under Noise each read leaves a gap behind every record's payload for its tag and the next record's header, so records seal in place inside the window.
 IOCP does not yet send file parts over Noise connections.
@@ -552,7 +552,7 @@ ucall_server_options_t config = {
 };
 ```
 
-A datagram that fails to send is dropped, and the next one carries its counters, so collectors see every request counted once.
+A datagram that fails to send is dropped, and the next one includes its counters, so collectors see every request counted once.
 
 ## FastAPI UX Comparison
 
@@ -762,7 +762,7 @@ UCall compiles in one of two shapes, picked by `UCALL_MULTIVERSIONED`.
   One binary runs well across diverse machines, because each CPU picks its own class at runtime.
   This is the default, and the shape of the Python wheels and the Rust crate.
 - __Monoversioned builds are for throughput.__
-  For common hardware and data-center deployments, the binary carries only the best code for one machine.
+  For common hardware and data-center deployments, the binary includes only the best code for one machine.
   These are the leanest binaries: they start fast and take little memory and disk.
   Outside that machine they refuse cleanly with `ucall_status_unsupported_k`, never crashing and never falling back to slower code in silence.
 - __The switches.__
@@ -776,7 +776,7 @@ A monoversioned build compiles the single `monoversioned` CPU class in place of 
 | Directory                   | Holds                                                                             |
 | :-------------------------- | :-------------------------------------------------------------------------------- |
 | `c/`                        | The C ABI headers `ucall.h`, `types.h`, `server.h` and `client.h`, and a C caller |
-| `include/ucall/`            | The C++ 20 core: HTTP, DNS, the Noise tunnel, I/O engines and the network loops   |
+| `include/ucall/`            | The C++ 20 core: HTTP, DNS, the Noise tunnel, I/O queues and the network loops   |
 | `src/`                      | The library exporting the C ABI, one unit per compiled CPU class                  |
 | `python/`, `rust/`, `mojo/` | The bindings, each with its own guide                                             |
 | `tools/`                    | The `ucall` command-line client and the server shared by examples and benchmarks  |

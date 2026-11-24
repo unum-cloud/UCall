@@ -66,7 +66,7 @@ struct log_field_t {
 template <typename network_type_>
 struct formatting {
     using network_t = network_type_;
-    using engine_t = typename network_t::engine_t;
+    using queue_t = typename network_t::queue_t;
     using http_t = typename network_t::http_t;
     using server_exchange_t = typename network_t::server_exchange_t;
     using network_interface_t = typename network_t::network_interface_t;
@@ -141,9 +141,9 @@ struct formatting {
         return peer;
     }
 
-    /** Binds and listens on the interface's address through @p engine, trying each address it
+    /** Binds and listens on the interface's address through @p queue, trying each address it
      *  resolves to. */
-    static ucall_status_t bind_listener(network_interface_t& network_interface, engine_t& engine,
+    static ucall_status_t bind_listener(network_interface_t& network_interface, queue_t& queue,
                                         descriptor_t& descriptor) noexcept {
         vector<char> host {rebound_allocator<char> {network_interface.address.get_allocator()}},
             service {host.get_allocator()};
@@ -157,7 +157,7 @@ struct formatting {
         addrinfo* addresses = nullptr;
         if (getaddrinfo(host.data(), service.data(), &hints, &addresses) != 0) return ucall_status_connection_failed_k;
         for (auto* address = addresses; address; address = address->ai_next) {
-            descriptor = engine.open_listener(address->ai_family);
+            descriptor = queue.open_listener(address->ai_family);
             if (descriptor < 0) continue;
             int enabled = 1;
 #if UCALL_OS_WINDOWS_
@@ -187,26 +187,27 @@ struct formatting {
         return descriptor < 0 ? ucall_status_connection_failed_k : ucall_status_success_k;
     }
 
-    /** The send buffer the interface's accepted sockets inherit, read before any engine opens to
-     *  size the loops' file windows: a borrowed listener's own, or else the TCP default, which a
-     *  fresh socket of either family shows just as the listener bound later will. */
+    /** The send buffer the interface's accepted sockets inherit, read before any queue opens to
+     *  size the loops' file windows: a caller-owned listener's own, or else the TCP default, which
+     *  a fresh socket of either family shows just as the listener bound later will. */
     static std::size_t listener_send_buffer(network_interface_t const& network_interface) noexcept {
-        std::intptr_t const* const borrowed = network_interface.config.listen_descriptor;
-        descriptor_t const descriptor = borrowed ? static_cast<descriptor_t>(*borrowed) : socket_open(AF_INET);
+        std::intptr_t const* const caller_listener = network_interface.config.listen_descriptor;
+        descriptor_t const descriptor = caller_listener ? static_cast<descriptor_t>(*caller_listener)
+                                                        : socket_open(AF_INET);
         int send_buffer = 0;
         socket_length_t length = sizeof(send_buffer);
         bool const measured = descriptor >= 0 &&
                               getsockopt(descriptor, SOL_SOCKET, SO_SNDBUF, reinterpret_cast<char*>(&send_buffer),
                                          &length) == 0 &&
                               send_buffer > 0;
-        if (!borrowed && descriptor >= 0) socket_close(descriptor);
+        if (!caller_listener && descriptor >= 0) socket_close(descriptor);
         return measured ? static_cast<std::size_t>(send_buffer) : max_unsent_bytes_k;
     }
 
     /** Readies loop zero's @p acceptor on a duplicate of the listener its interface was handed, or
-     *  on one @p engine opens and binds to its address, and reports the bound address, or an
+     *  on one @p queue opens and binds to its address, and reports the bound address, or an
      *  AF_UNIX socket's path. */
-    static ucall_status_t bind_acceptor(interface_acceptor_t& acceptor, engine_t& engine) noexcept {
+    static ucall_status_t bind_acceptor(interface_acceptor_t& acceptor, queue_t& queue) noexcept {
         if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
         network_interface_t& network_interface = *acceptor.network_interface;
         descriptor_t descriptor = -1;
@@ -214,7 +215,7 @@ struct formatting {
             descriptor = socket_duplicate_listener(*network_interface.config.listen_descriptor);
             if (descriptor < 0) return ucall_status_invalid_argument_k;
         }
-        else if (ucall_status_t const listened = bind_listener(network_interface, engine, descriptor);
+        else if (ucall_status_t const listened = bind_listener(network_interface, queue, descriptor);
                  listened != ucall_status_success_k)
             return listened;
         sockaddr_storage bound {};
@@ -343,7 +344,7 @@ struct formatting {
         log.callback(level, bytes_view({line, length}), log.context);
     }
 
-    /** Characters of an IMF-fixdate, the form of every @c date header a reply carries. */
+    /** Characters of an IMF-fixdate, the form of every @c date header a reply sends. */
     static constexpr std::size_t http_date_length_k = sizeof("Sun, 06 Nov 1994 08:49:37 GMT") - 1;
 
     /** Formats the RFC 9110 IMF-fixdate through the calendar types, without allocating. */

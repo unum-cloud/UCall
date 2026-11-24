@@ -1,12 +1,12 @@
 /**
- *  @file test/io/faulting_engine.hpp
+ *  @file test/io/faulting_queue.hpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief A POSIX engine that delays and resets transfers, as a kernel under pressure does.
+ *  @brief A POSIX queue that delays and resets transfers, as a kernel under pressure does.
  */
 #pragma once
-#include "ucall/io/posix_engine.hpp" // `posix_engine_t`
-#include "ucall/network.hpp"         // `serial_network`
+#include "ucall/io/posix_queue.hpp" // `posix_queue_t`
+#include "ucall/network.hpp"        // `serial_network`
 
 #include "harness.hpp" // `expect_true`
 
@@ -17,7 +17,7 @@ using namespace unum::ucall::io;
 #if UCALL_WITH_POSIX
 
 /**
- *  @brief A POSIX engine that mistreats every few transfers it is asked for, as a kernel under
+ *  @brief A POSIX queue that mistreats every few transfers it is asked for, as a kernel under
  *      pressure does: one waits a poll before it starts, as a ring refusing an entry makes it,
  *      and another completes with a reset its socket never saw.
  *
@@ -27,11 +27,11 @@ using namespace unum::ucall::io;
 template <typename allocator_type_ = uc::st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = uc::fu::standard_atomic_ref,
           typename row_kit_type_ = uc::st::serial_row_kit_t>
-struct faulting_engine {
+struct faulting_queue {
     using allocator_t = allocator_type_;
-    using inner_t = posix_engine<allocator_type_, atomic_ref_template_, row_kit_type_>;
+    using inner_t = posix_queue<allocator_type_, atomic_ref_template_, row_kit_type_>;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = faulting_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
+    using rebind = faulting_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr ucall_io_backend_t backend_k = inner_t::backend_k;
     static constexpr io_receive_memory_t receive_memory_k = inner_t::receive_memory_k;
 
@@ -47,7 +47,7 @@ struct faulting_engine {
     std::vector<held_t> held {};
     std::size_t transfers {};
 
-    explicit faulting_engine(allocator_t const& allocator = {}) noexcept : inner(allocator) {}
+    explicit faulting_queue(allocator_t const& allocator = {}) noexcept : inner(allocator) {}
     descriptor_t open_socket(int family) noexcept { return inner.open_socket(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return inner.import_socket(descriptor); }
     int close_socket(descriptor_t descriptor) noexcept { return inner.close_socket(descriptor); }
@@ -97,7 +97,7 @@ struct faulting_engine {
     }
 };
 
-using faulting_network_t = uc::network::serial_network<io_engine_variant<faulting_engine<>>>;
+using faulting_network_t = uc::network::serial_network<io_queue_variant<faulting_queue<>>>;
 
 #endif
 

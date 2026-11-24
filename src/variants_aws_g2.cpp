@@ -2,7 +2,7 @@
  *  @file src/variants_aws_g2.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief Aws g2 network variants for every enabled native I/O engine.
+ *  @brief Aws g2 network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

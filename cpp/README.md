@@ -61,6 +61,7 @@ Every fallible verb answers a `status_t` or an `expected<T>`, unpacked as `auto 
 `server_t::make` takes the interfaces to answer on, as an array whose size the compiler knows, and optionally `server_options_t`: the backend, a CPU class ceiling that caps the picked class rather than demanding one the machine lacks, a `log_t` sink and a StatsD endpoint.
 It fails rather than substituting when the backend is unavailable or the CPU does not run the class.
 An `interface_t` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
+`server_t::memory_domain` reports the NUMA node the kernel ties an interface's device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
 It admits 1024 connections by default, reads one request per connection at a time unless `max_pipelined_requests` allows more, and replies still leave in request order.
 `max_request_bytes` caps a request's head and buffered body, answering 413 past it, and `reply_directories` names the directories path replies resolve beneath.
 `listen_descriptor` accepts on a listener another owner opened instead of binding an address, and never closes it.
@@ -104,7 +105,8 @@ uc::status_t const fallback = server.route<not_served>("/anything", ucall_verb_a
 
 Routes register before any loop is polled, with `route` taking any verb and `get`, `post`, `put`, `delete_` and `patch` naming one; `delete_` carries an underscore, as `delete` is a keyword.
 A handler is a `noexcept` function taking `request_t` by value, named as a template argument, as in `server.get<greet>(path)`; a member function named the same way with its object, as in `server.post<&service_t::echo>(path, service)`; or a callable with state, such as a lambda with captures, passed as an argument.
-The server borrows a member's object or a callable until it is destroyed and keeps no record of a route; log sinks and peer authorizers are borrowed callables alike.
+The server refers to a member's object or a callable, which the caller keeps until the server is destroyed, and keeps no record of a route; log sinks and peer authorizers are callables the caller keeps alike.
+Every polling loop may run a route at once, so a callable, a log sink and a peer authorizer are called through a const call operator, and a member's object must be safe to call from several threads, like an internally synchronized store.
 Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice fails with `status_code_t::already_exists_k`.
 Routing is exact: an empty segment is a segment, so `/users` and `/users/` are different paths.
 A path no route matches answers 404, one whose routes take other verbs answers 405 with an `allow` header, a GET route also serves HEAD, and `OPTIONS` answers 204 with the same `allow` list.
@@ -115,7 +117,7 @@ Log lines reach the handler on whichever thread produced them, and StatsD datagr
 ## Requests
 
 A handler receives each `request_t` by value, owning it.
-Its reads borrow the received bytes: `verb`, `path`, `query_string`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on, the client's authenticated Noise key and its socket address.
+Its reads view the received bytes: `verb`, `path`, `query_string`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on, the client's authenticated Noise key and its socket address.
 Every read that can fail answers an `expected`, so a missing header answers `status_code_t::not_found_k` and a body read on a streamed route `status_code_t::invalid_argument_k`, while the counts answer plain numbers.
 The path and query values stay percent-encoded as sent, which `uc::decode_percent` decodes, header names match case-insensitively, and the body arrives whole, decoded from chunked framing if it was sent that way.
 `fields_count` and `field` read every header field in arrival order, names lowercased and values trimmed, as a proxy forwards a head.
@@ -147,7 +149,7 @@ The library clears the request's handle once a reply took it, a closed connectio
 
 ## Files & Streams
 
-Handlers run on the polling thread, so a reply or a pull that finishes later runs in a `deferred` slot the caller lends, which the polling thread finishes as it keeps polling.
+Handlers run on the polling thread, so a reply or a pull that finishes later runs in a `deferred` slot the caller keeps, which the polling thread finishes as it keeps polling.
 Await it on the polling thread through a scheduler, or wait on it from another thread; waiting on the polling thread itself never ends.
 A verb taking a slot answers a refusal at once, or success while the call runs, and the slot reports the final status.
 A slot is reused for the next call, waiting first only if its previous call still runs, so a server keeps a ring of slots rather than one per request.
@@ -175,7 +177,7 @@ ucall_bytes_view_t const directories[] {uc::bytes_view("/srv/videos")};
 uc::interface_t const interfaces[] {{.address = "0.0.0.0:8080", .reply_directories = directories}};
 auto [server, server_status] = uc::server_t::make(interfaces);
 auto serve = [&loop](uc::request_t request) noexcept { send_video(std::move(request), loop); };
-uc::status_t const routed = server.get("/videos/{name}", serve); // borrows `serve` until the server is destroyed
+uc::status_t const routed = server.get("/videos/{name}", serve); // the caller keeps `serve` until the server is destroyed
 for (;;) {
     uc::status_t const polled = server.take_call(0, std::chrono::milliseconds(1));
     if (polled == uc::status_code_t::connection_closed_k) break;
@@ -184,7 +186,7 @@ for (;;) {
 ```
 
 `reply_parts` concatenates `bytes_part`, `path_part` and `file_part` parts into one body whose Content-Length is measured from the files.
-A path part resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and a file part borrows the caller's unbuffered descriptor until the reply is final, while bytes and paths are copied before the call returns.
+A path part resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and a file part names the caller's unbuffered descriptor until the reply is final, while bytes and paths are copied before the call returns.
 A missing, unreadable or too short file replaces the reply with 404, 416 or 500 before its head leaves, and the awaited status reports the cause.
 `deferred::status` polls, `deferred::wait()` blocks, `co_await deferred.wait(loop)` re-polls through the loop between other tasks, and a `deferred` waits as it is destroyed, so the coroutine frame, the stack or the ring holding it must outlive the call.
 
@@ -254,7 +256,7 @@ std::thread batching_thread([&endpoint] { [[maybe_unused]] uc::status_t const ta
 
 `batching_t` dispatches as soon as `min_batch_size` requests wait, never more than `max_batch_size` at once, and a smaller batch once its oldest request waited `max_latency`; zero fields mean 1, 32 and 10 milliseconds.
 The handler runs on the thread polling the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
-A `batch_t` lends its requests in arrival order: `take(index)` hands one over, and iterating it hands over each in turn, once, answering 500 for one passed without being taken.
+A `batch_t` holds its requests in arrival order: `take(index)` hands one over, and iterating it hands over each in turn, once, answering 500 for one passed without being taken.
 A request never taken stays unanswered until the server is destroyed, so take every one; a taken request answers 500 if it is destroyed unreplied.
 The queue holds as many requests as the interfaces admit at once, connections times pipelined requests, and refuses more with 503.
 `batch_endpoint_t::statistics` counts batches and requests, and whether each was dispatched on reaching the maximum size, the minimum size, or the latency.
@@ -289,9 +291,9 @@ auto [health, health_status] = client.get("http://127.0.0.1:8545/health");
 auto [cache_control, cache_control_status] = health.header("cache-control");
 ```
 
-`submit` takes a `client_call_t`, whose URL, header lines and body stay borrowed until the call completes, and tags it with a `void*` context.
+`submit` takes a `client_call_t`, whose URL, header lines and body the caller keeps until the call completes, and tags it with a `void*` context.
 A call admitted once completes exactly once, and a client already holding its call budget of unretrieved calls refuses more with `status_code_t::contended_k`.
-`take_completed` drives every admitted call and fills the front of the storage the caller lends with finished ones, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
+`take_completed` drives every admitted call and fills the front of the storage the caller passes with finished ones, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
 It answers a `completed_view_t`, which hands each `completed_t` over once by `take` or by iterating and frees the responses never taken.
 `get`, `post`, `put`, `delete_`, `patch` and `call` submit one call and wait for it alone, while the library keeps the completions of other calls queued for the next `take_completed`.
 `client_call_t::options` carries the call's own `client_call_options_t`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
@@ -369,11 +371,11 @@ if (status == uc::status_code_t::connection_failed_k) fmt::println(stderr, "nobo
 A submitted call that fails completes with a failed `completed_t::response`: `connection_failed_k`, `connection_closed_k`, `timeout_k`, `handshake_failed_k` or `peer_rejected_k`.
 HTTP error statuses are ordinary responses.
 `status_name`, `io_backend_name` and `cpu_class_name` spell stable names, like "linux-uring618" and "intel-icelake", and their `_from_name` twins parse them back, failing with `status_code_t::invalid_argument_k` on a name no value has.
-`version_name()` spells the linked library's version, candidate suffix included, and `decode_percent` decodes a path or a query value, which requests lend still percent-encoded.
+`version_name()` spells the linked library's version, candidate suffix included, and `decode_percent` decodes a path or a query value, which requests hold still percent-encoded.
 
 ## Threads & Polling
 
-The interface starts no threads and needs no runtime: every callback runs on a thread the application lent to a polling call.
+The interface starts no threads and needs no runtime: every callback runs on a thread the application gave to a polling call.
 
 - A route handler runs on the thread inside `take_call` or `take_calls` for the event loop that received the request.
 - A batch handler runs on the thread inside `take_batch` or `take_batches` for its endpoint, never on an event loop.
@@ -397,8 +399,8 @@ The interface is a thin layer over UCall's native library, and every rule below 
   A reply that is final on return answers a `status_t`, and one that may finish later answers a `deferred` that `wait`s, is awaited through `co_await call.wait(loop)`, or waits as it is destroyed, as Rust's `Deferred` does when dropped.
 - __Ownership is a type, not a flag.__
   A reply takes its `request_t`, a destroyed request answers 500, a `response_t` frees itself, and a `deferred` never moves, so the stack or the coroutine frame holding it outlives the call.
-- __Handlers are borrowed, never boxed.__
-  A function or a member is a template argument and an object or a callable with state is borrowed until the server or client is destroyed, so registration copies no closure, and every handler is `noexcept`, as no fault can unwind through the library.
+- __Handlers stay the caller's, never boxed.__
+  A function or a member is a template argument and an object or a callable with state stays the caller's until the server or client is destroyed, so registration copies no closure, and every handler is `noexcept`, as no fault can unwind through the library.
 - __Polling allocates nothing.__
   Blocking verbs keep their outcome on the stack, a deferred call keeps it inside itself, and an awaiter posts two words, a function and its own address, into the caller's scheduler, as Rust's waker does.
   A server and a client hold their handles alone: the library hands each callback its server, and a blocking call takes its own completion out of the library's queue.

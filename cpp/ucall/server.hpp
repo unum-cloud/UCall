@@ -7,8 +7,8 @@
  *
  *  A server starts no thread: every handler runs on the thread polling the event loop or the batch
  *  endpoint that received its request. Handlers are @c noexcept: a plain function or a member
- *  function named as a template argument, the member's object borrowed until the server is freed,
- *  or a callable borrowed the same way, so no route keeps a record of its own.
+ *  function named as a template argument, the member's object the caller keeps until the server is
+ *  freed, or a callable kept the same way, so no route keeps a record of its own.
  */
 #pragma once
 
@@ -33,7 +33,7 @@ using event_loop_statistics_t = ucall_event_loop_statistics_t;
 /** Counters of one batch endpoint since it was registered. */
 using batch_endpoint_statistics_t = ucall_batch_endpoint_statistics_t;
 
-/** One part of a @c multipart/form-data request body, borrowing the received bytes. */
+/** One part of a @c multipart/form-data request body, viewing the received bytes. */
 struct request_part_t {
 
     /** The name its @c Content-Disposition gives. */
@@ -129,7 +129,7 @@ class reply_stream_t {
 /**
  *  @brief A received request, owned by one thread at a time, answered at most once.
  *
- *  Reads borrow the received bytes until the reply. A reply takes the request, as in
+ *  Reads view the received bytes until the reply. A reply takes the request, as in
  *  @c std::move(request).reply(...), and a request destroyed without one answers 500. A reply the
  *  library refused leaves the request retained, answering 500 once destroyed.
  */
@@ -354,11 +354,11 @@ class request_t {
      *  @brief Replies with @p http_status, header lines and @p parts concatenated into the body,
      *      its length measured from the files.
      *
-     *  Final on return for bytes alone; with a file or path part the caller-lent slot @p into
-     *  stays deferred until every part is sent, which the polling thread does, so await it there
-     *  or wait elsewhere. Answers a refusal, or success while the parts send. A part failing
-     *  before the head left replaces the reply with 404, 416 or 500, reported as a status. The
-     *  slot waits for its previous call first, if that still runs.
+     *  Final on return for bytes alone; with a file or path part the caller's slot @p into stays
+     *  deferred until every part is sent, which the polling thread does, so await it there or wait
+     *  elsewhere. Answers a refusal, or success while the parts send. A part failing before the
+     *  head left replaces the reply with 404, 416 or 500, reported as a status. The slot waits for
+     *  its previous call first, if that still runs.
      */
     status_t reply_parts(ucall_http_status_t http_status, std::span<ucall_bytes_view_t const> headers,
                          std::span<ucall_reply_part_t const> parts, deferred<>& into) && noexcept {
@@ -395,7 +395,7 @@ class request_t {
     }
 };
 
-/** The requests one batch callback lends, each taken once by @c take or by iterating, which
+/** The requests one batch callback received, each taken once by @c take or by iterating, which
  *  hands them over in arrival order. A request never taken stays unanswered until the server
  *  itself is freed, so take every one. */
 class batch_t {
@@ -446,24 +446,27 @@ using request_function_t = void (*)(request_t) noexcept;
 /** A plain function handling each batch of a batch endpoint. */
 using batch_function_t = void (*)(batch_t) noexcept;
 
-/** A request handler with state, borrowed until the server is freed. */
+/** A request handler with state, which the caller keeps until the server is freed, called
+ *  through a const call operator, since every polling loop may run it at once. */
 template <typename handler_type_>
 concept request_handler = std::is_object_v<handler_type_> &&
-                          std::is_nothrow_invocable_r_v<void, handler_type_&, request_t>;
+                          std::is_nothrow_invocable_r_v<void, handler_type_ const&, request_t>;
 
-/** A batch handler with state, borrowed until the server is freed. */
+/** A batch handler with state, which the caller keeps until the server is freed; one polling owner
+ *  drives a batch endpoint at a time, so it needs no const call operator. */
 template <typename handler_type_>
 concept batch_handler = std::is_object_v<handler_type_> && std::is_nothrow_invocable_r_v<void, handler_type_&, batch_t>;
 
-/** A member function of @p object_type_ handling each request, called on an object borrowed until
- *  the server is freed. */
+/** A member function of @p object_type_ handling each request, called on an object the caller
+ *  keeps until the server is freed. Every polling loop may run it at once, so the object must be
+ *  safe to call from several threads, like an internally synchronized store. */
 template <auto member_, typename object_type_>
 concept request_member = requires(object_type_& object, request_t request) {
     { (object.*member_)(std::move(request)) } noexcept;
 };
 
-/** A member function of @p object_type_ handling each batch, called on an object borrowed until the
- *  server is freed. */
+/** A member function of @p object_type_ handling each batch, called on an object the caller keeps
+ *  until the server is freed. */
 template <auto member_, typename object_type_>
 concept batch_member = requires(object_type_& object, batch_t batch) {
     { (object.*member_)(batch) } noexcept;
@@ -640,7 +643,7 @@ class server_t {
     template <typename handler_type_>
     static void handler_trampoline_(ucall_server_t server, ucall_received_http_request_t request,
                                     void* context) noexcept {
-        (*static_cast<handler_type_*>(context))(request_t {server, request});
+        (*static_cast<handler_type_ const*>(context))(request_t {server, request});
     }
 
     template <batch_function_t function_>
@@ -697,7 +700,7 @@ class server_t {
     }
 
   public:
-    /** Starts a server answering on @p interfaces, whose callbacks it borrows until it is freed. */
+    /** Starts a server answering on @p interfaces, whose callbacks it calls until it is freed. */
     template <std::size_t count_>
     static expected<server_t> make(interface_t const (&interfaces)[count_],
                                    server_options_t const& options = {}) noexcept {
@@ -751,6 +754,15 @@ class server_t {
         return {text_view_(interfaces[index].address)};
     }
 
+    /** The NUMA node the kernel ties interface @p index's device to, or -1; init and poll from
+     *  threads there. */
+    expected<std::int32_t> memory_domain(std::size_t index) const noexcept {
+        std::span<ucall_network_interface_t const> const interfaces = resolved_interfaces_();
+        if (index >= interfaces.size())
+            return {{}, status_t {status_code_t::invalid_argument_k, "The server has no such interface"}};
+        return {interfaces[index].memory_domain};
+    }
+
     /**
      *  @brief Routes requests matching @p path and @p verb to the plain function @p function_,
      *      which runs on the polling thread.
@@ -766,7 +778,7 @@ class server_t {
     }
 
     /** Routes like the function overload to the member function @p member_ of @p object, which
-     *  stays borrowed until the server is freed. */
+     *  the caller keeps until the server is freed. */
     template <auto member_, typename object_type_>
         requires request_member<member_, object_type_>
     status_t route(std::string_view path, ucall_verb_t verb, object_type_& object,
@@ -774,8 +786,9 @@ class server_t {
         return routed_(path, verb, delivery, &member_trampoline_<member_, object_type_>, &object);
     }
 
-    /** Routes like the function overload, borrowing a @p handler with state until the server is
-     *  freed. */
+    /** Routes like the function overload to a @p handler with state, which the caller keeps until
+     *  the server is freed. Every polling loop calls it as const; the reference is non-const only
+     *  because the C context is @c void*. */
     template <request_handler handler_type_>
     status_t route(std::string_view path, ucall_verb_t verb, handler_type_& handler,
                    ucall_body_delivery_t delivery = ucall_body_delivery_buffered_k) noexcept {
@@ -789,7 +802,7 @@ class server_t {
         return route<handler_>(path, ucall_verb_get_k, object...);
     }
 
-    /** Routes GET requests on @p path to a borrowed @p handler. */
+    /** Routes GET requests on @p path to a @p handler the caller keeps. */
     template <request_handler handler_type_>
     status_t get(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_get_k, handler);
@@ -801,7 +814,7 @@ class server_t {
         return route<handler_>(path, ucall_verb_post_k, object...);
     }
 
-    /** Routes POST requests on @p path to a borrowed @p handler. */
+    /** Routes POST requests on @p path to a @p handler the caller keeps. */
     template <request_handler handler_type_>
     status_t post(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_post_k, handler);
@@ -813,7 +826,7 @@ class server_t {
         return route<handler_>(path, ucall_verb_put_k, object...);
     }
 
-    /** Routes PUT requests on @p path to a borrowed @p handler. */
+    /** Routes PUT requests on @p path to a @p handler the caller keeps. */
     template <request_handler handler_type_>
     status_t put(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_put_k, handler);
@@ -826,7 +839,7 @@ class server_t {
         return route<handler_>(path, ucall_verb_delete_k, object...);
     }
 
-    /** Routes DELETE requests on @p path to a borrowed @p handler. */
+    /** Routes DELETE requests on @p path to a @p handler the caller keeps. */
     template <request_handler handler_type_>
     status_t delete_(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_delete_k, handler);
@@ -838,7 +851,7 @@ class server_t {
         return route<handler_>(path, ucall_verb_patch_k, object...);
     }
 
-    /** Routes PATCH requests on @p path to a borrowed @p handler. */
+    /** Routes PATCH requests on @p path to a @p handler the caller keeps. */
     template <request_handler handler_type_>
     status_t patch(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_patch_k, handler);
@@ -852,7 +865,7 @@ class server_t {
     }
 
     /** Batches like the function overload into the member function @p member_ of @p object, which
-     *  stays borrowed until the server is freed. */
+     *  the caller keeps until the server is freed. */
     template <auto member_, typename object_type_>
         requires batch_member<member_, object_type_>
     expected<batch_endpoint_t> batch(std::string_view path, ucall_verb_t verb, batching_t const& batching,
@@ -860,8 +873,8 @@ class server_t {
         return batch_routed_(path, verb, batching, &batch_member_trampoline_<member_, object_type_>, &object);
     }
 
-    /** Batches like the function overload, borrowing a @p handler with state until the server is
-     *  freed. */
+    /** Batches like the function overload into a @p handler with state, which the caller keeps
+     *  until the server is freed. */
     template <batch_handler handler_type_>
     expected<batch_endpoint_t> batch(std::string_view path, ucall_verb_t verb, batching_t const& batching,
                                      handler_type_& handler) noexcept {

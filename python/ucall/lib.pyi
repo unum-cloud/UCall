@@ -82,7 +82,7 @@ def version() -> str:
     """
 
 class Status(enum.IntEnum):
-    """The outcome of a verb, which `Error.status` and `Completed.status` carry.
+    """The outcome of a verb, which `Error.status` and `Completed.status` hold.
 
     Example:
       >>> ucall.Status.CONTENDED.name
@@ -321,7 +321,7 @@ class Interface:
       event_loops (int, optional): Loops accepting here; 0 takes one for an address and one per
         receive queue for a device.
       connections (int, optional): Connections open at once. Defaults to 1024.
-      pipelined_requests (int, optional): Requests one connection carries before the server
+      pipelined_requests (int, optional): Requests one connection holds before the server
         stops reading from it; 0 means one.
       max_request_bytes (int, optional): The largest request head and buffered body, past which
         the reply is 413; 0 takes the largest receive buffer the kernel grants a socket.
@@ -377,7 +377,7 @@ class Interface:
         """Connections open at once."""
     @property
     def pipelined_requests(self) -> int:
-        """Requests one connection carries at once; 0 means one."""
+        """Requests one connection holds at once; 0 means one."""
     @property
     def noise_peer_key(self) -> bytes | None:
         """The 32-byte static key KK expects, or None."""
@@ -659,7 +659,7 @@ class Path:
 class Deferred(Awaitable[None]):
     r"""A reply still sending file or path parts, from `reply_parts` or `ReplyStream.end`.
 
-    It owns the reply's outcome and keeps the `File` parts it borrows alive until the outcome is
+    It owns the reply's outcome and keeps the `File` parts it reads alive until the outcome is
     final. `await` it in a coroutine, or call `wait()`; released unfinished, it waits, so keep it
     off the polling thread, as `Request.detach` does.
 
@@ -1055,6 +1055,9 @@ class Server:
     def addresses(self) -> tuple[str, ...]:
         """The resolved "host:port" of each interface."""
     @property
+    def memory_domains(self) -> tuple[int, ...]:
+        """The NUMA node each interface's device is tied to, or -1; init and poll from threads there."""
+    @property
     def batch_endpoints(self) -> tuple[BatchEndpoint, ...]:
         """Batch endpoints, each needing a polling owner."""
     def add_endpoint(
@@ -1398,7 +1401,7 @@ class Response(Buffer):
         run on the client's thread and advance the client while nothing was decoded; a client
         bound to a server advances only as its loop polls, so there a pull finding nothing
         raises `Status.WOULD_BLOCK`, and `async for` yields until it polled. Every streamed
-        response is pulled to its end or released, bodiless ones too, as its connection carries
+        response is pulled to its end or released, bodiless ones too, as its connection holds
         no other call meanwhile; releasing it early closes that connection, failing the calls
         pipelined behind it with `Status.CONNECTION_CLOSED`.
 
@@ -1464,7 +1467,7 @@ class Client:
 
     Args:
       connections (int): Connections open at once, across every server it calls.
-      pipelined_calls (int, optional): Calls one connection carries at once; 0 means one.
+      pipelined_calls (int, optional): Calls one connection holds at once; 0 means one.
       calls (int, optional): Calls accepted at once, retrieved or not; 0 means `connections`
         times `pipelined_calls`.
       connect_timeout_microseconds (int, optional): The budget to connect, in microseconds;
@@ -1484,8 +1487,8 @@ class Client:
       max_response_bytes (int, optional): The largest response a call buffers, past which it
         fails with `Status.OVERFLOW`; 0 takes the largest receive buffer the kernel grants.
       server (Server, optional): A server whose event loop drives this client, sharing its
-        engine: bound before that loop first polls, used on its polling thread, and its
-        `take_completed` only hands out what the loop finished. None gives it its own engine.
+        queue: bound before that loop first polls, used on its polling thread, and its
+        `take_completed` only hands out what the loop finished. None gives it its own queue.
       event_loop (int, optional): Which of `server`'s event loops. Defaults to 0.
 
     Raises:
@@ -1757,7 +1760,7 @@ class Client:
         Args:
           verb (Verb): The method, such as `Verb.POST` or "post".
           url (str | bytes): The full URL, "http://" or "http+noise://" and the server.
-          body (Buffer, optional): Any bytes-like object, borrowed until the call completes.
+          body (Buffer, optional): Any bytes-like object the call keeps alive until it completes.
           headers (Sequence[str | bytes], optional): "name: value" lines; the client adds Host,
             Content-Length and User-Agent itself.
           security (Security, optional): The handshake for this call. Defaults to `Security.NONE`,

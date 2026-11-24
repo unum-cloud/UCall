@@ -177,8 +177,8 @@ type call struct {
 	arguments []byte
 }
 
-// lent is a call and the slot its result lands in, which the library writes in place.
-type lent[Result any] struct {
+// callWithResult is a call and the slot its result lands in, which the library writes in place.
+type callWithResult[Result any] struct {
 	call
 	result *Result
 }
@@ -186,11 +186,11 @@ type lent[Result any] struct {
 // open pins a fresh frame and hands back its argument structure, which a verb fills and passes to
 // C; verbs refuse before opening, so a refusal pins and allocates nothing. The arguments live in
 // the frame because cgo moves to the heap whatever a C function that may call back into Go reaches.
-func open[Arguments, Result any](lent *lent[Result]) *Arguments {
+func open[Arguments, Result any](opened *callWithResult[Result]) *Arguments {
 	frame := new(frame[Arguments, Result])
-	lent.pinner.Pin(frame)
-	lent.slots, lent.result = &frame.slots, &frame.result
-	lent.arguments = unsafe.Slice((*byte)(unsafe.Pointer(&frame.arguments)), unsafe.Sizeof(frame.arguments))
+	opened.pinner.Pin(frame)
+	opened.slots, opened.result = &frame.slots, &frame.result
+	opened.arguments = unsafe.Slice((*byte)(unsafe.Pointer(&frame.arguments)), unsafe.Sizeof(frame.arguments))
 	return &frame.arguments
 }
 
@@ -202,7 +202,7 @@ func (call *call) status() Status {
 	return Status(C.ucall_outcome_status(call.outcome()))
 }
 
-// settle waits until the call is final, releases everything it lent, and reports its failure, the
+// settle waits until the call is final, releases everything it pinned, and reports its failure, the
 // same every time it is asked.
 func (call *call) settle() error {
 	if call.status() == StatusDeferred {
@@ -220,15 +220,15 @@ func (call *call) settle() error {
 }
 
 // block settles the call a verb opened and hands back its result, or the verb's refusal.
-func block[Result any](lent *lent[Result], refusal error) (Result, error) {
+func block[Result any](call *callWithResult[Result], refusal error) (Result, error) {
 	var none Result
 	if refusal != nil {
 		return none, refusal
 	}
-	if err := lent.settle(); err != nil {
+	if err := call.settle(); err != nil {
 		return none, err
 	}
-	return *lent.result, nil
+	return *call.result, nil
 }
 
 // configOf reads a nil config as the zero one, by value, so generic verbs allocate nothing for it.
@@ -242,22 +242,22 @@ func configOf[Config any](config *Config) Config {
 
 // pin keeps a Go object in place until the call is final and hands back its address. It takes no
 // type parameter, since a generic call inlined into a generic verb reaches its callee through a
-// dictionary, and escape analysis then moves the verb's lent to the heap.
+// dictionary, and escape analysis then moves the verb's call to the heap.
 func (call *call) pin(pointer unsafe.Pointer) unsafe.Pointer {
 	call.pinner.Pin(pointer)
 	return pointer
 }
 
-// lend pins the backing array of a slice of length elements at data until the call is final, and
-// lends an empty slice as nil.
-func (call *call) lend(data unsafe.Pointer, length int) unsafe.Pointer {
+// pinArray pins the backing array of a slice of length elements at data until the call is final,
+// and passes an empty slice as nil.
+func (call *call) pinArray(data unsafe.Pointer, length int) unsafe.Pointer {
 	if length == 0 {
 		return nil
 	}
 	return call.pin(data)
 }
 
-// view lends a string to a call that only reads it before returning.
+// view passes a string to a call that only reads it before returning.
 func view(text string) C.ucall_bytes_view_t {
 	view := C.ucall_bytes_view_t{data: (*C.uint8_t)(unsafe.Pointer(unsafe.StringData(text)))}
 	// cgo names the length's typedef apart from size_t, though the two are as wide.
@@ -271,7 +271,7 @@ func view(text string) C.ucall_bytes_view_t {
 // dropped without Wait or Close is released by the collector once the call is final, never
 // blocking on it: until then every later collection checks it again.
 type Deferred[Result any] struct {
-	lent    lent[Result]
+	call    callWithResult[Result]
 	cleanup runtime.Cleanup
 }
 
@@ -281,7 +281,7 @@ func submitted[Result any](deferred *Deferred[Result], refusal error) (*Deferred
 	if refusal != nil {
 		return nil, refusal
 	}
-	deferred.cleanup = runtime.AddCleanup(deferred, release, deferred.lent.call)
+	deferred.cleanup = runtime.AddCleanup(deferred, release, deferred.call.call)
 	return deferred, nil
 }
 
@@ -296,30 +296,30 @@ func release(call call) {
 }
 
 // Status reports StatusDeferred until the call is final, then its final status, without blocking.
-func (deferred *Deferred[Result]) Status() Status { return deferred.lent.status() }
+func (deferred *Deferred[Result]) Status() Status { return deferred.call.status() }
 
 // Wait blocks until the call is final, releases its pins, then hands back its result, the same
 // every time it is asked.
 func (deferred *Deferred[Result]) Wait() (Result, error) {
 	deferred.cleanup.Stop()
-	return block(&deferred.lent, nil)
+	return block(&deferred.call, nil)
 }
 
 // Close blocks until the call is final, releases its pins, and reports the call's failure. It is
 // idempotent and safe after Wait.
 func (deferred *Deferred[Result]) Close() error {
 	deferred.cleanup.Stop()
-	return deferred.lent.settle()
+	return deferred.call.settle()
 }
 
 // endregion: Calls
 
 // region: Helpers
 
-// bytes lends a byte slab as the view the C interface reads, with no terminator and no copy.
+// bytes passes a byte slab as the view the C interface reads, with no terminator and no copy.
 func (call *call) bytes(bytes []byte) C.ucall_bytes_view_t {
 	return C.ucall_bytes_view_t{
-		data:   (*C.ucall_byte_t)(call.lend(unsafe.Pointer(unsafe.SliceData(bytes)), len(bytes))),
+		data:   (*C.ucall_byte_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(bytes)), len(bytes))),
 		length: C.size_t(len(bytes)),
 	}
 }
@@ -336,7 +336,7 @@ func (call *call) text(text string) C.ucall_bytes_view_t {
 	}
 }
 
-// texts lends a run of strings as the array of views a header or directory list takes.
+// texts passes a run of strings as the array of views a header or directory list takes.
 func (call *call) texts(texts []string) (*C.ucall_bytes_view_t, C.size_t) {
 	if len(texts) == 0 {
 		return nil, 0
@@ -345,10 +345,10 @@ func (call *call) texts(texts []string) (*C.ucall_bytes_view_t, C.size_t) {
 	for position, text := range texts {
 		views[position] = call.text(text)
 	}
-	return (*C.ucall_bytes_view_t)(call.lend(unsafe.Pointer(unsafe.SliceData(views)), len(views))), C.size_t(len(views))
+	return (*C.ucall_bytes_view_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(views)), len(views))), C.size_t(len(views))
 }
 
-// viewed borrows bytes the library lent, valid as long as the library says.
+// viewed views bytes the library owns, valid as long as the library says.
 func viewed(view C.ucall_bytes_view_t) []byte {
 	if view.length == 0 {
 		return nil
@@ -361,7 +361,7 @@ func microseconds(duration time.Duration) C.size_t {
 	return C.size_t(duration / time.Microsecond)
 }
 
-// context lends a handle to a C callback as its opaque context, which is no Go pointer.
+// contextOf passes a handle to a C callback as its opaque context, which is no Go pointer.
 func contextOf(handle cgo.Handle) unsafe.Pointer {
 	return C.ucall_go_context(C.uintptr_t(handle))
 }
@@ -471,7 +471,7 @@ const (
 	PercentQuery PercentMode = C.ucall_percent_query_k
 )
 
-// DecodePercent decodes the percent escapes of a path or a query value, which requests lend still
+// DecodePercent decodes the percent escapes of a path or a query value, which requests hold still
 // encoded, into a new slice.
 func DecodePercent(encoded []byte, mode PercentMode) ([]byte, error) {
 	decoded := make([]byte, len(encoded))
@@ -581,31 +581,31 @@ type NoiseKey [32]byte
 // GenerateNoiseKeypair draws a fresh private key and its public key from the operating system's
 // entropy.
 func GenerateNoiseKeypair() (NoiseKey, NoiseKey, error) {
-	var lent lent[[2]NoiseKey]
-	arguments := open[C.ucall_noise_key_generate_t](&lent)
+	var call callWithResult[[2]NoiseKey]
+	arguments := open[C.ucall_noise_key_generate_t](&call)
 	*arguments = C.ucall_noise_key_generate_t{
-		outcome:     lent.outcome(),
-		private_key: (*C.ucall_noise_key_t)(unsafe.Pointer(&lent.result[0])),
-		public_key:  (*C.ucall_noise_key_t)(unsafe.Pointer(&lent.result[1])),
+		outcome:     call.outcome(),
+		private_key: (*C.ucall_noise_key_t)(unsafe.Pointer(&call.result[0])),
+		public_key:  (*C.ucall_noise_key_t)(unsafe.Pointer(&call.result[1])),
 	}
 	C.ucall_noise_key_generate(arguments)
-	keys, err := block(&lent, nil)
+	keys, err := block(&call, nil)
 	return keys[0], keys[1], err
 }
 
 // DeriveNoisePublicKey recovers the public half of a stored private key, which peers compare in
 // their authorizers.
 func DeriveNoisePublicKey(privateKey NoiseKey) (NoiseKey, error) {
-	var lent lent[[2]NoiseKey]
-	arguments := open[C.ucall_noise_key_derive_t](&lent)
-	lent.result[0] = privateKey
+	var call callWithResult[[2]NoiseKey]
+	arguments := open[C.ucall_noise_key_derive_t](&call)
+	call.result[0] = privateKey
 	*arguments = C.ucall_noise_key_derive_t{
-		outcome:     lent.outcome(),
-		private_key: (*C.ucall_noise_key_t)(unsafe.Pointer(&lent.result[0])),
-		public_key:  (*C.ucall_noise_key_t)(unsafe.Pointer(&lent.result[1])),
+		outcome:     call.outcome(),
+		private_key: C.ucall_go_key(unsafe.Pointer(&call.result[0])),
+		public_key:  (*C.ucall_noise_key_t)(unsafe.Pointer(&call.result[1])),
 	}
 	C.ucall_noise_key_derive(arguments)
-	keys, err := block(&lent, nil)
+	keys, err := block(&call, nil)
 	return keys[1], err
 }
 
@@ -621,12 +621,13 @@ func ucallAuthorizes(key unsafe.Pointer, context unsafe.Pointer) C.ucall_status_
 	return C.ucall_status_peer_rejected_k
 }
 
-// key lends an optional key until the call is final.
-func (call *call) key(key *NoiseKey) *C.ucall_noise_key_t {
+// key pins an optional key until the call is final; a field takes it through C.ucall_go_key, as
+// cgo spells a key pointer field differently across platforms.
+func (call *call) key(key *NoiseKey) unsafe.Pointer {
 	if key == nil {
 		return nil
 	}
-	return (*C.ucall_noise_key_t)(call.pin(unsafe.Pointer(key)))
+	return call.pin(unsafe.Pointer(key))
 }
 
 // endregion: Noise Keys

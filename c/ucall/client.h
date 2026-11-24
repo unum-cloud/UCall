@@ -22,7 +22,7 @@ typedef struct ucall_client_options_t {
     /** Required positive budget for simultaneously open connections. */
     size_t max_concurrent_connections;
 
-    /** Calls one connection may carry before the next call opens or waits for another; zero means
+    /** Calls one connection may hold before the next call opens or waits for another; zero means
      *  one. No call follows one that is not idempotent or that asks to close the connection. A
      *  connection lost mid-pipeline retries its unanswered idempotent calls and fails the rest with
      *  @c ucall_status_connection_closed_k. Calls a closing server never read are sent again. */
@@ -65,8 +65,8 @@ typedef struct ucall_client_options_t {
      *  receive buffer the kernel grants a socket. */
     size_t max_response_bytes;
 
-    /** A server whose event loop drives this client, or NULL for a client with its own engine. A
-     *  bound client shares that loop's engine, backend and CPU class, so a @c backend naming
+    /** A server whose event loop drives this client, or NULL for a client with its own queue. A
+     *  bound client shares that loop's queue, backend and CPU class, so a @c backend naming
      *  another or a @c cpu_class_ceiling picking another is an invalid argument; it is made before
      *  the loop's first poll, and is used only on its polling thread, whose take_call advances it;
      *  its take_completed only pops finished calls. @c ucall_server_free() returns without freeing
@@ -310,7 +310,8 @@ typedef struct ucall_client_response_header_t {
     /** The name of the HTTP header to extract (case-insensitive). */
     ucall_bytes_view_t name;
 
-    /** Output for a borrowed view of the header value. */
+    /** Output for a view into the response's bytes holding the header value, valid until the
+     *  response is freed. */
     ucall_bytes_view_t* value;
 
 } ucall_client_response_header_t;
@@ -352,10 +353,12 @@ typedef struct ucall_client_response_field_t {
     /** Which field line, below @c ucall_client_response_fields_count(). */
     size_t index;
 
-    /** Output for a borrowed view of its name, lowercased as the parser keeps every field name. */
+    /** Output for a view into the response's bytes holding its name, lowercased as the parser keeps
+     *  every field name, valid until the response is freed. */
     ucall_bytes_view_t* name;
 
-    /** Output for a borrowed view of its value, without surrounding whitespace. */
+    /** Output for a view into the response's bytes holding its value, without surrounding
+     *  whitespace, valid until the response is freed. */
     ucall_bytes_view_t* value;
 
 } ucall_client_response_field_t;
@@ -382,7 +385,8 @@ typedef struct ucall_client_response_body_t {
     /** The verb's status, listed on the verb. */
     ucall_outcome_t* outcome;
 
-    /** Output for a borrowed view of the body. */
+    /** Output for a view into the response's bytes holding the body, valid until the response is
+     *  freed. */
     ucall_bytes_view_t* body;
 
 } ucall_client_response_body_t;
@@ -412,8 +416,8 @@ typedef struct ucall_client_response_body_chunk_t {
     /** A response of a call submitted with @c ucall_body_delivery_streamed_k. */
     ucall_received_http_response_t response;
 
-    /** Output for a borrowed view of the bytes decoded since the last pull, valid until the next
-     *  pull or the response's free; empty once the body ended. */
+    /** Output for a view into the response's bytes decoded since the last pull, valid until the
+     *  next pull or the response's free; empty once the body ended. */
     ucall_bytes_view_t* data;
 
 } ucall_client_response_body_chunk_t;

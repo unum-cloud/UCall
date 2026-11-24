@@ -3,13 +3,13 @@ if (NOT ucall_x25519_serial_kept_)
     set(ucall_serial_x25519_sources_ "${PROJECT_SOURCE_DIR}/src/crypto_x25519_serial.cpp")
 endif ()
 
-# The library suite: the outcome word, every engine under every admitted CPU class, and the network cells of every
+# The library suite: the outcome word, every queue under every admitted CPU class, and the network cells of every
 # compiled backend, admitted class and security mode, each passing its class through the C interface's ceiling.
 add_executable(
     ucall_test
     main.cpp
     utilities/types.cpp
-    io/posix_engine.cpp
+    io/posix_queue.cpp
     network.cpp
     network/exchanges.cpp
     network/serving.cpp
@@ -20,15 +20,15 @@ add_executable(
     network/loops.cpp
     ${ucall_serial_x25519_sources_}
 )
-# The engines of the kernel facilities this system has.
+# The queues of the kernel facilities this system has.
 if (CMAKE_SYSTEM_NAME MATCHES "^(Linux|Android)$")
-    target_sources(ucall_test PRIVATE io/linux_epollaio_engine.cpp)
+    target_sources(ucall_test PRIVATE io/linux_epollaio_queue.cpp)
 endif ()
 if (UCALL_WITH_LINUX_URING)
-    target_sources(ucall_test PRIVATE io/linux_uring612_engine.cpp io/linux_uring618_engine.cpp)
+    target_sources(ucall_test PRIVATE io/linux_uring612_queue.cpp io/linux_uring618_queue.cpp)
 endif ()
 if (APPLE OR CMAKE_SYSTEM_NAME STREQUAL "FreeBSD")
-    target_sources(ucall_test PRIVATE io/bsd_kqueue_engine.cpp)
+    target_sources(ucall_test PRIVATE io/bsd_kqueue_queue.cpp)
 endif ()
 target_include_directories(
     ucall_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tools"

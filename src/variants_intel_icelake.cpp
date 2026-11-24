@@ -2,7 +2,7 @@
  *  @file src/variants_intel_icelake.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief Intel icelake network variants for every enabled native I/O engine.
+ *  @brief Intel icelake network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

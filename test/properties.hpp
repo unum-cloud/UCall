@@ -28,8 +28,8 @@
 #include "ucall/http/multipart.hpp"       // `split_multipart`, `header_parameter`
 #include "ucall/tunnel/secure_tunnel.hpp" // `secure_tunnel_t`
 #if UCALL_OS_POSIX_
-#include "ucall/io/posix_engine.hpp" // `posix_engine_t`
-#include "ucall/network.hpp"         // `serial_network`
+#include "ucall/io/posix_queue.hpp" // `posix_queue_t`
+#include "ucall/network.hpp"        // `serial_network`
 #endif
 
 namespace uc = unum::ucall;
@@ -235,7 +235,7 @@ inline std::size_t reference_route(std::vector<reference_route_t> const& routes,
     copies.reserve(templates.size() + paths.size());
     std::vector<reference_route_t> routes;
     for (std::size_t index = 0; index != templates.size(); ++index) {
-        // The trie borrows its templates, so each lives in an exact heap copy for as long as it.
+        // The trie points into its templates, so each lives in an exact heap copy as long as it.
         std::string const& route = copies.emplace_back(templates[index]);
         void* const answer = reinterpret_cast<void*>(index + 1);
         if (trie.insert(route, verbs[index], answer) == ucall_status_success_k)
@@ -255,11 +255,10 @@ inline std::size_t reference_route(std::vector<reference_route_t> const& routes,
 #if UCALL_OS_POSIX_
 
 /** The client of the serial network, whose URL parsing and redirect joins need no instance. */
-using property_client_t = uc::network::serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>>::client_t;
+using property_client_t = uc::network::serial_network<uc::io::io_queue_variant<uc::io::posix_queue_t>>::client_t;
 using property_exchange_t =
-    uc::network::serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>>::client_exchange_t;
-using property_message_t =
-    uc::network::serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>>::http_message_t;
+    uc::network::serial_network<uc::io::io_queue_variant<uc::io::posix_queue_t>>::client_exchange_t;
+using property_message_t = uc::network::serial_network<uc::io::io_queue_variant<uc::io::posix_queue_t>>::http_message_t;
 
 /** Parses @p url as a client call would, and when it parses, parses the URL spelled back from its
  *  parts again, counting the parts that differ or break their promises: a target that starts with

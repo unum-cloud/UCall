@@ -108,6 +108,7 @@ struct NetworkInterfaceArguments(ImplicitlyCopyable):
     var listen_descriptor: Optional[Pointer[Int, ImmUntrackedOrigin]]
     var device_name: BytesView[ImmUntrackedOrigin]
     var security: Security
+    var memory_domain: Int32
     var noise_private_key: Optional[Pointer[NoiseKey, ImmUntrackedOrigin]]
     var noise_peer_key: Optional[Pointer[NoiseKey, ImmUntrackedOrigin]]
     var peer_authorizer: Address
@@ -373,7 +374,7 @@ struct ServerReplyEndArguments(ImplicitlyCopyable):
     var request: Pointer[Address, MutUntrackedOrigin]
 
 
-def _lend[T: Copyable](ref value: Optional[T]) -> Optional[Pointer[T, ImmUntrackedOrigin]]:
+def _pointer_in[T: Copyable](ref value: Optional[T]) -> Optional[Pointer[T, ImmUntrackedOrigin]]:
     """The address of an optional value the caller keeps alive, or `None` for the null the ABI takes."""
     if value:
         return Pointer[T, ImmUntrackedOrigin](unsafe_from_address=Int(Pointer(to=value.value())))
@@ -390,7 +391,7 @@ def _array[T: Copyable](ref items: List[T]) -> Optional[Pointer[T, ImmUntrackedO
 def _headers[
     origin: ImmOrigin
 ](headers: Span[BytesView[origin], _]) -> Optional[Pointer[BytesView[ImmUntrackedOrigin], ImmUntrackedOrigin]]:
-    """The header lines as the ABI's array, their borrow erased inside the verb that crosses."""
+    """The header lines as the ABI's array, their origin erased inside the verb that crosses."""
     if len(headers) == 0:
         return None
     return Pointer[BytesView[ImmUntrackedOrigin], ImmUntrackedOrigin](unsafe_from_address=Int(headers.unsafe_ptr()))
@@ -399,7 +400,7 @@ def _headers[
 def _parts[
     origin: ImmOrigin
 ](parts: Span[ReplyPart[origin], _]) -> Optional[Pointer[ReplyPart[ImmUntrackedOrigin], ImmUntrackedOrigin]]:
-    """The reply parts as the ABI's array, their borrow erased inside the verb that crosses."""
+    """The reply parts as the ABI's array, their origin erased inside the verb that crosses."""
     if len(parts) == 0:
         return None
     return Pointer[ReplyPart[ImmUntrackedOrigin], ImmUntrackedOrigin](unsafe_from_address=Int(parts.unsafe_ptr()))
@@ -540,9 +541,9 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
     """
 
     var polls: UInt64
-    """Engine polls the loop issued, each taking zero or more completions."""
+    """Queue polls the loop issued, each taking zero or more completions."""
     var empty_polls: UInt64
-    """Engine polls that took no completion."""
+    """Queue polls that took no completion."""
     var kernel_enters: UInt64
     """System calls: io_uring enters, or other backends' waits, registrations and socket calls."""
     var submissions: UInt64
@@ -552,7 +553,7 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
     var kernel_entries: UInt64
     """Submission and completion entries of io_uring; zero elsewhere."""
     var cancellations: UInt64
-    """Pending operations, or io_uring multishot receives, the engine asked to cancel."""
+    """Pending operations, or io_uring multishot receives, the queue asked to cancel."""
     var accepts: UInt64
     """Connections accepted and handed to this loop."""
     var requests: UInt64
@@ -594,7 +595,7 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
     var shed_connections: UInt64
     """Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under Noise."""
     var windows_unpinned: UInt64
-    """File windows the engine left unpinned, whose sends pin or copy on their own."""
+    """File windows the queue left unpinned, whose sends pin or copy on their own."""
 
     def __init__(out self):
         """Every counter at zero, as a failed read leaves them."""
@@ -740,11 +741,12 @@ struct Server:
             raw.append(
                 NetworkInterfaceArguments(
                     BytesView.of(StringSlice(interface.address)).arguments(),
-                    _lend(interface.listen_descriptor),
+                    _pointer_in(interface.listen_descriptor),
                     BytesView.of(StringSlice(interface.device_name)).arguments(),
                     interface.security,
-                    _lend(interface.noise_private_key),
-                    _lend(interface.noise_peer_key),
+                    Int32(-1),
+                    _pointer_in(interface.noise_private_key),
+                    _pointer_in(interface.noise_peer_key),
                     interface.peer_authorizer.callback,
                     interface.peer_authorizer.context,
                     c_size_t(interface.event_loops),
@@ -833,6 +835,22 @@ struct Server:
             return String(unsafe_from_utf8=address.span[ImmUntrackedOrigin]())
         return None
 
+    def memory_domain(self, index: Int) -> Optional[Int32]:
+        """The NUMA node the kernel ties interface `index`'s device to, or -1. Binding-only.
+
+        Args:
+            index: The interface's position among those the server was started with.
+
+        Returns:
+            The memory domain to init and poll from, or `None` past the last interface.
+        """
+        ref resolved = self.shared[].resolved
+        if index >= Int(resolved.interfaces_count):
+            return None
+        if case .Some(interfaces) = resolved.interfaces:
+            return interfaces[unsafe_offset=index].memory_domain
+        return None
+
     def route[path: StaticString, handler: def(var Request) thin raises -> None](mut self, verb: Verb) raises Error:
         """Routes requests matching `path` and `verb` to `handler`, which runs on the polling thread.
         Calls `ucall_server_add_http_endpoint`.
@@ -916,7 +934,7 @@ struct Server:
 
         Parameters:
             path: The URI template.
-            handler: Receives each due batch, lent for the call.
+            handler: Receives each due batch, valid for the call.
 
         Args:
             verb: The HTTP method, or `Verb.ANY`.
@@ -1067,7 +1085,7 @@ def _batch_trampoline[
 
 
 struct Batch(Sized):
-    """The requests of one due batch, from every event loop, lent to the handler in arrival order.
+    """The requests of one due batch, from every event loop, valid in the handler in arrival order.
 
     Each request is taken at most once; whatever the handler leaves answers 500 once it returns.
     """
@@ -1075,7 +1093,7 @@ struct Batch(Sized):
     var _state: Address
     """The endpoint's `_BatchState`, read for the server and the taken flags."""
     var _requests: Pointer[Address, ImmUntrackedOrigin]
-    """The library's array of retained request handles, borrowed for the call."""
+    """The library's array of retained request handles, valid for the call."""
     var _count: Int
     """Requests in the batch."""
 
@@ -1205,7 +1223,7 @@ struct Peer(ImplicitlyCopyable):
 
 @fieldwise_init
 struct RequestPart[origin: Origin](ImplicitlyCopyable):
-    """One part of a `multipart/form-data` request body, borrowing the received bytes."""
+    """One part of a `multipart/form-data` request body, pointing into the received bytes."""
 
     var name: Span[Byte, Self.origin]
     """The name its `Content-Disposition` gives."""
@@ -1478,7 +1496,7 @@ struct Request(Movable, RequestReads):
     """One received request, owned by its handler on the polling thread.
 
     `reply`, `reply_error` and `detach` consume it; one dropped without them answers 500. Reads
-    borrow the received bytes with the request's origin.
+    point into the received bytes with the request's origin.
     """
 
     var _server: Pointer[Server, ImmUntrackedOrigin]
@@ -1755,7 +1773,7 @@ struct FileRange(ImplicitlyCopyable, TrivialRegisterPassable):
     """A byte range of a regular file the caller opened with `O_DIRECT`, `ucall_file_range_t` in C."""
 
     var file_descriptor: c_int
-    """The open file, borrowed and never closed by UCall, until the reply is final."""
+    """The open file, which the caller owns and UCall never closes, valid until the reply is final."""
     var offset: UInt64
     """The range's first byte."""
     var length: UInt64
@@ -1770,7 +1788,7 @@ struct ReplyPart[origin: ImmOrigin = ImmUntrackedOrigin](ImplicitlyCopyable, Tri
     on the little-endian targets this binding runs on.
 
     Parameters:
-        origin: The bytes or path a part borrows, named so they outlive the reply call.
+        origin: The bytes or path a part points into, named so they outlive the reply call.
     """
 
     var kind: c_int

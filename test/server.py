@@ -46,6 +46,7 @@ def test_typed_handlers_sum_from_the_query_and_a_json_body(backend, loopback):
     try:
         client = ucall.Client(connections=1, backend=backend)
         url = f"http://{server.addresses[0]}/sum"
+        assert server.memory_domains == (-1,)
         response = client.get(f"{url}?a=1&b=2")
         assert (response.status_code, bytes(response.body)) == (200, b"3")
         assert response.header("Content-Type") == "application/json"

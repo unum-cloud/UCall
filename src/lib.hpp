@@ -253,7 +253,7 @@ struct waiter_for_cpu_class<cpu_class_t::monoversioned_k> {
 };
 #endif
 
-/** The spin hints every core of an architecture carries - PAUSE, YIELD, Zihintpause and Power's
+/** The spin hints every core of an architecture supports - PAUSE, YIELD, Zihintpause and Power's
  *  priority nops: the runtime confirms nothing about them. */
 inline constexpr fu::capabilities_t baseline_hints_k = fu::capability_x86_pause_k | fu::capability_arm64_yield_k |
                                                        fu::capability_riscv64_pause_k | fu::capability_ppc64_yield_k;

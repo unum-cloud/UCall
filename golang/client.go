@@ -117,7 +117,7 @@ type Completed struct {
 	Err      error
 }
 
-// admitted is one call slot: the caller's context and the pins on the inputs the library borrows
+// admitted is one call slot: the caller's context and the pins on the inputs the library reads
 // until the call completes.
 type admitted struct {
 	context uint64
@@ -153,15 +153,15 @@ func NewClient(config *ClientOptions) (*Client, error) {
 	if options.Server != nil {
 		bound = options.Server.handle
 	}
-	var lent lent[initialized]
-	arguments := open[C.ucall_client_init_t](&lent)
+	var call callWithResult[initialized]
+	arguments := open[C.ucall_client_init_t](&call)
 	authorize, authorizeContext := authorizer(options.PeerAuthorizer, &client.handles)
-	lent.result.options = C.ucall_client_options_t{
+	call.result.options = C.ucall_client_options_t{
 		max_concurrent_connections:   C.size_t(options.Connections),
 		max_pipelined_calls:          C.size_t(options.PipelinedCalls),
 		connect_timeout_microseconds: microseconds(options.ConnectTimeout),
 		call_timeout_microseconds:    microseconds(options.CallTimeout),
-		noise_private_key:            lent.key(options.NoisePrivateKey),
+		noise_private_key:            C.ucall_go_key(call.key(options.NoisePrivateKey)),
 		peer_authorizer:              authorize,
 		peer_authorizer_context:      authorizeContext,
 		log:                          options.Log.lowered(&client.handles),
@@ -173,13 +173,13 @@ func NewClient(config *ClientOptions) (*Client, error) {
 		event_loop:                   C.size_t(options.EventLoop),
 	}
 	*arguments = C.ucall_client_init_t{
-		client:   &lent.result.client,
-		outcome:  lent.outcome(),
-		options:  &lent.result.options,
-		resolved: &lent.result.resolved,
+		client:   &call.result.client,
+		outcome:  call.outcome(),
+		options:  &call.result.options,
+		resolved: &call.result.resolved,
 	}
 	C.ucall_client_init(arguments)
-	result, err := block(&lent, nil)
+	result, err := block(&call, nil)
 	if err != nil {
 		client.release()
 		return nil, err
@@ -222,9 +222,9 @@ func (client *Client) Close() error {
 	return nil
 }
 
-// admit lends call's inputs into a free slot and submits it, answering the slot it took. A closed
+// admit pins request's inputs in a free slot and submits it, answering the slot it took. A closed
 // client refuses here, before its inputs are pinned for a call C would refuse.
-func (client *Client) admit(call ClientCall, context uint64) (int, error) {
+func (client *Client) admit(request ClientCall, context uint64) (int, error) {
 	if client.handle == nil {
 		return 0, fail(StatusUninitialized, "the client is closed or was never started")
 	}
@@ -236,31 +236,31 @@ func (client *Client) admit(call ClientCall, context uint64) (int, error) {
 	admitted := &client.calls[slot]
 	admitted.context = context
 	inputs := &admitted.inputs
-	headers, headersCount := inputs.texts(call.Headers)
-	options := &call.Options
-	var lent lent[struct{}]
-	arguments := open[C.ucall_client_call_t](&lent)
+	headers, headersCount := inputs.texts(request.Headers)
+	options := &request.Options
+	var call callWithResult[struct{}]
+	arguments := open[C.ucall_client_call_t](&call)
 	*arguments = C.ucall_client_call_t{
 		client:        client.handle,
-		outcome:       lent.outcome(),
-		url:           inputs.text(call.URL),
-		verb:          C.ucall_verb_t(call.Verb),
+		outcome:       call.outcome(),
+		url:           inputs.text(request.URL),
+		verb:          C.ucall_verb_t(request.Verb),
 		headers:       headers,
 		headers_count: headersCount,
-		body:          inputs.bytes(call.Body),
+		body:          inputs.bytes(request.Body),
 		options: C.ucall_client_call_options_t{
 			timeout_microseconds: microseconds(options.Timeout),
 			max_retries:          C.size_t(options.MaxRetries),
 			max_redirects:        C.size_t(options.MaxRedirects),
 			security:             C.ucall_security_t(options.Security),
-			noise_private_key:    inputs.key(options.NoisePrivateKey),
-			noise_peer_key:       inputs.key(options.NoisePeerKey),
+			noise_private_key:    C.ucall_go_key(inputs.key(options.NoisePrivateKey)),
+			noise_peer_key:       C.ucall_go_key(inputs.key(options.NoisePeerKey)),
 			body_delivery:        C.ucall_body_delivery_t(options.BodyDelivery),
 		},
 		context: C.ucall_go_context(C.uintptr_t(slot)),
 	}
 	C.ucall_client_call(arguments)
-	if _, err := block(&lent, nil); err != nil {
+	if _, err := block(&call, nil); err != nil {
 		admitted.inputs.pinner.Unpin()
 		client.free = append(client.free, slot)
 		return 0, err
@@ -277,18 +277,18 @@ func (client *Client) Submit(call ClientCall, context uint64) error {
 
 // retrieve drives the client and takes up to capacity completions into the table.
 func (client *Client) retrieve(capacity int, timeout time.Duration) (int, error) {
-	var lent lent[C.size_t]
-	arguments := open[C.ucall_client_take_completed_t](&lent)
+	var call callWithResult[C.size_t]
+	arguments := open[C.ucall_client_take_completed_t](&call)
 	*arguments = C.ucall_client_take_completed_t{
 		client:               client.handle,
-		outcome:              lent.outcome(),
+		outcome:              call.outcome(),
 		calls:                unsafe.SliceData(client.retrieved),
 		capacity:             C.size_t(min(capacity, len(client.retrieved))),
-		count:                lent.result,
+		count:                call.result,
 		timeout_microseconds: microseconds(timeout),
 	}
 	C.ucall_client_take_completed(arguments)
-	count, err := block(&lent, nil)
+	count, err := block(&call, nil)
 	return int(count), err
 }
 
@@ -321,20 +321,20 @@ func (client *Client) TakeCompleted(completed []Completed, timeout time.Duration
 	return completed[:count], nil
 }
 
-// Call submits call and polls until it finishes, leaving the completions of other calls queued for
-// TakeCompleted. The response arrives whatever its HTTP status; a failed exchange answers its
+// Call submits request and polls until it finishes, leaving the completions of other calls queued
+// for TakeCompleted. The response arrives whatever its HTTP status; a failed exchange answers its
 // error.
-func (client *Client) Call(call ClientCall) (*Response, error) {
-	slot, err := client.admit(call, 0)
+func (client *Client) Call(request ClientCall) (*Response, error) {
+	slot, err := client.admit(request, 0)
 	if err != nil {
 		return nil, err
 	}
-	var lent lent[C.ucall_completed_call_t]
-	arguments := open[C.ucall_client_take_completed_call_t](&lent)
+	var call callWithResult[C.ucall_completed_call_t]
+	arguments := open[C.ucall_client_take_completed_call_t](&call)
 	*arguments = C.ucall_client_take_completed_call_t{
-		client: client.handle, outcome: lent.outcome(), context: C.ucall_go_context(C.uintptr_t(slot)), call: lent.result}
+		client: client.handle, outcome: call.outcome(), context: C.ucall_go_context(C.uintptr_t(slot)), call: call.result}
 	C.ucall_client_take_completed_call(arguments)
-	taken, err := block(&lent, nil)
+	taken, err := block(&call, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -387,7 +387,7 @@ func newResponse(client C.ucall_client_t, handle C.ucall_received_http_response_
 
 func freeResponse(handle C.ucall_received_http_response_t) { C.ucall_client_response_free(handle) }
 
-// Close frees the response, ending every slice it lent. It is idempotent.
+// Close frees the response, ending every slice viewing it. It is idempotent.
 func (response *Response) Close() error {
 	if response.handle == nil {
 		return nil
@@ -406,24 +406,24 @@ func (response *Response) StatusCode() HTTPStatus {
 // Body is the body, decoded from chunked framing if it arrived that way, valid until Close; a
 // streamed call refuses it, as BodyChunk pulls its body.
 func (response *Response) Body() ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_client_response_body_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_client_response_body_t](&call)
 	*arguments = C.ucall_client_response_body_t{
-		response: response.handle, outcome: lent.outcome(), body: lent.result}
+		response: response.handle, outcome: call.outcome(), body: call.result}
 	C.ucall_client_response_body(arguments)
-	body, err := block(&lent, nil)
+	body, err := block(&call, nil)
 	return viewed(body), err
 }
 
 // Header is the value of header name, matched case-insensitively, failing with StatusNotFound
 // without one.
 func (response *Response) Header(name string) ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_client_response_header_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_client_response_header_t](&call)
 	*arguments = C.ucall_client_response_header_t{
-		response: response.handle, outcome: lent.outcome(), name: lent.text(name), value: lent.result}
+		response: response.handle, outcome: call.outcome(), name: call.text(name), value: call.result}
 	C.ucall_client_response_header(arguments)
-	value, err := block(&lent, nil)
+	value, err := block(&call, nil)
 	return viewed(value), err
 }
 
@@ -432,13 +432,13 @@ func (response *Response) Fields() iter.Seq2[[]byte, []byte] {
 	return func(yield func(name, value []byte) bool) {
 		count := C.ucall_client_response_fields_count(response.handle)
 		for index := C.size_t(0); index < count; index++ {
-			var lent lent[[2]C.ucall_bytes_view_t]
-			arguments := open[C.ucall_client_response_field_t](&lent)
+			var call callWithResult[[2]C.ucall_bytes_view_t]
+			arguments := open[C.ucall_client_response_field_t](&call)
 			*arguments = C.ucall_client_response_field_t{
-				response: response.handle, outcome: lent.outcome(), index: index,
-				name: &lent.result[0], value: &lent.result[1]}
+				response: response.handle, outcome: call.outcome(), index: index,
+				name: &call.result[0], value: &call.result[1]}
 			C.ucall_client_response_field(arguments)
-			field, err := block(&lent, nil)
+			field, err := block(&call, nil)
 			if err != nil || !yield(viewed(field[0]), viewed(field[1])) {
 				return
 			}
@@ -450,12 +450,12 @@ func (response *Response) Fields() iter.Seq2[[]byte, []byte] {
 // next pull, empty once the body ended. Pulls never wait: with nothing decoded yet it fails with
 // StatusWouldBlock, and polling the client with TakeCompleted moves the next bytes in.
 func (response *Response) BodyChunk() ([]byte, error) {
-	var lent lent[C.ucall_bytes_view_t]
-	arguments := open[C.ucall_client_response_body_chunk_t](&lent)
+	var call callWithResult[C.ucall_bytes_view_t]
+	arguments := open[C.ucall_client_response_body_chunk_t](&call)
 	*arguments = C.ucall_client_response_body_chunk_t{
-		client: response.client, outcome: lent.outcome(), response: response.handle, data: lent.result}
+		client: response.client, outcome: call.outcome(), response: response.handle, data: call.result}
 	C.ucall_client_response_body_chunk(arguments)
-	chunk, err := block(&lent, nil)
+	chunk, err := block(&call, nil)
 	return viewed(chunk), err
 }
 

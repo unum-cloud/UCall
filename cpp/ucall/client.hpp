@@ -93,7 +93,7 @@ struct client_call_options_t {
     ucall_body_delivery_t body_delivery = ucall_body_delivery_buffered_k;
 };
 
-/** One call to submit, whose URL, header lines and body stay borrowed until it completes. */
+/** One call to submit, whose URL, header lines and body the caller keeps until it completes. */
 struct client_call_t {
 
     /** The HTTP method. */
@@ -274,7 +274,7 @@ class completed_view_t {
 /**
  *  @brief An HTTP client, made, submitted to, polled and destroyed by one owner at a time.
  *
- *  It owns its handle alone: completions land in storage the caller lends, and a blocking call
+ *  It owns its handle alone: completions land in storage the caller passes, and a blocking call
  *  takes its own completion out of the library, leaving the others queued there.
  */
 class client_t {

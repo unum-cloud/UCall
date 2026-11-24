@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/io/posix_engine.hpp
+ *  @file include/ucall/io/posix_queue.hpp
  *  @author Ash Vardanian
  *  @date January 13, 2025
  *  @brief Nonblocking POSIX syscalls completed through poll readiness.
@@ -163,10 +163,10 @@ struct poll_readiness {
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
-struct posix_engine {
+struct posix_queue {
     using allocator_t = allocator_type_;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = posix_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
+    using rebind = posix_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_posix_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
@@ -174,7 +174,7 @@ struct posix_engine {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     struct operation_t {
 
-        /** The request the record carries, or null while it is free. */
+        /** The request the record holds, or null while it is free. */
         io_request_t* request {};
 
         /** The next record on the free, fresh, ready or landed list holding this one. */
@@ -197,14 +197,14 @@ struct posix_engine {
         /** Always zero, as nothing lands here; the shared readiness collect names it. */
         descriptor_t result {};
     };
-    explicit posix_engine(allocator_t const& allocator = {}) noexcept
+    explicit posix_queue(allocator_t const& allocator = {}) noexcept
         : operations(rebound_allocator<operation_t> {allocator}), cold(rebound_allocator<operation_cold_t> {allocator}),
           timed(rebound_allocator<unsigned> {allocator}), readiness(allocator) {}
-    posix_engine(posix_engine const&) = delete;
-    posix_engine& operator=(posix_engine const&) = delete;
-    posix_engine(posix_engine&&) = delete;
-    posix_engine& operator=(posix_engine&&) = delete;
-    ~posix_engine() noexcept { stop(); }
+    posix_queue(posix_queue const&) = delete;
+    posix_queue& operator=(posix_queue const&) = delete;
+    posix_queue(posix_queue&&) = delete;
+    posix_queue& operator=(posix_queue&&) = delete;
+    ~posix_queue() noexcept { stop(); }
 
     /** Records indexed by @c operation_index, each free or carrying one submitted request. */
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
@@ -237,7 +237,7 @@ struct posix_engine {
      *  out; zero otherwise. */
     int fault {};
 
-    /** The counters the engine advances for its polling owner. */
+    /** The counters the queue advances for its polling owner. */
     io_statistics_t statistics {};
     operation_list_t& free_list(unsigned) noexcept { return free_operations; }
     operation_cold_t& cold_fields(unsigned index) noexcept { return cold[index]; }
@@ -310,7 +310,7 @@ struct posix_engine {
     }
 };
 
-using posix_engine_t = posix_engine<>;
+using posix_queue_t = posix_queue<>;
 
 } // namespace unum::ucall::io
 

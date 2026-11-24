@@ -29,7 +29,7 @@ A `pass` line is the header's own choice, and every `fail` or `stuck` line flips
 - A reused exchange keeps its listed bit and resets its stage, or a late listing queues one link twice and recycles a free exchange again: [`replied_queue.pml`](replied_queue.pml).
 - `detach` sets the detached bit with a release and a claimer loads the state with an acquire, or the claimer misses that its connection left: [`claims.pml`](claims.pml), [`claims.cpp`](claims.cpp).
 - A batch owner reads the ring's tail once more after announcing sleep, or a deposit that found it awake is never taken: [`batch_ring.pml`](batch_ring.pml).
-- The tail add, not the slot store, carries a deposited request to the owner, which waits on a claimed slot until its store lands: [`batch_ring.pml`](batch_ring.pml).
+- The tail add, not the slot store, delivers a deposited request to the owner, which waits on a claimed slot until its store lands: [`batch_ring.pml`](batch_ring.pml).
 - A free pushes its response before subtracting the pool's count, or the client drains a pool the freer still writes: [`response_pool.pml`](response_pool.pml).
 - With three responses out, a relaxed push leaks one, so the push releases: [`response_pool.pml`](response_pool.pml).
 - The owner of a bound client only stores its binding word, and the loop alone fails and deletes its connections: [`client_binding.pml`](client_binding.pml).

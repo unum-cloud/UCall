@@ -114,7 +114,7 @@ allocated_ptr<value_type_, allocator_type_> allocate_unique(allocator_type_ cons
  *      ladder's one closing @c >::type, with no nested @c std::conditional_t pile.
  *
  *  Every kit states its own needs: @c capability_k, the capability it runs under, and
- *  @c compiled_k, whether this build carries its body. A kit whose target this build cannot carry
+ *  @c compiled_k, whether this build includes its body. A kit whose target this build lacks
  *  is a stub of those two members alone, so naming it in a ladder never needs its body.
  */
 template <auto caps_, typename floor_, typename... kits_>
@@ -158,18 +158,18 @@ static_assert(sizeof(native_file_t) == sizeof(descriptor_t), "a file open comple
 template <typename element_type_, std::size_t extent_ = std::dynamic_extent>
 using span = std::span<element_type_, extent_>;
 
-/** The C view of @p text, borrowing its bytes. */
+/** The C view of @p text, pointing into its bytes, which the view does not own. */
 inline ucall_bytes_view_t bytes_view(std::string_view text) noexcept {
     return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
 }
 
-/** The text a C view holds, borrowing its bytes; empty for a null view. */
+/** The text a C view holds, pointing into its bytes; empty for a null view. */
 inline std::string_view text_view(ucall_bytes_view_t bytes) noexcept {
     return bytes.length ? std::string_view {reinterpret_cast<char const*>(bytes.data), bytes.length}
                         : std::string_view {};
 }
 
-/** The text @p bytes spell, borrowing them. */
+/** The text @p bytes spell, pointing into them. */
 inline std::string_view text_view(span<byte_t const> bytes) noexcept {
     return {reinterpret_cast<char const*>(bytes.data()), bytes.size()};
 }
@@ -199,7 +199,7 @@ span<element_type_> elements_of(span<byte_t> bytes) noexcept {
     return {reinterpret_cast<element_type_*>(bytes.data()), bytes.size() / sizeof(element_type_)};
 }
 
-/** The bytes of @p text, as engines and tunnels take their input. */
+/** The bytes of @p text, as queues and tunnels take their input. */
 inline span<byte_t const> byte_span(std::string_view text) noexcept { return std::as_bytes(std::span {text}); }
 
 } // namespace unum::ucall::utilities

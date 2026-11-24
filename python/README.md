@@ -35,13 +35,14 @@ runner.join()
 assert bytes(response.body) == b"Hello, world"
 ```
 
-`run` serves the one event loop on the thread the application lent it, the client blocks in `get` until its response arrives, and `stop` releases the serving thread.
+`run` serves the one event loop on the thread the application runs it on, the client blocks in `get` until its response arrives, and `stop` releases the serving thread.
 
 ## Serving
 
 `ucall.Server` takes the interfaces to answer on, and `backend` and `cpu_class_ceiling` keywords naming a `ucall.Backend` and a `ucall.CPUClass`, by member or by name such as "linux-epollaio".
 The ceiling caps the CPU class rather than demanding it: the newest compiled class fitting both it and the machine runs, and `server.cpu_class_ceiling` reports that class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
+`server.memory_domains` reports the NUMA node the kernel ties each interface's device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
 It admits 1024 connections by default, evicting the idle keep-alive connection that progressed least recently for a new peer, and reads one request per connection at a time unless `pipelined_requests` allows more, while replies still leave in request order.
 `max_request_bytes=` answers 413 past its size, `reply_directories=` names the directories a `ucall.Path` part resolves beneath, and `descriptor=` takes a listening socket that systemd or a supervisor opened in place of an address, which the server never closes.
 Without interfaces the server answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545", and port zero binds a free port, which `server.addresses` reports.
@@ -249,7 +250,7 @@ The queue holds as many requests as the interfaces admit at once, connections ti
 ## Calling
 
 A `Client` submits calls without driving the network, and polls to drive them and collect what finished.
-It holds up to `connections` connections, reusing them across calls, and carries up to `pipelined_calls` calls on each.
+It holds up to `connections` connections, reusing them across calls, and pipelines up to `pipelined_calls` calls on each.
 
 ```python
 import threading
@@ -289,10 +290,10 @@ server.stop()
 runner.join()
 ```
 
-`submit(verb, url, body, headers, security=..., noise_peer_key=..., context=...)` borrows its URL, header lines, body and key until the call completes, and tags it with any `context` object.
+`submit(verb, url, body, headers, security=..., noise_peer_key=..., context=...)` reads its URL, header lines, body and key until the call completes, and keeps them alive, and tags it with any `context` object.
 A call admitted once completes exactly once, and a client already holding `calls` unretrieved calls refuses more with `ucall.Error` and `Status.CONTENDED`; `calls` defaults to `connections` times `pipelined_calls`.
 `take_completed(timeout_microseconds, capacity)` drives every admitted call and returns up to `capacity` finished ones as `Completed` objects, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
-A `Completed` carries the `context`, the final `status`, a `message` on failure, and the `response`, None on failure.
+A `Completed` holds the `context`, the final `status`, a `message` on failure, and the `response`, None on failure.
 
 `request`, `get`, `post`, `put`, `delete` and `patch` submit one call and poll until it finishes, keeping the completions of other calls they retrieve meanwhile for the next `take_completed`, which hands those out first.
 They take `json=` to send a value as JSON with its content type, and raise `ucall.Error` when the exchange fails.
@@ -319,7 +320,7 @@ A call with `body_delivery=ucall.BodyDelivery.STREAMED`, on `submit`, `request` 
 Each chunk is a `memoryview` valid until the next pull, which releases it, and the bytes decoded before a failure come out before the failure is raised.
 Pulls run on the client's thread and never wait in the library: `for` advances the client while nothing was decoded, and `async for` advances it between the loop's other tasks, as `await deferred` polls.
 A client bound to a server advances only as that server's loop polls, so there `for` raises `Status.WOULD_BLOCK` and `async for` yields until the loop polled.
-Every streamed response is pulled to its end or released, bodiless ones too, as its connection carries no other call meanwhile; releasing it early closes that connection and fails the calls pipelined behind it with `Status.CONNECTION_CLOSED`.
+Every streamed response is pulled to its end or released, bodiless ones too, as its connection holds no other call meanwhile; releasing it early closes that connection and fails the calls pipelined behind it with `Status.CONNECTION_CLOSED`.
 Redirects stay buffered so they can be followed, and only the final response streams.
 
 ## Noise Keys

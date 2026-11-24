@@ -3,7 +3,7 @@
  *  @author Ash Vardanian
  *  @date November 16, 2026
  *  @brief File reads through POSIX AIO, whose landing the poll thread checks between waits, for a
- *      readiness engine whose kernel queue can't report AIO completions, as macOS kqueue can't.
+ *      readiness queue whose kernel queue can't report AIO completions, as macOS kqueue can't.
  *
  *  A single read is one @c aio_read; a vectored read is one @c lio_listio batch of @c aio_read
  *  control blocks, one per vector, chunked by the batch limit. Nothing is notified: the owner
@@ -46,10 +46,10 @@ inline constexpr unsigned aio_absent_k = ~0u;
 inline constexpr std::uint64_t aio_backoff_floor_ns_k = 1'000, aio_backoff_ceiling_ns_k = 1'000'000;
 
 /**
- *  @brief A pool of AIO control blocks, each owned by one engine operation while its read is in
+ *  @brief A pool of AIO control blocks, each owned by one queue operation while its read is in
  *      flight; an operation's vectored read links several blocks, landing once the last lands.
  *
- *  Every call runs on the engine's polling thread. The pool never allocates after @c reserve.
+ *  Every call runs on the queue's polling thread. The pool never allocates after @c reserve.
  */
 template <typename allocator_type_ = st::default_allocator<byte_t>>
 struct polled_file_reads {
@@ -85,13 +85,13 @@ struct polled_file_reads {
     /** The blocks in flight, which every reap walks. */
     st::vector<unsigned, rebound_allocator<unsigned>> flying {};
 
-    /** One per engine operation, indexed as the engine indexes them. */
+    /** One per queue operation, indexed as the queue indexes them. */
     st::vector<read_t, rebound_allocator<read_t>> reads {};
 
     /** How long the owner's next wait may last while reads are in flight. */
     std::uint64_t backoff_ns {aio_backoff_floor_ns_k};
 
-    /** Sizes the pool for @p operations, one block each, as vectored reads borrow the idle ones. */
+    /** Sizes the pool for @p operations, one block each, as vectored reads use the idle ones. */
     ucall_status_t reserve(std::size_t operations) noexcept {
         if (st::failed(blocks.resize(operations)) || st::failed(free_blocks.reserve(operations)) ||
             st::failed(flying.reserve(operations)) || st::failed(reads.resize(operations)))

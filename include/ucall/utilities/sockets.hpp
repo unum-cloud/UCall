@@ -304,6 +304,22 @@ inline std::size_t receive_queues_count([[maybe_unused]] std::string_view device
 #endif // UCALL_OS_LINUX_
 }
 
+/** The NUMA node the kernel ties the network device @p device_name to, or -1 when it names no
+ *  device or the platform reports none; other systems have no such file, so the open fails. */
+inline std::int32_t device_memory_domain(std::string_view device_name) noexcept {
+    char path[256];
+    if (device_name.empty() || std::memchr(device_name.data(), '/', device_name.size()) ||
+        std::snprintf(path, sizeof(path), "/sys/class/net/%.*s/device/numa_node", static_cast<int>(device_name.size()),
+                      device_name.data()) >= static_cast<int>(sizeof(path)))
+        return -1;
+    std::FILE* file = std::fopen(path, "r");
+    if (!file) return -1;
+    int domain = -1;
+    if (std::fscanf(file, "%d", &domain) != 1 || domain < 0) domain = -1;
+    std::fclose(file);
+    return static_cast<std::int32_t>(domain);
+}
+
 /** Whether @p descriptor listens for connections; Darwin answers only through @c proc_pidfdinfo, as
  *  its @c getsockopt refuses @c SO_ACCEPTCONN with @c ENOPROTOOPT. */
 inline bool socket_listening(descriptor_t descriptor) noexcept {
@@ -460,8 +476,8 @@ inline file_geometry_t direct_alignment_of(native_file_t file) noexcept {
             file_portable_alignment_k, 0};
 }
 
-/** Checks that the borrowed @p file reads a disk file. The loop reads it through a handle it
- *  reopens once beneath @p file with an empty name, since only its engine binds to its port. */
+/** Checks that the caller-owned @p file reads a disk file. The loop reads it through a handle it
+ *  reopens once beneath @p file with an empty name, since only its queue binds to its port. */
 inline ucall_status_t file_direct_switch(native_file_t& file) noexcept {
     return GetFileType(file) == FILE_TYPE_DISK ? ucall_status_success_k : ucall_status_invalid_argument_k;
 }
@@ -544,8 +560,8 @@ inline file_geometry_t direct_alignment_of(native_file_t file) noexcept {
 
 #if UCALL_OS_APPLE_
 
-/** Adopts the borrowed @p file for uncached reads; the switch is shared with the caller's open file
- *  description, and Darwin names no flag to read it back by. */
+/** Adopts the caller-owned @p file for uncached reads; the switch is shared with the caller's open
+ *  file description, and Darwin names no flag to read it back by. */
 inline ucall_status_t file_direct_switch(native_file_t& file) noexcept {
     return fcntl(file, F_NOCACHE, 1) == 0 ? ucall_status_success_k : ucall_status_invalid_argument_k;
 }
@@ -566,7 +582,7 @@ inline native_file_t open_native_file_finish(native_file_t file) noexcept {
 
 #else
 
-/** Adopts the borrowed @p file for unbuffered, blocking reads; the switch is shared with the
+/** Adopts the caller-owned @p file for unbuffered, blocking reads; the switch is shared with the
  *  caller's open file description, and a no-op once switched. */
 inline ucall_status_t file_direct_switch(native_file_t& file) noexcept {
     int const flags = fcntl(file, F_GETFL);

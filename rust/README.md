@@ -36,13 +36,14 @@ std::thread::scope(|scope| {
 })?;
 ```
 
-The server borrows `greet` until it is freed, the polling thread runs it, the client blocks in `get` until its response arrives, and `stop` releases the polling thread so the scope can end.
+The server refers to `greet` until it is freed, the polling thread runs it, the client blocks in `get` until its response arrives, and `stop` releases the polling thread so the scope can end.
 
 ## Serving
 
 `Server::new` takes the interfaces to answer on, and `Server::with_options` also takes `ServerOptions`: the `Backend`, an optional `CPUClass` ceiling that caps the picked class rather than demanding one the machine lacks, a `Log` sink and a StatsD endpoint in `Metrics`.
 It fails rather than substituting when the backend is unavailable or the CPU does not run the class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
+`Server::memory_domain` reports the NUMA node the kernel ties an interface's device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
 `max_request_bytes` caps a request's head and buffered body, answering 413 past it, and `reply_directories` names the directories path replies resolve beneath.
 `Interface::listening` accepts on a listener another owner opened, a `TcpListener`, a `UnixListener` or one systemd passed in, instead of binding an address, and never closes it.
@@ -77,23 +78,23 @@ server.route("/anything", Verb::Any, &refuse)?;
 ```
 
 Endpoints register through `&mut Server` before any loop is polled, with `route` taking any `Verb` and `get`, `post`, `put`, `delete` and `patch` naming one.
-A `Server<'server>` borrows every handler, authorizer and log handler it is given until it is freed, so they are declared before it, and each crosses to the library as a callback monomorphized for its type with nothing boxed.
+A `Server<'server>` refers to every handler, authorizer and log handler it is given until it is freed, so they are declared before it, and each crosses to the library as a callback monomorphized for its type with nothing boxed.
 Templates capture `{name}` segments and a greedy `{*name}` tail, literal segments match before captures, and registering one template and verb twice fails with `Status::AlreadyExists`.
 Routing is exact: an empty segment is a segment, so `/users` and `/users/` are different paths.
 A path no endpoint matches answers 404, one whose endpoints take other verbs answers 405 with an `allow` header, a GET endpoint also serves HEAD, and `OPTIONS` answers 204 with the same `allow` list.
 A request that cannot be parsed answers 400, 413 or 501 before reaching any handler.
 
-Log lines reach the callback on whichever thread produced them, and StatsD datagrams carry each loop's counters and sampled request latencies, every second unless `Metrics::interval` says otherwise.
+Log lines reach the callback on whichever thread produced them, and StatsD datagrams report each loop's counters and sampled request latencies, every second unless `Metrics::interval` says otherwise.
 `Server::event_loop_statistics` copies one loop's counters, from any thread while the loop runs: polls, system calls, submissions and completions, accepted connections, requests, and the bytes received, sent and copied.
 Divided by `requests`, they price one call.
 
 ## Requests
 
 A handler receives each `Request` by value.
-Its reads borrow the received bytes: `verb`, `path`, `query_string`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on, the client's authenticated Noise key and its `PeerAddress`: `Ip` with the port and IPv6 scope, `Unix`, or `Unknown`.
+Its reads point into the received bytes, valid until the reply: `verb`, `path`, `query_string`, `path_parameter`, `query`, `header` and `body`, with `peer` naming the interface it arrived on, the client's authenticated Noise key and its `PeerAddress`: `Ip` with the port and IPv6 scope, `Unix`, or `Unknown`.
 The path and query values stay percent-encoded as sent, which `ucall::decode_percent` decodes, header names match case-insensitively, and the body arrives whole, decoded from chunked framing if it was sent that way.
 `fields` iterates every header field in arrival order as `(name, value)`, names lowercased and values trimmed, as a proxy forwards a head.
-`path_segments_count` and `path_segment` read the path component by component, and `parts_count` and `part` read a `multipart/form-data` body as `RequestPart`s, each borrowing its name, content type and payload.
+`path_segments_count` and `path_segment` read the path component by component, and `parts_count` and `part` read a `multipart/form-data` body as `RequestPart`s, each pointing into the request for its name, content type and payload.
 
 ```rust
 use ucall::*;
@@ -128,7 +129,7 @@ Handlers run on the polling thread, so a reply or a pull that finishes later run
 | `body_chunk()`                              | the bytes decoded since the last pull                | an empty chunk once the body ended |
 | `next_body_chunk()`                         | a `BodyChunk` future of the same bytes               | an empty chunk once the body ended |
 
-A reply that may finish after it returns takes `into`, a `Deferred` slot the caller pins and lends, so the library writes its outcome in the caller's memory and nothing is allocated.
+A reply that may finish after it returns takes `into`, a `Deferred` slot the caller pins, so the library writes its outcome in the caller's memory and nothing is allocated.
 A slot is reused for the next reply, waiting first only while its previous one still sends.
 
 ### Serving a File
@@ -157,10 +158,10 @@ std::thread::scope(|scope| {
 });
 ```
 
-`reply_parts` concatenates `ReplyPart::bytes`, `ReplyPart::path` and `ReplyPart::file` parts into one body whose Content-Length is measured from the files, and `ReplyPart::from` turns a borrowed `std::io::IoSlice` into a bytes part.
-A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and a `File` borrows the caller's `O_DIRECT` descriptor for the slot's lifetime, while bytes and paths are copied before the call returns.
+`reply_parts` concatenates `ReplyPart::bytes`, `ReplyPart::path` and `ReplyPart::file` parts into one body whose Content-Length is measured from the files, and `ReplyPart::from` turns a `std::io::IoSlice` into a bytes part that points into the slice.
+A `Path` resolves beneath the interface's `reply_directories`, refusing absolute paths, `..` and links leading out, and a `File` names the caller's `O_DIRECT` descriptor for the slot's lifetime, while bytes and paths are copied before the call returns.
 A missing, unreadable or too short file replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
-`Deferred::status` polls, `Deferred::wait` blocks, `.await` on the pinned slot polls between other tasks, yielding to the executor until the reply is final, and dropping a `Deferred` waits for it, which is why only a detached request lends one.
+`Deferred::status` polls, `Deferred::wait` blocks, `.await` on the pinned slot polls between other tasks, yielding to the executor until the reply is final, and dropping a `Deferred` waits for it, which is why only a detached request takes one.
 
 ### Streaming a Reply
 
@@ -242,7 +243,7 @@ std::thread::scope(|scope| {
 
 `Batching` dispatches as soon as `min_size` requests wait, never more than `max_size` at once, and a smaller batch once its oldest request waited `max_latency`; zero fields mean 1, 32 and 10 milliseconds.
 The handler runs on the thread polling the endpoint through `take_batch` or `take_batches`, never on an event loop, so a slow batch never stalls the network.
-A `Batch` lends its requests in arrival order: `get` and `iter` borrow them, `take` moves one out, and iterating it by value takes them all, forwards or reversed.
+A `Batch` holds its requests in arrival order: `get` and `iter` hand out references valid while the batch lives, `take` moves one out, and iterating it by value takes them all, forwards or reversed.
 Requests the handler neither replies to nor keeps answer 500 once it returns, and a handler that panics aborts the process.
 Taken requests may be replied to later, from any thread, while their responses still leave each connection in request order.
 
@@ -253,7 +254,7 @@ The queue holds as many requests as the interfaces admit at once, connections ti
 ## Calling
 
 A `Client` submits calls without driving the network, and polls to drive them and collect what finished.
-It holds up to `connections` connections, reusing them across calls, and carries up to `pipelined_calls` calls on each.
+It holds up to `connections` connections, reusing them across calls, and pipelines up to `pipelined_calls` calls on each.
 
 ```rust
 use std::time::Duration;
@@ -285,7 +286,7 @@ println!("{:?} {:?}", response.body(), keep);
 A call admitted once completes exactly once, and a client already holding `calls` unretrieved calls refuses more with `Status::Contended`.
 `take_completed` drives every admitted call and fills a caller-provided buffer with finished ones, waiting up to its timeout for the first, and a zero timeout performs one nonblocking round.
 `get`, `post`, `put`, `delete`, `patch` and `call` submit one call and wait for it alone, while the library keeps the completions of other calls queued for the next `take_completed`.
-`ClientCall::options` carries the call's own `ClientCallOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
+`ClientCall::options` holds the call's own `ClientCallOptions`: a timeout in place of the client's, retries, redirect hops, security, and the client and server keys.
 
 `ClientOptions::max_response_bytes` caps what a call buffers, failing it with `Status::Overflow` past the cap, and `ClientOptions::log` reports dials that fail every address, refused handshakes and refused redirects.
 Host names resolve through the library's own stub resolver, driven by the client's polling, and connections race the answered addresses as Happy Eyeballs does.
@@ -311,10 +312,10 @@ loop {
 ```
 
 A call whose `ClientCallOptions::body_delivery` is `BodyDelivery::Streamed` completes once its head arrived, so a download larger than `max_response_bytes` is pulled through `Response::body_chunk` as it lands, while `Response::body` fails with `Status::InvalidArgument`.
-Each chunk borrows the response until the next pull, and the bytes decoded before a failure come out before the failure is returned.
+Each chunk points into the response, valid until the next pull, and the bytes decoded before a failure come out before the failure is returned.
 Pulls run on the client's thread, failing with `Status::InvalidArgument` on any other, and never wait in the library: `body_chunk` advances the client while nothing was decoded, and each poll of `next_body_chunk` advances it once and yields.
 A client bound to a server advances only as that server's loop polls, so there `body_chunk` fails with `Status::WouldBlock` and `next_body_chunk` yields until the loop polled.
-Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection carries no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `Status::ConnectionClosed`.
+Every streamed response is pulled to its end or dropped, bodiless ones too, as its connection holds no other call meanwhile; dropping it early closes that connection and fails the calls pipelined behind it with `Status::ConnectionClosed`.
 Redirects stay buffered so they can be followed, and only the final response streams.
 
 ## Noise Keys
@@ -351,7 +352,7 @@ An `http+noise://` URL implies Noise XX, and a handler reads the client's authen
 
 ## Errors
 
-Every fallible call answers `ucall::Result`, whose `Error` carries the `Status` the library reported and a static message beside it, so nothing allocates on the failure path.
+Every fallible call answers `ucall::Result`, whose `Error` holds the `Status` the library reported and a static message beside it, so nothing allocates on the failure path.
 A mistake the binding catches before calling the library, like polling an event loop the server lacks, reports the status the library would have used.
 `Status` prints its stable spelling, such as "connection-failed", and a status a newer library added reads as `Status::Internal`.
 
@@ -370,11 +371,11 @@ A submitted call that fails completes with `Err` in `Completed::response`: `Stat
 A request lookup that finds nothing answers `None`, and HTTP error statuses are ordinary responses.
 `Backend` and `CPUClass` print and parse their stable names, like "linux-uring618" and "intel-icelake", failing with `Status::InvalidArgument` on a name no value has, and `Status::from_name` reads a status back from its spelling.
 `ucall::version()` spells the linked library's version, candidate suffix included.
-`ucall::decode_percent` decodes a path or a query value, which requests lend still percent-encoded.
+`ucall::decode_percent` decodes a path or a query value, which requests keep percent-encoded.
 
 ## Threads & Polling
 
-The crate starts no threads and needs no async runtime: every callback runs on a thread the application lent to a polling call.
+The crate starts no threads and needs no async runtime: every callback runs on a thread the application runs a polling call on.
 
 - A route handler runs on the thread inside `take_call` or `take_calls` for the event loop that received the request.
 - A batch handler runs on the thread inside `take_batch` or `take_batches` for its endpoint, never on an event loop.
@@ -397,16 +398,16 @@ The crate is a thin layer over UCall's native library, and every rule below foll
 - __Verbs share one name across languages.__
   `take_call`, `take_calls`, `take_batch`, `take_batches`, `submit` and `take_completed` name the same calls in Python and Rust.
 - __Blocking stays simple, deferring stays symmetric.__
-  A reply that is final on return looks as it did before files and streams existed, a deferred one fills a caller-lent `Deferred` that `wait`s, `.await`s or waits as it drops, and nothing costs more until a `DetachedRequest` is used.
+  A reply that is final on return looks as it did before files and streams existed, a deferred one fills a `Deferred` the caller pins, which `wait`s, `.await`s or waits as it drops, and nothing costs more until a `DetachedRequest` is used.
 - __Ownership is a type, not a flag.__
   A reply consumes its `Request`, a dropped request answers 500, only a `DetachedRequest` fills a `Deferred`, a `Response` frees itself, and a `Client` is neither `Send` nor `Sync`, so misuse does not compile.
 - __Single owners are claimed, never assumed.__
   Event loops and batch endpoints take `&self`, and the library's own claim answers `Status::Contended` to a second poller instead of racing it.
-- __Handlers are plain closures, borrowed.__
-  A route, a batch handler, an authorizer and a log handler cross as their C callback and context, monomorphized per handler type, and the server or client borrows them until it is freed.
+- __Handlers are plain closures, kept by the caller.__
+  A route, a batch handler, an authorizer and a log handler cross as their C callback and context, monomorphized per handler type, and the server or client refers to them until it is freed.
   A panic inside a handler, an authorizer or a log callback aborts the process, because it cannot unwind through C and a half-run handler leaves no state worth serving from.
   Report an expected failure as a reply or a rejection instead.
 - __Polling allocates nothing.__
-  A client sizes its tables by its call budget once, a batch endpoint reuses the slots it lends requests in, and a deferred reply writes into a `Deferred` the caller lends.
+  A client sizes its tables by its call budget once, a batch endpoint reuses the slots it passes requests in, and a deferred reply writes into a `Deferred` the caller pins.
 - __No life of its own.__
   The crate starts no threads, keeps no global state and needs no async runtime, so it drops into any threading model.

@@ -494,7 +494,7 @@ struct probe_t {
 FIXTURE
 
 assert_rejects "bare trailing doc marker" "with a trailing marker" include/$project_directory/probe.h <<'FIXTURE'
-static int probe_value; //< The value.
+extern int probe_value; //< The value.
 FIXTURE
 
 assert_rejects "trailing field comment" "on its own line's tail" include/$project_directory/probe.h <<'FIXTURE'
@@ -1267,6 +1267,122 @@ assert_rejects "abbreviation in prose" "abbreviates a word this project spells o
 static inline int probe(int value) { return value; }
 FIXTURE
 
+assert_rejects "hand-over word in a name" "names a thing by a hand-over word" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int lend_log(int sink) noexcept { return sink; }
+FIXTURE
+
+assert_rejects "hand-over word in a Rust name" "names a thing by a hand-over word" rust/probe.rs <<'FIXTURE'
+fn borrowed_descriptor(descriptor: i32) -> i32 { descriptor }
+FIXTURE
+
+assert_accepts "a Rust std borrow and a hand-over word in prose" rust/probe.rs <<'FIXTURE'
+use std::borrow::Cow;
+
+// The borrow checker orders setup before serving.
+fn probe(bytes: &[u8]) -> Cow<'_, [u8]> { Cow::Borrowed(bytes) }
+FIXTURE
+
+assert_rejects "hand-over word in a camelCase Go name" "names a thing by a hand-over word" golang/probe.go <<'FIXTURE'
+package probe
+
+func probe(lentDevices []int32) int { return len(lentDevices) }
+FIXTURE
+
+assert_rejects "hand-over word in a Python name" "names a thing by a hand-over word" python/probe.py <<'FIXTURE'
+
+def tape_lend(tape):
+    return tape
+FIXTURE
+
+assert_accepts "hand-over words in Python comments, docstrings and strings" python/probe.py <<'FIXTURE'
+
+def probe(tape):
+    """Reads a tape
+    the caller lent."""
+    # Nothing here is borrowed.
+    return tape, "lent"
+FIXTURE
+
+assert_rejects "function-local static executor" "adds a static object" src/probe.hpp <<'FIXTURE'
+inline int probe_count() noexcept {
+    static int calls = 0;
+    return ++calls;
+}
+FIXTURE
+
+assert_rejects "constinit static counter" "adds a static object" src/probe.hpp <<'FIXTURE'
+static constinit int probe_counter = 0;
+FIXTURE
+
+assert_rejects "static mutable pointer to const characters" "adds a static object" src/probe.hpp <<'FIXTURE'
+static char const* probe_cursor = nullptr;
+FIXTURE
+
+assert_rejects "static object built by a call" "adds a static object" src/probe.hpp <<'FIXTURE'
+static probe_pool_t probe_threads(make_probe_threads());
+FIXTURE
+
+assert_accepts "static constexpr table and a static function" src/probe.hpp <<'FIXTURE'
+struct probe_t {
+    static constexpr int limit_k = 4;
+    static int twice(int value) noexcept { return value * 2; }
+};
+FIXTURE
+
+assert_rejects "offset_of! in a Rust test" "asserts a struct's layout" rust/probe.rs <<'FIXTURE'
+#[repr(C)]
+struct Probe {
+    value: u32,
+}
+
+#[test]
+fn probe_layout() {
+    assert_eq!(core::mem::offset_of!(Probe, value), 0);
+}
+FIXTURE
+
+assert_accepts "size_of for a stride" rust/probe.rs <<'FIXTURE'
+fn probe_stride(count: usize) -> usize {
+    count * core::mem::size_of::<u64>()
+}
+FIXTURE
+
+# Commits a C struct beside its Rust mirror, then grows the struct and stages the mirror only when asked.
+stage_struct_mirror_fixture() { # stage_struct_mirror_fixture <yes|no>
+    create_fixture_repository
+    local header="c/$project_directory/probe.h"
+    mkdir -p "$fixture_directory/c/$project_directory" "$fixture_directory/rust"
+    {
+        printf '/**\n *  @file %s\n *  @author Selftest\n *  @date January 1, 2026\n' "$header"
+        printf ' *  @brief One staged fixture for one rule.\n *\n *  The case under test follows.\n */\n'
+        printf '#pragma once\n\n#include <stdint.h>\n\n/** A probe. */\ntypedef struct probe_t {\n\n'
+        printf '    /** The first field. */\n    int32_t first;\n\n} probe_t;\n'
+    } > "$fixture_directory/$header"
+    local module='//! One staged fixture for one rule.\n//!\n//! File: rust/probe.rs\n//! Author: Selftest\n//! Date: January 1, 2026\n\n'
+    printf "$module"'#[repr(C)]\npub struct probe_t {\n    pub first: i32,\n}\n' > "$fixture_directory/rust/probe.rs"
+    git -C "$fixture_directory" add -- "$header" rust/probe.rs
+    git -C "$fixture_directory" commit --quiet -m "Chore: Seed the fixture"
+    sed 's/^    int32_t first;$/    int32_t first;\n\n    \/** The second field. *\/\n    int32_t second;/' \
+        "$fixture_directory/$header" > "$fixture_directory/$header.edited"
+    mv "$fixture_directory/$header.edited" "$fixture_directory/$header"
+    git -C "$fixture_directory" add -- "$header"
+    [ "$1" = yes ] || return 0
+    printf "$module"'#[repr(C)]\npub struct probe_t {\n    pub first: i32,\n    pub second: i32,\n}\n' > "$fixture_directory/rust/probe.rs"
+    git -C "$fixture_directory" add -- rust/probe.rs
+}
+
+stage_struct_mirror_fixture no
+run_precommit
+expect_rejection "C struct changed without its Rust mirror" "changes a struct without the bindings"
+
+stage_struct_mirror_fixture yes
+run_precommit
+expect_acceptance "C struct changed with its Rust mirror"
+
+stage_edited_fixture include/$project_directory/probe.h 's/^int settled(void);$/\/** Settles the probe. *\/\nint settled(int value);/'
+run_precommit
+expect_acceptance "comment edit beside a code edit"
+
 assert_accepts "abbreviations inside string literals, raw strings included" include/$project_directory/probe.hpp <<'FIXTURE'
 inline char const *probe_key() noexcept { return "obj"; }
 inline char const *probe_cases() noexcept {
@@ -1469,12 +1585,12 @@ FIXTURE
 # region C and C++ Idiom Fixtures
 
 assert_rejects "unpinned string split" "splits a string literal" include/$project_directory/probe.h <<'FIXTURE'
-static char const *probe_text = "first half "
+static char const *const probe_text = "first half "
                                 "second half";
 FIXTURE
 
 assert_accepts "pinned string split" include/$project_directory/probe.h <<'FIXTURE'
-static char const *probe_text = "first half " //
+static char const *const probe_text = "first half " //
                                 "second half";
 FIXTURE
 
@@ -2282,7 +2398,7 @@ assert_rejects "URL in code after a code block closing with its docblock" "misma
  *  @endcode */
 int probe(void);
 
-static char const *site = "https://example.com/probe";
+static char const *const site = "https://example.com/probe";
 FIXTURE
 
 stage_fixture_with_header include/$project_directory/probe.hpp <<'FIXTURE'
@@ -2928,7 +3044,7 @@ stage_committed_fixture() { # stage_committed_fixture <relative-path> <sed-expre
 }
 
 stage_committed_fixture include/$project_directory/probe.hpp 's/probe_text =$/probe_text = "first half "/' <<'FIXTURE'
-static char const *probe_text =
+static char const *const probe_text =
                                 "second half";
 FIXTURE
 run_precommit
@@ -3153,6 +3269,18 @@ FIXTURE
 
 assert_accepts "span of C strings spelled const char" include/$project_directory/probe.hpp <<'FIXTURE'
 void probe_name(std::span<const char* const> names) noexcept;
+FIXTURE
+
+assert_rejects "executor address comparison" "compares executor addresses" src/probe.cpp <<'FIXTURE'
+std::size_t probe_thread(probe_view_t const& view, probe_state_t const& state) noexcept {
+    return view.executor == state.executor ? view.thread_index : 0;
+}
+FIXTURE
+
+assert_accepts "null executor test and an executor's width" src/probe.cpp <<'FIXTURE'
+std::size_t probe_threads(probe_view_t const& view) noexcept {
+    return view.executor != nullptr && view.executor->size() != 0 ? view.executor->size() : 1;
+}
 FIXTURE
 
 assert_rejects "N-API mutex in a binding" "locks in a binding" javascript/probe.c <<'FIXTURE'
@@ -3992,11 +4120,11 @@ inline int probe(int count) {
 FIXTURE
 
 assert_rejects "doc trailer on a statement" "documents with a //! trailer" include/ucall/probe.hpp <<'FIXTURE'
-static int probe_value = 0; //! The value.
+constexpr int probe_value = 0; //! The value.
 FIXTURE
 
 assert_accepts "plain note on a statement" include/ucall/probe.hpp <<'FIXTURE'
-static int probe_value = 0; // Reset by every call.
+constexpr int probe_value = 0; // Read by every call.
 FIXTURE
 
 assert_rejects "fully qualified project namespace" "spells unum::ucall:: in full" include/ucall/probe.hpp <<'FIXTURE'

@@ -1,5 +1,5 @@
 /**
- *  @file include/ucall/io/bsd_kqueue_engine.hpp
+ *  @file include/ucall/io/bsd_kqueue_queue.hpp
  *  @author Ash Vardanian
  *  @date January 13, 2025
  *  @brief kqueue readiness for Apple and FreeBSD sockets, with file reads through AIO: FreeBSD
@@ -44,10 +44,10 @@ struct kqueue_readiness;
 template <typename allocator_type_ = st::default_allocator<byte_t>,
           template <typename> class atomic_ref_template_ = fu::standard_atomic_ref,
           typename row_kit_type_ = st::serial_row_kit_t>
-struct bsd_kqueue_engine {
+struct bsd_kqueue_queue {
     using allocator_t = allocator_type_;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
-    using rebind = bsd_kqueue_engine<other_allocator_, other_atomic_ref_, other_row_kit_>;
+    using rebind = bsd_kqueue_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
     static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_bsd_kqueue_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
@@ -55,7 +55,7 @@ struct bsd_kqueue_engine {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     struct operation_t {
 
-        /** The request the record carries, or null while it is free. */
+        /** The request the record holds, or null while it is free. */
         io_request_t* request {};
 
         /** The next record on the free, fresh, ready or landed list holding this one. */
@@ -95,13 +95,13 @@ struct bsd_kqueue_engine {
         if (operations[index].interest == io_interest_t::armed_k) readiness_wake(*this, index);
         return ucall_status_success_k;
     }
-    explicit bsd_kqueue_engine(allocator_t const& allocator = {}) noexcept
+    explicit bsd_kqueue_queue(allocator_t const& allocator = {}) noexcept
         : operations(rebound_allocator<operation_t> {allocator}), cold(rebound_allocator<operation_cold_t> {allocator}),
           timed(rebound_allocator<unsigned> {allocator}), readiness(allocator) {}
-    bsd_kqueue_engine(bsd_kqueue_engine const&) = delete;
-    bsd_kqueue_engine& operator=(bsd_kqueue_engine const&) = delete;
-    bsd_kqueue_engine(bsd_kqueue_engine&&) = delete;
-    bsd_kqueue_engine& operator=(bsd_kqueue_engine&&) = delete;
+    bsd_kqueue_queue(bsd_kqueue_queue const&) = delete;
+    bsd_kqueue_queue& operator=(bsd_kqueue_queue const&) = delete;
+    bsd_kqueue_queue(bsd_kqueue_queue&&) = delete;
+    bsd_kqueue_queue& operator=(bsd_kqueue_queue&&) = delete;
 
     /** Records indexed by @c operation_index, each free or carrying one submitted request. */
     st::vector<operation_t, rebound_allocator<operation_t>> operations {};
@@ -134,7 +134,7 @@ struct bsd_kqueue_engine {
      *  out; zero otherwise. */
     int fault {};
 
-    /** The counters the engine advances for its polling owner. */
+    /** The counters the queue advances for its polling owner. */
     io_statistics_t statistics {};
     operation_list_t& free_list(unsigned) noexcept { return free_operations; }
     operation_cold_t& cold_fields(unsigned index) noexcept { return cold[index]; }
@@ -195,7 +195,7 @@ struct bsd_kqueue_engine {
         readiness_close_unattempted(*this);
         readiness_reset(*this);
     }
-    ~bsd_kqueue_engine() noexcept { stop(); }
+    ~bsd_kqueue_queue() noexcept { stop(); }
 };
 
 /** kqueue readiness; FreeBSD reads files through @c aio_read completing as @c EVFILT_AIO events,
@@ -384,7 +384,7 @@ struct kqueue_readiness {
         if (descriptor >= 0) close(descriptor);
     }
 };
-using bsd_kqueue_engine_t = bsd_kqueue_engine<>;
+using bsd_kqueue_queue_t = bsd_kqueue_queue<>;
 
 } // namespace unum::ucall::io
 

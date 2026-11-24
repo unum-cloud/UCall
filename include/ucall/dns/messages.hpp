@@ -109,7 +109,7 @@ inline std::size_t compose_query(span<byte_t, query_bytes_k> query, std::uint16_
     }
 }
 
-/** What an answer held: its verdict, the least TTL it relied on, and the addresses it carried. */
+/** What an answer held: its verdict, the least TTL it relied on, and the addresses it listed. */
 struct decoded_answer_t {
     answer_t answer {answer_t::malformed_k};
     std::uint32_t ttl_seconds {};
@@ -147,7 +147,7 @@ struct decoded_answer_t {
  *      @p addresses' capacity of addresses, each 4 bytes for A and 16 for AAAA.
  *
  *  A truncated answer reports @c truncated_k once its question checks out, and a stream carrier
- *  treats that as malformed. NXDOMAIN and NODATA carry their negative-caching TTL.
+ *  treats that as malformed. NXDOMAIN and NODATA include their negative-caching TTL.
  */
 [[nodiscard]] inline decoded_answer_t decode_answer(span<byte_t const> packet, std::uint16_t id,
                                                     wire_name_t const& question, record_type_t type,

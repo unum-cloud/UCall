@@ -59,6 +59,8 @@ def _stream_key(seed: UInt64, name: String, index: UInt64 = 0) -> UInt64:
     for byte in name.as_bytes():
         hashed = (hashed ^ UInt64(byte)) * 0x100000001B3
     return _split_mix_bits(_split_mix_bits(seed ^ hashed) + index)
+
+
 # endregion Shared Testing
 
 
@@ -81,7 +83,7 @@ def test_names_come_from_the_library() raises:
     assert_equal(library.cpu_class_name(CPUClass.APPLE_M4), "apple-m4")
     assert_true(library.cpu_class_from_name("serial") == CPUClass.SERIAL, "a CPU class reads back")
     assert_equal(library.version()[0], 1, "the binding loads only its own major")
-    assert_true(library.version_name().startswith("1."), "the version name carries the major")
+    assert_true(library.version_name().startswith("1."), "the version name starts with the major")
 
 
 def test_percent_escapes_decode_by_mode() raises:
@@ -112,7 +114,7 @@ def test_generated_noise_keys_derive_back() raises:
 
 
 def _owned(bytes: Span[Byte, _]) -> List[Byte]:
-    """A copy of borrowed bytes, for a reply that consumes the request they borrow from."""
+    """A copy of bytes owned by a request, for a reply that consumes the request."""
     var copy = List[Byte](capacity=len(bytes))
     for byte in bytes:
         copy.append(byte)
@@ -218,6 +220,7 @@ def test_server_answers_a_bound_client() raises:
     server.post["/chunks", chunks]()
     var scores = server.batch["/score", score](Verb.POST)
     var origin = String("http://", server.address(0).value())
+    assert_equal(Int(server.memory_domain(0).value()), -1)
 
     var options = ClientOptions(connections=8)
     options.calls = 7

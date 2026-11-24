@@ -39,8 +39,12 @@ ucall_received_http_batch_callback_t ucall_go_batches(void);
 ucall_log_callback_t ucall_go_logs(void);
 ucall_peer_authorizer_t ucall_go_authorizes(void);
 
-/** Lends a handle as a callback's opaque context, which Go may not spell as a pointer. */
+/** Passes a handle as a callback's opaque context, which Go may not spell as a pointer. */
 void* ucall_go_context(uintptr_t handle);
+
+/** Passes a pinned key, or @c NULL, as the key pointer a field takes, whose Go spelling differs
+ *  between the platforms cgo runs on. */
+ucall_noise_key_t const* ucall_go_key(void* key);
 
 #ifdef __cplusplus
 }

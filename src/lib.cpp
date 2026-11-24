@@ -118,7 +118,7 @@ void ucall_client_init(ucall_client_init_t* arguments) {
         publish(arguments->outcome, ucall_status_invalid_argument_k);
         return;
     }
-    // A bound client takes its server's network, whose engine it shares, so its ceiling becomes
+    // A bound client takes its server's network, whose queue it shares, so its ceiling becomes
     // the class a network would be built for under it, which its server compares with its own.
     if (arguments->options->server) {
         ucall_client_options_t options = *arguments->options;

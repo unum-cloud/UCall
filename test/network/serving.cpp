@@ -271,7 +271,9 @@ static void test_second_poller_is_refused(sweep_cell_t const& cell) {
     std::thread owner {[&] {
         ucall_outcome_t owned {};
         ucall_server_take_calls_t take {fixture.server, &owned, 0};
-        ucall_server_take_calls(&take);
+        // The second poller may claim the loop first, between whose rounds the owner takes it.
+        do ucall_server_take_calls(&take);
+        while (owned.status == ucall_status_contended_k);
     }};
     ucall_outcome_t outcome {};
     ucall_server_take_call_t second {fixture.server, &outcome, 0, 0};
@@ -502,7 +504,7 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
  *  still ends the batch polling once the other loop drained. */
 static case_result_t test_setup_failure_ends_batch_polling(sweep_cell_t const&) {
 #if UCALL_WITH_POSIX && !UCALL_OS_WINDOWS_
-    using network_t = serial_network<uc::io::io_engine_variant<uc::io::posix_engine_t>>;
+    using network_t = serial_network<uc::io::io_queue_variant<uc::io::posix_queue_t>>;
     ucall_server_t server {};
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};

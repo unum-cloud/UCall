@@ -3,15 +3,15 @@
  *  @author Ash Vardanian
  *  @date October 19, 2026
  *  @brief Backend parity, admission across loops, accept shedding, CPU class ceilings, allocator
- *      propagation and engine faults.
+ *      propagation and queue faults.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
 #include <network.hpp>
 
 #include "ucall/utilities/sockets.hpp" // `monotonic_ns`, `nonblocking`
 
-#include "variants.hpp"           // `io_engines_t`, `network_t`
-#include "io/faulting_engine.hpp" // `faulting_network_t`
+#include "variants.hpp"          // `io_queues_t`, `network_t`
+#include "io/faulting_queue.hpp" // `faulting_network_t`
 
 #if UCALL_OS_POSIX_
 #include <sys/resource.h> // `getrlimit`, `setrlimit`, `RLIMIT_MEMLOCK`
@@ -19,7 +19,7 @@
 
 namespace unum::ucall::test::network {
 
-#pragma region Engines
+#pragma region Queues
 
 /** Under a locked-memory limit just short of a one-connection ring's, an automatic server lands on
  *  epollaio at init instead of refusing its first poll. */
@@ -125,8 +125,8 @@ static void test_cpu_class_ceiling() {
 
 static case_result_t test_origin_reuse_and_fairness() {
 #if UCALL_WITH_POSIX
-    // The library builds a serial client over every engine, so the handle reads as that network's.
-    using network_t = serial_network<uc::io_engines_t>;
+    // The library builds a serial client over every queue, so the handle reads as that network's.
+    using network_t = serial_network<uc::io_queues_t>;
     ucall_client_t handle {};
     ucall_outcome_t outcome {};
     ucall_client_options_t config {};
@@ -154,7 +154,7 @@ static case_result_t test_origin_reuse_and_fairness() {
         connection.origin = client.exchanges[i == 1 ? 2 : 0].origin;
         ++connection.origin->connections;
         expect_true(connection.transport.configure({}, &connection) == ucall_status_success_k);
-        descriptors[i] = connection.transport.descriptor = client.engine->open_socket(AF_INET);
+        descriptors[i] = connection.transport.descriptor = client.queue->open_socket(AF_INET);
         expect_true(descriptors[i] >= 0);
         connection.transport.stage = network_t::transport_stage_t::open_k;
         network_t::client_t::mark_ready(client, connection);
@@ -176,7 +176,7 @@ static case_result_t test_origin_reuse_and_fairness() {
                 origin.waiting_head == &client.exchanges[3] && origin.waiting_tail == &client.exchanges[3]);
     for (std::size_t i = 0; i != descriptors.size(); ++i)
         expect_true(client.connections[i]->transport.descriptor == descriptors[i]);
-    client.engine->stop();
+    client.queue->stop();
     auto& released = *client.connections[1];
     released.oldest_exchange = released.newest_exchange = nullptr;
     released.outstanding_exchanges = 0;
@@ -197,11 +197,11 @@ static case_result_t test_origin_reuse_and_fairness() {
 }
 
 /** An open connection at a depth of sixteen takes every one of sixteen waiting calls into one
- *  output, in call order, so a single send carries them all. */
+ *  output, in call order, so a single send takes them all. */
 static case_result_t test_client_batches_sends() {
 #if UCALL_WITH_POSIX
-    // The library builds a serial client over every engine, so the handle reads as that network's.
-    using network_t = serial_network<uc::io_engines_t>;
+    // The library builds a serial client over every queue, so the handle reads as that network's.
+    using network_t = serial_network<uc::io_queues_t>;
     ucall_client_t handle {};
     ucall_outcome_t outcome {};
     ucall_client_options_t config {};
@@ -227,7 +227,7 @@ static case_result_t test_client_batches_sends() {
     connection.origin = &origin;
     ++origin.connections;
     expect_true(connection.transport.configure({}, &connection) == ucall_status_success_k);
-    connection.transport.descriptor = client.engine->open_socket(AF_INET);
+    connection.transport.descriptor = client.queue->open_socket(AF_INET);
     expect_true(connection.transport.descriptor >= 0);
     connection.transport.stage = network_t::transport_stage_t::open_k;
     network_t::client_t::mark_ready(client, connection);
@@ -244,14 +244,14 @@ static case_result_t test_client_batches_sends() {
          at = output.find("PUT / HTTP/1.1", at + 1))
         ++requests;
     expect_true(requests == 16, "one output holds {} requests", requests);
-    client.engine->stop();
+    client.queue->stop();
     ucall_client_free(handle);
     return {};
 #else
     return case_result_t::skipped("built without UCALL_WITH_POSIX");
 #endif
 }
-#pragma endregion Engines
+#pragma endregion Queues
 
 #pragma region Raw Clients
 #if UCALL_OS_POSIX_
@@ -343,7 +343,7 @@ static void test_accept_exhaustion_sheds(sweep_cell_t const& cell, split_mix_gen
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
     fixture.serve_in_background();
     std::string_view const request = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
-    // A served request proves the loop opened its engine, which needs descriptors of its own.
+    // A served request proves the loop opened its queue, which needs descriptors of its own.
     raw_client_t fresh;
     if (!expect_true(fresh.connect(fixture.address))) return;
     expect_true(fresh.write(byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
@@ -570,9 +570,9 @@ static void test_allocation_failure(sweep_cell_t const& cell) {
 
 #pragma region Faults
 
-/** A server whose engine delays some transfers and resets others never answers with the wrong
+/** A server whose queue delays some transfers and resets others never answers with the wrong
  *  bytes, keeps serving new connections, and gives every descriptor back at its end. */
-static case_result_t test_engine_faults() {
+static case_result_t test_queue_faults() {
 #if UCALL_WITH_POSIX
     split_mix_generator_t generator {case_stream_key()};
     std::size_t const descriptors_before = open_descriptors();
@@ -622,7 +622,7 @@ static case_result_t test_engine_faults() {
             ++dropped;
             client.close();
         }
-        expect_true(!wrong, "{} replies carried the wrong status or bytes", wrong);
+        expect_true(!wrong, "{} replies had the wrong status or bytes", wrong);
         expect_true(answered > dropped, "{} requests answered against {} dropped", answered, dropped);
         client.close();
         ucall_server_stop(route.server);
@@ -726,7 +726,7 @@ void run_loops_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
         run_cell_case(cell_label, "test_ring_refused_at_init_falls_back", test_ring_refused_at_init_falls_back);
         run_cell_case(cell_label, "test_origin_reuse_and_fairness", test_origin_reuse_and_fairness);
         run_cell_case(cell_label, "test_client_batches_sends", test_client_batches_sends);
-        run_cell_case(cell_label, "test_engine_faults", test_engine_faults);
+        run_cell_case(cell_label, "test_queue_faults", test_queue_faults);
         run_cell_case(cell_label, "test_bound_client_counts_into_its_loop", test_bound_client_counts_into_its_loop);
     }
 #if UCALL_OS_POSIX_

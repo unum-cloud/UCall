@@ -41,7 +41,7 @@ jobs:
       - name: Require Every Linux Backend
         run: |
           if grep -E '^[0-9]+: skipped +(io|network) (linux-epollaio|linux-uring612|linux-uring618)' ctest.log; then
-            echo "A Linux backend suite skipped, so its engine went untested"
+            echo "A Linux backend suite skipped, so its queue went untested"
             exit 1
           fi
 
@@ -79,7 +79,7 @@ jobs:
       - name: Require Every Linux Backend
         run: |
           if grep -E '^[0-9]+: skipped +(io|network) (linux-epollaio|linux-uring612|linux-uring618)' ctest.log; then
-            echo "A Linux backend suite skipped, so its engine went untested"
+            echo "A Linux backend suite skipped, so its queue went untested"
             exit 1
           fi
 
@@ -124,7 +124,7 @@ jobs:
       - name: Require Every Linux Backend
         run: |
           if grep -E '^[0-9]+: skipped +(io|network) (linux-epollaio|linux-uring612|linux-uring618)' ctest.log; then
-            echo "A Linux backend suite skipped, so its engine went untested"
+            echo "A Linux backend suite skipped, so its queue went untested"
             exit 1
           fi
 
@@ -155,7 +155,7 @@ jobs:
       - name: Require the Kqueue Backend
         run: |
           if grep -E '^[0-9]+: skipped +(io|network) bsd-kqueue' ctest.log; then
-            echo "The kqueue suite skipped, so its engine went untested"
+            echo "The kqueue suite skipped, so its queue went untested"
             exit 1
           fi
 
@@ -186,7 +186,7 @@ jobs:
       - name: Require the IOCP Backend
         run: |
           if grep -E '^[0-9]+: skipped +network windows-iocp' ctest.log; then
-            echo "The IOCP suite skipped, so its engine went untested"
+            echo "The IOCP suite skipped, so its queue went untested"
             exit 1
           fi
 
@@ -423,7 +423,7 @@ jobs:
       - name: Test the C Interface on Both
         run: ctest --preset debug -R '^ucall_test_c' --no-tests=error --verbose
 
-  # AlmaLinux 8 carries Linux 4.18 headers, so the build proves the kernel mirrors suffice and the test checks them.
+  # AlmaLinux 8 ships Linux 4.18 headers, so the build proves the kernel mirrors suffice and the test checks them.
   test_c_manylinux_gcc:
     name: Build C Library on Old Kernel Headers
     runs-on: ubuntu-26.04
@@ -498,4 +498,3 @@ jobs:
         run: git submodule update --init forkunion
       - name: Check Models and Clients
         run: verification/check.sh
-

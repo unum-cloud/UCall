@@ -2,7 +2,7 @@
  *  @file include/ucall/http/multipart.hpp
  *  @author Ash Vardanian
  *  @date November 5, 2026
- *  @brief Splitting @c multipart/form-data bodies into parts, and the header fields they carry.
+ *  @brief Splitting @c multipart/form-data bodies into parts, and their header fields.
  */
 #pragma once
 

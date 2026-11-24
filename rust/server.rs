@@ -28,11 +28,11 @@ use std::sync::Arc;
 
 use crate::types::{
     Backend, BodyDelivery, BytesView, CPUClass, Deferred, Descriptor, HTTPStatus, Log, NoiseKey, PeerAuthorizer,
-    Result, Security, Status, Verb, borrowed_descriptor, check, microseconds, raw_descriptor, ucall_body_delivery_t,
-    ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t, ucall_http_status_t, ucall_io_backend_t,
-    ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t, ucall_outcome_wait, ucall_peer_authorizer_t,
-    ucall_received_http_request_t, ucall_security_t, ucall_server_t, ucall_status_deferred_k, ucall_verb_t, view,
-    viewed,
+    Result, Security, Status, Verb, authorizer_callback, check, descriptor_from_raw, log_callback, microseconds,
+    raw_descriptor, ucall_body_delivery_t, ucall_bytes_view_t, ucall_cpu_class_t, ucall_http_batch_endpoint_t,
+    ucall_http_status_t, ucall_io_backend_t, ucall_log_t, ucall_noise_key_t, ucall_outcome_status, ucall_outcome_t,
+    ucall_outcome_wait, ucall_peer_authorizer_t, ucall_received_http_request_t, ucall_security_t, ucall_server_t,
+    ucall_status_deferred_k, ucall_verb_t, view, viewed,
 };
 
 // region: Raw Declarations
@@ -44,6 +44,7 @@ struct ucall_network_interface_t {
     listen_descriptor: *const isize,
     device_name: ucall_bytes_view_t,
     security: ucall_security_t,
+    memory_domain: i32,
     noise_private_key: *const ucall_noise_key_t,
     noise_peer_key: *const ucall_noise_key_t,
     peer_authorizer: ucall_peer_authorizer_t,
@@ -488,8 +489,8 @@ impl<'server> Interface<'server> {
         self
     }
 
-    /// Vets each client's authenticated static key before any of its requests is read, borrowing
-    /// the authorizer's handler until the server is freed.
+    /// Vets each client's authenticated static key before any of its requests is read, calling the
+    /// authorizer's handler, which the caller keeps until the server is freed.
     pub fn peer_authorizer(mut self, authorizer: PeerAuthorizer<'server>) -> Self {
         self.peer_authorizer = Some(authorizer);
         self
@@ -540,8 +541,8 @@ pub struct ServerOptions<'server> {
     /// A ceiling on the CPU class, intersected with what the constructing thread's CPU runs: the
     /// newest compiled class fitting both runs, and `None` sets no ceiling.
     pub cpu_class_ceiling: Option<CPUClass>,
-    /// Where log lines go, its handler borrowed until the server is freed; `None` keeps the server
-    /// silent.
+    /// Where log lines go, its handler kept by the caller until the server is freed; `None` keeps
+    /// the server silent.
     pub log: Option<Log<'server>>,
     /// Where StatsD datagrams go; `None` sends none.
     pub metrics: Option<Metrics>,
@@ -588,8 +589,8 @@ impl Drop for ServerCore {
     }
 }
 
-/// A plain endpoint's borrowed handler and the server its requests retain: a request may outlive
-/// the handler and the [`Server`], so it shares the core rather than the raw server the library
+/// A plain endpoint's handler and the server its requests retain: a request may outlive the
+/// handler and the [`Server`], so it shares the core rather than the raw server the library
 /// passes.
 struct Route {
     server: Arc<ServerCore>,
@@ -621,7 +622,7 @@ pub enum Polling {
     Retired,
 }
 
-/// An HTTP server over one or more interfaces, polled by application threads, borrowing its
+/// An HTTP server over one or more interfaces, polled by application threads, referring to its
 /// handlers, authorizers and log for `'server`.
 ///
 /// Register every endpoint first, through `&mut self`, then share `&Server` with the threads
@@ -688,12 +689,13 @@ impl<'server> Server<'server> {
             .iter()
             .zip(&directories)
             .map(|(interface, directories)| {
-                let (peer_authorizer, peer_authorizer_context) = PeerAuthorizer::raw(interface.peer_authorizer);
+                let (peer_authorizer, peer_authorizer_context) = authorizer_callback(interface.peer_authorizer);
                 ucall_network_interface_t {
                     address: view(interface.address.as_bytes()),
                     listen_descriptor: interface.listen_descriptor.as_ref().map_or(ptr::null(), ptr::from_ref),
                     device_name: view(interface.device_name.as_deref().unwrap_or("").as_bytes()),
                     security: interface.security.to_raw(),
+                    memory_domain: -1,
                     noise_private_key: interface.noise_private_key.as_ref().map_or(ptr::null(), ptr::from_ref),
                     noise_peer_key: interface.noise_peer_key.as_ref().map_or(ptr::null(), ptr::from_ref),
                     peer_authorizer,
@@ -713,7 +715,7 @@ impl<'server> Server<'server> {
         let config = ucall_server_options_t {
             interfaces: raw_interfaces.as_ptr(),
             interfaces_count: raw_interfaces.len(),
-            log: Log::raw(options.log),
+            log: log_callback(options.log),
             metrics_address: view(metrics.address.as_bytes()),
             metrics_sample_rate: metrics.sample_rate,
             metrics_prefix: view(metrics.prefix.as_bytes()),
@@ -758,8 +760,14 @@ impl<'server> Server<'server> {
         Some(unsafe { core::str::from_utf8_unchecked(viewed(address)) })
     }
 
+    /// The NUMA node the kernel ties interface `index`'s device to, or -1; init and poll from
+    /// threads there.
+    pub fn memory_domain(&self, index: usize) -> Option<i32> {
+        Some(self.core.interfaces().get(index)?.memory_domain)
+    }
+
     /// Routes requests matching `path` and `verb` to `handler`, which runs on the polling thread
-    /// and stays borrowed until the server is freed.
+    /// and which the caller keeps until the server is freed.
     ///
     /// Templates capture `{name}` segments and a greedy `{*name}` tail, read back through
     /// [`Request::path_parameter`]; literal segments match before captures, and captures before a
@@ -827,8 +835,8 @@ impl<'server> Server<'server> {
     }
 
     /// Collects requests matching `path` and `verb` from every event loop into one queue, which the
-    /// returned endpoint drains into `handler` on whichever thread drains it; the handler stays
-    /// borrowed until the server is freed.
+    /// returned endpoint drains into `handler` on whichever thread drains it; the caller keeps the
+    /// handler until the server is freed.
     ///
     /// Requests the handler neither replies to nor keeps answer 500 once it returns; a handler
     /// that panics aborts the process.
@@ -939,19 +947,19 @@ impl Drop for Server<'_> {
 #[repr(C)]
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
 pub struct EventLoopStatistics {
-    /// Engine polls the loop issued, each taking zero or more completions.
+    /// Queue polls the loop issued, each taking zero or more completions.
     pub polls: u64,
-    /// Engine polls that took no completion.
+    /// Queue polls that took no completion.
     pub empty_polls: u64,
     /// System calls: io_uring enters, or other backends' waits, registrations and socket calls.
     pub kernel_enters: u64,
-    /// Operations the loop asked of its engine.
+    /// Operations the loop asked of its queue.
     pub submissions: u64,
-    /// Results the loop took from its engine, each connection of an accept among them.
+    /// Results the loop took from its queue, each connection of an accept among them.
     pub completions: u64,
     /// Submission entries io_uring filled and completion entries it reaped; zero elsewhere.
     pub kernel_entries: u64,
-    /// Pending operations, or io_uring multishot receives, the engine asked to cancel.
+    /// Pending operations, or io_uring multishot receives, the queue asked to cancel.
     pub cancellations: u64,
     /// Connections accepted and handed to this loop.
     pub accepts: u64,
@@ -996,7 +1004,7 @@ pub struct EventLoopStatistics {
     /// Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under
     /// Noise.
     pub shed_connections: u64,
-    /// File windows the engine left unpinned, as it pins none, or the locked-memory cap or a full
+    /// File windows the queue left unpinned, as it pins none, or the locked-memory cap or a full
     /// table refused; their sends pin or copy on their own.
     pub windows_unpinned: u64,
 }
@@ -1033,18 +1041,18 @@ pub struct BatchEndpointStatistics {
     pub expired_batches: u64,
 }
 
-/// A batch endpoint's handler, the server its requests retain, and the slots it lends them in.
+/// A batch endpoint's handler, the server its requests retain, and the slots it passes them in.
 struct BatchState {
     server: Arc<ServerCore>,
     handler: *const c_void,
-    // Grows to the largest batch once, then lends every later batch without allocating.
+    // Grows to the largest batch once, then reuses it for every later batch without allocating.
     requests: Vec<Option<Request>>,
 }
 
 /// # Safety
 /// `context` must address the [`BatchState`] of the endpoint being polled, whose handler is an `F`
-/// and which the library's one polling owner borrows exclusively, and `requests` a counted array
-/// of its server's retained handles.
+/// and which the library's one polling owner holds exclusively, and `requests` a counted array of
+/// its server's retained handles.
 unsafe extern "C" fn batch_trampoline<F: Fn(Batch<'_>) + Sync>(
     _server: ucall_server_t,
     requests: *const ucall_received_http_request_t,
@@ -1167,7 +1175,7 @@ impl Drop for BatchEndpoint<'_> {
     }
 }
 
-/// The requests of one due batch, from every event loop, lent to the handler in arrival order.
+/// The requests of one due batch, from every event loop, valid in the handler in arrival order.
 ///
 /// Each request is taken out at most once, by index or by iterating; whatever the handler leaves
 /// answers 500 once it returns.
@@ -1186,7 +1194,7 @@ impl<'batch> Batch<'batch> {
         self.requests.is_empty()
     }
 
-    /// Borrows request `index`, unless it was taken.
+    /// Request `index`, valid while the batch lives, unless it was taken.
     pub fn get(&self, index: usize) -> Option<&Request> {
         self.requests.get(index)?.as_ref()
     }
@@ -1196,7 +1204,7 @@ impl<'batch> Batch<'batch> {
         self.requests.get_mut(index)?.take()
     }
 
-    /// Borrows every request not yet taken, in order.
+    /// Every request not yet taken, in order, each valid while the batch lives.
     pub fn iter(&self) -> impl DoubleEndedIterator<Item = &Request> {
         self.requests.iter().flatten()
     }
@@ -1226,7 +1234,7 @@ pub struct Peer {
 /// The socket address a peer connected from, as its connection was accepted.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum PeerAddress {
-    /// The engine reported no address the library knows.
+    /// The queue reported no address the library knows.
     Unknown,
     /// An IPv4 or IPv6 address and port, with the IPv6 scope.
     Ip(SocketAddr),
@@ -1465,7 +1473,7 @@ impl Request {
         DetachedRequest(self)
     }
 
-    /// Lends the handle to one reply call that is final on return, which clears it once it took
+    /// Passes the handle to one reply call that is final on return, which clears it once it took
     /// the request; a refusal leaves it, so dropping the request answers 500.
     fn finish_final(
         mut self,
@@ -1476,7 +1484,7 @@ impl Request {
         check(outcome)
     }
 
-    /// Lends the handle to one reply call that may finish later into the slot `into`, as
+    /// Passes the handle to one reply call that may finish later into the slot `into`, as
     /// [`Request::finish_final`] does, answering a refusal or success while the reply sends.
     fn finish(
         mut self,
@@ -1545,7 +1553,7 @@ impl Drop for Request {
     }
 }
 
-/// One part of a `multipart/form-data` request body, borrowing the received bytes.
+/// One part of a `multipart/form-data` request body, pointing into the received bytes.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub struct RequestPart<'request> {
     /// The name its `Content-Disposition` gives.
@@ -1563,7 +1571,7 @@ pub struct RequestPart<'request> {
 #[repr(transparent)]
 pub struct ReplyPart<'b, 'f> {
     raw: ucall_reply_part_t,
-    borrows: PhantomData<(BytesView<'b>, Descriptor<'f>)>,
+    caller_bytes_and_files: PhantomData<(BytesView<'b>, Descriptor<'f>)>,
 }
 
 impl<'b, 'f> ReplyPart<'b, 'f> {
@@ -1606,7 +1614,7 @@ impl<'b, 'f> ReplyPart<'b, 'f> {
         (self.raw.kind == ucall_reply_part_file_k).then(|| {
             let file = unsafe { self.raw.data.file };
             FileRange {
-                file: unsafe { borrowed_descriptor(file.file_descriptor) },
+                file: unsafe { descriptor_from_raw(file.file_descriptor) },
                 offset: file.offset,
                 length: file.length,
             }
@@ -1627,7 +1635,7 @@ impl<'b, 'f> ReplyPart<'b, 'f> {
     }
 
     fn wrap(kind: ucall_reply_part_kind_t, data: ucall_reply_part_data_t) -> Self {
-        ReplyPart { raw: ucall_reply_part_t { kind, data }, borrows: PhantomData }
+        ReplyPart { raw: ucall_reply_part_t { kind, data }, caller_bytes_and_files: PhantomData }
     }
 }
 
@@ -1649,10 +1657,11 @@ impl<'b> From<&'b std::io::IoSlice<'_>> for ReplyPart<'b, '_> {
     }
 }
 
-/// A range of the caller's `O_DIRECT` descriptor, borrowed until the reply is final.
+/// A range of the caller's `O_DIRECT` descriptor, which stays the caller's and open until the
+/// reply is final.
 #[derive(Clone, Copy, Debug)]
 pub struct FileRange<'f> {
-    /// The open file, borrowed and never closed by UCall.
+    /// The open file, which stays the caller's and is never closed by UCall.
     pub file: Descriptor<'f>,
     /// The range's first byte.
     pub offset: u64,
@@ -1679,7 +1688,7 @@ pub struct PathRange<'b> {
 ///
 /// It reads like the [`Request`] it came from, moves to any thread, and answers 500 when dropped
 /// unreplied. Its replies that may still send a file or path part after they return take a
-/// [`Deferred`] slot the caller lends, and waiting on one belongs off the polling thread, as that
+/// [`Deferred`] slot the caller pins, and waiting on one belongs off the polling thread, as that
 /// thread is the one sending it.
 ///
 /// ```
@@ -1840,7 +1849,7 @@ pub struct BodyChunk<'r> {
     _pinned: PhantomPinned,
 }
 
-// The pull borrows its request exclusively, and until it is final only the library writes it.
+// The pull holds its request's only reference, and until it is final only the library writes it.
 unsafe impl Send for BodyChunk<'_> {}
 
 impl<'r> Future for BodyChunk<'r> {
@@ -1882,8 +1891,8 @@ impl Drop for BodyChunk<'_> {
 /// A reply whose head left and whose body is appended part by part, from any one thread at a
 /// time, until [`ReplyStream::end`]; dropping it ends it, waiting for its file parts to send.
 ///
-/// The descriptors its file parts borrow stay open for `'f`, through the [`Deferred`] slot its end
-/// is lent.
+/// The descriptors its file parts name stay open for `'f`, through the [`Deferred`] slot its end
+/// writes into.
 pub struct ReplyStream<'f> {
     server: Arc<ServerCore>,
     raw: ucall_received_http_request_t,
@@ -2019,6 +2028,7 @@ mod tests {
         let mut server = Server::new(&[loopback(1)]).unwrap();
         server.get("/sum/{unit}", &sum).unwrap();
         let address = server.address(0).unwrap().to_owned();
+        assert_eq!(server.memory_domain(0), Some(-1));
         serving(&server, || {
             let mut client = client(1);
             let response = client.get(format!("http://{address}/sum/apples?a=2&b=40")).unwrap();
@@ -2637,7 +2647,7 @@ mod tests {
             let mut client = client(1);
             let mut datagram = [0; 65536];
             // Each call polls the loop, which sends once the interval passed, and a datagram
-            // carries only the counters that moved since the last one.
+            // includes only the counters that moved since the last one.
             let counted = (0..100).any(|_| {
                 client.get(format!("http://{address}/ping")).unwrap();
                 let length = socket.recv(&mut datagram).unwrap_or(0);

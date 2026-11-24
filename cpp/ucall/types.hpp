@@ -3,12 +3,12 @@
  *  @author Ash Vardanian
  *  @date November 18, 2026
  *  @brief Statuses and expected values, deferred calls and their awaiter, owners, byte views,
- *      and the callbacks servers and clients borrow, which add no logic and throw nothing.
+ *      and the callbacks servers and clients call, which add no logic and throw nothing.
  *
  *  Every verb answers a @c status_t, an @c expected value unpacked as @c auto @c [value, status],
  *  or a @c deferred call its one owner polls, waits on, or awaits through a caller's scheduler.
- *  Handlers are @c noexcept callables borrowed for the server's or the client's lifetime, so no
- *  fault unwinds through the library.
+ *  Handlers are @c noexcept callables the caller keeps for the server's or the client's lifetime,
+ *  so no fault unwinds through the library.
  */
 #pragma once
 
@@ -102,7 +102,7 @@ class awaiter;
 
 /**
  *  @brief A submitted call: its outcome and its outputs, owned until the call is final, while the
- *      receiver, the inputs, the arena and the handlers it was handed stay borrowed until then.
+ *      receiver, the inputs, the arena and the handlers it was handed stay the caller's until then.
  *
  *  It never moves, as the library writes into it, and its one owner polls @c status, blocks in
  *  @c wait or awaits @c wait on its own loop; destruction waits, so nothing the call writes into
@@ -206,7 +206,7 @@ struct answer_value<expected<value_type_>> {
 template <typename answer_type_>
 using answer_value_t = typename answer_value<answer_type_>::type;
 
-/** Answers @p answer_type_ from a verb's @p body: a deferred call lends C its own outcome and
+/** Answers @p answer_type_ from a verb's @p body: a deferred call hands C its own outcome and
  *  outputs; a blocking call writes its outputs in place, then takes the C outcome's two words once
  *  it is final. */
 template <typename answer_type_, typename body_type_>
@@ -271,12 +271,12 @@ expected<owner_type_> opened_(void (*verb)(arguments_type_*), arguments_type_& a
 
 #pragma region Bytes and Names
 
-/** Views @p text as the counted bytes every verb reads, borrowing it. */
+/** Views @p text as the counted bytes every verb reads, without a copy. */
 inline ucall_bytes_view_t bytes_view(std::string_view text) noexcept {
     return {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
 }
 
-/** Views counted bytes the library lent as text, borrowing them. */
+/** Views counted bytes the library owns as text, without a copy. */
 inline std::string_view text_view_(ucall_bytes_view_t bytes) noexcept {
     return {reinterpret_cast<char const*>(bytes.data), bytes.length};
 }
@@ -404,32 +404,34 @@ inline bool noise_keys_equal(ucall_noise_key_t const& first, ucall_noise_key_t c
 
 #pragma region Callbacks
 
-/** A peer authorizer: hears a peer's authenticated static key and answers whether it may go on. */
+/** A peer authorizer: hears a peer's authenticated static key and answers whether it may go on,
+ *  through a const call operator, since several polling loops may call it at once. */
 template <typename handler_type_>
 concept peer_authorizer = std::is_object_v<handler_type_> &&
-                          std::is_nothrow_invocable_r_v<bool, handler_type_&, ucall_noise_key_t const&>;
+                          std::is_nothrow_invocable_r_v<bool, handler_type_ const&, ucall_noise_key_t const&>;
 
-/** A log handler: hears each formatted line and its level. */
+/** A log handler: hears each formatted line and its level, through a const call operator, since
+ *  every thread that logs may call it at once. */
 template <typename handler_type_>
 concept log_handler = std::is_object_v<handler_type_> &&
-                      std::is_nothrow_invocable_r_v<void, handler_type_&, ucall_log_level_t, std::string_view>;
+                      std::is_nothrow_invocable_r_v<void, handler_type_ const&, ucall_log_level_t, std::string_view>;
 
-/** A peer authorizer borrowed for the server's or the client's lifetime; empty admits nobody
- *  under Noise XX, which needs one. */
+/** A peer authorizer the caller keeps for the server's or the client's lifetime; empty admits
+ *  nobody under Noise XX, which needs one. */
 class peer_authorizer_t {
     ucall_peer_authorizer_t callback_ = nullptr;
     void* context_ = nullptr;
 
     template <typename handler_type_>
     static ucall_status_t trampoline_(ucall_noise_key_t const* key, void* context) noexcept {
-        if ((*static_cast<handler_type_*>(context))(*key)) return ucall_status_success_k;
+        if ((*static_cast<handler_type_ const*>(context))(*key)) return ucall_status_success_k;
         return ucall_status_peer_rejected_k;
     }
 
   public:
     peer_authorizer_t() noexcept = default;
 
-    /** Asks @p handler about every authenticated peer, borrowing it until the owner is freed. */
+    /** Asks @p handler about every authenticated peer, referring to it until the owner is freed. */
     template <peer_authorizer handler_type_>
     peer_authorizer_t(handler_type_& handler) noexcept : callback_(&trampoline_<handler_type_>), context_(&handler) {}
 
@@ -437,14 +439,14 @@ class peer_authorizer_t {
     void* context() const noexcept { return context_; }
 };
 
-/** The log sink of a server or a client: a handler borrowed for its lifetime, the line format,
- *  and the least severe level formatted; empty logs nothing. */
+/** The log sink of a server or a client: a handler the caller keeps for its lifetime, the line
+ *  format, and the least severe level formatted; empty logs nothing. */
 class log_t {
     ucall_log_t raw_ {};
 
     template <typename handler_type_>
     static void trampoline_(ucall_log_level_t level, ucall_bytes_view_t line, void* context) noexcept {
-        (*static_cast<handler_type_*>(context))(level, text_view_(line));
+        (*static_cast<handler_type_ const*>(context))(level, text_view_(line));
     }
 
   public:

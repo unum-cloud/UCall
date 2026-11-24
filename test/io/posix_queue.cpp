@@ -1,8 +1,8 @@
 /**
- *  @file test/io/posix_engine.cpp
+ *  @file test/io/posix_queue.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief The portable engine under every admitted CPU class, and the composition of every engine's
+ *  @brief The portable queue under every admitted CPU class, and the composition of every queue's
  *      cells this build compiled.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
@@ -10,26 +10,26 @@
 #include <unordered_map> // `std::unordered_map`
 
 #include "ucall/io/polled_file_reads.hpp" // `polled_file_reads`
-#include "ucall/io/posix_engine.hpp"      // `posix_engine_t`
+#include "ucall/io/posix_queue.hpp"       // `posix_queue_t`
 
-#include "io/engines.hpp" // `run_engine_cases`, `test_engine_duplex`, `test_accept_batch`, `test_direct_files`
+#include "io/queues.hpp" // `run_queue_cases`, `test_queue_duplex`, `test_accept_batch`, `test_direct_files`
 
 namespace unum::ucall::test::io {
 
-void run_posix_engine_cases() {
+void run_posix_queue_cases() {
 #if UCALL_WITH_POSIX
-    run_engine_cases<posix_engine_t>(ucall_io_backend_posix_k, []<typename engine_type_>(sz::string_t const& label) {
-        run_test_case(called("test_engine_cell", label).c_str(), [] {
+    run_queue_cases<posix_queue_t>(ucall_io_backend_posix_k, []<typename queue_type_>(sz::string_t const& label) {
+        run_test_case(called("test_queue_cell", label).c_str(), [] {
             return keeping_descriptors([] {
                 split_mix_generator_t generator {case_stream_key()};
-                test_engine_duplex<engine_type_>(generator);
-                test_accept_batch<engine_type_>();
+                test_queue_duplex<queue_type_>(generator);
+                test_accept_batch<queue_type_>();
             });
         });
-        run_cell_case(label, "test_direct_files", test_direct_files<engine_type_>);
+        run_cell_case(label, "test_direct_files", test_direct_files<queue_type_>);
     });
 #else
-    run_test_case("run_posix_engine_cases", [] { return case_result_t::skipped("built without UCALL_WITH_POSIX"); });
+    run_test_case("run_posix_queue_cases", [] { return case_result_t::skipped("built without UCALL_WITH_POSIX"); });
 #endif
 }
 
@@ -95,17 +95,17 @@ void test_polled_file_reads() {
 }
 
 void run_io_cases() {
-    run_posix_engine_cases();
+    run_posix_queue_cases();
     run_test_case("test_polled_file_reads", test_polled_file_reads);
 #if UCALL_WITH_LINUX_EPOLLAIO
-    run_linux_epollaio_engine_cases();
+    run_linux_epollaio_queue_cases();
 #endif
 #if UCALL_WITH_LINUX_URING
-    run_linux_uring612_engine_cases();
-    run_linux_uring618_engine_cases();
+    run_linux_uring612_queue_cases();
+    run_linux_uring618_queue_cases();
 #endif
 #if UCALL_WITH_BSD_KQUEUE
-    run_bsd_kqueue_engine_cases();
+    run_bsd_kqueue_queue_cases();
 #endif
 }
 

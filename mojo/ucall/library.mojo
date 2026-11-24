@@ -111,7 +111,7 @@ def _resolve[
     `get_symbol` answers `Optional` where `get_function` aborts the process, which is what lets a
     stale library name the symbol it is missing instead of dying without a message.
     """
-    comptime assert __fn_type_is_cabi[Signature](), 'the signature must carry abi("C")'
+    comptime assert __fn_type_is_cabi[Signature](), 'the signature must declare abi("C")'
     if case .Some(address) = handle.get_symbol[NoneType](name):
         return Pointer(to=address).unsafe_bitcast[Signature]()[]
     raise Error(Status.SYMBOL_MISSING, name)
@@ -250,7 +250,7 @@ struct Symbols:
         """Resolves every entry point at once, so no call ever pays for a `dlsym`.
 
         Args:
-            handle: The opened library, borrowed only while the addresses are read out.
+            handle: The opened library, used only while the addresses are read out.
 
         Raises:
             With `SYMBOL_MISSING`, on the first symbol the loaded library does not export.
@@ -353,7 +353,7 @@ struct _Loaded:
 struct Library(ImplicitlyCopyable):
     """A reference to the loaded library, cheap to copy and shared by everything it creates.
 
-    Every handle carries one, which is what keeps the shared object mapped for as long as anything
+    Every handle holds one, which is what keeps the shared object mapped for as long as anything
     can still call into it.
     """
 
@@ -372,7 +372,7 @@ struct Library(ImplicitlyCopyable):
 
     @inline(.always)
     def symbols(self) -> ref[origin_of(self.shared[].symbols)] Symbols:
-        """The resolved entry points, borrowed rather than copied on every call.
+        """The resolved entry points, read in place rather than copied on every call.
 
         Returns:
             A reference that stays valid for as long as this `Library` is held.

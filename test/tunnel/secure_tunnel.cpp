@@ -317,7 +317,7 @@ static void test_handshake_hostile() {
         handshake_stream_t message;
         expect_true(message.append(first.outbound));
 
-        // Every pattern's opening message carries one ephemeral in the clear behind the length
+        // Every pattern's opening message contains one ephemeral in the clear behind the length
         // prefix. All zeros is the canonical small-order point.
         expect_true(message.length >= secure_tunnel_headroom_k + secure_tunnel_key_size_k);
         std::memset(message.bytes + secure_tunnel_headroom_k, 0, secure_tunnel_key_size_k);

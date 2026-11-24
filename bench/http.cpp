@@ -310,7 +310,7 @@ static constexpr std::array flags_k {
                 return parse_count(text, settings.in_flight, 1);
             }},
     flag_t {"--pipeline-depth", "UCALL_PIPELINE_DEPTH", "count",
-            "calls one connection carries before awaiting a response (1)",
+            "calls one connection sends before awaiting a response (1)",
             [](std::string_view text, bench_settings_t& settings) noexcept {
                 return parse_count(text, settings.pipeline_depth, 1);
             }},
@@ -804,7 +804,7 @@ struct run_t {
     }
 };
 
-/** Prints @p text into @p row as a JSON string, escaping the quotes and backslashes URLs carry. */
+/** Prints @p text into @p row as a JSON string, escaping the quotes and backslashes URLs have. */
 template <typename row_type_>
 static void print_json_string(row_type_& row, std::string_view text) {
     row.push_back('"');

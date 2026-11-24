@@ -8,7 +8,7 @@
 #undef NDEBUG // ! A test's oracle must stay live in every build
 #include <network.hpp>
 
-#include "variants.hpp" // `io_engines_t`, `network_t`
+#include "variants.hpp" // `io_queues_t`, `network_t`
 
 namespace unum::ucall::test::network {
 
@@ -36,7 +36,7 @@ static std::string dns_wire_name(std::string_view dotted) {
     return wire + '\0';
 }
 
-/** The SOA a negative answer carries, its TTL and MINIMUM both @p ttl. */
+/** The SOA a negative answer includes, its TTL and MINIMUM both @p ttl. */
 static dns_record_t dns_soa(std::string_view owner, std::uint32_t ttl) {
     std::string data = dns_wire_name("ns.test") + dns_wire_name("admin.test");
     for (std::uint32_t const value : {1u, 60u, 60u, 60u, ttl})
@@ -198,7 +198,7 @@ struct scripted_resolver_t {
 /** A client of @p connections on @p cell 's backend and class that asks @p options' nameservers. */
 static ucall_client_t resolving_client(sweep_cell_t const& cell, uc::dns::resolver_options_t const& options,
                                        std::size_t connections = 1) {
-    using network_t = serial_network<uc::io_engines_t>;
+    using network_t = serial_network<uc::io_queues_t>;
     ucall_client_t client {};
     ucall_outcome_t outcome {};
     ucall_client_options_t config {};

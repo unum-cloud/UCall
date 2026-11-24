@@ -2,7 +2,7 @@
  *  @file src/variants_serial.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief Serial network variants for every enabled native I/O engine.
+ *  @brief Serial network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

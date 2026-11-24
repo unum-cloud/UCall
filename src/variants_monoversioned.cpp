@@ -2,7 +2,7 @@
  *  @file src/variants_monoversioned.cpp
  *  @author Ash Vardanian
  *  @date October 28, 2026
- *  @brief Monoversioned network variants for every enabled native I/O engine.
+ *  @brief Monoversioned network variants for every enabled native I/O queue.
  */
 #include "variants.hpp"
 

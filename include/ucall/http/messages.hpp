@@ -2,7 +2,8 @@
  *  @file include/ucall/http/messages.hpp
  *  @author Ash Vardanian
  *  @date July 21, 2023
- *  @brief Incremental HTTP framing and borrowed views, independent of sockets and event loops.
+ *  @brief Incremental HTTP framing and views into the caller's bytes, independent of sockets,
+ *      event loops and allocation.
  */
 #pragma once
 
@@ -122,7 +123,7 @@ struct skylake_hash_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct skylake_compare_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_skylake_k;
     static constexpr bool compiled_k = false;
@@ -158,7 +159,7 @@ struct icelake_fold_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct icelake_byteset_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
     static constexpr bool compiled_k = false;
@@ -200,7 +201,7 @@ struct neon_fold_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct neon_compare_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_neon_k;
     static constexpr bool compiled_k = false;
@@ -229,7 +230,7 @@ struct neonaes_hash_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct neonaes_hash_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_neonaes_k;
     static constexpr bool compiled_k = false;
@@ -268,7 +269,7 @@ struct powervsx_fold_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct powervsx_compare_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
     static constexpr bool compiled_k = false;
@@ -323,7 +324,7 @@ struct rvv_fold_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct rvv_compare_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_rvv_k;
     static constexpr bool compiled_k = false;
@@ -373,7 +374,7 @@ struct haswell_fold_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct haswell_compare_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_haswell_k;
     static constexpr bool compiled_k = false;
@@ -413,7 +414,7 @@ struct westmere_hash_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct westmere_compare_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_westmere_k;
     static constexpr bool compiled_k = false;
@@ -507,7 +508,7 @@ struct received_response_t : ucall_received_http_response_handle_t {
     span<byte_t const> bytes() const noexcept { return content; }
 };
 
-/** The text a byte vector holds, borrowing it. */
+/** The text a byte vector holds, pointing into it. */
 template <typename element_type_, typename allocator_type_>
 std::string_view text_view(st::vector<element_type_, allocator_type_> const& bytes) noexcept {
     static_assert(sizeof(element_type_) == 1);

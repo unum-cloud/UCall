@@ -10,8 +10,8 @@
  *  A pusher clears its link's @c next, exchanges the tail to its link, and stores its link into the
  *  @c next of the link it displaced, with a release. The loop alone walks from its head, which
  *  starts at the stub. Two repliers each write a payload, push it with a release store, queue their
- *  exchange's link, and notify: an exchange of the wake word, writing the wake channel only when it
- *  found the loop sleeping. The loop runs rounds: a pass serving a connection may adopt its
+ *  exchange's link, and notify: an exchange of the wake word, writing the pollable wakeup only when
+ *  it found the loop sleeping. The loop runs rounds: a pass serving a connection may adopt its
  *  replier's push with an acquire load before the queue hands the link out, then it drains the
  *  queue, adopting whatever is still unadopted. Before sleeping it exchanges the word to sleeping
  *  and drains again when a notify landed while it ran; it blocks until the channel was written,
@@ -106,7 +106,7 @@
 bit dequeued[3]; // ghost: links the loop handed out
 bit adopted[3];  // ghost: pushes the loop adopted
 byte received;   // ghost: how many links it handed out
-byte channel;    // ghost: wake channel writes not yet read
+byte channel;    // ghost: pollable wakeup writes not yet read
 bit queued[3];   // ghost: links in the queue, the stub aside
 byte life = 1;   // ghost: which life of the recycled exchange runs
 bit freed;       // ghost: the recycled exchange is on the free list

@@ -92,7 +92,7 @@ struct neonsha_sha256_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct neonsha_sha256_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_neonsha_k;
     static constexpr bool compiled_k = false;
@@ -111,7 +111,7 @@ struct goldmont_sha256_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct goldmont_sha256_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_goldmont_k;
     static constexpr bool compiled_k = false;
@@ -130,7 +130,7 @@ struct icelake_aes256_gcm_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct icelake_aes256_gcm_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_icelake_k;
     static constexpr bool compiled_k = false;
@@ -149,7 +149,7 @@ struct neonaes_aes256_gcm_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct neonaes_aes256_gcm_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_neonaes_k;
     static constexpr bool compiled_k = false;
@@ -168,7 +168,7 @@ struct westmere_aes256_gcm_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct westmere_aes256_gcm_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_westmere_k;
     static constexpr bool compiled_k = false;
@@ -194,7 +194,7 @@ struct powervsx_aes256_gcm_kit_t {
 };
 #else
 
-/** The kits this build cannot carry, kept so each ladder stays one list. */
+/** The kits this build lacks, kept so each ladder stays one list. */
 struct powervsx_sha256_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_powervsx_k;
     static constexpr bool compiled_k = false;
@@ -215,7 +215,7 @@ struct haswell_x25519_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct haswell_x25519_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_haswell_k;
     static constexpr bool compiled_k = false;
@@ -232,7 +232,7 @@ struct neon_x25519_kit_t {
 };
 #else
 
-/** The kit this build cannot carry, kept so the ladder stays one list. */
+/** The kit this build lacks, kept so the ladder stays one list. */
 struct neon_x25519_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_neon_k;
     static constexpr bool compiled_k = false;
@@ -335,10 +335,10 @@ struct secure_tunnel_crypto {
     /**
      *  @brief Bytes reserved inside the connection's storage for what @c advance generates.
      *
-     *  The widest handshake message any supported pattern writes carries an ephemeral in the clear,
-     *  a static under the AEAD, and the empty payload's tag - ninety-eight bytes with its prefix. A
-     *  close record's nineteen fit easily inside the same buffer, and the two are never live at
-     *  once because a close cannot be requested before the handshake completes.
+     *  The widest handshake message any supported pattern writes contains an ephemeral in the
+     *  clear, a static under the AEAD, and the empty payload's tag - ninety-eight bytes with its
+     *  prefix. A close record's nineteen fit easily inside the same buffer, and the two are never
+     *  live at once because a close cannot be requested before the handshake completes.
      *
      */
     static constexpr std::size_t outbound_capacity_k = prefix_size_k + 2 * secure_tunnel_key_size_k + 2 * tag_size_k;
@@ -830,7 +830,7 @@ struct secure_tunnel_crypto {
 
     struct secure_tunnel_pattern_t {
 
-        /** Tokens one message may carry, which the longest supported message needs all of. */
+        /** Tokens one message may contain, which the longest supported message needs all of. */
         static constexpr std::size_t max_tokens_k = 6;
 
         /** Messages a pattern may define. Three is XX's count, and the largest of the three. */
@@ -903,10 +903,11 @@ struct secure_tunnel_crypto {
      * ← e, ee, se
      *  @endcode
      *
-     *  @note No message carries a @c static_k, so the peer's key is never received and never
-     *      promoted by the reading path. It is proven instead by the @c ss and @c es operations,
-     *      whose results only agree if the peer holds the private half - which is why the promotion
-     *      at @c finish_handshake is load-bearing for this pattern specifically.
+     *  @note No message contains a @c static_k, so the peer's key is never received or promoted.
+     *
+     *  The @c ss and @c es operations prove it instead, since their results only agree if the peer
+     *  holds the private half, which is why the promotion at @c finish_handshake is load-bearing
+     *  for this pattern specifically.
      */
     static constexpr secure_tunnel_pattern_t pattern_kk_k {
         "Noise_KK_25519_AESGCM_SHA256",
@@ -957,10 +958,10 @@ struct secure_tunnel_crypto {
      *  @brief One connection's Noise state, from the first handshake byte to the last record.
      *
      *  Identical across all three patterns, which was checked rather than assumed: every one
-     *  carries @c e and at least one static-touching token, so all six key buffers are live in all
+     *  contains @c e and at least one static-touching token, so all six key buffers are live in all
      *  three and a union across modes would save nothing. What differs is the message count, the
-     *  two pre-message flags, and when the peer's key becomes trustworthy - all carried by
-     *  @c pattern and @c remote_static_state.
+     *  two pre-message flags, and when the peer's key becomes trustworthy - all kept by @c pattern
+     *  and @c remote_static_state.
      */
     struct secure_tunnel_noise_t {
 
@@ -1077,7 +1078,7 @@ struct secure_tunnel_crypto {
      *  @brief Derives the record-layer keys, then destroys everything the handshake no longer
      *      needs.
      *
-     *  The wipe is not tidiness. Forward secrecy is the entire reason Noise carries ephemerals:
+     *  The wipe is not tidiness. Forward secrecy is the entire reason Noise uses ephemerals:
      *  once the keys are split, an attacker who later compromises the static key - or simply reads
      *  this process's memory - must not be able to reconstruct session keys for traffic already
      *  sent, and they can if the ephemeral private half is still lying in the connection's storage.
@@ -1179,8 +1180,7 @@ struct secure_tunnel_crypto {
     }
 
     /**
-     *  @brief Reads the pattern message at @c message_index, discarding whatever payload it
-     *      carried.
+     *  @brief Reads the pattern message at @c message_index, discarding whatever payload it had.
      *  @param[in,out] noise The handshake state the message advances.
      *  @param[in] body The message without its length prefix.
      *  @return Why it failed. A message too short to hold the field a token demands is
@@ -1266,7 +1266,7 @@ struct secure_tunnel_crypto {
      *  @param[in,out] noise The established session state, whose sending cipher seals the record.
      *  @param[in,out] record The buffer holding the payload at one prefix in, which becomes it.
      *  @param[in] filled How many payload bytes sit behind the prefix.
-     *  @param[in] kind What the record carries, sealed behind the payload and inside the tag.
+     *  @param[in] kind What the record contains, sealed behind the payload and inside the tag.
      *  @return Bytes the finished record occupies, or zero when the key is exhausted.
      *
      *  The prefix is written before the payload is sealed and passed as associated data, exactly as

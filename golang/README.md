@@ -81,6 +81,7 @@ The polling goroutine runs the handler, the client blocks in `Get` until its res
 `NewServer` takes the interfaces to answer on and optional `ServerOptions`: the `Backend`, a `CPUClass` ceiling that caps the picked class rather than demanding one the machine lacks, a `Log` sink and a StatsD endpoint in `Metrics`.
 It fails rather than substituting when the backend is unavailable or the CPU does not run the class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
+`Server.MemoryDomain` reports the NUMA node the kernel ties an interface's device to, or -1, so the application inits and polls from goroutines locked to threads there; UCall places nothing by it.
 `NewInterface` admits 1024 connections, reads one request per connection at a time unless `PipelinedRequests` allows more, and replies still leave in request order.
 `MaxRequestBytes` caps a request's head and buffered body, answering 413 past it, and `ReplyDirectories` names the directories path replies resolve beneath.
 `ListenDescriptor` accepts on a listener another owner opened instead of binding an address, and never closes it.
@@ -128,7 +129,7 @@ Log lines reach the callback on whichever goroutine produced them, and StatsD da
 ## Requests
 
 A handler receives each `*Request`.
-Its reads borrow the received bytes until the reply: `Verb`, `Path`, `QueryString`, `PathParameter`, `Query`, `Header` and `Body`, with `Peer` naming the interface it arrived on, the client's authenticated Noise key and its `PeerAddress`.
+Its reads view the received bytes until the reply: `Verb`, `Path`, `QueryString`, `PathParameter`, `Query`, `Header` and `Body`, with `Peer` naming the interface it arrived on, the client's authenticated Noise key and its `PeerAddress`.
 Every read that can fail answers its value beside an error, so a missing header or parameter reports `StatusNotFound` and a body read on a streamed route `StatusInvalidArgument`.
 The path and query values stay percent-encoded as sent, which `ucall.DecodePercent` decodes, header names match case-insensitively, and the body arrives whole, decoded from chunked framing if it was sent that way.
 `Fields` yields every header field in arrival order as a name and a value, names lowercased and values trimmed, as a proxy forwards a head.
@@ -149,7 +150,7 @@ err = server.Post("/orders/{order}", func(request *ucall.Request) {
 ```
 
 `Reply` and `ReplyError` take the request, so a request is answered at most once, and Content-Length, Date and Server are generated.
-A reply copies what it sends before it returns, so a body may borrow the request's bytes.
+A reply copies what it sends before it returns, so a body may view the request's bytes.
 A handler that neither replies nor detaches its request answers 500 once it returns, and a handler that panics crashes the process, as a panic cannot unwind through the library.
 The library clears the request's handle once a reply took it, a closed connection included, which reports `StatusConnectionClosed`; a reply it refused keeps the handle, and the handler's return then answers 500.
 
@@ -185,7 +186,7 @@ for detached := range handed {
 ```
 
 `ReplyParts` concatenates `BytesPart`, `PathPart` and `FilePart` parts into one body whose Content-Length is measured from the files.
-A path part resolves beneath the interface's `ReplyDirectories`, refusing absolute paths, `..` and links leading out, and a file part borrows the caller's unbuffered descriptor until the reply is final, while bytes and paths are copied before the call returns.
+A path part resolves beneath the interface's `ReplyDirectories`, refusing absolute paths, `..` and links leading out, and a file part names the caller's unbuffered descriptor until the reply is final, while bytes and paths are copied before the call returns.
 A missing, unreadable or too short file replaces the reply with 404, 416 or 500 before its head leaves, and the `Deferred` reports the cause.
 `Deferred.Status` polls, `Deferred.Wait` parks the goroutine in the library until the call is final, `Deferred.Close` waits and drops it, and a `Deferred` dropped without either is released by the collector once final.
 A refusal comes back as the error beside a nil `Deferred`, before anything is submitted.
@@ -272,7 +273,7 @@ go infer.TakeBatches()
 
 `Batching` dispatches as soon as `MinSize` requests wait, never more than `MaxSize` at once, and a smaller batch once its oldest request waited `MaxLatency`; zero fields mean 1, 32 and 10 milliseconds.
 The handler runs on the goroutine polling the endpoint through `TakeBatch` or `TakeBatches`, never on an event loop, so a slow batch never stalls the network.
-A `Batch` lends its requests in arrival order, and `Take` hands one over, to be replied to then or later from any goroutine; a request never taken stays unanswered until the server closes.
+A `Batch` holds its requests in arrival order, and `Take` hands one over, to be replied to then or later from any goroutine; a request never taken stays unanswered until the server closes.
 The queue holds as many requests as the interfaces admit at once, connections times pipelined requests, and refuses more with 503.
 `BatchEndpoint.Statistics` counts batches and requests, and whether each was dispatched on reaching `MaxSize`, on reaching `MinSize`, or once `MaxLatency` passed.
 
@@ -425,11 +426,11 @@ default:
 A submitted call that fails completes with `Completed.Err`: `StatusConnectionFailed`, `StatusConnectionClosed`, `StatusTimeout`, `StatusHandshakeFailed` or `StatusPeerRejected`.
 A request or response lookup that finds nothing fails with `StatusNotFound` beside an empty value, and HTTP error statuses are ordinary responses.
 `Backend`, `CPUClass` and `Status` print their stable names, like "linux-uring618" and "intel-icelake", and `BackendFromName`, `CPUClassFromName` and `StatusFromName` parse them back, failing with `StatusInvalidArgument` on a name no value has.
-`ucall.Version()` spells the linked library's version, candidate suffix included, and `ucall.DecodePercent` decodes a path or a query value, which requests lend still percent-encoded.
+`ucall.Version()` spells the linked library's version, candidate suffix included, and `ucall.DecodePercent` decodes a path or a query value, which requests hold still percent-encoded.
 
 ## Threads & Polling
 
-The package starts no goroutines: every callback runs on a goroutine the application lent to a polling call, which stays on one thread for that call.
+The package starts no goroutines: every callback runs on a goroutine the application gave to a polling call, which stays on one thread for that call.
 
 - A route handler runs on the goroutine inside `TakeCall` or `TakeCalls` for the event loop that received the request.
 - A batch handler runs on the goroutine inside `TakeBatch` or `TakeBatches` for its endpoint, never on an event loop.

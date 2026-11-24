@@ -1,6 +1,6 @@
 //! Vocabulary shared by servers and clients: statuses and errors, deferred outcomes, verbs,
 //! backends, CPU classes, security modes, Noise keys, log sinks, and the byte views header lines
-//! are lent as.
+//! are passed as.
 //!
 //! File: rust/types.rs
 //! Author: Ash Vardanian
@@ -242,7 +242,7 @@ impl fmt::Display for Status {
 pub struct Error {
     /// What went wrong, to branch on.
     pub status: Status,
-    /// The detail the status alone cannot carry.
+    /// The detail the status alone cannot express.
     pub message: &'static str,
 }
 
@@ -276,11 +276,11 @@ impl Default for ucall_outcome_t {
     }
 }
 
-/// A caller-lent slot for a reply that may still send a file or path part after it returns: the
-/// event loop makes its outcome final in place, so the slot is pinned, and the descriptors its
-/// parts borrow stay open for `'f`.
+/// A slot the caller keeps for a reply that may still send a file or path part after it returns:
+/// the event loop makes its outcome final in place, so the slot is pinned, and the descriptors its
+/// parts name stay open for `'f`.
 ///
-/// A new slot is final, and each reply lent to it waits for the slot's previous one only while
+/// A new slot is final, and each reply written into it waits for the slot's previous one only while
 /// that still sends, so a server keeps a ring of slots rather than one per request.
 /// [`Deferred::status`] polls without blocking, [`Deferred::wait`] blocks until the reply is
 /// final, and `.await` re-polls it from async code. Dropping one that is not final waits for it,
@@ -293,7 +293,7 @@ pub struct Deferred<'f> {
     _pinned: PhantomPinned,
 }
 
-// Until a reply is lent to it the slot is plain data, and afterwards only the library writes it.
+// Until a reply writes into it the slot is plain data, and afterwards only the library writes it.
 unsafe impl Send for Deferred<'_> {}
 
 impl Default for Deferred<'_> {
@@ -308,7 +308,7 @@ impl Deferred<'_> {
         Deferred { outcome: UnsafeCell::new(ucall_outcome_t::default()), files: PhantomData, _pinned: PhantomPinned }
     }
 
-    /// Waits only while the slot's previous reply still sends, then lends its outcome afresh.
+    /// Waits only while the slot's previous reply still sends, then resets its outcome.
     pub(crate) fn reuse(self: Pin<&mut Self>) -> *mut ucall_outcome_t {
         let outcome = self.outcome.get();
         unsafe {
@@ -360,7 +360,7 @@ impl Future for Deferred<'_> {
     }
 }
 
-/// Borrows a static null-terminated string the library owns.
+/// Views a static null-terminated string the library owns.
 ///
 /// Every such string is ASCII by construction, so its bytes are read as UTF-8 unchecked.
 pub(crate) unsafe fn static_string(raw: *const c_char) -> &'static str {
@@ -370,7 +370,7 @@ pub(crate) unsafe fn static_string(raw: *const c_char) -> &'static str {
     unsafe { core::str::from_utf8_unchecked(CStr::from_ptr(raw).to_bytes()) }
 }
 
-/// Lends a borrowed slice as the view the library reads.
+/// Views a slice as the bytes the library reads, valid while the slice is.
 pub(crate) fn view(bytes: &[u8]) -> ucall_bytes_view_t {
     ucall_bytes_view_t { data: bytes.as_ptr(), length: bytes.len() }
 }
@@ -464,14 +464,14 @@ pub fn derive_noise_public_key(private_key: &NoiseKey) -> NoiseKey {
     public_key
 }
 
-/// A file descriptor borrowed for `'f`, laid out as the C `int` the library reads.
+/// A file descriptor open for `'f`, laid out as the C `int` the library reads.
 #[cfg(unix)]
 pub type Descriptor<'f> = std::os::fd::BorrowedFd<'f>;
-/// A file descriptor borrowed for `'f`, laid out as the C `int` the library reads.
+/// A file descriptor open for `'f`, laid out as the C `int` the library reads.
 #[cfg(windows)]
 pub type Descriptor<'f> = CrtDescriptor<'f>;
 
-/// A C runtime descriptor, as `_open_osfhandle` makes one, borrowed for `'f` and never closed.
+/// A C runtime descriptor, as `_open_osfhandle` makes one, open for `'f` and never closed here.
 #[cfg(windows)]
 #[repr(transparent)]
 #[derive(Clone, Copy, Debug)]
@@ -480,41 +480,42 @@ pub struct CrtDescriptor<'f> {
     file: PhantomData<&'f ()>,
 }
 
-/// The C `int` a borrowed descriptor names.
+/// The C `int` a descriptor names.
 #[cfg(unix)]
 pub(crate) fn raw_descriptor(descriptor: Descriptor<'_>) -> c_int {
     std::os::fd::AsRawFd::as_raw_fd(&descriptor)
 }
-/// The C `int` a borrowed descriptor names.
+/// The C `int` a descriptor names.
 #[cfg(windows)]
 pub(crate) fn raw_descriptor(descriptor: Descriptor<'_>) -> c_int {
     descriptor.descriptor
 }
 
-/// Borrows a C descriptor the caller knows stays open for `'f`.
+/// Names a C descriptor the caller knows stays open for `'f`.
 #[cfg(unix)]
-pub(crate) unsafe fn borrowed_descriptor<'f>(descriptor: c_int) -> Descriptor<'f> {
+pub(crate) unsafe fn descriptor_from_raw<'f>(descriptor: c_int) -> Descriptor<'f> {
     unsafe { std::os::fd::BorrowedFd::borrow_raw(descriptor) }
 }
-/// Borrows a C descriptor the caller knows stays open for `'f`.
+/// Names a C descriptor the caller knows stays open for `'f`.
 #[cfg(windows)]
-pub(crate) unsafe fn borrowed_descriptor<'f>(descriptor: c_int) -> Descriptor<'f> {
-    unsafe { CrtDescriptor::borrow_raw(descriptor) }
+pub(crate) unsafe fn descriptor_from_raw<'f>(descriptor: c_int) -> Descriptor<'f> {
+    unsafe { CrtDescriptor::from_raw(descriptor) }
 }
 
 #[cfg(windows)]
 impl CrtDescriptor<'_> {
-    /// Borrows `descriptor`.
+    /// Wraps `descriptor`.
     ///
     /// # Safety
     ///
     /// The descriptor stays open for the returned lifetime.
-    pub unsafe fn borrow_raw(descriptor: c_int) -> Self {
+    pub unsafe fn from_raw(descriptor: c_int) -> Self {
         CrtDescriptor { descriptor, file: PhantomData }
     }
 }
 
-/// A borrowed header line, laid out so a slice of them is lent to the library without copying.
+/// A header line pointing into the caller's bytes, laid out so a slice of them is the C array the
+/// library reads in place.
 #[repr(transparent)]
 #[derive(Clone, Copy)]
 pub struct BytesView<'bytes> {
@@ -541,7 +542,7 @@ impl<'bytes, const LENGTH: usize> From<&'bytes [u8; LENGTH]> for BytesView<'byte
 }
 
 impl<'bytes> BytesView<'bytes> {
-    /// The bytes this view borrows.
+    /// The bytes this view points into.
     pub fn as_bytes(&self) -> &'bytes [u8] {
         unsafe { viewed(self.raw) }
     }
@@ -551,12 +552,12 @@ impl<'bytes> BytesView<'bytes> {
         self.raw
     }
 
-    /// Wraps a C view the caller knows borrows for `'bytes`.
+    /// Wraps a C view the caller knows stays valid for `'bytes`.
     pub(crate) unsafe fn from_raw(raw: ucall_bytes_view_t) -> Self {
         BytesView { raw, bytes: PhantomData }
     }
 
-    /// Lends a run of views as the counted array the library reads.
+    /// Views a run of views as the counted array the library reads.
     pub(crate) fn raw_array(views: &[BytesView<'_>]) -> *const ucall_bytes_view_t {
         views.as_ptr().cast()
     }
@@ -625,7 +626,7 @@ impl HTTPStatus {
 /// An HTTP method, for routing on the server and for calls on the client.
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub enum Verb {
-    /// Unrecognized; a routed request never carries it.
+    /// Unrecognized; a routed request never has it.
     Unknown,
     /// GET, reading a resource.
     Get,
@@ -825,7 +826,8 @@ impl Security {
 }
 
 /// Decides whether a peer presenting an authenticated static key may proceed past the handshake:
-/// a handler borrowed for `'handler`, lent to the library as its C callback and context.
+/// a handler the caller keeps for `'handler`, which the library calls through its C callback and
+/// context.
 ///
 /// A server runs it on the polling thread completing the handshake, and a client on its owner
 /// thread inside [`Client::take_completed`](crate::Client::take_completed). A panic aborts the
@@ -837,7 +839,7 @@ pub struct PeerAuthorizer<'handler> {
     handler: PhantomData<&'handler ()>,
 }
 
-// The handler is `Sync`, so any thread may call it through the shared reference it was lent as.
+// The handler is `Sync`, so any thread may call it through the shared reference the caller keeps.
 unsafe impl Send for PeerAuthorizer<'_> {}
 unsafe impl Sync for PeerAuthorizer<'_> {}
 
@@ -847,11 +849,11 @@ impl<'handler> PeerAuthorizer<'handler> {
         let context = ptr::from_ref(handler).cast_mut().cast();
         PeerAuthorizer { callback: Some(authorize_trampoline::<F>), context, handler: PhantomData }
     }
+}
 
-    /// The C callback and context of an optional authorizer.
-    pub(crate) fn raw(authorizer: Option<PeerAuthorizer<'_>>) -> (ucall_peer_authorizer_t, *mut c_void) {
-        authorizer.map_or((None, ptr::null_mut()), |authorizer| (authorizer.callback, authorizer.context))
-    }
+/// Names an optional authorizer as the C callback and the context it is called with.
+pub(crate) fn authorizer_callback(authorizer: Option<PeerAuthorizer<'_>>) -> (ucall_peer_authorizer_t, *mut c_void) {
+    authorizer.map_or((None, ptr::null_mut()), |authorizer| (authorizer.callback, authorizer.context))
 }
 
 /// # Safety
@@ -921,17 +923,17 @@ pub enum LogFormat {
     JSON,
 }
 
-/// The one log sink of a server or a client: a handler borrowed for `'handler`, which receives
-/// each formatted line, without a trailing newline, on whichever thread produced it, polling
-/// threads included. It should return quickly, and a panic aborts the process; without a sink,
-/// the library writes nothing anywhere.
+/// The one log sink of a server or a client: a handler the caller keeps for `'handler`, which
+/// receives each formatted line, without a trailing newline, on whichever thread produced it,
+/// polling threads included. It should return quickly, and a panic aborts the process; without a
+/// sink, the library writes nothing anywhere.
 #[derive(Clone, Copy)]
 pub struct Log<'handler> {
     raw: ucall_log_t,
     handler: PhantomData<&'handler ()>,
 }
 
-// The handler is `Sync`, so any thread may call it through the shared reference it was lent as.
+// The handler is `Sync`, so any thread may call it through the shared reference the caller keeps.
 unsafe impl Send for Log<'_> {}
 unsafe impl Sync for Log<'_> {}
 
@@ -946,11 +948,11 @@ impl<'handler> Log<'handler> {
         };
         Log { raw, handler: PhantomData }
     }
+}
 
-    /// The C log of an optional sink, logging nothing without one.
-    pub(crate) fn raw(log: Option<Log<'_>>) -> ucall_log_t {
-        log.map_or(ucall_log_t { callback: None, context: ptr::null_mut(), format: 0, level: 0 }, |log| log.raw)
-    }
+/// Names an optional sink as the C log, logging nothing without one.
+pub(crate) fn log_callback(log: Option<Log<'_>>) -> ucall_log_t {
+    log.map_or(ucall_log_t { callback: None, context: ptr::null_mut(), format: 0, level: 0 }, |log| log.raw)
 }
 
 /// # Safety

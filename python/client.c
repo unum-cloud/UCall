@@ -17,7 +17,7 @@ typedef struct Client {
     /** The thread that created the client, the only one the C interface lets submit and poll. */
     unsigned long owner;
 
-    /** The 32-byte Noise identity the C client borrows, or NULL. */
+    /** The 32-byte Noise identity the C client reads, kept alive by this record, or NULL. */
     PyObject* noise_private_key;
 
     /** The callable vetting Noise servers, or NULL. */
@@ -51,20 +51,22 @@ struct Completed {
     /** @c ucall_status_deferred_k until retrieved. */
     ucall_status_t status;
 
-    /** The URL the client borrows while the call is in flight, as UTF-8 @c bytes. */
+    /** The URL the client reads while the call is in flight, kept alive by this record, as
+     *  UTF-8 @c bytes. */
     PyObject* url;
 
-    /** The header lines the client borrows while the call is in flight. */
+    /** The header lines the client reads while the call is in flight, kept alive by this record. */
     ucall_py_header_lines_t headers;
 
-    /** The body the client borrows while the call is in flight. */
+    /** The body the client reads while the call is in flight, kept alive by this record. */
     Py_buffer body;
 
-    /** The server's static key the client borrows while the call is in flight. */
+    /** The server's static key the client reads while the call is in flight, kept alive by this
+     *  record. */
     ucall_noise_key_t noise_peer_key;
 
-    /** The client's private key for this call, which the client borrows while the call is in
-     *  flight. */
+    /** The client's private key for this call, which the client reads while the call is in
+     *  flight and this record keeps alive. */
     ucall_noise_key_t noise_private_key;
 
     /** The neighbors in the client's in-flight list. */
@@ -120,7 +122,8 @@ typedef struct ResponseBodyChunks {
     ucall_bytes_view_t data;
 } ResponseBodyChunks;
 
-/** Returns the inputs a finished or cancelled call borrowed and unlinks it from its client. */
+/** Frees the inputs a finished or cancelled call kept alive for the client and unlinks it from its
+ *  client. */
 static void completed_release_inputs(Client* client, Completed* call) {
     if (call->previous) call->previous->next = call->next;
     else if (client->in_flight == call) client->in_flight = call->next;
@@ -288,8 +291,8 @@ static char const doc_Response_body_chunks[] =                                  
     "run on the client's thread and advance the client while nothing was decoded; a client\n"       //
     "bound to a server advances only as its loop polls, so there a pull finding nothing\n"          //
     "raises `Status.WOULD_BLOCK`, and `async for` yields until it polled. Every streamed\n"         //
-    "response is pulled to its end or released, bodiless ones too, as its connection carries\n"     //
-    "no other call meanwhile; releasing it early closes that connection, failing the calls\n"       //
+    "response is pulled to its end or released, bodiless ones too, as its connection holds no\n"    //
+    "other call meanwhile; releasing it early closes that connection, failing the calls\n"          //
     "pipelined behind it with `Status.CONNECTION_CLOSED`.\n"                                        //
     "\n"                                                                                            //
     "Returns:\n"                                                                                    //
@@ -431,7 +434,7 @@ static PyObject* response_chunks_yield(ResponseBodyChunks* self) {
     return Py_XNewRef(self->chunk);
 }
 
-/** Advances a client with its own engine and pulls again, answering whether still nothing was
+/** Advances a client with its own queue and pulls again, answering whether still nothing was
  *  decoded. */
 static PyObject* response_chunks_pending(ResponseBodyChunks* self, [[maybe_unused]] PyObject* unused) {
     if (!self->response->bound) {
@@ -559,7 +562,7 @@ static char const doc_Client[] =                                                
     "\n"                                                                                                //
     "Args:\n"                                                                                           //
     "  connections (int): Connections open at once, across every server it calls.\n"                    //
-    "  pipelined_calls (int, optional): Calls one connection carries at once; 0 means one.\n"           //
+    "  pipelined_calls (int, optional): Calls one connection holds at once; 0 means one.\n"             //
     "  calls (int, optional): Calls accepted at once, retrieved or not; 0 means `connections`\n"        //
     "    times `pipelined_calls`.\n"                                                                    //
     "  connect_timeout_microseconds (int, optional): The budget to connect, in microseconds;\n"         //
@@ -579,8 +582,8 @@ static char const doc_Client[] =                                                
     "  max_response_bytes (int, optional): The largest response a call buffers, past which it\n"        //
     "    fails with `Status.OVERFLOW`; 0 takes the largest receive buffer the kernel grants.\n"         //
     "  server (Server, optional): A server whose event loop drives this client, sharing its\n"          //
-    "    engine: bound before that loop first polls, used on its polling thread, and its\n"             //
-    "    `take_completed` only hands out what the loop finished. None gives it its own engine.\n"       //
+    "    queue: bound before that loop first polls, used on its polling thread, and its\n"              //
+    "    `take_completed` only hands out what the loop finished. None gives it its own queue.\n"        //
     "  event_loop (int, optional): Which of `server`'s event loops. Defaults to 0.\n"                   //
     "\n"                                                                                                //
     "Raises:\n"                                                                                         //
@@ -692,7 +695,7 @@ static int Client_clear(Client* self) {
 
 static void Client_dealloc(Client* self) {
     PyObject_GC_UnTrack(self);
-    // The C client cancels every accepted call, so their borrowed inputs return only after it.
+    // The C client cancels every accepted call, so their inputs stay allocated until it returns.
     Py_BEGIN_ALLOW_THREADS;
     ucall_client_free(self->handle);
     Py_END_ALLOW_THREADS;
@@ -729,7 +732,7 @@ typedef struct call_options_t {
 
 /**
  *  @brief Submits one exchange, whose @c Completed the client owns until it is retrieved.
- *  @return The borrowed @c Completed, or NULL with an exception set.
+ *  @return The @c Completed, which the caller owns, or NULL with an exception set.
  */
 static Completed* client_submit(Client* self, ucall_verb_t verb, PyObject* url, PyObject* body, PyObject* headers,
                                 call_options_t const* options, PyObject* context) {
@@ -838,7 +841,7 @@ static char const doc_Client_submit[] =                                         
     "Args:\n"                                                                                             //
     "  verb (Verb): The method, such as `Verb.POST` or \"post\".\n"                                       //
     "  url (str | bytes): The full URL, \"http://\" or \"http+noise://\" and the server.\n"               //
-    "  body (Buffer, optional): Any bytes-like object, borrowed until the call completes.\n"              //
+    "  body (Buffer, optional): Any bytes-like object the call keeps alive until it completes.\n"         //
     "  headers (Sequence[str | bytes], optional): \"name: value\" lines; the client adds Host,\n"         //
     "    Content-Length and User-Agent itself.\n"                                                         //
     "  security (Security, optional): The handshake for this call. Defaults to `Security.NONE`,\n"        //
@@ -955,7 +958,7 @@ static PyObject* client_request(Client* self, ucall_verb_t verb, PyObject* url, 
         body = encoded;
         headers = lines;
     }
-    // The call keeps its own references to the body and header lines it borrows.
+    // The call keeps its own references to the body and header lines it reads.
     Completed* const own = client_submit(self, verb, url, body, headers, options, NULL);
     Py_XDECREF(lines);
     Py_XDECREF(encoded);
