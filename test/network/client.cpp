@@ -456,6 +456,57 @@ static void test_redirect_to_noise_refused(sweep_cell_t const& cell, split_mix_g
     fixture.stop();
 }
 
+/** A call refused before its dial reports its own status, not the tunnel fault an earlier call's
+ *  failed handshake left on the connection it then takes. */
+static void test_refused_dial_drops_stale_note(sweep_cell_t const& cell, split_mix_generator_t& generator) {
+    fixture_t fixture {cell, {}};
+    raw_listener_t listener;
+    if (!expect_true(fixture.status == ucall_status_success_k && !listener.address.empty(), "setup: {}",
+                     ucall_status_name(fixture.status)))
+        return;
+    std::thread peer_thread {[&, seed = generator()] {
+        split_mix_generator_t peer_generator {seed};
+        auto const deadline = steady_clock::now() + wait_limit_k;
+        raw_client_t peer;
+        if (!listener.accept(peer, deadline) || peer.read(1, deadline) != read_end_t::filled_k) return;
+        // A one-byte handshake message, too short for any pattern's reply.
+        std::string const malformed {"\x00\x01\x00", 3};
+        if (!peer.write(byte_span(malformed), malformed.size(), peer_generator, deadline)) return;
+        [[maybe_unused]] read_end_t const closed = peer.read_until_close(deadline);
+    }};
+    auto call = [&](std::string const& url, ucall_security_t security) {
+        ucall_outcome_t outcome {};
+        ucall_client_call_t arguments {};
+        arguments.client = fixture.client;
+        arguments.outcome = &outcome;
+        arguments.url = bytes_view(url);
+        arguments.verb = ucall_verb_get_k;
+        arguments.options.security = security;
+        arguments.options.noise_peer_key = &fixture.server_public;
+        ucall_client_call(&arguments);
+        expect_true(outcome.status == ucall_status_success_k, "submitting {}: {}", url,
+                    ucall_status_name(outcome.status));
+        auto const completed = fixture.wait();
+        if (completed.response) ucall_client_response_free(completed.response);
+        return completed.outcome;
+    };
+    auto const faulted = call(fmt::format("http://{}/noise", listener.address), ucall_security_noise_ik_k);
+    peer_thread.join();
+    char const* const handshake_failed = ucall_status_name(ucall_status_handshake_failed_k);
+    expect_true(faulted.status == ucall_status_handshake_failed_k && faulted.message &&
+                    std::string_view {faulted.message} != handshake_failed,
+                "the handshake completed {} {}", ucall_status_name(faulted.status),
+                faulted.message ? faulted.message : "");
+    // A space in the target passes submission and fails only as the request is composed.
+    auto const refused = call(fmt::format("http://{}/a b", listener.address), ucall_security_none_k);
+    char const* const invalid_argument = ucall_status_name(ucall_status_invalid_argument_k);
+    expect_true(refused.status == ucall_status_invalid_argument_k && refused.message &&
+                    std::string_view {refused.message} == invalid_argument,
+                "the refused call completed {} {}", ucall_status_name(refused.status),
+                refused.message ? refused.message : "");
+    fixture.stop();
+}
+
 /** Response field lines read back by index in arrival order, repeated names apart, names lowercased
  *  as the parser keeps them and values trimmed, and an index past the last one is not found. */
 static void test_client_response_fields(sweep_cell_t const& cell, split_mix_generator_t& generator) {
@@ -1126,6 +1177,7 @@ void test_client_cell(sweep_cell_t const& cell, split_mix_generator_t& generator
         test_receive_follows_early_response(cell, generator);
         test_redirect_query_only(cell, generator);
         test_redirect_to_noise_refused(cell, generator);
+        test_refused_dial_drops_stale_note(cell, generator);
         test_client_response_fields(cell, generator);
         test_client_log_lines(cell);
         test_bound_client_calls_from_handler(cell);

@@ -1100,8 +1100,11 @@ struct client : ucall_client_handle_t {
             result = dial_connection(client, connection, exchange);
             if (result != ucall_status_success_k) pop_call(connection);
         }
+        // Only a tunnel that `configure` just refused sets the note, and a vacant connection keeps
+        // the one its last failure left.
         if (result != ucall_status_success_k)
-            finish_exchange(client, exchange, result, nullptr, connection.transport.note);
+            finish_exchange(client, exchange, result, nullptr,
+                            result == ucall_status_handshake_failed_k ? connection.transport.note : nullptr);
         credit_room(client, connection);
     }
 
