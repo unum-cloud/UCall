@@ -146,12 +146,18 @@ target_include_directories(
                         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
 )
 
-# The archive passes the native interface in `include/` and its siblings on to the tests, tools and bindings built here,
-# and an installed archive names only what it links. The shared library passes nothing but the C interface.
+# The header-only engine in `include/`, over the C types of `ucall::abi` and the siblings' headers. Only the build tree
+# has it, as no install ships the siblings it includes.
+add_library(ucall_header INTERFACE)
+add_library(ucall::header ALIAS ucall_header)
+target_include_directories(ucall_header INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
+target_compile_features(ucall_header INTERFACE cxx_std_20)
+target_link_libraries(ucall_header INTERFACE ucall_abi forkunion::header smashtable::header stringzilla::header)
+
+# The archive passes `ucall::header` on to the tests, tools and bindings built here, and an installed archive names only
+# what it links. The shared library passes nothing but the C interface.
 function (ucall_setup_library target_ scope_)
-    target_include_directories(
-        ${target_} ${scope_} "$<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>" PRIVATE "${PROJECT_SOURCE_DIR}/src"
-    )
+    target_include_directories(${target_} PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_compile_features(${target_} ${scope_} cxx_std_20)
     target_compile_definitions(${target_} PRIVATE UCALL_VERSION_NAME="${ucall_version_name_}")
     target_compile_definitions(${target_} ${scope_} ${ucall_facility_definitions_})
@@ -162,8 +168,7 @@ function (ucall_setup_library target_ scope_)
                 $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
     )
     target_link_libraries(
-        ${target_} ${scope_} $<BUILD_INTERFACE:forkunion::header> $<BUILD_INTERFACE:smashtable::header>
-        $<BUILD_INTERFACE:stringzilla::header> $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
+        ${target_} ${scope_} $<BUILD_INTERFACE:ucall_header> $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
     )
     # The C ABI is all a binary linking either flavor may export; UCALL_EXPORT marks it.
     set_target_properties(
