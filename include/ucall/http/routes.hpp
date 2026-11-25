@@ -131,7 +131,7 @@ class route_trie {
     template <typename record_type_>
     using pool = st::basic_growing_pool<record_type_, std::uint32_t, pool_allocator_t>;
 
-    pool_allocator_t allocator_;
+    [[no_unique_address]] pool_allocator_t allocator_;
     pool<node_t> nodes_;
     pool<edge_t> edges_;
     pool<endpoint_t> endpoints_;

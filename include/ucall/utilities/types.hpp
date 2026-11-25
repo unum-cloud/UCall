@@ -58,6 +58,13 @@ inline constexpr long linux_syscall_offset_k = 110;
 inline constexpr long linux_syscall_offset_k = 0;
 #endif
 
+/** A page of memory: the window headroom, the portable unbuffered alignment and the registered
+ *  slice, as x86, Arm and RISC-V base pages all are. */
+inline constexpr std::size_t page_bytes_k = 4096;
+
+/** No index: links, records and borrowers all spell it as the largest 32-bit value. */
+inline constexpr std::uint32_t absent_k = (std::numeric_limits<std::uint32_t>::max)();
+
 /** What one server or client may use: the StringZilla kernels its kits run and the ForkUnion
  *  atomics it synchronizes with, picked once at init. */
 struct cpu_ceiling_t {
@@ -85,7 +92,7 @@ static_assert(sizeof(byte_t) == sizeof(ucall_byte_t));
 template <typename value_type_, typename allocator_type_>
 struct allocator_delete {
     using allocator_t = typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_type_>;
-    allocator_t allocator {};
+    [[no_unique_address]] allocator_t allocator {};
 
     void operator()(value_type_* pointer) const noexcept {
         if (!pointer) return;

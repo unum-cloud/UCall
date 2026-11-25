@@ -147,7 +147,7 @@ struct formatting {
                                         descriptor_t& descriptor) noexcept {
         vector<char> host {rebound_allocator<char> {network_interface.address.get_allocator()}},
             service {host.get_allocator()};
-        if (auto status = split_address(text_view(network_interface.config.address), host, service);
+        if (auto status = split_address(text_view(network_interface.config->address), host, service);
             status != ucall_status_success_k)
             return status;
         addrinfo hints {};
@@ -170,14 +170,14 @@ struct formatting {
             configured = configured &&
                          socket_option(descriptor, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0;
 #if UCALL_OS_LINUX_
-            if (network_interface.config.device_name.length)
+            if (network_interface.config->device_name.length)
                 configured = configured &&
                              socket_option(descriptor, SOL_SOCKET, SO_BINDTODEVICE, network_interface.device.data(),
                                            static_cast<socket_length_t>(network_interface.device.size())) == 0;
 #endif // UCALL_OS_LINUX_
             if (configured && bind(descriptor, address->ai_addr, address->ai_addrlen) == 0 &&
                 listen(descriptor,
-                       static_cast<int>(fu::min_of<std::size_t>(network_interface.config.max_concurrent_connections,
+                       static_cast<int>(fu::min_of<std::size_t>(network_interface.config->max_concurrent_connections,
                                                                 (std::numeric_limits<int>::max)()))) == 0)
                 break;
             socket_close(descriptor);
@@ -191,7 +191,7 @@ struct formatting {
      *  size the loops' file windows: a caller-owned listener's own, or else the TCP default, which
      *  a fresh socket of either family shows just as the listener bound later will. */
     static std::size_t listener_send_buffer(network_interface_t const& network_interface) noexcept {
-        std::intptr_t const* const caller_listener = network_interface.config.listen_descriptor;
+        std::intptr_t const* const caller_listener = network_interface.config->listen_descriptor;
         descriptor_t const descriptor = caller_listener ? static_cast<descriptor_t>(*caller_listener)
                                                         : socket_open(AF_INET);
         int send_buffer = 0;
@@ -211,8 +211,8 @@ struct formatting {
         if (ucall_status_t const started = sockets_start(); started != ucall_status_success_k) return started;
         network_interface_t& network_interface = *acceptor.network_interface;
         descriptor_t descriptor = -1;
-        if (network_interface.config.listen_descriptor) {
-            descriptor = socket_duplicate_listener(*network_interface.config.listen_descriptor);
+        if (network_interface.config->listen_descriptor) {
+            descriptor = socket_duplicate_listener(*network_interface.config->listen_descriptor);
             if (descriptor < 0) return ucall_status_invalid_argument_k;
         }
         else if (ucall_status_t const listened = bind_listener(network_interface, queue, descriptor);
@@ -246,11 +246,11 @@ struct formatting {
             socket_close(descriptor);
             return copied;
         }
-        network_interface.config.address = bytes_view(
+        network_interface.config->address = bytes_view(
             {network_interface.address.data(), network_interface.address.size() - 1});
         network_interface.family = bound.ss_family;
-        if (!network_interface.config.max_request_bytes)
-            network_interface.config.max_request_bytes = largest_receive_buffer(bound.ss_family, max_unsent_bytes_k);
+        if (!network_interface.config->max_request_bytes)
+            network_interface.config->max_request_bytes = largest_receive_buffer(bound.ss_family, max_unsent_bytes_k);
         acceptor.request = {.operation = io_operation_t::accept_k, .descriptor = descriptor, .context = &acceptor};
         return ucall_status_success_k;
     }

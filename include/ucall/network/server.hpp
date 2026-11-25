@@ -83,7 +83,7 @@ struct server : ucall_server_handle_t {
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
 
     /** Allocates the server's interfaces, loops, routes, endpoints and their buffers. */
-    allocator_t allocator;
+    [[no_unique_address]] allocator_t allocator;
 
     explicit server(allocator_t const& allocator) noexcept
         : allocator(allocator), resolved(rebound_allocator<ucall_network_interface_t> {allocator}),
@@ -105,7 +105,8 @@ struct server : ucall_server_handle_t {
     /** One per interface, indexed alike by each loop's acceptors, orders and statistics. */
     span<network_interface_t> network_interfaces {};
 
-    /** Each interface's options as validated, which @c config.interfaces points at. */
+    /** Each interface's options as validated, sized once before any binds and never moved, which
+     *  @c config.interfaces and each interface's @c config point at. */
     vector<ucall_network_interface_t> resolved {};
 
     /** Every event loop, at the index its polls name. */
@@ -135,9 +136,6 @@ struct server : ucall_server_handle_t {
     /** Each tag within @c metrics_text, which @c config.metrics_tags points at. */
     vector<ucall_bytes_view_t> metrics_tag_views {};
 
-    /** The prefix at the front of @c metrics_text, @c ucall unless configured. */
-    ucall_bytes_view_t metrics_prefix {};
-
     /** The resolved StatsD address each loop's metrics socket connects to. */
     sockaddr_storage metrics_destination {};
 
@@ -165,7 +163,7 @@ struct server : ucall_server_handle_t {
     /** Opens the interface's reply directories, and points its configuration at copies of their
      *  names, which the resolved configuration reports. */
     static ucall_status_t open_reply_directories(network_interface_t& network_interface) noexcept {
-        auto& settings = network_interface.config;
+        auto& settings = *network_interface.config;
         if (!settings.reply_directories_count) {
             settings.reply_directories = nullptr;
             return ucall_status_success_k;
@@ -228,7 +226,7 @@ struct server : ucall_server_handle_t {
                 return copied;
         }
         if (st::failed(server.metrics_tag_views.resize(config.metrics_tags_count))) return ucall_status_out_of_memory_k;
-        server.metrics_prefix = bytes_view({text.data(), prefix.size()});
+        server.config.metrics_prefix = bytes_view({text.data(), prefix.size()});
         std::size_t offset = prefix.size();
         for (std::size_t i = 0; i != config.metrics_tags_count; ++i) {
             server.metrics_tag_views[i] = bytes_view({text.data() + offset, config.metrics_tags[i].length});
@@ -253,14 +251,18 @@ struct server : ucall_server_handle_t {
                                                  server.metrics_destination_length);
         if (probe < 0) return ucall_status_connection_failed_k;
         [[maybe_unused]] bool const inet6 = server.metrics_destination.ss_family == AF_INET6;
-        // The IPv4 minimum reassembly size, less its headers, wherever the path MTU is unknown.
-        server.metrics_datagram_bytes = 576 - 28;
+        // RFC 791's minimum reassembly size where the path MTU is unknown, less the IP header,
+        // 20 bytes on IPv4 and 40 on IPv6, and the 8-byte UDP header.
+        [[maybe_unused]] constexpr std::size_t ipv4_min_reassembly_bytes_k = 576, ipv4_udp_headers_bytes_k = 20 + 8,
+                                               ipv6_udp_headers_bytes_k = 40 + 8;
+        server.metrics_datagram_bytes = ipv4_min_reassembly_bytes_k - ipv4_udp_headers_bytes_k;
 #if UCALL_OS_LINUX_
+        std::size_t const headers = inet6 ? ipv6_udp_headers_bytes_k : ipv4_udp_headers_bytes_k;
         int mtu = 0;
         socket_length_t length = sizeof(mtu);
         if (getsockopt(probe, inet6 ? IPPROTO_IPV6 : IPPROTO_IP, inet6 ? IPV6_MTU : IP_MTU, &mtu, &length) == 0 &&
-            mtu > (inet6 ? 48 : 28))
-            server.metrics_datagram_bytes = static_cast<std::size_t>(mtu) - (inet6 ? 48 : 28);
+            mtu > static_cast<int>(headers))
+            server.metrics_datagram_bytes = static_cast<std::size_t>(mtu) - headers;
 #endif // UCALL_OS_LINUX_
         socket_close(probe);
         return ucall_status_success_k;
@@ -282,6 +284,7 @@ struct server : ucall_server_handle_t {
             publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
             return;
         }
+        server->config = *requested;
         if (ucall_status_t const resolved = resolve_metrics(*server, *requested); resolved != ucall_status_success_k) {
             publish<atomic_ref>(arguments->outcome, resolved);
             return;
@@ -303,18 +306,18 @@ struct server : ucall_server_handle_t {
         io::io_listeners_t listeners = io::io_listeners_t::created_k;
         for (std::size_t i = 0; i != requested->interfaces_count; ++i) {
             auto& network_interface = server->network_interfaces[i];
-            network_interface.config = requested->interfaces[i];
-            if (network_interface.config.noise_private_key) {
-                std::memcpy(network_interface.private_key, *network_interface.config.noise_private_key,
+            auto& settings = server->resolved[i];
+            settings = requested->interfaces[i];
+            network_interface.config = &settings;
+            if (settings.noise_private_key) {
+                std::memcpy(network_interface.private_key, *settings.noise_private_key,
                             sizeof(network_interface.private_key));
-                network_interface.config.noise_private_key = &network_interface.private_key;
+                settings.noise_private_key = &network_interface.private_key;
             }
-            if (network_interface.config.noise_peer_key) {
-                std::memcpy(network_interface.peer_key, *network_interface.config.noise_peer_key,
-                            sizeof(network_interface.peer_key));
-                network_interface.config.noise_peer_key = &network_interface.peer_key;
+            if (settings.noise_peer_key) {
+                std::memcpy(network_interface.peer_key, *settings.noise_peer_key, sizeof(network_interface.peer_key));
+                settings.noise_peer_key = &network_interface.peer_key;
             }
-            auto& settings = network_interface.config;
             std::string_view const device = text_view(settings.device_name);
             if (!http_t::valid_view(settings.address) || !http_t::valid_view(settings.device_name) ||
                 http_t::find(device, '\0') != std::string_view::npos) {
@@ -407,19 +410,15 @@ struct server : ucall_server_handle_t {
             }
             std::size_t connections_count = 0, acceptors_count = 0;
             for (auto& network_interface : server->network_interfaces) {
-                if (event_loop_index >= network_interface.config.event_loops) continue;
+                if (event_loop_index >= network_interface.config->event_loops) continue;
                 std::size_t const quota = network_interface.quota(event_loop_index);
                 if (quota > (std::numeric_limits<std::size_t>::max)() - connections_count) {
                     publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
                     return;
                 }
                 connections_count += quota;
-                event_loop.max_exchanges += quota * network_interface.config.max_pipelined_requests;
+                event_loop.max_exchanges += quota * network_interface.config->max_pipelined_requests;
                 ++acceptors_count;
-            }
-            if (st::failed(event_loop.connections.resize(connections_count))) {
-                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
-                return;
             }
             rebound_allocator<interface_acceptor_t> acceptor_allocator {allocator};
             auto* acceptors = acceptor_allocator.allocate(acceptors_count);
@@ -429,20 +428,21 @@ struct server : ucall_server_handle_t {
             }
             for (std::size_t i = 0; i != acceptors_count; ++i) std::construct_at(acceptors + i, allocator);
             event_loop.interface_acceptors = {acceptors, acceptors_count};
+            auto* connections = rebound_allocator<connection_t> {allocator}.allocate(connections_count);
+            if (!connections) {
+                publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
+                return;
+            }
+            for (std::size_t i = 0; i != connections_count; ++i) std::construct_at(connections + i, allocator);
+            event_loop.connections = {connections, connections_count};
             for (auto& connection : event_loop.connections) {
-                connection = allocate_unique<connection_t>(allocator, allocator);
-                if (!connection) {
-                    publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
-                    return;
-                }
-                connection->index = static_cast<std::uint32_t>(&connection - event_loop.connections.data());
-                connection->transport.statistics = &event_loop.statistics;
-                connection->next = event_loop.idle;
-                event_loop.idle = connection.get();
+                connection.transport.statistics = &event_loop.statistics;
+                connection.next = event_loop.idle;
+                event_loop.idle = &connection;
             }
             std::size_t acceptor_index = 0;
             for (auto& network_interface : server->network_interfaces) {
-                if (event_loop_index >= network_interface.config.event_loops) continue;
+                if (event_loop_index >= network_interface.config->event_loops) continue;
                 auto& acceptor = event_loop.interface_acceptors[acceptor_index++];
                 acceptor.event_loop = &event_loop;
                 acceptor.network_interface = &network_interface;
@@ -494,25 +494,20 @@ struct server : ucall_server_handle_t {
                 }
             }
         }
-        server->config = *requested;
         server->config.backend = backend;
-        for (std::size_t i = 0; i != requested->interfaces_count; ++i)
-            server->resolved[i] = server->network_interfaces[i].config;
         server->config.interfaces = server->resolved.data();
-        server->config.metrics_prefix = server->metrics_prefix;
         server->config.metrics_tags = server->metrics_tag_views.data();
         if (!server->config.metrics_sample_rate) server->config.metrics_sample_rate = 1.f;
         if (!server->config.metrics_interval_microseconds) server->config.metrics_interval_microseconds = 1'000'000;
         if (arguments->resolved) *arguments->resolved = server->config;
         // The caller's own views end with this call, so the kept copies let go of them.
         server->config.metrics_address = {};
-        for (std::size_t i = 0; i != requested->interfaces_count; ++i)
-            server->resolved[i].listen_descriptor = server->network_interfaces[i].config.listen_descriptor = nullptr;
+        for (auto& settings : server->resolved) settings.listen_descriptor = nullptr;
         server->api = &server_api_k;
         char digits[std::numeric_limits<std::size_t>::digits10 + 1];
         for (auto const& network_interface : server->network_interfaces)
             formatting_t::log_line(server->config.log, ucall_log_level_info_k, "serving",
-                                   {{"address", text_view(network_interface.config.address)},
+                                   {{"address", text_view(network_interface.config->address)},
                                     {"backend", ucall_io_backend_name(server->config.backend)},
                                     {"event_loops", formatting_t::format_decimal(digits, server->event_loops.size())}});
         *arguments->server = server.release();
@@ -676,7 +671,6 @@ struct server : ucall_server_handle_t {
         auto& pool = event_loop.file_windows;
         pool.max_windows = static_cast<std::uint32_t>(windows);
         if (st::failed(pool.window_runs.reserve(pool.max_windows)) ||
-            st::failed(pool.window_memory.reserve(pool.max_windows)) ||
             st::failed(pool.windows.reserve(pool.max_windows)) ||
             st::failed(pool.release_requests.reserve(pool.max_windows)))
             return ucall_status_out_of_memory_k;
@@ -1136,16 +1130,16 @@ struct server : ucall_server_handle_t {
         endpoint.batch = allocate_unique<batch_endpoint_t>(server.allocator, server.allocator);
         auto* batch = endpoint.batch.get();
         auto slots = server.requests_budget + server.event_loops.size();
-        auto max_batch_size = arguments.max_batch_size ? arguments.max_batch_size : 32;
+        auto max_batch_size = arguments.max_batch_size ? arguments.max_batch_size : batch_size_max_default_k;
         if (!batch || st::failed(batch->collected.reserve(max_batch_size)) ||
             st::failed(batch->slots.resize(std::bit_ceil(slots))) ||
             st::failed(server.batch_endpoints.reserve(server.batch_endpoints.size() + 1)))
             return ucall_status_out_of_memory_k;
         if (ucall_status_t const opened = batch->wake.open(); opened != ucall_status_success_k) return opened;
-        batch->min_batch_size = arguments.min_batch_size ? arguments.min_batch_size : 1;
+        batch->min_batch_size = arguments.min_batch_size ? arguments.min_batch_size : batch_size_min_default_k;
         batch->max_batch_size = max_batch_size;
         batch->max_latency_microseconds = arguments.max_latency_microseconds ? arguments.max_latency_microseconds
-                                                                             : 10'000;
+                                                                             : batch_latency_microseconds_default_k;
         batch->context = arguments.context;
         return ucall_status_success_k;
     }
@@ -1170,8 +1164,8 @@ struct server : ucall_server_handle_t {
         add_endpoint(arguments);
     }
     static void server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments) noexcept {
-        auto minimum = arguments->min_batch_size ? arguments->min_batch_size : 1;
-        auto maximum = arguments->max_batch_size ? arguments->max_batch_size : 32;
+        auto minimum = arguments->min_batch_size ? arguments->min_batch_size : batch_size_min_default_k;
+        auto maximum = arguments->max_batch_size ? arguments->max_batch_size : batch_size_max_default_k;
         if (!arguments->endpoint || minimum > maximum) {
             publish<atomic_ref>(arguments->outcome, ucall_status_invalid_argument_k);
             return;

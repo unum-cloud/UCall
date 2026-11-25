@@ -116,7 +116,6 @@ template <typename allocator_type_ = st::default_allocator<byte_t>,
           typename row_kit_type_ = st::serial_row_kit_t>
 struct epoll_readiness {
     using allocator_t = allocator_type_;
-    static constexpr std::uint32_t absent_k = operation_list_t::absent_k;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
 
@@ -298,7 +297,7 @@ struct linux_aio_t {
         iocb block {};
         block.aio_data = index;
         block.aio_lio_opcode = request.operation == io_operation_t::file_read_k ? IOCB_CMD_PREAD : IOCB_CMD_PREADV;
-        block.aio_fildes = static_cast<std::uint32_t>(request.file.file);
+        block.aio_fildes = static_cast<std::uint32_t>(request.file.handle);
         block.aio_buf = static_cast<std::uint64_t>(reinterpret_cast<std::uintptr_t>(request.data));
         block.aio_nbytes = request.length;
         block.aio_offset = static_cast<std::int64_t>(request.file.offset);
@@ -353,7 +352,6 @@ struct linux_epollaio_queue {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_epollaio_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     struct operation_t {

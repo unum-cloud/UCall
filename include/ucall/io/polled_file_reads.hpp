@@ -25,6 +25,7 @@
 
 namespace unum::ucall::io {
 
+using utilities::absent_k;
 using utilities::byte_t;
 using utilities::descriptor_t;
 using utilities::native_file_t;
@@ -38,9 +39,6 @@ inline constexpr std::size_t aio_batch_limit_k = AIO_LISTIO_MAX;
 #else
 inline constexpr std::size_t aio_batch_limit_k = 16;
 #endif
-
-/** Marks a block or a read that links to nothing. */
-inline constexpr unsigned aio_absent_k = ~0u;
 
 /** The shortest and longest wait while reads are in flight, in nanoseconds. */
 inline constexpr std::uint64_t aio_backoff_floor_ns_k = 1'000, aio_backoff_ceiling_ns_k = 1'000'000;
@@ -61,15 +59,15 @@ struct polled_file_reads {
     struct block_t {
         aiocb control {};
         utilities::io_vector_t vector {};
-        unsigned owner {aio_absent_k};
-        unsigned next {aio_absent_k};
+        unsigned owner {absent_k};
+        unsigned next {absent_k};
         descriptor_t landed {};
         bool in_flight {};
     };
 
     /** An operation's read: its first block, the blocks still in flight, and how many it spans. */
     struct read_t {
-        unsigned first {aio_absent_k};
+        unsigned first {absent_k};
         unsigned pending {};
     };
 
@@ -225,7 +223,7 @@ struct polled_file_reads {
     descriptor_t finish(unsigned owner) noexcept {
         descriptor_t total = 0;
         bool ended = false;
-        for (unsigned slot = reads[owner].first; slot != aio_absent_k; slot = blocks[slot].next) {
+        for (unsigned slot = reads[owner].first; slot != absent_k; slot = blocks[slot].next) {
             block_t const& block = blocks[slot];
             if (ended) continue;
             if (block.landed < 0) {
@@ -241,9 +239,9 @@ struct polled_file_reads {
     }
 
     void release(unsigned owner) noexcept {
-        for (unsigned slot = reads[owner].first; slot != aio_absent_k;) {
+        for (unsigned slot = reads[owner].first; slot != absent_k;) {
             unsigned const next = blocks[slot].next;
-            blocks[slot].owner = aio_absent_k;
+            blocks[slot].owner = absent_k;
             [[maybe_unused]] st::status_t const kept = free_blocks.push_back(st::assume_reserved, unsigned {slot});
             slot = next;
         }

@@ -22,6 +22,7 @@
 
 namespace unum::ucall::io {
 
+using utilities::absent_k;
 using utilities::accepted_socket;
 using utilities::byte_t;
 using utilities::descriptor_t;
@@ -130,11 +131,11 @@ enum class io_operation_t : std::uint8_t {
     /** Closes the socket. */
     close_k,
 
-    /** Opens the NUL-terminated path in @c data beneath the directory @c file.file for unbuffered
+    /** Opens the NUL-terminated path in @c data beneath the directory @c file.handle for unbuffered
      *  reads, completing with a descriptor the submitter owns even after a cancel. */
     file_open_k,
 
-    /** Reads @c length bytes of @c file.file at @c file.offset into @c data. */
+    /** Reads @c length bytes of @c file.handle at @c file.offset into @c data. */
     file_read_k,
 
     /** Scatters the bytes @c file_read_k would read into the @c length vectors in @c data. */
@@ -163,9 +164,6 @@ enum class registered_memory_t : std::uint16_t {};
 /** The @c registered_memory of a request whose buffer lies in no queue-registered range. */
 inline constexpr registered_memory_t io_unregistered_k {(std::numeric_limits<std::uint16_t>::max)()};
 
-/** The @c operation_index of a request no queue record tracks. */
-inline constexpr std::uint32_t io_unindexed_k = (std::numeric_limits<std::uint32_t>::max)();
-
 /** The file a read reads, or the directory a @c file_open_k opens beneath, owned by the
  *  submitter until the request completes. */
 struct io_file_t {
@@ -174,7 +172,7 @@ struct io_file_t {
     std::uint64_t offset {};
 
     /** The file a read reads, or the directory an open resolves its path beneath. */
-    native_file_t file {invalid_native_file_k};
+    native_file_t handle {invalid_native_file_k};
 };
 static_assert(sizeof(io_file_t) == 16);
 
@@ -199,8 +197,8 @@ struct io_request_t {
     registered_memory_t registered_memory {io_unregistered_k};
 
     /** The queue record carrying this request while it is submitted, which the queue sets, so a
-     *  cancel or a release finds it without a search; @c io_unindexed_k otherwise. */
-    std::uint32_t operation_index {io_unindexed_k};
+     *  cancel or a release finds it without a search; @c absent_k otherwise. */
+    std::uint32_t operation_index {absent_k};
 
     /** The socket, the listener of an accept, or for a file operation the socket it serves; a
      *  successful close sets it to -1. */
@@ -492,6 +490,7 @@ struct registered_socket_t {
 
 /** An intrusive FIFO of queue operations, linked through their @c next indices. */
 using operation_list_t = st::intrusive_list<unsigned>;
+static_assert(operation_list_t::absent_k == absent_k);
 
 /** The vectors a @c file_read_vectors_k or @c receive_k request fills, named by its @c data. */
 inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
@@ -582,13 +581,13 @@ inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, 
     case io_operation_t::shutdown_k: return ::shutdown(descriptor, SHUT_WR) == 0 ? 0 : -errno;
     case io_operation_t::close_k: return socket_close(request.descriptor) == 0 || errno == EINTR ? 0 : -errno;
     case io_operation_t::file_open_k:
-        return open_native_file_beneath(request.file.file, reinterpret_cast<char const*>(request.data));
+        return open_native_file_beneath(request.file.handle, reinterpret_cast<char const*>(request.data));
     case io_operation_t::file_read_k:
         tally<atomic_ref_template_>(statistics.file_reads_blocking);
-        return utilities::read_native_file(request.file.file, {request.data, request.length}, request.file.offset);
+        return utilities::read_native_file(request.file.handle, {request.data, request.length}, request.file.offset);
     case io_operation_t::file_read_vectors_k:
         tally<atomic_ref_template_>(statistics.file_reads_blocking);
-        return utilities::read_native_file_vectors(request.file.file, io_vectors(request), request.file.offset);
+        return utilities::read_native_file_vectors(request.file.handle, io_vectors(request), request.file.offset);
     case io_operation_t::zero_copy_release_k: return 1;
     }
     return result >= 0 ? static_cast<descriptor_t>(result) : -errno;
@@ -659,7 +658,7 @@ io_completion_t readiness_finish(queue_type_& queue, unsigned index, descriptor_
     auto& operation = queue.operations[index];
     auto& request = *operation.request;
     typename queue_type_::operation_cold_t& cold = queue.cold_fields(index);
-    if (cold.timed != queue_type_::absent_k) {
+    if (cold.timed != absent_k) {
         queue.timed[cold.timed] = queue.timed.back();
         queue.cold_fields(queue.timed.back()).timed = cold.timed;
         queue.timed.pop_back();
@@ -669,7 +668,7 @@ io_completion_t readiness_finish(queue_type_& queue, unsigned index, descriptor_
         if (operation.interest == io_interest_t::armed_k || operation.interest == io_interest_t::ready_k)
             queue.readiness.disarm(request.descriptor, io_direction(request.operation), index);
     if (request.operation == io_operation_t::accept_k) request.length = 0;
-    request.operation_index = io_unindexed_k;
+    request.operation_index = absent_k;
     operation = {};
     cold = {};
     queue.free_list(index).push(queue.operations, index);
@@ -696,7 +695,7 @@ template <template <typename> class atomic_ref_template_, typename queue_type_>
 std::size_t readiness_collect(queue_type_& queue, span<io_completion_t> completions, std::size_t count) noexcept {
     while (count != completions.size()) {
         auto index = queue.completed_operations.pop(queue.operations);
-        if (index == queue_type_::absent_k) break;
+        if (index == absent_k) break;
         descriptor_t const result = queue.operations[index].stage == operation_stage_t::cancelled_k
                                         ? -ECANCELED
                                         : queue.cold_fields(index).result;
@@ -712,13 +711,13 @@ std::size_t readiness_progress(queue_type_& queue, operation_list_t& list, span<
                                std::size_t count, std::uint64_t now) noexcept {
     while (count != completions.size()) {
         unsigned const index = list.pop(queue.operations);
-        if (index == queue_type_::absent_k) break;
+        if (index == absent_k) break;
         auto& operation = queue.operations[index];
         io_request_t& request = *operation.request;
         bool const fired = operation.interest == io_interest_t::ready_k;
         descriptor_t result = -ETIMEDOUT;
         // An edge-triggered operation hears nothing more until its syscall reports EAGAIN.
-        if (queue.cold_fields(index).timed == queue_type_::absent_k || request.deadline > now) {
+        if (queue.cold_fields(index).timed == absent_k || request.deadline > now) {
             do result = queue.attempt(index);
             while (fired && result == -EINTR);
         }

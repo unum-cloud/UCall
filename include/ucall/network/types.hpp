@@ -115,8 +115,22 @@ enum class transport_stage_t : std::uint8_t {
 /** RFC 6298's initial retransmission timeout bounds the round trip a peer's last bytes take. */
 inline constexpr std::size_t linger_microseconds_k = 1'000'000;
 
-/** Linux's default receive buffer, @c tcp_rmem, bounds what a peer has in flight at our FIN. */
-inline constexpr std::size_t linger_bytes_k = 128 * 1024;
+/** Linux's default receive buffer, the middle value of @c net.ipv4.tcp_rmem. */
+inline constexpr std::size_t linux_default_receive_bytes_k = 128 * 1024;
+
+/** A peer has at most its receive buffer in flight at our FIN. */
+inline constexpr std::size_t linger_bytes_k = linux_default_receive_bytes_k;
+
+/** Requests a batch endpoint hands its callback at most, unless configured: a batch's worth of
+ *  work per call without holding the first request long. */
+inline constexpr std::size_t batch_size_max_default_k = 32;
+
+/** Requests a batch endpoint waits for, unless configured: one, so none waits for company. */
+inline constexpr std::size_t batch_size_min_default_k = 1;
+
+/** How long a batch endpoint holds its first request for company, unless configured: 10 ms, a
+ *  hundredth of @c linger_microseconds_k, short against a round trip's retransmission. */
+inline constexpr std::size_t batch_latency_microseconds_default_k = linger_microseconds_k / 100;
 
 /** Whether a direction's one queue request is in flight; only submission and completion
  *  write it. */
@@ -183,7 +197,7 @@ enum class reply_head_t : std::uint8_t { pushed_k, held_k };
 
 /** A reading peer takes Linux's default @c tcp_rmem per round trip, so more unsent chunk bytes
  *  only queue. */
-inline constexpr std::size_t max_unsent_bytes_k = 128 * 1024;
+inline constexpr std::size_t max_unsent_bytes_k = linux_default_receive_bytes_k;
 
 /** Each unsent file segment pins a descriptor, so a stream outrunning its peer pins at most
  *  this many. */
@@ -287,14 +301,13 @@ inline constexpr std::size_t file_window_records_k = 4;
  *  from 512 to 32768. */
 inline constexpr std::size_t file_record_stride_k = 64 * 1024;
 
-/** A window's headroom, which holds its first record's header and keeps its reads aligned. */
-inline constexpr std::size_t page_bytes_k = 4096;
+/** A window's headroom, one page, holds its first record's header and keeps its reads aligned. */
+using utilities::page_bytes_k;
 
 /** The largest unbuffered alignment a window serves: past it, no record payload fits a slot. */
 inline constexpr std::size_t file_max_alignment_k = 32768;
 
-/** No index, as @c file_window_t links and borrowers spell it. */
-inline constexpr std::uint32_t absent_k = (std::numeric_limits<std::uint32_t>::max)();
+using utilities::absent_k;
 
 /** Where a pooled window is: free, read into, holding read bytes, being sent, or waiting for
  *  the kernel to let go of it. */
@@ -305,6 +318,9 @@ enum class file_read_state_t : std::uint8_t { idle_k, opening_file_k, reading_fi
 
 /** One window of an event loop's pool: an aligned read of a file segment and its slice. */
 struct file_window_t {
+
+    /** The window's first byte, its headroom page, in one of its pool's runs, set as it grows. */
+    byte_t* memory {};
 
     /** Bytes of the requested range in this window. */
     std::uint32_t slice_bytes {};
@@ -325,7 +341,7 @@ struct file_window_t {
      *  sends. */
     file_window_stage_t stage {};
 };
-static_assert(sizeof(file_window_t) == 20);
+static_assert(sizeof(file_window_t) == 32);
 
 /** Whether the peer still writes, or sent its FIN or Noise close record. */
 enum class peer_stream_t : std::uint8_t { writing_k, closed_k };

@@ -139,9 +139,6 @@ struct server_connection {
     /** Requests from @c oldest_exchange to @c newest_exchange, bounded by pipelining. */
     std::uint32_t outstanding_exchanges {};
 
-    /** In its event loop's connections, as windows and orders name it. */
-    std::uint32_t index {};
-
     /** Links the event loop's idle list or ready queue. */
     connection_t* next {};
 
@@ -159,7 +156,7 @@ struct server_connection {
      *  outcome belongs to the segment it served, which the server lands. */
     void complete(io_completion_t const& completion) noexcept {
         if (completion.request != &file_read_request) {
-            transport.complete(completion, network_interface->config.max_request_bytes);
+            transport.complete(completion, network_interface->config->max_request_bytes);
             if (transport.stage == transport_stage_t::closed_k && outstanding_releases())
                 transport.stage = transport_stage_t::closed_holding_k;
             return;
@@ -173,8 +170,8 @@ struct server_connection {
      *  kernel still holds what it sent. */
     io_request_t* advance() noexcept {
         if (file_request_in_flight()) return nullptr;
-        io_request_t* next_request = transport.advance(network_interface->config.peer_authorizer,
-                                                       network_interface->config.peer_authorizer_context);
+        io_request_t* next_request = transport.advance(network_interface->config->peer_authorizer,
+                                                       network_interface->config->peer_authorizer_context);
         // A close sends what the kernel still holds, unless it resets, which purges it.
         if (!next_request || next_request->operation != io_operation_t::close_k || !outstanding_releases() ||
             transport.close_mode != close_mode_t::orderly_k)
@@ -302,7 +299,7 @@ struct serving {
         char digits[std::numeric_limits<unsigned>::digits10 + 1];
         formatting_t::log_line(exchange.event_loop->server->config.log, ucall_log_level_info_k, "refused",
                                {{"status", formatting_t::format_decimal(digits, status)},
-                                {"address", text_view(connection.network_interface->config.address)}});
+                                {"address", text_view(connection.network_interface->config->address)}});
         answer(connection, exchange, status, body, headers);
     }
 
@@ -507,7 +504,7 @@ struct serving {
         if (!exchange.body_chunk.empty()) return http_parse_t::incomplete_k;
         std::size_t payload = 0, consumed = 0;
         auto parsed = http_t::http_stream_body(connection.transport.input, connection.transport.message,
-                                               connection.network_interface->config.max_request_bytes, payload,
+                                               connection.network_interface->config->max_request_bytes, payload,
                                                consumed);
         if (parsed != http_parse_t::complete_k && parsed != http_parse_t::incomplete_k) {
             ucall_status_t const failure = parsed == http_parse_t::overflow_k ? ucall_status_overflow_k
@@ -625,8 +622,8 @@ struct serving {
             if (io_request_t* release = replies_t::retire_sent_segments(event_loop, connection)) return release;
         if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         connection.transport.open_records();
-        auto depth = connection.network_interface->config.max_pipelined_requests;
-        auto const cap = connection.network_interface->config.max_request_bytes;
+        auto depth = connection.network_interface->config->max_pipelined_requests;
+        auto const cap = connection.network_interface->config->max_request_bytes;
         // Requests dispatched so far, which leave `input` together rather than one by one.
         std::size_t consumed = std::exchange(connection.transport.parsed, 0);
         while (connection.transport.stage == transport_stage_t::open_k &&
@@ -746,7 +743,7 @@ struct serving {
         event_loop_t& event_loop;
 
         order_link_t& operator[](std::uint32_t index) const noexcept {
-            return event_loop.connections[index]->order_link;
+            return event_loop.connections[index].order_link;
         }
     };
     static st::intrusive_list<std::uint32_t>& order_list(event_loop_t& event_loop, connection_t& connection,
@@ -760,8 +757,9 @@ struct serving {
     static void unlist(event_loop_t& event_loop, connection_t& connection) noexcept {
         if (connection.order == connection_order_t::unlisted_k) return;
         order_links_t links {event_loop};
+        auto const index = static_cast<std::uint32_t>(&connection - event_loop.connections.data());
         [[maybe_unused]] st::status_t const erased =
-            order_list(event_loop, connection, connection.order).erase(links, connection.index);
+            order_list(event_loop, connection, connection.order).erase(links, index);
         connection.order = connection_order_t::unlisted_k;
     }
 
@@ -769,12 +767,13 @@ struct serving {
     static void relist(event_loop_t& event_loop, connection_t& connection, connection_order_t order) noexcept {
         unlist(event_loop, connection);
         order_links_t links {event_loop};
-        order_list(event_loop, connection, order).push(links, connection.index);
+        auto const index = static_cast<std::uint32_t>(&connection - event_loop.connections.data());
+        order_list(event_loop, connection, order).push(links, index);
         connection.order = order;
     }
     static void release_admission(server_t& server, network_interface_t& network_interface) noexcept {
         auto before = atomic_ref<std::size_t> {network_interface.active}.fetch_sub(1, std::memory_order_relaxed);
-        if (before == network_interface.config.max_concurrent_connections)
+        if (before == network_interface.config->max_concurrent_connections)
             for (auto& event_loop : server.event_loops) event_loop->notify();
     }
     static server_stage_t server_stage(server_t& server) noexcept {
@@ -880,7 +879,7 @@ struct serving {
                 formatting_t::log_line(
                     server.config.log, ucall_log_level_warning_k, "handshake_failed",
                     {{"fault", tunnel::secure_tunnel_fault_name(connection.transport.tunnel.fault())},
-                     {"address", text_view(connection.network_interface->config.address)}});
+                     {"address", text_view(connection.network_interface->config->address)}});
             connection.transport.tunnel.clear();
             connection.transport.input.clear();
             connection.transport.parsed = 0;
@@ -914,10 +913,10 @@ struct serving {
         bool only_stalled = true;
         for (auto& connection : event_loop.connections)
             only_stalled = only_stalled &&
-                           (connection->transport.stage == transport_stage_t::idle_k || stalled(*connection));
+                           (connection.transport.stage == transport_stage_t::idle_k || stalled(connection));
         for (auto& connection : event_loop.connections) {
-            if (only_stalled && connection->transport.stage != transport_stage_t::idle_k) cut(event_loop, *connection);
-            connection->transport.progress = transmit_progress_t::stalled_k;
+            if (only_stalled && connection.transport.stage != transport_stage_t::idle_k) cut(event_loop, connection);
+            connection.transport.progress = transmit_progress_t::stalled_k;
         }
     }
 
@@ -927,7 +926,7 @@ struct serving {
     static void expire_releases(event_loop_t& event_loop) noexcept {
         std::uint64_t const now = monotonic_ns();
         while (!event_loop.expiring.empty()) {
-            auto& connection = *event_loop.connections[event_loop.expiring.oldest];
+            auto& connection = event_loop.connections[event_loop.expiring.oldest];
             if (connection.transport.deadline > now) return;
             unlist(event_loop, connection);
             if (lingers(connection.transport.stage)) connection.transport.fail(ucall_status_success_k);
@@ -935,7 +934,7 @@ struct serving {
                 connection.transport.close_mode = close_mode_t::reset_k;
                 tally<atomic_ref>(event_loop.statistics.linger_resets);
                 formatting_t::log_line(event_loop.server->config.log, ucall_log_level_info_k, "linger_reset",
-                                       {{"address", text_view(connection.network_interface->config.address)}});
+                                       {{"address", text_view(connection.network_interface->config->address)}});
                 connection.transport.stage = transport_stage_t::closing_k;
             }
             else continue;
@@ -945,7 +944,7 @@ struct serving {
 
     /** When the oldest linger or release expires, or zero when none waits. */
     static std::uint64_t release_deadline(event_loop_t const& event_loop) noexcept {
-        return event_loop.expiring.empty() ? 0 : event_loop.connections[event_loop.expiring.oldest]->transport.deadline;
+        return event_loop.expiring.empty() ? 0 : event_loop.connections[event_loop.expiring.oldest].transport.deadline;
     }
 
     /** Whether @p stage waits out the linger after a last reply, before or after its FIN. */
@@ -986,7 +985,7 @@ struct serving {
                 (order.parked >= 0 && order.eviction != eviction_t::none_k))
                 continue;
             auto active = atomic_ref<std::size_t> {network_interface.active};
-            auto const limit = network_interface.config.max_concurrent_connections;
+            auto const limit = network_interface.config->max_concurrent_connections;
             bool const admitted = event_loop.idle &&
                                   active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit;
             auto accepting = atomic_ref<std::size_t> {network_interface.accepting};
@@ -1008,8 +1007,8 @@ struct serving {
         if (stage != server_stage_t::serving_k && event_loop.stage < loop_stage) {
             // Each connection sees every new stage once; later passes move what completions mark.
             for (auto& connection : event_loop.connections) {
-                if (connection->transport.stage != transport_stage_t::idle_k) mark_ready(event_loop, *connection);
-                connection->transport.progress = transmit_progress_t::stalled_k;
+                if (connection.transport.stage != transport_stage_t::idle_k) mark_ready(event_loop, connection);
+                connection.transport.progress = transmit_progress_t::stalled_k;
             }
             event_loop.stage = loop_stage;
         }
@@ -1071,7 +1070,7 @@ struct serving {
     static void aim_accept(event_loop_t const& event_loop, interface_acceptor_t& acceptor) noexcept {
         std::size_t headroom = 0;
         if (acceptor.stage == acceptor_stage_t::accepting_k) {
-            std::size_t const limit = acceptor.network_interface->config.max_concurrent_connections;
+            std::size_t const limit = acceptor.network_interface->config->max_concurrent_connections;
             std::size_t const active = atomic_ref<std::size_t> {acceptor.network_interface->active}.load(
                 std::memory_order_relaxed);
             std::size_t const idle = event_loop.connections.size() - event_loop.open_connections;
@@ -1152,7 +1151,7 @@ struct serving {
                 failure == accept_failure_t::exhausted_k ? ucall_log_level_warning_k : ucall_log_level_error_k,
                 failure == accept_failure_t::exhausted_k ? "accept_exhausted" : "accept_failed",
                 {{"errno", formatting_t::format_decimal(digits, -completion.result)},
-                 {"address", text_view(network_interface.config.address)}});
+                 {"address", text_view(network_interface.config->address)}});
             if (failure == accept_failure_t::broken_k) {
                 atomic_ref<ucall_status_t> {server.failure}.store(ucall_status_io_k, std::memory_order_release);
                 return server_t::server_cut(server);
@@ -1165,7 +1164,7 @@ struct serving {
         byte_t const* const written = completion.data ? completion.data : completion.request->data;
         auto const peer = formatting_t::peer_address(reinterpret_cast<io_peer_address_t const*>(written)->address);
         auto active = atomic_ref<std::size_t> {network_interface.active};
-        auto const limit = network_interface.config.max_concurrent_connections;
+        auto const limit = network_interface.config->max_concurrent_connections;
         if (stage == acceptor_stage_t::accepting_k) {
             admit(server, event_loop, network_interface, descriptor, peer);
             if (!pending) return;
@@ -1186,7 +1185,7 @@ struct serving {
             acceptor.shed_request = {.operation = io_operation_t::send_k,
                                      .descriptor = descriptor,
                                      .context = &acceptor};
-            if (network_interface.config.security != ucall_security_none_k) {
+            if (network_interface.config->security != ucall_security_none_k) {
                 [[maybe_unused]] ucall_status_t const reset = event_loop.queue.reset_on_close(descriptor);
                 return shed_sent(event_loop, acceptor);
             }
@@ -1239,8 +1238,8 @@ struct serving {
         order.parked = descriptor;
         order.parked_peer = peer;
         for (auto& connection : event_loop.connections)
-            if (connection->network_interface == &network_interface)
-                connection->transport.progress = transmit_progress_t::stalled_k;
+            if (connection.network_interface == &network_interface)
+                connection.transport.progress = transmit_progress_t::stalled_k;
     }
 
     /** Closes a connection for the peer parked in @p order, unless one already closes for it: the
@@ -1250,7 +1249,7 @@ struct serving {
                       interface_order_t& order) noexcept {
         if (order.parked < 0 || order.eviction != eviction_t::none_k) return;
         if (!order.keepalive.empty()) {
-            auto& evicted = *event_loop.connections[order.keepalive.oldest];
+            auto& evicted = event_loop.connections[order.keepalive.oldest];
             unlist(event_loop, evicted);
             evicted.transport.fail(ucall_status_connection_closed_k);
             mark_ready(event_loop, evicted);
@@ -1259,8 +1258,8 @@ struct serving {
         }
         if (order.queued < 0) return;
         for (auto& connection : event_loop.connections)
-            if (connection->network_interface == &network_interface && stalled(*connection)) {
-                cut(event_loop, *connection);
+            if (connection.network_interface == &network_interface && stalled(connection)) {
+                cut(event_loop, connection);
                 order.eviction = eviction_t::closing_k;
                 return;
             }
@@ -1291,9 +1290,9 @@ struct serving {
                  .interface_statistics[static_cast<std::size_t>(&network_interface - server.network_interfaces.data())];
         tally<atomic_ref>(chosen->transport.interface_statistics->connections);
         auto result = chosen->configure(
-            formatting_t::tunnel_config(network_interface.config.security, secure_tunnel_role_t::responder_k,
-                                        network_interface.config.noise_private_key, network_interface.public_key,
-                                        network_interface.config.noise_peer_key));
+            formatting_t::tunnel_config(network_interface.config->security, secure_tunnel_role_t::responder_k,
+                                        network_interface.config->noise_private_key, network_interface.public_key,
+                                        network_interface.config->noise_peer_key));
         if (result != ucall_status_success_k) chosen->transport.fail(result);
         mark_ready(event_loop, *chosen);
     }

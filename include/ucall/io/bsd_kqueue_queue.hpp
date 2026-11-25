@@ -48,7 +48,6 @@ struct bsd_kqueue_queue {
     using allocator_t = allocator_type_;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
     using rebind = bsd_kqueue_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_bsd_kqueue_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     template <typename value_type_>
@@ -270,7 +269,7 @@ struct kqueue_readiness {
         if (stage == operation_stage_t::cancelled_k) return -ECANCELED;
         aiocb& block = file_reads[index];
         block = {};
-        block.aio_fildes = request.file.file;
+        block.aio_fildes = request.file.handle;
         block.aio_offset = static_cast<off_t>(request.file.offset);
         block.aio_sigevent.sigev_notify = SIGEV_KEVENT;
         block.aio_sigevent.sigev_notify_kqueue = descriptor;
@@ -312,7 +311,7 @@ struct kqueue_readiness {
                                                        : span<io_vector_t const> {io_vectors(request)};
         descriptor_t result = 0;
         tally<atomic_ref_template_>(statistics.kernel_enters);
-        if (!file_reads.start(index, request.file.file, vectors, request.file.offset, result)) {
+        if (!file_reads.start(index, request.file.handle, vectors, request.file.offset, result)) {
             tally<atomic_ref_template_>(statistics.file_reads_blocking);
             return result;
         }

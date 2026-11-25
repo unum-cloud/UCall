@@ -44,6 +44,22 @@ template <typename handle_type_>
     return ucall_status_uninitialized_k;
 }
 
+/** The arguments of a server verb, which name their server rather than a client. */
+template <typename arguments_type_>
+concept a_server_call = requires(arguments_type_& arguments) { arguments.server; };
+
+/** Admits the server or client @p arguments name and forwards them to that handle's @p verb_. */
+template <auto verb_, typename arguments_type_>
+static void forward_to_api(arguments_type_* arguments) noexcept {
+    if (!arguments) return;
+    auto* const owner = [arguments] {
+        if constexpr (a_server_call<arguments_type_>) return arguments->server;
+        else return arguments->client;
+    }();
+    if (admit(owner, arguments->outcome) != ucall_status_success_k) return;
+    (owner->api->*verb_)(arguments);
+}
+
 template <typename init_type_>
 static void init_network(init_type_* arguments) noexcept {
     cpu_ceiling_t ceiling;
@@ -137,55 +153,43 @@ void ucall_client_init(ucall_client_init_t* arguments) {
 }
 
 void ucall_server_take_call(ucall_server_take_call_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->take_call(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::take_call>(arguments);
 }
 
 void ucall_server_take_calls(ucall_server_take_calls_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->take_calls(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::take_calls>(arguments);
 }
 
 void ucall_server_event_loop_statistics(ucall_server_event_loop_statistics_t* arguments) {
     if (!arguments) return;
     if (arguments->statistics) *arguments->statistics = {};
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->event_loop_statistics(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::event_loop_statistics>(arguments);
 }
 
 void ucall_server_take_batch(ucall_server_take_batch_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->take_batch(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::take_batch>(arguments);
 }
 
 void ucall_server_take_batches(ucall_server_take_batches_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->take_batches(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::take_batches>(arguments);
 }
 
 void ucall_server_batch_endpoint_statistics(ucall_server_batch_endpoint_statistics_t* arguments) {
     if (!arguments) return;
     if (arguments->statistics) *arguments->statistics = {};
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->batch_endpoint_statistics(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::batch_endpoint_statistics>(arguments);
 }
 
 void ucall_client_take_completed(ucall_client_take_completed_t* arguments) {
     if (!arguments) return;
     if (arguments->count) *arguments->count = 0;
-    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
-    arguments->client->api->take_completed(arguments);
+    forward_to_api<&ucall_client_handle_t::api_t::take_completed>(arguments);
 }
 
 void ucall_client_take_completed_call(ucall_client_take_completed_call_t* arguments) {
     if (!arguments) return;
     if (arguments->call) *arguments->call = {};
-    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
-    arguments->client->api->take_completed_call(arguments);
+    forward_to_api<&ucall_client_handle_t::api_t::take_completed_call>(arguments);
 }
 
 void ucall_server_free(ucall_server_t server) {
@@ -202,69 +206,43 @@ void ucall_client_free(ucall_client_t client) {
 }
 
 void ucall_server_add_http_endpoint(ucall_server_add_http_endpoint_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->add_http_endpoint(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::add_http_endpoint>(arguments);
 }
 void ucall_server_request_path(ucall_server_request_path_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_path(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_path>(arguments);
 }
 void ucall_server_request_path_segment(ucall_server_request_path_segment_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_path_segment(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_path_segment>(arguments);
 }
 void ucall_server_request_path_parameter(ucall_server_request_path_parameter_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_path_parameter(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_path_parameter>(arguments);
 }
 void ucall_server_request_query_parameter(ucall_server_request_query_parameter_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_query_parameter(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_query_parameter>(arguments);
 }
 void ucall_server_request_header(ucall_server_request_header_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_header(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_header>(arguments);
 }
 void ucall_server_request_field(ucall_server_request_field_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_field(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_field>(arguments);
 }
 void ucall_server_request_query(ucall_server_request_query_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_query(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_query>(arguments);
 }
 void ucall_server_request_peer(ucall_server_request_peer_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_peer(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_peer>(arguments);
 }
 void ucall_server_request_body(ucall_server_request_body_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_body(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_body>(arguments);
 }
 void ucall_server_reply_content(ucall_server_reply_content_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_content(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::reply_content>(arguments);
 }
 void ucall_server_reply_error(ucall_server_reply_error_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_error(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::reply_error>(arguments);
 }
 void ucall_client_call(ucall_client_call_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->client, arguments->outcome) != ucall_status_success_k) return;
-    arguments->client->api->call(arguments);
+    forward_to_api<&ucall_client_handle_t::api_t::call>(arguments);
 }
 void ucall_client_response_header(ucall_client_response_header_t* arguments) {
     if (!arguments) return;
@@ -352,16 +330,13 @@ void ucall_client_response_free(ucall_received_http_response_t response) {
 }
 
 void ucall_server_add_http_batch_endpoint(ucall_server_add_http_batch_endpoint_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->add_http_batch_endpoint(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::add_http_batch_endpoint>(arguments);
 }
 
 void ucall_server_request_body_chunk(ucall_server_request_body_chunk_t* arguments) {
     if (!arguments) return;
     if (arguments->data) *arguments->data = {};
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_body_chunk(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_body_chunk>(arguments);
 }
 
 size_t ucall_server_request_parts_count(ucall_server_t server, ucall_received_http_request_t request) {
@@ -373,32 +348,23 @@ void ucall_server_request_part(ucall_server_request_part_t* arguments) {
     if (arguments->name) *arguments->name = {};
     if (arguments->content_type) *arguments->content_type = {};
     if (arguments->data) *arguments->data = {};
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->request_part(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::request_part>(arguments);
 }
 
 void ucall_server_reply_vectored(ucall_server_reply_vectored_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_vectored(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::reply_vectored>(arguments);
 }
 
 void ucall_server_reply_begin(ucall_server_reply_begin_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_begin(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::reply_begin>(arguments);
 }
 
 void ucall_server_reply_append(ucall_server_reply_append_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_append(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::reply_append>(arguments);
 }
 
 void ucall_server_reply_end(ucall_server_reply_end_t* arguments) {
-    if (!arguments) return;
-    if (admit(arguments->server, arguments->outcome) != ucall_status_success_k) return;
-    arguments->server->api->reply_end(arguments);
+    forward_to_api<&ucall_server_handle_t::api_t::reply_end>(arguments);
 }
 
 } // extern "C"

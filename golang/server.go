@@ -291,7 +291,7 @@ func (server *Server) MemoryDomain(index uint) (int32, bool) {
 
 //export ucallServes
 func ucallServes(server C.ucall_server_t, request C.ucall_received_http_request_t, context unsafe.Pointer) {
-	received := &Request{server: server, request: request}
+	received := &Request{server: server, handle: request}
 	handled[func(request *Request)](context)(received)
 	received.drop()
 }
@@ -462,8 +462,8 @@ func (server *Server) EventLoopStatistics(eventLoop uint) (EventLoopStatistics, 
 // Request is one received request, answered at most once. Its reads view the received bytes until
 // the reply, which consumes it; a handler that neither replies nor detaches it answers 500.
 type Request struct {
-	server  C.ucall_server_t
-	request C.ucall_received_http_request_t
+	server C.ucall_server_t
+	handle C.ucall_received_http_request_t
 }
 
 // Peer is who sent a request: the interface it arrived on, the client's authenticated static
@@ -508,16 +508,16 @@ type RequestPart struct {
 
 // drop answers 500 for a request its handler neither replied to nor detached.
 func (request *Request) drop() {
-	if request.request == nil {
+	if request.handle == nil {
 		return
 	}
 	_ = request.ReplyError(HTTPStatusInternalError, "The request was dropped without a reply")
-	request.request = nil
+	request.handle = nil
 }
 
 // Verb is the HTTP method, which tells apart the requests of a VerbAny route.
 func (request *Request) Verb() Verb {
-	return Verb(C.ucall_server_request_verb(request.server, request.request))
+	return Verb(C.ucall_server_request_verb(request.server, request.handle))
 }
 
 // Path is the path as sent, still percent-encoded, without the query.
@@ -525,7 +525,7 @@ func (request *Request) Path() ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_path_t](&call)
 	*arguments = C.ucall_server_request_path_t{
-		server: request.server, outcome: call.outcome(), request: request.request, path: call.result}
+		server: request.server, outcome: call.outcome(), request: request.handle, path: call.result}
 	C.ucall_server_request_path(arguments)
 	path, err := block(&call, nil)
 	return viewed(path), err
@@ -536,7 +536,7 @@ func (request *Request) QueryString() ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_query_t](&call)
 	*arguments = C.ucall_server_request_query_t{
-		server: request.server, outcome: call.outcome(), request: request.request, query: call.result}
+		server: request.server, outcome: call.outcome(), request: request.handle, query: call.result}
 	C.ucall_server_request_query(arguments)
 	query, err := block(&call, nil)
 	return viewed(query), err
@@ -548,7 +548,7 @@ func (request *Request) Body() ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_body_t](&call)
 	*arguments = C.ucall_server_request_body_t{
-		server: request.server, outcome: call.outcome(), request: request.request, body: call.result}
+		server: request.server, outcome: call.outcome(), request: request.handle, body: call.result}
 	C.ucall_server_request_body(arguments)
 	body, err := block(&call, nil)
 	return viewed(body), err
@@ -560,7 +560,7 @@ func (request *Request) PathParameter(name string) ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_path_parameter_t](&call)
 	*arguments = C.ucall_server_request_path_parameter_t{
-		server: request.server, outcome: call.outcome(), request: request.request,
+		server: request.server, outcome: call.outcome(), request: request.handle,
 		name: call.text(name), value: call.result}
 	C.ucall_server_request_path_parameter(arguments)
 	value, err := block(&call, nil)
@@ -573,7 +573,7 @@ func (request *Request) Query(name string) ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_query_parameter_t](&call)
 	*arguments = C.ucall_server_request_query_parameter_t{
-		server: request.server, outcome: call.outcome(), request: request.request,
+		server: request.server, outcome: call.outcome(), request: request.handle,
 		name: call.text(name), value: call.result}
 	C.ucall_server_request_query_parameter(arguments)
 	value, err := block(&call, nil)
@@ -586,7 +586,7 @@ func (request *Request) Header(name string) ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_header_t](&call)
 	*arguments = C.ucall_server_request_header_t{
-		server: request.server, outcome: call.outcome(), request: request.request,
+		server: request.server, outcome: call.outcome(), request: request.handle,
 		name: call.text(name), value: call.result}
 	C.ucall_server_request_header(arguments)
 	value, err := block(&call, nil)
@@ -597,12 +597,12 @@ func (request *Request) Header(name string) ([]byte, error) {
 // lowercased as the parser keeps it and its value trimmed.
 func (request *Request) Fields() iter.Seq2[[]byte, []byte] {
 	return func(yield func(name, value []byte) bool) {
-		count := C.ucall_server_request_fields_count(request.server, request.request)
+		count := C.ucall_server_request_fields_count(request.server, request.handle)
 		for index := C.size_t(0); index < count; index++ {
 			var call callWithResult[[2]C.ucall_bytes_view_t]
 			arguments := open[C.ucall_server_request_field_t](&call)
 			*arguments = C.ucall_server_request_field_t{
-				server: request.server, outcome: call.outcome(), request: request.request, index: index,
+				server: request.server, outcome: call.outcome(), request: request.handle, index: index,
 				name: &call.result[0], value: &call.result[1]}
 			C.ucall_server_request_field(arguments)
 			field, err := block(&call, nil)
@@ -619,7 +619,7 @@ func (request *Request) Peer() (Peer, error) {
 	var call callWithResult[Peer]
 	arguments := open[C.ucall_server_request_peer_t](&call)
 	*arguments = C.ucall_server_request_peer_t{
-		server: request.server, outcome: call.outcome(), request: request.request,
+		server: request.server, outcome: call.outcome(), request: request.handle,
 		network_interface_index: (*C.size_t)(unsafe.Pointer(&call.result.NetworkInterfaceIndex)),
 		static_key:              (*C.ucall_noise_key_t)(unsafe.Pointer(&call.result.StaticKey)),
 		address:                 (*C.ucall_peer_address_t)(unsafe.Pointer(&call.result.Address))}
@@ -629,7 +629,7 @@ func (request *Request) Peer() (Peer, error) {
 
 // PathSegmentsCount is how many path components the request has, as sent.
 func (request *Request) PathSegmentsCount() uint {
-	return uint(C.ucall_server_request_path_segments_count(request.server, request.request))
+	return uint(C.ucall_server_request_path_segments_count(request.server, request.handle))
 }
 
 // PathSegment is path component index, counting from zero, failing with StatusNotFound past the
@@ -638,7 +638,7 @@ func (request *Request) PathSegment(index uint) ([]byte, error) {
 	var call callWithResult[C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_path_segment_t](&call)
 	*arguments = C.ucall_server_request_path_segment_t{
-		server: request.server, outcome: call.outcome(), request: request.request,
+		server: request.server, outcome: call.outcome(), request: request.handle,
 		index: C.size_t(index), segment: call.result}
 	C.ucall_server_request_path_segment(arguments)
 	segment, err := block(&call, nil)
@@ -647,7 +647,7 @@ func (request *Request) PathSegment(index uint) ([]byte, error) {
 
 // PartsCount is how many parts a multipart/form-data body has, zero for any other body.
 func (request *Request) PartsCount() uint {
-	return uint(C.ucall_server_request_parts_count(request.server, request.request))
+	return uint(C.ucall_server_request_parts_count(request.server, request.handle))
 }
 
 // Part is part index of a multipart/form-data body, its payload undecoded.
@@ -655,7 +655,7 @@ func (request *Request) Part(index uint) (RequestPart, error) {
 	var call callWithResult[[3]C.ucall_bytes_view_t]
 	arguments := open[C.ucall_server_request_part_t](&call)
 	*arguments = C.ucall_server_request_part_t{
-		server: request.server, outcome: call.outcome(), request: request.request, index: C.size_t(index),
+		server: request.server, outcome: call.outcome(), request: request.handle, index: C.size_t(index),
 		name: &call.result[0], content_type: &call.result[1], data: &call.result[2]}
 	C.ucall_server_request_part(arguments)
 	part, err := block(&call, nil)
@@ -675,7 +675,7 @@ func (request *Request) Reply(status HTTPStatus, headers []string, body []byte) 
 	lines, linesCount := call.texts(headers)
 	arguments := open[C.ucall_server_reply_content_t](&call)
 	*arguments = C.ucall_server_reply_content_t{
-		server: request.server, outcome: call.outcome(), request: call.taken(&request.request),
+		server: request.server, outcome: call.outcome(), request: call.taken(&request.handle),
 		http_status: C.ucall_http_status_t(status), headers: lines, headers_count: linesCount,
 		body: call.bytes(body)}
 	C.ucall_server_reply_content(arguments)
@@ -689,7 +689,7 @@ func (request *Request) ReplyError(status HTTPStatus, message string) error {
 	var call callWithResult[struct{}]
 	arguments := open[C.ucall_server_reply_error_t](&call)
 	*arguments = C.ucall_server_reply_error_t{
-		server: request.server, outcome: call.outcome(), request: call.taken(&request.request),
+		server: request.server, outcome: call.outcome(), request: call.taken(&request.handle),
 		http_status: C.ucall_http_status_t(status), message: call.text(message)}
 	C.ucall_server_reply_error(arguments)
 	_, err := block(&call, nil)
@@ -700,7 +700,7 @@ func (request *Request) ReplyError(status HTTPStatus, message string) error {
 // finish later; the polling goroutine itself must never wait on them.
 func (request *Request) Detach() *DetachedRequest {
 	detached := &DetachedRequest{Request: *request}
-	request.request = nil
+	request.handle = nil
 	return detached
 }
 
@@ -798,7 +798,7 @@ func (detached *DetachedRequest) ReplyParts(status HTTPStatus, headers []string,
 	lowered, loweredCount := call.parts(parts)
 	arguments := open[C.ucall_server_reply_vectored_t](call)
 	*arguments = C.ucall_server_reply_vectored_t{
-		server: detached.server, outcome: call.outcome(), request: call.taken(&detached.request),
+		server: detached.server, outcome: call.outcome(), request: call.taken(&detached.handle),
 		http_status: C.ucall_http_status_t(status), headers: lines, headers_count: linesCount,
 		parts: lowered, parts_count: loweredCount}
 	C.ucall_server_reply_vectored(arguments)
@@ -812,14 +812,14 @@ func (detached *DetachedRequest) ReplyStream(status HTTPStatus, headers []string
 	lines, linesCount := call.texts(headers)
 	arguments := open[C.ucall_server_reply_begin_t](&call)
 	*arguments = C.ucall_server_reply_begin_t{
-		server: detached.server, outcome: call.outcome(), request: call.taken(&detached.request),
+		server: detached.server, outcome: call.outcome(), request: call.taken(&detached.handle),
 		http_status: C.ucall_http_status_t(status), headers: lines, headers_count: linesCount}
 	C.ucall_server_reply_begin(arguments)
 	if _, err := block(&call, nil); err != nil {
 		return nil, err
 	}
-	stream := &ReplyStream{server: detached.server, request: detached.request}
-	detached.request = nil
+	stream := &ReplyStream{server: detached.server, request: detached.handle}
+	detached.handle = nil
 	return stream, nil
 }
 
@@ -839,7 +839,7 @@ func (detached *DetachedRequest) BodyChunk() (*Deferred[BodyChunk], error) {
 	call := &deferred.call
 	arguments := open[C.ucall_server_request_body_chunk_t](call)
 	*arguments = C.ucall_server_request_body_chunk_t{
-		server: detached.server, outcome: call.outcome(), request: detached.request, data: &call.result.view}
+		server: detached.server, outcome: call.outcome(), request: detached.handle, data: &call.result.view}
 	C.ucall_server_request_body_chunk(arguments)
 	return submitted(deferred, nil)
 }
@@ -913,7 +913,7 @@ func (batch Batch) Len() int { return len(batch.requests) }
 
 // Take hands over request index, which its taker replies to.
 func (batch Batch) Take(index int) *Request {
-	return &Request{server: batch.server, request: batch.requests[index]}
+	return &Request{server: batch.server, handle: batch.requests[index]}
 }
 
 //export ucallBatches
@@ -923,8 +923,8 @@ func ucallBatches(server C.ucall_server_t, requests *C.ucall_received_http_reque
 
 // BatchEndpoint is one batch endpoint, drained by one goroutine at a time until its server closes.
 type BatchEndpoint struct {
-	server   C.ucall_server_t
-	endpoint C.ucall_http_batch_endpoint_t
+	server C.ucall_server_t
+	handle C.ucall_http_batch_endpoint_t
 }
 
 // Batch collects requests matching path and verb from every event loop into one queue, which the
@@ -957,7 +957,7 @@ func (server *Server) Batch(path string, verb Verb, options Batching, handler fu
 		return nil, err
 	}
 	server.handles = append(server.handles, handle)
-	return &BatchEndpoint{server: server.handle, endpoint: endpoint}, nil
+	return &BatchEndpoint{server: server.handle, handle: endpoint}, nil
 }
 
 // TakeBatch runs the handler on this goroutine if a batch is due, waiting up to timeout for one;
@@ -966,7 +966,7 @@ func (endpoint *BatchEndpoint) TakeBatch(timeout time.Duration) error {
 	var call callWithResult[struct{}]
 	arguments := open[C.ucall_server_take_batch_t](&call)
 	*arguments = C.ucall_server_take_batch_t{
-		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.endpoint,
+		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.handle,
 		timeout_microseconds: microseconds(timeout)}
 	C.ucall_server_take_batch(arguments)
 	_, err := block(&call, nil)
@@ -978,7 +978,7 @@ func (endpoint *BatchEndpoint) TakeBatches() error {
 	var call callWithResult[struct{}]
 	arguments := open[C.ucall_server_take_batches_t](&call)
 	*arguments = C.ucall_server_take_batches_t{
-		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.endpoint}
+		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.handle}
 	C.ucall_server_take_batches(arguments)
 	_, err := block(&call, nil)
 	return err
@@ -999,7 +999,7 @@ func (endpoint *BatchEndpoint) Statistics() (BatchEndpointStatistics, error) {
 	var call callWithResult[BatchEndpointStatistics]
 	arguments := open[C.ucall_server_batch_endpoint_statistics_t](&call)
 	*arguments = C.ucall_server_batch_endpoint_statistics_t{
-		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.endpoint,
+		server: endpoint.server, outcome: call.outcome(), endpoint: endpoint.handle,
 		statistics: (*C.ucall_batch_endpoint_statistics_t)(unsafe.Pointer(call.result))}
 	C.ucall_server_batch_endpoint_statistics(arguments)
 	return block(&call, nil)

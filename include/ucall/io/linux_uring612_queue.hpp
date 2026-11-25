@@ -188,7 +188,6 @@ inline constexpr std::uintptr_t uring_operation_tag_k = 0, uring_control_tag_k =
  *  an accept takes, which shares the request with the accept's anchor, the record it names. */
 template <typename socket_slot_type_>
 struct alignas(8) uring_operation {
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     /** The request the record holds, or null while it is free; an accept's records share one. */
     io_request_t* request {};
@@ -259,7 +258,6 @@ struct uring_provided_buffers {
     template <typename value_type_>
     using vector =
         st::vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     /** How far the kernel filled a buffer, and how many of its slices await @c release. */
     struct record_t {
@@ -415,7 +413,7 @@ struct uring_state {
     io_uring ring {};
 
     /** What the pool, the storage and the queue's grown records allocate from. */
-    allocator_t allocator;
+    [[no_unique_address]] allocator_t allocator;
 
     /** The receive pool the kernel picks buffers from. */
     uring_provided_buffers<allocator_t> provided;
@@ -678,7 +676,6 @@ struct uring_socket_slots {
     template <typename value_type_>
     using vector =
         st::vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     /** One slot per index of the registered file table. */
     vector<socket_slot_t> records;
@@ -835,7 +832,6 @@ struct uring_operations {
     template <typename value_type_>
     using vector =
         st::vector<value_type_, typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     /** One record per operation; those from @c first_release on serve named releases. */
     vector<operation_t> records;
@@ -931,7 +927,7 @@ struct uring_operations {
                 }
         // A connection an accept took leaves its request named by the accept's anchor.
         if (operation.request && operation.request->operation_index == index_of(operation))
-            operation.request->operation_index = io_unindexed_k;
+            operation.request->operation_index = absent_k;
         operation.request = nullptr;
         push(index_of(operation) < first_release ? free_operations : free_releases, operation);
     }
@@ -1175,7 +1171,6 @@ struct uring_zero_copy {
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operation_t = typename operations_t::operation_t;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     /** Summed over every release. */
     std::uint32_t outstanding_notifications {};
@@ -1340,14 +1335,14 @@ void uring_prepare(io_uring_sqe* submission, typename operations_type_::operatio
         auto const bytes = static_cast<unsigned>(
             fu::min_of<std::size_t>(request.length, (std::numeric_limits<unsigned>::max)()));
         if (request.registered_memory != io_unregistered_k)
-            io_uring_prep_read_fixed(submission, request.file.file, request.data, bytes, request.file.offset,
+            io_uring_prep_read_fixed(submission, request.file.handle, request.data, bytes, request.file.offset,
                                      static_cast<int>(request.registered_memory));
-        else io_uring_prep_read(submission, request.file.file, request.data, bytes, request.file.offset);
+        else io_uring_prep_read(submission, request.file.handle, request.data, bytes, request.file.offset);
         tally<state_type_::template atomic_ref>(state.statistics.file_reads_asynchronous);
         break;
     }
     case io_operation_t::file_open_k:
-        io_uring_prep_openat2(submission, request.file.file, reinterpret_cast<char const*>(request.data),
+        io_uring_prep_openat2(submission, request.file.handle, reinterpret_cast<char const*>(request.data),
                               &state.storage->open_resolution);
         break;
     case io_operation_t::shutdown_k: io_uring_prep_shutdown(submission, socket, SHUT_WR); break;
@@ -1594,8 +1589,7 @@ template <typename queue_type_>
 void uring_abandon(queue_type_& queue, typename queue_type_::socket_slot_t& owner) noexcept {
     owner.stage = owner.stage == uring_socket_stage_t::installing_k ? uring_socket_stage_t::abandoned_k
                                                                     : uring_socket_stage_t::retiring_k;
-    for (unsigned index = owner.owned_head; index != queue_type_::absent_k;
-         index = queue.operations[index].owned_next) {
+    for (unsigned index = owner.owned_head; index != absent_k; index = queue.operations[index].owned_next) {
         auto& operation = queue.operations[index];
         if (!operation.answered() && operation.request->operation != io_operation_t::close_k)
             if (queue.cancel(operation) != ucall_status_success_k) queue.state.fault = -EIO;
@@ -1638,7 +1632,6 @@ struct linux_uring612_queue {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     template <typename value_type_>
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     struct alignas(8) socket_slot_t {
 
@@ -1766,7 +1759,7 @@ struct linux_uring612_queue {
             submission->buf_group = 0;
         }
         else if (request.operation == io_operation_t::file_read_vectors_k) {
-            io_uring_prep_readv(submission, request.file.file, io_vectors(request).data(),
+            io_uring_prep_readv(submission, request.file.handle, io_vectors(request).data(),
                                 static_cast<unsigned>(request.length), request.file.offset);
             tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
         }

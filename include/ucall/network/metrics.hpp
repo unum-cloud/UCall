@@ -71,7 +71,7 @@ struct metrics {
                                         std::initializer_list<std::string_view> tags) noexcept {
         std::size_t const before = datagram.size();
         ucall_status_t status = http_t::append_text(
-            datagram, {before ? "\n" : "", text_view(server.metrics_prefix), ".", name, ":", value, "|", type});
+            datagram, {before ? "\n" : "", text_view(server.config.metrics_prefix), ".", name, ":", value, "|", type});
         std::string_view separator = "|#";
         for (ucall_bytes_view_t tag : server.metrics_tag_views) {
             if (status == ucall_status_success_k) status = http_t::append_text(datagram, {separator, text_view(tag)});

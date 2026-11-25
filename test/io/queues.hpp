@@ -481,7 +481,7 @@ case_result_t test_end_of_stream() {
     expect_true(completed.result == 0 && !completed.release_token && !completed.data, "the end answered {}",
                 completed.result);
     queue.release(completed);
-    expect_true(provided.available_buffers == before && provided.newest_buffer != queue.absent_k &&
+    expect_true(provided.available_buffers == before && provided.newest_buffer != absent_k &&
                     provided.records[provided.newest_buffer].consumed_bytes == sizeof(bytes),
                 "{} buffers left of {}", provided.available_buffers, before);
 

@@ -56,13 +56,14 @@ struct network_interface {
         for (native_file_t directory : reply_directory_descriptors) close_native_file(directory);
     }
 
-    /** The caller's interface settings, resolved: its views and keys point into this record. */
-    ucall_network_interface_t config {};
+    /** The caller's interface settings, resolved, in its server's @c resolved: their views and keys
+     *  point into this record. */
+    ucall_network_interface_t* config {};
 
-    /** The bound address as text, NUL-terminated, which @c config.address views once bound. */
+    /** The bound address as text, NUL-terminated, which @c config->address views once bound. */
     vector<char> address {};
 
-    /** The device name, NUL-terminated, which @c config.device_name views; empty if unset. */
+    /** The device name, NUL-terminated, which @c config->device_name views; empty if unset. */
     vector<char> device {};
 
     /** Derived from @c private_key at initialization; zero when no private key was given. */
@@ -92,8 +93,8 @@ struct network_interface {
     /** The share of @c max_concurrent_connections that event loop @p index admits, one of the
      *  interface's @c event_loops. */
     std::size_t quota(std::size_t index) const noexcept {
-        return config.max_concurrent_connections / config.event_loops +
-               (index < config.max_concurrent_connections % config.event_loops);
+        return config->max_concurrent_connections / config->event_loops +
+               (index < config->max_concurrent_connections % config->event_loops);
     }
 
     /** Admitted connections across every loop, apart from the words each request reads. */
@@ -184,7 +185,7 @@ struct file_window_pool {
     };
     explicit file_window_pool(allocator_t const& allocator) noexcept
         : window_runs(rebound_allocator<span<byte_t>> {allocator}),
-          window_memory(rebound_allocator<byte_t*> {allocator}), windows(rebound_allocator<file_window_t> {allocator}),
+          windows(rebound_allocator<file_window_t> {allocator}),
           release_requests(rebound_allocator<io_request_t> {allocator}) {}
     file_window_pool(file_window_pool const&) = delete;
     file_window_pool& operator=(file_window_pool const&) = delete;
@@ -193,9 +194,6 @@ struct file_window_pool {
 
     /** One allocation each, holding whole windows. */
     vector<span<byte_t>> window_runs {};
-
-    /** Each window's first byte, by window index. */
-    vector<byte_t*> window_memory {};
 
     /** Each window's record, by index; reserved to @c max_windows at open, never moved. */
     vector<file_window_t> windows {};
@@ -339,15 +337,12 @@ struct event_loop {
     template <typename value_type_>
     using vector = typename network_t::template vector<value_type_>;
     template <typename value_type_>
-    using owner = typename network_t::template owner<value_type_>;
-    template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
 
     /** The server's allocator, which the loop's connections, exchanges and windows take. */
-    allocator_t allocator;
+    [[no_unique_address]] allocator_t allocator;
     explicit event_loop(allocator_t const& allocator) noexcept
         : allocator(allocator), queue(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
-          connections(rebound_allocator<owner<connection_t>> {allocator}),
           interface_statistics(rebound_allocator<interface_statistics_t> {allocator}),
           interface_orders(rebound_allocator<interface_order_t> {allocator}), metrics(allocator),
           file_windows(allocator) {}
@@ -374,8 +369,9 @@ struct event_loop {
     /** The thread inside @c take_call, written only by it; zero between polls. */
     polling_thread_t polling_thread {};
 
-    /** Every connection of the loop by index, each interface's quota of it, never resized. */
-    vector<owner<connection_t>> connections {};
+    /** Every connection of the loop by index, each interface's quota of it, allocated at
+     *  initialization; a connection's index is its offset here. */
+    span<connection_t> connections {};
 
     /** One per interface served by this loop, allocated at initialization. */
     span<interface_acceptor_t> interface_acceptors {};
@@ -475,8 +471,7 @@ struct event_loop {
             for (descriptor_t waiting : {order.parked, order.queued})
                 if (waiting >= 0) queue.close_socket(waiting);
         for (auto& connection : connections)
-            if (connection && connection->transport.descriptor >= 0)
-                queue.close_socket(connection->transport.descriptor);
+            if (connection.transport.descriptor >= 0) queue.close_socket(connection.transport.descriptor);
         while (exchanges) {
             auto* next = exchanges->next;
             allocator_delete<server_exchange_t, allocator_t> {allocator}(exchanges);
@@ -499,6 +494,9 @@ struct event_loop {
         if (!interface_acceptors.empty())
             rebound_allocator<interface_acceptor_t> {allocator}.deallocate(interface_acceptors.data(),
                                                                            interface_acceptors.size());
+        std::destroy(connections.begin(), connections.end());
+        if (!connections.empty())
+            rebound_allocator<connection_t> {allocator}.deallocate(connections.data(), connections.size());
     }
 };
 

@@ -34,7 +34,6 @@ template <typename allocator_type_ = st::default_allocator<byte_t>,
           typename row_kit_type_ = st::serial_row_kit_t>
 struct poll_readiness {
     using allocator_t = allocator_type_;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     using position_index_t =
@@ -167,7 +166,6 @@ struct posix_queue {
     using allocator_t = allocator_type_;
     template <typename other_allocator_, template <typename> class other_atomic_ref_, typename other_row_kit_>
     using rebind = posix_queue<other_allocator_, other_atomic_ref_, other_row_kit_>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_posix_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::submitter_k;
     template <typename value_type_>

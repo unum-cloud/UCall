@@ -195,7 +195,7 @@ struct windows_rio_operation_t {
 struct windows_rio_socket_t {
 
     /** The socket, or @c INVALID_SOCKET once the queue closed it. */
-    SOCKET socket {INVALID_SOCKET};
+    SOCKET handle {INVALID_SOCKET};
 
     /** Its request queue, or invalid where its family keeps it out of Registered I/O. */
     windows_rio_request_queue_t request_queue {};
@@ -235,13 +235,12 @@ struct windows_rio_range_t {
  *  to what @c open sized, and valid until @c release. */
 template <typename allocator_type_>
 struct windows_rio_slices {
-    struct alignas(4096) page_t {
+    struct alignas(utilities::page_bytes_k) page_t {
 
         /** One page of a range. */
-        byte_t bytes[4096];
+        byte_t bytes[utilities::page_bytes_k];
     };
     static constexpr std::size_t slice_bytes_k = windows_rio_slice_pages_k * sizeof(page_t);
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
     template <typename value_type_>
     using rebound_allocator = typename std::allocator_traits<allocator_type_>::template rebind_alloc<value_type_>;
 
@@ -263,7 +262,7 @@ struct windows_rio_slices {
     st::vector<unsigned, rebound_allocator<unsigned>> free_slices {};
 
     /** What ranges allocate from. */
-    allocator_type_ allocator;
+    [[no_unique_address]] allocator_type_ allocator;
 
     /** Reserves the bookkeeping for @p slices awaiting @c release at once, so growing
      *  allocates only ranges. */
@@ -352,7 +351,6 @@ template <typename allocator_type_ = st::default_allocator<byte_t>,
 struct windows_rio_queue {
     using allocator_t = allocator_type_;
     using operation_stage_t = windows_operation_stage_t;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_windows_rio_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_k;
 
@@ -380,7 +378,7 @@ struct windows_rio_queue {
         if (completion_queue == windows_rio_invalid_completion_queue_k) return;
         stop();
         for (windows_rio_socket_t& socket : sockets)
-            if (socket.socket != INVALID_SOCKET) closesocket(socket.socket);
+            if (socket.handle != INVALID_SOCKET) closesocket(socket.handle);
         rio.close_completion_queue(completion_queue);
         for (windows_rio_range_t const& range : ranges) rio.deregister_buffer(range.buffer);
         slices.close(rio);
@@ -565,13 +563,12 @@ struct windows_rio_queue {
             socket.slices[receive_direction_k] = slice;
             io_vectors(request).front() = {slices.data(slice), windows_rio_slices<allocator_t>::slice_bytes_k};
         }
-        return overlapped.submit(request, socket.socket, extensions, scatter, statistics);
+        return overlapped.submit(request, socket.handle, extensions, scatter, statistics);
     }
 
     ucall_status_t cancel(io_request_t& request) noexcept {
         std::uint32_t const code = request.operation_index;
-        if (code == io_unindexed_k || !(code & windows_rio_operation_tag_k))
-            return overlapped.cancel(request, statistics);
+        if (code == absent_k || !(code & windows_rio_operation_tag_k)) return overlapped.cancel(request, statistics);
         unsigned const index = (code & ~windows_rio_operation_tag_k) >> 1;
         unsigned const direction = code & 1;
         if (index >= sockets.size() || sockets[index].directions[direction].request != &request)
@@ -631,7 +628,7 @@ struct windows_rio_queue {
 
     /** The socket @p descriptor names, or @c INVALID_SOCKET once the queue closed it. */
     SOCKET socket_of(descriptor_t descriptor) const noexcept {
-        return registered_socket_t::contains(descriptor) ? sockets[registered_socket_t::index_of(descriptor)].socket
+        return registered_socket_t::contains(descriptor) ? sockets[registered_socket_t::index_of(descriptor)].handle
                                                          : static_cast<SOCKET>(descriptor);
     }
 
@@ -645,7 +642,7 @@ struct windows_rio_queue {
         }
         windows_rio_socket_t& record = sockets[index];
         record = {};
-        record.socket = socket;
+        record.handle = socket;
         record.stage = windows_rio_socket_stage_t::open_k;
         // A socket the family keeps out of Registered I/O, such as a Unix one, stays overlapped.
         record.request_queue = rio.create_request_queue(socket, 1, 1, 1, 1, completion_queue, completion_queue,
@@ -757,16 +754,16 @@ struct windows_rio_queue {
         if (socket.stage != windows_rio_socket_stage_t::open_k) return;
         if (direction == transmit_direction_k) {
             [[maybe_unused]] ucall_status_t const reset = socket_reset_on_close(
-                static_cast<descriptor_t>(socket.socket));
+                static_cast<descriptor_t>(socket.handle));
         }
-        closesocket(std::exchange(socket.socket, INVALID_SOCKET));
+        closesocket(std::exchange(socket.handle, INVALID_SOCKET));
         socket.stage = windows_rio_socket_stage_t::aborted_k;
     }
 
     /** The network lets socket @p index go: closed, and free once no result is due. */
     void let_go(unsigned index) noexcept {
         windows_rio_socket_t& socket = sockets[index];
-        if (socket.socket != INVALID_SOCKET) closesocket(std::exchange(socket.socket, INVALID_SOCKET));
+        if (socket.handle != INVALID_SOCKET) closesocket(std::exchange(socket.handle, INVALID_SOCKET));
         socket.stage = windows_rio_socket_stage_t::draining_k;
         if (!socket.outstanding) vacate(index);
     }
@@ -823,7 +820,7 @@ struct windows_rio_queue {
             else if (slice != absent_k) slices.release(slice);
             if (operation.timed != absent_k) untime(index, direction);
             operation = {};
-            request.operation_index = io_unindexed_k;
+            request.operation_index = absent_k;
             --registered_operations;
             if (!--socket.outstanding && socket.stage == windows_rio_socket_stage_t::draining_k) vacate(index);
             tally<atomic_ref_template_>(statistics.completions);

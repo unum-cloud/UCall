@@ -105,7 +105,7 @@ struct windows_extensions_t {
 };
 
 /** Page elements one @c ReadFileScatter takes: the 64 pages of the largest vectored read a file
- *  window issues, 256 KiB, and the terminating element. */
+ *  window issues, 256 KiB, and the terminating element, as @c src/variants.hpp checks. */
 inline constexpr std::size_t windows_scatter_pages_k = 65;
 
 /** The page lists vectored file reads scatter through, @c windows_scatter_pages_k elements per
@@ -207,7 +207,6 @@ struct windows_overlapped {
     using rebound_allocator = typename std::allocator_traits<allocator_t>::template rebind_alloc<value_type_>;
     using operation_t = windows_operation_t;
     using operation_stage_t = windows_operation_stage_t;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     explicit windows_overlapped(allocator_t const& allocator = {}) noexcept
         : operations(rebound_allocator<operation_t> {allocator}), timed(rebound_allocator<unsigned> {allocator}),
@@ -507,7 +506,7 @@ struct windows_overlapped {
 
     /** Opens the file @p request names beneath its directory, bound to the port. */
     descriptor_t open_file(io_request_t const& request) noexcept {
-        descriptor_t const file = open_native_file_beneath(request.file.file,
+        descriptor_t const file = open_native_file_beneath(request.file.handle,
                                                            reinterpret_cast<char const*>(request.data));
         if (file < 0 || associate(std::bit_cast<HANDLE>(file)) == ucall_status_success_k) return file;
         CloseHandle(std::bit_cast<HANDLE>(file));
@@ -518,7 +517,7 @@ struct windows_overlapped {
     DWORD read_file(unsigned index, windows_scatter_pages<allocator_t>& scatter) noexcept {
         operation_t& operation = operations[index];
         io_request_t const& request = *operation.request;
-        operation.handle = request.file.file;
+        operation.handle = request.file.handle;
         operation.overlapped.Offset = static_cast<DWORD>(request.file.offset);
         operation.overlapped.OffsetHigh = static_cast<DWORD>(request.file.offset >> 32);
         if (request.operation == io_operation_t::file_read_k) {
@@ -705,7 +704,7 @@ struct windows_overlapped {
                 0)
             result = -socket_last_error();
         if (request.operation == io_operation_t::accept_k) request.length = 0;
-        request.operation_index = io_unindexed_k;
+        request.operation_index = absent_k;
         release(index);
         --taken_operations;
         tally<atomic_ref_template_>(statistics.completions);

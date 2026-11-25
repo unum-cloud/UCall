@@ -82,7 +82,7 @@
 /** Serializes threads on one object where no interpreter lock does; the lock does it otherwise. */
 typedef struct ucall_py_section_t {
 #ifdef Py_GIL_DISABLED
-    PyCriticalSection section;
+    PyCriticalSection critical;
 #else
     char unused;
 #endif
@@ -91,13 +91,13 @@ typedef struct ucall_py_section_t {
 static inline void ucall_py_section_begin([[maybe_unused]] ucall_py_section_t* section,
                                           [[maybe_unused]] PyObject* object) {
 #ifdef Py_GIL_DISABLED
-    PyCriticalSection_Begin(&section->section, object);
+    PyCriticalSection_Begin(&section->critical, object);
 #endif
 }
 
 static inline void ucall_py_section_end([[maybe_unused]] ucall_py_section_t* section) {
 #ifdef Py_GIL_DISABLED
-    PyCriticalSection_End(&section->section);
+    PyCriticalSection_End(&section->critical);
 #endif
 }
 

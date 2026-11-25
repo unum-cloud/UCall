@@ -876,7 +876,7 @@ struct replies {
         io_request_t* request = connection.transport.emit(connection.file_read_request, io_operation_t::file_open_k,
                                                           file_segment.segment.bytes);
         request->deadline = 0;
-        request->file = {.file = file_segment.file};
+        request->file = {.handle = file_segment.file};
         return request;
     }
 
@@ -1049,11 +1049,10 @@ struct replies {
                                                                               span<byte_t> {base, run_bytes});
         for (std::size_t offset = run_windows * window_bytes; offset;) {
             offset -= window_bytes;
-            [[maybe_unused]] st::status_t const listed = pool.window_memory.push_back(st::assume_reserved,
-                                                                                      base + offset);
             auto const grown = static_cast<std::uint32_t>(pool.windows.size());
             [[maybe_unused]] st::status_t const added = pool.windows.push_back(
-                st::assume_reserved, file_window_t {.next = std::exchange(pool.free_windows, grown)});
+                st::assume_reserved,
+                file_window_t {.memory = base + offset, .next = std::exchange(pool.free_windows, grown)});
             [[maybe_unused]] st::status_t const named = pool.release_requests.push_back(st::assume_reserved,
                                                                                         io_request_t {release});
         }
@@ -1077,8 +1076,8 @@ struct replies {
             return absent_k;
         }
         file_window_t& record = pool.windows[window];
-        record = {};
-        record.connection = connection.index;
+        record = {.memory = record.memory,
+                  .connection = static_cast<std::uint32_t>(&connection - event_loop.connections.data())};
         pool.release_requests[window].descriptor = connection.transport.descriptor;
         if (connection.newest_window != absent_k) pool.windows[connection.newest_window].next = window;
         else connection.oldest_window = window;
@@ -1106,7 +1105,7 @@ struct replies {
         file_segment.file_offset += record.slice_bytes;
         file_segment.remaining_bytes -= record.slice_bytes;
         std::size_t const length = (record.skipped + record.slice_bytes + alignment - 1) / alignment * alignment;
-        byte_t* const base = pool.window_memory[window] + page_bytes_k;
+        byte_t* const base = record.memory + page_bytes_k;
         connection.file_reading = file_read_state_t::reading_file_k;
         io_request_t* request;
         if (!sealed)
@@ -1122,7 +1121,7 @@ struct replies {
         }
         request->deadline = 0;
         request->registered_memory = pool.registered_memory(window);
-        request->file = {.offset = extent_offset, .file = file_segment.file};
+        request->file = {.offset = extent_offset, .handle = file_segment.file};
         return request;
     }
 
@@ -1225,7 +1224,7 @@ struct replies {
         file_window_t& record = pool.windows[window];
         if (record.stage == file_window_stage_t::reading_k) return nullptr;
         if (record.sent_bytes == record.slice_bytes) return &pool.release_requests[window];
-        byte_t* const base = pool.window_memory[window] + page_bytes_k;
+        byte_t* const base = record.memory + page_bytes_k;
         span<byte_t> bytes {base + record.skipped + record.sent_bytes, record.slice_bytes - record.sent_bytes};
         if (connection.transport.tunnel.encrypts()) {
             secure_tunnel_geometry_t const geometry = connection.transport.tunnel.geometry();
@@ -1324,7 +1323,7 @@ struct replies {
         std::uint32_t const window = pool.window_of(completion.request);
         connection_t* connection;
         if (window != absent_k) {
-            connection = event_loop.connections[pool.windows[window].connection].get();
+            connection = &event_loop.connections[pool.windows[window].connection];
             --connection->releasing_windows;
             vacate_window(event_loop, window);
         }

@@ -141,7 +141,7 @@ struct response_pool {
     std::size_t outside {1};
 
     /** Allocates the responses and frees them and the pool, even after the client is gone. */
-    allocator_t allocator;
+    [[no_unique_address]] allocator_t allocator;
 };
 
 template <typename network_type_>
@@ -417,7 +417,7 @@ struct client : ucall_client_handle_t {
         st::basic_hash_index<std::uint64_t, std::uint32_t, st::default_hash_t, rebound_allocator<byte_t>, row_kit_t>;
 
     /** Allocates the client's records, their buffers and its responses. */
-    allocator_t allocator;
+    [[no_unique_address]] allocator_t allocator;
 
     explicit client(allocator_t const& allocator) noexcept
         : allocator(allocator), owned_queue(allocator), completions(rebound_allocator<io_completion_t> {allocator}),
@@ -1648,10 +1648,13 @@ struct client : ucall_client_handle_t {
         return !deadline || (earliest && earliest < deadline) ? earliest : deadline;
     }
 
-    /** Queue slots a client needs: each connection an operation per direction, and each lookup one
-     *  per question. */
+    /** Queue slots one connection takes: an operation per direction, and one per question of the
+     *  lookup it may run, AAAA and A. */
+    static constexpr std::size_t connection_queue_slots_k = 2 + 2;
+
+    /** Queue slots a client needs, @c connection_queue_slots_k per connection. */
     static std::size_t queue_slots(ucall_client_options_t const& config) noexcept {
-        return 4 * config.max_concurrent_connections;
+        return connection_queue_slots_k * config.max_concurrent_connections;
     }
 
     /** Makes a client over its own queue, or over @p bound, a server event loop's queue that loop
@@ -1696,11 +1699,11 @@ struct client : ucall_client_handle_t {
             }
             config.max_concurrent_calls = config.max_concurrent_connections * config.max_pipelined_calls;
         }
-        // Each connection keeps one operation per direction, and origin slots index one origin per
-        // call and per connection below `absent_k`.
+        // Queue slots index below `absent_k`, and so do origin slots, one per call and two per
+        // connection, which the same bound on calls keeps below it.
+        constexpr std::size_t indexed_max = (std::numeric_limits<std::uint32_t>::max)() / connection_queue_slots_k;
         if (config.max_pipelined_calls > (std::numeric_limits<std::uint32_t>::max)() ||
-            config.max_concurrent_connections > (std::numeric_limits<std::uint32_t>::max)() / 4 ||
-            config.max_concurrent_calls > (std::numeric_limits<std::uint32_t>::max)() / 4) {
+            config.max_concurrent_connections > indexed_max || config.max_concurrent_calls > indexed_max) {
             publish<atomic_ref>(arguments->outcome, ucall_status_overflow_k);
             return;
         }

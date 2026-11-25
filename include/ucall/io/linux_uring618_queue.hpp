@@ -34,7 +34,6 @@ struct linux_uring618_queue {
     using vector = st::vector<value_type_, rebound_allocator<value_type_>>;
     template <typename other_allocator_type_, template <typename> class other_atomic_ref_, typename other_row_kit_>
     using rebind = linux_uring618_queue<other_allocator_type_, other_atomic_ref_, other_row_kit_>;
-    static constexpr unsigned absent_k = operation_list_t::absent_k;
 
     enum class receive_stage_t : std::uint8_t {
 
@@ -394,11 +393,11 @@ struct linux_uring618_queue {
         if (!submission) return operations.push(operations.waiting_operations, operation);
         if (request.operation == io_operation_t::file_read_vectors_k) {
             if (request.registered_memory != io_unregistered_k)
-                io_uring_prep_readv_fixed(submission, request.file.file, io_vectors(request).data(),
+                io_uring_prep_readv_fixed(submission, request.file.handle, io_vectors(request).data(),
                                           static_cast<unsigned>(request.length), request.file.offset, 0,
                                           static_cast<int>(request.registered_memory));
             else
-                io_uring_prep_readv(submission, request.file.file, io_vectors(request).data(),
+                io_uring_prep_readv(submission, request.file.handle, io_vectors(request).data(),
                                     static_cast<unsigned>(request.length), request.file.offset);
             tally<atomic_ref_template_>(statistics.file_reads_asynchronous);
         }

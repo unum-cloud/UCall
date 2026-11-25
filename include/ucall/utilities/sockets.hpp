@@ -446,7 +446,7 @@ struct file_geometry_t {
 static_assert(sizeof(file_geometry_t) == 24);
 
 /** The alignment unbuffered reads assume where the filesystem cannot say, a page everywhere. */
-inline constexpr std::uint32_t file_portable_alignment_k = 4096;
+inline constexpr std::uint32_t file_portable_alignment_k = page_bytes_k;
 
 /** Whether @p path names something beneath its directory: relative, and free of NUL bytes,
  *  backslashes, <tt>:</tt> drives or streams, and <tt>..</tt> segments, alike on every platform. */

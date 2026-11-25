@@ -58,6 +58,9 @@ using rio_queues_t = io::io_queue_variant<>;
 #endif // UCALL_WITH_WINDOWS_RIO
 #if UCALL_WITH_WINDOWS_IOCP
 using iocp_queues_t = io::io_queue_variant<io::windows_iocp_queue_t>;
+/*  One scatter element per page of a window's largest vectored read, and its terminator. */
+static_assert(io::windows_scatter_pages_k ==
+              network::file_window_records_k * network::file_record_stride_k / utilities::page_bytes_k + 1);
 #else
 using iocp_queues_t = io::io_queue_variant<>;
 #endif // UCALL_WITH_WINDOWS_IOCP
