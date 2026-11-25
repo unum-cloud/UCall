@@ -601,7 +601,7 @@ inline bool io_pending(descriptor_t result) noexcept {
 /** A readiness queue whose level-triggered set keeps polling what nothing waits on, so it must
  *  hear of each operation's end. */
 template <typename queue_type_>
-concept readiness_disarming = requires(queue_type_& queue, descriptor_t descriptor, unsigned index) {
+concept a_readiness_disarming_queue = requires(queue_type_& queue, descriptor_t descriptor, unsigned index) {
     queue.readiness.disarm(descriptor, io_direction_t::receive_k, index);
 };
 
@@ -665,7 +665,7 @@ io_completion_t readiness_finish(queue_type_& queue, unsigned index, descriptor_
         queue.timed.pop_back();
     }
     // Only a level-triggered set keeps polling what nothing waits on, so only it hears of the end.
-    if constexpr (readiness_disarming<queue_type_>)
+    if constexpr (a_readiness_disarming_queue<queue_type_>)
         if (operation.interest == io_interest_t::armed_k || operation.interest == io_interest_t::ready_k)
             queue.readiness.disarm(request.descriptor, io_direction(request.operation), index);
     if (request.operation == io_operation_t::accept_k) request.length = 0;
@@ -786,37 +786,35 @@ enum class zero_copy_stage_t : std::uint8_t {
 
 /** A queue that names the host setting its refused setup needs raised. */
 template <typename queue_type_>
-concept io_queue_naming_refusals = requires(queue_type_ const& queue) {
+concept a_refusal_naming_queue = requires(queue_type_ const& queue) {
     { queue.refusal } -> std::convertible_to<char const*>;
 };
 
 /** A queue that grows its capacity in place, keeping the setup it proved. */
 template <typename queue_type_>
-concept io_queue_growing_in_place = requires(queue_type_& queue, std::size_t capacity) {
+concept an_in_place_growing_queue = requires(queue_type_& queue, std::size_t capacity) {
     { queue.grow(capacity) } -> std::same_as<ucall_status_t>;
 };
 
 /** A queue that keeps the records sends' releases name apart from the rest. */
 template <typename queue_type_>
-concept io_queue_reserving_releases = requires(queue_type_& queue, std::size_t count) {
-    queue.reserve_releases(count);
-};
+concept a_release_reserving_queue = requires(queue_type_& queue, std::size_t count) { queue.reserve_releases(count); };
 
 /** A queue that prefetches a stream's bytes, and so can pause while nobody pulls them. */
 template <typename queue_type_>
-concept io_queue_prefetching = requires(queue_type_& queue, descriptor_t descriptor) {
+concept a_prefetching_queue = requires(queue_type_& queue, descriptor_t descriptor) {
     queue.receive_pause(descriptor);
 };
 
 /** A queue whose accepted sockets share flags its listener must be created with. */
 template <typename queue_type_>
-concept io_queue_creating_listeners = requires(queue_type_& queue, int family) {
+concept a_listener_creating_queue = requires(queue_type_& queue, int family) {
     { queue.open_listener(family) } -> std::same_as<descriptor_t>;
 };
 
 /** A queue that accepts only from listeners it creates, naming why it refuses a caller's. */
 template <typename queue_type_>
-concept io_queue_refusing_caller_listeners = requires {
+concept a_caller_listener_refusing_queue = requires {
     { queue_type_::caller_listener_refusal_k } -> std::convertible_to<char const*>;
 };
 
@@ -878,7 +876,7 @@ class io_queue_variant {
     char const* refusal() const noexcept {
         return std::visit(
             [](auto const& queue) noexcept -> char const* {
-                if constexpr (io_queue_naming_refusals<decltype(queue)>) return queue.refusal;
+                if constexpr (a_refusal_naming_queue<decltype(queue)>) return queue.refusal;
                 else return nullptr;
             },
             queues_);
@@ -894,7 +892,7 @@ class io_queue_variant {
         ucall_status_t grown = ucall_status_success_k;
         bool const in_place = std::visit(
             [&](auto& queue) noexcept {
-                if constexpr (io_queue_growing_in_place<decltype(queue)>) {
+                if constexpr (an_in_place_growing_queue<decltype(queue)>) {
                     grown = queue.grow(capacity);
                     return true;
                 }
@@ -909,7 +907,7 @@ class io_queue_variant {
     void reserve_releases(std::size_t count) noexcept {
         std::visit(
             [&](auto& queue) noexcept {
-                if constexpr (io_queue_reserving_releases<decltype(queue)>) queue.reserve_releases(count);
+                if constexpr (a_release_reserving_queue<decltype(queue)>) queue.reserve_releases(count);
             },
             queues_);
     }
@@ -919,7 +917,7 @@ class io_queue_variant {
     void receive_pause(descriptor_t descriptor) noexcept {
         std::visit(
             [&](auto& queue) noexcept {
-                if constexpr (io_queue_prefetching<decltype(queue)>) queue.receive_pause(descriptor);
+                if constexpr (a_prefetching_queue<decltype(queue)>) queue.receive_pause(descriptor);
             },
             queues_);
     }
@@ -943,7 +941,7 @@ class io_queue_variant {
     descriptor_t open_listener(int family) noexcept {
         return std::visit(
             [&](auto& queue) noexcept {
-                if constexpr (io_queue_creating_listeners<decltype(queue)>) return queue.open_listener(family);
+                if constexpr (a_listener_creating_queue<decltype(queue)>) return queue.open_listener(family);
                 else return socket_open(family);
             },
             queues_);
@@ -986,7 +984,7 @@ class io_queue_variant {
         bool const automatic = backend == ucall_io_backend_automatic_k;
         if (!automatic && backend != backends_k[index_])
             return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
-        if constexpr (io_queue_refusing_caller_listeners<queue_t>)
+        if constexpr (a_caller_listener_refusing_queue<queue_t>)
             if (listeners == io_listeners_t::caller_k) {
                 if (automatic) return open_<index_ + 1>(backend, depth, capacity, scope, listeners, refused);
                 queues_.template emplace<index_>(allocator_).refusal = queue_t::caller_listener_refusal_k;

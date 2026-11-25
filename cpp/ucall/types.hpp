@@ -93,11 +93,11 @@ struct outputs<void> {};
 /** Runs @p poll with @p state later on its own loop, storing the two words and allocating
  *  nothing. */
 template <typename scheduler_type_>
-concept scheduler = requires(scheduler_type_& loop, void (*poll)(void*) noexcept, void* state) {
+concept a_scheduler = requires(scheduler_type_& loop, void (*poll)(void*) noexcept, void* state) {
     loop.post(poll, state);
 };
 
-template <typename value_type_, scheduler scheduler_type_>
+template <typename value_type_, a_scheduler scheduler_type_>
 class awaiter;
 
 /**
@@ -158,7 +158,7 @@ class [[nodiscard]] deferred {
     }
 
     /** Awaits the call on @p loop, which polls its status until it is final. */
-    template <scheduler scheduler_type_>
+    template <a_scheduler scheduler_type_>
     awaiter<value_type_, scheduler_type_> wait(scheduler_type_& loop) noexcept {
         return {*this, loop};
     }
@@ -166,7 +166,7 @@ class [[nodiscard]] deferred {
 
 /** A @c deferred being awaited, living in the awaiting coroutine's frame: each poll reads the
  *  status word, and one not yet final posts itself again. */
-template <typename value_type_, scheduler scheduler_type_>
+template <typename value_type_, a_scheduler scheduler_type_>
 class awaiter {
     deferred<value_type_>& call_;
     scheduler_type_& loop_;
@@ -407,14 +407,14 @@ inline bool noise_keys_equal(ucall_noise_key_t const& first, ucall_noise_key_t c
 /** A peer authorizer: hears a peer's authenticated static key and answers whether it may go on,
  *  through a const call operator, since several polling loops may call it at once. */
 template <typename handler_type_>
-concept peer_authorizer = std::is_object_v<handler_type_> &&
-                          std::is_nothrow_invocable_r_v<bool, handler_type_ const&, ucall_noise_key_t const&>;
+concept a_peer_authorizer = std::is_object_v<handler_type_> &&
+                            std::is_nothrow_invocable_r_v<bool, handler_type_ const&, ucall_noise_key_t const&>;
 
 /** A log handler: hears each formatted line and its level, through a const call operator, since
  *  every thread that logs may call it at once. */
 template <typename handler_type_>
-concept log_handler = std::is_object_v<handler_type_> &&
-                      std::is_nothrow_invocable_r_v<void, handler_type_ const&, ucall_log_level_t, std::string_view>;
+concept a_log_handler = std::is_object_v<handler_type_> &&
+                        std::is_nothrow_invocable_r_v<void, handler_type_ const&, ucall_log_level_t, std::string_view>;
 
 /** A peer authorizer the caller keeps for the server's or the client's lifetime; empty admits
  *  nobody under Noise XX, which needs one. */
@@ -432,7 +432,7 @@ class peer_authorizer_t {
     peer_authorizer_t() noexcept = default;
 
     /** Asks @p handler about every authenticated peer, referring to it until the owner is freed. */
-    template <peer_authorizer handler_type_>
+    template <a_peer_authorizer handler_type_>
     peer_authorizer_t(handler_type_& handler) noexcept : callback_(&trampoline_<handler_type_>), context_(&handler) {}
 
     ucall_peer_authorizer_t callback() const noexcept { return callback_; }
@@ -453,7 +453,7 @@ class log_t {
     log_t() noexcept = default;
 
     /** Hears every line at or above @p level in @p format through @p handler. */
-    template <log_handler handler_type_>
+    template <a_log_handler handler_type_>
     log_t(handler_type_& handler, ucall_log_format_t format = ucall_log_format_human_k,
           ucall_log_level_t level = ucall_log_level_debug_k) noexcept
         : raw_ {&trampoline_<handler_type_>, &handler, format, level} {}

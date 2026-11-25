@@ -48,7 +48,7 @@ using utilities::text_view;
 /** An allocator that knows its platform's default page, such as a huge page, so a pool carves runs
  *  of that size rather than of the base page. */
 template <typename allocator_type_>
-concept sized_pages = requires(allocator_type_& pages) {
+concept a_page_aware_allocator = requires(allocator_type_& pages) {
     { pages.default_page_size() } -> std::convertible_to<std::size_t>;
 };
 
@@ -1022,7 +1022,7 @@ struct replies {
         using page_t = typename file_window_pool_t::page_t;
         rebound_allocator<page_t> pages {event_loop.allocator};
         std::size_t granularity = page_bytes_k;
-        if constexpr (sized_pages<rebound_allocator<page_t>>)
+        if constexpr (a_page_aware_allocator<rebound_allocator<page_t>>)
             granularity = fu::max_of<std::size_t>(pages.default_page_size(), page_bytes_k);
         std::size_t const window_bytes = file_window_pool_t::window_bytes;
         std::size_t const run_windows = fu::min_of<std::size_t>(fu::max_of<std::size_t>(granularity / window_bytes, 1),

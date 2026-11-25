@@ -449,26 +449,27 @@ using batch_function_t = void (*)(batch_t) noexcept;
 /** A request handler with state, which the caller keeps until the server is freed, called
  *  through a const call operator, since every polling loop may run it at once. */
 template <typename handler_type_>
-concept request_handler = std::is_object_v<handler_type_> &&
-                          std::is_nothrow_invocable_r_v<void, handler_type_ const&, request_t>;
+concept a_request_handler = std::is_object_v<handler_type_> &&
+                            std::is_nothrow_invocable_r_v<void, handler_type_ const&, request_t>;
 
 /** A batch handler with state, which the caller keeps until the server is freed; one polling owner
  *  drives a batch endpoint at a time, so it needs no const call operator. */
 template <typename handler_type_>
-concept batch_handler = std::is_object_v<handler_type_> && std::is_nothrow_invocable_r_v<void, handler_type_&, batch_t>;
+concept a_batch_handler = std::is_object_v<handler_type_> &&
+                          std::is_nothrow_invocable_r_v<void, handler_type_&, batch_t>;
 
 /** A member function of @p object_type_ handling each request, called on an object the caller
  *  keeps until the server is freed. Every polling loop may run it at once, so the object must be
  *  safe to call from several threads, like an internally synchronized store. */
 template <auto member_, typename object_type_>
-concept request_member = requires(object_type_& object, request_t request) {
+concept a_request_handling_member = requires(object_type_& object, request_t request) {
     { (object.*member_)(std::move(request)) } noexcept;
 };
 
 /** A member function of @p object_type_ handling each batch, called on an object the caller keeps
  *  until the server is freed. */
 template <auto member_, typename object_type_>
-concept batch_member = requires(object_type_& object, batch_t batch) {
+concept a_batch_handling_member = requires(object_type_& object, batch_t batch) {
     { (object.*member_)(batch) } noexcept;
 };
 
@@ -780,7 +781,7 @@ class server_t {
     /** Routes like the function overload to the member function @p member_ of @p object, which
      *  the caller keeps until the server is freed. */
     template <auto member_, typename object_type_>
-        requires request_member<member_, object_type_>
+        requires a_request_handling_member<member_, object_type_>
     status_t route(std::string_view path, ucall_verb_t verb, object_type_& object,
                    ucall_body_delivery_t delivery = ucall_body_delivery_buffered_k) noexcept {
         return routed_(path, verb, delivery, &member_trampoline_<member_, object_type_>, &object);
@@ -789,7 +790,7 @@ class server_t {
     /** Routes like the function overload to a @p handler with state, which the caller keeps until
      *  the server is freed. Every polling loop calls it as const; the reference is non-const only
      *  because the C context is @c void*. */
-    template <request_handler handler_type_>
+    template <a_request_handler handler_type_>
     status_t route(std::string_view path, ucall_verb_t verb, handler_type_& handler,
                    ucall_body_delivery_t delivery = ucall_body_delivery_buffered_k) noexcept {
         return routed_(path, verb, delivery, &handler_trampoline_<handler_type_>, &handler);
@@ -803,7 +804,7 @@ class server_t {
     }
 
     /** Routes GET requests on @p path to a @p handler the caller keeps. */
-    template <request_handler handler_type_>
+    template <a_request_handler handler_type_>
     status_t get(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_get_k, handler);
     }
@@ -815,7 +816,7 @@ class server_t {
     }
 
     /** Routes POST requests on @p path to a @p handler the caller keeps. */
-    template <request_handler handler_type_>
+    template <a_request_handler handler_type_>
     status_t post(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_post_k, handler);
     }
@@ -827,7 +828,7 @@ class server_t {
     }
 
     /** Routes PUT requests on @p path to a @p handler the caller keeps. */
-    template <request_handler handler_type_>
+    template <a_request_handler handler_type_>
     status_t put(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_put_k, handler);
     }
@@ -840,7 +841,7 @@ class server_t {
     }
 
     /** Routes DELETE requests on @p path to a @p handler the caller keeps. */
-    template <request_handler handler_type_>
+    template <a_request_handler handler_type_>
     status_t delete_(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_delete_k, handler);
     }
@@ -852,7 +853,7 @@ class server_t {
     }
 
     /** Routes PATCH requests on @p path to a @p handler the caller keeps. */
-    template <request_handler handler_type_>
+    template <a_request_handler handler_type_>
     status_t patch(std::string_view path, handler_type_& handler) noexcept {
         return route(path, ucall_verb_patch_k, handler);
     }
@@ -867,7 +868,7 @@ class server_t {
     /** Batches like the function overload into the member function @p member_ of @p object, which
      *  the caller keeps until the server is freed. */
     template <auto member_, typename object_type_>
-        requires batch_member<member_, object_type_>
+        requires a_batch_handling_member<member_, object_type_>
     expected<batch_endpoint_t> batch(std::string_view path, ucall_verb_t verb, batching_t const& batching,
                                      object_type_& object) noexcept {
         return batch_routed_(path, verb, batching, &batch_member_trampoline_<member_, object_type_>, &object);
@@ -875,7 +876,7 @@ class server_t {
 
     /** Batches like the function overload into a @p handler with state, which the caller keeps
      *  until the server is freed. */
-    template <batch_handler handler_type_>
+    template <a_batch_handler handler_type_>
     expected<batch_endpoint_t> batch(std::string_view path, ucall_verb_t verb, batching_t const& batching,
                                      handler_type_& handler) noexcept {
         return batch_routed_(path, verb, batching, &batch_handler_trampoline_<handler_type_>, &handler);

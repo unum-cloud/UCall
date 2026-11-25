@@ -105,21 +105,22 @@ struct counting_authorizer_t {
     std::size_t admitted = 0;
     bool operator()(ucall_noise_key_t const&) noexcept { return ++admitted != 0; }
 };
-static_assert(!uc::peer_authorizer<counting_authorizer_t>, "a stateful authorizer races across polling loops");
+static_assert(!uc::a_peer_authorizer<counting_authorizer_t>, "a stateful authorizer races across polling loops");
 
 /** Counts the lines it heard, which no two logging threads may do at once. */
 struct counting_log_handler_t {
     std::size_t lines = 0;
     void operator()(ucall_log_level_t, std::string_view) noexcept { ++lines; }
 };
-static_assert(!uc::log_handler<counting_log_handler_t>, "a stateful log handler races across logging threads");
+static_assert(!uc::a_log_handler<counting_log_handler_t>, "a stateful log handler races across logging threads");
 
 /** Counts the requests it answered, which no two polling loops may do at once. */
 struct counting_request_handler_t {
     std::size_t answered = 0;
     void operator()(uc::request_t) noexcept { ++answered; }
 };
-static_assert(!uc::request_handler<counting_request_handler_t>, "a stateful route handler races across polling loops");
+static_assert(!uc::a_request_handler<counting_request_handler_t>,
+              "a stateful route handler races across polling loops");
 
 static void greet(uc::request_t request) noexcept {
     auto [name, name_status] = request.path_parameter("name");

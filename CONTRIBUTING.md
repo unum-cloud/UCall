@@ -241,10 +241,10 @@ An `else if constexpr` chain is still one level.
 
 ```cpp
 template <typename query_type_>
-concept hinted_query = requires(query_type_& query) { query.find_hinted(0u); };
+concept a_hinted_query = requires(query_type_& query) { query.find_hinted(0u); };
 
-if constexpr (hinted_query<query_type_>) seeds = query.find_hinted(shard); // allowed: a named concept
-else if constexpr (serial_class_k) seeds = {};                            // allowed: one chain, one level
+if constexpr (a_hinted_query<query_type_>) seeds = query.find_hinted(shard); // allowed: a named concept
+else if constexpr (serial_class_k) seeds = {};                               // allowed: one chain, one level
 ```
 
 The hook refuses each of these, in the directories its `gated_source_directories` names:
@@ -336,6 +336,29 @@ A commit message explains the resulting behavior, why the change matters, and ho
 Stage a concrete review candidate with a proposed title and body; staging does not authorize committing.
 Performance reports name the backend, CPU class, build, placement, workload, admission budgets, and load generator.
 Traced timings explain costs and are not throughput measurements.
+
+## Lean State
+
+A type holds only what it cannot recompute, and names each part for what it holds.
+These rules are shared by every sibling library, and the pre-commit hook enforces each rule that names a check.
+
+- Members are named for what they hold, never for their type.
+  Write `request->call` or `call->kept`, never `call->call` or `file.file`.
+  Checked by `check_self_repeat_access`.
+- Derived state is a method, not a field.
+  A count, mask or capacity that follows from other members is computed when asked, so it can never disagree with them.
+- One fact, one constant.
+  Every `_k` constant states its derivation in its docblock, or says "measured" and where, and no other constant restates it.
+- An owner that never moves holds its parts by value.
+  A pointer is for a part that outlives its owner, moves apart from it, or is shared beyond it.
+- Empty allocators take no bytes.
+  An allocator member is declared `[[no_unique_address]]`, so a container over a stateless allocator is no larger than its own state.
+  Checked by `check_empty_member_bytes`.
+- No wrapper without its own state or invariant.
+  A type that only forwards to one member is a name for that member, so use an alias or a function instead.
+- Concepts are `a_`/`an_` noun phrases.
+  A concept names what satisfies it, as `an_allocator` or `a_task_callback`: `an_` before a vowel sound, singular, with no `is_` or `has_` prefix and no `_concept` or `_t` suffix.
+  Checked by `check_concept_names`.
 
 ## Test Suites
 
