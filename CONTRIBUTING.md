@@ -113,10 +113,11 @@ Kernel port groups are how the io_uring, epoll and POSIX backends spread connect
 `.githooks/pre-commit` holds the rules here that a check on added lines can hold.
 
 - No static, global, shared or thread-local pool, executor, queue set, stream or handle exists, stateless ones included: whoever needs one creates it and frees it.
+- An engine creates, synchronizes and frees its own CUDA, HIP and Metal streams and allocates its own device and pinned memory; NumKong and StringZilla only provide kernels, which may still take an `nk_stream_t` or `sz_stream_t` handle.
 - A C struct change lands with every binding that lays the struct out by hand, checked field by field in review.
 - Tests never restate a struct's layout that the compiler already pins, so no binding asserts a mirror's size or offsets.
 - A handler the engine may call from several threads at once is safe to call concurrently in every binding: route handlers, peer authorizers and log handlers.
-- Every executor is equal; a handle owns its media, cache and epochs, never an executor, so no engine compares executor addresses to pick a path; the C layer may refuse an arena or plan used on another executor than its own.
+- Every executor is equal; a handle owns its media, cache and epochs, never an executor, so no engine compares executor addresses to pick a path; the C layer may refuse an arena or plan used on another executor than its own, in a one-line `if (... ->executor != ...)` guard.
 - Names say who owns a thing and until when a view is valid; no identifier in any language hands a thing over.
 - A fix lands on every residency and vendor that has the bug, or its message names the ones left and why.
 - A commit message names only what its diff shows.
@@ -132,6 +133,7 @@ Declare sibling namespace aliases once and use `st::`, `fu::`, and `sz::` at use
 Spell full sibling namespaces only when declaring those aliases.
 Each template in `include/` takes its kits and atomic reference as template arguments, and `src/` picks them per CPU class.
 No template in `include/` names a CPU class or a capability mask; classes, masks, and the ladder that chooses rungs stay in `src/`.
+A file never includes both a library's SDK umbrella `<X/X.hpp>` and its native umbrella `<X.hpp>`, for this library and every sibling, and nothing under `include/` includes a header that resolves under `cpp/`; C headers are the ABI every SDK sits on, so they are free everywhere. `.githooks/pre-commit` refuses both.
 
 Every mutable object has one owner and one authoritative state.
 Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
@@ -211,7 +213,7 @@ Each header lists a verb's refusals under `@par Statuses` in this order and in t
 
 A batched kernel takes its queries as one flat transparent view over a static extent, like a `std::array` of views sized by the batch's extent, never as a span of pointers it chases one query at a time.
 A query type that owns packed storage exposes a view of it, and the kernel reads that view.
-`.githooks/pre-commit` refuses a `std::span` of pointers to const under `include/`, except a span of C strings, which names things rather than batching queries.
+`.githooks/pre-commit` refuses a `std::span` of pointers to const under `include/`, except a span of C strings, which names things, and a span of runs such as `std::span<run_t const* const>`, which lists the sorted runs a store merges; neither batches queries.
 
 ### Compile-Time Choices
 

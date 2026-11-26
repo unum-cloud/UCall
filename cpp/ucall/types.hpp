@@ -102,7 +102,7 @@ class awaiter;
 
 /**
  *  @brief A submitted call: its outcome and its outputs, owned until the call is final, while the
- *      receiver, the inputs, the arena and the handlers it was handed stay the caller's until then.
+ *      receiver, inputs, arena and handlers it was handed stay allocated and unchanged until then.
  *
  *  It never moves, as the library writes into it, and its one owner polls @c status, blocks in
  *  @c wait or awaits @c wait on its own loop; destruction waits, so nothing the call writes into
@@ -206,7 +206,7 @@ struct answer_value<expected<value_type_>> {
 template <typename answer_type_>
 using answer_value_t = typename answer_value<answer_type_>::type;
 
-/** Answers @p answer_type_ from a verb's @p body: a deferred call hands C its own outcome and
+/** Answers @p answer_type_ from a verb's @p body: a deferred call passes C its own outcome and
  *  outputs; a blocking call writes its outputs in place, then takes the C outcome's two words once
  *  it is final. */
 template <typename answer_type_, typename body_type_>

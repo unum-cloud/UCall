@@ -248,9 +248,9 @@ func (call *call) pin(pointer unsafe.Pointer) unsafe.Pointer {
 	return pointer
 }
 
-// pinArray pins the backing array of a slice of length elements at data until the call is final,
-// and passes an empty slice as nil.
-func (call *call) pinArray(data unsafe.Pointer, length int) unsafe.Pointer {
+// pinSlice pins the backing array of a slice of length elements at data until the call is final,
+// and answers nil for an empty slice.
+func (call *call) pinSlice(data unsafe.Pointer, length int) unsafe.Pointer {
 	if length == 0 {
 		return nil
 	}
@@ -319,7 +319,7 @@ func (deferred *Deferred[Result]) Close() error {
 // bytes passes a byte slab as the view the C interface reads, with no terminator and no copy.
 func (call *call) bytes(bytes []byte) C.ucall_bytes_view_t {
 	return C.ucall_bytes_view_t{
-		data:   (*C.ucall_byte_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(bytes)), len(bytes))),
+		data:   (*C.ucall_byte_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(bytes)), len(bytes))),
 		length: C.size_t(len(bytes)),
 	}
 }
@@ -345,7 +345,7 @@ func (call *call) texts(texts []string) (*C.ucall_bytes_view_t, C.size_t) {
 	for position, text := range texts {
 		views[position] = call.text(text)
 	}
-	return (*C.ucall_bytes_view_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(views)), len(views))), C.size_t(len(views))
+	return (*C.ucall_bytes_view_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(views)), len(views))), C.size_t(len(views))
 }
 
 // viewed views bytes the library owns, valid as long as the library says.

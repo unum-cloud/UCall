@@ -171,7 +171,7 @@ func NewServer(interfaces []Interface, config *ServerOptions) (*Server, error) {
 	}
 	tags, tagsCount := call.texts(metrics.Tags)
 	call.result.options = C.ucall_server_options_t{
-		interfaces:                    (*C.ucall_network_interface_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))),
+		interfaces:                    (*C.ucall_network_interface_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))),
 		interfaces_count:              C.size_t(len(lowered)),
 		log:                           options.Log.lowered(&server.handles),
 		metrics_address:               call.text(metrics.Address),
@@ -787,7 +787,7 @@ func (call *call) parts(parts []ReplyPart) (*C.ucall_reply_part_t, C.size_t) {
 			*(*C.ucall_bytes_view_t)(data) = call.bytes(part.bytes)
 		}
 	}
-	return (*C.ucall_reply_part_t)(call.pinArray(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))), C.size_t(len(lowered))
+	return (*C.ucall_reply_part_t)(call.pinSlice(unsafe.Pointer(unsafe.SliceData(lowered)), len(lowered))), C.size_t(len(lowered))
 }
 
 // ReplyParts answers with status, header lines and parts concatenated into the body, its length
