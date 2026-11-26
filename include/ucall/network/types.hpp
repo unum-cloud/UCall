@@ -435,6 +435,9 @@ struct alignas(fu::default_alignment_k) event_loop_statistics_t {
 
     /** Windows added unpinned, as the queue pins none or declined to pin their run. */
     std::uint64_t windows_unpinned {};
+
+    /** Received pool slices copied rather than kept, as the pool spared the kernel no buffer. */
+    std::uint64_t receive_slices_refused {};
 };
 
 /** The statuses the loop answers itself with, in @c interface_statistics_t::refused order. */

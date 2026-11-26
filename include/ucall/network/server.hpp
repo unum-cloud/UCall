@@ -727,7 +727,7 @@ struct server : ucall_server_handle_t {
     }
     static void advance_completion(queue_t& queue, io_completion_t const& completion) noexcept {
         if (completion.request->operation == io_operation_t::accept_k) serving_t::accepted(completion);
-        else static_cast<connection_t*>(completion.request->context)->complete(completion);
+        else if (static_cast<connection_t*>(completion.request->context)->complete(completion, queue)) return;
         queue.release(completion);
     }
     static ucall_status_t server_poll(server_t& server, event_loop_t& event_loop, io_wait_t wait,
@@ -873,31 +873,36 @@ struct server : ucall_server_handle_t {
         auto read = [](std::uint64_t& counter) noexcept {
             return atomic_ref<std::uint64_t> {counter}.load(std::memory_order_relaxed);
         };
-        ucall_event_loop_statistics_t totals {.polls = read(loop.polls),
-                                              .empty_polls = read(loop.empty_polls),
-                                              .kernel_enters = read(queue.kernel_enters),
-                                              .submissions = read(queue.submissions),
-                                              .completions = read(queue.completions),
-                                              .kernel_entries = read(queue.kernel_entries),
-                                              .cancellations = read(queue.cancellations),
-                                              .accepts = read(loop.accepts),
-                                              .requests = read(loop.requests),
-                                              .receive_rearms = read(queue.receive_rearms),
-                                              .bytes_received = read(loop.bytes_received),
-                                              .bytes_sent = read(loop.bytes_sent),
-                                              .bytes_copied = read(loop.bytes_copied) + read(queue.bytes_copied),
-                                              .zero_copy_sends = read(queue.zero_copy_sends),
-                                              .zero_copy_fallbacks = read(queue.zero_copy_fallbacks),
-                                              .copying_sends = read(queue.copying_sends),
-                                              .file_reads_asynchronous = read(queue.file_reads_asynchronous),
-                                              .file_reads_blocking = read(queue.file_reads_blocking),
-                                              .bytes_read = read(loop.bytes_read),
-                                              .file_window_overlaps = read(loop.file_window_overlaps),
-                                              .linger_resets = read(loop.linger_resets),
-                                              .ready_passes = read(loop.ready_passes),
-                                              .replied_dequeues = read(loop.replied_dequeues),
-                                              .shed_connections = read(loop.shed_connections),
-                                              .windows_unpinned = read(loop.windows_unpinned)};
+        ucall_event_loop_statistics_t totals {
+            .polls = read(loop.polls),
+            .empty_polls = read(loop.empty_polls),
+            .kernel_enters = read(queue.kernel_enters),
+            .submissions = read(queue.submissions),
+            .completions = read(queue.completions),
+            .kernel_entries = read(queue.kernel_entries),
+            .cancellations = read(queue.cancellations),
+            .accepts = read(loop.accepts),
+            .requests = read(loop.requests),
+            .receive_rearms = read(queue.receive_rearms),
+            .bytes_received = read(loop.bytes_received),
+            .bytes_sent = read(loop.bytes_sent),
+            .bytes_copied = read(loop.bytes_copied) + read(queue.bytes_copied),
+            .zero_copy_sends = read(queue.zero_copy_sends),
+            .zero_copy_fallbacks = read(queue.zero_copy_fallbacks),
+            .copying_sends = read(queue.copying_sends),
+            .file_reads_asynchronous = read(queue.file_reads_asynchronous),
+            .file_reads_blocking = read(queue.file_reads_blocking),
+            .bytes_read = read(loop.bytes_read),
+            .file_window_overlaps = read(loop.file_window_overlaps),
+            .linger_resets = read(loop.linger_resets),
+            .ready_passes = read(loop.ready_passes),
+            .replied_dequeues = read(loop.replied_dequeues),
+            .shed_connections = read(loop.shed_connections),
+            .windows_unpinned = read(loop.windows_unpinned),
+            .receive_slices_refused = read(loop.receive_slices_refused),
+            // Fixed once the queue opened, so any thread reads them.
+            .receive_pool_buffers = event_loop.queue.receive_pool_buffers(),
+            .receive_pool_buffer_bytes = event_loop.queue.receive_pool_buffer_bytes()};
         for (auto& counters : event_loop.interface_statistics) {
             for (auto& refused : counters.refused) totals.refused_requests += read(refused);
             totals.handshake_failures += read(counters.handshake_failures);
@@ -1466,8 +1471,9 @@ struct server : ucall_server_handle_t {
         publish<atomic_ref>(arguments->outcome, ucall_status_deferred_k);
         // Only the loop touches the chunks, so a pull on the polling thread can finish at once.
         if (exchange.event_loop->polled_by_this_thread()) {
+            serving_t::release_pulled_slice(*exchange.event_loop, exchange);
             auto requested = atomic_ref<std::uint32_t> {exchange.shared.pull_requested};
-            if (!exchange.body_chunk.empty() || exchange.body_stage == body_stage_t::ended_k) {
+            if (exchange.holds_chunk() || exchange.body_stage == body_stage_t::ended_k) {
                 requested.store(pull_waiting_k, std::memory_order_relaxed);
                 return serving_t::finish_pull(exchange, ucall_status_success_k);
             }

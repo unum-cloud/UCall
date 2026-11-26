@@ -148,8 +148,9 @@ struct transport {
     /** Bytes of a server's front segment, or of a client's composed requests, that sends took. */
     std::size_t output_offset {};
 
-    /** Bytes in front of @c input a server already dispatched, which leave once they outweigh
-     *  what follows or a receive needs their room, so a pipelined burst moves each byte once. */
+    /** Bytes in front of @c input already dispatched or answered, streamed heads and payloads
+     *  included, which leave once they outweigh what follows or a receive needs their room, so
+     *  bytes queued behind them move once rather than per message. */
     std::size_t parsed {};
 
     /** Bytes read and dropped while lingering. */
@@ -185,7 +186,8 @@ struct transport {
     }
 
     /** Records what one completion did to bytes and operation states, deciding nothing for the
-     *  protocol; a receive that filled its room doubles it, while under @p limit bytes. */
+     *  protocol; a receive into the submitter's room that filled it doubles it, while under
+     *  @p limit bytes. */
     void complete(io_completion_t const& completion, std::size_t limit) noexcept {
         auto& completed = *completion.request;
         (&completed == &receive_request ? receive_operation : transmit_operation) = operation_state_t::idle_k;
@@ -223,15 +225,21 @@ struct transport {
             vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
             std::size_t const arrived = static_cast<std::size_t>(result);
             std::size_t const previous = destination.size();
-            if (st::failed(destination.resize(st::assume_uninitialized, previous + arrived)))
+            // Nothing moves the destination while the kernel fills its room in place.
+            assert((receive_memory == io_receive_memory_t::submitter_k || completion.release_token ||
+                    receive_vector.iov_base == destination.data() + previous) &&
+                   "a receive in place lands at the destination's tail");
+            if (st::failed(grow(destination, previous + arrived)) ||
+                st::failed(destination.resize(st::assume_uninitialized, previous + arrived)))
                 return fail(ucall_status_out_of_memory_k);
-            if (receive_memory == io_receive_memory_t::queue_k) {
+            if (completion.release_token) {
                 std::memcpy(destination.data() + previous, completion.data, arrived);
                 if (statistics) tally<atomic_ref>(statistics->bytes_copied, arrived);
             }
             // A failed reservation only leaves the room as it was.
-            else if (arrived >= receive_vector.iov_len && destination.capacity() < limit) {
-                [[maybe_unused]] st::status_t const grown = destination.reserve(destination.capacity() + 1);
+            else if (receive_memory == io_receive_memory_t::submitter_k &&
+                     destination.size() == destination.capacity() && destination.capacity() < limit) {
+                [[maybe_unused]] st::status_t const grown = grow(destination, destination.capacity() + 1);
             }
             if (statistics) tally<atomic_ref>(statistics->bytes_received, arrived);
         }
@@ -264,7 +272,7 @@ struct transport {
                                                                ? secure_tunnel_request_t::close_k
                                                                : secure_tunnel_request_t::proceed_k;
             auto step = tunnel.advance({encrypted.data(), encrypted.data() + encrypted.size()}, tunnel_request);
-            http_t::drop_bytes(encrypted, step.consumed);
+            drop_front(encrypted, step.consumed);
             if (step.state == secure_tunnel_state_t::broken_k ||
                 (step.state == secure_tunnel_state_t::closed_k &&
                  tunnel_request == secure_tunnel_request_t::proceed_k)) {
@@ -334,18 +342,41 @@ struct transport {
         if (receive_memory == io_receive_memory_t::submitter_k) {
             vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
             if (destination.size() == destination.capacity() && &destination == &input && parsed)
-                http_t::drop_bytes(input, std::exchange(parsed, 0));
+                drop_front(input, std::exchange(parsed, 0));
             // A receive of no bytes would read as a peer close.
             if (destination.size() == destination.capacity() &&
-                st::failed(destination.reserve(destination.size() + page_size())))
+                st::failed(grow(destination, destination.size() + page_size())))
                 return fail(ucall_status_out_of_memory_k);
             receive_vector = {destination.data() + destination.size(), destination.capacity() - destination.size()};
         }
     }
 
-    /** Starts a receive, or steps the close of a transport that could not grow its room. */
-    io_request_t* emit_receive() noexcept {
+    /** Points the receive of a queue landing receives in its own memory unless the vector names
+     *  room at room for the @p known_bytes the peer is bound to send next, once they reach a page,
+     *  as sends of a page or more skip their copy too; a shorter run lands in the queue's memory.
+     *  The room takes as many as fit in room holding at least a page and at most the
+     *  @p arrived_bytes of the message so far, so it follows the bytes that arrived rather than the
+     *  length a head declared, and stops at the last of them. */
+    void aim_known(std::size_t known_bytes, std::size_t arrived_bytes) noexcept {
+        if (receive_memory != io_receive_memory_t::queue_unless_room_k) return;
+        vector<byte_t>& destination = tunnel.encrypts() ? encrypted : input;
+        receive_vector = {destination.data() + destination.size(), 0};
+        if (known_bytes < page_size()) return;
+        // The request then starts `input`, which its exchange takes whole rather than copied.
+        if (parsed) drop_front(input, std::exchange(parsed, 0));
+        std::size_t const wanted = fu::min_of(known_bytes, fu::max_of(page_size(), arrived_bytes));
+        if (destination.capacity() - destination.size() < wanted &&
+            st::failed(grow(destination, destination.size() + wanted)))
+            return fail(ucall_status_out_of_memory_k);
+        receive_vector = {destination.data() + destination.size(),
+                          fu::min_of(known_bytes, destination.capacity() - destination.size())};
+    }
+
+    /** Starts a receive, or steps the close of a transport that could not grow its room, taking
+     *  the @p known_bytes the peer is bound to send next in place as @c aim_known does. */
+    io_request_t* emit_receive(std::size_t known_bytes = 0, std::size_t arrived_bytes = 0) noexcept {
         aim_receive();
+        aim_known(known_bytes, arrived_bytes);
         // A closing transport is past its handshake, so it asks no authorizer.
         if (stage == transport_stage_t::closing_k) return advance(nullptr, nullptr);
         return emit(receive_request, io_operation_t::receive_k, {reinterpret_cast<byte_t*>(&receive_vector), 1});
@@ -455,14 +486,30 @@ struct transport {
             if (pending.empty() || tunnel.bytes_until_boundary(pending)) break;
             std::size_t const declared = tunnel.bytes_until_boundary(pending.first(secure_tunnel_headroom_k));
             std::size_t const previous = input.size();
-            if (st::failed(input.resize(previous + declared))) return fail(ucall_status_out_of_memory_k);
+            if (st::failed(grow(input, previous + declared)) || st::failed(input.resize(previous + declared)))
+                return fail(ucall_status_out_of_memory_k);
             auto opened = tunnel.open(pending, {input.data() + previous, input.data() + previous + declared});
             if (!opened.consumed) return fail(ucall_status_handshake_failed_k);
             input.erase(previous + opened.payload.size(), declared - opened.payload.size());
             consumed += opened.consumed;
             if (opened.kind == secure_tunnel_record_t::close_k) peer_stream = peer_stream_t::closed_k;
         }
-        http_t::drop_bytes(encrypted, consumed);
+        drop_front(encrypted, consumed);
+    }
+
+    /** Reserves @p capacity bytes in @p bytes, counting those a move to a larger block copies. */
+    [[nodiscard]] st::status_t grow(vector<byte_t>& bytes, std::size_t capacity) noexcept {
+        std::size_t const moved = capacity > bytes.capacity() ? bytes.size() : 0;
+        st::status_t const grown = bytes.reserve(capacity);
+        if (moved && statistics && !st::failed(grown)) tally<atomic_ref>(statistics->bytes_copied, moved);
+        return grown;
+    }
+
+    /** Drops the first @p count bytes of @p bytes, counting those moving to its front as copied. */
+    void drop_front(vector<byte_t>& bytes, std::size_t count) noexcept {
+        if (!count) return;
+        if (statistics) tally<atomic_ref>(statistics->bytes_copied, bytes.size() - count);
+        http_t::drop_bytes(bytes, count);
     }
     void fail(ucall_status_t error) noexcept {
         if (interface_statistics && error == ucall_status_handshake_failed_k)

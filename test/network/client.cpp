@@ -1104,6 +1104,39 @@ static void test_streamed_barrier(sweep_cell_t const& cell, split_mix_generator_
     fixture.stop();
 }
 
+/** Streamed responses pipelined back to back on one connection, each past the client's cap, reach
+ *  their calls whole and in order through pulls, as each body streams from where its head ended
+ *  with the responses behind it still waiting in the same buffer. */
+static void test_streamed_pipelined_responses(sweep_cell_t const& cell, split_mix_generator_t& generator) {
+    std::size_t const cap = 64 * 1024, calls = 4;
+    fixture_t fixture {cell, {.pipelined_calls = calls, .max_response_bytes = cap}};
+    auto body_of = [&](std::size_t index) { return std::string(4 * cap + index, static_cast<char>('a' + index)); };
+    scripted_server_t server {
+        generator, [&](std::string_view, std::size_t, std::size_t index) { return answer_ok(body_of(index)); }, 100ms};
+    if (!expect_true(fixture.status == ucall_status_success_k && !server.listener.address.empty(), "setup: {}",
+                     ucall_status_name(fixture.status)))
+        return;
+    std::array<int, calls> marks {};
+    for (int& mark : marks) submit_streamed(fixture, server.url("/streamed"), ucall_security_none_k, &mark);
+    for (std::size_t index = 0; index != calls; ++index) {
+        auto const head = fixture.wait();
+        if (!expect_true(
+                head.context == &marks[index] && head.outcome.status == ucall_status_success_k && head.response,
+                "call {} completed {}", index, ucall_status_name(head.outcome.status)))
+            break;
+        std::string received;
+        ucall_status_t const ended = pull_until_end(fixture, head.response,
+                                                    [&](std::string_view data) { received += data; });
+        expect_true(ended == ucall_status_success_k && received == body_of(index), "call {} ended {} after {} bytes",
+                    index, ucall_status_name(ended), received.size());
+        ucall_client_response_free(head.response);
+    }
+    server.stop();
+    expect_true(server.requests_per_connection == (std::vector<std::size_t> {calls}), "{} connections sent the calls",
+                server.requests_per_connection.size());
+    fixture.stop();
+}
+
 /** Freeing a streamed response mid-body closes its connection and ends the call pipelined behind it
  *  with @c ucall_status_connection_closed_k, never sending it again; freeing the client then cuts
  *  another streamed body short. */
@@ -1184,6 +1217,7 @@ void test_client_cell(sweep_cell_t const& cell, split_mix_generator_t& generator
         test_streamed_endings(cell, generator);
         test_streamed_free_mid_body(cell, generator);
         test_streamed_barrier(cell, generator);
+        test_streamed_pipelined_responses(cell, generator);
     }
     test_streamed_whole_bodies(cell);
     test_streamed_download(cell, generator);

@@ -52,6 +52,7 @@ using utilities::text_view;
 template <typename network_type_>
 struct server_connection {
     using network_t = network_type_;
+    using http_t = typename network_t::http_t;
     using allocator_t = typename network_t::allocator_t;
     using transport_t = typename network_t::transport_t;
     using connection_t = typename network_t::server_connection_t;
@@ -69,7 +70,7 @@ struct server_connection {
         : transport(allocator), send_vectors(rebound_allocator<io_vector_t> {allocator}) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(server_connection) == 2280);
+            static_assert(sizeof(server_connection) == 2320);
     }
     server_connection(server_connection const&) = delete;
     server_connection& operator=(server_connection const&) = delete;
@@ -155,6 +156,19 @@ struct server_connection {
     /** Bytes gathered sends took that no segment was credited with yet. */
     std::size_t uncredited_bytes {};
 
+    /** A receive's slice of queue memory the connection reads from while a body streams, in place
+     *  of @c input, or none while its @c release_token is zero; the chunks handed out of it share
+     *  it, each releasing its own part. */
+    io_completion_t held_slice {};
+
+    /** Bytes of @c held_slice already handed out or moved to @c input. */
+    std::size_t held_consumed {};
+
+    /** What @c held_slice still holds. */
+    span<byte_t> held_rest() const noexcept {
+        return {held_slice.data + held_consumed, static_cast<std::size_t>(held_slice.result) - held_consumed};
+    }
+
     ucall_status_t configure(secure_tunnel_config_t const& config) noexcept {
         file_read_request = {.context = this};
         file_reading = file_read_state_t::idle_k;
@@ -167,17 +181,67 @@ struct server_connection {
     }
 
     /** Records one completion as @c transport_t::complete does, and a file operation's, whose
-     *  outcome belongs to the segment it served, which the server lands. */
-    void complete(io_completion_t const& completion) noexcept {
+     *  outcome belongs to the segment it served, which the server lands. A receive into queue
+     *  memory that @p queue lets the caller keep may stay where it landed while a body streams,
+     *  answering true once the connection kept it for @c release. */
+    template <typename queue_type_>
+    bool complete(io_completion_t const& completion, queue_type_& queue) noexcept {
         if (completion.request != &file_read_request) {
+            if (holds_receive(completion)) {
+                if (queue.retains(completion)) return hold_slice(completion), true;
+                if (completion.release_token && transport.statistics)
+                    tally<atomic_ref>(transport.statistics->receive_slices_refused);
+            }
             transport.complete(completion, network_interface->config->max_request_bytes);
             if (transport.stage == transport_stage_t::closed_k && outstanding_releases())
                 transport.stage = transport_stage_t::closed_holding_k;
-            return;
+            return false;
         }
         if (transport.statistics && completion.result > 0 &&
             completion.request->operation != io_operation_t::file_open_k)
             tally<atomic_ref>(transport.statistics->bytes_read, static_cast<std::uint64_t>(completion.result));
+        return false;
+    }
+
+    /** Keeps a receive's slice of queue memory to read on from, which @c holds_receive admitted,
+     *  so streamed body bytes become chunks where the kernel landed them. */
+    void hold_slice(io_completion_t const& completion) noexcept {
+        transport.receive_operation = operation_state_t::idle_k;
+        if (transport.statistics)
+            tally<atomic_ref>(transport.statistics->bytes_received, static_cast<std::uint64_t>(completion.result));
+        held_slice = completion;
+        held_consumed = 0;
+    }
+
+    /** Whether @p completion is a receive the connection would read in place, as nothing waits in
+     *  @c input ahead of it, where its queue landed it in memory it lets the connection keep, and
+     *  keeping it beats copying it by the rule sends follow: it carries a page of body bytes. */
+    bool holds_receive(io_completion_t const& completion) const noexcept {
+        return completion.request == &transport.receive_request && completion.result > 0 && completion.release_token &&
+               !held_slice.release_token && transport.stage == transport_stage_t::open_k &&
+               !transport.tunnel.encrypts() && transport.input.size() == transport.parsed &&
+               body_bytes(completion) >= utilities::page_size();
+    }
+
+    /** The body bytes @p completion's slice carries, zero below a page: what a streaming body still
+     *  lacks, or else what the head opening the slice frames past itself, found by parsing it. */
+    std::size_t body_bytes(io_completion_t const& completion) const noexcept {
+        std::size_t const size = static_cast<std::size_t>(completion.result);
+        auto const& message = transport.message;
+        if (size < utilities::page_size()) return 0;
+        if (streaming)
+            return message.framing == http_framing_t::length_k
+                       ? fu::min_of(size, message.content_length - message.decoded_length)
+                       : size;
+        if (message.headers_length) return 0;
+        std::remove_cvref_t<decltype(message)> head {};
+        http_parse_t const parsed = http_t::http_parse({completion.data, size}, head, http_role_t::request_k);
+        if ((parsed != http_parse_t::complete_k && parsed != http_parse_t::incomplete_k) || !head.headers_length)
+            return 0;
+        std::size_t const beyond = size - fu::min_of(size, head.headers_length);
+        return head.framing == http_framing_t::length_k    ? fu::min_of(beyond, head.content_length)
+               : head.framing == http_framing_t::chunked_k ? beyond
+                                                           : 0;
     }
 
     /** The transport's next request, after any file operation, holding a close back while the
@@ -234,6 +298,7 @@ struct serving {
         if (status == ucall_status_success_k) metrics_t::time_request(*event_loop.server, event_loop, exchange);
         tally<atomic_ref>(event_loop.statistics.bytes_copied, std::exchange(exchange.copied, 0));
         exchange.input.clear();
+        release_slices(event_loop, exchange);
         replies_t::release_all_segments(exchange);
         // A reply that failed already keeps the cause it failed with.
         if (exchange.ended_status == ucall_status_deferred_k) exchange.ended_status = status;
@@ -243,6 +308,89 @@ struct serving {
         }
         replies_t::publish_reply_outcome(exchange, exchange.ended_status);
         free_exchange(event_loop, exchange);
+    }
+
+    /** Gives the queue back the slices @p exchange kept as body chunks, pulled or not. */
+    static void release_slices(event_loop_t& event_loop, server_exchange_t& exchange) noexcept {
+        for (io_completion_t* slice : {&exchange.body_slice, &exchange.pulled_slice})
+            if (slice->release_token) event_loop.queue.release(std::exchange(*slice, io_completion_t {}));
+    }
+
+    /** Reads on from @p connection's held slice once @c input holds nothing past @p consumed: a
+     *  streaming identity body takes its next chunk where the slice holds it, sharing the slice, or
+     *  skips it while its reply already ended; anything else moves to @c input to parse, a head at
+     *  a time, so bodies queued behind it stay in the slice. A slice with nothing left returns. */
+    static void read_held_slice(event_loop_t& event_loop, connection_t& connection, std::size_t& consumed) noexcept {
+        auto& transport = connection.transport;
+        auto& message = transport.message;
+        // Bytes that landed right behind the slice join it, so one chunk takes them.
+        auto const kept = connection.held_slice.result;
+        event_loop.queue.extend(transport.descriptor, connection.held_slice);
+        if (transport.statistics && connection.held_slice.result != kept)
+            tally<atomic_ref>(transport.statistics->bytes_received,
+                              static_cast<std::uint64_t>(connection.held_slice.result - kept));
+        span<byte_t> const rest = connection.held_rest();
+        auto* const streamed = connection.streaming;
+        std::size_t taken = 0;
+        if (streamed && message.framing == http_framing_t::length_k) {
+            std::size_t const body = fu::min_of(rest.size(), message.content_length - message.decoded_length);
+            if (streamed->stage == exchange_stage_t::ended_k) taken = body;
+            else if (!streamed->holds_chunk() && body) {
+                event_loop.queue.share(connection.held_slice);
+                streamed->body_slice = connection.held_slice;
+                streamed->body_slice.data = rest.data();
+                streamed->body_slice.result = static_cast<decltype(streamed->body_slice.result)>(body);
+                taken = body;
+            }
+            message.decoded_length += taken;
+        }
+        else {
+            std::string_view const text = text_view(rest);
+            // A head past the request cap is refused once parsed, so the search stops there.
+            std::size_t const head_end = http_t::find(
+                text.substr(0, connection.network_interface->config->max_request_bytes), "\r\n\r\n");
+            // A head moves alone, a buffered body as far as its head frames it, and the rest whole.
+            std::size_t const framed =
+                message.headers_length && message.framing == http_framing_t::length_k && !streamed
+                    ? message.wire_length - fu::min_of(message.wire_length, transport.input.size() - consumed)
+                    : rest.size();
+            // With nothing unread ahead, what moves starts `input`, which its exchange takes whole.
+            if (consumed == transport.input.size()) {
+                transport.input.clear();
+                consumed = 0;
+            }
+            taken = fu::min_of(rest.size(), !message.headers_length && !streamed && head_end != std::string_view::npos
+                                                ? head_end + 4
+                                                : framed);
+            if (ucall_status_t const moved = http_t::append_text(transport.input, {text.substr(0, taken)});
+                moved != ucall_status_success_k)
+                transport.fail(moved);
+            if (transport.statistics) tally<atomic_ref>(transport.statistics->bytes_copied, taken);
+        }
+        connection.held_consumed += taken;
+        if (connection.held_consumed == static_cast<std::size_t>(connection.held_slice.result))
+            event_loop.queue.release(std::exchange(connection.held_slice, io_completion_t {}));
+    }
+
+    /** Moves what @p connection's held slice still holds to the end of @c input and gives the slice
+     *  back, for a connection whose pipeline is full: it reads no further for now, so it should pin
+     *  no buffer of the receive pool while its exchanges finish. */
+    static void spill_held_slice(event_loop_t& event_loop, connection_t& connection) noexcept {
+        if (!connection.held_slice.release_token) return;
+        auto& transport = connection.transport;
+        span<byte_t> const rest = connection.held_rest();
+        if (ucall_status_t const moved = http_t::append_text(transport.input, {text_view(rest)});
+            moved != ucall_status_success_k)
+            transport.fail(moved);
+        if (transport.statistics) tally<atomic_ref>(transport.statistics->bytes_copied, rest.size());
+        event_loop.queue.release(std::exchange(connection.held_slice, io_completion_t {}));
+    }
+
+    /** Gives the queue back the slice @p exchange's last pull handed out, once the next pull asked,
+     *  which ends the view of it. */
+    static void release_pulled_slice(event_loop_t& event_loop, server_exchange_t& exchange) noexcept {
+        if (exchange.pulled_slice.release_token)
+            event_loop.queue.release(std::exchange(exchange.pulled_slice, io_completion_t {}));
     }
 
     /** Lists @p exchange, whose segments nothing holds any longer, among the free ones. */
@@ -278,6 +426,7 @@ struct serving {
             bool const adopted = replies_t::adopt_segments(*exchange);
             bool const pulling = atomic_ref<std::uint32_t> {exchange->shared.pull_requested}.load(
                 std::memory_order_acquire);
+            if (pulling) release_pulled_slice(event_loop, *exchange);
             if (pull_ready(*exchange)) finish_pull(*exchange, ucall_status_success_k);
             if (auto* connection = exchange->connection) {
                 bool const detached =
@@ -380,6 +529,7 @@ struct serving {
         exchange->reply_status = 0;
         exchange->arrived = monotonic_ns();
         exchange->body_chunk.clear();
+        exchange->body_chunk_front = 0;
         exchange->pulled_chunk.clear();
         exchange->event_loop = &event_loop;
         exchange->connection = &connection;
@@ -396,25 +546,47 @@ struct serving {
         return exchange;
     }
 
-    /** Moves the request parsed at @p offset of @c input into a fresh exchange, and routes it. */
-    static void dispatch(server_t& server, event_loop_t& event_loop, connection_t& connection,
-                         std::size_t offset) noexcept {
+    /** Moves the request parsed at @p offset of @c input into a fresh exchange, and routes it,
+     *  answering where in @c input what follows the request starts. A request at the front that
+     *  outweighs what follows takes @c input whole, and only what follows is copied back. */
+    static std::size_t dispatch(server_t& server, event_loop_t& event_loop, connection_t& connection,
+                                std::size_t offset) noexcept {
         auto* exchange = enqueue_exchange(event_loop, connection);
-        if (!exchange) return;
+        if (!exchange) return offset;
+        auto& input = connection.transport.input;
         auto wire = connection.transport.message.wire_length;
-        if (!offset && wire == connection.transport.input.size() && connection.transport.input_may_leave(wire))
-            std::swap(exchange->input, connection.transport.input);
-        else if (ucall_status_t const appended = http_t::append_text(
-                     exchange->input, {text_view(connection.transport.input).substr(offset, wire)});
-                 appended == ucall_status_success_k)
+        std::size_t const following = input.size() - offset - wire;
+        if (!offset && following < wire && connection.transport.input_may_leave(wire)) {
+            std::swap(exchange->input, input);
+            ucall_status_t const kept = http_t::append_text(input, {text_view(exchange->input).substr(wire)});
+            tally<atomic_ref>(event_loop.statistics.bytes_copied, following);
+            // Never grows.
+            [[maybe_unused]] st::status_t const shrunk = exchange->input.resize(wire);
+            offset = 0;
+            if (kept != ucall_status_success_k) connection.transport.fail(kept);
+        }
+        else if (ucall_status_t const appended = http_t::append_text(exchange->input,
+                                                                     {text_view(input).substr(offset, wire)});
+                 appended == ucall_status_success_k) {
             tally<atomic_ref>(event_loop.statistics.bytes_copied, wire);
+            offset += wire;
+        }
         else {
             // Never handed out, so the close recycles it.
             exchange->stage = exchange_stage_t::ended_k;
-            return connection.transport.fail(appended);
+            connection.transport.fail(appended);
+            return offset;
         }
         tally<atomic_ref>(event_loop.statistics.requests);
         exchange->message = std::exchange(connection.transport.message, http_message_t {});
+        route_exchange(server, event_loop, connection, exchange);
+        return offset;
+    }
+
+    /** Takes @p exchange, whose request it now holds, to its endpoint: a callback, a batch, or a
+     *  refusal when none routed or the loop is past its budgets. */
+    static void route_exchange(server_t& server, event_loop_t& event_loop, connection_t& connection,
+                               server_exchange_t* exchange) noexcept {
         auto* endpoint = std::exchange(connection.routed, nullptr);
         exchange->endpoint = endpoint;
         if (!endpoint) return refuse_unrouted(connection, *exchange, std::exchange(connection.routed_verbs, 0));
@@ -458,24 +630,26 @@ struct serving {
     }
 
     /** Hands a streamed request to its callback once its head parsed at @p offset of @c input:
-     *  the head moves to the exchange, and the body behind it stays in @c input to stream. */
-    static void dispatch_streamed(event_loop_t& event_loop, connection_t& connection, std::size_t offset) noexcept {
+     *  the head moves to the exchange, and the body behind it stays in @c input to stream from
+     *  where the head ended, which it answers. */
+    static std::size_t dispatch_streamed(event_loop_t& event_loop, connection_t& connection,
+                                         std::size_t offset) noexcept {
         auto* exchange = enqueue_exchange(event_loop, connection);
-        if (!exchange) return;
+        if (!exchange) return offset;
         auto const head = connection.transport.message.headers_length;
         if (ucall_status_t const appended = http_t::append_text(
                 exchange->input, {text_view(connection.transport.input).substr(offset, head)});
             appended != ucall_status_success_k) {
             // Never handed out, so the close recycles it.
             exchange->stage = exchange_stage_t::ended_k;
-            return connection.transport.fail(appended);
+            connection.transport.fail(appended);
+            return offset;
         }
         tally<atomic_ref>(event_loop.statistics.bytes_copied, head);
         tally<atomic_ref>(event_loop.statistics.requests);
-        http_t::drop_bytes(connection.transport.input, offset + head);
         exchange->message = connection.transport.message;
         exchange->message.body_length = 0;
-        // The connection keeps the framing and decodes the body from the front of what remains.
+        // The connection keeps the framing and decodes the body from where the head ended.
         connection.transport.message.decoded_length = connection.transport.message.chunk_remaining = 0;
         connection.transport.message.cursor = connection.transport.message.scanned = 0;
         connection.transport.message.chunk_state = http_chunk_state_t::size_k;
@@ -485,11 +659,13 @@ struct serving {
             // The body behind the head cannot be framed past, so the connection reads no further.
             connection.transport.receiving = receive_state_t::ended_k;
             exchange->message.connection = http_connection_t::close_k;
-            return refuse(connection, *exchange, 503, "Too many abandoned requests", {});
+            refuse(connection, *exchange, 503, "Too many abandoned requests", {});
+            return offset + head;
         }
         exchange->body_stage = body_stage_t::streaming_k;
         connection.streaming = exchange;
         endpoint->callback(event_loop.server, exchange, endpoint->context);
+        return offset + head;
     }
 
     /** Hands a waiting pull @c body_chunk, or the end of the body, and makes its outcome final. */
@@ -500,11 +676,18 @@ struct serving {
         requested.store(pull_unrequested_k, std::memory_order_relaxed);
         auto* outcome = std::exchange(exchange.pull_outcome, nullptr);
         *exchange.pulled_view = {};
-        if (status == ucall_status_success_k && exchange.body_chunk.empty()) status = exchange.body_status;
-        if (status == ucall_status_success_k) {
+        if (status == ucall_status_success_k && !exchange.holds_chunk()) status = exchange.body_status;
+        if (status == ucall_status_success_k && exchange.body_slice.release_token) {
+            release_pulled_slice(*exchange.event_loop, exchange);
+            exchange.pulled_slice = std::exchange(exchange.body_slice, io_completion_t {});
+            *exchange.pulled_view = bytes_view({reinterpret_cast<char const*>(exchange.pulled_slice.data),
+                                                static_cast<std::size_t>(exchange.pulled_slice.result)});
+        }
+        else if (status == ucall_status_success_k) {
             std::swap(exchange.pulled_chunk, exchange.body_chunk);
             exchange.body_chunk.clear();
-            *exchange.pulled_view = bytes_view(text_view(exchange.pulled_chunk));
+            *exchange.pulled_view = bytes_view(
+                text_view(exchange.pulled_chunk).substr(std::exchange(exchange.body_chunk_front, 0)));
         }
         publish<atomic_ref>(outcome, status);
     }
@@ -512,20 +695,33 @@ struct serving {
     /** Whether a waiting pull of @p exchange can take bytes or the end now. */
     static bool pull_ready(server_exchange_t& exchange) noexcept {
         return atomic_ref<std::uint32_t> {exchange.shared.pull_requested}.load(std::memory_order_acquire) &&
-               (!exchange.body_chunk.empty() || exchange.body_stage == body_stage_t::ended_k);
+               (exchange.holds_chunk() || exchange.body_stage == body_stage_t::ended_k);
     }
 
-    /** Decodes what @c input holds of the streamed body in place and, once the last chunk was
-     *  pulled, rotates @c input into @c body_chunk and finishes a waiting pull; complete once the
-     *  body ended, leaving the bytes behind it in @c input. */
-    static http_parse_t stream_body(connection_t& connection) noexcept {
+    /** Decodes what @c input holds of the streamed body from @p offset in place, moves the payload
+     *  to @c body_chunk once the last chunk was pulled, and finishes a waiting pull; complete once
+     *  the body ended, with @p offset past it. A payload that outweighs what follows takes @c input
+     *  whole, the bytes in front of it skipped by its pull, and only what follows is copied back;
+     *  any other payload is copied out, so bytes queued behind a body never move per body. */
+    static http_parse_t stream_body(connection_t& connection, std::size_t& offset) noexcept {
         auto& exchange = *connection.streaming;
+        auto& input = connection.transport.input;
+        auto* const counters = connection.transport.statistics;
         // A reply that ended before its body drains the rest, so nothing behind it stalls.
         bool const draining = exchange.stage == exchange_stage_t::ended_k;
-        if (draining) exchange.body_chunk.clear();
-        if (!exchange.body_chunk.empty()) return http_parse_t::incomplete_k;
+        if (draining) {
+            exchange.body_chunk.clear();
+            exchange.body_chunk_front = 0;
+            release_slices(*exchange.event_loop, exchange);
+        }
+        if (exchange.holds_chunk()) {
+            // A chunk kept where its slice landed is the one a waiting pull takes.
+            if (pull_ready(exchange)) finish_pull(exchange, ucall_status_success_k);
+            return http_parse_t::incomplete_k;
+        }
         std::size_t payload = 0, consumed = 0;
-        auto parsed = http_t::http_stream_body(connection.transport.input, connection.transport.message,
+        span<byte_t> const bytes {input.data() + offset, input.data() + input.size()};
+        auto parsed = http_t::http_stream_body(bytes, connection.transport.message,
                                                connection.network_interface->config->max_request_bytes, payload,
                                                consumed);
         if (parsed != http_parse_t::complete_k && parsed != http_parse_t::incomplete_k) {
@@ -539,17 +735,26 @@ struct serving {
             connection.transport.fail(failure);
             return parsed;
         }
-        if (payload && !draining) {
-            // Rotating buffers hands the payload over where it was decoded, never copying it.
-            std::swap(exchange.body_chunk, connection.transport.input);
-            connection.transport.input.clear();
-            ucall_status_t const kept = http_t::append_text(connection.transport.input,
-                                                            {text_view(exchange.body_chunk).substr(consumed)});
+        std::size_t const following = bytes.size() - consumed;
+        if (payload && !draining && following < payload) {
+            std::swap(exchange.body_chunk, input);
+            input.clear();
+            exchange.body_chunk_front = offset;
+            ucall_status_t const kept = http_t::append_text(input,
+                                                            {text_view(exchange.body_chunk).substr(offset + consumed)});
+            if (counters) tally<atomic_ref>(counters->bytes_copied, following);
             if (kept != ucall_status_success_k) connection.transport.fail(kept);
             // Never grows.
-            [[maybe_unused]] st::status_t const shrunk = exchange.body_chunk.resize(payload);
+            [[maybe_unused]] st::status_t const shrunk = exchange.body_chunk.resize(offset + payload);
+            offset = 0;
         }
-        else http_t::drop_bytes(connection.transport.input, consumed);
+        else if (payload && !draining) {
+            ucall_status_t const copied = http_t::append_text(exchange.body_chunk, {text_view(bytes.first(payload))});
+            if (counters) tally<atomic_ref>(counters->bytes_copied, payload);
+            if (copied != ucall_status_success_k) connection.transport.fail(copied);
+            offset += consumed;
+        }
+        else offset += consumed;
         if (parsed == http_parse_t::complete_k) {
             exchange.body_stage = body_stage_t::ended_k;
             connection.streaming = nullptr;
@@ -566,6 +771,40 @@ struct serving {
         }
         if (pull_ready(exchange)) finish_pull(exchange, ucall_status_success_k);
         return parsed;
+    }
+
+    /** The bytes @p connection's peer is bound to send next, as a declared length frames them: the
+     *  rest of a request whose head arrived, or of a streamed body, which one pull takes up to the
+     *  request cap. Under Noise, the ciphertext already held counts against them, as records only
+     *  add bytes to what they carry. */
+    static std::size_t known_bytes(connection_t const& connection) noexcept {
+        auto const& transport = connection.transport;
+        auto const& message = transport.message;
+        if (message.framing != http_framing_t::length_k || !message.headers_length) return 0;
+        std::size_t const remaining = connection.streaming
+                                          ? fu::min_of(message.content_length - message.decoded_length,
+                                                       connection.network_interface->config->max_request_bytes)
+                                          : message.wire_length - fu::min_of(message.wire_length,
+                                                                             transport.input.size() - transport.parsed);
+        return remaining - fu::min_of(remaining, transport.encrypted.size());
+    }
+
+    /** The bytes of the message being parsed that already arrived: the body decoded so far while it
+     *  streams, else what @c input holds of the request. */
+    static std::size_t arrived_bytes(connection_t const& connection) noexcept {
+        auto const& transport = connection.transport;
+        return connection.streaming ? transport.message.decoded_length : transport.input.size() - transport.parsed;
+    }
+
+    /** The body bytes @p connection's peer still owes past what its held slice holds, as the head
+     *  declared their length, or the most there can be under any other framing. */
+    static std::size_t body_rest(connection_t const& connection) noexcept {
+        auto const& message = connection.transport.message;
+        if (message.framing != http_framing_t::length_k || !message.headers_length)
+            return (std::numeric_limits<std::size_t>::max)();
+        std::size_t rest = message.content_length - fu::min_of(message.content_length, message.decoded_length);
+        if (connection.held_slice.release_token) rest -= fu::min_of(rest, connection.held_rest().size());
+        return rest;
     }
 
     /** Whether the request line opening @p request names HTTP/1.0, which has
@@ -651,16 +890,19 @@ struct serving {
         std::size_t consumed = std::exchange(connection.transport.parsed, 0);
         while (connection.transport.stage == transport_stage_t::open_k &&
                connection.transport.receiving == receive_state_t::reading_k) {
+            if (connection.held_slice.release_token && consumed == connection.transport.input.size())
+                read_held_slice(event_loop, connection, consumed);
             // A streamed body is a barrier: nothing behind it parses until it ended.
             if (connection.streaming) {
-                if (stream_body(connection) == http_parse_t::complete_k) continue;
+                if (stream_body(connection, consumed) == http_parse_t::complete_k) continue;
                 // A queue prefetching into a shared ring parks what an unpulled body holds there.
-                if (connection.streaming && !connection.streaming->body_chunk.empty())
-                    event_loop.queue.receive_pause(connection.transport.descriptor);
+                if (connection.streaming && connection.streaming->holds_chunk())
+                    event_loop.queue.receive_pause(connection.transport.descriptor, body_rest(connection));
                 break;
             }
             if (connection.outstanding_exchanges == depth) {
                 connection.transport.receiving = receive_state_t::full_k;
+                spill_held_slice(event_loop, connection);
                 break;
             }
             span<byte_t> unparsed {connection.transport.input.data() + consumed,
@@ -690,8 +932,7 @@ struct serving {
             // A parsed head is valid, so what the body holds is the stream's to report.
             if (head && head_fits && connection.routed &&
                 connection.routed->body_delivery == ucall_body_delivery_streamed_k) {
-                dispatch_streamed(event_loop, connection, consumed);
-                consumed = 0;
+                consumed = dispatch_streamed(event_loop, connection, consumed);
                 continue;
             }
             bool const body_fits = message.framing != http_framing_t::length_k
@@ -702,6 +943,11 @@ struct serving {
                 (parsed == http_parse_t::incomplete_k || parsed == http_parse_t::complete_k))
                 parsed = http_parse_t::overflow_k;
             if (parsed == http_parse_t::incomplete_k) {
+                // A held slice holds the rest of a request behind a streamed body, its body too.
+                if (connection.held_slice.release_token) {
+                    read_held_slice(event_loop, connection, consumed);
+                    continue;
+                }
                 if (connection.transport.peer_stream == peer_stream_t::closed_k)
                     connection.transport.receiving = receive_state_t::ended_k;
                 break;
@@ -714,13 +960,11 @@ struct serving {
             }
             http_t::http_decode_chunks(unparsed, connection.transport.message);
             if (!connection.transport.message.keep_alive()) connection.transport.receiving = receive_state_t::ended_k;
-            auto wire = connection.transport.message.wire_length;
-            dispatch(server, event_loop, connection, consumed);
-            consumed = connection.transport.input.empty() ? 0 : consumed + wire;
+            consumed = dispatch(server, event_loop, connection, consumed);
         }
         // The dispatched front leaves once it outweighs the rest, so a burst moves each byte once.
         if (consumed >= connection.transport.input.size() - consumed)
-            http_t::drop_bytes(connection.transport.input, consumed);
+            connection.transport.drop_front(connection.transport.input, consumed);
         else connection.transport.parsed = consumed;
         connection.transport.aim_receive();
         if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
@@ -735,10 +979,14 @@ struct serving {
             if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         }
         // A streamed body reads on only once its last chunk was pulled.
+        // A held slice is read through before the socket is, so a stream prefetching into a shared
+        // ring pauses meanwhile rather than filling it.
+        if (connection.held_slice.release_token)
+            event_loop.queue.receive_pause(connection.transport.descriptor, body_rest(connection));
         if (connection.transport.receiving == receive_state_t::reading_k &&
             connection.transport.receive_operation == operation_state_t::idle_k &&
-            (!connection.streaming || connection.streaming->body_chunk.empty()))
-            return connection.transport.emit_receive();
+            !connection.held_slice.release_token && (!connection.streaming || !connection.streaming->holds_chunk()))
+            return connection.transport.emit_receive(known_bytes(connection), arrived_bytes(connection));
         if (connection.transport.receiving == receive_state_t::ended_k && !connection.oldest_exchange &&
             connection.transport.transmitting == transmit_state_t::idle_k) {
             // A peer that closed left nothing unread, so only a live receive side lingers.
@@ -873,7 +1121,7 @@ struct serving {
         // only a streamed one waiting on its peer: every byte pulled, and no reply adopted.
         if ((stage == transport_stage_t::open_k || stage == transport_stage_t::handshake_k) && carried &&
             (!oldest || (oldest == connection.streaming && oldest->stage == exchange_stage_t::dispatched_k &&
-                         oldest->body_chunk.empty()))) {
+                         !oldest->holds_chunk()))) {
             relist(event_loop, connection, connection_order_t::keepalive_k);
             // A peer parked while every connection was busy evicts the first to turn idle.
             evict(event_loop, *connection.network_interface,
@@ -909,6 +1157,8 @@ struct serving {
             connection.transport.tunnel.clear();
             connection.transport.input.clear();
             connection.transport.parsed = 0;
+            if (connection.held_slice.release_token)
+                event_loop.queue.release(std::exchange(connection.held_slice, io_completion_t {}));
             connection.transport.encrypted.clear();
             connection.transport.sending = nullptr;
             connection.transport.output_offset = 0;

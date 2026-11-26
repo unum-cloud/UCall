@@ -279,7 +279,12 @@ struct server_t {
             {"handshake_failures", "handshake failures", &ucall_event_loop_statistics_t::handshake_failures},
             {"authorizer_refusals", "authorizer refusals", &ucall_event_loop_statistics_t::authorizer_refusals},
             {"shed_connections", "shed connections", &ucall_event_loop_statistics_t::shed_connections},
-            {"windows_unpinned", "unpinned windows", &ucall_event_loop_statistics_t::windows_unpinned}};
+            {"windows_unpinned", "unpinned windows", &ucall_event_loop_statistics_t::windows_unpinned},
+            {"receive_slices_refused", "refused receive slices",
+             &ucall_event_loop_statistics_t::receive_slices_refused},
+            {"receive_pool_buffers", "receive pool buffers", &ucall_event_loop_statistics_t::receive_pool_buffers},
+            {"receive_pool_buffer_bytes", "receive pool buffer bytes",
+             &ucall_event_loop_statistics_t::receive_pool_buffer_bytes}};
         // Each row composes on the stack and leaves in one write, so no log line splits a row.
         fmt::basic_memory_buffer<char, 4096> row;
         auto emit = [&] {

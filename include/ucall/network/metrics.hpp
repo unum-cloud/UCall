@@ -198,7 +198,10 @@ struct metrics {
             {"ready_passes", &ucall_event_loop_statistics_t::ready_passes},
             {"replied_dequeues", &ucall_event_loop_statistics_t::replied_dequeues},
             {"shed_connections", &ucall_event_loop_statistics_t::shed_connections},
-            {"windows_unpinned", &ucall_event_loop_statistics_t::windows_unpinned}};
+            {"windows_unpinned", &ucall_event_loop_statistics_t::windows_unpinned},
+            {"receive_slices_refused", &ucall_event_loop_statistics_t::receive_slices_refused},
+            {"receive_pool_buffers", &ucall_event_loop_statistics_t::receive_pool_buffers},
+            {"receive_pool_buffer_bytes", &ucall_event_loop_statistics_t::receive_pool_buffer_bytes}};
         ucall_event_loop_statistics_t const totals = server_t::loop_totals(event_loop);
         ucall_status_t fitted = ucall_status_success_k;
         for (auto [name, counter] : counters_k) {

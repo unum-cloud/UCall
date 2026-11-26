@@ -308,7 +308,8 @@ class request_t {
 
     /**
      *  @brief Pulls the body bytes decoded since the last pull into @p into, empty once the body
-     *      ended, valid until the next pull; answers a refusal, or success while the pull runs.
+     *      ended and valid until the next pull or the reply; answers a refusal, or success while
+     *      the pull runs.
      *
      *  On a streamed endpoint the pull is final once the bytes arrive, which the polling thread
      *  delivers; a pull from the polling thread itself finding nothing answers

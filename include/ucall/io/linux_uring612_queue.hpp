@@ -351,6 +351,24 @@ struct uring_provided_buffers {
         return std::size_t {buffer_count()} * sizeof(*receive_ring->bufs);
     }
 
+    /** Whether @p next continues @p slice within one buffer, so the two read as one slice that a
+     *  single @c release_slice gives back once @p next was released on its own. */
+    bool adjoins(span<byte_t const> slice, span<byte_t const> next) const noexcept {
+        return !slice.empty() && slice.data() + slice.size() == next.data() &&
+               offset_of(slice) >> buffer_bytes_log2 == offset_of(next) >> buffer_bytes_log2;
+    }
+
+    /** Counts one more holder of @p slice, each passing a part of it to @c release_slice. */
+    void share_slice(span<byte_t const> slice) noexcept {
+        ++records[offset_of(slice) >> buffer_bytes_log2].slices_awaiting_release;
+    }
+
+    /** Whether a slice kept past its round starves no receive: the kernel has a buffer to pick
+     *  besides the one it fills, or the pool can still provide one. This alone keeps a buffer for
+     *  the kernel, however many slices a connection keeps: a pulled chunk, a held slice and a
+     *  waiting one each pin theirs. */
+    bool spares_a_buffer() const noexcept { return available_buffers > 1 || provided_buffers < buffer_count(); }
+
     /** Doubles the buffers handed to the kernel, once it has none left to pick. */
     void provide_more() noexcept {
         unsigned const target = fu::min_of(fu::max_of(provided_buffers * 2, 2u), buffer_count());
@@ -1327,8 +1345,8 @@ struct uring_zero_copy {
     }
 };
 
-/** Prepares every operation the io_uring queues submit alike: all but accepts, receives and
- *  vectored reads. */
+/** Prepares every operation the io_uring queues submit alike: all but accepts, receives into
+ *  queue memory and vectored reads. */
 template <typename state_type_, typename operations_type_, typename zero_copy_type_>
 void uring_prepare(io_uring_sqe* submission, typename operations_type_::operation_t& operation, state_type_& state,
                    operations_type_& operations, zero_copy_type_& zero_copy) noexcept {
@@ -1387,8 +1405,13 @@ void uring_prepare(io_uring_sqe* submission, typename operations_type_::operatio
                               &state.storage->open_resolution);
         break;
     case io_operation_t::shutdown_k: io_uring_prep_shutdown(submission, socket, SHUT_WR); break;
+    case io_operation_t::receive_k: {
+        auto const& room = io_vectors(request).front();
+        io_uring_prep_recv(submission, socket, room.iov_base,
+                           fu::min_of(room.iov_len, std::size_t {(std::numeric_limits<unsigned>::max)()}), 0);
+        break;
+    }
     case io_operation_t::accept_k:
-    case io_operation_t::receive_k:
     case io_operation_t::file_read_vectors_k:
     case io_operation_t::zero_copy_release_k:
     case io_operation_t::close_k: break;
@@ -1724,7 +1747,7 @@ struct linux_uring612_queue {
         IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD, IORING_OP_OPENAT2,
         IORING_OP_SEND_ZC,      IORING_OP_READ_FIXED,   IORING_OP_READV,     IORING_OP_SENDMSG};
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_uring612_k;
-    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_k;
+    static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_unless_room_k;
 
     /** The counters the queue and its components advance for its polling owner. */
     io_statistics_t statistics {};
@@ -1785,6 +1808,17 @@ struct linux_uring612_queue {
         if (!state.is_open() || !completion.release_token) return;
         state.provided.release_slice({completion.data, static_cast<std::size_t>(completion.result)});
     }
+
+    /** Whether the slice @p completion names may be kept past its round, as the pool spares a
+     *  buffer for the kernel. */
+    bool retains(io_completion_t const& completion) const noexcept {
+        return completion.release_token && state.provided.spares_a_buffer();
+    }
+
+    /** Counts one more holder of the slice @p completion names, which releases its own part. */
+    void share(io_completion_t const& completion) noexcept {
+        state.provided.share_slice({completion.data, static_cast<std::size_t>(completion.result)});
+    }
     memory_registration_t register_memory(span<byte_t> memory) noexcept { return state.register_memory(memory); }
     void submit(io_request_t& request) noexcept {
         tally<atomic_ref_template_>(statistics.submissions);
@@ -1801,11 +1835,12 @@ struct linux_uring612_queue {
         auto& request = *operation.request;
         if (request.operation == io_operation_t::accept_k)
             return operations.arm_accepts(operation, state, socket_slots);
-        auto* submission = request.operation == io_operation_t::receive_k && !state.provided.available_buffers
-                               ? nullptr
-                               : operations.entry(operation, state);
+        bool const into_queue_memory = request.operation == io_operation_t::receive_k &&
+                                       !io_receive_names_room(request);
+        auto* submission = into_queue_memory && !state.provided.available_buffers ? nullptr
+                                                                                  : operations.entry(operation, state);
         if (!submission) return operations.push(operations.waiting_operations, operation);
-        if (request.operation == io_operation_t::receive_k) {
+        if (into_queue_memory) {
             // A length would cut the buffer short of what the cursor expects.
             io_uring_prep_recv(submission, static_cast<int>(operation.socket_slot->index), nullptr, 0, 0);
             submission->flags |= IOSQE_BUFFER_SELECT;

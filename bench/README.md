@@ -419,6 +419,25 @@ taskset -c 16-31 build_release/ucall_bench_http --url http://127.0.0.1:8545/echo
 The Intel server preallocates about 15 KiB per budgeted connection, 145,660 KiB across the 9,936 extra connections, and grows by under 250 KiB under load.
 To repeat the runs across a real NIC, start the server with `--host 0.0.0.0` and point the driver at its address.
 
+## Receive Pool
+
+How large should the buffers of an io_uring loop's receive pool be?
+A kernel read lands in the buffer the kernel is filling and continues in the next one, so a pipelined burst that straddles two buffers reaches the loop as two completions, with a request split between them.
+UCall cuts the pool into buffers as large as a socket's receive buffer, at least two, and the loop statistics report `receive_pool_buffers`, `receive_pool_buffer_bytes`, and `receive_slices_refused`, the slices copied because the pool spared the kernel no buffer.
+
+The rows below ran ServEval on loopback with 64 connections over 4 loops, 100 small `tool` calls in flight per connection, and a 16 MiB pool per loop cut into a forced count of buffers; the last row grew the pool to keep 16 buffers of 8 MiB:
+
+| Machine                    | Buffers | Buffer bytes | Calls/s   | Server CPU, µs/call | Bytes copied per call | Date       |
+| :------------------------- | ------: | -----------: | --------: | ------------------: | --------------------: | :--------- |
+| AWS Neoverse-V2, 2 domains |       2 |        8 MiB | 1,416,046 |                4.74 |                 2,663 | 2026-11-26 |
+| AWS Neoverse-V2, 2 domains |       4 |        4 MiB | 1,359,420 |                4.78 |                 2,686 | 2026-11-26 |
+| AWS Neoverse-V2, 2 domains |       8 |        2 MiB | 1,315,418 |                4.79 |                 2,691 | 2026-11-26 |
+| AWS Neoverse-V2, 2 domains |      16 |        1 MiB | 1,261,431 |                4.77 |                 2,715 | 2026-11-26 |
+| AWS Neoverse-V2, 2 domains |      32 |      512 KiB | 1,129,966 |                4.83 |                 2,762 | 2026-11-26 |
+| AWS Neoverse-V2, 2 domains |      16 |        8 MiB | 1,386,259 |                4.76 |                 2,680 | 2026-11-26 |
+
+The CPU per call stays flat while the calls per second fall with the buffer's size, not with the count, as the split requests wait for their rest.
+
 ## File Replies
 
 What does a file reply cost when the server reads it through `O_DIRECT` windows and sends it without a copy?

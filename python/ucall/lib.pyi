@@ -1384,8 +1384,9 @@ class Server:
             `bytes_sent`, `bytes_copied`, `zero_copy_sends`, `zero_copy_fallbacks`,
             `copying_sends`, `file_reads_asynchronous`, `file_reads_blocking`, `bytes_read`,
             `file_window_overlaps`, `linger_resets`, `ready_passes`, `replied_dequeues`,
-            `refused_requests`, `handshake_failures`, `authorizer_refusals`, `shed_connections` and
-            `windows_unpinned`, each read on its own.
+            `refused_requests`, `handshake_failures`, `authorizer_refusals`, `shed_connections`,
+            `windows_unpinned`, `receive_slices_refused`, `receive_pool_buffers` and
+            `receive_pool_buffer_bytes`, each read on its own.
 
         Raises:
           Error: An `event_loop` past the last one.

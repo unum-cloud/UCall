@@ -413,6 +413,17 @@ typedef struct ucall_event_loop_statistics_t {
      *  table refused; their sends pin or copy on their own. */
     uint64_t windows_unpinned;
 
+    /** Received slices of an io_uring pool a connection would have read in place, copied instead
+     *  as the pool spared the kernel no buffer to receive into; zero elsewhere. */
+    uint64_t receive_slices_refused;
+
+    /** Buffers the loop's io_uring receive pool is cut into, each as large as a socket's receive
+     *  buffer and at least two; zero elsewhere. */
+    uint64_t receive_pool_buffers;
+
+    /** Bytes of each buffer of the loop's io_uring receive pool; zero elsewhere. */
+    uint64_t receive_pool_buffer_bytes;
+
 } ucall_event_loop_statistics_t;
 
 /** Arguments of @c ucall_server_event_loop_statistics(). */
@@ -1082,7 +1093,9 @@ typedef struct ucall_server_request_body_chunk_t {
  *  previous bytes were pulled, and parses no pipelined request until the body ended. On a buffered
  *  endpoint the first pull answers the whole body and the next one empty.
  *
- *  @warning The returned @c data is valid only until the next call on this @c request.
+ *  @warning The returned @c data is valid only until the next call on this @c request. A ring may
+ *      hand it out where its receive pool landed the bytes, so reading it later may read bytes
+ *      that arrived since for another connection.
  *  @sa Use @c ucall_server_request_body() for endpoints that are not registered as streaming.
  *
  *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.

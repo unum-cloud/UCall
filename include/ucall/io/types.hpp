@@ -110,7 +110,10 @@ enum class io_operation_t : std::uint8_t {
     connect_k,
 
     /** Receives into the vector @c data names, read at each attempt so its owner may move it, or
-     *  into queue memory where the queue's @c receive_memory_k says so. */
+     *  into queue memory where the queue's @c receive_memory_k says so. A queue whose memory is
+     *  @c queue_unless_room_k fills a vector with room in place once the bytes it already holds
+     *  for the socket were taken, answering those first in its own memory, and the kernel writes
+     *  that room until the receive completes, so it stays allocated and unmoved until then. */
     receive_k,
 
     /** Sends @c data by copying. */
@@ -160,6 +163,10 @@ enum class io_receive_memory_t : std::uint8_t {
     /** Into the queue's own buffers; the completion's bytes stay valid until the caller passes them
      *  to @c release. */
     queue_k,
+
+    /** Into the queue's own buffers as @c queue_k, unless the vector names room, which the receive
+     *  fills in place; bytes a completion with no @c release_token reports are in the vector. */
+    queue_unless_room_k,
 };
 
 /** The queue buffer index a request's memory lies in, scoped so no descriptor binds to it. */
@@ -503,6 +510,12 @@ inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
     return {reinterpret_cast<io_vector_t*>(request.data), request.length};
 }
 
+/** Whether a @c receive_k names room of its own, which a @c queue_unless_room_k queue fills in
+ *  place rather than its buffers. */
+inline bool io_receive_names_room(io_request_t const& request) noexcept {
+    return request.operation == io_operation_t::receive_k && request.length && io_vectors(request).front().iov_len;
+}
+
 /** The most vectors one @c send_vectors_k takes: @c IOV_MAX, as every POSIX queue gathers through
  *  @c sendmsg, and one on Windows, whose queues send a single span and are never handed one. */
 #if UCALL_OS_POSIX_
@@ -829,6 +842,26 @@ concept an_in_place_growing_queue = requires(queue_type_& queue, std::size_t cap
 template <typename queue_type_>
 concept a_release_reserving_queue = requires(queue_type_& queue, std::size_t count) { queue.reserve_releases(count); };
 
+/** A queue whose receives may name slices of its memory that a caller keeps past their round. */
+template <typename queue_type_>
+concept a_slice_retaining_queue = requires(queue_type_& queue, io_completion_t const& completion) {
+    { queue.retains(completion) } -> std::convertible_to<bool>;
+    queue.share(completion);
+};
+
+/** A queue that keeps received bytes waiting for a receive, which may continue a kept slice. */
+template <typename queue_type_>
+concept a_slice_extending_queue = requires(queue_type_& queue, descriptor_t descriptor, io_completion_t& completion) {
+    queue.extend(descriptor, completion);
+};
+
+/** A queue whose receives land in a pool of buffers it provides the kernel. */
+template <typename queue_type_>
+concept a_receive_pool_queue = requires(queue_type_& queue) {
+    { queue.state.provided.buffer_count() } -> std::convertible_to<std::size_t>;
+    { queue.state.provided.buffer_bytes() } -> std::convertible_to<std::size_t>;
+};
+
 /** A queue that prefetches a stream's bytes, and so can pause while nobody pulls them. */
 template <typename queue_type_>
 concept a_prefetching_queue = requires(queue_type_& queue, descriptor_t descriptor) {
@@ -895,6 +928,28 @@ class io_queue_variant {
         return open_<0>(backend, depth, capacity, scope, listeners, ucall_status_unsupported_k);
     }
 
+    /** The buffers the open queue's receive pool is cut into, or zero where it has none. */
+    std::size_t receive_pool_buffers() const noexcept {
+        return std::visit(
+            [](auto const& queue) noexcept -> std::size_t {
+                if constexpr (a_receive_pool_queue<std::remove_cvref_t<decltype(queue)>>)
+                    return queue.state.provided.buffer_count();
+                else return 0;
+            },
+            queues_);
+    }
+
+    /** Bytes of each buffer of the open queue's receive pool, or zero where it has none. */
+    std::size_t receive_pool_buffer_bytes() const noexcept {
+        return std::visit(
+            [](auto const& queue) noexcept -> std::size_t {
+                if constexpr (a_receive_pool_queue<std::remove_cvref_t<decltype(queue)>>)
+                    return queue.state.provided.buffer_bytes();
+                else return 0;
+            },
+            queues_);
+    }
+
     /** The backend of the queue @c open picked, or tried last. */
     ucall_io_backend_t backend() const noexcept { return backends_k[queues_.index()]; }
 
@@ -941,12 +996,12 @@ class io_queue_variant {
             queues_);
     }
 
-    /** Stops prefetching into @p descriptor's stream while nobody pulls its bytes, where the queue
-     *  prefetches at all. */
-    void receive_pause(descriptor_t descriptor) noexcept {
+    /** Stops prefetching into @p descriptor's stream while nobody pulls its bytes, whose peer still
+     *  owes @p rest of them, where the queue prefetches at all. */
+    void receive_pause(descriptor_t descriptor, std::size_t rest = (std::numeric_limits<std::size_t>::max)()) noexcept {
         std::visit(
             [&](auto& queue) noexcept {
-                if constexpr (a_prefetching_queue<decltype(queue)>) queue.receive_pause(descriptor);
+                if constexpr (a_prefetching_queue<decltype(queue)>) queue.receive_pause(descriptor, rest);
             },
             queues_);
     }
@@ -992,6 +1047,37 @@ class io_queue_variant {
     }
     void release(io_completion_t const& completion) noexcept {
         std::visit([&](auto& queue) noexcept { queue.release(completion); }, queues_);
+    }
+
+    /** Whether the caller may keep the queue memory @p completion names past this round and pass
+     *  it to @c release later, where the queue lets it without starving its receives. */
+    bool retains(io_completion_t const& completion) noexcept {
+        return std::visit(
+            [&](auto& queue) noexcept {
+                if constexpr (a_slice_retaining_queue<decltype(queue)>) return queue.retains(completion);
+                else return false;
+            },
+            queues_);
+    }
+
+    /** Counts one more holder of the slice a retained @p completion names, so a part of it can be
+     *  passed to @c release apart from the rest; only a queue that retains slices is asked. */
+    void share(io_completion_t const& completion) noexcept {
+        std::visit(
+            [&](auto& queue) noexcept {
+                if constexpr (a_slice_retaining_queue<decltype(queue)>) queue.share(completion);
+            },
+            queues_);
+    }
+
+    /** Extends @p completion, a slice kept of @p descriptor's receives, by the bytes waiting right
+     *  behind it, where the queue keeps arrivals waiting for a receive. */
+    void extend(descriptor_t descriptor, io_completion_t& completion) noexcept {
+        std::visit(
+            [&](auto& queue) noexcept {
+                if constexpr (a_slice_extending_queue<decltype(queue)>) queue.extend(descriptor, completion);
+            },
+            queues_);
     }
     void stop() noexcept {
         std::visit([](auto& queue) noexcept { queue.stop(); }, queues_);

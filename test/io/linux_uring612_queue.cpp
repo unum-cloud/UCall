@@ -96,6 +96,8 @@ void run_linux_uring612_queue_cases() {
             run_cell_case(label, "test_sockets_interleave", test_sockets_interleave<queue_type_>);
             run_cell_case(label, "test_registered_direct_files", test_registered_direct_files<queue_type_>);
             run_cell_case(label, "test_zero_copy_sends", test_zero_copy_sends<queue_type_>);
+            run_cell_case(label, "test_ring_receive_in_place", test_ring_receive_in_place<queue_type_>);
+            run_cell_case(label, "test_ring_retains_while_spare", test_ring_retains_while_spare<queue_type_>);
             run_cell_case(label, "test_provides_past_two_buffers", test_provides_past_two_buffers);
             run_cell_case(label, "test_ring_past_file_table", test_ring_past_file_table<queue_type_>);
         });

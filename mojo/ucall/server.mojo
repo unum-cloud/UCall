@@ -597,6 +597,12 @@ struct EventLoopStatistics(Defaultable, ImplicitlyCopyable):
     """Peers refused while the process was out of descriptors: a 503 in plaintext, a reset under Noise."""
     var windows_unpinned: UInt64
     """File windows the queue left unpinned, whose sends pin or copy on their own."""
+    var receive_slices_refused: UInt64
+    """Received io_uring pool slices copied rather than kept, as the pool spared no buffer."""
+    var receive_pool_buffers: UInt64
+    """Buffers the loop's io_uring receive pool is cut into; zero elsewhere."""
+    var receive_pool_buffer_bytes: UInt64
+    """Bytes of each buffer of the loop's io_uring receive pool; zero elsewhere."""
 
     def __init__(out self):
         """Every counter at zero, as a failed read leaves them."""

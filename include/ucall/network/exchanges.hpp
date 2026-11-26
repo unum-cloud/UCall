@@ -18,6 +18,7 @@
 
 namespace unum::ucall::network {
 
+using io::io_completion_t;
 using io::io_request_t;
 using io::pollable_wakeup_t;
 using tunnel::secure_tunnel_geometry_t;
@@ -398,8 +399,22 @@ struct server_exchange : ucall_received_http_request_handle_t {
      *  either; a pull from another thread only raises @c shared.pull_requested. */
     vector<byte_t> body_chunk {};
 
+    /** Bytes at the front of @c body_chunk before its payload, the end of a head that arrived with
+     *  it, which the pull taking the chunk skips. */
+    std::size_t body_chunk_front {};
+
     /** The chunk the last pull handed out, which the application views until its next pull. */
     vector<byte_t> pulled_chunk {};
+
+    /** A slice of the queue's memory holding the next chunk in place of @c body_chunk, kept from
+     *  the receive that filled it, or none while its @c release_token is zero. */
+    io_completion_t body_slice {};
+
+    /** The slice the last pull handed out, which the loop releases once the next pull asks. */
+    io_completion_t pulled_slice {};
+
+    /** Whether a decoded chunk waits for its pull, in @c body_chunk or @c body_slice. */
+    bool holds_chunk() const noexcept { return !body_chunk.empty() || body_slice.release_token; }
 
     /** A waiting pull's output, written as the loop finishes it. */
     ucall_bytes_view_t* pulled_view {};

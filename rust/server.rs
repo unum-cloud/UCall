@@ -1035,6 +1035,14 @@ pub struct EventLoopStatistics {
     /// File windows the queue left unpinned, as it pins none, or the locked-memory cap or a full
     /// table refused; their sends pin or copy on their own.
     pub windows_unpinned: u64,
+    /// Received slices of an io_uring pool a connection would have read in place, copied instead
+    /// as the pool spared the kernel no buffer to receive into; zero elsewhere.
+    pub receive_slices_refused: u64,
+    /// Buffers the loop's io_uring receive pool is cut into, each as large as a socket's receive
+    /// buffer and at least two; zero elsewhere.
+    pub receive_pool_buffers: u64,
+    /// Bytes of each buffer of the loop's io_uring receive pool; zero elsewhere.
+    pub receive_pool_buffer_bytes: u64,
 }
 
 /// When a batch endpoint hands its queue to the handler; zero fields take the defaults of 1

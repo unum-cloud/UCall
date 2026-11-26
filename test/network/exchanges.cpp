@@ -36,35 +36,39 @@ static void test_exchanges(sweep_cell_t const& cell) {
                     ucall_status_name(completed.outcome.status));
         if (completed.response) check_response(completed.response, expected);
     };
-    // Rings and Registered I/O copy what lands in their pool; other queues land straight in the
-    // transport's buffers.
+    // Rings and Registered I/O copy what lands in their pool, short of a body's known rest, which
+    // lands in place; other queues land everything straight in the transport's buffers.
     ucall_io_backend_t const backend = fixture.resolved.backend;
     bool const pooled = backend == ucall_io_backend_linux_uring612_k || backend == ucall_io_backend_linux_uring618_k ||
                         backend == ucall_io_backend_windows_rio_k;
-    auto copies_beyond_receipt = [&] {
-        ucall_event_loop_statistics_t const counters = loop_statistics(fixture);
-        return pooled ? counters.bytes_copied - counters.bytes_received : counters.bytes_copied;
-    };
     // A reply's copy is counted once its send completes, which can trail the client's completion.
-    auto settled_copies = [&](std::uint64_t since, std::uint64_t expected) {
+    auto settled_counters = [&](std::uint64_t since, std::uint64_t expected) {
         steady_clock::time_point const deadline = steady_clock::now() + 2s;
         ucall_completed_call_t completed {};
-        auto copies = copies_beyond_receipt();
-        while (copies - since < expected && steady_clock::now() < deadline) {
+        auto counters = loop_statistics(fixture);
+        while (counters.bytes_copied - since < expected && steady_clock::now() < deadline) {
             expect_true(!fixture.poll(completed), "a call completed unasked");
-            copies = copies_beyond_receipt();
+            counters = loop_statistics(fixture);
         }
-        return copies;
+        return counters;
     };
+    // Each dispatch trades the connection's buffer for the exchange's, which the exchange's recycle
+    // keeps, so the first request grows one and the second the other; from the third on, both hold
+    // a request already and nothing grows.
     exchange(payload);
-    auto const before = settled_copies(0, payload.size());
+    auto const first = settled_counters(0, payload.size());
     exchange(payload);
-    auto const copied = settled_copies(before, payload.size()) - before;
-    // A 618 stream that outruns its receive copies those bytes into the backlog as well.
-    bool const streams = backend == ucall_io_backend_linux_uring618_k;
-    std::size_t const copied_limit = streams ? 3 * payload.size() : payload.size();
+    auto const before = settled_counters(first.bytes_copied, payload.size());
+    exchange(payload);
+    auto const after = settled_counters(before.bytes_copied, payload.size());
+    std::uint64_t const copied = after.bytes_copied - before.bytes_copied;
+    std::uint64_t const received = after.bytes_received - before.bytes_received;
+    // The reply copies the echoed body once, and a pool at most what it took of the request, which
+    // a 6.18 stream that outruns its receive copies into the backlog as well.
+    std::uint64_t const pool_copies = backend == ucall_io_backend_linux_uring618_k ? 2 : pooled ? 1 : 0;
+    std::uint64_t const copied_limit = payload.size() + pool_copies * received;
     expect_true(copied >= payload.size() && copied <= copied_limit,
-                "{} bytes copied beyond those received for a {}-byte echo", copied, payload.size());
+                "{} bytes copied for a {}-byte echo of {} received bytes", copied, payload.size(), received);
     // Only a socket accepted in Registered I/O sends unregistered bytes through a slice.
     expect_true(backend != ucall_io_backend_windows_rio_k || loop_statistics(fixture).copying_sends > 0,
                 "the server's connections sent outside Registered I/O");
@@ -1638,9 +1642,9 @@ static void test_configuration_byte_views(sweep_cell_t const& cell) {
     });
 }
 
-/** A mebibyte of letters, so a misplaced byte shows in the diff. */
-static std::string lettered_body() {
-    std::string body(std::size_t {1} << 20, '\0');
+/** @p length letters, a mebibyte unless named, so a misplaced byte shows in the diff. */
+static std::string lettered_body(std::size_t length = std::size_t {1} << 20) {
+    std::string body(length, '\0');
     for (std::size_t i = 0; i != body.size(); ++i) body[i] = static_cast<char>('a' + i % 23);
     return body;
 }
@@ -1905,6 +1909,509 @@ static void test_streamed_body_barrier(sweep_cell_t const& cell, split_mix_gener
     fixture.stop();
 }
 
+/** Takes the oldest request the @c /gate and @c /stream routes hold, once one waits. */
+static ucall_received_http_request_t take_oldest_held(fixture_t& fixture) {
+    if (!spin_until([&] { return fixture.held_count() != 0; })) return nullptr;
+    std::lock_guard lock {fixture.held_mutex};
+    ucall_received_http_request_t const held = fixture.held.front();
+    fixture.held.erase(fixture.held.begin());
+    return held;
+}
+
+/** Writes the head of a @p body_bytes upload to @p target, and waits for the loop to have asked
+ *  for the body, which then lands in place. Only a 6.18 stream could take body bytes before that
+ *  receive, and it asks by cancelling the stream, which the loop counts; the other queues hold no
+ *  receive between the head's and the body's. */
+static bool send_upload_head(fixture_t& fixture, raw_client_t& client, std::string_view target,
+                             std::size_t body_bytes) {
+    std::string const head = fmt::format("PUT {} HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n", target,
+                                         body_bytes);
+    ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+    bool const streams = fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
+    if (!expect_true(::send(client.descriptor, head.data(), head.size(), 0) == static_cast<ssize_t>(head.size())))
+        return false;
+    return expect_true(spin_until([&] {
+                           ucall_event_loop_statistics_t const now = loop_statistics(fixture);
+                           return now.bytes_received >= before.bytes_received + head.size() &&
+                                  (!streams || now.cancellations > before.cancellations);
+                       }),
+                       "the loop never asked for the body of {}", target);
+}
+
+/** An upload whose head arrived before its body lands in place: buffered, streamed, and streamed
+ *  under a request cap a sixteenth of the body, whose pulls each take at most the cap. The body
+ *  reaches the request byte for byte, and once two uploads on the connection grew the buffers the
+ *  request and its exchange trade, the loop copies no more than the reply and the last run of the
+ *  body shorter than a page, which a ring copies out of its pool. Other queues double a room a
+ *  receive filled, moving what it held, which stays short of the body. */
+static void test_upload_in_place(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    std::string const body = lettered_body();
+    struct upload_t {
+        std::string_view target;
+        std::size_t max_request_bytes;
+    };
+    for (upload_t const upload :
+         {upload_t {"/gate", 0}, upload_t {"/stream", 0}, upload_t {"/stream", body.size() / 16}}) {
+        fixture_t fixture {cell, {.max_request_bytes = upload.max_request_bytes}};
+        if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+            return;
+        fixture.serve_in_background();
+        raw_client_t client;
+        if (!expect_true(client.connect(fixture.address))) return;
+        std::size_t const warming = 2;
+        bool const in_place = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
+                              fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
+        for (std::size_t round = 0, offset = 0; round != warming + 1; ++round) {
+            if (!send_upload_head(fixture, client, upload.target, body.size())) break;
+            ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+            bool written = false;
+            std::thread writer {
+                [&] { written = client.write(byte_span(body), 65536, generator, steady_clock::now() + wait_limit_k); }};
+            auto* held = take_oldest_held(fixture);
+            std::string received;
+            std::size_t pulls = 0;
+            if (held && upload.target == "/stream") received = pull_body(fixture, held, pulls);
+            else if (held) {
+                ucall_outcome_t outcome {};
+                ucall_bytes_view_t whole {};
+                ucall_server_request_body_t buffered {fixture.server, &outcome, held, &whole};
+                ucall_server_request_body(&buffered);
+                received = text_view(whole);
+            }
+            writer.join();
+            expect_true(written, "the body of {} was not written", upload.target);
+            expect_equal_bytes(byte_span(received), byte_span(body));
+            if (upload.max_request_bytes)
+                expect_true(pulls > body.size() / upload.max_request_bytes,
+                            "{} pulls took {} bytes under a {}-byte cap", pulls, body.size(), upload.max_request_bytes);
+            if (held) reply_length(fixture, held, received.size());
+            auto const response = read_response(client, offset);
+            offset += response.length;
+            if (!expect_true(response.status == 200 && response.body == fmt::format("{}", body.size()),
+                             "{} answered {} {}", upload.target, response.status, response.body))
+                break;
+            // The reply's copy is counted once its send completes, which can trail the peer's read.
+            std::uint64_t copied = 0;
+            spin_until([&] {
+                copied = loop_statistics(fixture).bytes_copied - before.bytes_copied;
+                return copied >= response.body.size();
+            });
+            if (round == warming)
+                expect_true(copied <= response.length + util::page_size() + (in_place ? 0 : body.size()),
+                            "{} copied {} bytes for a {}-byte upload and a {}-byte reply", upload.target, copied,
+                            body.size(), response.length);
+        }
+        fixture.stop();
+    }
+}
+
+/** A streamed upload whose head and body are written at once, as most clients send them, reaches
+ *  its pulls byte for byte, and once two uploads warmed the connection the loop copies each byte a
+ *  ring's pool took at most once: a pull takes a chunk where the pool slice holding it landed,
+ *  behind its head, and only a slice the pool cannot spare is copied. Other queues land it
+ *  uncopied, and double a room a receive filled, moving what it held, short of the body. */
+static void test_upload_with_head(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    std::string const body = lettered_body();
+    std::string const wire = fmt::format("PUT /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}", body.size(),
+                                         body);
+    fixture_t fixture {cell, {}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    bool const pooled = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
+                        fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
+    std::size_t const warming = 2;
+    for (std::size_t round = 0, offset = 0; round != warming + 1; ++round) {
+        ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+        bool written = false;
+        std::thread writer {[&] {
+            written = client.write(byte_span(wire), wire.size(), generator, steady_clock::now() + wait_limit_k);
+        }};
+        auto* held = take_oldest_held(fixture);
+        std::size_t pulls = 0;
+        std::string const received = held ? pull_body(fixture, held, pulls) : std::string {};
+        writer.join();
+        expect_true(written && received == body, "{} of {} bytes pulled", received.size(), body.size());
+        if (held) reply_length(fixture, held, received.size());
+        auto const response = read_response(client, offset);
+        offset += response.length;
+        if (!expect_true(response.status == 200, "answered {}", response.status)) break;
+        std::uint64_t copied = 0;
+        spin_until([&] {
+            copied = loop_statistics(fixture).bytes_copied - before.bytes_copied;
+            return copied >= response.body.size();
+        });
+        if (round == warming)
+            expect_true(copied <= response.length + util::page_size() + (pooled ? wire.size() : body.size()),
+                        "{} copied for a {}-byte upload written whole and a {}-byte reply", copied, wire.size(),
+                        response.length);
+    }
+    fixture.stop();
+}
+
+/** One pull of @p request, answering its status and the view it handed out in @p data. */
+static ucall_status_t pull_view(fixture_t& fixture, ucall_received_http_request_t request, std::string_view& data) {
+    ucall_outcome_t outcome {};
+    ucall_bytes_view_t view {};
+    ucall_server_request_body_chunk_t pull {fixture.server, &outcome, request, &view};
+    ucall_server_request_body_chunk(&pull);
+    ucall_status_t const status = ucall_outcome_wait(&outcome);
+    data = {reinterpret_cast<char const*>(view.data), view.length};
+    return status;
+}
+
+/** A pulled chunk, which a ring may hand out where its pool received it, keeps its bytes until the
+ *  next pull, while later body bytes arrive and wait as the next chunk. */
+static void test_pulled_view_outlives_arrivals(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    std::string const body = lettered_body();
+    std::string_view const first = std::string_view {body}.substr(0, body.size() / 2);
+    std::string_view const second = std::string_view {body}.substr(first.size());
+    fixture_t fixture {cell, {}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    std::string const head = fmt::format("PUT /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n", body.size());
+    std::string const opening = head + std::string {first};
+    if (!expect_true(client.write(byte_span(opening), opening.size(), generator, steady_clock::now() + wait_limit_k)))
+        return;
+    auto* held = take_oldest_held(fixture);
+    if (!expect_true(held != nullptr, "the stream was not held")) return;
+    std::string_view view;
+    ucall_status_t status = pull_view(fixture, held, view);
+    std::string const pulled {view};
+    if (!expect_true(status == ucall_status_success_k && !pulled.empty() && first.starts_with(pulled),
+                     "the first pull answered {} with {} bytes", ucall_status_name(status), pulled.size()))
+        return;
+    // The rest arrives behind the view while the application still reads it.
+    std::uint64_t const received = loop_statistics(fixture).bytes_received;
+    if (!expect_true(client.write(byte_span(second), second.size(), generator, steady_clock::now() + wait_limit_k)))
+        return;
+    spin_until([&] { return loop_statistics(fixture).bytes_received > received; });
+    expect_true(view == pulled, "a pulled view changed before the next pull");
+    std::string rest;
+    std::size_t pulls = 0;
+    rest = pull_body(fixture, held, pulls);
+    expect_true(pulled + rest == body, "{} and {} bytes pulled of {}", pulled.size(), rest.size(), body.size());
+    reply_length(fixture, held, body.size());
+    expect_true(read_response(client, 0).status == 200, "the upload was not answered");
+    fixture.stop();
+}
+
+/** Streams whose applications hold a pulled chunk and pull no further never starve the loop's
+ *  other connections: a ring keeps a slice of its pool as a chunk only while the pool spares a
+ *  buffer for the kernel, and copies it out otherwise. Twice as many holders as the pool has
+ *  buffers and one more each send a buffer's worth whole before their streams are held, so their
+ *  views would pin more than the pool holds: the pool must refuse some, while one more
+ *  connection's calls go on. */
+static void test_held_views_spare_the_pool(sweep_cell_t const& cell) {
+    // Twice as many holders as a loop's pool has buffers and one more, as a holder's buffer's
+    // worth may straddle two buffers, and a connection beside them; without a pool, one.
+    std::size_t holders = 1;
+    {
+        fixture_t probe {cell, {}};
+        if (!expect_true(probe.status == ucall_status_success_k, "probe: {}", ucall_status_name(probe.status))) return;
+        holders += 2 * loop_statistics(probe).receive_pool_buffers;
+    }
+    std::size_t const connections = holders + 1;
+    fixture_t fixture {cell, {.connections = connections}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    ucall_event_loop_statistics_t const pool = loop_statistics(fixture);
+    bool const ring = pool.receive_pool_buffers != 0;
+    // A holder sends a buffer's worth whole, head and body, so it lands in the pool unpaused.
+    std::size_t const lead = ring ? pool.receive_pool_buffer_bytes : std::size_t {1} << 20;
+    auto const head = [](std::size_t body) {
+        return fmt::format("PUT /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n", body);
+    };
+    // A shorter length can take a digit off the head, which the body then gains back.
+    std::size_t body = lead - head(lead).size();
+    body += lead - head(body).size() - body;
+    std::string const upload = head(body) + lettered_body(body);
+    if (!expect_true(!ring || 2 * pool.receive_pool_buffers + 1 == holders, "{} buffers for {} holders",
+                     pool.receive_pool_buffers, holders))
+        return;
+    // Every upload is on its way before the loop reads, so each first receive takes a buffer's
+    // worth rather than whatever a busy host delivered first.
+    std::vector<raw_client_t> streams(holders);
+    std::vector<std::thread> writers;
+    for (auto& stream : streams) {
+        if (!expect_true(stream.connect(fixture.address))) break;
+        // A loop pausing a held stream may stop reading before a large upload is in.
+        writers.emplace_back([&stream, &upload] {
+            [[maybe_unused]] ssize_t const sent = ::send(stream.descriptor, upload.data(), upload.size(), 0);
+        });
+    }
+    fixture.serve_in_background();
+    std::vector<ucall_received_http_request_t> held;
+    for (std::size_t holder = 0; holder != writers.size(); ++holder) {
+        auto* request = take_oldest_held(fixture);
+        if (!expect_true(request != nullptr, "stream {} was not held", held.size())) break;
+        std::string_view view;
+        ucall_status_t const status = pull_view(fixture, request, view);
+        expect_true(status == ucall_status_success_k && !view.empty(), "stream {} first pulled {}", held.size(),
+                    ucall_status_name(status));
+        held.push_back(request);
+    }
+    std::uint64_t const refused = loop_statistics(fixture).receive_slices_refused;
+    expect_true(!ring || refused, "{} views held over {} buffers of {} bytes and the pool refused no slice",
+                held.size(), pool.receive_pool_buffers, pool.receive_pool_buffer_bytes);
+    raw_client_t quick;
+    if (expect_true(quick.connect(fixture.address))) {
+        std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
+        for (std::size_t index = 0; index != holders; ++index) {
+            std::size_t const offset = quick.received.size();
+            expect_true(::send(quick.descriptor, echo.data(), echo.size(), 0) == static_cast<ssize_t>(echo.size()));
+            auto const response = read_response(quick, offset);
+            if (!expect_true(response.status == 200 && response.body == "hi",
+                             "echo {} beside {} held views answered {}", index, held.size(), response.status))
+                break;
+        }
+    }
+    for (auto* request : held) {
+        std::size_t pulls = 0;
+        std::string const rest = pull_body(fixture, request, pulls);
+        reply_length(fixture, request, rest.size());
+    }
+    for (auto& writer : writers) writer.join();
+    fixture.stop();
+}
+
+/** A buffered request pipelined behind a streamed body, framed by length or in chunks, is answered
+ *  as soon as the body before it was pulled, even when one receive took the end of that body and
+ *  the whole request behind it: a body shorter than a page arrives after its head, which then
+ *  waits for it, so the receive taking both lands in the pool rather than in place. */
+static void test_buffered_behind_streamed(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    std::string_view const body = "hello";
+    for (std::string_view const behind :
+         {"POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi",
+          "POST /echo/1 HTTP/1.1\r\nHost: a\r\nTransfer-Encoding: chunked\r\n\r\n2\r\nhi\r\n0\r\n\r\n"}) {
+        fixture_t fixture {cell, {.pipelined_requests = 2}};
+        if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+            return;
+        fixture.serve_in_background();
+        raw_client_t client;
+        std::string const head = fmt::format("PUT /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n",
+                                             body.size());
+        if (!expect_true(client.connect(fixture.address) &&
+                         client.write(byte_span(head), head.size(), generator, steady_clock::now() + wait_limit_k)))
+            return;
+        auto* held = take_oldest_held(fixture);
+        if (!expect_true(held != nullptr, "the stream was not held")) return;
+        std::string const rest = std::string {body} + std::string {behind};
+        ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+        if (!expect_true(client.write(byte_span(rest), rest.size(), generator, steady_clock::now() + wait_limit_k)))
+            return;
+        std::size_t pulls = 0;
+        std::string const received = pull_body(fixture, held, pulls);
+        reply_length(fixture, held, received.size());
+        expect_true(received == body, "the stream pulled {:?}", received);
+        // Both answers leave within the pass that pulled the body, well before the loop's linger
+        // timer, the next thing that would step a stalled connection again.
+        auto const deadline = steady_clock::now() + std::chrono::microseconds {linger_microseconds_k / 2};
+        while (
+            parse_response(std::string_view {client.received}.substr(parse_response(client.received).length)).length ==
+                0 &&
+            client.read(client.received.size() + 1, deadline) == read_end_t::filled_k) {}
+        auto const first = parse_response(client.received);
+        auto const second = parse_response(std::string_view {client.received}.substr(first.length));
+        expect_true(first.status == 200 && second.status == 200 && second.body == "hi",
+                    "answered {} and {} {:?} behind a streamed body", first.status, second.status, second.body);
+        // A ring holds the slice the rest landed in: the body is pulled where it landed, the
+        // request behind it moves once to start `input`, its exchange takes it whole, and the two
+        // replies copy into their segments. A copy of the slice into `input` would add the body
+        // and the request a second time.
+        std::size_t const replied = first.length + second.length;
+        std::uint64_t copied = 0;
+        spin_until([&] {
+            copied = loop_statistics(fixture).bytes_copied - before.bytes_copied;
+            return copied >= behind.size() + first.body.size() + second.body.size();
+        });
+        bool const ring = fixture.resolved.backend == ucall_io_backend_linux_uring612_k ||
+                          fixture.resolved.backend == ucall_io_backend_linux_uring618_k;
+        expect_true(!ring || copied <= behind.size() + replied,
+                    "{} bytes copied for a {}-byte body, {} behind it and {} replied", copied, body.size(),
+                    behind.size(), replied);
+        fixture.stop();
+    }
+}
+
+/** Pulls @p request until @p wanted bytes arrived or a pull failed, answering the last status. */
+static ucall_status_t pull_until(fixture_t& fixture, ucall_received_http_request_t request, std::size_t wanted,
+                                 std::string& received) {
+    ucall_status_t status = ucall_status_success_k;
+    while (received.size() < wanted && status == ucall_status_success_k) {
+        ucall_outcome_t outcome {};
+        ucall_bytes_view_t data {};
+        ucall_server_request_body_chunk_t pull {fixture.server, &outcome, request, &data};
+        ucall_server_request_body_chunk(&pull);
+        status = ucall_outcome_wait(&outcome);
+        received += text_view(data);
+    }
+    return status;
+}
+
+/** A streamed body landing in place, cut after its first half: a peer leaving ends the next pull
+ *  with @c ucall_status_connection_closed_k, a drain lets the second half land and the reply leave,
+ *  and a stop cutting the loop ends the pull as the peer's leaving does. */
+static void test_upload_in_place_cut(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    std::string const body = lettered_body();
+    std::string_view const first = std::string_view {body}.substr(0, body.size() / 2);
+    std::string_view const second = std::string_view {body}.substr(first.size());
+    for (std::string_view const cut : {"peer leaves", "server drains", "server cuts"}) {
+        fixture_t fixture {cell, {}};
+        if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+            return;
+        fixture.serve_in_background();
+        raw_client_t client;
+        if (!expect_true(client.connect(fixture.address)) || !send_upload_head(fixture, client, "/stream", body.size()))
+            return;
+        auto* held = take_oldest_held(fixture);
+        if (!expect_true(held != nullptr, "the stream was not held")) return;
+        bool written = false;
+        std::thread writer {
+            [&] { written = client.write(byte_span(first), 65536, generator, steady_clock::now() + wait_limit_k); }};
+        std::string received;
+        ucall_status_t status = pull_until(fixture, held, first.size(), received);
+        // A pull that failed stops the loop reading, so the writer is freed by the close.
+        if (received.size() != first.size()) client.close();
+        writer.join();
+        expect_true(written && status == ucall_status_success_k && received == first,
+                    "{}: {} of {} bytes pulled, then {}", cut, received.size(), first.size(),
+                    ucall_status_name(status));
+        if (cut == "server drains") {
+            ucall_server_stop(fixture.server);
+            expect_true(client.write(byte_span(second), 65536, generator, steady_clock::now() + wait_limit_k),
+                        "a draining server stopped reading the body");
+            status = pull_until(fixture, held, body.size(), received);
+            expect_true(status == ucall_status_success_k && received == body, "{}: {} of {} bytes pulled, then {}", cut,
+                        received.size(), body.size(), ucall_status_name(status));
+            reply_length(fixture, held, received.size());
+            auto const response = read_response(client, 0);
+            expect_true(response.status == 200, "{}: answered {}", cut, response.status);
+            fixture.stop();
+            continue;
+        }
+        if (cut == "peer leaves") client.close();
+        // The first stop drains, and the second cuts what the drain still waits for.
+        else {
+            ucall_server_stop(fixture.server);
+            fixture.stop();
+        }
+        std::string past;
+        status = pull_until(fixture, held, 1, past);
+        expect_true(status == ucall_status_connection_closed_k && past.empty(),
+                    "{}: the pull past the cut ended with {}", cut, ucall_status_name(status));
+        // A reply to a peer that left reports its leaving, and lets a drain finish.
+        ucall_outcome_t outcome {};
+        ucall_server_reply_content_t reply {fixture.server, &outcome, &held, ucall_http_status_ok_k, nullptr, 0, {}};
+        if (cut == "peer leaves") ucall_server_reply_content(&reply);
+        fixture.stop();
+    }
+}
+
+/** Small calls are copied at most once each, as a ring takes them out of its pool, and the loop
+ *  copies nothing more than their replies; other queues land them in their exchanges uncopied. */
+static void test_small_calls_copied_once(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    std::string_view const call = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nhi";
+    auto exchange_once = [&] {
+        std::size_t const offset = client.received.size();
+        expect_true(::send(client.descriptor, call.data(), call.size(), 0) == static_cast<ssize_t>(call.size()));
+        return read_response(client, offset);
+    };
+    // The first call sizes the connection's buffers.
+    exchange_once();
+    ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+    std::size_t const calls = scaled_iterations(100);
+    std::size_t replied = 0;
+    for (std::size_t index = 0; index != calls; ++index) {
+        auto const response = exchange_once();
+        if (!expect_true(response.status == 200 && response.body == "hi", "call {} answered {}", index,
+                         response.status))
+            break;
+        replied += response.length;
+    }
+    ucall_io_backend_t const backend = fixture.resolved.backend;
+    bool const pooled = backend == ucall_io_backend_linux_uring612_k || backend == ucall_io_backend_linux_uring618_k ||
+                        backend == ucall_io_backend_windows_rio_k;
+    std::uint64_t copied = 0;
+    std::uint64_t const limit = replied + (pooled ? calls * call.size() : 0);
+    // Each reply's copy is counted once its send completes, which can trail the peer's read.
+    spin_until([&] {
+        ucall_event_loop_statistics_t const now = loop_statistics(fixture);
+        copied = now.bytes_copied - before.bytes_copied;
+        return now.bytes_sent - before.bytes_sent >= replied && copied >= calls * std::string_view {"hi"}.size();
+    });
+    expect_true(copied <= limit, "{} bytes copied for {} calls of {} bytes and {} reply bytes", copied, calls,
+                call.size(), replied);
+    fixture.stop();
+}
+
+/** Uploads pipelined back to back on one connection stream through pulls whole and in order, and
+ *  the bytes queued behind each body never move per body: copies, every move of a buffer included,
+ *  stay a few times what arrived, however many uploads wait behind the one being pulled. The
+ *  server reads sixteen requests ahead, as deep as the client cases pipeline, and four times as
+ *  many uploads are written at once, so most wait behind that depth as well. */
+static void test_streamed_body_pipelined(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    std::string const body = lettered_body();
+    std::size_t const depth = 16, uploads = scaled_iterations(4 * depth);
+    fixture_t fixture {cell, {.pipelined_requests = depth}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    std::string wire;
+    for (std::size_t upload = 0; upload != uploads; ++upload)
+        wire += fmt::format("PUT /stream HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}", body.size(), body);
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+    bool written = false;
+    std::thread writer {
+        [&] { written = client.write(byte_span(wire), wire.size(), generator, steady_clock::now() + wait_limit_k); }};
+    std::size_t pulled = 0;
+    for (; pulled != uploads; ++pulled) {
+        // A body that arrived whole ends before its pulls, so the uploads behind it may wait too.
+        auto* held = take_oldest_held(fixture);
+        if (!held) break;
+        std::size_t pulls = 0;
+        std::string const received = pull_body(fixture, held, pulls);
+        if (!expect_true(received == body, "upload {} arrived as {} bytes", pulled, received.size())) break;
+        reply_length(fixture, held, received.size());
+    }
+    writer.join();
+    expect_true(written && pulled == uploads, "{} of {} uploads pulled", pulled, uploads);
+    for (std::size_t answered = 0, offset = 0; answered != pulled; ++answered) {
+        auto const response = read_response(client, offset);
+        if (!expect_true(response.status == 200 && response.body == fmt::format("{}", body.size()),
+                         "upload {} answered {} {}", answered, response.status, response.body))
+            break;
+        offset += response.length;
+    }
+    ucall_event_loop_statistics_t const after = loop_statistics(fixture);
+    // A ring's pool copies what it took, a 6.18 backlog once more, a body sharing its receive with
+    // those behind it is copied out once, and buffers doubling as bytes arrive move less than that.
+    ucall_io_backend_t const backend = fixture.resolved.backend;
+    std::uint64_t const pool_copies = backend == ucall_io_backend_linux_uring618_k ? 2
+                                      : backend == ucall_io_backend_linux_uring612_k ||
+                                              backend == ucall_io_backend_windows_rio_k
+                                          ? 1
+                                          : 0;
+    std::uint64_t const copied = after.bytes_copied - before.bytes_copied;
+    expect_true(copied <= (pool_copies + 2) * wire.size(), "{} bytes copied for {} pipelined bytes", copied,
+                wire.size());
+    fixture.stop();
+}
+
 /** A chunk size that is not hexadecimal ends the waiting pull as malformed and the stream. */
 static void test_streamed_body_malformed(sweep_cell_t const& cell) {
     fixture_t fixture {cell, {}};
@@ -2158,6 +2665,14 @@ void run_exchanges_cases(sweep_cell_t const& cell, sz::string_t const& cell_labe
     run_cell_case(cell_label, "test_multiloop_retention", test_multiloop_retention, cell);
 #if UCALL_OS_POSIX_
     run_cell_case(cell_label, "test_request_peer_ipv6", test_request_peer_ipv6, cell);
+    run_cell_case(cell_label, "test_streamed_body_pipelined", test_streamed_body_pipelined, cell);
+    run_cell_case(cell_label, "test_upload_in_place", test_upload_in_place, cell);
+    run_cell_case(cell_label, "test_upload_in_place_cut", test_upload_in_place_cut, cell);
+    run_cell_case(cell_label, "test_upload_with_head", test_upload_with_head, cell);
+    run_cell_case(cell_label, "test_pulled_view_outlives_arrivals", test_pulled_view_outlives_arrivals, cell);
+    run_cell_case(cell_label, "test_buffered_behind_streamed", test_buffered_behind_streamed, cell);
+    run_cell_case(cell_label, "test_held_views_spare_the_pool", test_held_views_spare_the_pool, cell);
+    run_cell_case(cell_label, "test_small_calls_copied_once", test_small_calls_copied_once, cell);
 #endif
 }
 

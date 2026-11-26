@@ -439,6 +439,9 @@ type EventLoopStatistics struct {
 	AuthorizerRefusals    uint64
 	ShedConnections       uint64
 	WindowsUnpinned       uint64
+	ReceiveSlicesRefused  uint64
+	ReceivePoolBuffers    uint64
+	ReceivePoolBufferBytes uint64
 }
 
 // EventLoopStatistics copies one loop's counters, from any goroutine while it is polled.

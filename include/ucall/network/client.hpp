@@ -1228,20 +1228,25 @@ struct client : ucall_client_handle_t {
 
     /** Completes @p connection's oldest call with the head parsed at @p offset of @c input, rule
      *  C1b of @c call_open: the head moves to a fresh response, and the body behind it stays in
-     *  @c input to stream into that response. */
-    static void dispatch_streamed(client_t& client, client_connection_t& connection, std::size_t offset) noexcept {
+     *  @c input to stream into that response from where the head ended, which it answers. */
+    static std::size_t dispatch_streamed(client_t& client, client_connection_t& connection,
+                                         std::size_t offset) noexcept {
         auto& transport = connection.transport;
         auto& message = transport.message;
         auto& exchange = *connection.oldest_exchange;
         response_t* response = take_response(client);
-        if (!response) return transport.fail(ucall_status_out_of_memory_k);
+        if (!response) {
+            transport.fail(ucall_status_out_of_memory_k);
+            return offset;
+        }
         if (ucall_status_t const appended = http_t::append_text(
                 response->storage, {transport.text().substr(offset, message.headers_length)});
             appended != ucall_status_success_k) {
             response_t::release(&response->received);
-            return transport.fail(appended);
+            transport.fail(appended);
+            return offset;
         }
-        http_t::drop_bytes(transport.input, offset + message.headers_length);
+        std::size_t const body_offset = offset + message.headers_length;
         response->received.headers_length = message.headers_length;
         response->received.body_length = 0;
         response->received.status = message.status;
@@ -1252,7 +1257,7 @@ struct client : ucall_client_handle_t {
         response->connection = &connection;
         connection.streaming = response;
         ++client.streaming_connections;
-        // The connection keeps the framing and decodes the body from the front of what remains.
+        // The connection keeps the framing and decodes the body from where the head ended.
         message.decoded_length = message.chunk_remaining = message.cursor = message.scanned = 0;
         message.chunk_state = http::http_chunk_state_t::size_k;
         // A caller's close waits for the body, past the call itself.
@@ -1260,13 +1265,15 @@ struct client : ucall_client_handle_t {
         ++connection.answered_exchanges;
         pop_call(connection);
         finish_exchange(client, exchange, ucall_status_success_k, response);
+        return body_offset;
     }
 
-    /** Decodes what @c input holds of @p connection's streamed body in place and, once the last
-     *  bytes were pulled, rotates @c input into the response's @c body_chunk, as a server's
-     *  @c stream_body does; complete once the body ended, leaving what follows it in @c input. */
-    static http_parse_t stream_body(client_t& client, client_connection_t& connection) noexcept {
+    /** Decodes what @c input holds of @p connection's streamed body from @p offset in place and,
+     *  once the last bytes were pulled, moves the payload to the response's @c body_chunk as a
+     *  server's @c stream_body does; complete once the body ended, with @p offset past it. */
+    static http_parse_t stream_body(client_t& client, client_connection_t& connection, std::size_t& offset) noexcept {
         auto& transport = connection.transport;
+        auto& input = transport.input;
         auto& message = transport.message;
         response_t& response = *connection.streaming;
         if (atomic_ref<response_body_t> {response.body}.load(std::memory_order_acquire) ==
@@ -1282,27 +1289,32 @@ struct client : ucall_client_handle_t {
         if (!response.body_chunk.empty()) return http_parse_t::incomplete_k;
         std::size_t payload = 0, consumed = 0;
         http_parse_t parsed = http_parse_t::incomplete_k;
+        span<byte_t> const bytes {input.data() + offset, input.data() + input.size()};
         // Over Noise only a close record, never a bare end of stream, ends a close-delimited body.
         if (message.framing == http_framing_t::until_close_k) {
-            payload = consumed = transport.input.size();
+            payload = consumed = bytes.size();
             if (transport.peer_stream == peer_stream_t::closed_k &&
                 !(transport.tunnel.encrypts() && transport.tunnel.may_open()))
                 parsed = http_parse_t::complete_k;
         }
-        else
-            parsed = http_t::http_stream_body(transport.input, message, client.config.max_response_bytes, payload,
-                                              consumed);
-        if (payload) {
-            // Rotating buffers hands the payload over where it was decoded, never copying it.
-            std::swap(response.body_chunk, transport.input);
-            transport.input.clear();
-            ucall_status_t const kept = http_t::append_text(transport.input,
-                                                            {text_view(response.body_chunk).substr(consumed)});
+        else parsed = http_t::http_stream_body(bytes, message, client.config.max_response_bytes, payload, consumed);
+        std::size_t const following = bytes.size() - consumed;
+        if (payload && !offset && following < payload) {
+            std::swap(response.body_chunk, input);
+            input.clear();
+            ucall_status_t const kept = http_t::append_text(input, {text_view(response.body_chunk).substr(consumed)});
+            if (transport.statistics) tally<atomic_ref>(transport.statistics->bytes_copied, following);
             if (kept != ucall_status_success_k) transport.fail(kept);
             // Never grows.
             [[maybe_unused]] st::status_t const shrunk = response.body_chunk.resize(payload);
         }
-        else http_t::drop_bytes(transport.input, consumed);
+        else if (payload) {
+            ucall_status_t const copied = http_t::append_text(response.body_chunk, {text_view(bytes.first(payload))});
+            if (transport.statistics) tally<atomic_ref>(transport.statistics->bytes_copied, payload);
+            if (copied != ucall_status_success_k) transport.fail(copied);
+            offset += consumed;
+        }
+        else offset += consumed;
         // What decoded before bad framing is handed out before the failure is.
         if (parsed != http_parse_t::complete_k && parsed != http_parse_t::incomplete_k) {
             end_body(client, connection, ucall_status_malformed_k);
@@ -1372,12 +1384,12 @@ struct client : ucall_client_handle_t {
             transport.output_offset == connection.requests.size())
             transport.transmitting = transmit_state_t::idle_k;
         transport.open_records();
-        // Responses answered this round, erased from `input` once after it rather than one by one.
-        std::size_t consumed = 0;
+        // Responses answered so far, which leave `input` together rather than one by one.
+        std::size_t consumed = std::exchange(transport.parsed, 0);
         while (transport.stage == transport_stage_t::open_k && transport.receiving == receive_state_t::reading_k &&
                (connection.streaming || awaits_response(connection))) {
             if (connection.streaming) {
-                if (stream_body(client, connection) == http_parse_t::complete_k) continue;
+                if (stream_body(client, connection, consumed) == http_parse_t::complete_k) continue;
                 // A queue prefetching into a shared ring parks what an unpulled body holds there.
                 if (connection.streaming && !connection.streaming->body_chunk.empty())
                     client.queue->receive_pause(transport.descriptor);
@@ -1398,8 +1410,7 @@ struct client : ucall_client_handle_t {
                                   code != 307 && code != 308;
             if (streamed && message.headers_length <= cap &&
                 !(parsed == http_parse_t::complete_k && message.wire_length <= cap)) {
-                dispatch_streamed(client, connection, consumed);
-                consumed = 0;
+                consumed = dispatch_streamed(client, connection, consumed);
                 continue;
             }
             // Bounded as a server bounds requests: a declared length up front, anything else
@@ -1440,13 +1451,15 @@ struct client : ucall_client_handle_t {
             answer_call(client, connection, consumed);
             consumed = input.empty() ? 0 : consumed + wire;
         }
-        if (consumed) http_t::drop_bytes(input, consumed);
+        // The answered front leaves once it outweighs the rest, so bytes behind it move once.
+        if (consumed >= input.size() - consumed) transport.drop_front(input, consumed);
+        else transport.parsed = consumed;
         transport.aim_receive();
         if (transport.stage != transport_stage_t::open_k)
             return transport.advance(client.config.peer_authorizer, client.config.peer_authorizer_context);
         // A streamed body ends itself, and what follows a peer's close in it is its own.
-        if (!connection.streaming &&
-            (transport.peer_stream == peer_stream_t::closed_k || (!connection.oldest_exchange && !input.empty())))
+        if (!connection.streaming && (transport.peer_stream == peer_stream_t::closed_k ||
+                                      (!connection.oldest_exchange && input.size() != transport.parsed)))
             transport.receiving = receive_state_t::ended_k;
         if (transport.receiving == receive_state_t::reading_k) {
             client_origin_t& origin = *connection.origin;
@@ -1489,7 +1502,7 @@ struct client : ucall_client_handle_t {
         bool const lost = status == ucall_status_connection_closed_k || status == ucall_status_io_k ||
                           (status == ucall_status_timeout_k &&
                            connection.oldest_exchange != connection.newest_exchange);
-        bool const unread = lost && connection.answered_exchanges && transport.input.empty() &&
+        bool const unread = lost && connection.answered_exchanges && transport.input.size() == transport.parsed &&
                             transport.encrypted.empty();
         if (status == ucall_status_handshake_failed_k)
             formatting_t::log_line(client.config.log, ucall_log_level_warning_k, "handshake_failed",

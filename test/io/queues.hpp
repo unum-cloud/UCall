@@ -526,6 +526,130 @@ case_result_t test_failed_submission() {
     return {};
 }
 
+/** Polls @p queue until it answers a completion or @p deadline passes, answering whether it did. */
+template <typename queue_type_>
+bool poll_one(queue_type_& queue, io_completion_t& completed, std::uint64_t deadline) {
+    return queue.poll(span<io_completion_t> {&completed, 1}, io_wait_t::blocking_k, deadline) == 1;
+}
+
+/** On either ring, a receive naming room lands there uncopied, a deadline ends one with
+ *  @c -ETIMEDOUT, and a close ends one in flight with @c -ECANCELED. */
+template <typename queue_type_>
+case_result_t test_ring_receive_in_place() {
+    queue_type_ queue;
+    auto status = queue.open(8, 4);
+    if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
+    if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
+    loopback_pair_t sockets = loopback_pair();
+    if (!expect_true(sockets.connected())) return {};
+    auto descriptor = queue.import_socket(std::exchange(sockets.client, -1));
+    if (!expect_true(descriptor >= 0)) return {};
+    auto const deadline = util::deadline_after(1000000);
+    util::byte_t const marker[16] {util::byte_t {7}};
+    io_completion_t completed {};
+    io_request_t streaming {.operation = io_operation_t::receive_k, .descriptor = descriptor};
+    queue.submit(streaming);
+    if (!expect_true(send_all(sockets.peer, marker) && poll_one(queue, completed, deadline))) return {};
+    expect_true(completed.result == sizeof(marker) && completed.release_token, "the pool answered {}",
+                completed.result);
+    queue.release(completed);
+
+    std::vector<util::byte_t> body(queue.state.page_bytes * 4), room(body.size());
+    for (std::size_t index = 0; index != body.size(); ++index) body[index] = static_cast<util::byte_t>(index % 251);
+    util::io_vector_t vector {};
+    auto aim_past = [&](std::size_t filled) { vector = {room.data() + filled, room.size() - filled}; };
+    aim_past(0);
+    io_request_t in_place {.operation = io_operation_t::receive_k,
+                           .descriptor = descriptor,
+                           .data = reinterpret_cast<util::byte_t*>(&vector),
+                           .length = 1};
+    // The shortest deadline passes before any byte could arrive.
+    in_place.deadline = util::deadline_after(1);
+    queue.submit(in_place);
+    if (!expect_true(poll_one(queue, completed, deadline))) return {};
+    expect_true(completed.request == &in_place && completed.result == -ETIMEDOUT && !completed.release_token,
+                "a receive in place past its deadline ended with {}", completed.result);
+    in_place.deadline = 0;
+
+    auto const copied = queue.statistics.bytes_copied;
+    std::size_t received = 0;
+    queue.submit(in_place);
+    if (!expect_true(send_all(sockets.peer, body))) return {};
+    while (received != body.size()) {
+        if (!expect_true(poll_one(queue, completed, deadline))) return {};
+        if (!expect_true(completed.request == &in_place && completed.result > 0 && !completed.release_token,
+                         "receiving in place ended with {}", completed.result))
+            return {};
+        received += static_cast<std::size_t>(completed.result);
+        aim_past(received);
+        if (received != body.size()) queue.submit(in_place);
+    }
+    expect_true(room == body && queue.statistics.bytes_copied == copied, "{} bytes copied landing {} in place",
+                queue.statistics.bytes_copied - copied, body.size());
+
+    aim_past(0);
+    queue.submit(in_place);
+    expect_true(queue.close_socket(descriptor) == 0);
+    if (!expect_true(poll_one(queue, completed, deadline))) return {};
+    expect_true(completed.request == &in_place && completed.result == -ECANCELED && !completed.release_token,
+                "a receive in place cut by a close ended with {}", completed.result);
+    queue.stop();
+    expect_true(!queue.has_kernel_work());
+    return {};
+}
+
+/** A ring lets its caller keep a pool slice past its round only while the pool spares a buffer
+ *  for the kernel: kept slices of half a buffer each run the pool dry within twice its buffers,
+ *  past which it refuses, and once they come back it lets slices be kept again. */
+template <typename queue_type_>
+case_result_t test_ring_retains_while_spare() {
+    queue_type_ queue;
+    auto status = queue.open(8, 4);
+    if (status == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
+    if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return {};
+    loopback_pair_t sockets = loopback_pair();
+    if (!expect_true(sockets.connected())) return {};
+    auto descriptor = queue.import_socket(std::exchange(sockets.client, -1));
+    if (!expect_true(descriptor >= 0)) return {};
+    auto& provided = queue.state.provided;
+    std::size_t const pool = provided.memory.size(), rounds = 2 * provided.buffer_count();
+    std::vector<util::byte_t> const half(provided.buffer_bytes() / 2, util::byte_t {7});
+    std::vector<io_completion_t> kept;
+    bool refused = false;
+    auto const deadline = util::deadline_after(1000000);
+    io_request_t receiving {.operation = io_operation_t::receive_k, .descriptor = descriptor};
+    for (std::size_t round = 0; round != rounds && !refused; ++round) {
+        if (!expect_true(send_all(sockets.peer, half))) break;
+        for (std::size_t received = 0; received != half.size() && !refused;) {
+            io_completion_t completed {};
+            queue.submit(receiving);
+            if (!expect_true(poll_one(queue, completed, deadline) && completed.result > 0, "round {} received {}",
+                             round, completed.result))
+                return {};
+            received += static_cast<std::size_t>(completed.result);
+            // Only a slice of the pool is the pool's to spare; a 6.18 backlog never stays.
+            bool const pooled = completed.release_token && completed.release_token <= pool;
+            if (pooled && queue.retains(completed)) kept.push_back(completed);
+            else {
+                refused = refused || pooled;
+                queue.release(completed);
+            }
+        }
+    }
+    expect_true(refused, "{} slices kept across {} buffers and none refused", kept.size(), provided.buffer_count());
+    for (io_completion_t const& slice : kept) queue.release(slice);
+    io_completion_t completed {};
+    queue.submit(receiving);
+    util::byte_t const marker[1] {util::byte_t {9}};
+    if (expect_true(send_all(sockets.peer, marker) && poll_one(queue, completed, deadline))) {
+        expect_true(queue.retains(completed), "a slice could not be kept once every kept one came back");
+        queue.release(completed);
+    }
+    expect_true(queue.close_socket(descriptor) == 0);
+    queue.stop();
+    return {};
+}
+
 template <typename queue_type_>
 case_result_t test_streamed_transmit() {
     queue_type_ queue;
