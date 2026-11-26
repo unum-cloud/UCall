@@ -135,8 +135,8 @@ struct serial_words {
  *      Every field uses it.
  *  @see Fiat Cryptography origin v0.1.6+137: https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_64.c#L116
  */
-inline static void fiat_25519_cmovznz_u64(std::uint64_t* out1, fiat_25519_uint1_t arg1, std::uint64_t arg2,
-                                          std::uint64_t arg3) noexcept {
+[[gnu::always_inline]] inline static void fiat_25519_cmovznz_u64(std::uint64_t* out1, fiat_25519_uint1_t arg1,
+                                                                 std::uint64_t arg2, std::uint64_t arg3) noexcept {
     fiat_25519_uint1_t x1;
     std::uint64_t x2, x3;
     x1 = (!(!arg1)), x2 = ((fiat_25519_int1_t)(0x0 - x1) & 0xffffffffffffffffULL),
@@ -157,6 +157,14 @@ inline static void fiat_25519_cmovznz_u64(std::uint64_t* out1, fiat_25519_uint1_
  *  @c fe4 is fiat's name for this shape - a field element in four limbs. Values stay unreduced
  *  anywhere below 2^256 between operations; @c fe4_canon produces the canonical representative
  *  below 2^255-19 only at serialization.
+ *
+ *  That laziness is what fiat's bounds already prove, not an extra assumption: every kernel here
+ *  accepts any four limbs and returns four limbs congruent to its result, and 2^256 = 2p + 38, so
+ *  an element is always one of at most three representatives and the ladder never canonicalizes.
+ *  @c fe4_canon subtracts p twice, which covers every value below 3p, so 2^256 included.
+ *
+ *  Every kernel is forced inline: the ladder step then keeps its elements in registers rather than
+ *  passing them through memory to out-of-line multiplies, which is most of its cost.
  */
 template <typename words_>
 struct field_saturated {
@@ -165,8 +173,8 @@ struct field_saturated {
      *  @brief Multiplies two saturated 4-limb elements mod 2^255-19.
      *  @see Fiat Cryptography origin v0.1.6+137: https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L150
      */
-    static void fiat_25519_solinas_mul(std::uint64_t out1[4], std::uint64_t const arg1[4],
-                                       std::uint64_t const arg2[4]) noexcept {
+    [[gnu::always_inline]] static void fiat_25519_solinas_mul(std::uint64_t out1[4], std::uint64_t const arg1[4],
+                                                              std::uint64_t const arg2[4]) noexcept {
         std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x12, x13, x14, x15, x16, x17, x18, x19, x20, x21,
             x22, x23, x24, x25, x26, x27, x28, x29, x30, x31, x32, x33, x35, x37, x38, x40, x42, x44, x45, x47, x49,
             x51, x53, x55, x56, x58, x60, x62, x64, x66, x68, x70, x72, x74, x76, x78, x80, x82, x84, x86, x88, x90,
@@ -251,7 +259,8 @@ struct field_saturated {
      *  @brief Squares a saturated 4-limb element mod 2^255-19.
      *  @see Fiat Cryptography origin v0.1.6+137: https://github.com/mit-plv/fiat-crypto/blob/330f965d024902f7b0667acc230277854c782464/fiat-c/src/curve25519_solinas_64.c#L369
      */
-    static void fiat_25519_solinas_square(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
+    [[gnu::always_inline]] static void fiat_25519_solinas_square(std::uint64_t out1[4],
+                                                                 std::uint64_t const arg1[4]) noexcept {
         std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8, x9, x10, x11, x13, x15, x17, x19, x20, x21, x22, x24, x26, x28,
             x30, x32, x34, x36, x38, x40, x42, x43, x44, x45, x46, x47, x48, x49, x50, x51, x53, x55, x57, x59, x61,
             x63, x65, x66, x67, x68, x69, x70, x71, x72, x73, x75, x77, x79, x80, x82, x84, x86, x88, x89, x90, x91,
@@ -318,7 +327,8 @@ struct field_saturated {
      *  @brief Adds saturated 4-limb elements mod 2^255-19.
      *  @see BoringSSL origin, main of 2026-08-04: https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L169
      */
-    static void fe4_add(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t const arg2[4]) noexcept {
+    [[gnu::always_inline]] static void fe4_add(std::uint64_t out1[4], std::uint64_t const arg1[4],
+                                               std::uint64_t const arg2[4]) noexcept {
         std::uint64_t x1, x3, x5, x7, x9, x10, x12, x14, x16, x18, x19;
         fiat_25519_uint1_t x2, x4, x6, x8, x11, x13, x15, x17, x20;
         words_::fiat_addcarryx_u64(&x1, &x2, 0x0, (arg1[0]), (arg2[0]));
@@ -339,7 +349,8 @@ struct field_saturated {
      *  @brief Subtracts saturated 4-limb elements mod 2^255-19.
      *  @see BoringSSL origin, main of 2026-08-04: https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L215
      */
-    static void fe4_sub(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t const arg2[4]) noexcept {
+    [[gnu::always_inline]] static void fe4_sub(std::uint64_t out1[4], std::uint64_t const arg1[4],
+                                               std::uint64_t const arg2[4]) noexcept {
         std::uint64_t x1, x2, x4, x5, x7, x8, x10, x11, x13, x14, x16, x18, x20, x22, x23;
         fiat_25519_uint1_t x3, x6, x9, x12, x15, x17, x19, x21, x24;
         x1 = (arg2[0]);
@@ -364,7 +375,8 @@ struct field_saturated {
      *  @brief Multiplies a saturated 4-limb element by a small scalar constant, at most 2^58-1.
      *  @see BoringSSL origin, main of 2026-08-04: https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L269
      */
-    static void fe4_scmul(std::uint64_t out1[4], std::uint64_t const arg1[4], std::uint64_t arg2) noexcept {
+    [[gnu::always_inline]] static void fe4_scmul(std::uint64_t out1[4], std::uint64_t const arg1[4],
+                                                 std::uint64_t arg2) noexcept {
         std::uint64_t x1, x2, x3, x4, x5, x7, x8, x9, x11, x12, x13, x15, x16, x17, x19, x21, x23, x25, x26;
         fiat_25519_uint1_t x6, x10, x14, x18, x20, x22, x24, x27;
         words_::fiat_mulx_u64(&x1, &x2, (arg1[0]), arg2);
@@ -388,7 +400,7 @@ struct field_saturated {
      *  @brief Reduces a saturated 4-limb element to its canonical representative below 2^255-19.
      *  @see BoringSSL origin, main of 2026-08-04: https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L324
      */
-    static void fe4_canon(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
+    [[gnu::always_inline]] static void fe4_canon(std::uint64_t out1[4], std::uint64_t const arg1[4]) noexcept {
         std::uint64_t x1, x3, x5, x7, x9, x10, x11, x12, x13, x15, x17, x19, x21, x22, x23, x24;
         fiat_25519_uint1_t x2, x4, x6, x8, x14, x16, x18, x20;
         words_::fiat_subborrowx_u64(&x1, &x2, 0x0, (arg1[0]), 0xffffffffffffffedULL);
@@ -414,8 +426,8 @@ struct field_saturated {
      *  @brief Constant-time conditional swap of two saturated 4-limb elements; outputs may alias.
      *  @see BoringSSL origin, main of 2026-08-04: https://github.com/google/boringssl/blob/eeccc518e91ddebe290349092f0f75fcef24a86e/third_party/fiat/curve25519_64_adx.h#L381
      */
-    static void fe4_cswap(std::uint64_t out1[4], std::uint64_t out2[4], fiat_25519_uint1_t arg1,
-                          std::uint64_t const arg2[4], std::uint64_t const arg3[4]) noexcept {
+    [[gnu::always_inline]] static void fe4_cswap(std::uint64_t out1[4], std::uint64_t out2[4], fiat_25519_uint1_t arg1,
+                                                 std::uint64_t const arg2[4], std::uint64_t const arg3[4]) noexcept {
         std::uint64_t x1, x2, x3, x4, x5, x6, x7, x8;
         fiat_25519_cmovznz_u64(&x1, arg1, (arg2[0]), (arg3[0]));
         fiat_25519_cmovznz_u64(&x2, arg1, (arg2[1]), (arg3[1]));
@@ -432,37 +444,41 @@ struct field_saturated {
         std::uint64_t limb[4];
     };
 
-    static element_t zero() noexcept { return {{0, 0, 0, 0}}; }
-    static element_t one() noexcept { return {{1, 0, 0, 0}}; }
+    [[gnu::always_inline]] static element_t zero() noexcept { return {{0, 0, 0, 0}}; }
+    [[gnu::always_inline]] static element_t one() noexcept { return {{1, 0, 0, 0}}; }
 
-    static void add(element_t& out, element_t const& first, element_t const& second) noexcept {
+    [[gnu::always_inline]] static void add(element_t& out, element_t const& first, element_t const& second) noexcept {
         fe4_add(out.limb, first.limb, second.limb);
     }
 
-    static void subtract(element_t& out, element_t const& first, element_t const& second) noexcept {
+    [[gnu::always_inline]] static void subtract(element_t& out, element_t const& first,
+                                                element_t const& second) noexcept {
         fe4_sub(out.limb, first.limb, second.limb);
     }
 
     /** May alias @p out with either input - fiat kernels read everything before writing. */
-    static void multiply(element_t& out, element_t const& first, element_t const& second) noexcept {
+    [[gnu::always_inline]] static void multiply(element_t& out, element_t const& first,
+                                                element_t const& second) noexcept {
         fiat_25519_solinas_mul(out.limb, first.limb, second.limb);
     }
 
-    static void square(element_t& out, element_t const& value) noexcept {
+    [[gnu::always_inline]] static void square(element_t& out, element_t const& value) noexcept {
         fiat_25519_solinas_square(out.limb, value.limb);
     }
 
-    static void multiply_121666(element_t& out, element_t const& value) noexcept {
+    [[gnu::always_inline]] static void multiply_121666(element_t& out, element_t const& value) noexcept {
         fe4_scmul(out.limb, value.limb, 121666);
     }
 
     /** Constant-time swap when @p bit is 1: a barriered mask select, never a branch. */
-    static void conditional_swap(element_t& first, element_t& second, std::uint64_t bit) noexcept {
+    [[gnu::always_inline]] static void conditional_swap(element_t& first, element_t& second,
+                                                        std::uint64_t bit) noexcept {
         fe4_cswap(first.limb, second.limb, (fiat_25519_uint1_t)bit, first.limb, second.limb);
     }
 
     /** Precondition: bit 255 of @p bytes is already clear - the caller masks it per RFC 7748 §5. */
-    static void from_bytes(element_t& out, std::uint8_t const bytes[x25519_key_size_k]) noexcept {
+    [[gnu::always_inline]] static void from_bytes(element_t& out,
+                                                  std::uint8_t const bytes[x25519_key_size_k]) noexcept {
         for (std::size_t limb_index = 0; limb_index != 4; ++limb_index) {
             std::uint64_t assembled = 0;
             for (std::size_t byte_index = 0; byte_index != 8; ++byte_index)
@@ -471,7 +487,8 @@ struct field_saturated {
         }
     }
 
-    static void to_bytes(std::uint8_t bytes[x25519_key_size_k], element_t const& value) noexcept {
+    [[gnu::always_inline]] static void to_bytes(std::uint8_t bytes[x25519_key_size_k],
+                                                element_t const& value) noexcept {
         element_t canonical;
         fe4_canon(canonical.limb, value.limb);
         for (std::size_t limb_index = 0; limb_index != 4; ++limb_index)

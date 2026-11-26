@@ -246,6 +246,28 @@ static void test_x25519_kits() {
             std::memcpy(scalar, expected, x25519_key_size_k);
         }
     }
+
+    // A chain walks one narrow path, so independent random scalars and points, the u-coordinate's
+    // top bit included, reach limb patterns and carries the chain never does.
+    split_mix_generator_t generator {case_stream_key()};
+    for (std::size_t iteration = 0; iteration != scaled_iterations(200); ++iteration) {
+        byte_t scalar[x25519_key_size_k], point[x25519_key_size_k], expected[x25519_key_size_k];
+        for (std::size_t offset = 0; offset != x25519_key_size_k; offset += sizeof(std::uint64_t)) {
+            std::uint64_t const scalar_word = generator(), point_word = generator();
+            std::memcpy(scalar + offset, &scalar_word, sizeof(scalar_word));
+            std::memcpy(point + offset, &point_word, sizeof(point_word));
+        }
+        shared_secret_t const expected_answer = reported(
+            x25519_reference_k.multiply(std::span {expected}, std::span {scalar}, std::span {point}));
+        for (x25519_backend_t const& backend : x25519_backends_k) {
+            if (!runnable_here(backend) || &backend == &x25519_reference_k) continue;
+            byte_t produced[x25519_key_size_k];
+            shared_secret_t const answer = reported(
+                backend.multiply(std::span {produced}, std::span {scalar}, std::span {point}));
+            expect_true(answer == expected_answer && bytes_equal(produced, expected), "{} left {} on random input {}",
+                        backend.name, x25519_reference_k.name, iteration);
+        }
+    }
 }
 
 /** Whether this machine runs @p capability, as StringZilla detects it. */

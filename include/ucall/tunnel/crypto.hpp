@@ -224,7 +224,7 @@ struct haswell_x25519_kit_t {
 
 #if STRINGZILLA_TARGET_NEON
 
-/** Radix-51 X25519 over UMULH. */
+/** Saturated X25519 over UMULH and ADCS chains, radix-51 under GCC, scalar despite its rung. */
 struct neon_x25519_kit_t {
     static constexpr sz_capability_t capability_k = sz_cap_neon_k;
     static constexpr bool compiled_k = true;

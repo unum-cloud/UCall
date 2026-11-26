@@ -24,7 +24,8 @@
  *  Three kits, selected by CPU class like every other. @c serial_x25519_kit_t is four saturated
  *  limbs over 32×32 partial products and runs wherever this file compiles;
  *  @c haswell_x25519_kit_t is the same field over @c MULX, @c ADC and @c SBB chains, and
- *  @c neon_x25519_kit_t is five radix-51 limbs over @c UMULH. Each builds apart from the class
+ *  @c neon_x25519_kit_t is the same field again over @c UMULH and @c ADCS chains, or five
+ *  radix-51 limbs under GCC, which leaves those carries unfused. Each builds apart from the class
  *  units, so their throughput flags never reach a constant-time kernel.
  *
  *  @section Cost
