@@ -2246,6 +2246,11 @@ stage_renamed_fixture scripts/probe.sh scripts/moved.sh 's/^echo settled$/# ----
 run_precommit
 expect_rejection "banner ruler in a renamed file" "adds a banner ruler"
 
+assert_verbatim_accepts "vendored standard header kept as its upstream wrote it" python/dlpack.h <<'FIXTURE'
+// ----------------------------------------------------------------------
+#define DLPACK_DLL  /* exported */
+FIXTURE
+
 assert_rejects "banner ruler" "adds a banner ruler" scripts/probe.sh <<'FIXTURE'
 # ----
 echo probe
@@ -4376,8 +4381,8 @@ inline int probe(unum::ucall::utilities::uuid128_t key) { return 0; }
 FIXTURE
 
 assert_accepts "project namespace through an alias" include/ucall/probe.hpp <<'FIXTURE'
-namespace us = unum::ucall;
-inline int probe(us::utilities::uuid128_t key) { return 0; }
+namespace util = unum::ucall::utilities;
+inline int probe(util::uuid128_t key) { return 0; }
 FIXTURE
 
 assert_rejects "namespace reopened" "reopens namespace" test/probe.hpp <<'FIXTURE'
