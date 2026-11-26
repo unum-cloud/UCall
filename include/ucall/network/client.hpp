@@ -19,6 +19,7 @@
 #include "ucall/network/resolving.hpp"  // `client_lookup`, `resolving`, `resolution_t`
 #include "ucall/network/transports.hpp" // `transport`
 #include "ucall/network/types.hpp"      // `transport_stage_t`, `operation_state_t`, `transmit_state_t`
+#include "ucall/tunnel/curve25519.hpp"  // `x25519_derive_public`, `x25519_key_size_k`
 #include "ucall/tunnel/types.hpp"       // `secure_tunnel_geometry_t`, `secure_tunnel_mode_encrypts`
 #include "ucall/utilities/sockets.hpp"  // `sockets_start`, `deadline_after`, `monotonic_ns`
 #include "ucall/utilities/types.hpp"    // `byte_t`, `span`, `publish`, `allocator_delete`
@@ -41,6 +42,8 @@ using tunnel::secure_tunnel_headroom_k;
 using tunnel::secure_tunnel_mode_encrypts;
 using tunnel::secure_tunnel_role_t;
 using tunnel::secure_tunnel_tailroom_k;
+using tunnel::x25519_derive_public;
+using tunnel::x25519_key_size_k;
 using utilities::allocate_unique;
 using utilities::allocator_delete;
 using utilities::byte_t;
@@ -247,6 +250,9 @@ struct client_origin {
 
     /** The Noise peer key its calls name, which tells it apart; zeroed when they name none. */
     ucall_noise_key_t peer_key {};
+
+    /** The public half of @c private_key, derived once as the origin is made, not at every dial. */
+    byte_t public_key[x25519_key_size_k] {};
 
     /** The waiting call due first; waiting calls link through @c next by deadline. */
     client_exchange_t* waiting_head {};
@@ -746,6 +752,9 @@ struct client : ucall_client_handle_t {
             if (!resolving_t::resolve_numeric(*origin)) origin->expires = 0;
             std::memcpy(origin->private_key, private_key, sizeof(private_key));
             std::memcpy(origin->peer_key, peer_key, sizeof(peer_key));
+            if (options.security != ucall_security_none_k)
+                x25519_derive_public<typename crypto_t::x25519_kit_t>(origin->public_key,
+                                                                      std::as_bytes(std::span {private_key}));
             [[maybe_unused]] st::status_t const indexed = client.origin_index.insert(exchange.authority_hash, index,
                                                                                      st::assume_unique);
             found = origin;
@@ -771,8 +780,8 @@ struct client : ucall_client_handle_t {
             }
             auto& options = exchange.arguments.options;
             auto* key = options.noise_private_key ? options.noise_private_key : client.config.noise_private_key;
-            auto config = formatting_t::tunnel_config(options.security, secure_tunnel_role_t::initiator_k, key, nullptr,
-                                                      options.noise_peer_key);
+            auto config = formatting_t::tunnel_config(options.security, secure_tunnel_role_t::initiator_k, key,
+                                                      origin.public_key, options.noise_peer_key);
             auto result = transport.configure(config, &connection);
             if (result != ucall_status_success_k) {
                 client.queue->close_socket(descriptor);

@@ -1044,6 +1044,43 @@ static void test_stalled_stream_eviction(sweep_cell_t const& cell, split_mix_gen
     fixture.stop();
 }
 
+/** At its connection budget the server never evicts a connection admitted before its first request
+ *  arrived, whose peer may have sent that request already: the waiting peer is served once that
+ *  connection carried its request and turned idle. */
+static void test_fresh_connection_kept(sweep_cell_t const& cell, split_mix_generator_t& generator) {
+    fixture_t fixture {cell, {.connections = 1}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
+    auto send = [&](raw_client_t& client, std::string_view bytes) {
+        expect_true(client.write(byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
+    };
+    auto accepts = [&] {
+        ucall_outcome_t outcome {};
+        ucall_event_loop_statistics_t statistics {};
+        ucall_server_event_loop_statistics_t query {fixture.server, &outcome, 0, &statistics};
+        ucall_server_event_loop_statistics(&query);
+        return statistics.accepts;
+    };
+    raw_client_t fresh, waiting;
+    if (!expect_true(fresh.connect(fixture.address))) return;
+    auto const deadline = steady_clock::now() + wait_limit_k;
+    while (accepts() == 0 && steady_clock::now() < deadline) std::this_thread::yield();
+    if (!expect_true(accepts() == 1, "the first peer was not admitted")) return;
+    if (!expect_true(waiting.connect(fixture.address))) return;
+    send(waiting, echo);
+    expect_true(fresh.read(1, steady_clock::now() + 300ms) == read_end_t::timed_out_k,
+                "the connection admitted before its request was evicted");
+    send(fresh, echo);
+    expect_true(read_response(fresh, 0).status == 200, "the request on the kept connection was not served");
+    auto const answered = waiting.read(1, steady_clock::now() + 1s);
+    expect_true(answered == read_end_t::filled_k && read_response(waiting, 0).status == 200,
+                "the waiting client ended as {}", static_cast<int>(answered));
+    expect_true(fresh.read_until_close(steady_clock::now() + 1s) == read_end_t::closed_k,
+                "the served connection was not closed in order for the waiting peer");
+    fixture.stop();
+}
+
 #endif // UCALL_OS_POSIX_
 #pragma endregion Eviction
 
@@ -1062,6 +1099,7 @@ void test_serving_cell(sweep_cell_t const& cell, split_mix_generator_t& generato
     if (cell.security == ucall_security_none_k) {
         test_keepalive_eviction(cell, generator);
         test_stalled_stream_eviction(cell, generator);
+        test_fresh_connection_kept(cell, generator);
     }
 #endif
 }

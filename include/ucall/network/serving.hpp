@@ -819,6 +819,7 @@ struct serving {
                                    server_stage_t server_stage) noexcept {
         auto& queue = event_loop.queue;
         auto const entered = connection.transport.stage;
+        server_exchange_t const* const held = connection.oldest_exchange;
         if (entered == transport_stage_t::idle_k) return;
         tally<atomic_ref>(event_loop.statistics.ready_passes);
         // A drain closes idle connections and lets busy ones close after their last reply.
@@ -864,17 +865,19 @@ struct serving {
         }
         auto const stage = connection.transport.stage;
         server_exchange_t const* const oldest = connection.oldest_exchange;
+        // Only a connection that carried a request keeps alive: one admitted before its first
+        // request arrived, mid-handshake or not, is never evicted, as its peer may have sent that
+        // request already and could not tell whether it was processed.
+        bool const carried = held || oldest || connection.order == connection_order_t::keepalive_k;
         // Saturation evicts the connection that progressed least recently and holds no request, or
         // only a streamed one waiting on its peer: every byte pulled, and no reply adopted.
-        if ((stage == transport_stage_t::open_k || stage == transport_stage_t::handshake_k) &&
+        if ((stage == transport_stage_t::open_k || stage == transport_stage_t::handshake_k) && carried &&
             (!oldest || (oldest == connection.streaming && oldest->stage == exchange_stage_t::dispatched_k &&
                          oldest->body_chunk.empty()))) {
             relist(event_loop, connection, connection_order_t::keepalive_k);
-            // A peer parked while every connection was busy evicts the first to turn idle, never
-            // the one just admitted, whose request may still be on its way in.
-            if (entered != transport_stage_t::handshake_k)
-                evict(event_loop, *connection.network_interface,
-                      interface_order(server, event_loop, *connection.network_interface));
+            // A peer parked while every connection was busy evicts the first to turn idle.
+            evict(event_loop, *connection.network_interface,
+                  interface_order(server, event_loop, *connection.network_interface));
         }
         // Lingers and releases all wait linger_microseconds_k from their start, so appending
         // keeps deadline order.
