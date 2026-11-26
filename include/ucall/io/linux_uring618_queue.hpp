@@ -131,6 +131,9 @@ struct linux_uring618_queue {
 
         /** The next slot on @c waiting_socket_slots, or @c absent_k. */
         unsigned next_waiting {operation_list_t::absent_k};
+
+        /** The header of the socket's gathered send, which names the request's vectors. */
+        msghdr message {};
         explicit socket_slot_t(allocator_t const& allocator) noexcept : backlog(allocator) {}
         bool receive_in_flight() const noexcept {
             return receive_stage == receive_stage_t::submitted_k || receive_stage == receive_stage_t::cancelling_k;
@@ -143,10 +146,10 @@ struct linux_uring618_queue {
     using operation_t = typename operations_t::operation_t;
     static_assert(sizeof(operation_t) == 64);
     static constexpr io_uring_op opcodes_k[] {
-        IORING_OP_SOCKET,       IORING_OP_ACCEPT,       IORING_OP_CONNECT,   IORING_OP_RECV,
-        IORING_OP_SEND,         IORING_OP_READ,         IORING_OP_SHUTDOWN,  IORING_OP_CLOSE,
-        IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD, IORING_OP_OPENAT2,
-        IORING_OP_SEND_ZC,      IORING_OP_READ_FIXED,   IORING_OP_READV,     IORING_OP_READV_FIXED};
+        IORING_OP_SOCKET,      IORING_OP_ACCEPT,   IORING_OP_CONNECT, IORING_OP_RECV,         IORING_OP_SEND,
+        IORING_OP_READ,        IORING_OP_SHUTDOWN, IORING_OP_CLOSE,   IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT,
+        IORING_OP_URING_CMD,   IORING_OP_OPENAT2,  IORING_OP_SEND_ZC, IORING_OP_READ_FIXED,   IORING_OP_READV,
+        IORING_OP_READV_FIXED, IORING_OP_SENDMSG};
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_uring618_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_k;
 

@@ -61,6 +61,11 @@ struct batch_endpoint : ucall_http_batch_endpoint_handle_t {
     /** Whether the polling owner sleeps on @c wake, so a depositor knows to notify it. */
     wake_state_t wake_state {wake_state_t::awake_k};
 
+    /** The @c tail whose deposit wakes the sleeping polling owner: one past @c head while it holds
+     *  no request, as that deposit starts the latency clock, else where its batch reaches
+     *  @c min_batch_size; written by the polling owner before it announces sleep. */
+    std::uint64_t wake_tail {};
+
     /** The thread inside take_batch or take_batches, empty while none polls. */
     polling_thread_t polling_thread {};
 

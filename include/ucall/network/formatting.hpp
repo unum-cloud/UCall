@@ -43,6 +43,8 @@ using utilities::socket_duplicate_listener;
 using utilities::socket_length_t;
 using utilities::socket_open;
 using utilities::socket_option;
+using utilities::socket_prefer_pinned_cpu;
+using utilities::socket_share_port;
 using utilities::sockets_start;
 using utilities::span;
 using utilities::text_view;
@@ -141,10 +143,14 @@ struct formatting {
         return peer;
     }
 
-    /** Binds and listens on the interface's address through @p queue, trying each address it
-     *  resolves to. */
-    static ucall_status_t bind_listener(network_interface_t& network_interface, queue_t& queue,
+    /** Binds and listens on the address of @p acceptor's interface through @p queue, trying each
+     *  address it resolves to, with the backlog of @p acceptor's loop; a listener of its own joins
+     *  the port group of the other loops' listeners. */
+    static ucall_status_t bind_listener(interface_acceptor_t const& acceptor, queue_t& queue,
                                         descriptor_t& descriptor) noexcept {
+        network_interface_t const& network_interface = *acceptor.network_interface;
+        int const backlog = static_cast<int>(fu::min_of<std::size_t>(
+            network_interface.backlog(acceptor.event_loop->index), (std::numeric_limits<int>::max)()));
         vector<char> host {rebound_allocator<char> {network_interface.address.get_allocator()}},
             service {host.get_allocator()};
         if (auto status = split_address(text_view(network_interface.config->address), host, service);
@@ -169,6 +175,8 @@ struct formatting {
             // Accepted sockets inherit it, so the kernel's own keepalive settings reap dead peers.
             configured = configured &&
                          socket_option(descriptor, SOL_SOCKET, SO_KEEPALIVE, &enabled, sizeof(enabled)) == 0;
+            if (network_interface.listen_queues == listen_queues_t::per_loop_k)
+                configured = configured && socket_share_port(descriptor);
 #if UCALL_OS_LINUX_
             if (network_interface.config->device_name.length)
                 configured = configured &&
@@ -176,9 +184,7 @@ struct formatting {
                                            static_cast<socket_length_t>(network_interface.device.size())) == 0;
 #endif // UCALL_OS_LINUX_
             if (configured && bind(descriptor, address->ai_addr, address->ai_addrlen) == 0 &&
-                listen(descriptor,
-                       static_cast<int>(fu::min_of<std::size_t>(network_interface.config->max_concurrent_connections,
-                                                                (std::numeric_limits<int>::max)()))) == 0)
+                listen(descriptor, backlog) == 0)
                 break;
             socket_close(descriptor);
             descriptor = -1;
@@ -215,7 +221,7 @@ struct formatting {
             descriptor = socket_duplicate_listener(*network_interface.config->listen_descriptor);
             if (descriptor < 0) return ucall_status_invalid_argument_k;
         }
-        else if (ucall_status_t const listened = bind_listener(network_interface, queue, descriptor);
+        else if (ucall_status_t const listened = bind_listener(acceptor, queue, descriptor);
                  listened != ucall_status_success_k)
             return listened;
         sockaddr_storage bound {};
@@ -252,6 +258,19 @@ struct formatting {
         if (!network_interface.config->max_request_bytes)
             network_interface.config->max_request_bytes = largest_receive_buffer(bound.ss_family, max_unsent_bytes_k);
         acceptor.request = {.operation = io_operation_t::accept_k, .descriptor = descriptor, .context = &acceptor};
+        return ucall_status_success_k;
+    }
+
+    /** Readies @p acceptor at its loop's first poll, on the polling thread, where each loop of its
+     *  interface listens on its own: a later loop binds its listener to the address loop zero
+     *  resolved, joining the port group, and each listener names the CPU its owner is pinned to. */
+    static ucall_status_t join_port_group(interface_acceptor_t& acceptor, queue_t& queue) noexcept {
+        if (acceptor.network_interface->listen_queues != listen_queues_t::per_loop_k) return ucall_status_success_k;
+        if (acceptor.request.descriptor < 0) {
+            ucall_status_t const listened = bind_listener(acceptor, queue, acceptor.request.descriptor);
+            if (listened != ucall_status_success_k) return listened;
+        }
+        socket_prefer_pinned_cpu(acceptor.request.descriptor);
         return ucall_status_success_k;
     }
 

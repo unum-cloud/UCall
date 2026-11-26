@@ -94,6 +94,11 @@ using client_api_t = ucall_client_handle_t::api_t;
  *  any later stop; the server's @c stage word holds it. */
 enum class server_stage_t : std::uint32_t { serving_k, draining_k, cutting_k };
 
+/** Whether an interface's loops accept on duplicates of one listener, sharing its listen queue, or
+ *  each on a listener of its own in one @c SO_REUSEPORT group, which Linux spreads connections
+ *  across by a hash of each peer's address. */
+enum class listen_queues_t : std::uint8_t { shared_k, per_loop_k };
+
 /** Where a socket is: none yet, a client's connect in flight, the Noise handshake and the
  *  authorizer, which plaintext passes at once, or open for requests and replies. Closing, which any
  *  failure enters, cancels what is in flight and sends the close on the receive request; once
@@ -148,9 +153,11 @@ enum class transmit_state_t : std::uint8_t { idle_k, sending_k };
  *  connection, which tells a peer taking its reply slowly from one that stopped reading. */
 enum class transmit_progress_t : std::uint8_t { stalled_k, progressed_k };
 
-/** How the socket's sends reach the wire: pinned until the kernel reports a copied send, which
- *  demotes the socket for good, as the rulings say; a demoted socket names no releases. */
-enum class send_mode_t : std::uint8_t { zero_copy_k, copying_k };
+/** How the socket's sends reach the wire: every one pinned until the first release reports whether
+ *  the kernel copied, then those of a page or more pinned and shorter ones copied, until a release
+ *  reports a copied send, which demotes the socket for good, as the rulings say; a demoted socket
+ *  names no releases. */
+enum class send_mode_t : std::uint8_t { probing_k, zero_copy_k, copying_k };
 
 /** Whether a request expecting <tt>100-continue</tt> is still owed its interim response. */
 enum class continue_state_t : std::uint8_t { none_k, owed_k };

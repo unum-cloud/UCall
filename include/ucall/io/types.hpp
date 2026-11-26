@@ -121,6 +121,10 @@ enum class io_operation_t : std::uint8_t {
      *  release after the last send naming it completed. */
     send_zero_copy_k,
 
+    /** Sends the bytes of the @c length vectors in @c data by copying, as one send that may take
+     *  only part of them; the vectors stay the submitter's until it completes. */
+    send_vectors_k,
+
     /** Reads into @c data, never into queue memory, for a wakeup or a datagram that must stay
      *  whole. */
     read_k,
@@ -262,7 +266,8 @@ enum class io_direction_t : std::uint8_t {
 };
 inline io_direction_t io_direction(io_operation_t operation) noexcept {
     return operation == io_operation_t::connect_k || operation == io_operation_t::send_k ||
-                   operation == io_operation_t::send_zero_copy_k || operation == io_operation_t::shutdown_k
+                   operation == io_operation_t::send_zero_copy_k || operation == io_operation_t::send_vectors_k ||
+                   operation == io_operation_t::shutdown_k
                ? io_direction_t::transmit_k
                : io_direction_t::receive_k;
 }
@@ -492,10 +497,19 @@ struct registered_socket_t {
 using operation_list_t = st::intrusive_list<unsigned>;
 static_assert(operation_list_t::absent_k == absent_k);
 
-/** The vectors a @c file_read_vectors_k or @c receive_k request fills, named by its @c data. */
+/** The vectors a @c file_read_vectors_k or @c receive_k request fills, or a @c send_vectors_k
+ *  sends, named by its @c data. */
 inline span<io_vector_t> io_vectors(io_request_t const& request) noexcept {
     return {reinterpret_cast<io_vector_t*>(request.data), request.length};
 }
+
+/** The most vectors one @c send_vectors_k takes: @c IOV_MAX, as every POSIX queue gathers through
+ *  @c sendmsg, and one on Windows, whose queues send a single span and are never handed one. */
+#if UCALL_OS_POSIX_
+inline constexpr std::size_t io_send_vectors_limit_k = IOV_MAX;
+#else
+inline constexpr std::size_t io_send_vectors_limit_k = 1;
+#endif // UCALL_OS_POSIX_
 
 /** Whether a polled operation is untouched, has started connecting, or was cancelled. */
 enum class operation_stage_t : std::uint8_t {
@@ -577,6 +591,14 @@ inline descriptor_t attempt_io(io_request_t& request, operation_stage_t& stage, 
     }
     case io_operation_t::send_k:
     case io_operation_t::send_zero_copy_k: result = send(descriptor, request.data, length, MSG_NOSIGNAL); break;
+    case io_operation_t::send_vectors_k: {
+        msghdr message {};
+        message.msg_iov = io_vectors(request).data();
+        message.msg_iovlen = static_cast<decltype(message.msg_iovlen)>(
+            fu::min_of<std::size_t>(request.length, io_send_vectors_limit_k));
+        result = sendmsg(descriptor, &message, MSG_NOSIGNAL);
+        break;
+    }
     case io_operation_t::read_k: result = read(descriptor, request.data, length); break;
     case io_operation_t::shutdown_k: return ::shutdown(descriptor, SHUT_WR) == 0 ? 0 : -errno;
     case io_operation_t::close_k: return socket_close(request.descriptor) == 0 || errno == EINTR ? 0 : -errno;
@@ -674,7 +696,8 @@ io_completion_t readiness_finish(queue_type_& queue, unsigned index, descriptor_
     queue.free_list(index).push(queue.operations, index);
     --queue.taken_operations;
     tally<atomic_ref_template_>(queue.statistics.completions);
-    if (request.operation == io_operation_t::send_k && result >= 0)
+    if ((request.operation == io_operation_t::send_k || request.operation == io_operation_t::send_vectors_k) &&
+        result >= 0)
         tally<atomic_ref_template_>(queue.statistics.copying_sends);
     return {&request, result};
 }

@@ -690,8 +690,9 @@ def test_kk_interface_admits_its_peer_key(backend, loopback, serving):
 
 
 def test_four_event_loops_serve_four_client_threads(backend, loopback, serving):
-    """Four event loops answer four client threads in order, on several threads, and keep a free-threaded GIL off."""
-    server = ucall.Server(loopback(event_loops=4), backend=backend)
+    """Four event loops answer four client threads in order, each on its own thread, and keep a free-threaded GIL off."""
+    # The kernel may hash every client to one loop, whose share of sixteen then holds all four.
+    server = ucall.Server(loopback(event_loops=4, connections=16), backend=backend)
     loop_threads = set()
 
     @server.post("/echo")
@@ -706,7 +707,10 @@ def test_four_event_loops_serve_four_client_threads(backend, loopback, serving):
     with serving(server) as base, concurrent.futures.ThreadPoolExecutor(4) as pool:
         answers = list(pool.map(post, range(4)))
     assert answers == [[f"{sender}:{index}".encode() for index in range(64)] for sender in range(4)]
-    assert len(loop_threads) >= 2
+    # Each loop that accepted a client answered it on its own polling thread, whichever loops
+    # the kernel picked.
+    accepting_loops = sum(1 for loop in range(4) if server.event_loop_statistics(loop)["accepts"])
+    assert len(loop_threads) == accepting_loops
     if sysconfig.get_config_var("Py_GIL_DISABLED"):
         assert not sys._is_gil_enabled()
 

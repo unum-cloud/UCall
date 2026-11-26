@@ -60,11 +60,16 @@ struct server_connection {
     using network_interface_t = typename network_t::network_interface_t;
     template <typename value_type_>
     using atomic_ref = typename network_t::template atomic_ref<value_type_>;
+    template <typename value_type_>
+    using rebound_allocator = typename network_t::template rebound_allocator<value_type_>;
+    template <typename value_type_>
+    using vector = typename network_t::template vector<value_type_>;
 
-    explicit server_connection(allocator_t const& allocator) noexcept : transport(allocator) {
+    explicit server_connection(allocator_t const& allocator) noexcept
+        : transport(allocator), send_vectors(rebound_allocator<io_vector_t> {allocator}) {
         // Measured on Linux AArch64 LP64 with a stateless allocator; other targets go unmeasured.
         if constexpr (UCALL_OS_LINUX_ && UCALL_ARCH_ARM64_ && std::is_empty_v<allocator_t>)
-            static_assert(sizeof(server_connection) == 2248);
+            static_assert(sizeof(server_connection) == 2280);
     }
     server_connection(server_connection const&) = delete;
     server_connection& operator=(server_connection const&) = delete;
@@ -88,7 +93,8 @@ struct server_connection {
         return file_reading == file_read_state_t::opening_file_k || file_reading == file_read_state_t::reading_file_k;
     }
 
-    /** Zero-copy from admission until a release reports the kernel copied, then copying. */
+    /** Zero-copy for every segment from admission until the first release lands, then for segments
+     *  of a page or more, until a release reports the kernel copied, then copying for every one. */
     send_mode_t send_mode {};
 
     /** Whether the request being parsed is owed the interim @c 100, set as its head arrives. */
@@ -142,10 +148,18 @@ struct server_connection {
     /** Links the event loop's idle list or ready queue. */
     connection_t* next {};
 
+    /** Where a gathered send points, a vector per reply segment it takes, sized at initialization
+     *  to the loop's deepest pipeline within @c io_send_vectors_limit_k, else left empty. */
+    vector<io_vector_t> send_vectors;
+
+    /** Bytes gathered sends took that no segment was credited with yet. */
+    std::size_t uncredited_bytes {};
+
     ucall_status_t configure(secure_tunnel_config_t const& config) noexcept {
         file_read_request = {.context = this};
         file_reading = file_read_state_t::idle_k;
-        send_mode = send_mode_t::zero_copy_k;
+        send_mode = send_mode_t::probing_k;
+        uncredited_bytes = 0;
         continuing = continue_state_t::none_k;
         routed = nullptr;
         streaming = nullptr;
@@ -417,8 +431,10 @@ struct serving {
         auto index = tail.fetch_add(1, std::memory_order_seq_cst);
         atomic_ref<server_exchange_t*> {batch.slots[index & (batch.slots.size() - 1)]}.store(exchange,
                                                                                              std::memory_order_release);
+        // A deposit short of the owner's wake tail joins a batch whose deadline bounds its sleep.
         auto wake_state = atomic_ref<wake_state_t> {batch.wake_state};
         if (wake_state.load(std::memory_order_seq_cst) == wake_state_t::sleeping_k &&
+            index + 1 >= atomic_ref<std::uint64_t> {batch.wake_tail}.load(std::memory_order_relaxed) &&
             wake_state.exchange(wake_state_t::awake_k, std::memory_order_seq_cst) == wake_state_t::sleeping_k)
             batch.wake.notify();
     }
@@ -605,22 +621,23 @@ struct serving {
 
     /** Steps an open server connection, answering its next queue request or null, by these rules
      *  in order:
-     *  R1 replies sent: with the transmit side free, retire the oldest replies' sent segments, then
-     *     each exchange whose reply ended, submitting its release first, and a full receive side
-     *     reads again.
+     *  R1 replies sent: with the transmit side free, or a gathered send resuming past what it took,
+     *     retire the oldest replies' sent segments, then each exchange whose reply ended,
+     *     submitting its release first, and a full receive side reads again.
      *  R2 requests: while reading, dispatch each complete request; the depth makes the side full,
      *     and <tt>connection: close</tt>, a peer close, or an unparsable request, refused in its turn,
      *     ends it.
      *  R3 file side: the oldest reply adopts what its replier pushed, in the pass that reads and
      *     sends it, then a free file request advances its files, as @c read_reply steps them,
      *     measuring every file of a deferred head before completing it.
-     *  R4 socket side: a free transmit side advances the oldest reply once adopted, as
-     *     @c transmit_reply steps it.
+     *  R4 socket side: a free transmit side advances the oldest reply once adopted, gathering the
+     *     replies ready behind it into the same send, as @c transmit_reply steps them.
      *  R5 receive: a receive while reading.
      *  R6 done: ended with every reply sent, the connection lingers half-closed until the peer
      *     closes, so request bytes it never read cannot turn the close into a reset. */
     static io_request_t* serve_open(server_t& server, event_loop_t& event_loop, connection_t& connection) noexcept {
-        if (connection.transport.transmit_operation == operation_state_t::idle_k && !connection.transport.sending)
+        if (connection.transport.transmit_operation == operation_state_t::idle_k &&
+            (!connection.transport.sending || connection.uncredited_bytes))
             if (io_request_t* release = replies_t::retire_sent_segments(event_loop, connection)) return release;
         if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
         connection.transport.open_records();
@@ -992,8 +1009,12 @@ struct serving {
                                   active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit;
             auto accepting = atomic_ref<std::size_t> {network_interface.accepting};
             // Saturated by connections, not by other loops' pending accepts, an accept probes for a
-            // peer to evict for.
-            if (!admitted && active.load(std::memory_order_relaxed) - accepting.load(std::memory_order_relaxed) < limit)
+            // peer to evict for, as does a loop out of connections whose listener no other loop
+            // drains, since the kernel hashes peers to it whatever room the others have.
+            bool const loop_saturated = !event_loop.idle &&
+                                        network_interface.listen_queues == listen_queues_t::per_loop_k;
+            if (!admitted && !loop_saturated &&
+                active.load(std::memory_order_relaxed) - accepting.load(std::memory_order_relaxed) < limit)
                 continue;
             acceptor.stage = admitted ? acceptor_stage_t::accepting_k : acceptor_stage_t::probing_k;
             if (admitted) accepting.store_add(1, std::memory_order_relaxed);
@@ -1219,11 +1240,14 @@ struct serving {
     }
 
     /** Whether @p connection only waits for its peer to take a reply the application finished,
-     *  with a send the socket took nothing of since the loop last asked. */
+     *  with a send the socket took nothing of since the loop last asked, or with no send or file
+     *  read in flight but releases of zero-copy sends, whose bytes the kernel keeps queued until
+     *  that peer reads. */
     static bool stalled(connection_t const& connection) noexcept {
+        bool const waits_on_peer = connection.transport.transmit_operation == operation_state_t::submitted_k ||
+                                   (connection.outstanding_releases() && !connection.file_request_in_flight());
         return connection.transport.stage == transport_stage_t::open_k && connection.oldest_exchange &&
-               connection.oldest_exchange->stage == exchange_stage_t::ended_k &&
-               connection.transport.transmit_operation == operation_state_t::submitted_k &&
+               connection.oldest_exchange->stage == exchange_stage_t::ended_k && waits_on_peer &&
                connection.transport.progress == transmit_progress_t::stalled_k;
     }
 

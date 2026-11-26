@@ -6,7 +6,7 @@
  */
 #pragma once
 
-#include "ucall/io/types.hpp"      // `io_completion_t`, `io_operation_t`, `io_request_t`, `registered_memory_t`
+#include "ucall/io/types.hpp"      // `io_completion_t`, `io_operation_t`, `io_request_t`, `io_vectors`
 #include "ucall/network/types.hpp" // `transport_stage_t`, `linger_bytes_k`, `operation_state_t`
 #include "ucall/tunnel/types.hpp" // `secure_tunnel_config_t`, `secure_tunnel_fault_t`, `secure_tunnel_headroom_k`, `secure_tunnel_mode_t`
 #include "ucall/utilities/sockets.hpp" // `page_size`
@@ -18,6 +18,7 @@ using io::io_completion_t;
 using io::io_operation_t;
 using io::io_receive_memory_t;
 using io::io_request_t;
+using io::io_vectors;
 using io::registered_memory_t;
 using io::tally;
 using tunnel::secure_tunnel_config_t;
@@ -199,11 +200,12 @@ struct transport {
                                                             : ucall_status_io_k);
         else if (completed.operation == io_operation_t::connect_k) stage = transport_stage_t::handshake_k;
         else if (completed.operation == io_operation_t::send_k ||
-                 completed.operation == io_operation_t::send_zero_copy_k) {
+                 completed.operation == io_operation_t::send_zero_copy_k ||
+                 completed.operation == io_operation_t::send_vectors_k) {
             if (!result) return fail(ucall_status_connection_closed_k);
             sending_offset += static_cast<std::size_t>(result);
             if (statistics) tally<atomic_ref>(statistics->bytes_sent, static_cast<std::uint64_t>(result));
-            if (sending_offset != sending_length) return;
+            if (sending_offset != sending_length) return step_vectors(static_cast<std::size_t>(result));
             // A server credits its zero-copy sends itself, as a window's slice is no segment.
             if (completed.operation == io_operation_t::send_k && stage == transport_stage_t::open_k &&
                 transmitting == transmit_state_t::sending_k)
@@ -369,11 +371,37 @@ struct transport {
         return emit(transmit_request, io_operation_t::send_k, bytes);
     }
 
+    /** Starts sending the @p bytes that the nonempty @p vectors point at as one send, which the
+     *  socket copies; the vectors stay the submitter's until its last part completes. */
+    io_request_t* emit_send_vectors(span<io_vector_t> vectors, std::size_t bytes) noexcept {
+        sending = static_cast<byte_t*>(vectors.front().iov_base);
+        sending_length = bytes;
+        sending_offset = 0;
+        progress = transmit_progress_t::progressed_k;
+        return emit(transmit_request, io_operation_t::send_vectors_k,
+                    {reinterpret_cast<byte_t*>(vectors.data()), vectors.size()});
+    }
+
+    /** Steps a @c send_vectors_k the socket took only part of past its @p taken bytes, so the
+     *  request names just the rest; any other send resumes from @c sending_offset. */
+    void step_vectors(std::size_t taken) noexcept {
+        if (transmit_request.operation != io_operation_t::send_vectors_k) return;
+        span<io_vector_t> const vectors = io_vectors(transmit_request);
+        // The vectors hold more than the socket took, so the walk stops inside them.
+        std::size_t skipped = 0;
+        for (; taken >= vectors[skipped].iov_len; ++skipped) taken -= vectors[skipped].iov_len;
+        vectors[skipped] = {static_cast<byte_t*>(vectors[skipped].iov_base) + taken, vectors[skipped].iov_len - taken};
+        transmit_request.data = reinterpret_cast<byte_t*>(vectors.data() + skipped);
+        transmit_request.length = vectors.size() - skipped;
+    }
+
     /** The rest of the send the socket took only part of, with its operation, memory and
-     *  release. */
+     *  release; a vectored one's vectors were already stepped past what the socket took. */
     io_request_t* resume_send() noexcept {
-        transmit_request.data = sending + sending_offset;
-        transmit_request.length = sending_length - sending_offset;
+        if (transmit_request.operation != io_operation_t::send_vectors_k) {
+            transmit_request.data = sending + sending_offset;
+            transmit_request.length = sending_length - sending_offset;
+        }
         transmit_request.deadline = deadline;
         progress = transmit_progress_t::progressed_k;
         return &transmit_request;

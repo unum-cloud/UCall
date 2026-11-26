@@ -308,8 +308,21 @@ static case_result_t test_backend_parity(sweep_cell_t const& cell) {
     return {};
 }
 
-/** Two loops share a budget of two: a third client is served only once an eviction closes one of
- *  the two idle ones. */
+/** The connections event loop @p loop of @p fixture accepted. */
+static std::uint64_t loop_accepts(fixture_t& fixture, std::size_t loop) {
+    ucall_outcome_t outcome {};
+    ucall_event_loop_statistics_t statistics {};
+    ucall_server_event_loop_statistics_t query {fixture.server, &outcome, loop, &statistics};
+    ucall_server_event_loop_statistics(&query);
+    expect_true(outcome.status == ucall_status_success_k, "loop {}: {}", loop, ucall_status_name(outcome.status));
+    return statistics.accepts;
+}
+
+/** Two loops share a budget of two, one connection each: a third client is served only once an
+ *  eviction closes an idle one. Each loop that accepted ends holding one client, so the evictions
+ *  number the accepts past one per such loop: one where both loops accepted, and two where each
+ *  loop listens on its own and the kernel hashed all three peers to the same one, which evicts
+ *  for its own peers even while the other has room. */
 static case_result_t test_admission_across_loops(sweep_cell_t const& cell) {
     split_mix_generator_t generator {case_stream_key()};
     if (UCALL_OS_WINDOWS_) return case_result_t::skipped(loops_refused_k);
@@ -329,7 +342,99 @@ static case_result_t test_admission_across_loops(sweep_cell_t const& cell) {
     std::size_t closed = 0;
     for (std::size_t i = 0; i != 2; ++i)
         closed += clients[i].read_until_close(steady_clock::now() + 300ms) == read_end_t::closed_k;
-    expect_true(closed == 1, "{} of the two idle clients were closed for the third", closed);
+    std::uint64_t accepts = 0, accepting_loops = 0;
+    for (std::size_t loop = 0; loop != 2; ++loop) {
+        std::uint64_t const accepted = loop_accepts(fixture, loop);
+        accepts += accepted;
+        accepting_loops += accepted != 0;
+    }
+    expect_true(accepts == 3, "the loops accepted {} of three clients", accepts);
+    expect_true(closed == accepts - accepting_loops, "{} of the two idle clients were closed, for {} accepts on {} loops",
+                closed, accepts, accepting_loops);
+    fixture.stop();
+    return {};
+}
+
+/** Why a case counting the accepts the kernel spreads skips where loops share one listen queue. */
+static constexpr char const* port_groups_refused_k = "balanced SO_REUSEPORT groups are refused on this machine";
+
+/** Raw clients a spreading case serves, few enough for one loop's share of its budget. */
+static constexpr std::size_t spread_peers_k = 64;
+
+/** Polls the first @p polled loops of @p fixture, each on its own thread until the fixture stops,
+ *  counting each into @p opened once its first poll returned with its listener bound. */
+static void serve_loops(fixture_t& fixture, std::size_t polled, std::atomic<std::size_t>& opened) {
+    for (std::size_t loop = 0; loop != polled; ++loop)
+        fixture.pollers.emplace_back([&fixture, &opened, loop] {
+            ucall_outcome_t outcome {};
+            ucall_server_take_call_t first {fixture.server, &outcome, loop, 0};
+            ucall_server_take_call(&first);
+            expect_true(outcome.status == ucall_status_success_k, "loop {} opened with {}", loop,
+                        ucall_status_name(outcome.status));
+            opened.fetch_add(1, std::memory_order_release);
+            ucall_server_take_calls_t serving {fixture.server, &outcome, loop};
+            ucall_server_take_calls(&serving);
+            expect_true(outcome.status == ucall_status_success_k, "loop {} ended with {}", loop,
+                        ucall_status_name(outcome.status));
+        });
+}
+
+/** Serves @c spread_peers_k raw clients one echo each, holding every one open until the last is
+ *  served, so each counts as one accept. */
+static void serve_spread_peers(fixture_t& fixture, split_mix_generator_t& generator) {
+    std::string_view const request = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
+    std::array<raw_client_t, spread_peers_k> clients;
+    for (std::size_t i = 0; i != clients.size(); ++i) {
+        if (!expect_true(clients[i].connect(fixture.address), "client {} could not connect", i)) return;
+        expect_true(clients[i].write(byte_span(request), 0, generator, steady_clock::now() + wait_limit_k));
+        expect_true(read_response(clients[i], 0).status == 200, "client {} was not served", i);
+    }
+}
+
+/** Four loops each listen on a socket of their own, so the kernel spreads 64 peers across them,
+ *  under a budget no loop's share binds, and every loop accepts some. The hash of each peer's
+ *  ephemeral port picks a loop as if at random, so one loop misses all 64 with odds (3/4)^64, under
+ *  1.1e-8, and any of the four with under 4.5e-8. */
+static case_result_t test_accepts_spread_across_loops(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    if (UCALL_OS_WINDOWS_) return case_result_t::skipped(loops_refused_k);
+    if (!UCALL_OS_LINUX_) return case_result_t::skipped(port_groups_refused_k);
+    // Declared before the fixture, whose pollers count into it until the fixture joins them.
+    std::atomic<std::size_t> opened {};
+    fixture_t fixture {cell, {.event_loops = 4, .connections = 4 * spread_peers_k}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+        return {};
+    if (!expect_true(fixture.resolved.interfaces[0].event_loops == 4)) return {};
+    serve_loops(fixture, 4, opened);
+    // A later loop binds its listener at its first poll, so peers wait until every loop has one.
+    if (!expect_true(spin_until([&] { return opened.load(std::memory_order_acquire) == 4; }), "{} of 4 loops opened",
+                     opened.load()))
+        return {};
+    serve_spread_peers(fixture, generator);
+    for (std::size_t loop = 0; loop != 4; ++loop)
+        expect_true(loop_accepts(fixture, loop) >= 1, "loop {} accepted none of {} peers", loop, spread_peers_k);
+    fixture.stop();
+    return {};
+}
+
+/** Of four loops only three are polled, so the fourth never binds its listener, and every one of
+ *  64 peers lands on the other three and is served. */
+static case_result_t test_unpolled_loop_strands_no_peers(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    if (UCALL_OS_WINDOWS_) return case_result_t::skipped(loops_refused_k);
+    if (!UCALL_OS_LINUX_) return case_result_t::skipped(port_groups_refused_k);
+    // Declared before the fixture, whose pollers count into it until the fixture joins them.
+    std::atomic<std::size_t> opened {};
+    fixture_t fixture {cell, {.event_loops = 4, .connections = 4 * spread_peers_k}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+        return {};
+    if (!expect_true(fixture.resolved.interfaces[0].event_loops == 4)) return {};
+    serve_loops(fixture, 3, opened);
+    if (!expect_true(spin_until([&] { return opened.load(std::memory_order_acquire) == 3; }), "{} of 3 loops opened",
+                     opened.load()))
+        return {};
+    serve_spread_peers(fixture, generator);
+    expect_true(loop_accepts(fixture, 3) == 0, "the unpolled loop accepted a peer");
     fixture.stop();
     return {};
 }
@@ -719,6 +824,8 @@ void run_loops_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
 #if UCALL_OS_POSIX_
     if (cell.security == ucall_security_none_k) {
         run_cell_case(cell_label, "test_admission_across_loops", test_admission_across_loops, cell);
+        run_cell_case(cell_label, "test_accepts_spread_across_loops", test_accepts_spread_across_loops, cell);
+        run_cell_case(cell_label, "test_unpolled_loop_strands_no_peers", test_unpolled_loop_strands_no_peers, cell);
     }
 #endif
     if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k &&

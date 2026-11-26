@@ -84,6 +84,10 @@ struct network_interface {
     /** The listener's address family, which each acceptor's reserve socket takes. */
     int family {};
 
+    /** How the loops share the interface's listener, set at initialization: one listen queue for
+     *  a caller's listener, a single loop, or a kernel that does not balance a port group. */
+    listen_queues_t listen_queues {listen_queues_t::shared_k};
+
     /** Every reply directory, NUL-terminated, back to back. */
     vector<char> reply_directory_names {};
 
@@ -95,6 +99,12 @@ struct network_interface {
     std::size_t quota(std::size_t index) const noexcept {
         return config->max_concurrent_connections / config->event_loops +
                (index < config->max_concurrent_connections % config->event_loops);
+    }
+
+    /** The backlog of event loop @p index's listener: its @c quota when it listens on its own, or
+     *  the whole budget of the queue the loops share. */
+    std::size_t backlog(std::size_t index) const noexcept {
+        return listen_queues == listen_queues_t::per_loop_k ? quota(index) : config->max_concurrent_connections;
     }
 
     /** Admitted connections across every loop, apart from the words each request reads. */

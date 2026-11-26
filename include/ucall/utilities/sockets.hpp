@@ -40,6 +40,7 @@
 #endif
 #if UCALL_OS_LINUX_
 #include <dirent.h>      // `opendir`, `readdir`, `closedir`
+#include <sched.h>       // `sched_getaffinity`, `sched_getcpu`, `CPU_COUNT`
 #include <sys/syscall.h> // `SYS_statx`
 #endif
 #if UCALL_OS_APPLE_
@@ -356,6 +357,32 @@ inline descriptor_t socket_duplicate_listener(std::intptr_t handed) noexcept {
         return descriptor;
     socket_close(descriptor);
     return -1;
+}
+
+/** Lets the listener @p descriptor, not yet bound, join the group of listeners on its address and
+ *  port, whose connections Linux spreads across them by a hash of each peer's address; false where
+ *  the kernel refused, or where it does not balance a group, as macOS does not. */
+inline bool socket_share_port([[maybe_unused]] descriptor_t descriptor) noexcept {
+#if UCALL_OS_LINUX_
+    int enabled = 1;
+    return socket_option(descriptor, SOL_SOCKET, SO_REUSEPORT, &enabled, sizeof(enabled)) == 0;
+#else
+    return false;
+#endif // UCALL_OS_LINUX_
+}
+
+/** Asks Linux 6.1 and later to prefer the listener @p descriptor, among its port group, for the
+ *  connections whose handshake the calling thread's CPU handled, once the application pinned the
+ *  thread to that one CPU; a thread free to move sits nowhere in particular, so it names none. */
+inline void socket_prefer_pinned_cpu([[maybe_unused]] descriptor_t descriptor) noexcept {
+#if UCALL_OS_LINUX_
+    cpu_set_t allowed {};
+    if (sched_getaffinity(0, sizeof(allowed), &allowed) != 0 || CPU_COUNT(&allowed) != 1) return;
+    int const cpu = sched_getcpu();
+    if (cpu < 0) return;
+    // Only a hint, which a kernel or sandbox without it refuses, leaving the hash to pick.
+    [[maybe_unused]] int const preferred = socket_option(descriptor, SOL_SOCKET, SO_INCOMING_CPU, &cpu, sizeof(cpu));
+#endif // UCALL_OS_LINUX_
 }
 
 /** An accepted socket set up for the loop, or a negated error; the accepted socket's own setup

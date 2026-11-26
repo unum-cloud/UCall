@@ -65,11 +65,25 @@ typedef struct ucall_network_interface_t {
     void* peer_authorizer_context;
 
     /**
-     *  Event loops accepting on this interface. Zero uses one loop for an address, or the
-     *  receive-queue count for a named Linux device, bounded by the connection budget.
+     *  @brief Event loops accepting on this interface. Zero uses one loop for an address, or the
+     *      receive-queue count for a named Linux device, bounded by the connection budget.
      *
      *  Each loop has one application polling owner; UCall creates no threads.
-     *  POSIX readiness backends and io_uring share one listen queue through a descriptor per loop.
+     *  On Linux, each loop of an address listens on a socket of its own in one @c SO_REUSEPORT
+     *  group, so the kernel spreads connections across the loops by a hash of each peer's address.
+     *  Loop zero binds during @c ucall_server_init() and every later loop at its first poll, so a
+     *  loop nobody polls takes no connection.
+     *  A loop out of connections evicts its own idle ones for the peers hashed to it, whatever room
+     *  the other loops have, as no other loop accepts from its listener.
+     *  Where its owner is pinned to one CPU, a loop's listener asks Linux 6.1 and later for the
+     *  connections whose handshakes that CPU handled; UCall still pins nothing.
+     *  Another process of the same user binding the same address with several loops joins the group
+     *  rather than failing to bind.
+     *  Kernel port groups are how the io_uring, epoll and POSIX backends spread connections, and a
+     *  future user-space backend, such as one over DPDK, will need a balancer of its own.
+     *
+     *  Elsewhere, and on a caller's @c listen_descriptor, the loops accept on duplicates of one
+     *  listener and share its listen queue.
      *  IOCP currently accepts one loop per interface because a socket belongs to one completion
      *  port; requesting more returns @c ucall_status_unsupported_k.
      *  @sa @c ucall_server_init_t::resolved reports the chosen counts.
@@ -78,13 +92,16 @@ typedef struct ucall_network_interface_t {
 
     /** Required open-connection budget across this interface's loops.
      *  Accept operations reserve this budget before submission; releasing a connection wakes
-     *  the other loops to resume admission. The OS separately bounds the listen backlog and
-     *  descriptor resources. Receive storage grows with the actual framed message. */
+     *  the other loops to resume admission. Each loop's share of it sizes the backlog of a
+     *  listener of its own, and the OS separately bounds the listen backlog and descriptor
+     *  resources. Receive storage grows with the actual framed message. */
     size_t max_concurrent_connections;
 
     /** Requests one connection may have in flight before UCall stops reading from it; zero means
-     *  one. Replies leave in request order. Batch rings hold @c max_concurrent_connections times
-     *  this many requests. */
+     *  one. Replies leave in request order, and on POSIX backends those shorter than a page and
+     *  ready together leave in one gathered send, from a vector per reply that each connection
+     *  reserves at initialization, at most @c IOV_MAX. Batch rings hold
+     *  @c max_concurrent_connections times this many requests. */
     size_t max_pipelined_requests;
 
     /** Largest request head and buffered body; past it the reply is 413 and the connection
@@ -239,6 +256,8 @@ typedef struct ucall_server_take_call_t {
  *  @par Statuses:
  *  - @c ucall_status_connection_closed_k The loop retired after a stop: its drain or cut ended,
  *    so a caller polling in slices stops here.
+ *  - @c ucall_status_connection_failed_k The loop's first poll could not bind its own listener to
+ *    the address loop zero bound, so the loop retired without serving.
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c event_loop_index is past the last loop.
  *  - @c ucall_status_contended_k Another call polls this loop, so this one finishes without
@@ -266,6 +285,8 @@ typedef struct ucall_server_take_calls_t {
  *  @brief Drives one server loop until @c ucall_server_stop() or an I/O failure.
  *
  *  @par Statuses:
+ *  - @c ucall_status_connection_failed_k The loop's first poll could not bind its own listener to
+ *    the address loop zero bound, so the loop retired without serving.
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.
  *  - @c ucall_status_invalid_argument_k The @c event_loop_index is past the last loop.
  *  - @c ucall_status_contended_k Another call polls this loop, so this one finishes without
@@ -320,13 +341,14 @@ typedef struct ucall_event_loop_statistics_t {
     /** Bytes UCall copied: receive appends, reply bodies, Noise records and parked receives. */
     uint64_t bytes_copied;
 
-    /** Sends that left without copying: reply segments and file windows. */
+    /** Sends that left without copying: reply segments of a page or more, and file windows. */
     uint64_t zero_copy_sends;
 
     /** Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does. */
     uint64_t zero_copy_fallbacks;
 
-    /** Sends that copied instead of pinning: the socket was demoted or refused zero-copy. */
+    /** Sends that copied instead of pinning: reply segments shorter than a page, one per send or
+     *  several gathered into one, and every send of a socket demoted or refusing zero-copy. */
     uint64_t copying_sends;
 
     /** File reads the kernel finishes later: io_uring, Linux or FreeBSD AIO, or overlapped I/O. */
@@ -418,8 +440,9 @@ typedef struct ucall_server_take_batch_t {
  *  @brief Invokes one batch endpoint's callback if a batch is due, with requests from every
  *      event loop, on the calling thread.
  *
- *  UCall creates no thread; a bounded wait sleeps until a deposit, the partial batch's deadline,
- *  or the timeout, without polling any event loop.
+ *  UCall creates no thread; a bounded wait sleeps until the first request of a batch, the one
+ *  reaching @c min_batch_size, the partial batch's deadline, or the timeout, without polling any
+ *  event loop. Requests between the first and that one wake nobody, as the deadline collects them.
  *
  *  @par Statuses:
  *  - @c ucall_status_uninitialized_k The @c server is @c NULL.

@@ -124,6 +124,7 @@ Routing is exact: empty segments are segments and a trailing slash is significan
 A path no route takes answers 404, other verbs' routes answer 405 with `allow`, GET routes serve HEAD, `OPTIONS` answers 204 with `allow`, and `Expect: 100-continue` gets its interim response once the request is next and its body is wanted.
 An interface at its connection budget evicts its least recently progressed idle keep-alive connection for a new peer.
 A server interface's `max_pipelined_requests` bounds the requests one connection holds at once; zero means one, and replies leave in request order.
+Replies shorter than a page and ready together leave in one gathered send, up to what the socket's send buffer takes, on every POSIX backend; IOCP and Registered I/O send them one at a time.
 Servers support immutable routes, size and latency based application batching, retained request views, and content, error, vectored and streamed replies.
 The `metrics_*` configuration reports StatsD counters.
 The first `ucall_server_stop()` drains: listeners and idle connections close, and every held request gets its reply before its connection closes; a second stop cuts what is still in flight.
@@ -190,7 +191,8 @@ if (ucall_outcome_wait(&sent) != ucall_status_success_k)
 The event loop opens files with `O_DIRECT`, refusing caller descriptors without it, and reads aligned extents itself before sending the requested slice.
 Paths are copied before the call returns, and empty or absolute paths, `..` components and any resolution leaving the directory are refused.
 A reply with file or path parts publishes its outcome as `ucall_status_deferred_k`, then success once they are sent, or the cause; a refusal before the head becomes `404` or `416`, and a failure after it resets the connection.
-Replies leave through zero-copy sends where the backend has them, so a connection closes only once the kernel let go of what it sent, and resets a peer that stops acknowledging by the linger deadline.
+Windows and reply segments of a page or more leave through zero-copy sends where the backend has them, so a connection closes only once the kernel let go of what it sent, and resets a peer that stops acknowledging by the linger deadline.
+Shorter segments copy, as pinning them costs more than the copy.
 
 ## Batches
 
@@ -379,7 +381,7 @@ Server shutdown uses baseline atomics and native wakeups, so another thread can 
   Select `automatic`, `posix`, `linux-epollaio`, `linux-uring612`, `linux-uring618`, `bsd-kqueue`, `windows-iocp`, or `windows-rio` in the server or client configuration; explicit unavailable selections fail.
   All variants use the same HTTP/1.1 and Noise connection automata.
 - __Zero-copy where the kernel offers it.__
-  Both io_uring variants and `linux-epollaio` send without copying and read files unbuffered on the event loop, while `posix`, `kqueue` and IOCP send by copying.
+  Both io_uring variants and `linux-epollaio` send file windows and reply segments of a page or more without copying and read files unbuffered on the event loop, while `posix`, `kqueue` and IOCP send by copying.
 - __One argument struct per verb.__
   Fields are named at the call site, zeroed fields take their documented defaults, and every fallible verb reports through the outcome its struct points at.
 - __Bound clients.__

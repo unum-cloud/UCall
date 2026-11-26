@@ -63,6 +63,7 @@ struct faulting_queue {
     void submit(io_request_t& request) noexcept {
         bool const transfer = request.operation == io_operation_t::send_k ||
                               request.operation == io_operation_t::send_zero_copy_k ||
+                              request.operation == io_operation_t::send_vectors_k ||
                               request.operation == io_operation_t::receive_k;
         std::size_t const turn = transfer ? transfers++ : 0;
         if (transfer && turn % 7 == 3) held.push_back({&request, 0});

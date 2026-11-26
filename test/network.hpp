@@ -91,6 +91,9 @@ struct fixture_config_t {
 
     /** The largest response the client buffers; zero lets the kernel decide. */
     std::size_t max_response_bytes = 0;
+
+    /** A listener the caller bound, which the server accepts on through duplicates, or none. */
+    std::intptr_t const* listen_descriptor = nullptr;
 };
 
 /** The global tags a fixture reporting metrics attaches to every line. */
@@ -313,6 +316,7 @@ struct fixture_t {
         network_interface.max_concurrent_connections = settings.connections;
         network_interface.max_pipelined_requests = settings.pipelined_requests;
         network_interface.max_request_bytes = settings.max_request_bytes;
+        network_interface.listen_descriptor = settings.listen_descriptor;
         network_interface.security = cell.security;
         network_interface.noise_private_key = &server_private;
         if (cell.security == ucall_security_noise_kk_k) network_interface.noise_peer_key = &client_public;

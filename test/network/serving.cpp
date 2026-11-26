@@ -416,7 +416,7 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
     ucall_outcome_t outcome {};
     ucall_network_interface_t network_interface {};
     network_interface.address = bytes_view("127.0.0.1:0");
-    network_interface.max_concurrent_connections = 4;
+    network_interface.max_concurrent_connections = 8;
     network_interface.event_loops = 2;
     ucall_server_options_t config {}, resolved {};
     config.backend = cell.backend;
@@ -443,7 +443,8 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
     ucall_client_init(&client_init);
     expect_true(outcome.status == ucall_status_success_k);
     auto poller = poll_batches(server, endpoint);
-    // Each loop owns two of the four connections, so each receives exactly half of the batch.
+    // Each loop's share of eight admits all four connections, however the kernel spreads them, so
+    // every call reaches the one batch.
     std::string url = fmt::format("http://{}/batch", text_view(resolved.interfaces[0].address));
     for (std::size_t i = 0; i != 4; ++i) {
         ucall_client_call_t call {};
@@ -476,6 +477,16 @@ static case_result_t test_batches_across_loops(sweep_cell_t const& cell) {
     while (!batches.completed.load(std::memory_order_acquire) && progress()) {}
     expect_true(batches.completed == 1 && batches.sizes[0] == 4, "{} batches, the first of {}",
                 batches.completed.load(), batches.sizes[0]);
+    // The one batch holds every loop's requests, whichever loops the kernel handed the connections.
+    std::uint64_t dispatched = 0;
+    for (std::size_t loop = 0; loop != 2; ++loop) {
+        ucall_event_loop_statistics_t statistics {};
+        ucall_server_event_loop_statistics_t query {server, &outcome, loop, &statistics};
+        ucall_server_event_loop_statistics(&query);
+        expect_true(outcome.status == ucall_status_success_k);
+        dispatched += statistics.requests;
+    }
+    expect_true(dispatched == 4, "the loops dispatched {} of the batch's four requests", dispatched);
     if (batches.completed == 1)
         for (auto request : batches.requests) {
             ucall_server_reply_content_t response {server,  &outcome, &request,          ucall_http_status_ok_k,

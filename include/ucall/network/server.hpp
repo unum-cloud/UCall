@@ -381,6 +381,11 @@ struct server : ucall_server_handle_t {
 #endif
             event_loops_count = fu::max_of(event_loops_count, settings.event_loops);
             if (settings.listen_descriptor) listeners = io::io_listeners_t::caller_k;
+#if UCALL_OS_LINUX_
+            // Linux alone balances a port group; a caller's listener, TCP or AF_UNIX, stays one.
+            if (settings.event_loops > 1 && !settings.listen_descriptor)
+                network_interface.listen_queues = listen_queues_t::per_loop_k;
+#endif
             network_interface.send_buffer_bytes = formatting_t::listener_send_buffer(network_interface);
             if (settings.noise_private_key)
                 x25519_derive_public<typename crypto_t::x25519_kit_t>(
@@ -408,7 +413,7 @@ struct server : ucall_server_handle_t {
                 publish<atomic_ref>(arguments->outcome, opened);
                 return;
             }
-            std::size_t connections_count = 0, acceptors_count = 0;
+            std::size_t connections_count = 0, acceptors_count = 0, depth = 0;
             for (auto& network_interface : server->network_interfaces) {
                 if (event_loop_index >= network_interface.config->event_loops) continue;
                 std::size_t const quota = network_interface.quota(event_loop_index);
@@ -418,8 +423,12 @@ struct server : ucall_server_handle_t {
                 }
                 connections_count += quota;
                 event_loop.max_exchanges += quota * network_interface.config->max_pipelined_requests;
+                depth = fu::max_of<std::size_t>(depth, network_interface.config->max_pipelined_requests);
                 ++acceptors_count;
             }
+            // A gathered send takes a vector per reply segment, from as many replies as a pipeline
+            // holds; one reply at a time gathers nothing.
+            std::size_t const send_vectors = fu::min_of(depth, io::io_send_vectors_limit_k);
             rebound_allocator<interface_acceptor_t> acceptor_allocator {allocator};
             auto* acceptors = acceptor_allocator.allocate(acceptors_count);
             if (!acceptors) {
@@ -436,6 +445,10 @@ struct server : ucall_server_handle_t {
             for (std::size_t i = 0; i != connections_count; ++i) std::construct_at(connections + i, allocator);
             event_loop.connections = {connections, connections_count};
             for (auto& connection : event_loop.connections) {
+                if (send_vectors > 1 && st::failed(connection.send_vectors.resize(send_vectors))) {
+                    publish<atomic_ref>(arguments->outcome, ucall_status_out_of_memory_k);
+                    return;
+                }
                 connection.transport.statistics = &event_loop.statistics;
                 connection.next = event_loop.idle;
                 event_loop.idle = &connection;
@@ -455,8 +468,9 @@ struct server : ucall_server_handle_t {
         }
         // Each queue opens before its loop's listeners, the later loops on the backend the first
         // one resolved, so loop zero's listeners and the sockets they accept inherit its queue's
-        // flags, and the later loops accept on duplicates of them; a ring serves the thread that
-        // first polls it.
+        // flags. A later loop accepts on a duplicate of loop zero's listener, or, where each loop
+        // listens on its own, binds one of the port group at its first poll, so a loop nobody
+        // polls takes no connection; a ring serves the thread that first polls it.
         ucall_io_backend_t backend = requested->backend;
         for (auto& event_loop : server->event_loops) {
             std::size_t windows = 0, slots = 0;
@@ -472,8 +486,10 @@ struct server : ucall_server_handle_t {
             reserve_releases(*event_loop, windows);
             backend = event_loop->queue.backend();
             for (auto& acceptor : event_loop->interface_acceptors) {
-                ucall_status_t result;
+                ucall_status_t result = ucall_status_success_k;
                 if (!event_loop->index) result = formatting_t::bind_acceptor(acceptor, event_loop->queue);
+                else if (acceptor.network_interface->listen_queues == listen_queues_t::per_loop_k)
+                    acceptor.request = {.operation = io_operation_t::accept_k, .context = &acceptor};
 #if UCALL_OS_POSIX_
                 else {
                     auto network_interface_index = static_cast<std::size_t>(acceptor.network_interface -
@@ -684,6 +700,9 @@ struct server : ucall_server_handle_t {
             opened != ucall_status_success_k)
             return opened;
         for (auto& acceptor : event_loop.interface_acceptors) {
+            if (ucall_status_t const joined = formatting_t::join_port_group(acceptor, event_loop.queue);
+                joined != ucall_status_success_k)
+                return joined;
             acceptor.request.descriptor = event_loop.queue.import_socket(acceptor.request.descriptor);
             if (acceptor.request.descriptor < 0) return ucall_status_io_k;
             acceptor.stage = interface_acceptor_t::stage_t::idle_k;
@@ -770,6 +789,8 @@ struct server : ucall_server_handle_t {
                 bool const file_read = completion.request == &connection.file_read_request;
                 if (!file_read && completion.request->operation == io_operation_t::send_zero_copy_k)
                     replies_t::complete_zero_copy_send(event_loop, connection, completion);
+                else if (!file_read && completion.request->operation == io_operation_t::send_vectors_k)
+                    replies_t::complete_gathered_send(connection, completion);
                 else if (file_read && completion.request->operation == io_operation_t::file_open_k)
                     replies_t::complete_file_open(connection, completion);
                 else if (file_read) replies_t::complete_file_read(event_loop, connection, completion);
@@ -970,13 +991,20 @@ struct server : ucall_server_handle_t {
         return retired == server.event_loops.size();
     }
 
-    /** Sleeps on the endpoint's pollable wakeup until a deposit, a stop, or @p deadline, zero
-     *  meaning none. Depositors wake only a sleeping polling owner, so it announces sleep before
-     *  its last look at the queue. */
+    /** Sleeps on the endpoint's pollable wakeup until a stop, @p deadline, zero meaning none, or a
+     *  deposit worth waking for: the first into a batch holding none, which starts its latency
+     *  clock, or the one completing @c min_batch_size. Deposits short of that wait for the deadline
+     *  of the batch they join, which a caller holding requests always passes. Depositors wake only
+     *  a sleeping polling owner, so it names its wake tail and announces sleep before its last look
+     *  at the queue. */
     static void wait_for_deposits(server_t& server, batch_endpoint_t& endpoint, std::uint64_t deadline) noexcept {
+        std::size_t const held = endpoint.collected.size();
+        std::uint64_t const wake_tail = endpoint.head +
+                                        (held && held < endpoint.min_batch_size ? endpoint.min_batch_size - held : 1);
+        atomic_ref<std::uint64_t> {endpoint.wake_tail}.store(wake_tail, std::memory_order_relaxed);
         auto wake_state = atomic_ref<wake_state_t> {endpoint.wake_state};
         wake_state.store(wake_state_t::sleeping_k, std::memory_order_seq_cst);
-        if (atomic_ref<std::uint64_t> {endpoint.tail}.load(std::memory_order_seq_cst) == endpoint.head &&
+        if (atomic_ref<std::uint64_t> {endpoint.tail}.load(std::memory_order_seq_cst) < wake_tail &&
             !batches_ended(server, serving_t::server_stage(server)))
             endpoint.wake.wait(deadline);
         wake_state.store(wake_state_t::awake_k, std::memory_order_seq_cst);

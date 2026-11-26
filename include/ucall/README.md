@@ -62,10 +62,11 @@ Outside `include/`, `tools/ucall.cpp` is the `ucall` command-line client, one HT
 Every queue answers the same requests, and each spends what its kernel offers:
 
 - __io_uring.__
-  Both io_uring variants use registered files, direct descriptors, an incremental provided receive-buffer ring, a sparse table of registered buffers, `SEND_ZC` zero-copy sends and `READ_FIXED` file reads.
+  Both io_uring variants use registered files, direct descriptors, an incremental provided receive-buffer ring, a sparse table of registered buffers, `SEND_ZC` zero-copy sends of file windows and segments of a page or more, `SENDMSG` gathered sends of shorter ones, and `READ_FIXED` file reads.
   The 6.18 variant adds multishot receive and vectored `READV_FIXED` file reads.
 - __Readiness and completion ports.__
-  `linux-epollaio` reads files through Linux AIO completing into its epoll set, sends with `MSG_ZEROCOPY`, and refuses to start where `io_setup` is refused, naming `fs.aio-max-nr`.
+  `linux-epollaio` reads files through Linux AIO completing into its epoll set, sends the same with `MSG_ZEROCOPY`, and refuses to start where `io_setup` is refused, naming `fs.aio-max-nr`.
   `posix` reads files blocking; FreeBSD `kqueue` reads them through `aio_read` landing as `EVFILT_AIO` events, and macOS `kqueue` through `aio_read`, a vectored read as `lio_listio` batches, polled with `aio_error` while its wait shrinks from 1 µs to 1 ms; IOCP reads through overlapped unbuffered reads. These send by copying, and a kernel refusing to queue a read has it read blocking.
+  The readiness queues gather a `send_vectors_k` through `sendmsg`, while IOCP and Registered I/O, whose loops send one span at a time, refuse one.
 - __Credit-limited accepts.__
   Accepts remain one-shot operations: multishot direct accept can consume more connections than a finite file table can install before userspace observes a completion.

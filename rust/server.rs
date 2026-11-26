@@ -973,12 +973,13 @@ pub struct EventLoopStatistics {
     pub bytes_sent: u64,
     /// Bytes UCall copied: receive appends, reply bodies, Noise records and parked receives.
     pub bytes_copied: u64,
-    /// Sends that left without copying: reply segments and file windows.
+    /// Sends that left without copying: reply segments of a page or more, and file windows.
     pub zero_copy_sends: u64,
     /// Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does.
     pub zero_copy_fallbacks: u64,
-    /// Sends that copied instead of pinning: the socket was demoted, refused zero-copy, or had no
-    /// room to track one.
+    /// Sends that copied instead of pinning: reply segments shorter than a page, one per send or
+    /// several gathered into one, and every send of a socket demoted, refusing zero-copy, or with
+    /// no room to track one.
     pub copying_sends: u64,
     /// File reads handed to the kernel to finish later: io_uring, Linux or FreeBSD AIO, or
     /// overlapped reads.

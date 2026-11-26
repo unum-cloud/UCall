@@ -196,6 +196,7 @@ Endpoint callbacks run synchronously on the application polling caller; a deadli
 Registering a batch endpoint returns its `ucall_http_batch_endpoint_t` handle.
 Each batch endpoint has one queue fed by every event loop and one application thread polling that handle through `ucall_server_take_batches()`, so its callback never runs on an event loop.
 With `max_pipelined_requests` on an interface and `max_pipelined_calls` on a client, one connection holds several requests at once, so a single client can fill a batch; replies still leave in request order.
+Replies ready together leave in one gathered send, as many as the socket's send buffer takes, where the backend gathers, as every POSIX one does.
 
 ### Caller-Owned Polling
 
@@ -472,7 +473,8 @@ Streaming multipart is another upload design, but continuation after a failure r
 
 Replies can include byte ranges of files, as descriptors or as paths beneath directories an interface registers, which is what a `Range` response needs.
 The event loop reads them with `O_DIRECT`, past the page cache, into windows taken from its pool, reading the next window while the previous one sends.
-Every reply leaves through zero-copy sends wherever the kernel offers them, and a window returns to the pool once the kernel let go of it.
+Every window and every reply segment of a page or more leaves through zero-copy sends wherever the kernel offers them, and a window returns to the pool once the kernel let go of it.
+A shorter segment copies, as pinning it, waiting for the kernel's notification and releasing it cost more than the copy.
 Under Noise each read leaves a gap behind every record's payload for its tag and the next record's header, so records seal in place inside the window.
 IOCP does not yet send file parts over Noise connections.
 

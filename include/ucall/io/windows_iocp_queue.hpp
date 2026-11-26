@@ -338,6 +338,8 @@ struct windows_overlapped {
             bool const sent = WSASend(socket, &buffer, 1, &bytes, 0, &operation.overlapped, nullptr) == 0;
             return issued(index, sent ? 0 : WSAGetLastError(), statistics);
         }
+        // `io_send_vectors_limit_k` keeps gathered sends off Windows queues.
+        case io_operation_t::send_vectors_k: break;
         }
         return settle_now(index, -EINVAL);
     }

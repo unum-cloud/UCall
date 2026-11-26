@@ -84,6 +84,8 @@ void run_linux_uring612_queue_cases() {
                 return keeping_descriptors([] {
                     split_mix_generator_t generator {case_stream_key()};
                     test_queue_duplex<queue_type_>(generator);
+                    test_gathered_send<queue_type_>(generator);
+                    test_wait_follows_rounds<queue_type_>();
                     test_accept_batch<queue_type_>();
                     test_ring_allocation_failure();
                 });

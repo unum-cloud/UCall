@@ -309,6 +309,126 @@ case_result_t test_direct_files() {
     return {};
 }
 
+/** A blocking poll after a round that reaped many completions still ends as soon as a lone one
+ *  arrives: the wait sized from that round gives up within the time the round took to handle, and
+ *  no completion of either round goes missing. */
+template <typename queue_type_>
+void test_wait_follows_rounds() {
+    constexpr std::size_t sockets_k = 8;
+    queue_type_ queue;
+    auto const status = queue.open(sockets_k, sockets_k);
+    if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return;
+    std::vector<loopback_pair_t> pairs;
+    pairs.reserve(sockets_k);
+    std::array<int, sockets_k> owned {};
+    std::array<std::array<util::byte_t, fixture_buffer_bytes_k>, sockets_k> buffers {};
+    std::array<util::io_vector_t, sockets_k> rooms {};
+    std::array<io_request_t, sockets_k> receiving {};
+    for (std::size_t i = 0; i != sockets_k; ++i) {
+        pairs.push_back(loopback_pair());
+        if (!expect_true(pairs[i].connected())) return;
+        owned[i] = queue.import_socket(std::exchange(pairs[i].client, -1));
+        if (!expect_true(owned[i] >= 0, "importing ended with {}", owned[i])) return;
+        rooms[i] = {buffers[i].data(), buffers[i].size()};
+        receiving[i] = {.operation = io_operation_t::receive_k,
+                        .descriptor = owned[i],
+                        .data = reinterpret_cast<util::byte_t*>(&rooms[i]),
+                        .length = 1};
+    }
+    span<util::byte_t const> const message = util::byte_span("round");
+    // Collects one receive per written peer, answering how long the blocking polls took.
+    auto const collect = [&](std::size_t writers) -> std::uint64_t {
+        for (std::size_t i = 0; i != writers; ++i) queue.submit(receiving[i]);
+        for (std::size_t i = 0; i != writers; ++i)
+            if (!expect_true(::send(pairs[i].peer, message.data(), message.size(), MSG_NOSIGNAL) ==
+                             static_cast<ssize_t>(message.size())))
+                return 0;
+        auto const started = util::monotonic_ns();
+        auto const deadline = util::deadline_after(5000000);
+        std::array<io_completion_t, sockets_k> completions {};
+        std::size_t received = 0;
+        while (received != writers && util::monotonic_ns() < deadline) {
+            int const count = queue.poll(span<io_completion_t> {completions}, io_wait_t::blocking_k, deadline);
+            if (!expect_true(count >= 0, "polling ended with {}", count)) return 0;
+            for (auto const& completed : span<io_completion_t> {completions}.first(static_cast<std::size_t>(count))) {
+                expect_true(completed.result == static_cast<int>(message.size()), "receiving ended with {}",
+                            completed.result);
+                ++received;
+                queue.release(completed);
+            }
+        }
+        expect_true(received == writers, "{} of {} receives completed", received, writers);
+        return util::monotonic_ns() - started;
+    };
+    collect(sockets_k);
+    std::uint64_t const lone = collect(1);
+    expect_true(lone < 1000000000, "a lone receive after a full round took {} ns", lone);
+    for (auto const descriptor : owned) expect_true(queue.close_socket(descriptor) == 0);
+}
+
+/** A gathered send of uneven vectors spanning a mebibyte, far past the send buffer, arrives in
+ *  order byte for byte, as each completion takes part of it and the rest goes again past it. */
+template <typename queue_type_>
+void test_gathered_send(split_mix_generator_t& generator) {
+    queue_type_ queue;
+    auto const status = queue.open(2, 2);
+    if (!expect_true(status == ucall_status_success_k, "{}", ucall_status_name(status))) return;
+    loopback_pair_t sockets = loopback_pair();
+    if (!expect_true(sockets.connected())) return;
+    int const send_buffer = static_cast<int>(16 * fixture_buffer_bytes_k);
+    if (!expect_true(util::nonblocking(sockets.client) == ucall_status_success_k &&
+                     util::nonblocking(sockets.peer) == ucall_status_success_k &&
+                     util::socket_option(sockets.client, SOL_SOCKET, SO_SNDBUF, &send_buffer, sizeof(send_buffer)) ==
+                         0))
+        return;
+    auto const owned = queue.import_socket(std::exchange(sockets.client, -1));
+    if (!expect_true(owned >= 0, "importing ended with {}", owned)) return;
+    std::vector<util::byte_t> payload(std::size_t {1} << 20), drained(payload.size());
+    for (auto& byte : payload) byte = static_cast<util::byte_t>(generator());
+    std::vector<util::io_vector_t> vectors;
+    for (std::size_t offset = 0; offset != payload.size();) {
+        std::size_t const length = fu::min_of<std::size_t>(1 + generator.below(65536), payload.size() - offset);
+        vectors.push_back({payload.data() + offset, length});
+        offset += length;
+    }
+    io_request_t sending {.operation = io_operation_t::send_vectors_k,
+                          .descriptor = owned,
+                          .data = reinterpret_cast<util::byte_t*>(vectors.data()),
+                          .length = vectors.size()};
+    queue.submit(sending);
+    std::size_t sent = 0, read = 0, first = 0;
+    auto const deadline = util::deadline_after(5000000);
+    while (sent != payload.size() || read != payload.size()) {
+        io_completion_t completed {};
+        if (queue.poll(span<io_completion_t> {&completed, 1}, io_wait_t::nonblocking_k) == 1) {
+            if (!expect_true(completed.request == &sending && completed.result > 0, "sending ended with {}",
+                             completed.result))
+                return;
+            sent += static_cast<std::size_t>(completed.result);
+            // Steps past the vectors the socket took whole, and into the one it took in part.
+            for (std::size_t taken = static_cast<std::size_t>(completed.result); taken;) {
+                std::size_t const step = fu::min_of(taken, vectors[first].iov_len);
+                vectors[first] = {static_cast<util::byte_t*>(vectors[first].iov_base) + step,
+                                  vectors[first].iov_len - step};
+                taken -= step;
+                first += !vectors[first].iov_len;
+            }
+            sending.data = reinterpret_cast<util::byte_t*>(vectors.data() + first);
+            sending.length = vectors.size() - first;
+            if (sent != payload.size()) queue.submit(sending);
+        }
+        if (read != drained.size()) {
+            auto const length = ::recv(sockets.peer, drained.data() + read, drained.size() - read, 0);
+            if (length > 0) read += static_cast<std::size_t>(length);
+            else if (!expect_true(length < 0 && io_pending(-errno), "draining ended with {}", length)) return;
+        }
+        if (!expect_true(util::monotonic_ns() < deadline, "{} sent and {} read of {}", sent, read, payload.size()))
+            return;
+    }
+    expect_true(drained == payload);
+    expect_true(queue.close_socket(owned) == 0);
+}
+
 #pragma endregion Every Queue
 
 #if UCALL_WITH_LINUX_URING

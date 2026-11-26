@@ -451,6 +451,14 @@ struct uring_state {
     /** The read end of a pipe whose only write end sits in the file table, armed at @c claim. */
     descriptor_t exit_descriptor {-1};
 
+    /** Completions reaped since the last enter returned, which the next waiting one waits for as
+     *  many of. */
+    unsigned reaped_since_enter {};
+
+    /** When the last enter returned, waiting or not, so the next waiting one waits at most as long
+     *  as the loop since spent handling what it reaped; zero before the first. */
+    std::uint64_t enter_returned_ns {};
+
     /** The file-table slot past the sockets', holding the exit pipe's write end. */
     unsigned exit_slot {};
 
@@ -510,13 +518,30 @@ struct uring_state {
     int enter(unsigned wait, std::uint64_t deadline) noexcept {
         tally<atomic_ref_template_>(statistics.kernel_enters);
         if (int const claimed = claim(); claimed < 0) return claimed;
+        // Every enter ends a round, so the count and the time a waiting one sizes itself from never
+        // span the rounds of nonblocking polls before it.
+        unsigned const reaped = std::exchange(reaped_since_enter, 0);
         // Deferred task work only runs inside an enter that asks for events.
-        if (!wait) return io_uring_submit_and_get_events(&ring);
-        auto now = deadline ? monotonic_ns() : 0;
+        if (!wait) {
+            int const result = io_uring_submit_and_get_events(&ring);
+            enter_returned_ns = monotonic_ns();
+            return result;
+        }
+        // A loop that reaped several completions last round waits for as many again, for at most as
+        // long as it spent handling them, so one enter takes a round's worth while the added wait
+        // stays within the loop's own recent service time. With deferred task work the kernel wakes
+        // the loop only once that many are ready. A round of one, or an empty one, waits for one.
+        auto now = monotonic_ns();
+        std::uint64_t const handling = enter_returned_ns && now > enter_returned_ns ? now - enter_returned_ns : 0;
+        if (reaped > wait && handling && (!deadline || now + handling < deadline)) {
+            wait = reaped;
+            deadline = now + handling;
+        }
         auto timeout = timespec_of(deadline > now ? deadline - now : 0);
         io_uring_cqe* completion {};
         int result = deadline ? io_uring_submit_and_wait_timeout(&ring, &completion, wait, &timeout, nullptr)
                               : io_uring_submit_and_wait(&ring, wait);
+        enter_returned_ns = monotonic_ns();
         // A signal, the deadline, or a full queue's overflow ends it empty; reaping makes room.
         return result == -ETIME || result == -EINTR || result == -EBUSY ? 0 : result;
     }
@@ -1327,6 +1352,17 @@ void uring_prepare(io_uring_sqe* submission, typename operations_type_::operatio
         io_uring_prep_send(submission, socket, request.data, sent, MSG_NOSIGNAL);
         tally<state_type_::template atomic_ref>(state.statistics.copying_sends);
         break;
+    case io_operation_t::send_vectors_k: {
+        // A socket keeps one send pending, so its slot holds the header the kernel reads.
+        msghdr& message = operation.socket_slot->message;
+        message = {};
+        message.msg_iov = io_vectors(request).data();
+        message.msg_iovlen = static_cast<decltype(message.msg_iovlen)>(
+            fu::min_of<std::size_t>(request.length, io_send_vectors_limit_k));
+        io_uring_prep_sendmsg(submission, socket, &message, MSG_NOSIGNAL);
+        tally<state_type_::template atomic_ref>(state.statistics.copying_sends);
+        break;
+    }
     case io_operation_t::read_k:
         io_uring_prep_read(submission, socket, request.data,
                            static_cast<unsigned>(fu::min_of(request.length, state.page_bytes)), -1);
@@ -1403,6 +1439,7 @@ void uring_reap(queue_type_& queue) noexcept {
     }
     if (!count) return;
     io_uring_cq_advance(&queue.state.ring, count);
+    queue.state.reaped_since_enter += count;
     tally<queue_type_::state_t::template atomic_ref>(queue.statistics.kernel_entries, count);
 }
 
@@ -1658,8 +1695,11 @@ struct linux_uring612_queue {
 
         /** Whether the close sends a FIN or a reset. */
         close_mode_t close {close_mode_t::orderly_k};
+
+        /** The header of the socket's gathered send, which names the request's vectors. */
+        msghdr message {};
     };
-    static_assert(sizeof(socket_slot_t) == 32);
+    static_assert(sizeof(socket_slot_t) == 88);
     using state_t = uring_state<allocator_t, atomic_ref_template_>;
     using socket_slots_t = uring_socket_slots<socket_slot_t, allocator_t>;
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
@@ -1667,9 +1707,10 @@ struct linux_uring612_queue {
     using operation_t = typename operations_t::operation_t;
     static_assert(sizeof(operation_t) == 64);
     static constexpr io_uring_op opcodes_k[] {
-        IORING_OP_SOCKET,    IORING_OP_ACCEPT,   IORING_OP_CONNECT, IORING_OP_RECV,         IORING_OP_SEND,
-        IORING_OP_READ,      IORING_OP_SHUTDOWN, IORING_OP_CLOSE,   IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT,
-        IORING_OP_URING_CMD, IORING_OP_OPENAT2,  IORING_OP_SEND_ZC, IORING_OP_READ_FIXED,   IORING_OP_READV};
+        IORING_OP_SOCKET,       IORING_OP_ACCEPT,       IORING_OP_CONNECT,   IORING_OP_RECV,
+        IORING_OP_SEND,         IORING_OP_READ,         IORING_OP_SHUTDOWN,  IORING_OP_CLOSE,
+        IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT, IORING_OP_URING_CMD, IORING_OP_OPENAT2,
+        IORING_OP_SEND_ZC,      IORING_OP_READ_FIXED,   IORING_OP_READV,     IORING_OP_SENDMSG};
     static constexpr ucall_io_backend_t backend_k = ucall_io_backend_linux_uring612_k;
     static constexpr io_receive_memory_t receive_memory_k = io_receive_memory_t::queue_k;
 

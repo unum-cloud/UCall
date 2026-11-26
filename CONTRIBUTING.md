@@ -104,6 +104,9 @@ Each event loop owns one queue, which only the thread polling that loop touches.
 Waits happen in the kernel, since a remote peer triggers the events a loop waits on, and a spin would burn a core for nothing.
 UCall reports the network interface's memory domain in `ucall_network_interface_t::memory_domain` and places no thread or buffer itself.
 The application pins its threads and picks their cores.
+On Linux, each loop of an interface listens on a socket of its own in one `SO_REUSEPORT` group, the later loops binding theirs at their first poll, and the kernel spreads connections across the loops by a hash of each peer's address.
+A listener whose polling thread the application pinned to one CPU names that CPU through `SO_INCOMING_CPU`, which reports the application's placement rather than making one.
+Kernel port groups are how the io_uring, epoll and POSIX backends spread connections; a future user-space backend, such as one over DPDK, will need its own load balancing across loops.
 
 ### Hardening
 

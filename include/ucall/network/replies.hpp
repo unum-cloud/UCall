@@ -15,7 +15,7 @@
 #include "ucall/network/exchanges.hpp" // `bit_of`, `claimed_k`, `replied_k`, `detached_k`
 #include "ucall/network/types.hpp" // `transport_stage_t`, `operation_state_t`, `receive_state_t`, `transmit_state_t`
 #include "ucall/tunnel/types.hpp"  // `secure_tunnel_geometry_t`, `secure_tunnel_overhead_k`
-#include "ucall/utilities/sockets.hpp" // `close_native_file`, `direct_alignment_of`, `native_file_of`
+#include "ucall/utilities/sockets.hpp" // `close_native_file`, `direct_alignment_of`, `native_file_of`, `page_size`
 #include "ucall/utilities/types.hpp"   // `text_view`, `byte_t`, `descriptor_t`, `publish`
 
 namespace unum::ucall::network {
@@ -39,8 +39,10 @@ using utilities::descriptor_t;
 using utilities::direct_alignment_of;
 using utilities::file_geometry_t;
 using utilities::invalid_native_file_k;
+using utilities::io_vector_t;
 using utilities::native_file_of;
 using utilities::native_file_t;
+using utilities::page_size;
 using utilities::publish;
 using utilities::span;
 using utilities::text_view;
@@ -750,13 +752,24 @@ struct replies {
         return release.request;
     }
 
+    /** Credits the front memory segment of @p exchange with what gathered sends took of it, which
+     *  they took in the order the segments retire. */
+    static void credit_front_segment(connection_t& connection, server_exchange_t const& exchange) noexcept {
+        std::size_t const unsent = exchange.oldest_segment->bytes.size() - connection.transport.output_offset;
+        std::size_t const credited = fu::min_of(unsent, connection.uncredited_bytes);
+        connection.transport.output_offset += credited;
+        connection.uncredited_bytes -= credited;
+    }
+
     /** Retires the oldest replies' sent segments, then each exchange whose reply ended with nothing
      *  left to send, reading again on a full receive side, and answers the release such an exchange
-     *  must submit first. A reply delimited by the close, or cut short of its length, ends the
-     *  connection after it. */
+     *  must submit first. A gathered send credits the segments it took, a part of one included,
+     *  across as many exchanges as it reached, even while the rest of it waits to resume. A reply
+     *  delimited by the close, or cut short of its length, ends the connection after it. */
     static io_request_t* retire_sent_segments(event_loop_t& event_loop, connection_t& connection) noexcept {
         while (auto* oldest = connection.oldest_exchange) {
             if (oldest->oldest_segment) {
+                if (connection.uncredited_bytes) credit_front_segment(connection, *oldest);
                 if (!front_segment_sent(connection, *oldest)) return nullptr;
                 connection.transport.output_offset = 0;
                 retire_oldest_segment(*oldest);
@@ -1189,10 +1202,19 @@ struct replies {
         return submit_file_read(event_loop, connection, *file_segment, window);
     }
 
-    /** Starts sending @p bytes of @p exchange's front segment, sealing its records first; every
-     *  segment send names the exchange's release until the socket is demoted to copying. A
-     *  stream whose sends hold its socket's send buffer submits that release first, and sends
-     *  on once it completes. */
+    /** Whether a segment send of @p bytes copies: any once the socket was demoted, or one shorter
+     *  than a page, whose pinning, kernel notification and release cost more than the copy, once a
+     *  first release told whether the kernel copies, so a socket that does demotes before the sends
+     *  of a file's windows wait on their notifications. */
+    static bool sends_copying(connection_t const& connection, std::size_t bytes) noexcept {
+        return connection.send_mode == send_mode_t::copying_k ||
+               (connection.send_mode == send_mode_t::zero_copy_k && bytes < page_size());
+    }
+
+    /** Starts sending @p bytes of @p exchange's front segment, sealing its records first; a send
+     *  of a page or more names the exchange's release until the socket is demoted to copying,
+     *  and a shorter one copies. A stream whose sends hold its socket's send buffer submits that
+     *  release first, and sends on once it completes. */
     static io_request_t* send_segment(connection_t& connection, server_exchange_t& exchange,
                                       span<byte_t> bytes) noexcept {
         // A release holding half the buffer goes to the kernel, and sends name the other, waiting
@@ -1209,7 +1231,7 @@ struct replies {
             connection.transport.fail(sealed);
             return nullptr;
         }
-        if (connection.send_mode == send_mode_t::copying_k) return connection.transport.emit_send(bytes);
+        if (sends_copying(connection, bytes.size())) return connection.transport.emit_send(bytes);
         return connection.transport.emit_zero_copy(bytes, name_exchange_release(connection, exchange),
                                                    io_unregistered_k);
     }
@@ -1243,24 +1265,85 @@ struct replies {
                                                    pool.registered_memory(window));
     }
 
+    /** Points @p connection's vectors at the reply segments that leave by copying, in request order
+     *  from the front one, adopting what each replier pushed: through every reply that ended, up to
+     *  a reply with file segments, a segment a pinning send takes, or a reply still open, as many
+     *  as the vectors hold and the socket's send buffer takes. Answers how many vectors it filled,
+     *  adding their bytes to @p bytes. */
+    static std::size_t gather_segments(connection_t& connection, std::size_t& bytes) noexcept {
+        span<io_vector_t> const vectors {connection.send_vectors};
+        std::size_t const budget = connection.network_interface->send_buffer_bytes;
+        std::size_t count = 0;
+        for (server_exchange_t* exchange = connection.oldest_exchange; exchange; exchange = exchange->next_queued) {
+            adopt_segments(*exchange);
+            if (exchange->reply_head == reply_head_t::held_k || exchange->oldest_file_segment) return count;
+            for (reply_segment_t* segment = exchange->oldest_segment; segment;
+                 segment = segment == exchange->newest_segment ? nullptr : segment->next) {
+                std::size_t const size = segment->bytes.size();
+                if (!size) continue;
+                if (!sends_copying(connection, size) || count == vectors.size() || (count && bytes + size > budget))
+                    return count;
+                vectors[count++] = {segment->bytes.data(), size};
+                bytes += size;
+            }
+            if (exchange->stage != exchange_stage_t::ended_k || exchange == connection.streaming ||
+                !exchange->message.keep_alive())
+                return count;
+        }
+        return count;
+    }
+
+    /** One copying send of the reply segments @c gather_segments points at, each sealed in place
+     *  first; null where the connection gathers nothing or fewer than two are ready, leaving the
+     *  front one to @c send_segment, or where sealing failed the connection. */
+    static io_request_t* send_gathered(connection_t& connection) noexcept {
+        if (connection.send_vectors.size() < 2 || connection.transport.output_offset) return nullptr;
+        std::size_t bytes = 0;
+        std::size_t const count = gather_segments(connection, bytes);
+        if (count < 2) return nullptr;
+        span<io_vector_t> const vectors {connection.send_vectors.data(), count};
+        for (io_vector_t const& segment : vectors)
+            if (ucall_status_t const sealed = connection.transport.seal_records(
+                    {static_cast<byte_t*>(segment.iov_base), segment.iov_len});
+                sealed != ucall_status_success_k) {
+                connection.transport.fail(sealed);
+                return nullptr;
+            }
+        return connection.transport.emit_send_vectors(vectors, bytes);
+    }
+
+    /** Credits a gathered send the socket took, whose bytes its segments take in order. */
+    static void complete_gathered_send(connection_t& connection, io_completion_t const& completion) noexcept {
+        if (completion.result > 0) connection.uncredited_bytes += static_cast<std::size_t>(completion.result);
+    }
+
     /** The next socket request of the oldest reply, taking these steps in turn: finish a partial
-     *  send; retire what was sent; wait for a deferred head or a stream's release; send the front
-     *  memory segment; or, for a file segment, send its chunk framing, its windows in file order,
-     *  each followed by its release, and its closing framing. Null once nothing can proceed, or
-     *  the connection failed. */
+     *  send, once what a gathered one took is credited; retire what was sent; wait for a deferred
+     *  head or a stream's release; send the memory segments ready from the front one, gathered
+     *  into one send where several are; or, for a file segment, send its chunk framing, its
+     *  windows in file order, each followed by its release, and its closing framing. Null once
+     *  nothing can proceed, or the connection failed. */
     static io_request_t* transmit_reply(event_loop_t& event_loop, connection_t& connection) noexcept {
         for (;;) {
-            if (connection.transport.sending) return connection.transport.resume_send();
+            if (connection.transport.sending && !connection.uncredited_bytes) return connection.transport.resume_send();
             if (io_request_t* release = retire_sent_segments(event_loop, connection)) return release;
             auto* exchange = connection.oldest_exchange;
-            if (connection.transport.stage != transport_stage_t::open_k || !exchange || !exchange->oldest_segment ||
-                exchange->reply_head == reply_head_t::held_k ||
+            if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
+            if (connection.transport.sending) {
+                connection.transport.transmitting = transmit_state_t::sending_k;
+                return connection.transport.resume_send();
+            }
+            if (!exchange || !exchange->oldest_segment || exchange->reply_head == reply_head_t::held_k ||
                 exchange->releases[exchange->naming].state == release_state_t::releasing_k)
                 return nullptr;
             connection.transport.transmitting = transmit_state_t::sending_k;
             auto& bytes = exchange->oldest_segment->bytes;
             file_segment_t* file_segment = front_file_segment(*exchange);
-            if (!file_segment) return send_segment(connection, *exchange, bytes);
+            if (!file_segment) {
+                if (io_request_t* gathered = send_gathered(connection)) return gathered;
+                if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
+                return send_segment(connection, *exchange, bytes);
+            }
             switch (file_segment->stage) {
             case file_segment_stage_t::measured_k: break;
             case file_segment_stage_t::not_found_k:
@@ -1336,6 +1419,7 @@ struct replies {
                 serving_t::free_exchange(event_loop, exchange);
         }
         if (completion.result > 0) connection->send_mode = send_mode_t::copying_k;
+        else if (connection->send_mode == send_mode_t::probing_k) connection->send_mode = send_mode_t::zero_copy_k;
         if (!connection->outstanding_releases()) {
             if (connection->transport.stage == transport_stage_t::releasing_k)
                 connection->transport.stage = transport_stage_t::closing_k;

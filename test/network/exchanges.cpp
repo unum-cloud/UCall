@@ -163,10 +163,11 @@ static void test_server_kk_wrong_initiator(sweep_cell_t const& cell) {
     fixture.stop();
 }
 
-/** A request retained on one loop does not stall a call the other loop serves meanwhile. */
+/** A request retained on one loop does not stall a call served meanwhile, under a budget whose
+ *  share leaves room on whichever loop the kernel hands the second connection. */
 static case_result_t test_multiloop_retention(sweep_cell_t const& cell) {
     if (UCALL_OS_WINDOWS_) return case_result_t::skipped(loops_refused_k);
-    fixture_t fixture {cell, {.event_loops = 2, .connections = 2}};
+    fixture_t fixture {cell, {.event_loops = 2, .connections = 4}};
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
         return {};
     ucall_outcome_t outcome {};
@@ -958,6 +959,135 @@ static void test_pipelined_burst(sweep_cell_t const& cell, split_mix_generator_t
         expect_true(answered == count, "{} of {} pipelined requests were answered in order", answered, count);
         fixture.stop();
     }
+}
+
+/** The pipelined echo requests @p bodies ask for, back to back. */
+static std::string echo_burst(std::vector<std::string> const& bodies) {
+    std::string burst;
+    for (std::size_t i = 0; i != bodies.size(); ++i)
+        burst += fmt::format("POST /echo/{} HTTP/1.1\r\nHost: a\r\nContent-Length: {}\r\n\r\n{}", i, bodies[i].size(),
+                             bodies[i]);
+    return burst;
+}
+
+/** Reads from @p offset on the echoes of @p bodies, answering how many arrived whole and in order
+ *  before the first that did not, and moving @p offset past them. */
+static std::size_t read_echoes(raw_client_t& client, std::vector<std::string> const& bodies, std::size_t& offset) {
+    std::size_t answered = 0;
+    for (; answered != bodies.size(); ++answered) {
+        auto const response = read_response(client, offset);
+        if (response.status != 200 || response.body != bodies[answered]) break;
+        offset += response.length;
+    }
+    return answered;
+}
+
+/** Sixteen echoes pipelined in one segment, whose replies the loop finishes in the pass that
+ *  parses them, leave in at most half as many sends as requests, each copying as shorter than a
+ *  page, and arrive in order byte for byte. */
+static void test_pipelined_replies_gathered(sweep_cell_t const& cell) {
+    std::size_t const count = 16;
+    fixture_t fixture {cell, {.pipelined_requests = count}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    std::vector<std::string> bodies(count);
+    for (std::size_t i = 0; i != count; ++i) bodies[i] = fmt::format("reply {} of {}", i, count);
+    std::string const burst = echo_burst(bodies);
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    // A connection pins its replies until the first release tells whether the kernel copies, so
+    // lone echoes go first until one leaves without pinning.
+    std::string_view const probe = "GET /echo/probe HTTP/1.1\r\nHost: a\r\n\r\n";
+    std::size_t offset = 0;
+    bool probed = false;
+    for (auto const deadline = steady_clock::now() + wait_limit_k; !probed && steady_clock::now() < deadline;) {
+        ucall_event_loop_statistics_t const sent_before = loop_statistics(fixture);
+        expect_true(::send(client.descriptor, probe.data(), probe.size(), 0) == static_cast<ssize_t>(probe.size()));
+        auto const response = read_response(client, offset);
+        if (!expect_true(response.status == 200, "a probing echo answered {}", response.status)) return;
+        offset += response.length;
+        ucall_event_loop_statistics_t const sent_after = loop_statistics(fixture);
+        probed = sent_after.zero_copy_sends == sent_before.zero_copy_sends &&
+                 sent_after.copying_sends != sent_before.copying_sends;
+    }
+    if (!expect_true(probed, "every probing echo left pinned")) return;
+    ucall_event_loop_statistics_t const before = loop_statistics(fixture);
+    // One send, so the loop parses every request in one pass and the echoes reply together.
+    expect_true(::send(client.descriptor, burst.data(), burst.size(), 0) == static_cast<ssize_t>(burst.size()));
+    std::size_t const answered = read_echoes(client, bodies, offset);
+    expect_true(answered == count, "{} of {} pipelined replies arrived in order", answered, count);
+    // A request past the pipeline's depth is read once the burst's sends completed, so its reply
+    // arrives after the loop counted every one of them.
+    std::string_view const behind = "GET /echo/behind HTTP/1.1\r\nHost: a\r\n\r\n";
+    expect_true(::send(client.descriptor, behind.data(), behind.size(), 0) == static_cast<ssize_t>(behind.size()));
+    expect_true(read_response(client, offset).status == 200, "the request behind the burst was not answered");
+    ucall_event_loop_statistics_t const after = loop_statistics(fixture);
+    std::uint64_t const requests = after.requests - before.requests;
+    std::uint64_t const copying = after.copying_sends - before.copying_sends;
+    std::uint64_t const pinned = after.zero_copy_sends - before.zero_copy_sends;
+    expect_true(requests == count + 1, "{} requests dispatched for {}", requests, count + 1);
+    expect_true(copying && !pinned && 2 * copying <= count, "{} copying and {} zero-copy sends for {} replies", copying,
+                pinned, count);
+    fixture.stop();
+}
+
+/** Echoes @p count pipelined bodies of @p body_bytes each through a server accepting on
+ *  @p listener, reading them only once every request was written. */
+static void echo_unread_burst(sweep_cell_t const& cell, split_mix_generator_t& generator, int listener,
+                              std::size_t count, std::size_t body_bytes) {
+    std::intptr_t const handed = listener;
+    fixture_t fixture {cell, {.pipelined_requests = count, .listen_descriptor = &handed}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    std::vector<std::string> bodies(count);
+    for (std::size_t i = 0; i != count; ++i) {
+        bodies[i] = fmt::format("{:08}", i);
+        while (bodies[i].size() != body_bytes) bodies[i].push_back(static_cast<char>('a' + generator.below(26)));
+    }
+    std::string const burst = echo_burst(bodies);
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    // The loop reads every request while its replies wait on the window this client keeps shut.
+    expect_true(client.write(byte_span(burst), 65536, generator, steady_clock::now() + wait_limit_k),
+                "the burst was not written");
+    std::size_t offset = 0;
+    std::size_t const answered = read_echoes(client, bodies, offset);
+    expect_true(answered == count, "{} of {} pipelined replies arrived in order", answered, count);
+    fixture.stop();
+}
+
+/** Pipelined echoes of three kilobytes each, read only once all were written, outgrow the client's
+ *  receive buffer and a server send buffer of two replies, which bounds each gathered send, so the
+ *  gathered sends that meet the buffer full wait for room or go in part, and the loop resumes each
+ *  where it stopped, while the replies arrive whole and in order. Whether one goes in part depends
+ *  on where the kernel's segments end, so @c test_gathered_send asserts the parts. */
+static void test_gathered_replies_resume(sweep_cell_t const& cell, split_mix_generator_t& generator) {
+    std::size_t const body_bytes = 3000;
+    // A client that has not read yet takes at most its receive buffer, as only reads grow it.
+    int receive_bytes = 0, send_bytes = 0;
+    util::socket_length_t length = sizeof(receive_bytes);
+    int const probe = ::socket(AF_INET, SOCK_STREAM, 0);
+    bool const measured = probe >= 0 && ::getsockopt(probe, SOL_SOCKET, SO_RCVBUF, &receive_bytes, &length) == 0;
+    if (probe >= 0) ::close(probe);
+    if (!expect_true(measured, "the receive buffer went unmeasured")) return;
+    // Accepted sockets inherit the listener's send buffer, which the loop also reads as its budget
+    // for one gathered send; the kernel doubles what is asked for its own bookkeeping.
+    int const listener = ::socket(AF_INET, SOCK_STREAM, 0);
+    if (!expect_true(listener >= 0, "the listener was not opened")) return;
+    int const asked_send_bytes = static_cast<int>(2 * body_bytes);
+    sockaddr_in loopback {};
+    loopback.sin_family = AF_INET;
+    loopback.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    length = sizeof(send_bytes);
+    if (expect_true(::setsockopt(listener, SOL_SOCKET, SO_SNDBUF, &asked_send_bytes, sizeof(asked_send_bytes)) == 0 &&
+                        ::getsockopt(listener, SOL_SOCKET, SO_SNDBUF, &send_bytes, &length) == 0 &&
+                        ::bind(listener, reinterpret_cast<sockaddr const*>(&loopback), sizeof(loopback)) == 0 &&
+                        ::listen(listener, 1) == 0,
+                    "the listener could not be set up"))
+        // The fewest replies past both buffers, and one gathered send more, which cannot fit whole.
+        echo_unread_burst(cell, generator, listener,
+                          static_cast<std::size_t>(receive_bytes + 2 * send_bytes) / body_bytes + 1, body_bytes);
+    ::close(listener);
 }
 
 /** A request whose peer left lives until answered, so once a loop holds as many of those as it
@@ -2005,6 +2135,8 @@ void test_exchanges_cell(sweep_cell_t const& cell, split_mix_generator_t& genera
         test_cross_thread_teardown_delivery(cell, generator);
         test_drain_closes_listener(cell, generator);
         test_pipelined_burst(cell, generator);
+        test_pipelined_replies_gathered(cell);
+        test_gathered_replies_resume(cell, generator);
         test_orphaned_exchanges_bounded(cell, generator);
         test_interface_listen_descriptor(cell, generator);
         test_configuration_byte_views(cell);
