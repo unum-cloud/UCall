@@ -275,13 +275,13 @@ class MalformedError(Error, ValueError):
 class InternalError(Error):
     """The library violated its contract, which points at a defect."""
 
-class OverflowError(Error, builtins.OverflowError):
+class CapacityOverflowError(Error, OverflowError):
     """A requested size exceeds the representable range."""
 
 class UninitializedError(Error):
     """The call needs a handle that was never initialized."""
 
-class ContendedError(Error):
+class ContendedError(Error, BufferError):
     """The call was refused rather than waited for, like a submission to a full client."""
 
 class UnsupportedError(Error, NotImplementedError):

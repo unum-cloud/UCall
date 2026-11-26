@@ -375,8 +375,8 @@ An `http+noise://` URL implies Noise XX, and a handler reads the client's authen
 ## Errors
 
 A failed operation raises `ucall.Error`, a `RuntimeError` whose `status` is the `ucall.Status` it reported and whose `message` is a static detail beside it.
-Each failing status raises a subclass of its own, named after the status, such as `ucall.ConnectionFailedError` or `ucall.NotFoundError`.
-Where a built-in exception names the same fault, the subclass derives it too: `ConnectionError` for connection failures, `TimeoutError`, `MemoryError`, `OSError`, `ValueError` for invalid or malformed input, `KeyError`, `NotImplementedError`, `OverflowError` and `BlockingIOError`.
+Each failing status raises a subclass of its own, named after the status, such as `ucall.ConnectionFailedError` or `ucall.NotFoundError`; `overflow` raises `ucall.CapacityOverflowError`, so the built-in name stays free.
+Where a built-in exception names the same fault, the subclass derives it too: `ConnectionError` for connection failures, `TimeoutError`, `MemoryError`, `OSError`, `ValueError` for invalid or malformed input, `KeyError`, `NotImplementedError`, `OverflowError`, `BufferError` for a contended call and `BlockingIOError`.
 `str(error)` joins the two, as in "CONNECTION_FAILED: connection-failed".
 Arguments of the wrong type raise `TypeError`, a key of the wrong length or an unknown enum name raises `ValueError`, and a reply while views over the body are alive raises `BufferError`.
 
