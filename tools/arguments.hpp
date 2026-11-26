@@ -9,6 +9,8 @@
 #include <cstddef> // `std::size_t`
 #include <cstdint> // `std::uint32_t`, `std::uint64_t`
 #include <cstdio>  // `std::FILE`
+#include <cstdlib> // `std::getenv`, `std::exit`
+#include <cstring> // `std::strncmp`
 
 #include <charconv>     // `std::from_chars`
 #include <chrono>       // `std::chrono::nanoseconds`
@@ -31,6 +33,25 @@ using util::bytes_view;
 
 /** The exit status of a run a signal stopped, as shells report a command SIGINT ended. */
 inline constexpr int exit_stopped_k = 130;
+
+/** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
+[[noreturn]] inline void exit_unparsed(char const* variable, char const* text, char const* expected) noexcept {
+    fmt::println(stderr, "{}=\"{}\" does not parse, expected {}", variable, text, expected);
+    std::exit(1);
+}
+
+/** The text of a setting: its @p flag when given, else its environment @p variable , else null. */
+inline char const* setting_text(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
+    for (int index = 1; index < argc; ++index) {
+        std::string_view const argument {argv[index]};
+        if (argument == flag)
+            return index + 1 < argc && std::strncmp(argv[index + 1], "--", 2) != 0 ? argv[index + 1] : "1";
+        if (argument.size() > flag.size() && argument.starts_with(flag) && argument[flag.size()] == '=')
+            return argv[index] + flag.size() + 1;
+    }
+    char const* text = std::getenv(variable);
+    return text && *text ? text : nullptr;
+}
 
 /** A whole decimal @p text of at least @p minimum, left unchanged in @p value when it fails. */
 inline bool parse_count(std::string_view text, std::size_t& value, std::size_t minimum = 0) noexcept {

@@ -94,6 +94,9 @@ struct fixture_config_t {
 
     /** A listener the caller bound, which the server accepts on through duplicates, or none. */
     std::intptr_t const* listen_descriptor = nullptr;
+
+    /** How the server's replies of a page or more leave, copied to this host's peers by default. */
+    ucall_send_policy_t send_policy = ucall_send_policy_automatic_k;
 };
 
 /** The global tags a fixture reporting metrics attaches to every line. */
@@ -325,6 +328,7 @@ struct fixture_t {
         ucall_bytes_view_t const directory = bytes_view(settings.directory);
         network_interface.reply_directories = &directory;
         network_interface.reply_directories_count = settings.directory.empty() ? 0 : 1;
+        network_interface.send_policy = settings.send_policy;
         ucall_server_options_t config {};
         config.interfaces = &network_interface;
         config.interfaces_count = 1;

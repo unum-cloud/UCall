@@ -120,28 +120,69 @@ struct replies {
             .release();
     }
 
+    /** A fresh segment for @p exchange's replier, linked as the newest of @p batch. */
+    static reply_segment_t* take_batch_segment(server_exchange_t& exchange, reply_batch_t& batch) noexcept {
+        reply_segment_t* segment = take_segment(exchange);
+        if (!segment) return nullptr;
+        segment->caller_bytes = {};
+        segment->next = batch.newest_segment;
+        batch.newest_segment = segment;
+        if (!batch.oldest_segment) batch.oldest_segment = segment;
+        return segment;
+    }
+
+    /** Frames @p texts into a fresh record held in @p batch. */
+    static ucall_status_t frame_batch_segment(server_exchange_t& exchange, reply_batch_t& batch,
+                                              std::initializer_list<std::string_view> texts) noexcept {
+        reply_segment_t* segment = take_batch_segment(exchange, batch);
+        if (!segment) return ucall_status_out_of_memory_k;
+        ucall_status_t const framed = formatting_t::frame_segment(segment->bytes, exchange.geometry, texts);
+        if (framed == ucall_status_success_k) batch.bytes += segment->bytes.size();
+        return framed;
+    }
+
     /** Frames one bytes part into a fresh record held in @p batch, copied as the exchange's framing
      *  asks, unless it is bodiless or empty, and adds its bytes to @c streamed. */
     static ucall_status_t frame_bytes_part(server_exchange_t& exchange, std::string_view data,
                                            reply_batch_t& batch) noexcept {
         exchange.streamed += data.size();
         if (data.empty() || exchange.framing == reply_framing_t::bodiless_k) return ucall_status_success_k;
-        reply_segment_t* segment = take_segment(exchange);
-        if (!segment) return ucall_status_out_of_memory_k;
-        segment->next = batch.newest_segment;
-        batch.newest_segment = segment;
-        if (!batch.oldest_segment) batch.oldest_segment = segment;
         char digits[sizeof(std::size_t) * 2];
         auto written = std::to_chars(digits, digits + sizeof(digits), data.size(), 16);
         std::string_view const size {digits, static_cast<std::size_t>(written.ptr - digits)};
         ucall_status_t const framed = exchange.framing == reply_framing_t::chunked_k
-                                          ? formatting_t::frame_segment(segment->bytes, exchange.geometry,
-                                                                        {size, "\r\n", data, "\r\n"})
-                                          : formatting_t::frame_segment(segment->bytes, exchange.geometry, {data});
-        if (framed != ucall_status_success_k) return framed;
-        batch.bytes += segment->bytes.size();
-        batch.copied += data.size();
-        return ucall_status_success_k;
+                                          ? frame_batch_segment(exchange, batch, {size, "\r\n", data, "\r\n"})
+                                          : frame_batch_segment(exchange, batch, {data});
+        if (framed == ucall_status_success_k) batch.copied += data.size();
+        return framed;
+    }
+
+    /** Queues one memory part in @p batch as a segment sending the caller's bytes in place, between
+     *  the size line and line break of its chunk when the reply is chunked, unless it is bodiless
+     *  or empty, and adds its bytes to @c streamed. Under Noise it frames as a bytes part, as
+     *  sealing writes the records it sends. */
+    static ucall_status_t frame_memory_part(server_exchange_t& exchange, std::string_view data,
+                                            reply_batch_t& batch) noexcept {
+        if (exchange.geometry.tailroom) return frame_bytes_part(exchange, data, batch);
+        exchange.streamed += data.size();
+        if (data.empty() || exchange.framing == reply_framing_t::bodiless_k) return ucall_status_success_k;
+        bool const chunked = exchange.framing == reply_framing_t::chunked_k;
+        char digits[sizeof(std::size_t) * 2];
+        auto written = std::to_chars(digits, digits + sizeof(digits), data.size(), 16);
+        std::string_view const size {digits, static_cast<std::size_t>(written.ptr - digits)};
+        if (chunked)
+            if (ucall_status_t const framed = frame_batch_segment(exchange, batch, {size, "\r\n"});
+                framed != ucall_status_success_k)
+                return framed;
+        reply_segment_t* segment = take_batch_segment(exchange, batch);
+        if (!segment) return ucall_status_out_of_memory_k;
+        segment->bytes.clear();
+        // A queue request names one mutable pointer for receives and sends alike, and sends only
+        // read the caller's memory through it.
+        segment->caller_bytes = {std::bit_cast<byte_t*>(data.data()), data.size()};
+        batch.bytes += data.size();
+        ++exchange.memory_parts;
+        return chunked ? frame_batch_segment(exchange, batch, {"\r\n"}) : ucall_status_success_k;
     }
 
     /** Aims @p record at the caller's open @p file. */
@@ -197,14 +238,16 @@ struct replies {
     }
 
     /** Frames @p parts into fresh records held in @p batch: bytes parts copied as the
-     *  exchange's framing asks, unless it is bodiless, and file and path parts as file
-     *  segments. Adds the bytes to @c streamed, and the ranges too unless the loop measures
-     *  them for a deferred head. */
+     *  exchange's framing asks, unless it is bodiless, memory parts sent from the caller's
+     *  memory, and file and path parts as file segments. Adds the bytes to @c streamed, and the
+     *  ranges too unless the loop measures them for a deferred head. */
     static ucall_status_t build_reply_batch(server_exchange_t& exchange, span<ucall_reply_part_t const> parts,
                                             reply_batch_t& batch) noexcept {
         for (ucall_reply_part_t const& part : parts) {
             ucall_status_t const framed = part.kind == ucall_reply_part_bytes_k
                                               ? frame_bytes_part(exchange, text_view(part.data.bytes), batch)
+                                          : part.kind == ucall_reply_part_memory_k
+                                              ? frame_memory_part(exchange, text_view(part.data.memory), batch)
                                               : frame_file_part(exchange, part, batch);
             if (framed != ucall_status_success_k) return framed;
         }
@@ -262,22 +305,41 @@ struct replies {
         if (newest) push_segments(exchange, *newest, *oldest);
     }
 
-    /** Queues a reply whose file segments the loop must measure before its head: the head without
-     *  its framing in @c head_segment, the parts, and an empty @c end_segment. The outcome reads
-     *  deferred before the loop can see the reply, which then makes it final. */
-    static ucall_status_t queue_measured_reply(server_exchange_t& exchange, ucall_outcome_t* outcome, unsigned status,
-                                               span<ucall_bytes_view_t const> headers,
-                                               span<ucall_reply_part_t const> parts) noexcept {
-        exchange.framing = exchange.message.verb == ucall_verb_head_k ? reply_framing_t::bodiless_k
-                                                                      : reply_framing_t::length_k;
-        exchange.reply_head = reply_head_t::held_k;
+    /** Completes the head of a reply whose @p length is known, laid out as whole records. */
+    static ucall_status_t finish_known_head(server_exchange_t& exchange, reply_framing_t framing,
+                                            std::uint64_t length) noexcept {
+        auto& head = exchange.head_segment.bytes;
+        ucall_status_t result = formatting_t::finish_reply_head(head, exchange, framing, length);
+        if (result == ucall_status_success_k) result = formatting_t::spread_records(head, exchange.geometry);
+        if (result == ucall_status_success_k && st::failed(head.resize(head.size() + exchange.geometry.tailroom)))
+            result = ucall_status_out_of_memory_k;
+        return result;
+    }
+
+    /** Queues a reply whose parts the loop reads after the call returns: the head in
+     *  @c head_segment, the parts, and an empty @c end_segment. With @p files, the loop measures
+     *  their segments before it completes the head; memory parts alone leave it whole. The outcome
+     *  reads deferred before the loop can see the reply, which then makes it final. */
+    static ucall_status_t queue_reply(server_exchange_t& exchange, ucall_outcome_t* outcome, unsigned status,
+                                      span<ucall_bytes_view_t const> headers, span<ucall_reply_part_t const> parts,
+                                      std::size_t files) noexcept {
+        bool const bodiless = status == 204 || status == 304;
+        exchange.framing = exchange.message.verb == ucall_verb_head_k || bodiless ? reply_framing_t::bodiless_k
+                                                                                  : reply_framing_t::length_k;
+        exchange.reply_head = files ? reply_head_t::held_k : reply_head_t::pushed_k;
         exchange.streamed = exchange.declared = 0;
         reply_batch_t batch {};
         auto& head = exchange.head_segment.bytes;
         ucall_status_t result = build_reply_batch(exchange, parts, batch);
+        if (result == ucall_status_success_k && bodiless && exchange.streamed) result = ucall_status_invalid_argument_k;
         if (result == ucall_status_success_k) result = formatting_t::write_reply_head(head, exchange.geometry, status);
         if (result == ucall_status_success_k)
             result = formatting_t::append_headers(head, headers, http_role_t::response_k);
+        if (result == ucall_status_success_k && !files) {
+            exchange.declared = exchange.streamed;
+            result = finish_known_head(exchange, bodiless ? reply_framing_t::bodiless_k : reply_framing_t::length_k,
+                                       exchange.declared);
+        }
         if (result != ucall_status_success_k) {
             head.clear();
             discard_reply_batch(exchange, batch);
@@ -292,12 +354,12 @@ struct replies {
     }
 
     /** Answers @p exchange with @p parts. Bytes alone are serialized whole and final on return;
-     *  with any file or path part the reply is queued, and the outcome reads deferred until the
-     *  loop sent every part. */
+     *  with any memory, file or path part the reply is queued, and the outcome reads deferred until
+     *  the loop sent every part and the kernel let go of them. */
     static ucall_status_t reply(server_exchange_t& exchange, ucall_outcome_t* outcome, unsigned status,
                                 span<ucall_bytes_view_t const> headers, span<ucall_reply_part_t const> parts) noexcept {
-        std::size_t files = 0;
-        if (ucall_status_t const checked = formatting_t::check_parts(exchange, parts, files);
+        std::size_t files = 0, memory_parts = 0;
+        if (ucall_status_t const checked = formatting_t::check_parts(exchange, parts, files, memory_parts);
             checked != ucall_status_success_k)
             return checked;
         if (files && (status == 204 || status == 304)) return ucall_status_invalid_argument_k;
@@ -311,8 +373,8 @@ struct replies {
             abandon_reply(exchange);
             return ucall_status_connection_closed_k;
         }
-        auto result = files ? queue_measured_reply(exchange, outcome, status, headers, parts)
-                            : formatting_t::serialize_reply(exchange, status, headers, parts);
+        auto result = files || memory_parts ? queue_reply(exchange, outcome, status, headers, parts, files)
+                                            : formatting_t::serialize_reply(exchange, status, headers, parts);
         if (result == ucall_status_deferred_k) return result;
         if (result != ucall_status_success_k) {
             state.clear_bits(claimed_k, std::memory_order_release);
@@ -338,6 +400,7 @@ struct replies {
             return ucall_status_already_exists_k;
         exchange.reply_status = static_cast<std::uint16_t>(status);
         exchange.declared = exchange.streamed = 0;
+        exchange.memory_parts = 0;
         exchange.framing = reply_framing_t::bodiless_k;
         exchange.reply_head = reply_head_t::pushed_k;
         // A peer that left takes no body, so the reply ends here, as a whole reply's would.
@@ -396,18 +459,20 @@ struct replies {
                                              span<ucall_reply_part_t const> parts) noexcept {
         std::uint32_t const state = atomic_ref<std::uint32_t> {exchange.shared.state}.load(std::memory_order_acquire);
         if (!(state & claimed_k) || (state & replied_k)) return ucall_status_invalid_argument_k;
-        std::size_t files = 0;
-        if (ucall_status_t const checked = formatting_t::check_parts(exchange, parts, files);
+        std::size_t files = 0, memory_parts = 0;
+        if (ucall_status_t const checked = formatting_t::check_parts(exchange, parts, files, memory_parts);
             checked != ucall_status_success_k)
             return checked;
         if ((state & detached_k) || formatting_t::server_stage(exchange) == server_stage_t::cutting_k)
             return ucall_status_connection_closed_k;
         std::uint64_t length = 0;
         for (ucall_reply_part_t const& part : parts) {
-            std::uint64_t const size = part.kind == ucall_reply_part_bytes_k  ? part.data.bytes.length
-                                       : part.kind == ucall_reply_part_file_k ? part.data.file.length
-                                                                              : part.data.path.length;
-            if (part.kind != ucall_reply_part_bytes_k && !size && exchange.framing == reply_framing_t::length_k)
+            std::uint64_t const size = part.kind == ucall_reply_part_bytes_k    ? part.data.bytes.length
+                                       : part.kind == ucall_reply_part_memory_k ? part.data.memory.length
+                                       : part.kind == ucall_reply_part_file_k   ? part.data.file.length
+                                                                                : part.data.path.length;
+            bool const ranged = part.kind == ucall_reply_part_file_k || part.kind == ucall_reply_part_path_k;
+            if (ranged && !size && exchange.framing == reply_framing_t::length_k)
                 return ucall_status_invalid_argument_k;
             if (size > (std::numeric_limits<std::uint64_t>::max)() - length) return ucall_status_overflow_k;
             length += size;
@@ -455,10 +520,11 @@ struct replies {
             end_segment.bytes.clear();
             exchange.message.connection = http_connection_t::close_k;
         }
-        // The loop may still read a caller-owned descriptor, so the loop reports how the reply
-        // ended, unless the peer left, when the loop reads none and may have retired.
+        // The loop may still read a caller-owned descriptor, and the kernel caller memory, so the
+        // loop reports how the reply ended, unless the peer left, when neither reads any longer.
         if (!(state.load(std::memory_order_acquire) & detached_k) &&
-            atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.load(std::memory_order_acquire)) {
+            (exchange.memory_parts ||
+             atomic_ref<std::uint32_t> {exchange.shared.unsent_file_segments}.load(std::memory_order_acquire))) {
             publish<atomic_ref>(outcome, ucall_status_deferred_k);
             exchange.outcome = outcome;
             result = ucall_status_deferred_k;
@@ -590,7 +656,7 @@ struct replies {
      *  named a release the kernel has not completed. */
     static void retire_segment(server_exchange_t& exchange, reply_segment_t& segment) noexcept {
         if (&segment == &exchange.head_segment || &segment == &exchange.end_segment) return;
-        atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.store_sub(segment.bytes.size(),
+        atomic_ref<std::size_t> {exchange.shared.unsent_bytes}.store_sub(segment.outgoing_size(),
                                                                          std::memory_order_relaxed);
         if (&segment == exchange.newest_segment && replier_links(exchange)) {
             exchange.parked_segment = &segment;
@@ -733,7 +799,7 @@ struct replies {
     /** Whether the segment leading @p exchange's queue is all sent: a memory segment once sends
      *  took its bytes, a file segment once its framing and every window of its range did. */
     static bool front_segment_sent(connection_t const& connection, server_exchange_t const& exchange) noexcept {
-        std::size_t const size = exchange.oldest_segment->bytes.size();
+        std::size_t const size = exchange.oldest_segment->outgoing_size();
         file_segment_t const* file_segment = front_file_segment(exchange);
         if (!file_segment) return connection.transport.output_offset == size;
         return file_segment->stage == file_segment_stage_t::measured_k && !file_segment->remaining_bytes &&
@@ -755,7 +821,7 @@ struct replies {
     /** Credits the front memory segment of @p exchange with what gathered sends took of it, which
      *  they took in the order the segments retire. */
     static void credit_front_segment(connection_t& connection, server_exchange_t const& exchange) noexcept {
-        std::size_t const unsent = exchange.oldest_segment->bytes.size() - connection.transport.output_offset;
+        std::size_t const unsent = exchange.oldest_segment->outgoing_size() - connection.transport.output_offset;
         std::size_t const credited = fu::min_of(unsent, connection.uncredited_bytes);
         connection.transport.output_offset += credited;
         connection.uncredited_bytes -= credited;
@@ -894,9 +960,10 @@ struct replies {
     }
 
     /** Breaks off a reply whose head already left: the close resets the connection, so the peer
-     *  never takes the truncated body for a whole one, and the reply's outcome reports @p cause. */
+     *  never takes the truncated body for a whole one, and the reply's outcome reports @p cause
+     *  once the exchange recycles and the kernel let go of what it sent. */
     static void fail_reply(connection_t& connection, server_exchange_t& exchange, ucall_status_t cause) noexcept {
-        publish_reply_outcome(exchange, cause);
+        if (exchange.ended_status == ucall_status_deferred_k) exchange.ended_status = cause;
         connection.transport.close_mode = close_mode_t::reset_k;
         connection.transport.fail(cause);
     }
@@ -1202,13 +1269,10 @@ struct replies {
         return submit_file_read(event_loop, connection, *file_segment, window);
     }
 
-    /** Whether a segment send of @p bytes copies: any once the socket was demoted, or one shorter
-     *  than a page, whose pinning, kernel notification and release cost more than the copy, once a
-     *  first release told whether the kernel copies, so a socket that does demotes before the sends
-     *  of a file's windows wait on their notifications. */
+    /** Whether a segment send of @p bytes copies: one shorter than a page, whose pinning, kernel
+     *  notification and release cost more than the copy, or any once the socket copies. */
     static bool sends_copying(connection_t const& connection, std::size_t bytes) noexcept {
-        return connection.send_mode == send_mode_t::copying_k ||
-               (connection.send_mode == send_mode_t::zero_copy_k && bytes < page_size());
+        return connection.send_mode == send_mode_t::copying_k || bytes < page_size();
     }
 
     /** Starts sending @p bytes of @p exchange's front segment, sealing its records first; a send
@@ -1279,11 +1343,12 @@ struct replies {
             if (exchange->reply_head == reply_head_t::held_k || exchange->oldest_file_segment) return count;
             for (reply_segment_t* segment = exchange->oldest_segment; segment;
                  segment = segment == exchange->newest_segment ? nullptr : segment->next) {
-                std::size_t const size = segment->bytes.size();
+                span<byte_t> const outgoing = segment->outgoing();
+                std::size_t const size = outgoing.size();
                 if (!size) continue;
                 if (!sends_copying(connection, size) || count == vectors.size() || (count && bytes + size > budget))
                     return count;
-                vectors[count++] = {segment->bytes.data(), size};
+                vectors[count++] = {outgoing.data(), size};
                 bytes += size;
             }
             if (exchange->stage != exchange_stage_t::ended_k || exchange == connection.streaming ||
@@ -1291,6 +1356,17 @@ struct replies {
                 return count;
         }
         return count;
+    }
+
+    /** What the next send of a front memory @p segment takes: in plaintext, the rest of it up to
+     *  the largest send buffer the socket grows to, since an unregistered zero-copy send charges
+     *  its whole length to the locked-memory limit, while the socket takes no more at once anyway;
+     *  under Noise, the whole segment, whose records seal together. */
+    static span<byte_t> next_outgoing(connection_t const& connection, reply_segment_t& segment) noexcept {
+        span<byte_t> const outgoing = segment.outgoing();
+        if (connection.transport.tunnel.encrypts()) return outgoing;
+        span<byte_t> const rest = outgoing.subspan(connection.transport.output_offset);
+        return rest.first(fu::min_of(rest.size(), connection.network_interface->largest_send_buffer_bytes));
     }
 
     /** One copying send of the reply segments @c gather_segments points at, each sealed in place
@@ -1342,7 +1418,7 @@ struct replies {
             if (!file_segment) {
                 if (io_request_t* gathered = send_gathered(connection)) return gathered;
                 if (connection.transport.stage != transport_stage_t::open_k) return nullptr;
-                return send_segment(connection, *exchange, bytes);
+                return send_segment(connection, *exchange, next_outgoing(connection, *exchange->oldest_segment));
             }
             switch (file_segment->stage) {
             case file_segment_stage_t::measured_k: break;
@@ -1415,11 +1491,12 @@ struct replies {
             connection = exchange.connection;
             --connection->releasing_exchanges;
             return_released_segments(exchange, exchange.release_of(completion.request));
-            if (exchange.stage == exchange_stage_t::releasing_k && !exchange.releasing())
+            if (exchange.stage == exchange_stage_t::releasing_k && !exchange.releasing()) {
+                publish_reply_outcome(exchange, exchange.ended_status);
                 serving_t::free_exchange(event_loop, exchange);
+            }
         }
         if (completion.result > 0) connection->send_mode = send_mode_t::copying_k;
-        else if (connection->send_mode == send_mode_t::probing_k) connection->send_mode = send_mode_t::zero_copy_k;
         if (!connection->outstanding_releases()) {
             if (connection->transport.stage == transport_stage_t::releasing_k)
                 connection->transport.stage = transport_stage_t::closing_k;

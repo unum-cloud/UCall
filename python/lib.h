@@ -224,6 +224,9 @@ extern ucall_py_enum_mirror_t ucall_py_cpu_class_enum;
 /** The transport security modes, as `ucall.Security`. */
 extern ucall_py_enum_mirror_t ucall_py_security_enum;
 
+/** How an interface sends replies of a page or more, as @c ucall.SendPolicy. */
+extern ucall_py_enum_mirror_t ucall_py_send_policy_enum;
+
 /** The HTTP methods, as `ucall.Verb`. */
 extern ucall_py_enum_mirror_t ucall_py_verb_enum;
 
@@ -329,6 +332,9 @@ extern PyTypeObject FileType;
 
 /** @c ucall.Path, a byte range of a file beneath a reply directory, as a reply part. */
 extern PyTypeObject PathType;
+
+/** @c ucall.Memory, a buffer the event loop sends in place, as a reply part. */
+extern PyTypeObject MemoryType;
 
 /** @c ucall.Deferred, a reply still sending file or path parts. */
 extern PyTypeObject DeferredType;

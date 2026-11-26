@@ -196,8 +196,9 @@ static int enum_register(PyObject* module, PyObject* int_enum, PyObject* keyword
 
 int ucall_py_enums_register(PyObject* module) {
     ucall_py_enum_mirror_t* const mirrors[] = {
-        &ucall_py_status_enum, &ucall_py_backend_enum,       &ucall_py_cpu_class_enum, &ucall_py_security_enum,
-        &ucall_py_verb_enum,   &ucall_py_body_delivery_enum, &ucall_py_log_level_enum, &ucall_py_log_format_enum};
+        &ucall_py_status_enum,        &ucall_py_backend_enum,     &ucall_py_cpu_class_enum,
+        &ucall_py_security_enum,      &ucall_py_send_policy_enum, &ucall_py_verb_enum,
+        &ucall_py_body_delivery_enum, &ucall_py_log_level_enum,   &ucall_py_log_format_enum};
     PyObject* const enum_module = PyImport_ImportModule("enum");
     PyObject* const int_enum = enum_module ? PyObject_GetAttrString(enum_module, "IntEnum") : NULL;
     PyObject* const keywords = int_enum ? Py_BuildValue("{ss}", "module", "ucall") : NULL;
@@ -414,6 +415,7 @@ static struct {
     {"BodyChunks", &BodyChunksType},
     {"File", &FileType},
     {"Path", &PathType},
+    {"Memory", &MemoryType},
     {"Deferred", &DeferredType},
     {"ReplyStream", &ReplyStreamType},
     {"BatchEndpoint", &BatchEndpointType},

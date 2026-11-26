@@ -43,6 +43,16 @@ using utilities::span;
 /** Slots in an io_uring registered-buffer table, the kernel's @c IORING_MAX_REG_BUFFERS. */
 inline constexpr unsigned uring_registered_buffers_limit_k = 16384;
 
+/** Slots in an io_uring registered-file table, the kernel's @c IORING_MAX_FIXED_FILES. */
+inline constexpr std::size_t uring_registered_files_limit_k = std::size_t {1} << 20;
+
+/** Registered sockets a queue of @p capacity operations holds: one per operation, within the open
+ *  files the process may hold and the kernel's file table, both less the exit signal's slot, as a
+ *  table refused would refuse the ring. */
+inline std::size_t uring_socket_capacity(std::size_t capacity) noexcept {
+    return fu::min_of(fu::min_of(capacity, open_files_limit() - 1), uring_registered_files_limit_k - 1);
+}
+
 /** Why a queue's @c open answered @c ucall_status_unsupported_k before its ring existed. */
 inline constexpr char const* uring_setup_refusal_k =
     "io_uring ring setup failed: raise `ulimit -l`, free contiguous memory or pick linux-epollaio";
@@ -200,7 +210,6 @@ struct alignas(8) uring_operation {
 
     /** The record before this one on the list holding it, so a list unlinks it in place. */
     unsigned previous {absent_k};
-    std::uint64_t zero_copy_serial {}; // The serial `zero_copy_socket` had when the send left.
 
     /** For one connection of an accept, the slot it accepts into; else @c absent_k. */
     unsigned accepted {absent_k};
@@ -224,9 +233,6 @@ struct alignas(8) uring_operation {
         /** An accept anchor's accepts the kernel holds. */
         std::uint32_t accepting;
     };
-
-    /** The socket slot a release's latest send left through. */
-    unsigned zero_copy_socket {absent_k};
 
     /** Where the record stands, from the request taking it to its collection. */
     uring_operation_stage_t stage {uring_operation_stage_t::waiting_k};
@@ -1217,7 +1223,8 @@ struct uring_zero_copy {
      *  no release record is free, or another send naming the release is still in flight. */
     unsigned pair_release(operation_t& operation, operations_t& operations) noexcept {
         io_request_t* const named = operation.request->release_request;
-        if (operation.socket_slot->zero_copy == zero_copy_stage_t::copying_k || !named) return absent_k;
+        zero_copy_stage_t const stage = operation.socket_slot->zero_copy;
+        if (stage == zero_copy_stage_t::copying_k || stage == zero_copy_stage_t::refused_k || !named) return absent_k;
         unsigned release = collecting(*named, operations);
         if (release == absent_k) {
             auto* taken = operations.take_release(*named);
@@ -1245,8 +1252,6 @@ struct uring_zero_copy {
         ++release.outstanding_notifications;
         ++outstanding_notifications;
         release.paired_operation = operations.index_of(operation);
-        release.zero_copy_socket = owner->index;
-        release.zero_copy_serial = owner->serial;
         operation.paired_operation = operations.index_of(release);
         tally<atomic_ref_template_>(statistics.zero_copy_sends);
     }
@@ -1281,13 +1286,8 @@ struct uring_zero_copy {
                           socket_slots_t& socket_slots) noexcept {
         socket_slot_t* settled {};
         if (completion.flags & IORING_CQE_F_NOTIF) {
-            if (static_cast<std::uint32_t>(completion.res) & IORING_NOTIF_USAGE_ZC_COPIED) {
+            if (static_cast<std::uint32_t>(completion.res) & IORING_NOTIF_USAGE_ZC_COPIED)
                 tally<atomic_ref_template_>(statistics.zero_copy_fallbacks);
-                // A notification after the close must not demote whichever socket reuses the slot.
-                if (release.zero_copy_socket != absent_k &&
-                    socket_slots.records[release.zero_copy_socket].serial == release.zero_copy_serial)
-                    socket_slots.records[release.zero_copy_socket].zero_copy = zero_copy_stage_t::copying_k;
-            }
             --release.outstanding_notifications;
             --outstanding_notifications;
         }
@@ -1299,11 +1299,13 @@ struct uring_zero_copy {
                 --release.outstanding_notifications;
                 --outstanding_notifications;
             }
-            // The kernel refuses zero-copy with no notification to demote the socket: AF_UNIX has
-            // none, and pinning past the user's locked-memory limit fails with ENOMEM.
+            // The kernel refuses zero-copy with no notification: AF_UNIX has none, so its socket
+            // copies for good, while pinning past the locked-memory limit fails one send with
+            // ENOMEM, whose retry copies.
             if ((completion.res == -EOPNOTSUPP || completion.res == -ENOMEM) &&
                 send.stage != uring_operation_stage_t::cancelling_k) {
-                send.socket_slot->zero_copy = zero_copy_stage_t::copying_k;
+                send.socket_slot->zero_copy = completion.res == -ENOMEM ? zero_copy_stage_t::refused_k
+                                                                        : zero_copy_stage_t::copying_k;
                 tally<atomic_ref_template_>(statistics.zero_copy_fallbacks);
                 // The retry counts itself in flight again once submitted.
                 --operations.outstanding_operations;
@@ -1351,6 +1353,9 @@ void uring_prepare(io_uring_sqe* submission, typename operations_type_::operatio
         }
         io_uring_prep_send(submission, socket, request.data, sent, MSG_NOSIGNAL);
         tally<state_type_::template atomic_ref>(state.statistics.copying_sends);
+        // A send the kernel refused to pin copies once, and the socket's next send pins again.
+        if (operation.socket_slot->zero_copy == zero_copy_stage_t::refused_k)
+            operation.socket_slot->zero_copy = zero_copy_stage_t::untried_k;
         break;
     case io_operation_t::send_vectors_k: {
         // A socket keeps one send pending, so its slot holds the header the kernel reads.
@@ -1574,7 +1579,7 @@ template <typename queue_type_, typename... slot_arguments_type_>
     if (state.stage != uring_queue_stage_t::running_k || state.issuer != uring_issuer_t::unclaimed_k)
         return ucall_status_invalid_argument_k;
     if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
-    std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
+    std::size_t const sockets = uring_socket_capacity(capacity);
     std::destroy_at(&queue.operations);
     std::construct_at(&queue.operations, state.allocator);
     std::destroy_at(&queue.socket_slots);
@@ -1619,6 +1624,13 @@ template <typename queue_type_>
     if (!owner) return ucall_status_io_k;
     owner->close = close_mode_t::reset_k;
     return ucall_status_success_k;
+}
+
+/** Makes every later zero-copy send of @p descriptor copy, as delivery to a peer on this host
+ *  copies anyway; its releases then complete as soon as their sends do. */
+template <typename queue_type_>
+void uring_copy_sends(queue_type_& queue, descriptor_t descriptor) noexcept {
+    if (auto* owner = queue.socket_slots.find(descriptor)) owner->zero_copy = zero_copy_stage_t::copying_k;
 }
 
 /** Stops @p owner taking operations and cancels every unanswered one it owns but its close. */
@@ -1690,7 +1702,7 @@ struct linux_uring612_queue {
         /** Where the slot's registered descriptor stands. */
         uring_socket_stage_t stage {uring_socket_stage_t::vacant_k};
 
-        /** Untried, or copying once the kernel reported a send copied or refused zero-copy. */
+        /** Untried, or copying once the kernel refused zero-copy for the socket or for one send. */
         zero_copy_stage_t zero_copy {zero_copy_stage_t::untried_k};
 
         /** Whether the close sends a FIN or a reset. */
@@ -1705,7 +1717,7 @@ struct linux_uring612_queue {
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
     using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_>;
     using operation_t = typename operations_t::operation_t;
-    static_assert(sizeof(operation_t) == 64);
+    static_assert(sizeof(operation_t) == 56);
     static constexpr io_uring_op opcodes_k[] {
         IORING_OP_SOCKET,       IORING_OP_ACCEPT,       IORING_OP_CONNECT,   IORING_OP_RECV,
         IORING_OP_SEND,         IORING_OP_READ,         IORING_OP_SHUTDOWN,  IORING_OP_CLOSE,
@@ -1752,7 +1764,7 @@ struct linux_uring612_queue {
         if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
         if (state.stage != uring_queue_stage_t::idle_k) return ucall_status_invalid_argument_k;
         // Releases take no file, and the kernel registers no more files than descriptors.
-        std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
+        std::size_t const sockets = uring_socket_capacity(capacity);
         if (ucall_status_t const reserved = state.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k || socket_slots.open(sockets) != ucall_status_success_k)
@@ -1812,6 +1824,7 @@ struct linux_uring612_queue {
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return uring_reset_on_close(*this, descriptor);
     }
+    void copy_sends(descriptor_t descriptor) noexcept { uring_copy_sends(*this, descriptor); }
     ucall_status_t cancel(io_request_t& request) noexcept { return uring_cancel(*this, request); }
     ucall_status_t cancel(operation_t& operation) noexcept {
         if (operation.answered() || operation.stage == uring_operation_stage_t::cancelling_k)

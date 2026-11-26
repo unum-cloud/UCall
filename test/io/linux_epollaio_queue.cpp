@@ -102,8 +102,9 @@ static case_result_t test_epollaio_reads() {
 }
 
 /** A @c MSG_ZEROCOPY send completes once the socket took its bytes, and its release only once the
- *  error queue reported it; loopback copies, so that report demotes the socket, whose next
- *  zero-copy send copies and whose next release completes at once. */
+ *  error queue reported it. Loopback copies, and that report counts a fallback without demoting
+ *  the socket, whose next send pins again; once @c copy_sends marks the socket, its sends copy and
+ *  each release completes at once, reporting the socket copying. */
 template <typename queue_type_>
 static case_result_t test_epollaio_zero_copy_sends() {
     queue_type_ queue;
@@ -127,7 +128,7 @@ static case_result_t test_epollaio_zero_copy_sends() {
     };
 
     queue.reserve_releases(1);
-    io_request_t release {.operation = io_operation_t::zero_copy_release_k};
+    io_request_t release {.operation = io_operation_t::zero_copy_release_k, .descriptor = sockets.client};
     io_request_t sending {.operation = io_operation_t::send_zero_copy_k,
                           .descriptor = sockets.client,
                           .data = window.data,
@@ -143,9 +144,19 @@ static case_result_t test_epollaio_zero_copy_sends() {
     expect_true(drain(static_cast<std::size_t>(sent)));
 
     received.clear();
+    descriptor_t const pinned = await(queue, sending, deadline);
+    expect_true(pinned > 0 && queue.statistics.zero_copy_sends == 2, "a copied report demoted the socket: {} sends",
+                queue.statistics.zero_copy_sends);
+    queue.submit(release);
+    expect_true(finish(queue, release, deadline) == 0);
+    expect_true(drain(static_cast<std::size_t>(pinned)));
+
+    received.clear();
+    queue.copy_sends(sockets.client);
     descriptor_t const copied = await(queue, sending, deadline);
-    expect_true(copied > 0 && queue.statistics.zero_copy_sends == 1);
-    expect_true(await(queue, release, deadline) == 0);
+    expect_true(copied > 0 && queue.statistics.zero_copy_sends == 2, "a copying socket pinned: {} sends",
+                queue.statistics.zero_copy_sends);
+    expect_true(await(queue, release, deadline) == 1);
     expect_true(drain(static_cast<std::size_t>(copied)));
     expect_true(queue.close_socket(std::exchange(sockets.client, -1)) == 0);
     return {};

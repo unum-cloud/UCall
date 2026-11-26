@@ -73,6 +73,7 @@ static bool interface_valid(ucall_network_interface_t const& network_interface) 
         http_t::find(text_view(settings.device_name), '\0') != std::string_view::npos)
         return false;
     if ((!settings.address.length && !settings.listen_descriptor) || !security_valid(settings.security) ||
+        !send_policy_valid(settings.send_policy) ||
         (settings.security != ucall_security_none_k && !settings.noise_private_key) ||
         (settings.security == ucall_security_noise_xx_k && !settings.peer_authorizer) ||
         (settings.security == ucall_security_noise_kk_k && !settings.noise_peer_key))

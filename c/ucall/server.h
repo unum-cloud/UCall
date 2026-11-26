@@ -13,6 +13,25 @@
 extern "C" {
 #endif
 
+/** How an interface sends reply segments of a page or more: by copying, or by pinning the pages
+ *  until the kernel lets go of them. File windows follow the same choice. */
+typedef enum ucall_send_policy_t {
+
+    /** Copies to a peer on this host, whose delivery copies every send anyway, pinning to the
+     *  rest: an AF_UNIX peer, a loopback address, or an address of one of this host's interfaces,
+     *  as read during @c ucall_server_init(). That list is a snapshot: an address added later, or
+     *  a peer in another network namespace on this host, reads as remote, and
+     *  @c ucall_send_policy_copying_k serves an interface those reach. */
+    ucall_send_policy_automatic_k = 0,
+
+    /** Pins for every peer, as a test of the zero-copy path over loopback needs. */
+    ucall_send_policy_zero_copy_k = 1,
+
+    /** Copies for every peer. */
+    ucall_send_policy_copying_k = 2,
+
+} ucall_send_policy_t;
+
 /** One virtualized network interface, and every policy applying to what arrives on it.
  *
  *  An interface is an address the server answers on, together with the security posture and
@@ -117,6 +136,9 @@ typedef struct ucall_network_interface_t {
     /** Entries in @c reply_directories. */
     size_t reply_directories_count;
 
+    /** How replies of a page or more leave. Default: @c ucall_send_policy_automatic_k. */
+    ucall_send_policy_t send_policy;
+
 } ucall_network_interface_t;
 
 /**
@@ -194,7 +216,7 @@ typedef struct ucall_server_init_t {
  *  @par Statuses:
  *  - @c ucall_status_invalid_argument_k An output, the configuration or its interfaces are missing,
  *    or the CPU class ceiling, a metrics setting, an address, a device name, a security mode with
- *    the key or authorizer it needs, a connection budget or the reply directories are unusable.
+ *    its key or authorizer, a send policy, a connection budget or the reply directories fail.
  *  - @c ucall_status_unsupported_k No compiled CPU class fits under the ceiling on this machine,
  *    as when a monoversioned build targets a newer CPU, no I/O backend serves the configuration
  *    on it, a device is named outside Linux, or an interface asks Windows for several loops.
@@ -344,11 +366,13 @@ typedef struct ucall_event_loop_statistics_t {
     /** Sends that left without copying: reply segments of a page or more, and file windows. */
     uint64_t zero_copy_sends;
 
-    /** Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does. */
+    /** Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does; a
+     *  count, which changes no later send. */
     uint64_t zero_copy_fallbacks;
 
     /** Sends that copied instead of pinning: reply segments shorter than a page, one per send or
-     *  several gathered into one, and every send of a socket demoted or refusing zero-copy. */
+     *  several gathered into one, every reply segment to a peer on this host, whose delivery copies
+     *  anyway, and every send of a socket refusing zero-copy. */
     uint64_t copying_sends;
 
     /** File reads the kernel finishes later: io_uring, Linux or FreeBSD AIO, or overlapped I/O. */
@@ -1228,6 +1252,11 @@ typedef enum ucall_reply_part_kind_t {
     /** @c data.path, a range of a file the event loop opens beneath a registered directory. */
     ucall_reply_part_path_k = 2,
 
+    /** @c data.memory, bytes the caller keeps unchanged until the reply's outcome leaves
+     *  @c ucall_status_deferred_k, which the event loop sends in place, without copying where the
+     *  kernel allows. Under Noise the call copies them into the loop's own records to seal. */
+    ucall_reply_part_memory_k = 3,
+
 } ucall_reply_part_kind_t;
 
 /** A byte range of a file the caller opened. UCall never closes the descriptor: the caller keeps
@@ -1270,8 +1299,8 @@ typedef struct ucall_path_range_t {
 
 } ucall_path_range_t;
 
-/** One part of a reply body: bytes in memory, or a byte range of a file, which the event loop
- *  reads after the call returns. */
+/** One part of a reply body: bytes copied now, bytes the event loop sends from the caller's memory,
+ *  or a byte range of a file, which the event loop reads after the call returns. */
 typedef struct ucall_reply_part_t {
 
     /** Which member of @c data the part uses. */
@@ -1288,6 +1317,9 @@ typedef struct ucall_reply_part_t {
 
         /** Range of a @c ucall_reply_part_path_k part. */
         ucall_path_range_t path;
+
+        /** Content of a @c ucall_reply_part_memory_k part. */
+        ucall_bytes_view_t memory;
 
     } data;
 
@@ -1333,7 +1365,9 @@ typedef struct ucall_server_reply_vectored_t {
  *  staging buffer first. Sets @c Content-Length to the sum of the parts, and sends no body to a
  *  @c HEAD request.
  *
- *  Memory-only replies are final on return. With any file or path part, the outcome reads
+ *  Replies of bytes parts alone are final on return. With any memory part, the outcome reads
+ *  @c ucall_status_deferred_k on return, and the event loop publishes success once the kernel let
+ *  go of every part, or the cause of a failure. With any file or path part, the outcome reads
  *  @c ucall_status_deferred_k on return: the event loop opens and sizes every part before it sends
  *  the head, so @c Content-Length is measured, then publishes success once every part is sent, or
  *  the cause of a failure. A part failing before the head replaces the whole reply: @c 404 for a
@@ -1431,8 +1465,9 @@ typedef struct ucall_server_reply_append_t {
 /**
  *  @brief Appends parts to a response opened with @c ucall_server_reply_begin().
  *
- *  Can be called from any thread, long after the request callback returned. Empty bytes parts send
- *  nothing, and so do file ranges of zero bytes.
+ *  Can be called from any thread, long after the request callback returned. Empty bytes and memory
+ *  parts send nothing, and so do file ranges of zero bytes. Memory parts stay the caller's,
+ *  unchanged, until the outcome of @c ucall_server_reply_end() is final.
  *
  *  A file or path part that fails once the head left resets the connection.
  *
@@ -1443,9 +1478,9 @@ typedef struct ucall_server_reply_append_t {
  *  - @c ucall_status_overflow_k The parts' length overflows its counter, or parts would run past a
  *    declared @c Content-Length.
  *  - @c ucall_status_connection_closed_k The peer left or the server stops.
- *  - @c ucall_status_would_block_k Nothing was queued, as the bytes parts already queued for this
- *    request and not yet taken by the socket exceed the bytes a reading peer takes per round trip,
- *    or too many file and path parts wait; retry once the peer catches up.
+ *  - @c ucall_status_would_block_k Nothing was queued, as the bytes and memory parts already queued
+ *    for this request and not yet taken by the socket exceed the bytes a reading peer takes per
+ *    round trip, or too many file and path parts wait; retry once the peer catches up.
  *
  *  @c ucall_status_invalid_argument_k answers a @c NULL @c request, a reply not begun or already
  *  ended, an invalid part, view or range end, a descriptor that reads buffered, a path leaving
@@ -1478,8 +1513,10 @@ typedef struct ucall_server_reply_end_t {
  *  reply not open. A response falling short of a declared @c Content-Length closes the connection
  *  after the bytes already sent, so the peer cannot mistake the truncated body for a whole one.
  *
- *  While file or path parts are still unsent, the outcome reads @c ucall_status_deferred_k on
- *  return, and the event loop publishes success once they are sent, or the cause of a failure.
+ *  While file or path parts are still unsent, or after any memory part was appended in plaintext,
+ *  the outcome reads @c ucall_status_deferred_k on return, and the event loop publishes success
+ *  once they are sent and the kernel let go of every memory part, or the cause of a failure. Under
+ *  Noise memory parts were copied as they were appended, so they leave the outcome final.
  *
  *  @note @b Thread-safe across requests, though two threads must not use one @c request at once.
  *

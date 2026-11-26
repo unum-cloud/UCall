@@ -502,6 +502,10 @@ struct windows_rio_queue {
         let_go(registered_socket_t::index_of(descriptor));
         return 0;
     }
+
+    /** A registered send leaves in place and holds nothing past its completion, so no send waits
+     *  on a notification to copy instead. */
+    void copy_sends(descriptor_t) noexcept {}
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         SOCKET const socket = socket_of(descriptor);
         return socket == INVALID_SOCKET ? ucall_status_success_k

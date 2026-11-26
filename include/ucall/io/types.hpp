@@ -793,7 +793,10 @@ int readiness_poll(queue_type_& queue, span<io_completion_t> completions, io_wai
 
 #endif // UCALL_OS_POSIX_
 
-/** Whether a socket's sends still try zero-copy, which ends once the kernel reports it copied. */
+/** Whether a socket's sends still try zero-copy, which ends once the kernel refuses it for the
+ *  socket, as for AF_UNIX. A notification that the kernel copied a send counts as a fallback and
+ *  demotes nothing: a NIC copies only what its stack coalesced, and peers on this host, whose
+ *  deliveries copy every send, get copying sends from their admission on. */
 enum class zero_copy_stage_t : std::uint8_t {
 
     /** No zero-copy send tried yet, or not yet reported copied. */
@@ -804,6 +807,10 @@ enum class zero_copy_stage_t : std::uint8_t {
 
     /** Sends copy for the socket's lifetime. */
     copying_k,
+
+    /** The kernel could not pin the last send under the locked-memory limit, so its retry copies,
+     *  and the send after it pins again. */
+    refused_k,
 };
 
 /** A queue that names the host setting its refused setup needs raised. */
@@ -976,6 +983,9 @@ class io_queue_variant {
     }
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return std::visit([&](auto& queue) noexcept { return queue.reset_on_close(descriptor); }, queues_);
+    }
+    void copy_sends(descriptor_t descriptor) noexcept {
+        std::visit([&](auto& queue) noexcept { queue.copy_sends(descriptor); }, queues_);
     }
     memory_registration_t register_memory(span<byte_t> memory) noexcept {
         return std::visit([&](auto& queue) noexcept { return queue.register_memory(memory); }, queues_);

@@ -83,6 +83,9 @@ struct bsd_kqueue_queue {
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return socket_reset_on_close(descriptor);
     }
+
+    /** Every send copies here already. */
+    void copy_sends(descriptor_t) noexcept {}
     memory_registration_t register_memory(span<byte_t>) noexcept { return {}; }
     void release(io_completion_t const&) noexcept {}
     ucall_status_t cancel(io_request_t& request) noexcept {

@@ -11,7 +11,7 @@
 
 #include "ucall/io/linux_uring612_queue.hpp" // `uring_operation`, `registered_socket_t`
 #include "ucall/io/types.hpp"          // `operation_list_t`, `zero_copy_stage_t`, `io_statistics_t`, `io_completion_t`
-#include "ucall/utilities/sockets.hpp" // `open_files_limit`, `monotonic_ns`
+#include "ucall/utilities/sockets.hpp" // `monotonic_ns`
 #include "ucall/utilities/types.hpp"   // `byte_t`, `descriptor_t`, `span`
 
 namespace unum::ucall::io {
@@ -19,7 +19,6 @@ namespace unum::ucall::io {
 using utilities::byte_t;
 using utilities::descriptor_t;
 using utilities::monotonic_ns;
-using utilities::open_files_limit;
 using utilities::span;
 
 /** One-shot requests and multishot streams share the same registered socket slot lifetimes. */
@@ -101,7 +100,7 @@ struct linux_uring618_queue {
         /** Where the slot's registered descriptor stands. */
         uring_socket_stage_t stage {uring_socket_stage_t::vacant_k};
 
-        /** Untried, or copying once the kernel reported a send copied or refused zero-copy. */
+        /** Untried, or copying once the kernel refused zero-copy for the socket or for one send. */
         zero_copy_stage_t zero_copy {zero_copy_stage_t::untried_k};
 
         /** Whether the close sends a FIN or a reset. */
@@ -144,7 +143,7 @@ struct linux_uring618_queue {
     using operations_t = uring_operations<socket_slot_t, allocator_t>;
     using zero_copy_t = uring_zero_copy<socket_slot_t, allocator_t, atomic_ref_template_>;
     using operation_t = typename operations_t::operation_t;
-    static_assert(sizeof(operation_t) == 64);
+    static_assert(sizeof(operation_t) == 56);
     static constexpr io_uring_op opcodes_k[] {
         IORING_OP_SOCKET,      IORING_OP_ACCEPT,   IORING_OP_CONNECT, IORING_OP_RECV,         IORING_OP_SEND,
         IORING_OP_READ,        IORING_OP_SHUTDOWN, IORING_OP_CLOSE,   IORING_OP_ASYNC_CANCEL, IORING_OP_LINK_TIMEOUT,
@@ -206,7 +205,7 @@ struct linux_uring618_queue {
         if (capacity > static_cast<std::size_t>(registered_socket_t::tag_k)) return ucall_status_overflow_k;
         if (state.stage != uring_queue_stage_t::idle_k) return ucall_status_invalid_argument_k;
         // Releases take no file, and the kernel registers no more files than descriptors.
-        std::size_t const sockets = fu::min_of(capacity, open_files_limit() - 1);
+        std::size_t const sockets = uring_socket_capacity(capacity);
         if (ucall_status_t const reserved = state.reserve(capacity); reserved != ucall_status_success_k)
             return reserved;
         if (operations.open(capacity) != ucall_status_success_k ||
@@ -412,6 +411,7 @@ struct linux_uring618_queue {
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return uring_reset_on_close(*this, descriptor);
     }
+    void copy_sends(descriptor_t descriptor) noexcept { uring_copy_sends(*this, descriptor); }
     ucall_status_t cancel(io_request_t& request) noexcept { return uring_cancel(*this, request); }
     ucall_status_t cancel(operation_t& operation) noexcept {
         if (operation.answered() || operation.stage == uring_operation_stage_t::cancelling_k)

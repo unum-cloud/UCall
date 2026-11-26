@@ -10,7 +10,7 @@
 #include <cmath>   // `std::ceil`, `std::isfinite`
 #include <cstdint> // `std::uint64_t`
 #include <cstdio>  // `stdout`, `stderr`, `std::fwrite`
-#include <cstdlib> // `std::getenv`, `std::exit`
+#include <cstdlib> // `std::strtod`
 #include <cstring> // `std::memcmp`, `std::strcmp`
 
 #include <algorithm>    // `std::find_if`, `std::any_of`
@@ -46,24 +46,8 @@ void print_line(std::FILE* stream, fmt::format_string<args_types_...> format, ar
 
 #pragma region Shared Settings
 
-/** Exits with one line naming a setting that does not parse, so a bad value never runs anything. */
-[[noreturn]] inline void exit_unparsed(char const* variable, char const* text, char const* expected) noexcept {
-    print_line(stderr, "{}=\"{}\" does not parse, expected {}", variable, text, expected);
-    std::exit(1);
-}
-
-/** The text of a setting: its @p flag when given, else its environment @p variable , else null. */
-inline char const* setting_text(int argc, char** argv, char const* variable, std::string_view flag) noexcept {
-    for (int index = 1; index < argc; ++index) {
-        std::string_view const argument {argv[index]};
-        if (argument == flag)
-            return index + 1 < argc && std::strncmp(argv[index + 1], "--", 2) != 0 ? argv[index + 1] : "1";
-        if (argument.size() > flag.size() && argument.starts_with(flag) && argument[flag.size()] == '=')
-            return argv[index] + flag.size() + 1;
-    }
-    char const* text = std::getenv(variable);
-    return text && *text ? text : nullptr;
-}
+using tools::exit_unparsed;
+using tools::setting_text;
 
 /** A switch, @p fallback when unset: 0, false, off and no turn it off, anything else on. */
 inline bool read_flag_setting(int argc, char** argv, char const* variable, std::string_view flag,

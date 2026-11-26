@@ -65,6 +65,11 @@ inline ucall_reply_part_t bytes_part(std::string_view bytes) noexcept {
     return {.kind = ucall_reply_part_bytes_k, .data = {.bytes = bytes_view(bytes)}};
 }
 
+/** A reply part of bytes the caller keeps unchanged until the reply is final, sent in place. */
+inline ucall_reply_part_t memory_part(std::string_view bytes) noexcept {
+    return {.kind = ucall_reply_part_memory_k, .data = {.memory = bytes_view(bytes)}};
+}
+
 /** A reply part of a range of the caller's unbuffered descriptor, open until the reply is final. */
 inline ucall_reply_part_t file_part(ucall_file_range_t range) noexcept {
     return {.kind = ucall_reply_part_file_k, .data = {.file = range}};
@@ -572,6 +577,9 @@ struct interface_t {
     /** Directories that path parts of replies resolve beneath, by position. */
     std::span<ucall_bytes_view_t const> reply_directories {};
 
+    /** How replies of a page or more leave: copied to peers on this host, pinned for the rest. */
+    ucall_send_policy_t send_policy = ucall_send_policy_automatic_k;
+
     ucall_network_interface_t raw() const noexcept {
         return {.address = bytes_view(address),
                 .listen_descriptor = listen_descriptor,
@@ -586,7 +594,8 @@ struct interface_t {
                 .max_pipelined_requests = max_pipelined_requests,
                 .max_request_bytes = max_request_bytes,
                 .reply_directories = reply_directories.data(),
-                .reply_directories_count = reply_directories.size()};
+                .reply_directories_count = reply_directories.size(),
+                .send_policy = send_policy};
     }
 };
 

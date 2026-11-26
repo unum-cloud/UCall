@@ -171,6 +171,19 @@ class Security(enum.IntEnum):
     NOISE_IK = 2
     NOISE_KK = 3
 
+class SendPolicy(enum.IntEnum):
+    """How an `Interface` sends replies of a page or more: copied to peers on this host, whose
+    delivery copies anyway, and pinned for the rest, or pinned or copied for every peer.
+
+    Example:
+      >>> ucall.Interface("127.0.0.1:0", send_policy=ucall.SendPolicy.ZERO_COPY).send_policy
+      <SendPolicy.ZERO_COPY: 1>
+    """
+
+    AUTOMATIC = 0
+    ZERO_COPY = 1
+    COPYING = 2
+
 class Verb(enum.IntEnum):
     """An HTTP method; `ANY` registers an endpoint for every method and never arrives itself.
 
@@ -327,10 +340,12 @@ class Interface:
         the reply is 413; 0 takes the largest receive buffer the kernel grants a socket.
       reply_directories (Sequence[str | bytes | os.PathLike], optional): The directories a
         `Path` part names by position, each opened once by the server.
+      send_policy (SendPolicy, optional): How replies of a page or more leave. Defaults to
+        `SendPolicy.AUTOMATIC`, copying to peers on this host and pinning for the rest.
 
     Raises:
       TypeError: An argument of the wrong type.
-      ValueError: A key other than 32 bytes long, or an unknown `security`.
+      ValueError: A key other than 32 bytes long, or an unknown `security` or `send_policy`.
 
     Example:
       >>> interface = ucall.Interface("127.0.0.1:0", connections=64, pipelined_requests=16)
@@ -353,6 +368,7 @@ class Interface:
         pipelined_requests: int = 0,
         max_request_bytes: int = 0,
         reply_directories: Sequence[str | bytes | os.PathLike[str] | os.PathLike[bytes]] = (),
+        send_policy: SendPolicy | str = SendPolicy.AUTOMATIC,
     ) -> Interface: ...
     @property
     def address(self) -> str:
@@ -363,6 +379,9 @@ class Interface:
     @property
     def security(self) -> Security:
         """Encryption of accepted connections."""
+    @property
+    def send_policy(self) -> SendPolicy:
+        """How replies of a page or more leave."""
     @property
     def noise_private_key(self) -> bytes | None:
         """The 32-byte Noise identity, or None."""
@@ -620,6 +639,29 @@ class File:
     def length(self) -> int:
         """The range's bytes; 0 runs to the end."""
 
+class Memory:
+    """A buffer the event loop sends in place, as one part of `DetachedRequest.reply_parts` or
+    `ReplyStream.append`.
+
+    In plaintext the loop sends from the buffer after the call returns, without copying where
+    the kernel allows, so the reply defers, and the `Deferred` keeps this part, and through it
+    the buffer's owner, alive until it is final; the owner cannot resize meanwhile, and its
+    bytes must stay unchanged. Under Noise the call copies them to seal.
+
+    Args:
+      buffer (Buffer): The bytes, such as `bytes`, a `memoryview` or a NumPy array.
+
+    Example:
+      >>> part = ucall.Memory(weights)
+    """
+    def __new__(cls, buffer: Buffer) -> Memory: ...
+    @property
+    def buffer(self) -> Any:
+        """The object owning the bytes."""
+    @property
+    def nbytes(self) -> int:
+        """The bytes the part sends."""
+
 class Path:
     """A byte range of a file beneath a reply directory, as one part of `reply_parts`.
 
@@ -814,19 +856,20 @@ class DetachedRequest(Buffer):
         """
     def reply_parts(
         self,
-        parts: Sequence[Buffer | File | Path],
+        parts: Sequence[Buffer | Memory | File | Path],
         status: int = 200,
         headers: Sequence[str | bytes] = (),
     ) -> Deferred | None:
         r"""Answers the request, once, with `parts` concatenated into the body.
 
-        Bytes-like parts are copied before the call returns, and the reply is then final. A `File` or
-        `Path` part is read by the event loop afterwards, sized first so Content-Length is measured,
-        and its reply defers: one failing before the head replaces the reply with 404 or 416, and one
-        failing after it resets the connection.
+        Bytes-like parts are copied before the call returns, and the reply is then final. A `Memory`
+        part is sent in place afterwards, and its reply defers until the kernel let go of it. A `File`
+        or `Path` part is read by the event loop afterwards, sized first so Content-Length is
+        measured, and its reply defers: one failing before the head replaces the reply with 404 or
+        416, and one failing after it resets the connection.
 
         Args:
-          parts (Sequence[Buffer | File | Path]): The body, in order.
+          parts (Sequence[Buffer | Memory | File | Path]): The body, in order.
           status (int, optional): The HTTP status. Defaults to 200.
           headers (Sequence[str | bytes], optional): "name: value" lines; the server adds
             Content-Length, Date and Server itself.
@@ -898,14 +941,14 @@ class ReplyStream:
       ...     stream.append([json.dumps(row).encode(), b"\n"])
       >>> stream.end()
     """
-    def append(self, parts: Sequence[Buffer | File | Path], /) -> None:
+    def append(self, parts: Sequence[Buffer | Memory | File | Path], /) -> None:
         r"""Queues `parts` after the ones before, all of them or none.
 
-        Bytes-like parts are copied before the call returns; `File` parts stay alive with the
-        stream until its end is final.
+        Bytes-like parts are copied before the call returns; `Memory` and `File` parts stay
+        alive with the stream until its end is final.
 
         Args:
-          parts (Sequence[Buffer | File | Path]): The next parts of the body.
+          parts (Sequence[Buffer | Memory | File | Path]): The next parts of the body.
 
         Raises:
           Error: `Status.WOULD_BLOCK` while the peer lags, to retry once it caught up, or

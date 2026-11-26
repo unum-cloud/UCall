@@ -119,6 +119,7 @@ struct NetworkInterfaceArguments(ImplicitlyCopyable):
     var max_request_bytes: c_size_t
     var reply_directories: Optional[Pointer[BytesView[ImmUntrackedOrigin], ImmUntrackedOrigin]]
     var reply_directories_count: c_size_t
+    var send_policy: c_int
 
 
 @fieldwise_init
@@ -755,6 +756,8 @@ struct Server:
                     c_size_t(interface.max_request_bytes),
                     _array(directories[index]),
                     c_size_t(len(directories[index])),
+                    # `ucall_send_policy_automatic_k`: copy to peers on this host, pin for the rest.
+                    c_int(0),
                 )
             )
         var tags = List[BytesView[ImmUntrackedOrigin]](capacity=len(options.metrics.tags))

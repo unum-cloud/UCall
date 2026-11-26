@@ -349,8 +349,8 @@ static case_result_t test_admission_across_loops(sweep_cell_t const& cell) {
         accepting_loops += accepted != 0;
     }
     expect_true(accepts == 3, "the loops accepted {} of three clients", accepts);
-    expect_true(closed == accepts - accepting_loops, "{} of the two idle clients were closed, for {} accepts on {} loops",
-                closed, accepts, accepting_loops);
+    expect_true(closed == accepts - accepting_loops,
+                "{} of the two idle clients were closed, for {} accepts on {} loops", closed, accepts, accepting_loops);
     fixture.stop();
     return {};
 }

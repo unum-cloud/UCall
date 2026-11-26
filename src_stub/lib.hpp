@@ -108,6 +108,10 @@ inline bool security_valid(ucall_security_t security) noexcept {
     return security >= ucall_security_none_k && security <= ucall_security_noise_kk_k;
 }
 
+inline bool send_policy_valid(ucall_send_policy_t send_policy) noexcept {
+    return send_policy >= ucall_send_policy_automatic_k && send_policy <= ucall_send_policy_copying_k;
+}
+
 /** Whether @p address spells "host:port" as the engine splits it before resolving: a host, in
  *  brackets when it holds a colon, and a decimal port up to 65535. */
 inline bool address_valid(std::string_view address) noexcept {

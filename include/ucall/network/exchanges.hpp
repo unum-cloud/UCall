@@ -314,6 +314,10 @@ struct server_exchange : ucall_received_http_request_handle_t {
     /** Reply body bytes, counted later by the event loop, as any thread may reply. */
     std::size_t copied {};
 
+    /** Memory parts its replier queued since the reply began, which keep a stream's end deferred
+     *  until the kernel let go of them; only the replier touches it. */
+    std::size_t memory_parts {};
+
     /** A stream's status line and headers, or a measured reply's head, which a refusal replaces
      *  whole. The loop learns a reply ended by adopting @c end_segment, and only the chunks between
      *  the two ever allocate. */
@@ -357,6 +361,10 @@ struct server_exchange : ucall_received_http_request_handle_t {
 
     /** A reply's deferred outcome, which the loop makes final. */
     ucall_outcome_t* outcome {};
+
+    /** How the reply ended, deferred until it did, which its deferred outcome reports once the
+     *  kernel let go of every segment the reply sent without copying. */
+    ucall_status_t ended_status {ucall_status_deferred_k};
 
     /** The reply's declared @c content-length, or a held head's measured one; zero without one. */
     std::uint64_t declared {};

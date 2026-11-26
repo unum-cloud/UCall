@@ -97,6 +97,7 @@ void run_linux_uring612_queue_cases() {
             run_cell_case(label, "test_registered_direct_files", test_registered_direct_files<queue_type_>);
             run_cell_case(label, "test_zero_copy_sends", test_zero_copy_sends<queue_type_>);
             run_cell_case(label, "test_provides_past_two_buffers", test_provides_past_two_buffers);
+            run_cell_case(label, "test_ring_past_file_table", test_ring_past_file_table<queue_type_>);
         });
 }
 

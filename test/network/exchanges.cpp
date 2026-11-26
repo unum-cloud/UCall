@@ -995,8 +995,8 @@ static void test_pipelined_replies_gathered(sweep_cell_t const& cell) {
     std::string const burst = echo_burst(bodies);
     raw_client_t client;
     if (!expect_true(client.connect(fixture.address))) return;
-    // A connection pins its replies until the first release tells whether the kernel copies, so
-    // lone echoes go first until one leaves without pinning.
+    // Lone echoes go first until one leaves without pinning, which a peer on this host does from
+    // its admission, as the default send policy copies to it.
     std::string_view const probe = "GET /echo/probe HTTP/1.1\r\nHost: a\r\n\r\n";
     std::size_t offset = 0;
     bool probed = false;

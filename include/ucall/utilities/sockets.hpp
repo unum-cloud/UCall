@@ -27,6 +27,7 @@
 #else
 #include <arpa/inet.h>
 #include <fcntl.h>
+#include <ifaddrs.h> // `getifaddrs`, `freeifaddrs`
 #include <netdb.h>
 #include <netinet/in.h> // `IPPROTO_TCP`, `sockaddr_in6`, which glibc alone pulls in through `<arpa/inet.h>`
 #include <netinet/tcp.h>
@@ -206,6 +207,38 @@ inline int socket_poll(pollfd* polled, std::size_t count, std::uint64_t nanoseco
 
 /** The @c SO_LINGER setting that makes a close send a reset rather than a FIN. */
 inline constexpr linger socket_reset_linger_k {1, 0};
+
+/** The send buffer TCP's autotuning grows a socket to, the third value of @c net.ipv4.tcp_wmem on
+ *  Linux, or zero where the system names none. */
+inline std::size_t largest_send_buffer_bytes() noexcept {
+#if UCALL_OS_LINUX_
+    std::FILE* file = std::fopen("/proc/sys/net/ipv4/tcp_wmem", "r");
+    if (!file) return 0;
+    unsigned long minimum = 0, initial = 0, largest = 0;
+    int const read = std::fscanf(file, "%lu %lu %lu", &minimum, &initial, &largest);
+    std::fclose(file);
+    return read == 3 ? static_cast<std::size_t>(largest) : 0;
+#else
+    return 0;
+#endif
+}
+
+/** Calls @p visit with the address of every IPv4 and IPv6 address this host's interfaces hold, as
+ *  a @c sockaddr, answering false where the host cannot list them. */
+template <typename visit_type_>
+bool visit_host_addresses([[maybe_unused]] visit_type_&& visit) noexcept {
+#if UCALL_OS_POSIX_
+    ifaddrs* listed = nullptr;
+    if (getifaddrs(&listed) != 0) return false;
+    for (ifaddrs const* entry = listed; entry; entry = entry->ifa_next)
+        if (entry->ifa_addr && (entry->ifa_addr->sa_family == AF_INET || entry->ifa_addr->sa_family == AF_INET6))
+            visit(*entry->ifa_addr);
+    freeifaddrs(listed);
+    return true;
+#else
+    return false;
+#endif
+}
 
 /** Makes the close of @p descriptor send a reset rather than a FIN. */
 [[nodiscard]] inline ucall_status_t socket_reset_on_close(descriptor_t descriptor) noexcept {

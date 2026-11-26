@@ -93,8 +93,8 @@ struct server_connection {
         return file_reading == file_read_state_t::opening_file_k || file_reading == file_read_state_t::reading_file_k;
     }
 
-    /** Zero-copy for every segment from admission until the first release lands, then for segments
-     *  of a page or more, until a release reports the kernel copied, then copying for every one. */
+    /** Zero-copy for segments of a page or more, unless the interface send policy copies to the
+     *  peer or a release reports the socket refusing zero-copy. */
     send_mode_t send_mode {};
 
     /** Whether the request being parsed is owed the interim @c 100, set as its head arrives. */
@@ -158,7 +158,7 @@ struct server_connection {
     ucall_status_t configure(secure_tunnel_config_t const& config) noexcept {
         file_read_request = {.context = this};
         file_reading = file_read_state_t::idle_k;
-        send_mode = send_mode_t::probing_k;
+        send_mode = send_mode_t::zero_copy_k;
         uncredited_bytes = 0;
         continuing = continue_state_t::none_k;
         routed = nullptr;
@@ -227,18 +227,21 @@ struct serving {
 
     /** Frees @p exchange for the next request once its reply ended, making a deferred outcome final
      *  with @p status after the loop let go of every file segment. While the kernel still holds its
-     *  sent segments, it waits as @c releasing_k for the release to complete. */
+     *  sent segments, which may be the caller's memory, it waits as @c releasing_k for the release
+     *  to complete, and only then makes the outcome final. */
     static void recycle_exchange(event_loop_t& event_loop, server_exchange_t& exchange,
                                  ucall_status_t status) noexcept {
         if (status == ucall_status_success_k) metrics_t::time_request(*event_loop.server, event_loop, exchange);
         tally<atomic_ref>(event_loop.statistics.bytes_copied, std::exchange(exchange.copied, 0));
         exchange.input.clear();
         replies_t::release_all_segments(exchange);
-        replies_t::publish_reply_outcome(exchange, status);
+        // A reply that failed already keeps the cause it failed with.
+        if (exchange.ended_status == ucall_status_deferred_k) exchange.ended_status = status;
         if (exchange.releasing()) {
             exchange.stage = exchange_stage_t::releasing_k;
             return;
         }
+        replies_t::publish_reply_outcome(exchange, exchange.ended_status);
         free_exchange(event_loop, exchange);
     }
 
@@ -247,6 +250,7 @@ struct serving {
         exchange.head_segment.bytes.clear();
         exchange.end_segment.bytes.clear();
         exchange.connection = nullptr;
+        exchange.ended_status = ucall_status_deferred_k;
         // A replier listing an ended reply late finds a free exchange nothing recycles twice.
         exchange.stage = exchange_stage_t::free_k;
         crypto_t::secure_zero(exchange.peer_static_key);
@@ -1319,6 +1323,12 @@ struct serving {
             formatting_t::tunnel_config(network_interface.config->security, secure_tunnel_role_t::responder_k,
                                         network_interface.config->noise_private_key, network_interface.public_key,
                                         network_interface.config->noise_peer_key));
+        // The queue copies the socket's file windows too, which a slow reader on this host would
+        // otherwise hold pinned until it reads them.
+        if (formatting_t::sends_copying_to(network_interface, peer, server.host_addresses)) {
+            chosen->send_mode = send_mode_t::copying_k;
+            event_loop.queue.copy_sends(descriptor);
+        }
         if (result != ucall_status_success_k) chosen->transport.fail(result);
         mark_ready(event_loop, *chosen);
     }

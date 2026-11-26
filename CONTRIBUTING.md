@@ -50,7 +50,7 @@ A `cpu_class_ceiling` below that class, or a machine below it, then fails as uns
 The machine profiles `xeon4`, `xeon6`, `venice`, `grace` and `vera` set both, and CI compiles each of them, beside `android_arm64` over the `linux-epollaio` backend and `msvc2026_x64` with Visual Studio.
 `CMAKE_C_COMPILER_LAUNCHER` and `CMAKE_CXX_COMPILER_LAUNCHER` come from the environment, so exporting `ccache` there caches objects in every tree.
 
-`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_hello`, `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`.
+`UCALL_BUILD_EXAMPLES=ON` enables `ucall_example_hello`, `ucall_example_echo`, `ucall_example_ledger`, `ucall_example_redis`, and `ucall_example_inference`; `UCALL_BUILD_BENCH=ON` enables `ucall_bench_http` and `ucall_bench_server`, and with io_uring `ucall_bench_zero_copy_sends`, which prices copying against zero-copy sends per send size.
 They share the command-line, polling and shutdown helpers in `tools/`, which every one of them has on its private include path.
 `ucall_cli`, the `ucall` command-line client in `tools/`, builds with `UCALL_BUILD_TOOLS` and with any install, and `ucall_test_tools` drives it against an in-process server.
 Executables go directly into the preset's build directory, such as `build_release/ucall_example_echo`.

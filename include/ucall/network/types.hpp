@@ -8,7 +8,7 @@
 #pragma once
 
 #include "ucall/io/types.hpp"        // `close_mode_t`, `listing_t`
-#include "ucall/utilities/types.hpp" // `byte_t`
+#include "ucall/utilities/types.hpp" // `byte_t`, `span`
 
 struct ucall_received_http_request_handle_t {};
 struct ucall_http_batch_endpoint_handle_t {};
@@ -87,6 +87,7 @@ using io::close_mode_t;
 using io::listing_t;
 using utilities::byte_t;
 using utilities::native_file_t;
+using utilities::span;
 using server_api_t = ucall_server_handle_t::api_t;
 using client_api_t = ucall_client_handle_t::api_t;
 
@@ -153,11 +154,11 @@ enum class transmit_state_t : std::uint8_t { idle_k, sending_k };
  *  connection, which tells a peer taking its reply slowly from one that stopped reading. */
 enum class transmit_progress_t : std::uint8_t { stalled_k, progressed_k };
 
-/** How the socket's sends reach the wire: every one pinned until the first release reports whether
- *  the kernel copied, then those of a page or more pinned and shorter ones copied, until a release
- *  reports a copied send, which demotes the socket for good, as the rulings say; a demoted socket
- *  names no releases. */
-enum class send_mode_t : std::uint8_t { probing_k, zero_copy_k, copying_k };
+/** How the socket sends reply segments of a page or more: pinned, or copied from admission for a
+ *  peer the interface send policy copies to, or once the queue reports the socket refusing
+ *  zero-copy, as AF_UNIX does, which demotes it for good; a copying socket names no releases.
+ *  Shorter segments copy in either mode. */
+enum class send_mode_t : std::uint8_t { zero_copy_k, copying_k };
 
 /** Whether a request expecting <tt>100-continue</tt> is still owed its interim response. */
 enum class continue_state_t : std::uint8_t { none_k, owed_k };
@@ -234,6 +235,14 @@ struct reply_segment {
 
     /** The next segment of whichever pushed stack, send queue or free list holds this one. */
     reply_segment_t* next {};
+
+    /** A plaintext memory part, which its caller keeps unchanged until the reply's outcome is
+     *  final, sent in place of @c bytes and never sealed or written; empty for a framed segment. */
+    span<byte_t> caller_bytes {};
+
+    /** What sends take: the caller's bytes, else the framed ones. */
+    span<byte_t> outgoing() noexcept { return caller_bytes.empty() ? span<byte_t> {bytes} : caller_bytes; }
+    std::size_t outgoing_size() const noexcept { return caller_bytes.empty() ? bytes.size() : caller_bytes.size(); }
 };
 
 /** How far a file segment got: a path to open, a descriptor to measure, a range ready to read,
@@ -264,8 +273,8 @@ struct file_segment {
     explicit file_segment(allocator_t const& allocator) noexcept : segment(allocator) {
         // A Windows handle takes 8 bytes where a descriptor takes 4, which pads the record by 8.
         static_assert(sizeof(file_segment_t) == sizeof(reply_segment_t) + (UCALL_OS_WINDOWS_ ? 40 : 32));
-        static_assert(!std::is_empty_v<allocator_t> || sizeof(reply_segment_t) == 32,
-                      "a stateless allocator keeps reply segments at 32 bytes and file segments at 64");
+        static_assert(!std::is_empty_v<allocator_t> || sizeof(reply_segment_t) == 48,
+                      "a stateless allocator keeps reply segments at 48 bytes and file segments at 80");
     }
     file_segment(file_segment const&) = delete;
     file_segment& operator=(file_segment const&) = delete;

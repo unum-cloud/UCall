@@ -17,8 +17,8 @@
 #include "ucall/io/types.hpp"      // `io_operation_t`
 #include "ucall/network/types.hpp" // `reply_framing_t`, `max_unsent_bytes_k`
 #include "ucall/tunnel/types.hpp" // `secure_tunnel_config_t`, `secure_tunnel_geometry_t`, `secure_tunnel_mode_t`, `secure_tunnel_role_t`
-#include "ucall/utilities/sockets.hpp" // `file_direct_switch`, `socket_close`, `socket_length_t`, `socket_open`
-#include "ucall/utilities/types.hpp"   // `text_view`, `byte_t`, `bytes_view`, `descriptor_t`
+#include "ucall/utilities/sockets.hpp" // `file_direct_switch`, `socket_close`, `socket_length_t`, `socket_open`, `visit_host_addresses`
+#include "ucall/utilities/types.hpp" // `text_view`, `byte_t`, `bytes_view`, `descriptor_t`
 
 namespace unum::ucall::network {
 
@@ -48,6 +48,7 @@ using utilities::socket_share_port;
 using utilities::sockets_start;
 using utilities::span;
 using utilities::text_view;
+using utilities::visit_host_addresses;
 
 /** What a plaintext peer the loop sheds reads before its close, while the process is out of
  *  descriptors. */
@@ -63,6 +64,26 @@ struct log_field_t {
     /** The field's text, which may quote a peer; JSON escapes it, text writes it as is. */
     std::string_view value;
 };
+
+/** Whether @p peer connects from this host: over AF_UNIX, from a loopback address, or from one
+ *  of @p host_addresses, an IPv4 one also when mapped into IPv6. The list is a snapshot, so an
+ *  address added later, or a peer in another network namespace, which reaches this one through a
+ *  virtual device, reads as remote; @c ucall_send_policy_copying_k covers those. */
+inline bool shares_host(ucall_peer_address_t const& peer, span<ucall_peer_address_t const> host_addresses) noexcept {
+    constexpr ucall_byte_t mapped_prefix_k[12] {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xFF, 0xFF};
+    constexpr ucall_byte_t loopback_ipv6_k[16] {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1};
+    if (peer.family == ucall_address_family_unix_k) return true;
+    bool const mapped = peer.family == ucall_address_family_ipv6_k &&
+                        std::memcmp(peer.bytes, mapped_prefix_k, sizeof(mapped_prefix_k)) == 0;
+    bool const ipv4 = peer.family == ucall_address_family_ipv4_k || mapped;
+    ucall_byte_t const* const bytes = mapped ? peer.bytes + sizeof(mapped_prefix_k) : peer.bytes;
+    if ((ipv4 && bytes[0] == 127) || (!ipv4 && std::memcmp(bytes, loopback_ipv6_k, 16) == 0)) return true;
+    for (ucall_peer_address_t const& address : host_addresses) {
+        bool const same_family = (address.family == ucall_address_family_ipv4_k) == ipv4;
+        if (same_family && std::memcmp(address.bytes, bytes, ipv4 ? 4 : 16) == 0) return true;
+    }
+    return false;
+}
 
 /** Configuration checks, socket binding, and the text of reply heads, records and log lines. */
 template <typename network_type_>
@@ -85,6 +106,19 @@ struct formatting {
     }
     static bool security_valid(ucall_security_t security) noexcept {
         return security >= ucall_security_none_k && security <= ucall_security_noise_kk_k;
+    }
+    static bool send_policy_valid(ucall_send_policy_t send_policy) noexcept {
+        return send_policy >= ucall_send_policy_automatic_k && send_policy <= ucall_send_policy_copying_k;
+    }
+
+    /** Whether @p network_interface copies its sends to @p peer, as its send policy picks. */
+    static bool sends_copying_to(network_interface_t const& network_interface, ucall_peer_address_t const& peer,
+                                 span<ucall_peer_address_t const> host_addresses) noexcept {
+        switch (network_interface.config->send_policy) {
+        case ucall_send_policy_zero_copy_k: return false;
+        case ucall_send_policy_copying_k: return true;
+        default: return shares_host(peer, host_addresses);
+        }
     }
     static secure_tunnel_config_t tunnel_config(ucall_security_t security, secure_tunnel_role_t role,
                                                 ucall_noise_key_t const* private_key, byte_t const* public_key,
@@ -141,6 +175,19 @@ struct formatting {
         }
         else if (address.ss_family == AF_UNIX) peer.family = ucall_address_family_unix_k;
         return peer;
+    }
+
+    /** Appends every IPv4 and IPv6 address this host's interfaces hold to @p addresses; a host
+     *  that cannot list them still recognizes loopback and AF_UNIX peers. */
+    static ucall_status_t read_host_addresses(vector<ucall_peer_address_t>& addresses) noexcept {
+        ucall_status_t result = ucall_status_success_k;
+        visit_host_addresses([&](sockaddr const& host_address) noexcept {
+            sockaddr_storage address {};
+            std::memcpy(&address, &host_address,
+                        host_address.sa_family == AF_INET ? sizeof(sockaddr_in) : sizeof(sockaddr_in6));
+            if (st::failed(addresses.push_back(peer_address(address)))) result = ucall_status_out_of_memory_k;
+        });
+        return result;
     }
 
     /** Binds and listens on the address of @p acceptor's interface through @p queue, trying each
@@ -586,6 +633,8 @@ struct formatting {
         switch (part.kind) {
         case ucall_reply_part_bytes_k:
             return http_t::valid_view(part.data.bytes) ? ucall_status_success_k : ucall_status_invalid_argument_k;
+        case ucall_reply_part_memory_k:
+            return http_t::valid_view(part.data.memory) ? ucall_status_success_k : ucall_status_invalid_argument_k;
         case ucall_reply_part_file_k: {
             ucall_file_range_t const& file = part.data.file;
             if (file.file_descriptor < 0) return ucall_status_invalid_argument_k;
@@ -605,14 +654,16 @@ struct formatting {
         }
     }
 
-    /** Checks every one of @p parts, counting the file and path parts into @p files. */
+    /** Checks every one of @p parts, counting the file and path parts into @p files and the memory
+     *  parts into @p memory_parts. */
     static ucall_status_t check_parts(server_exchange_t const& exchange, span<ucall_reply_part_t const> parts,
-                                      std::size_t& files) noexcept {
-        files = 0;
+                                      std::size_t& files, std::size_t& memory_parts) noexcept {
+        files = memory_parts = 0;
         for (ucall_reply_part_t const& part : parts) {
             if (ucall_status_t const checked = check_part(exchange, part); checked != ucall_status_success_k)
                 return checked;
-            files += part.kind != ucall_reply_part_bytes_k;
+            files += part.kind == ucall_reply_part_file_k || part.kind == ucall_reply_part_path_k;
+            memory_parts += part.kind == ucall_reply_part_memory_k;
         }
         return ucall_status_success_k;
     }

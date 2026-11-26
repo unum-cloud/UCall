@@ -8,8 +8,9 @@
 #pragma once
 #include <cstring> // `std::memcmp`
 
-#include <fcntl.h>    // `open`, `O_DIRECT`
-#include <sys/stat.h> // `mkfifo`, `mkdir`
+#include <fcntl.h>        // `open`, `O_DIRECT`
+#include <sys/resource.h> // `getrlimit`, `setrlimit`
+#include <sys/stat.h>     // `mkfifo`, `mkdir`
 
 #include <algorithm> // `std::find`, `std::fill`
 #include <array>     // `std::array`
@@ -460,6 +461,19 @@ void expect_nodelay(queue_type_& queue, util::descriptor_t handle) {
     util::socket_close(descriptor);
 }
 
+/** A ring sized for more operations than the kernel's file table holds still opens, registering
+ *  sockets up to that table, as releases take no file: a server of thousands of connections, each
+ *  naming a release per pipelined request, keeps its ring instead of the next queue it admits. */
+template <typename queue_type_>
+case_result_t test_ring_past_file_table() {
+    if (queue_type_ {}.open(2, 2) == ucall_status_unsupported_k) return case_result_t::skipped(generation_refused_k);
+    queue_type_ queue;
+    auto const status = queue.open(2, uring_registered_files_limit_k + 1);
+    expect_true(status == ucall_status_success_k, "a ring past the file table opened with {}",
+                ucall_status_name(status));
+    return {};
+}
+
 template <typename queue_type_>
 case_result_t test_failed_submission() {
     queue_type_ queue;
@@ -756,8 +770,10 @@ case_result_t test_registered_direct_files() {
 }
 
 /** A zero-copy send completes once the socket took its bytes, and its release only once the
- *  kernel's notification arrived; loopback copies, so that notification demotes the socket, whose
- *  next zero-copy send copies and whose next release completes at once. */
+ *  kernel's notification arrived. Loopback copies, as a NIC copies what its stack coalesced, and
+ *  that notification counts a fallback without demoting the socket, whose next send pins again. A
+ *  send pinning past the locked-memory limit copies its retry alone, and the send after it pins,
+ *  while a socket that @c copy_sends marks copies every send, its release completing at once. */
 template <typename queue_type_>
 case_result_t test_zero_copy_sends() {
     queue_type_ queue;
@@ -791,30 +807,63 @@ case_result_t test_zero_copy_sends() {
                 received.insert(received.end(), buffer, buffer + length);
         return received.size() == expected;
     };
+    auto send_and_release = [&](io_request_t& sending, io_request_t& release) {
+        received.clear();
+        util::descriptor_t const sent = await(sending);
+        queue.submit(release);
+        expect_true(queue.cancel(release) == ucall_status_success_k);
+        expect_true(finish(release) == 0, "the release reported its socket copying for good");
+        expect_true(drain(static_cast<std::size_t>(fu::max_of<util::descriptor_t>(sent, 0))) &&
+                    std::memcmp(received.data(), window.data, received.size()) == 0);
+        return sent;
+    };
 
     queue.reserve_releases(1);
-    io_request_t release {.operation = io_operation_t::zero_copy_release_k};
+    io_request_t release {.operation = io_operation_t::zero_copy_release_k, .descriptor = socket};
     io_request_t sending {.operation = io_operation_t::send_zero_copy_k,
                           .registered_memory = registration.index,
                           .descriptor = socket,
                           .data = window.data,
                           .length = window.size,
                           .release_request = &release};
-    util::descriptor_t const sent = await(sending);
-    expect_true(sent > 0 && queue.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", sent,
+    util::descriptor_t const sent = send_and_release(sending, release);
+    expect_true(sent > 0 && queue.statistics.zero_copy_sends == 1 && queue.statistics.zero_copy_fallbacks == 1,
+                "sending ended with {} after {} sends and {} fallbacks", sent, queue.statistics.zero_copy_sends,
+                queue.statistics.zero_copy_fallbacks);
+    util::descriptor_t const pinned_again = send_and_release(sending, release);
+    expect_true(pinned_again > 0 && queue.statistics.zero_copy_sends == 2,
+                "a copied notification demoted the socket: {} after {} sends", pinned_again,
                 queue.statistics.zero_copy_sends);
-    queue.submit(release);
-    expect_true(queue.cancel(release) == ucall_status_success_k);
-    expect_true(finish(release) == 0 && queue.statistics.zero_copy_fallbacks == 1,
-                "the release completed with {} fallbacks counted", queue.statistics.zero_copy_fallbacks);
-    expect_true(drain(static_cast<std::size_t>(sent)) &&
-                std::memcmp(received.data(), window.data, received.size()) == 0);
 
+    // Root pins past RLIMIT_MEMLOCK, and registered memory was pinned once at registration.
+    if (::geteuid() != 0) {
+        io_request_t unregistered = sending;
+        unregistered.registered_memory = io_unregistered_k;
+        rlimit original {};
+        expect_true(::getrlimit(RLIMIT_MEMLOCK, &original) == 0);
+        rlimit lowered = original;
+        lowered.rlim_cur = 0;
+        expect_true(::setrlimit(RLIMIT_MEMLOCK, &lowered) == 0, "the locked-memory limit stayed");
+        std::uint64_t const fallbacks = queue.statistics.zero_copy_fallbacks;
+        util::descriptor_t const refused = send_and_release(unregistered, release);
+        expect_true(::setrlimit(RLIMIT_MEMLOCK, &original) == 0, "the locked-memory limit stayed lowered");
+        expect_true(
+            refused > 0 && queue.statistics.zero_copy_fallbacks > fallbacks && queue.statistics.zero_copy_sends == 3,
+            "a refused pinning sent {} after {} sends", refused, queue.statistics.zero_copy_sends);
+        util::descriptor_t const pinned_after = send_and_release(unregistered, release);
+        expect_true(pinned_after > 0 && queue.statistics.zero_copy_sends == 4,
+                    "the send after a refused one copied: {} after {} sends", pinned_after,
+                    queue.statistics.zero_copy_sends);
+    }
+
+    // A socket marked to copy sends without pinning, and its release reports it copying at once.
+    std::uint64_t const pinned_sends = queue.statistics.zero_copy_sends;
+    queue.copy_sends(socket);
     received.clear();
     util::descriptor_t const copied = await(sending);
-    expect_true(copied > 0 && queue.statistics.zero_copy_sends == 1, "sending ended with {} after {} sends", copied,
+    expect_true(copied > 0 && queue.statistics.zero_copy_sends == pinned_sends, "a copying socket pinned: {} sends",
                 queue.statistics.zero_copy_sends);
-    expect_true(await(release) == 0);
+    expect_true(await(release) == 1, "the release of a copying socket reported pinning");
     expect_true(drain(static_cast<std::size_t>(copied)) &&
                 std::memcmp(received.data(), window.data, received.size()) == 0);
     expect_true(queue.close_socket(socket) == 0);

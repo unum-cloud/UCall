@@ -46,7 +46,7 @@ pub use client::{Client, ClientCall, ClientCallOptions, ClientOptions, Completed
 pub use server::{
     Batch, BatchEndpoint, BatchEndpointStatistics, Batching, BodyChunk, DetachedRequest, EventLoopStatistics,
     FileRange, Interface, Metrics, PathRange, Peer, PeerAddress, Polling, ReplyPart, ReplyStream, Request, RequestPart,
-    Server, ServerOptions,
+    SendPolicy, Server, ServerOptions,
 };
 #[cfg(windows)]
 pub use types::CrtDescriptor;

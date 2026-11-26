@@ -15,7 +15,7 @@
 #include "ucall/network/loops.hpp"     // `event_loop_stage_t`, `wake_state_t`, `metrics_state_t`
 #include "ucall/network/types.hpp"     // `server_stage_t`, `transport_stage_t`, `body_stage_t`, `parts_state_t`
 #include "ucall/tunnel/curve25519.hpp" // `x25519_derive_public`
-#include "ucall/utilities/sockets.hpp" // `datagram_open`, `deadline_after`, `directory_open`, `monotonic_ns`
+#include "ucall/utilities/sockets.hpp" // `datagram_open`, `deadline_after`, `directory_open`, `largest_send_buffer_bytes`
 #include "ucall/utilities/types.hpp"   // `text_view`, `allocator_delete`, `current_polling_thread`, `polling_thread_t`
 
 namespace unum::ucall::network {
@@ -40,6 +40,7 @@ using utilities::datagram_open;
 using utilities::deadline_after;
 using utilities::descriptor_t;
 using utilities::directory_open;
+using utilities::largest_send_buffer_bytes;
 using utilities::monotonic_ns;
 using utilities::polling_thread_t;
 using utilities::publish;
@@ -90,7 +91,8 @@ struct server : ucall_server_handle_t {
           event_loops(rebound_allocator<owner<event_loop_t>> {allocator}), routes(allocator),
           batch_endpoints(rebound_allocator<batch_endpoint_t*> {allocator}),
           metrics_text(rebound_allocator<char> {allocator}),
-          metrics_tag_views(rebound_allocator<ucall_bytes_view_t> {allocator}) {}
+          metrics_tag_views(rebound_allocator<ucall_bytes_view_t> {allocator}),
+          host_addresses(rebound_allocator<ucall_peer_address_t> {allocator}) {}
     server(server const&) = delete;
     server& operator=(server const&) = delete;
     server(server&&) = delete;
@@ -135,6 +137,10 @@ struct server : ucall_server_handle_t {
 
     /** Each tag within @c metrics_text, which @c config.metrics_tags points at. */
     vector<ucall_bytes_view_t> metrics_tag_views {};
+
+    /** The addresses this host's interfaces held at initialization, which a peer on this host
+     *  connects from, so its replies leave by copying, as local delivery copies every send. */
+    vector<ucall_peer_address_t> host_addresses {};
 
     /** The resolved StatsD address each loop's metrics socket connects to. */
     sockaddr_storage metrics_destination {};
@@ -293,6 +299,11 @@ struct server : ucall_server_handle_t {
             publish<atomic_ref>(arguments->outcome, routed);
             return;
         }
+        if (ucall_status_t const listed = formatting_t::read_host_addresses(server->host_addresses);
+            listed != ucall_status_success_k) {
+            publish<atomic_ref>(arguments->outcome, listed);
+            return;
+        }
         rebound_allocator<network_interface_t> network_interface_allocator {allocator};
         auto* network_interfaces = network_interface_allocator.allocate(requested->interfaces_count);
         if (!network_interfaces) {
@@ -334,6 +345,7 @@ struct server : ucall_server_handle_t {
             }
             if ((!settings.address.length && !settings.listen_descriptor) ||
                 !formatting_t::security_valid(settings.security) ||
+                !formatting_t::send_policy_valid(settings.send_policy) ||
                 (settings.security != ucall_security_none_k && !settings.noise_private_key) ||
                 (settings.security == ucall_security_noise_xx_k && !settings.peer_authorizer) ||
                 (settings.security == ucall_security_noise_kk_k && !settings.noise_peer_key)) {
@@ -387,6 +399,8 @@ struct server : ucall_server_handle_t {
                 network_interface.listen_queues = listen_queues_t::per_loop_k;
 #endif
             network_interface.send_buffer_bytes = formatting_t::listener_send_buffer(network_interface);
+            network_interface.largest_send_buffer_bytes = fu::max_of(network_interface.send_buffer_bytes,
+                                                                     largest_send_buffer_bytes());
             if (settings.noise_private_key)
                 x25519_derive_public<typename crypto_t::x25519_kit_t>(
                     network_interface.public_key, std::as_bytes(std::span {*settings.noise_private_key}));

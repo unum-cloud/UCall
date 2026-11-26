@@ -2,7 +2,7 @@
  *  @file test/network/replies.cpp
  *  @author Ash Vardanian
  *  @date October 19, 2026
- *  @brief File and path reply parts, mixed streams, Noise record boundaries, stop, linger,
+ *  @brief File, path and memory reply parts, mixed streams, Noise record boundaries, stop, linger,
  *      windows and fairness.
  */
 #undef NDEBUG // ! A test's oracle must stay live in every build
@@ -1072,7 +1072,8 @@ static void test_server_free_off_its_polling_owner(sweep_cell_t const& cell) {
  *  one connection slot for the next peer. A copying queue closes in order. */
 static case_result_t test_linger_then_reset(sweep_cell_t const& cell) {
 #if UCALL_OS_POSIX_
-    fixture_t fixture {cell, {}};
+    // Loopback would copy anyway, so only a forced policy sends this reply without copying.
+    fixture_t fixture {cell, {.send_policy = ucall_send_policy_zero_copy_k}};
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
         return {};
     fixture.serve_in_background();
@@ -1125,13 +1126,14 @@ static case_result_t test_zero_copy_pins_past_memlock(sweep_cell_t const& cell) 
     if (::geteuid() == 0)
         return case_result_t::skipped("needs an unprivileged user, as root pins without RLIMIT_MEMLOCK");
     std::size_t const body_length = std::size_t {4} << 20;
-    fixture_t fixture {cell, {.connections = 2, .max_request_bytes = 2 * body_length}};
+    fixture_t fixture {
+        cell,
+        {.connections = 2, .max_request_bytes = 2 * body_length, .send_policy = ucall_send_policy_zero_copy_k}};
     if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
         return {};
     fixture.serve_in_background();
     {
         // An echo on another connection proves the loop registered rings under the lowered limit.
-        // It also keeps this socket's first send zero-copy, as loopback demotes a socket after one.
         raw_client_t warm;
         if (!expect_true(warm.connect(fixture.address))) return {};
         std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok";
@@ -1358,8 +1360,334 @@ static case_result_t test_warm_file_reply_allocates_nothing(sweep_cell_t const& 
     });
 }
 
+#pragma region Memory Parts
+
+/** A reply part of @p data, which the caller keeps unchanged until the reply is final. */
+static ucall_reply_part_t memory_part(std::string_view data) {
+    ucall_reply_part_t part {};
+    part.kind = ucall_reply_part_memory_k;
+    part.data.memory = bytes_view(data);
+    return part;
+}
+
+/** Memory parts, a large one, an empty one and a short one, arrive among bytes parts under a
+ *  content length summing them, and a @c HEAD request gets that length alone, while the second
+ *  @c GET leaves through a socket loopback demoted to copying. Each outcome reads deferred on
+ *  return and success once sent. In plaintext the loop copies none of the memory parts' bytes,
+ *  while Noise seals them into the loop's records. */
+static void test_memory_parts_vectored(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {.max_response_bytes = std::size_t {128} << 20}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    std::string const big = file_tree_t::big();
+    std::string const expected = fmt::format("head|{}|tail", big);
+    for (ucall_verb_t verb : {ucall_verb_get_k, ucall_verb_head_k, ucall_verb_get_k}) {
+        auto* request = hold_call(fixture, verb, cell.security);
+        if (!expect_true(request)) return;
+        std::uint64_t const copied = loop_statistics(fixture).bytes_copied;
+        ucall_outcome_t outcome {};
+        reply_parts(fixture, request, outcome,
+                    {bytes_part("head|"), memory_part(big), memory_part(""), memory_part("|tail")});
+        auto completed = fixture.wait();
+        if (completed.response)
+            expect_true(response_header(completed.response, "content-length") == fmt::format("{}", expected.size()),
+                        "content-length {}", response_header(completed.response, "content-length"));
+        check_answer(completed, ucall_http_status_ok_k, verb == ucall_verb_get_k ? expected : "");
+        expect_outcome(fixture, outcome, ucall_status_success_k);
+        std::uint64_t const copied_now = loop_statistics(fixture).bytes_copied - copied;
+        // Only the bytes part copies in plaintext, while Noise copies the memory parts to seal too.
+        std::size_t const bytes_part_size = std::string_view {"head|"}.size();
+        if (verb == ucall_verb_get_k)
+            expect_true(
+                cell.security == ucall_security_none_k ? copied_now == bytes_part_size : copied_now >= expected.size(),
+                "the loop copied {} bytes of a {}-byte reply", copied_now, expected.size());
+    }
+}
+
+/** A stream appends memory parts among bytes parts, chunked and under a declared length, from
+ *  the polling thread before the loop runs, so its end reads deferred in plaintext, until the
+ *  kernel let go of the memory, and final under Noise, which copied it into records. The body
+ *  arrives whole through the library client. */
+static void test_memory_stream(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {.max_response_bytes = std::size_t {128} << 20}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    // Below what a stream may hold unsent, so no append waits for the loop.
+    std::string const big = file_tree_t::big(1000, max_unsent_bytes_k / 2);
+    std::string const expected = fmt::format("a|{}|z", big);
+    std::string const declared = fmt::format("content-length: {}", expected.size());
+    for (bool const chunked : {true, false}) {
+        auto* request = hold_call(fixture, ucall_verb_get_k, cell.security);
+        if (!expect_true(request)) return;
+        ucall_outcome_t outcome {}, ended {};
+        ucall_bytes_view_t const header = bytes_view(declared);
+        ucall_server_reply_begin_t begin {fixture.server, &outcome, &request, 0, &header, chunked ? 0u : 1u};
+        ucall_server_reply_begin(&begin);
+        expect_true(outcome.status == ucall_status_success_k, "begin: {}", ucall_status_name(outcome.status));
+        std::vector<std::vector<ucall_reply_part_t>> const chunks {{bytes_part("a|"), memory_part(big)},
+                                                                   {memory_part("")},
+                                                                   {memory_part("|z")}};
+        for (auto const& chunk : chunks) {
+            ucall_server_reply_append_t append {fixture.server, &outcome, request, chunk.data(), chunk.size()};
+            ucall_server_reply_append(&append);
+            expect_true(outcome.status == ucall_status_success_k, "chunk: {}", ucall_status_name(outcome.status));
+        }
+        ucall_server_reply_end_t end {fixture.server, &ended, &request};
+        ucall_server_reply_end(&end);
+        ucall_status_t const wanted = cell.security == ucall_security_none_k ? ucall_status_deferred_k
+                                                                             : ucall_status_success_k;
+        expect_true(ucall_outcome_status(&ended) == wanted, "end: {}", ucall_status_name(ended.status));
+        auto completed = fixture.wait();
+        if (completed.response)
+            expect_true(response_header(completed.response, "transfer-encoding") == (chunked ? "chunked" : ""),
+                        "transfer-encoding {}", response_header(completed.response, "transfer-encoding"));
+        check_answer(completed, ucall_http_status_ok_k, expected);
+        expect_outcome(fixture, ended, ucall_status_success_k);
+    }
+}
+
+/** A memory part with no bytes behind its length is refused, and so is a 204 carrying one with
+ *  bytes, each leaving the request for the next reply, while an empty one on a 204 is no body. */
+static void test_memory_part_refusals(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    auto* request = hold_call(fixture, ucall_verb_get_k, cell.security);
+    if (!expect_true(request)) return;
+    ucall_reply_part_t missing {};
+    missing.kind = ucall_reply_part_memory_k;
+    missing.data.memory = {nullptr, 4};
+    ucall_outcome_t outcome {};
+    expect_true(reply_parts(fixture, request, outcome, {missing}, {}, ucall_status_invalid_argument_k));
+    ucall_server_reply_vectored_t no_content {fixture.server, &outcome, &request, ucall_http_status_no_content_k,
+                                              nullptr,        0,        nullptr,  0};
+    ucall_reply_part_t const body = memory_part("body");
+    no_content.parts = &body;
+    no_content.parts_count = 1;
+    ucall_server_reply_vectored(&no_content);
+    expect_true(outcome.status == ucall_status_invalid_argument_k && request, "a 204 with a body: {}",
+                ucall_status_name(outcome.status));
+    ucall_reply_part_t const empty = memory_part("");
+    no_content.parts = &empty;
+    ucall_server_reply_vectored(&no_content);
+    check_answer(fixture.wait(), ucall_http_status_no_content_k, "");
+    expect_outcome(fixture, outcome, ucall_status_success_k);
+}
+
+/** A peer that reads only once the reply started takes a memory part larger than its receive
+ *  buffer and the largest send buffer the server's socket grows to, so the part leaves over many
+ *  partial sends, pinned though loopback copies, each resuming where the socket stopped, and the
+ *  outcome stays deferred until the last of it left and the kernel let go of it. */
+static void test_memory_part_partial_sends(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {.send_policy = ucall_send_policy_zero_copy_k}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    // A window the client shrank would stay a trickle once it reads, so the body outgrows the
+    // buffers instead: the client's, which only its reads grow, and the server's at its largest.
+    int receive_buffer_bytes = 0;
+    util::socket_length_t length = sizeof(receive_buffer_bytes);
+    expect_true(getsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes, &length) == 0);
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    expect_true(::send(client.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
+    if (!await_held_in_background(fixture, 1)) return;
+    std::string const body = file_tree_t::big(
+        0, static_cast<std::size_t>(receive_buffer_bytes) + util::largest_send_buffer_bytes() + util::page_size());
+    ucall_outcome_t outcome {};
+    reply_parts(fixture, fixture.take_held(), outcome, {memory_part(body)});
+    // The body outweighs both sockets' buffers, so the server cannot have sent it unread.
+    std::this_thread::sleep_for(50ms);
+    expect_true(ucall_outcome_status(&outcome) == ucall_status_deferred_k, "the outcome turned {} unread",
+                ucall_status_name(ucall_outcome_status(&outcome)));
+    auto const response = read_response(client, 0);
+    expect_true(response.status == 200 && response.body == body, "answered {} with {} of {} bytes", response.status,
+                response.body.size(), body.size());
+    expect_outcome(fixture, outcome, ucall_status_success_k);
+    fixture.stop();
+}
+
+/** Stopping the server while a peer that reads nothing holds a memory part in its socket ends
+ *  within two linger periods, and the outcome, deferred until then, turns final with the close. */
+static void test_memory_part_stop(sweep_cell_t const& cell) {
+    keeping_descriptors([&] {
+        std::string const body(std::size_t {64} << 20, 'm');
+        ucall_outcome_t outcome {};
+        raw_client_t client;
+        {
+            fixture_t fixture {cell, {}};
+            if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+                return;
+            fixture.serve_in_background();
+            if (!expect_true(client.connect(fixture.address))) return;
+            int const receive_buffer_bytes = 4096;
+            expect_true(setsockopt(client.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes,
+                                   sizeof(receive_buffer_bytes)) == 0);
+            std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+            expect_true(::send(client.descriptor, request.data(), request.size(), 0) ==
+                        static_cast<ssize_t>(request.size()));
+            if (!await_held_in_background(fixture, 1)) return;
+            reply_parts(fixture, fixture.take_held(), outcome, {memory_part(body)});
+            auto const deadline = steady_clock::now() + wait_limit_k;
+            while (client.received.find("\r\n\r\n") == std::string::npos &&
+                   client.read(client.received.size() + 1, deadline) == read_end_t::filled_k) {}
+            std::this_thread::sleep_for(50ms);
+            expect_true(ucall_outcome_status(&outcome) == ucall_status_deferred_k, "the outcome turned {} unread",
+                        ucall_status_name(ucall_outcome_status(&outcome)));
+            auto const stopping = steady_clock::now();
+            ucall_server_stop(fixture.server);
+            fixture.stop();
+            auto const stopped = steady_clock::now() - stopping;
+            expect_true(stopped < 3s, "stopping took {} ms",
+                        std::chrono::duration_cast<std::chrono::milliseconds>(stopped).count());
+        }
+        expect_true(ucall_outcome_status(&outcome) == ucall_status_connection_closed_k, "the outcome turned {}",
+                    ucall_status_name(ucall_outcome_status(&outcome)));
+    });
+}
+
+/** A memory part answering a closing request of a peer that never reads lingers, as any reply
+ *  does: the next peer is served meanwhile, the body arrives whole once the peer reads, and the
+ *  outcome turns success. */
+static void test_memory_part_linger(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t silent;
+    if (!expect_true(silent.connect(fixture.address))) return;
+    int const receive_buffer_bytes = 4096;
+    expect_true(
+        setsockopt(silent.descriptor, SOL_SOCKET, SO_RCVBUF, &receive_buffer_bytes, sizeof(receive_buffer_bytes)) == 0);
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    expect_true(::send(silent.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
+    if (!await_held_in_background(fixture, 1)) return;
+    // As in `test_linger_then_reset`, the copying sends a peer on this host takes fit this body.
+    std::string const body(12000, 'l');
+    ucall_outcome_t outcome {};
+    auto const replied = steady_clock::now();
+    reply_parts(fixture, fixture.take_held(), outcome, {memory_part(body)});
+    raw_client_t next;
+    if (!expect_true(next.connect(fixture.address))) return;
+    std::string_view const echo = "POST /echo/1 HTTP/1.1\r\nHost: a\r\nContent-Length: 2\r\n\r\nok";
+    expect_true(::send(next.descriptor, echo.data(), echo.size(), 0) == static_cast<ssize_t>(echo.size()));
+    auto const response = read_response(next, 0);
+    auto const freed = std::chrono::duration_cast<std::chrono::milliseconds>(steady_clock::now() - replied);
+    expect_true(response.body == "ok" && freed < 4s, "the next peer was served after {} ms", freed.count());
+    auto const end = silent.read_until_close(steady_clock::now() + wait_limit_k);
+    bool const whole = end == read_end_t::closed_k && parse_response(silent.received).body == body;
+    expect_true(whole, "the read ended as {} with {} bytes", static_cast<int>(end), silent.received.size());
+    expect_outcome(fixture, outcome, ucall_status_success_k);
+    fixture.stop();
+}
+
+/** A peer on this host takes copying sends from its admission, as local delivery copies every
+ *  send anyway, so a four-mebibyte memory part arrives whole with no zero-copy send at all. */
+static void test_local_peer_copies(sweep_cell_t const& cell) {
+    fixture_t fixture {cell, {}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    expect_true(::send(client.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
+    if (!await_held_in_background(fixture, 1)) return;
+    std::string const body = file_tree_t::big();
+    ucall_outcome_t outcome {};
+    reply_parts(fixture, fixture.take_held(), outcome, {memory_part(body)});
+    auto const response = read_response(client, 0);
+    expect_true(response.status == 200 && response.body == body, "answered {} with {} of {} bytes", response.status,
+                response.body.size(), body.size());
+    expect_outcome(fixture, outcome, ucall_status_success_k);
+    auto const statistics = loop_statistics(fixture);
+    expect_true(statistics.zero_copy_sends == 0 && statistics.copying_sends > 0,
+                "{} zero-copy and {} copying sends to a peer on this host", statistics.zero_copy_sends,
+                statistics.copying_sends);
+    fixture.stop();
+}
+
+/** A peer address from @p family and its @p bytes, as an accept reports one. */
+static ucall_peer_address_t peer_from(ucall_address_family_t family, std::initializer_list<int> bytes) {
+    ucall_peer_address_t peer {};
+    peer.family = static_cast<std::uint8_t>(family);
+    std::size_t index = 0;
+    for (int byte : bytes) peer.bytes[index++] = static_cast<ucall_byte_t>(byte);
+    return peer;
+}
+
+/** Loopback addresses in either family, an IPv4 one mapped into IPv6, AF_UNIX and an address of
+ *  one of this host's interfaces all share the host, while documentation addresses do not. */
+static case_result_t test_shares_host() {
+    std::vector<ucall_peer_address_t> host;
+    bool const listed = uc::utilities::visit_host_addresses([&](sockaddr const& address) {
+        if (address.sa_family != AF_INET) return;
+        ucall_peer_address_t peer = peer_from(ucall_address_family_ipv4_k, {});
+        std::memcpy(peer.bytes, &reinterpret_cast<sockaddr_in const&>(address).sin_addr, 4);
+        host.push_back(peer);
+    });
+    auto const own_address = std::find_if(host.begin(), host.end(),
+                                          [](auto const& peer) { return peer.bytes[0] != 127; });
+    if (!listed || own_address == host.end()) return case_result_t::skipped("needs an IPv4 interface beside loopback");
+    span<ucall_peer_address_t const> const addresses {host};
+    ucall_peer_address_t mapped_own_address = peer_from(ucall_address_family_ipv6_k,
+                                                        {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255});
+    std::memcpy(mapped_own_address.bytes + 12, own_address->bytes, 4);
+    expect_true(shares_host(peer_from(ucall_address_family_ipv4_k, {127, 0, 0, 5}), addresses), "127.0.0.5");
+    expect_true(shares_host(peer_from(ucall_address_family_ipv6_k, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
+                            addresses),
+                "::1");
+    expect_true(
+        shares_host(peer_from(ucall_address_family_ipv6_k, {0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 255, 255, 127, 0, 0, 1}),
+                    addresses),
+        "::ffff:127.0.0.1");
+    expect_true(shares_host(*own_address, addresses), "an address of this host's interface");
+    expect_true(shares_host(mapped_own_address, addresses), "that address mapped into IPv6");
+    expect_true(shares_host(peer_from(ucall_address_family_unix_k, {}), addresses), "AF_UNIX");
+    expect_true(!shares_host(peer_from(ucall_address_family_ipv4_k, {192, 0, 2, 1}), addresses), "192.0.2.1");
+    expect_true(!shares_host(peer_from(ucall_address_family_ipv6_k,
+                                       {0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1}),
+                             addresses),
+                "2001:db8::1");
+    expect_true(!shares_host(peer_from(ucall_address_family_ipv4_k, {192, 0, 2, 1}), {}),
+                "192.0.2.1 with no host addresses");
+    return {};
+}
+
+/** A memory part three times the largest send buffer a socket grows to leaves pinned, in sends of
+ *  at most that buffer each, and arrives whole. */
+static void test_memory_part_past_send_buffer(sweep_cell_t const& cell) {
+    std::size_t const largest = uc::utilities::largest_send_buffer_bytes();
+    if (!largest) return;
+    fixture_t fixture {cell, {.send_policy = ucall_send_policy_zero_copy_k}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status))) return;
+    fixture.serve_in_background();
+    raw_client_t client;
+    if (!expect_true(client.connect(fixture.address))) return;
+    std::string_view const request = "GET /gate HTTP/1.1\r\nHost: a\r\n\r\n";
+    expect_true(::send(client.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()));
+    if (!await_held_in_background(fixture, 1)) return;
+    std::string const body = file_tree_t::big(0, 3 * largest);
+    ucall_outcome_t outcome {};
+    std::uint64_t const sends = loop_statistics(fixture).zero_copy_sends + loop_statistics(fixture).copying_sends;
+    reply_parts(fixture, fixture.take_held(), outcome, {memory_part(body)});
+    auto const response = read_response(client, 0);
+    expect_true(response.status == 200 && response.body == body, "answered {} with {} of {} bytes", response.status,
+                response.body.size(), body.size());
+    expect_outcome(fixture, outcome, ucall_status_success_k);
+    auto const statistics = loop_statistics(fixture);
+    std::uint64_t const sent = statistics.zero_copy_sends + statistics.copying_sends - sends;
+    expect_true(sent >= 3, "{} sends took a part three send buffers long", sent);
+    fixture.stop();
+}
+
+#pragma endregion Memory Parts
+
 void test_replies_cell(sweep_cell_t const& cell, split_mix_generator_t& generator) {
+    test_memory_parts_vectored(cell);
+    test_memory_stream(cell);
     if (cell.security == ucall_security_none_k) {
+        test_memory_part_refusals(cell);
+        test_memory_part_partial_sends(cell);
+        test_memory_part_stop(cell);
+        test_memory_part_linger(cell);
+        test_local_peer_copies(cell);
+        test_memory_part_past_send_buffer(cell);
         test_stop_drains_held_reply(cell);
         test_client_free_on_another_ring_thread(cell);
         test_server_free_off_its_polling_owner(cell);
@@ -1395,6 +1723,8 @@ void run_replies_cases(sweep_cell_t const& cell, sz::string_t const& cell_label)
         (cell.backend == ucall_io_backend_linux_uring612_k || cell.backend == ucall_io_backend_linux_uring618_k)) {
         run_cell_case(cell_label, "test_zero_copy_pins_past_memlock", test_zero_copy_pins_past_memlock, cell);
     }
+    if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k)
+        run_cell_case(cell_label, "test_shares_host", test_shares_host);
     if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k) {
         run_cell_case(cell_label, "test_warm_file_reply_allocates_nothing", test_warm_file_reply_allocates_nothing,
                       cell);

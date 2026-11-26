@@ -140,7 +140,7 @@ unsafe extern "C" {
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 #[non_exhaustive]
 pub enum Status {
-    /// A reply is still sending a file or path part, as [`Deferred::status`] reports it.
+    /// A reply is still sending a memory, file or path part, as [`Deferred::status`] reports it.
     Deferred = 1,
     /// An allocation or reservation could not be satisfied.
     OutOfMemory = 2,
@@ -276,9 +276,9 @@ impl Default for ucall_outcome_t {
     }
 }
 
-/// A slot the caller keeps for a reply that may still send a file or path part after it returns:
-/// the event loop makes its outcome final in place, so the slot is pinned, and the descriptors its
-/// parts name stay open for `'f`.
+/// A slot the caller keeps for a reply that may still send a memory, file or path part after it
+/// returns: the event loop makes its outcome final in place, so the slot is pinned, and the memory
+/// and descriptors its parts name stay unchanged and open for `'f`.
 ///
 /// A new slot is final, and each reply written into it waits for the slot's previous one only while
 /// that still sends, so a server keeps a ring of slots rather than one per request.

@@ -34,6 +34,9 @@ typedef struct Interface {
     /** The encryption of accepted connections. */
     ucall_security_t security;
 
+    /** How replies of a page or more leave. */
+    ucall_send_policy_t send_policy;
+
     /** The requested loops; zero lets the library choose. */
     Py_ssize_t event_loops;
 
@@ -53,7 +56,8 @@ typedef struct Interface {
 static char const doc_Interface[] =                                                                 //
     "Interface(address=\"\", *, descriptor=None, device_name=None, security=Security.NONE,\n"       //
     "    noise_private_key=None, peer_authorizer=None, noise_peer_key=None, event_loops=0,\n"       //
-    "    connections=1024, pipelined_requests=0, max_request_bytes=0, reply_directories=())\n"      //
+    "    connections=1024, pipelined_requests=0, max_request_bytes=0, reply_directories=(),\n"      //
+    "    send_policy=SendPolicy.AUTOMATIC)\n"                                                       //
     "\n"                                                                                            //
     "One address a server answers on, with the security and admission of what arrives there.\n"     //
     "\n"                                                                                            //
@@ -80,10 +84,12 @@ static char const doc_Interface[] =                                             
     "    the reply is 413; 0 takes the largest receive buffer the kernel grants a socket.\n"        //
     "  reply_directories (Sequence[str | bytes | os.PathLike], optional): The directories a\n"      //
     "    `Path` part names by position, each opened once by the server.\n"                          //
+    "  send_policy (SendPolicy, optional): How replies of a page or more leave. Defaults to\n"      //
+    "    `SendPolicy.AUTOMATIC`, copying to peers on this host and pinning for the rest.\n"         //
     "\n"                                                                                            //
     "Raises:\n"                                                                                     //
     "  TypeError: An argument of the wrong type.\n"                                                 //
-    "  ValueError: A key other than 32 bytes long, or an unknown `security`.\n"                     //
+    "  ValueError: A key other than 32 bytes long, or an unknown `security` or `send_policy`.\n"    //
     "\n"                                                                                            //
     "Example:\n"                                                                                    //
     "  >>> interface = ucall.Interface(\"127.0.0.1:0\", connections=64, pipelined_requests=16)\n"   //
@@ -112,7 +118,7 @@ static PyObject* interface_directories(PyObject* object) {
 static PyObject* Interface_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
     PyObject *address = NULL, *descriptor = NULL, *device_name = NULL, *security = NULL, *noise_private_key = NULL,
              *peer_authorizer = NULL, *noise_peer_key = NULL, *event_loops = NULL, *connections = NULL,
-             *pipelined_requests = NULL, *max_request_bytes = NULL, *reply_directories = NULL;
+             *pipelined_requests = NULL, *max_request_bytes = NULL, *reply_directories = NULL, *send_policy = NULL;
     ucall_py_argument_t const arguments[] = {
         {"address", &address},
         {"descriptor", &descriptor},
@@ -126,6 +132,7 @@ static PyObject* Interface_new(PyTypeObject* type, PyObject* positional, PyObjec
         {"pipelined_requests", &pipelined_requests},
         {"max_request_bytes", &max_request_bytes},
         {"reply_directories", &reply_directories},
+        {"send_policy", &send_policy},
     };
     if (ucall_py_parse_tuple("Interface", positional, keywords, 0, 1, arguments,
                              sizeof(arguments) / sizeof(arguments[0])) != 0)
@@ -168,9 +175,10 @@ static PyObject* Interface_new(PyTypeObject* type, PyObject* positional, PyObjec
     if (peer_authorizer && !PyCallable_Check(peer_authorizer))
         return PyErr_Format(PyExc_TypeError, "'peer_authorizer' must be callable, got %s",
                             Py_TYPE(peer_authorizer)->tp_name);
-    int security_value = ucall_security_none_k;
+    int security_value = ucall_security_none_k, send_policy_value = ucall_send_policy_automatic_k;
     size_t loops = 0, budget = 1024, pipelined = 0, request_bytes = 0;
     if (ucall_py_enum_from_object(security, "security", &ucall_py_security_enum, &security_value) != 0 ||
+        ucall_py_enum_from_object(send_policy, "send_policy", &ucall_py_send_policy_enum, &send_policy_value) != 0 ||
         ucall_py_size_from_object(event_loops, "event_loops", &loops) != 0 ||
         ucall_py_size_from_object(connections, "connections", &budget) != 0 ||
         ucall_py_size_from_object(pipelined_requests, "pipelined_requests", &pipelined) != 0 ||
@@ -197,6 +205,7 @@ static PyObject* Interface_new(PyTypeObject* type, PyObject* positional, PyObjec
     self->noise_peer_key = Py_XNewRef(noise_peer_key);
     self->reply_directories = directories;
     self->security = (ucall_security_t)security_value;
+    self->send_policy = (ucall_send_policy_t)send_policy_value;
     self->event_loops = (Py_ssize_t)loops;
     self->connections = (Py_ssize_t)budget;
     self->pipelined_requests = (Py_ssize_t)pipelined;
@@ -229,6 +238,10 @@ static PyObject* Interface_get_security(Interface* self, [[maybe_unused]] void* 
     return ucall_py_enum_to_object(&ucall_py_security_enum, self->security);
 }
 
+static PyObject* Interface_get_send_policy(Interface* self, [[maybe_unused]] void* closure) {
+    return ucall_py_enum_to_object(&ucall_py_send_policy_enum, self->send_policy);
+}
+
 static PyMemberDef Interface_members[] = {
     {"address", Py_T_OBJECT_EX, offsetof(Interface, address), Py_READONLY, "The \"host:port\" to listen on."},
     {"event_loops", Py_T_PYSSIZET, offsetof(Interface, event_loops), Py_READONLY, "Requested loops; 0 chooses."},
@@ -244,6 +257,7 @@ static PyMemberDef Interface_members[] = {
 
 static PyGetSetDef Interface_getset[] = {
     {"security", (getter)Interface_get_security, NULL, "Encryption of accepted connections.", NULL},
+    {"send_policy", (getter)Interface_get_send_policy, NULL, "How replies of a page or more leave.", NULL},
     {"device_name", ucall_py_get_optional, NULL, "The pinned device, or None.",
      (void*)offsetof(Interface, device_name)},
     {"noise_private_key", ucall_py_get_optional, NULL, "The 32-byte Noise identity, or None.",
@@ -461,6 +475,14 @@ typedef struct File {
     ucall_file_range_t range;
 } File;
 
+typedef struct Memory {
+    PyObject ob_base;
+
+    /** The buffer the part exports from its owner, held until the part is freed, which keeps the
+     *  owner alive and refuses its resizing meanwhile. */
+    Py_buffer view;
+} Memory;
+
 typedef struct Path {
     PyObject ob_base;
 
@@ -494,7 +516,7 @@ typedef struct ReplyStream {
      *  a list. */
     PyObject* files;
 
-    /** File and path parts appended so far, which make the end defer. */
+    /** Memory, file and path parts appended so far, which make the end defer. */
     size_t deferring_count;
 } ReplyStream;
 
@@ -1301,6 +1323,58 @@ PyTypeObject PathType = {
     .tp_members = Path_members,
 };
 
+static char const doc_Memory[] =                                                                   //
+    "Memory(buffer)\n"                                                                             //
+    "\n"                                                                                           //
+    "A buffer the event loop sends in place, as one part of `DetachedRequest.reply_parts` or\n"    //
+    "`ReplyStream.append`.\n"                                                                      //
+    "\n"                                                                                           //
+    "In plaintext the loop sends from the buffer after the call returns, without copying where\n"  //
+    "the kernel allows, so the reply defers, and the `Deferred` keeps this part, and through it\n" //
+    "the buffer's owner, alive until it is final; the owner cannot resize meanwhile, and its\n"    //
+    "bytes must stay unchanged. Under Noise the call copies them to seal.\n"                       //
+    "\n"                                                                                           //
+    "Args:\n"                                                                                      //
+    "  buffer (Buffer): The bytes, such as `bytes`, a `memoryview` or a NumPy array.\n"            //
+    "\n"                                                                                           //
+    "Example:\n"                                                                                   //
+    "  >>> part = ucall.Memory(weights)";
+
+static PyObject* Memory_new(PyTypeObject* type, PyObject* positional, PyObject* keywords) {
+    PyObject* buffer = NULL;
+    ucall_py_argument_t const arguments[] = {{"buffer", &buffer}};
+    if (ucall_py_parse_tuple("Memory", positional, keywords, 1, 1, arguments, 1) != 0) return NULL;
+    Memory* const self = (Memory*)type->tp_alloc(type, 0);
+    if (!self) return NULL;
+    if (PyObject_GetBuffer(buffer, &self->view, PyBUF_SIMPLE) != 0) {
+        self->view.obj = NULL;
+        Py_DECREF(self);
+        return NULL;
+    }
+    return (PyObject*)self;
+}
+
+static void Memory_dealloc(Memory* self) {
+    if (self->view.obj) PyBuffer_Release(&self->view);
+    Py_TYPE(self)->tp_free((PyObject*)self);
+}
+
+static PyMemberDef Memory_members[] = {
+    {"buffer", Py_T_OBJECT_EX, offsetof(Memory, view.obj), Py_READONLY, "The object owning the bytes."},
+    {"nbytes", Py_T_PYSSIZET, offsetof(Memory, view.len), Py_READONLY, "The bytes the part sends."},
+    {NULL, 0, 0, 0, NULL},
+};
+
+PyTypeObject MemoryType = {
+    PyVarObject_HEAD_INIT(NULL, 0).tp_name = "ucall.Memory",
+    .tp_basicsize = sizeof(Memory),
+    .tp_flags = Py_TPFLAGS_DEFAULT,
+    .tp_doc = doc_Memory,
+    .tp_new = Memory_new,
+    .tp_dealloc = (destructor)Memory_dealloc,
+    .tp_members = Memory_members,
+};
+
 /** The parts one reply call lays out on the stack, past which it takes them from the heap. */
 enum { inline_reply_parts_k = 16 };
 
@@ -1319,7 +1393,7 @@ typedef struct reply_parts_t {
     /** Entries filled in @c parts and @c buffers. */
     size_t count;
 
-    /** File and path parts, which make the reply defer. */
+    /** Memory, file and path parts, which make the reply defer. */
     size_t deferring_count;
 
     ucall_reply_part_t inline_parts[inline_reply_parts_k];
@@ -1369,6 +1443,12 @@ static int reply_parts_from_object(PyObject* object, reply_parts_t* source) {
             part->data.path = ((Path*)item)->range;
             ++source->deferring_count;
         }
+        else if (Py_IS_TYPE(item, &MemoryType)) {
+            Py_buffer const* const view = &((Memory*)item)->view;
+            part->kind = ucall_reply_part_memory_k;
+            part->data.memory = (ucall_bytes_view_t) {view->buf, (size_t)view->len};
+            ++source->deferring_count;
+        }
         else if (PyObject_GetBuffer(item, buffer, PyBUF_SIMPLE) == 0) {
             part->kind = ucall_reply_part_bytes_k;
             part->data.bytes = (ucall_bytes_view_t) {buffer->buf, (size_t)buffer->len};
@@ -1382,12 +1462,13 @@ static int reply_parts_from_object(PyObject* object, reply_parts_t* source) {
     return 0;
 }
 
-/** Appends every @c File part of @p source to @p files, which keeps them until the reply is
- *  final. */
+/** Appends every @c File and @c Memory part of @p source to @p files, which keeps them until the
+ *  reply is final. */
 static int reply_parts_keep_files(reply_parts_t const* source, PyObject* files) {
     for (size_t index = 0; index != source->count; ++index) {
         PyObject* const item = PySequence_Fast_GET_ITEM(source->sequence, (Py_ssize_t)index);
-        if (Py_IS_TYPE(item, &FileType) && PyList_Append(files, item) != 0) return -1;
+        bool const kept = Py_IS_TYPE(item, &FileType) || Py_IS_TYPE(item, &MemoryType);
+        if (kept && PyList_Append(files, item) != 0) return -1;
     }
     return 0;
 }
@@ -1512,33 +1593,34 @@ PyTypeObject DeferredType = {
 
 #pragma region Detached Requests
 
-static char const doc_DetachedRequest_reply_parts[] =                                                 //
-    "reply_parts(parts, status=200, headers=()) -> Deferred | None\n"                                 //
-    "\n"                                                                                              //
-    "Answers the request, once, with `parts` concatenated into the body.\n"                           //
-    "\n"                                                                                              //
-    "Bytes-like parts are copied before the call returns, and the reply is then final. A `File` or\n" //
-    "`Path` part is read by the event loop afterwards, sized first so Content-Length is measured,\n"  //
-    "and its reply defers: one failing before the head replaces the reply with 404 or 416, and one\n" //
-    "failing after it resets the connection.\n"                                                       //
-    "\n"                                                                                              //
-    "Args:\n"                                                                                         //
-    "  parts (Sequence[Buffer | File | Path]): The body, in order.\n"                                 //
-    "  status (int, optional): The HTTP status. Defaults to 200.\n"                                   //
-    "  headers (Sequence[str | bytes], optional): \"name: value\" lines; the server adds\n"           //
-    "    Content-Length, Date and Server itself.\n"                                                   //
-    "\n"                                                                                              //
-    "Returns:\n"                                                                                      //
-    "  Deferred | None: The `Deferred` of a reply with file or path parts, which may already be\n"    //
-    "    final, or None for bytes alone, final on return.\n"                                          //
-    "\n"                                                                                              //
-    "Raises:\n"                                                                                       //
-    "  BufferError: A view over the request's bytes is still alive.\n"                                //
-    "  Error: A refused part, such as a socket for a file, or a request already\n"                    //
-    "    answered, with `Status.ALREADY_EXISTS`.\n"                                                   //
-    "\n"                                                                                              //
-    "Example:\n"                                                                                      //
-    "  >>> deferred = detached.reply_parts([b\"--frame\\r\\n\", ucall.Path(0, \"intro.mp4\")])\n"     //
+static char const doc_DetachedRequest_reply_parts[] =                                                  //
+    "reply_parts(parts, status=200, headers=()) -> Deferred | None\n"                                  //
+    "\n"                                                                                               //
+    "Answers the request, once, with `parts` concatenated into the body.\n"                            //
+    "\n"                                                                                               //
+    "Bytes-like parts are copied before the call returns, and the reply is then final. A `Memory`\n"   //
+    "part is sent in place afterwards, and its reply defers until the kernel let go of it. A `File`\n" //
+    "or `Path` part is read by the event loop afterwards, sized first so Content-Length is\n"          //
+    "measured, and its reply defers: one failing before the head replaces the reply with 404 or\n"     //
+    "416, and one failing after it resets the connection.\n"                                           //
+    "\n"                                                                                               //
+    "Args:\n"                                                                                          //
+    "  parts (Sequence[Buffer | Memory | File | Path]): The body, in order.\n"                         //
+    "  status (int, optional): The HTTP status. Defaults to 200.\n"                                    //
+    "  headers (Sequence[str | bytes], optional): \"name: value\" lines; the server adds\n"            //
+    "    Content-Length, Date and Server itself.\n"                                                    //
+    "\n"                                                                                               //
+    "Returns:\n"                                                                                       //
+    "  Deferred | None: The `Deferred` of a reply with file or path parts, which may already be\n"     //
+    "    final, or None for bytes alone, final on return.\n"                                           //
+    "\n"                                                                                               //
+    "Raises:\n"                                                                                        //
+    "  BufferError: A view over the request's bytes is still alive.\n"                                 //
+    "  Error: A refused part, such as a socket for a file, or a request already\n"                     //
+    "    answered, with `Status.ALREADY_EXISTS`.\n"                                                    //
+    "\n"                                                                                               //
+    "Example:\n"                                                                                       //
+    "  >>> deferred = detached.reply_parts([b\"--frame\\r\\n\", ucall.Path(0, \"intro.mp4\")])\n"      //
     "  >>> deferred.wait()  # or: await deferred";
 
 static PyObject* DetachedRequest_reply_parts(Request* self, PyObject* const* values, Py_ssize_t count,
@@ -1703,22 +1785,22 @@ static int reply_stream_live(ReplyStream* self) {
     return -1;
 }
 
-static char const doc_ReplyStream_append[] =                                                  //
-    "append(parts, /) -> None\n"                                                              //
-    "\n"                                                                                      //
-    "Queues `parts` after the ones before, all of them or none.\n"                            //
-    "\n"                                                                                      //
-    "Bytes-like parts are copied before the call returns; `File` parts stay alive with the\n" //
-    "stream until its end is final.\n"                                                        //
-    "\n"                                                                                      //
-    "Args:\n"                                                                                 //
-    "  parts (Sequence[Buffer | File | Path]): The next parts of the body.\n"                 //
-    "\n"                                                                                      //
-    "Raises:\n"                                                                               //
-    "  Error: `Status.WOULD_BLOCK` while the peer lags, to retry once it caught up, or\n"     //
-    "    `Status.CONNECTION_CLOSED` once it left; nothing was queued either way.\n"           //
-    "\n"                                                                                      //
-    "Example:\n"                                                                              //
+static char const doc_ReplyStream_append[] =                                                //
+    "append(parts, /) -> None\n"                                                            //
+    "\n"                                                                                    //
+    "Queues `parts` after the ones before, all of them or none.\n"                          //
+    "\n"                                                                                    //
+    "Bytes-like parts are copied before the call returns; `Memory` and `File` parts stay\n" //
+    "alive with the stream until its end is final.\n"                                       //
+    "\n"                                                                                    //
+    "Args:\n"                                                                               //
+    "  parts (Sequence[Buffer | Memory | File | Path]): The next parts of the body.\n"      //
+    "\n"                                                                                    //
+    "Raises:\n"                                                                             //
+    "  Error: `Status.WOULD_BLOCK` while the peer lags, to retry once it caught up, or\n"   //
+    "    `Status.CONNECTION_CLOSED` once it left; nothing was queued either way.\n"         //
+    "\n"                                                                                    //
+    "Example:\n"                                                                            //
     "  >>> stream.append([b\"data: \", payload, b\"\\n\\n\"])";
 
 static PyObject* ReplyStream_append(ReplyStream* self, PyObject* parts) {
@@ -2832,6 +2914,7 @@ static PyObject* Server_new(PyTypeObject* type, PyObject* positional, PyObject* 
         if (source->descriptor >= 0) target->listen_descriptor = &source->descriptor;
         target->device_name = (ucall_bytes_view_t) {(ucall_byte_t const*)device, (size_t)device_length};
         target->security = source->security;
+        target->send_policy = source->send_policy;
         if (source->noise_private_key) {
             memcpy(keys[index], PyBytes_AS_STRING(source->noise_private_key), sizeof(ucall_noise_key_t));
             target->noise_private_key = (ucall_noise_key_t const*)&keys[index];

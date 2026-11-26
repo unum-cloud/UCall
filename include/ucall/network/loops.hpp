@@ -81,6 +81,10 @@ struct network_interface {
     /** The listener's @c SO_SNDBUF, which every accepted socket inherits. */
     std::size_t send_buffer_bytes {};
 
+    /** The send buffer TCP grows a socket to at most, by @c largest_send_buffer_bytes, which caps
+     *  each zero-copy send of a memory part. */
+    std::size_t largest_send_buffer_bytes {};
+
     /** The listener's address family, which each acceptor's reserve socket takes. */
     int family {};
 

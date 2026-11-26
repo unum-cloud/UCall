@@ -51,6 +51,7 @@ struct faulting_queue {
     descriptor_t open_socket(int family) noexcept { return inner.open_socket(family); }
     descriptor_t import_socket(descriptor_t descriptor) noexcept { return inner.import_socket(descriptor); }
     int close_socket(descriptor_t descriptor) noexcept { return inner.close_socket(descriptor); }
+    void copy_sends(descriptor_t descriptor) noexcept { inner.copy_sends(descriptor); }
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return inner.reset_on_close(descriptor);
     }

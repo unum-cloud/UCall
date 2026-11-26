@@ -172,6 +172,7 @@ void run_linux_uring618_queue_cases() {
             run_cell_case(label, "test_zero_copy_sends", test_zero_copy_sends<queue_type_>);
             run_cell_case(label, "test_slice_waits_a_round", test_slice_waits_a_round);
             run_cell_case(label, "test_paused_receive", test_paused_receive);
+            run_cell_case(label, "test_ring_past_file_table", test_ring_past_file_table<queue_type_>);
         });
 }
 

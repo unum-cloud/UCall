@@ -55,6 +55,7 @@ struct ucall_network_interface_t {
     max_request_bytes: usize,
     reply_directories: *const ucall_bytes_view_t,
     reply_directories_count: usize,
+    send_policy: c_int,
 }
 
 #[repr(C)]
@@ -288,6 +289,7 @@ type ucall_reply_part_kind_t = c_int;
 const ucall_reply_part_bytes_k: ucall_reply_part_kind_t = 0;
 const ucall_reply_part_file_k: ucall_reply_part_kind_t = 1;
 const ucall_reply_part_path_k: ucall_reply_part_kind_t = 2;
+const ucall_reply_part_memory_k: ucall_reply_part_kind_t = 3;
 
 #[repr(C)]
 #[derive(Clone, Copy)]
@@ -312,6 +314,7 @@ union ucall_reply_part_data_t {
     bytes: ucall_bytes_view_t,
     file: ucall_file_range_t,
     path: ucall_path_range_t,
+    memory: ucall_bytes_view_t,
 }
 
 #[repr(C)]
@@ -432,6 +435,20 @@ pub struct Interface<'server> {
     pipelined_requests: usize,
     max_request_bytes: usize,
     reply_directories: Vec<String>,
+    send_policy: SendPolicy,
+}
+
+/// How an interface sends replies of a page or more, `ucall_send_policy_t` in C.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash, Default)]
+pub enum SendPolicy {
+    /// Copies to a peer on this host, whose delivery copies every send anyway, and pins the pages
+    /// of sends to every other peer until the kernel lets go of them.
+    #[default]
+    Automatic,
+    /// Pins for every peer, as a test of the zero-copy path over loopback needs.
+    ZeroCopy,
+    /// Copies for every peer.
+    Copying,
 }
 
 impl<'server> Interface<'server> {
@@ -451,7 +468,15 @@ impl<'server> Interface<'server> {
             pipelined_requests: 0,
             max_request_bytes: 0,
             reply_directories: Vec::new(),
+            send_policy: SendPolicy::Automatic,
         }
+    }
+
+    /// Picks how replies of a page or more leave: copied to peers on this host and pinned for the
+    /// rest by default.
+    pub fn send_policy(mut self, send_policy: SendPolicy) -> Self {
+        self.send_policy = send_policy;
+        self
     }
 
     /// An interface accepting on a listening stream socket another owner opened, such as a
@@ -706,6 +731,7 @@ impl<'server> Server<'server> {
                     max_request_bytes: interface.max_request_bytes,
                     reply_directories: directories.as_ptr(),
                     reply_directories_count: directories.len(),
+                    send_policy: interface.send_policy as c_int,
                 }
             })
             .collect();
@@ -975,11 +1001,12 @@ pub struct EventLoopStatistics {
     pub bytes_copied: u64,
     /// Sends that left without copying: reply segments of a page or more, and file windows.
     pub zero_copy_sends: u64,
-    /// Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does.
+    /// Zero-copy sends the kernel copied anyway or refused to pin, as loopback always does; a
+    /// count, which changes no later send.
     pub zero_copy_fallbacks: u64,
     /// Sends that copied instead of pinning: reply segments shorter than a page, one per send or
-    /// several gathered into one, and every send of a socket demoted, refusing zero-copy, or with
-    /// no room to track one.
+    /// several gathered into one, every reply segment to a peer on this host, and every send of a
+    /// socket refusing zero-copy, or with no room to track one.
     pub copying_sends: u64,
     /// File reads handed to the kernel to finish later: io_uring, Linux or FreeBSD AIO, or
     /// overlapped reads.
@@ -1567,7 +1594,7 @@ pub struct RequestPart<'request> {
 
 /// One part of a reply body: a `ucall_reply_part_t` and nothing else, so a slice of parts is the C
 /// array the library reads. Bytes and paths borrow for `'b`, copied before the call returns, and
-/// descriptors for `'f`, read until the reply is final.
+/// memory and descriptors for `'f`, read until the reply is final.
 #[derive(Clone, Copy)]
 #[repr(transparent)]
 pub struct ReplyPart<'b, 'f> {
@@ -1579,6 +1606,20 @@ impl<'b, 'f> ReplyPart<'b, 'f> {
     /// Bytes in memory, copied before the call returns.
     pub fn bytes(bytes: impl Into<BytesView<'b>>) -> Self {
         Self::wrap(ucall_reply_part_bytes_k, ucall_reply_part_data_t { bytes: bytes.into().raw() })
+    }
+
+    /// Bytes the event loop sends in place after the call returns, without copying where the
+    /// kernel allows, so they stay unchanged until the reply is final; under Noise they are sealed
+    /// into the loop's own records before the call returns.
+    ///
+    /// # Safety
+    ///
+    /// The borrow ends with `'f`, while the kernel may still read `bytes` until the reply is
+    /// final, which only the drop of the [`Deferred`] slot or [`ReplyStream`] the reply ends into
+    /// waits for. That drop must run: leaking either one, as through `mem::forget`, lets `bytes`
+    /// be freed or changed while the kernel still sends them.
+    pub unsafe fn memory(bytes: &'f [u8]) -> Self {
+        Self::wrap(ucall_reply_part_memory_k, ucall_reply_part_data_t { memory: view(bytes) })
     }
 
     /// A range of a regular file opened with `O_DIRECT`, which the event loop reads unbuffered
@@ -1608,6 +1649,11 @@ impl<'b, 'f> ReplyPart<'b, 'f> {
     pub fn as_bytes(&self) -> Option<&'b [u8]> {
         // The kind names the union member the constructor wrote.
         (self.raw.kind == ucall_reply_part_bytes_k).then(|| unsafe { viewed(self.raw.data.bytes) })
+    }
+
+    /// The bytes of a memory part.
+    pub fn as_memory(&self) -> Option<&'f [u8]> {
+        (self.raw.kind == ucall_reply_part_memory_k).then(|| unsafe { viewed(self.raw.data.memory) })
     }
 
     /// The range of a file part.
@@ -1644,6 +1690,8 @@ impl fmt::Debug for ReplyPart<'_, '_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         if let Some(bytes) = self.as_bytes() {
             formatter.debug_tuple("Bytes").field(&bytes).finish()
+        } else if let Some(memory) = self.as_memory() {
+            formatter.debug_tuple("Memory").field(&memory).finish()
         } else if let Some(file) = self.as_file() {
             formatter.debug_tuple("File").field(&file).finish()
         } else {
@@ -1688,7 +1736,7 @@ pub struct PathRange<'b> {
 /// [`DetachedRequest::body_chunk`].
 ///
 /// It reads like the [`Request`] it came from, moves to any thread, and answers 500 when dropped
-/// unreplied. Its replies that may still send a file or path part after they return take a
+/// unreplied. Its replies that may still send a memory, file or path part after they return take a
 /// [`Deferred`] slot the caller pins, and waiting on one belongs off the polling thread, as that
 /// thread is the one sending it.
 ///
@@ -1748,8 +1796,8 @@ impl DetachedRequest {
     }
 
     /// Replies with `status`, full header lines, and `parts` concatenated into the body, its
-    /// Content-Length measured, into the slot `into`, which stays deferred while a file or path
-    /// part still sends; the slot first waits for its previous reply, if that still sends.
+    /// Content-Length measured, into the slot `into`, which stays deferred while a memory, file or
+    /// path part still sends; the slot first waits for its previous reply, if that still sends.
     ///
     /// A part failing before the head left replaces the reply with 404 for a missing, unreadable
     /// or irregular file, 416 for a range past its end, or 500, and the slot reports the cause.
@@ -1889,11 +1937,11 @@ impl Drop for BodyChunk<'_> {
     }
 }
 
-/// A reply whose head left and whose body is appended part by part, from any one thread at a
-/// time, until [`ReplyStream::end`]; dropping it ends it, waiting for its file parts to send.
+/// A reply whose head left and whose body is appended part by part, from any one thread at a time,
+/// until [`ReplyStream::end`]; dropping it ends it, waiting for its memory and file parts to send.
 ///
-/// The descriptors its file parts name stay open for `'f`, through the [`Deferred`] slot its end
-/// writes into.
+/// The memory and descriptors its parts name stay unchanged and open for `'f`, through the
+/// [`Deferred`] slot its end writes into.
 pub struct ReplyStream<'f> {
     server: Arc<ServerCore>,
     raw: ucall_received_http_request_t,
@@ -1922,8 +1970,8 @@ impl<'f> ReplyStream<'f> {
     }
 
     /// Ends the body into the slot `into`, taking the request whatever the outcome; the slot stays
-    /// deferred while file or path parts still send, and first waits for its previous reply, if
-    /// that still sends.
+    /// deferred while memory, file or path parts still send, and first waits for its previous
+    /// reply, if that still sends.
     ///
     /// A body short of its declared Content-Length fails with [`Status::Malformed`] and closes
     /// the connection after the bytes already sent.
@@ -2372,6 +2420,43 @@ mod tests {
                 let response = client(1).get(format!("http://{address}/stream")).unwrap();
                 let expected = [b"<".as_slice(), &clip[4096..], b">"].concat();
                 assert_eq!(response.body().unwrap(), expected.as_slice());
+            });
+        });
+    }
+
+    #[test]
+    fn memory_parts_send_in_place_until_final() {
+        let (handler, received) = detaching();
+        let mut server = Server::new(&[loopback(1)]).unwrap();
+        server.get("/memory", &handler).unwrap();
+        let address = server.address(0).unwrap().to_owned();
+        let tensor = pattern(4 << 20);
+        serving(&server, || {
+            std::thread::scope(|scope| {
+                let tensor = tensor.as_slice();
+                scope.spawn(move || {
+                    // The slot and the stream below drop before the scope lets go of the tensor.
+                    let parts = [ReplyPart::bytes(b"<"), unsafe { ReplyPart::memory(tensor) }, ReplyPart::bytes(b">")];
+                    assert_eq!(parts[1].as_memory(), Some(tensor));
+                    let mut sent = pin!(Deferred::new());
+                    next_detached(&received).reply_parts(HTTPStatus::OK, &[], &parts, sent.as_mut()).unwrap();
+                    sent.wait().unwrap();
+                    let mut stream = next_detached(&received).reply_stream(HTTPStatus::OK, &[]).unwrap();
+                    stream.append(&[unsafe { ReplyPart::memory(tensor) }, ReplyPart::bytes(b"|")]).unwrap();
+                    // The tensor outweighs what a reading peer takes per round trip, so the next
+                    // append waits for the socket to take it.
+                    while let Err(error) = stream.append(&[unsafe { ReplyPart::memory(&tensor[..1000]) }]) {
+                        assert_eq!(error.status, Status::WouldBlock);
+                        std::thread::yield_now();
+                    }
+                    stream.end(sent.as_mut()).unwrap();
+                    sent.wait().unwrap();
+                });
+                let mut client = client(1);
+                let whole = client.get(format!("http://{address}/memory")).unwrap();
+                assert_eq!(whole.body().unwrap(), [b"<".as_slice(), tensor, b">"].concat().as_slice());
+                let streamed = client.get(format!("http://{address}/memory")).unwrap();
+                assert_eq!(streamed.body().unwrap(), [tensor, b"|", &tensor[..1000]].concat().as_slice());
             });
         });
     }

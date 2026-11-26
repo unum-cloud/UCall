@@ -450,6 +450,70 @@ def test_reply_parts_concatenates_bytes_paths_and_files(backend, loopback, servi
     assert answers == [ucall.Deferred, type(None)]
 
 
+def test_memory_parts_send_in_place_and_keep_their_buffers(backend, loopback, serving):
+    """Memory parts send their buffers in place, whole and streamed, and the Deferred keeps each buffer until final."""
+    tensor = bytearray(bytes(range(256)) * 16384)
+    server = ucall.Server(loopback(), backend=backend)
+    outcomes = []
+
+    def send(detached: ucall.DetachedRequest):
+        part = ucall.Memory(tensor)
+        assert part.buffer is tensor
+        assert part.nbytes == len(tensor)
+        deferred = detached.reply_parts([b"<", part, b">"])
+        # The exported buffer refuses resizing while the reply may still read it.
+        with pytest.raises(BufferError):
+            tensor.extend(b"!")
+        outcomes.append(type(deferred))
+        deferred.wait()
+
+    def stream(detached: ucall.DetachedRequest):
+        replying = detached.reply_stream()
+        replying.append([ucall.Memory(memoryview(tensor)[:1000]), b"|"])
+        deferred = replying.end()
+        outcomes.append(type(deferred))
+        if deferred is not None:
+            deferred.wait()
+
+    @server.get("/whole")
+    def whole(request: ucall.Request):
+        workers.submit(send, request.detach())
+
+    @server.get("/streamed")
+    def streamed(request: ucall.Request):
+        workers.submit(stream, request.detach())
+
+    with concurrent.futures.ThreadPoolExecutor(1) as workers, serving(server) as base:
+        client = ucall.Client(connections=1, backend=backend)
+        sent = bytes(client.get(f"{base}/whole").body)
+        streamed_body = bytes(client.get(f"{base}/streamed").body)
+    assert sent == b"<" + bytes(tensor) + b">"
+    assert streamed_body == bytes(tensor[:1000]) + b"|"
+    assert outcomes == [ucall.Deferred, ucall.Deferred]
+
+
+def test_interface_send_policy_picks_how_replies_leave(backend, loopback, serving):
+    """Each send policy reads back and delivers a large reply whole, and only a forced zero-copy one pins on loopback."""
+    assert ucall.Interface("127.0.0.1:0").send_policy == ucall.SendPolicy.AUTOMATIC
+    with pytest.raises(ValueError):  # noqa: PT011
+        ucall.Interface("127.0.0.1:0", send_policy=7)
+    body = bytes(range(256)) * 4096
+    for policy in ucall.SendPolicy:
+        interface = loopback(send_policy=policy)
+        assert interface.send_policy == policy
+        server = ucall.Server(interface, backend=backend)
+
+        @server.get("/large")
+        def large(request: ucall.Request):
+            request.reply(body)
+
+        with serving(server) as base:
+            replied = bytes(ucall.Client(connections=1, backend=backend).get(f"{base}/large").body)
+        assert replied == body
+        if policy != ucall.SendPolicy.ZERO_COPY:
+            assert server.event_loop_statistics(0)["zero_copy_sends"] == 0
+
+
 def test_reply_parts_rejects_overflowing_range_and_keeps_the_request(backend, loopback, serving, direct_directory):
     """A path range whose end overflows 64 bits is refused as an invalid argument, and the request stays answerable."""
     server = ucall.Server(loopback(reply_directories=[direct_directory]), backend=backend)

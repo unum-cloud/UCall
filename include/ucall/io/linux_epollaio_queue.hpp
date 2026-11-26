@@ -448,6 +448,13 @@ struct linux_epollaio_queue {
     [[nodiscard]] ucall_status_t reset_on_close(descriptor_t descriptor) noexcept {
         return socket_reset_on_close(descriptor);
     }
+
+    /** Makes every later zero-copy send of @p descriptor copy, as delivery to a peer on this host
+     *  copies anyway; a watch it cannot register leaves its sends pinning. */
+    void copy_sends(descriptor_t descriptor) noexcept {
+        std::int64_t const chosen = readiness.watch(descriptor, statistics);
+        if (chosen >= 0) readiness.watches[static_cast<std::uint32_t>(chosen)].zero_copy = zero_copy_stage_t::copying_k;
+    }
     memory_registration_t register_memory(span<byte_t>) noexcept { return {}; }
     void release(io_completion_t const&) noexcept {}
 
@@ -654,10 +661,8 @@ struct linux_epollaio_queue {
                   zero_copy_stage_t reported) noexcept {
         readiness_watch_t& watch = readiness.watches[chosen];
         std::uint32_t const span = highest - lowest + 1;
-        if (reported == zero_copy_stage_t::copying_k) {
-            watch.zero_copy = zero_copy_stage_t::copying_k;
-            tally<atomic_ref_template_>(statistics.zero_copy_fallbacks, span);
-        }
+        // A copied send counts as a fallback and demotes nothing, as `zero_copy_stage_t` says.
+        if (reported == zero_copy_stage_t::copying_k) tally<atomic_ref_template_>(statistics.zero_copy_fallbacks, span);
         for (unsigned previous = absent_k, current = watch.oldest_run; current != absent_k;) {
             zero_copy_run_t& run = runs[current];
             unsigned const next = run.next;

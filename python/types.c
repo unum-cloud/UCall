@@ -18,6 +18,11 @@ static char const* spell_security(int value) {
     return names[value];
 }
 
+static char const* spell_send_policy(int value) {
+    static char const* const names[] = {"automatic", "zero-copy", "copying"};
+    return names[value];
+}
+
 static char const* spell_verb(int value) {
     static char const* const names[] = {"unknown", "get", "post", "put", "delete", "patch", "head", "options", "any"};
     return names[value];
@@ -74,6 +79,16 @@ static char const doc_Security[] =                                              
     "  >>> ucall.Security[\"NOISE_XX\"]\n"                                                     //
     "  <Security.NOISE_XX: 1>";
 
+static char const doc_SendPolicy[] =                                                               //
+    "SendPolicy(value)\n"                                                                          //
+    "\n"                                                                                           //
+    "How an `Interface` sends replies of a page or more: copied to peers on this host, whose\n"    //
+    "delivery copies anyway, and pinned for the rest, or pinned or copied for every peer.\n"       //
+    "\n"                                                                                           //
+    "Example:\n"                                                                                   //
+    "  >>> ucall.Interface(\"127.0.0.1:0\", send_policy=ucall.SendPolicy.ZERO_COPY).send_policy\n" //
+    "  <SendPolicy.ZERO_COPY: 1>";
+
 static char const doc_Verb[] =                                                                 //
     "Verb(value)\n"                                                                            //
     "\n"                                                                                       //
@@ -123,6 +138,9 @@ ucall_py_enum_mirror_t ucall_py_cpu_class_enum = {
 };
 ucall_py_enum_mirror_t ucall_py_security_enum = {
     "Security", doc_Security, ucall_security_none_k, ucall_security_noise_kk_k, spell_security, NULL,
+};
+ucall_py_enum_mirror_t ucall_py_send_policy_enum = {
+    "SendPolicy", doc_SendPolicy, ucall_send_policy_automatic_k, ucall_send_policy_copying_k, spell_send_policy, NULL,
 };
 ucall_py_enum_mirror_t ucall_py_verb_enum = {
     "Verb", doc_Verb, ucall_verb_unknown_k, ucall_verb_any_k, spell_verb, NULL,
