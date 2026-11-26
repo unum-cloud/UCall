@@ -4611,7 +4611,7 @@ FIXTURE
 
 assert_accepts "sibling namespace through an alias" include/ucall/probe.hpp <<'FIXTURE'
 namespace fu = ashvardanian::forkunion;
-inline void probe() { fu::spin_mutex_t mutex; }
+inline void probe() { fu::fair_mutex_t mutex; }
 FIXTURE
 
 stage_fixture_verbatim examples/echo/README.md <<'FIXTURE'
@@ -4894,6 +4894,40 @@ FIXTURE
 stage_release_fixture 1.1.0
 assert_message_rejects "version bump outside a release" "VERSION only changes" <<'FIXTURE'
 Make: Bump the version
+FIXTURE
+
+assert_rejects "standard mutex in the library" "adds a lock other than fu::fair_mutex_t" include/$project_directory/probe.hpp <<'FIXTURE'
+inline void probe() noexcept {
+    std::mutex guard;
+}
+FIXTURE
+
+assert_rejects "ForkUnion spin mutex in the library" "adds a lock other than fu::fair_mutex_t" src/probe.hpp <<'FIXTURE'
+inline void probe() noexcept {
+    fu::spin_mutex_t guard;
+}
+FIXTURE
+
+assert_rejects "Apple unfair lock in the library" "adds a lock other than fu::fair_mutex_t" src/probe.c <<'FIXTURE'
+void probe(void) {
+    os_unfair_lock guard = OS_UNFAIR_LOCK_INIT;
+}
+FIXTURE
+
+assert_accepts "fair mutex in the library" include/$project_directory/probe.hpp <<'FIXTURE'
+#include <mutex>
+
+inline void probe(fu::fair_mutex_t &guard, fu::fair_mutex<fu::standard_yield_t> &other) noexcept {
+    guard.unlock();
+    other.unlock();
+}
+FIXTURE
+
+assert_accepts "lock named in a comment" include/$project_directory/probe.hpp <<'FIXTURE'
+inline int probe(int &count) noexcept {
+    // One owner, not a std::mutex, keeps this count consistent.
+    return ++count;
+}
 FIXTURE
 
 # endregion UCall Fixtures

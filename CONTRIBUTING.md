@@ -107,6 +107,7 @@ The application pins its threads and picks their cores.
 On Linux, each loop of an interface listens on a socket of its own in one `SO_REUSEPORT` group, the later loops binding theirs at their first poll, and the kernel spreads connections across the loops by a hash of each peer's address.
 A listener whose polling thread the application pinned to one CPU names that CPU through `SO_INCOMING_CPU`, which reports the application's placement rather than making one.
 Kernel port groups are how the io_uring, epoll and POSIX backends spread connections; a future user-space backend, such as one over DPDK, will need its own load balancing across loops.
+A try-only claim is an atomic bit or `fu::spin_mutex_t`, anything that waits is `fu::fair_mutex_t` from `<forkunion/locks.hpp>`, and UCall holds no reader-writer gate yet; `.githooks/pre-commit` refuses any other new lock, so ask first.
 
 ### Hardening
 
