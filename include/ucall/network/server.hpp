@@ -937,8 +937,11 @@ struct server : ucall_server_handle_t {
             slot.store(nullptr, std::memory_order_relaxed);
             if (abandoned(*exchange)) continue;
             [[maybe_unused]] st::status_t const queued = endpoint.collected.push_back(st::assume_reserved, exchange);
-            if (endpoint.collected.size() == endpoint.max_batch_size &&
-                flush_collected(server, endpoint, stage, endpoint.statistics.filled_batches) == ucall_status_success_k)
+            if (endpoint.collected.size() != endpoint.max_batch_size) continue;
+            // The batch answers its requests before this pass ends, and their peers send the next
+            // ones meanwhile, so depositors must see these slots free before it fires.
+            atomic_ref<std::uint64_t> {endpoint.head}.store(head + 1, std::memory_order_release);
+            if (flush_collected(server, endpoint, stage, endpoint.statistics.filled_batches) == ucall_status_success_k)
                 flushed = ucall_status_success_k;
         }
         atomic_ref<std::uint64_t> {endpoint.head}.store(head, std::memory_order_release);

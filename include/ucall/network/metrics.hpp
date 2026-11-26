@@ -241,8 +241,9 @@ struct metrics {
             auto& reporting = metrics.batches_reporting[batch_index++];
             char endpoint_text[256];
             std::string_view const tag = tag_text(endpoint_text, "endpoint:", endpoint->path);
-            std::uint64_t const queued = atomic_ref<std::uint64_t> {batch.tail}.load(std::memory_order_relaxed) -
-                                         atomic_ref<std::uint64_t> {batch.head}.load(std::memory_order_relaxed);
+            // The head first, so the tail read after it is never behind it.
+            std::uint64_t const head = atomic_ref<std::uint64_t> {batch.head}.load(std::memory_order_acquire);
+            std::uint64_t const queued = atomic_ref<std::uint64_t> {batch.tail}.load(std::memory_order_relaxed) - head;
             fitted = append_metric(server, datagram, "batch.queue", formatting_t::format_decimal(digits, queued), "g",
                                    {tag});
             using batch_counter_t = std::uint64_t ucall_batch_endpoint_statistics_t::*;

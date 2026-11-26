@@ -408,9 +408,11 @@ struct serving {
         auto& batch = *endpoint->batch;
         auto tail = atomic_ref<std::uint64_t> {batch.tail};
         // Exchanges of closed connections outlive their admission, so this check alone bounds it.
-        if (tail.load(std::memory_order_relaxed) -
-                atomic_ref<std::uint64_t> {batch.head}.load(std::memory_order_acquire) >=
-            server.requests_budget)
+        // The head goes first: its owner moves it only past deposits it saw, so the tail read after
+        // it is never behind it, while a tail read first can be, once other loops deposit and the
+        // owner moves the head past them in between.
+        std::uint64_t const head = atomic_ref<std::uint64_t> {batch.head}.load(std::memory_order_acquire);
+        if (tail.load(std::memory_order_relaxed) - head >= server.requests_budget)
             return refuse(connection, *exchange, 503, "Batch queue full", {});
         auto index = tail.fetch_add(1, std::memory_order_seq_cst);
         atomic_ref<server_exchange_t*> {batch.slots[index & (batch.slots.size() - 1)]}.store(exchange,

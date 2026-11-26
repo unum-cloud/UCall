@@ -753,6 +753,120 @@ static case_result_t test_pipelined_batches([[maybe_unused]] sweep_cell_t const&
 #endif
 }
 
+/** Answers each request of a batch at once, and holds the first batch until released, so the round
+ *  that fired it runs on while the loop takes the request its reply let the peer send. */
+struct held_batch_t {
+    ucall_server_t server {};
+    std::atomic<std::size_t> fired {};
+    std::atomic<bool> released {};
+
+    static void receive(ucall_server_t server, ucall_received_http_request_t const* requests, std::size_t count,
+                        void* context) {
+        auto& state = *static_cast<held_batch_t*>(context);
+        for (std::size_t i = 0; i != count; ++i) {
+            ucall_outcome_t outcome {};
+            ucall_received_http_request_t request = requests[i];
+            ucall_server_reply_content_t reply {server,  &outcome, &request,         ucall_http_status_ok_k,
+                                                nullptr, 0,        bytes_view("ok")};
+            ucall_server_reply_content(&reply);
+            expect_true(outcome.status == ucall_status_success_k, "a reply ended with {}",
+                        ucall_status_name(outcome.status));
+        }
+        if (state.fired.fetch_add(1, std::memory_order_acq_rel)) return;
+        expect_true(spin_until([&] { return state.released.load(std::memory_order_acquire); }),
+                    "the first batch was never released");
+    }
+};
+
+/** A batch frees the queue slots it took before it fires, so the request its reply lets the peer
+ *  send finds room while the round that fired it still runs. One connection pipelining two
+ *  requests fills a queue of exactly two, and batches of one fire the first while the second
+ *  waits, so a slot freed only once the round ended would refuse the third request with 503. */
+static case_result_t test_batch_slots_free_before_firing([[maybe_unused]] sweep_cell_t const& cell) {
+#if UCALL_OS_POSIX_
+    held_batch_t batches;
+    ucall_outcome_t outcome {};
+    ucall_network_interface_t network_interface {};
+    network_interface.address = bytes_view("127.0.0.1:0");
+    network_interface.max_concurrent_connections = 1;
+    network_interface.max_pipelined_requests = 2;
+    ucall_server_options_t config {}, resolved {};
+    config.backend = cell.backend;
+    config.cpu_class_ceiling = cell.cpu_class_ceiling;
+    config.interfaces = &network_interface;
+    config.interfaces_count = 1;
+    ucall_server_init_t init {&batches.server, &outcome, &config, &resolved};
+    ucall_server_init(&init);
+    if (!expect_true(outcome.status == ucall_status_success_k, "{}", ucall_status_name(outcome.status))) return {};
+    ucall_http_batch_endpoint_t endpoint {};
+    ucall_server_add_http_batch_endpoint_t add {
+        batches.server, &outcome, bytes_view("/batch"), ucall_verb_post_k, held_batch_t::receive, &batches, 1, 1,
+        10000000,       &endpoint};
+    ucall_server_add_http_batch_endpoint(&add);
+    expect_true(outcome.status == ucall_status_success_k);
+    auto poller = poll_batches(batches.server, endpoint);
+    // The test polls the loop itself, so each request's dispatch is over once a round returns.
+    auto const round = [&] {
+        ucall_outcome_t served {};
+        ucall_server_take_call_t take {batches.server, &served, 0, 1000};
+        ucall_server_take_call(&take);
+        expect_true(served.status == ucall_status_success_k, "a round ended with {}", ucall_status_name(served.status));
+    };
+    auto const dispatched = [&] {
+        ucall_outcome_t queried {};
+        ucall_event_loop_statistics_t counters {};
+        ucall_server_event_loop_statistics_t query {batches.server, &queried, 0, &counters};
+        ucall_server_event_loop_statistics(&query);
+        return counters.requests;
+    };
+    std::string_view const request = "POST /batch HTTP/1.1\r\nHost: a\r\nContent-Length: 1\r\n\r\nx";
+    raw_client_t client;
+    bool const connected = client.connect(text_view(resolved.interfaces[0].address));
+    expect_true(connected && ::send(client.descriptor, request.data(), request.size(), 0) ==
+                                 static_cast<ssize_t>(request.size()) &&
+                    ::send(client.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()),
+                "the two pipelined requests were not written");
+    steady_clock::time_point const deadline = steady_clock::now() + wait_limit_k;
+    std::size_t offset = 0;
+    wire_response_t first {};
+    while (connected && !(first = parse_response(client.received)).length && steady_clock::now() <= deadline) {
+        round();
+        [[maybe_unused]] read_end_t const read = client.read(client.received.size() + 1,
+                                                             steady_clock::now() + std::chrono::milliseconds {1});
+    }
+    expect_true(first.status == 200 && batches.fired.load() == 1, "the first request answered {} after {} batches",
+                first.status, batches.fired.load());
+    offset += first.length;
+    expect_true(::send(client.descriptor, request.data(), request.size(), 0) == static_cast<ssize_t>(request.size()),
+                "the third request was not written");
+    while (dispatched() != 3 && steady_clock::now() <= deadline) round();
+    expect_true(dispatched() == 3, "the loop dispatched {} of 3 requests", dispatched());
+    batches.released.store(true, std::memory_order_release);
+    for (std::size_t i = 1; i != 3; ++i) {
+        wire_response_t response {};
+        while (!(response = parse_response(std::string_view {client.received}.substr(offset))).length &&
+               steady_clock::now() <= deadline) {
+            round();
+            [[maybe_unused]] read_end_t const read = client.read(client.received.size() + 1,
+                                                                 steady_clock::now() + std::chrono::milliseconds {1});
+        }
+        expect_true(response.status == 200, "request {} answered {} with {}", i + 1, response.status, response.body);
+        offset += response.length;
+    }
+    ucall_server_stop(batches.server);
+    // The loop retires on a later round, which ends the batch polling.
+    for (ucall_outcome_t served {}; served.status == ucall_status_success_k && steady_clock::now() <= deadline;) {
+        ucall_server_take_call_t take {batches.server, &served, 0, 1000};
+        ucall_server_take_call(&take);
+    }
+    poller.join();
+    ucall_server_free(batches.server);
+    return {};
+#else
+    return case_result_t::skipped(needs_posix_sockets_k);
+#endif
+}
+
 /** A request whose peer reset before its batch fired never reaches the application: the batch
  *  round ends it, so peers that deposit and leave cost the batch owner no work. */
 static case_result_t test_batches_skip_abandoned([[maybe_unused]] sweep_cell_t const& cell) {
@@ -946,6 +1060,7 @@ void run_serving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label)
         run_cell_case(cell_label, "test_batches_across_loops", test_batches_across_loops, cell);
         run_cell_case(cell_label, "test_setup_failure_ends_batch_polling", test_setup_failure_ends_batch_polling, cell);
         run_cell_case(cell_label, "test_pipelined_batches", test_pipelined_batches, cell);
+        run_cell_case(cell_label, "test_batch_slots_free_before_firing", test_batch_slots_free_before_firing, cell);
         run_cell_case(cell_label, "test_batches_skip_abandoned", test_batches_skip_abandoned, cell);
     }
 }
