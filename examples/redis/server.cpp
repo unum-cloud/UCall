@@ -14,39 +14,26 @@
 
 #include <smashtable/locked_store.hpp>   // `st::locked_store`
 #include <smashtable/snapshot_store.hpp> // `st::strict_serializable_hash_map`
-#include <stringzilla/hash/serial.h>     // `sz_hash_serial`
+#include <stringzilla/stringzilla.hpp>   // `sz::string_t`, `sz::hash_t`, `sz::equal_to_t`
 
 #include "ucall/ucall.hpp" // `uc::request_t`, `uc::batch_t`, `uc::status_t`, `uc::bytes_view`
 #include "server.hpp"
 
 namespace st = ashvardanian::smashtable;
+namespace sz = ashvardanian::stringzilla;
 namespace uc = unum::ucall;
 
-using bytes_t = st::vector<std::byte>;
-
-struct key_hash_t {
-    std::size_t operator()(bytes_t const& key) const noexcept {
-        sz_u64_t hash {};
-        sz_hash_serial(uc::utilities::text_view(key).data(), key.size(), 0, &hash, nullptr);
-        return static_cast<std::size_t>(hash);
-    }
-};
-struct key_equal_t {
-    bool operator()(bytes_t const& left, bytes_t const& right) const noexcept {
-        return uc::utilities::text_view(left) == uc::utilities::text_view(right);
-    }
-};
 struct value_t {
-    bytes_t bytes;
+    sz::string_t bytes;
     st::generation_t revision {};
     st::expected<value_t> copy() const noexcept {
-        auto copied = bytes.copy();
-        if (!copied) return copied.status();
-        return value_t {std::move(*copied), revision};
+        value_t copied {{}, revision};
+        if (sz::failed(copied.bytes.assign(bytes))) return st::status_t::out_of_memory_heap_k;
+        return copied;
     }
 };
 
-using store_t = st::locked_store<st::strict_serializable_hash_map<bytes_t, value_t, key_hash_t, key_equal_t>>;
+using store_t = st::locked_store<st::strict_serializable_hash_map<sz::string_t, value_t, sz::hash_t, sz::equal_to_t>>;
 
 /** Answers @p request with an error @p status and a plain-text @p message. */
 static void reply_error(uc::request_t request, ucall_http_status_t status, std::string_view message) noexcept {
@@ -69,10 +56,9 @@ struct service_t {
         auto [key_text, key_status] = request.path_parameter("key");
         if (key_status.failed() || key_text.empty())
             return reply_error(std::move(request), ucall_http_status_bad_request_k, "A key is required\n");
-        bytes_t key;
-        if (st::status_t const resized = key.resize(key_text.size()); st::failed(resized))
-            return reply_error(std::move(request), resized);
-        std::memcpy(key.data(), key_text.data(), key_text.size());
+        sz::string_t key;
+        if (sz::failed(key.assign(key_text)))
+            return reply_error(std::move(request), ucall_http_status_service_unavailable_k, "Storage unavailable\n");
         ucall_verb_t const verb = request.verb();
         if (verb != ucall_verb_get_k && verb != ucall_verb_put_k && verb != ucall_verb_delete_k)
             return reply_error(std::move(request), ucall_http_status_method_not_allowed_k, "Use GET, PUT or DELETE\n");
@@ -111,10 +97,8 @@ struct service_t {
             auto [body, body_status] = request.body();
             if (body_status.failed())
                 return reply_error(std::move(request), ucall_http_status_bad_request_k, "Expected a buffered body\n");
-            result.bytes.clear();
-            if (st::status_t const resized = result.bytes.resize(body.size()); st::failed(resized))
-                return reply_error(std::move(request), resized);
-            if (!body.empty()) std::memcpy(result.bytes.data(), body.data(), body.size());
+            if (sz::failed(result.bytes.assign(body)))
+                return reply_error(std::move(request), st::status_t::out_of_memory_heap_k);
             result.revision = transaction.generation();
             auto [stored, copy_status] = result.copy();
             if (st::failed(copy_status)) return reply_error(std::move(request), copy_status);
@@ -130,9 +114,8 @@ struct service_t {
         *end++ = '"';
         ucall_bytes_view_t const headers[] {uc::bytes_view({etag_header, end}),
                                             uc::bytes_view("Content-Type: application/octet-stream")};
-        std::string_view const response = verb == ucall_verb_get_k && !not_modified
-                                              ? uc::utilities::text_view(result.bytes)
-                                              : std::string_view {};
+        std::string_view const response = verb == ucall_verb_get_k && !not_modified ? std::string_view(result.bytes)
+                                                                                    : std::string_view {};
         ucall_http_status_t const http_status = not_modified ? ucall_http_status_not_modified_k
                                                              : ucall_http_status_ok_k;
         [[maybe_unused]] uc::status_t const replied = std::move(request).reply(http_status, headers, response);

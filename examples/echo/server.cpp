@@ -16,20 +16,19 @@
 #include <utility>     // `std::move`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`
-#include <stringzilla/hash/serial.h>       // `sz_hash_serial_`
+#include <stringzilla/stringzilla.hpp>     // `sz::string_view_t`, `sz::hash_t`, `sz::equal_to_t`
 
 #include "ucall/ucall.hpp" // `uc::request_t`, `uc::batch_t`, `uc::status_t`, `uc::bytes_view`
 #include "server.hpp"
 
 namespace st = ashvardanian::smashtable;
+namespace sz = ashvardanian::stringzilla;
 namespace uc = unum::ucall;
 
-using pair_key_t = std::array<std::uint64_t, 3>;
-
-struct pair_hash_t {
-    std::size_t operator()(pair_key_t const& key) const noexcept {
-        return static_cast<std::size_t>(sz_hash_serial_(reinterpret_cast<char const*>(key.data()), sizeof(key), 0));
-    }
+/** A pair ID's three words, hashed and compared as the bytes they occupy. */
+struct pair_key_t {
+    std::array<std::uint64_t, 3> words {};
+    operator sz::string_view_t() const noexcept { return {reinterpret_cast<char const*>(words.data()), sizeof(words)}; }
 };
 
 /** The member of a pair that arrived first, held until its partner does. */
@@ -38,15 +37,15 @@ struct held_member_t {
     std::size_t member {};
 };
 
-using pair_table_t = st::hash_map<pair_key_t, held_member_t, pair_hash_t>;
+using pair_table_t = st::hash_map<pair_key_t, held_member_t, sz::hash_t, sz::equal_to_t>;
 
 /** Reads a pair ID spelled as three decimal words joined by colons. */
 static bool parse_pair_key(std::string_view text, pair_key_t& key) noexcept {
     char const* const end = text.data() + text.size();
     std::from_chars_result parsed {text.data(), std::errc {}};
-    for (std::size_t index = 0; index != key.size(); ++index) {
+    for (std::size_t index = 0; index != key.words.size(); ++index) {
         if (index != 0 && (parsed.ptr == end || *parsed.ptr != ':')) return false;
-        parsed = std::from_chars(parsed.ptr + (index != 0), end, key[index]);
+        parsed = std::from_chars(parsed.ptr + (index != 0), end, key.words[index]);
         if (parsed.ec != std::errc {}) return false;
     }
     return parsed.ptr == end;
@@ -98,9 +97,10 @@ struct service_t {
         }
         pair[member] = std::move(request);
         char pair_header[sizeof("x-ucall-pair: ::") + 3 * (std::numeric_limits<std::uint64_t>::digits10 + 1)] {};
-        int const length = std::snprintf(
-            pair_header, sizeof(pair_header), "x-ucall-pair: %llu:%llu:%llu", static_cast<unsigned long long>(key[0]),
-            static_cast<unsigned long long>(key[1]), static_cast<unsigned long long>(key[2]));
+        int const length = std::snprintf(pair_header, sizeof(pair_header), "x-ucall-pair: %llu:%llu:%llu",
+                                         static_cast<unsigned long long>(key.words[0]),
+                                         static_cast<unsigned long long>(key.words[1]),
+                                         static_cast<unsigned long long>(key.words[2]));
         for (std::size_t const replied_member : {std::size_t {1}, std::size_t {0}}) {
             auto [body, body_status] = pair[replied_member].body();
             if (body_status.failed()) {

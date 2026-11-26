@@ -21,17 +21,20 @@
 #include <thread>           // `std::this_thread::sleep_for`
 #include <utility>          // `std::move`
 
-#include <fmt/format.h>          // `fmt::print`, `fmt::format_to_n`, `fmt::format_to`, `fmt::basic_memory_buffer`
-#include <forkunion/forkunion.h> // `fu_pool_t`, `fu_pool_unsafe_for_threads`, `fu_pool_capabilities`
+#include <fmt/format.h> // `fmt::print`, `fmt::format_to_n`, `fmt::format_to`, `fmt::basic_memory_buffer`
 
-#include "ucall/ucall.hpp"           // `server_t`, `request_t`, `batch_endpoint_t`, `status_t`
-#include "ucall/utilities/types.hpp" // `bytes_view`, `st::vector`
+#include <forkunion/forkunion.h>       // `fu_pool_t`, `fu_pool_unsafe_for_threads`, `fu_pool_capabilities`
+#include <forkunion/types.hpp>         // `fu::min_of`
+#include <smashtable/basic_vector.hpp> // `st::vector`, `st::failed`
+
+#include "ucall/ucall.hpp" // `server_t`, `request_t`, `batch_endpoint_t`, `status_t`, `bytes_view`
 
 #include "arguments.hpp" // `parse_count`, `parse_key`, `process_clocks_t`
 
 namespace unum::ucall::tools {
 
-using util::bytes_view;
+namespace fu = ashvardanian::forkunion;
+namespace st = ashvardanian::smashtable;
 
 /** Set by the first SIGINT or SIGTERM, or by a failing loop; the main thread checks it every
  *  100 ms, and the server answers what it holds before the process exits. */

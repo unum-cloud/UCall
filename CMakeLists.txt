@@ -152,10 +152,13 @@ add_library(ucall_header INTERFACE)
 add_library(ucall::header ALIAS ucall_header)
 target_include_directories(ucall_header INTERFACE $<BUILD_INTERFACE:${PROJECT_SOURCE_DIR}/include>)
 target_compile_features(ucall_header INTERFACE cxx_std_20)
-target_link_libraries(ucall_header INTERFACE ucall_abi forkunion::header smashtable::header stringzilla::header)
+target_link_libraries(
+    ucall_header INTERFACE ucall_abi forkunion::header forkunion::cpu_capabilities_compiled smashtable::header
+                           stringzilla::header
+)
 
-# The archive passes `ucall::header` on to the tests, tools and bindings built here, and an installed archive names only
-# what it links. The shared library passes nothing but the C interface.
+# Neither library passes `ucall::header` on: the tests, tools and benchmarks that include the engine link it themselves,
+# and the SDK's consumers, the examples among them, never see it. An installed archive names only what it links.
 function (ucall_setup_library target_ scope_)
     target_include_directories(${target_} PRIVATE "${PROJECT_SOURCE_DIR}/src")
     target_compile_features(${target_} ${scope_} cxx_std_20)
@@ -167,9 +170,7 @@ function (ucall_setup_library target_ scope_)
         PRIVATE Threads::Threads $<BUILD_INTERFACE:ucall_sanitizers> $<BUILD_INTERFACE:ucall_warnings>
                 $<BUILD_INTERFACE:stringzilla::cpu_capabilities_compiled>
     )
-    target_link_libraries(
-        ${target_} ${scope_} $<BUILD_INTERFACE:ucall_header> $<BUILD_INTERFACE:forkunion::cpu_capabilities_compiled>
-    )
+    target_link_libraries(${target_} PRIVATE $<BUILD_INTERFACE:ucall_header>)
     # The C ABI is all a binary linking either flavor may export; UCALL_EXPORT marks it.
     set_target_properties(
         ${target_}
@@ -324,9 +325,11 @@ if (UCALL_BUILD_EXAMPLES)
         add_executable(ucall_example_${example_} examples/${example_}/server.cpp)
         target_include_directories(ucall_example_${example_} PRIVATE tools)
         target_link_libraries(
-            ucall_example_${example_} PRIVATE ucall::cpp ucall_static forkunion::static fmt::fmt ucall_warnings
+            ucall_example_${example_} PRIVATE ucall::cpp forkunion::static smashtable::header fmt::fmt ucall_warnings
         )
     endforeach ()
+    target_link_libraries(ucall_example_echo PRIVATE stringzilla::cpp)
+    target_link_libraries(ucall_example_redis PRIVATE stringzilla::cpp)
     target_link_libraries(ucall_example_inference PRIVATE numkong::static)
     add_executable(ucall_example_hello examples/hello.c)
     target_link_libraries(ucall_example_hello PRIVATE ucall_static ucall_warnings)
@@ -336,7 +339,7 @@ if (UCALL_BUILD_TOOLS OR UCALL_INSTALL)
     add_executable(ucall_cli tools/ucall.cpp)
     set_target_properties(ucall_cli PROPERTIES OUTPUT_NAME ucall)
     target_include_directories(ucall_cli PRIVATE tools)
-    target_link_libraries(ucall_cli PRIVATE ucall_static fmt::fmt ucall_warnings)
+    target_link_libraries(ucall_cli PRIVATE ucall_static ucall_header fmt::fmt ucall_warnings)
 endif ()
 if (UCALL_BUILD_BENCH)
     add_executable(ucall_bench_http bench/http.cpp)
@@ -345,12 +348,15 @@ if (UCALL_BUILD_BENCH)
         target_include_directories(${bench_} PRIVATE tools)
         target_link_libraries(${bench_} PRIVATE ucall_static forkunion::static fmt::fmt ucall_warnings)
     endforeach ()
-    target_link_libraries(ucall_bench_server PRIVATE ucall::cpp)
+    target_link_libraries(ucall_bench_http PRIVATE ucall_header)
+    target_link_libraries(ucall_bench_server PRIVATE ucall::cpp smashtable::header)
     # The zero-copy sweep drives io_uring itself, so it builds where the ring queues do.
     if (UCALL_WITH_LINUX_URING)
         add_executable(ucall_bench_zero_copy_sends bench/zero_copy_sends.cpp)
         target_include_directories(ucall_bench_zero_copy_sends PRIVATE tools)
-        target_link_libraries(ucall_bench_zero_copy_sends PRIVATE ucall_static uring::uring fmt::fmt ucall_warnings)
+        target_link_libraries(
+            ucall_bench_zero_copy_sends PRIVATE ucall_static ucall_header uring::uring fmt::fmt ucall_warnings
+        )
     endif ()
 endif ()
 if (UCALL_BUILD_PYTHON)

@@ -33,7 +33,7 @@ endif ()
 target_include_directories(
     ucall_test PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tools"
 )
-target_link_libraries(ucall_test PRIVATE ucall_static ucall_sanitizers ucall_warnings fmt::fmt)
+target_link_libraries(ucall_test PRIVATE ucall_static ucall_header ucall_sanitizers ucall_warnings fmt::fmt)
 # Serial needs no capability, so the library compiles it exactly when it keeps every class that exists.
 target_compile_definitions(
     ucall_test PRIVATE UCALL_TARGET_SERIAL=$<BOOL:${UCALL_MULTIVERSIONED}>
@@ -63,7 +63,7 @@ target_include_directories(
 )
 # The kit rows name what the library compiled, which a unit at baseline flags cannot infer.
 target_link_libraries(
-    ucall_test_header_only PRIVATE ucall_static ucall_sanitizers ucall_warnings fmt::fmt stringzilla::header
+    ucall_test_header_only PRIVATE ucall_static ucall_header ucall_sanitizers ucall_warnings fmt::fmt stringzilla::header
                                    stringzilla::cpu_capabilities_compiled
 )
 add_test(NAME ucall_test_header_only COMMAND ucall_test_header_only)
@@ -73,7 +73,7 @@ if (UNIX AND TARGET ucall_cli)
     target_include_directories(
         ucall_test_tools PRIVATE ${CMAKE_CURRENT_SOURCE_DIR} "${PROJECT_SOURCE_DIR}/src" "${PROJECT_SOURCE_DIR}/tools"
     )
-    target_link_libraries(ucall_test_tools PRIVATE ucall_static ucall_sanitizers ucall_warnings fmt::fmt)
+    target_link_libraries(ucall_test_tools PRIVATE ucall_static ucall_header ucall_sanitizers ucall_warnings fmt::fmt)
     # A cross build runs this suite through its emulator, and the suite must run the tool the same way.
     add_test(NAME ucall_test_tools COMMAND ucall_test_tools -- ${CMAKE_CROSSCOMPILING_EMULATOR}
                                            $<TARGET_FILE:ucall_cli>
@@ -91,7 +91,7 @@ endif ()
 # The kernel ABI mirrors match the kernel's own spelling, checked at compile time against the build's headers.
 if (CMAKE_SYSTEM_NAME STREQUAL "Linux")
     add_library(ucall_test_kernel_abi OBJECT kernel_abi.cpp)
-    target_link_libraries(ucall_test_kernel_abi PRIVATE ucall_static ucall_warnings)
+    target_link_libraries(ucall_test_kernel_abi PRIVATE ucall_static ucall_header ucall_warnings)
 endif ()
 
 # libFuzzer drives each parser's oracle from `properties.hpp`, under the sanitizers the `fuzz` preset inherits.
@@ -103,6 +103,6 @@ if (UCALL_BUILD_FUZZ)
         )
         target_compile_options(ucall_fuzz_${harness_} PRIVATE -fsanitize=fuzzer)
         target_link_options(ucall_fuzz_${harness_} PRIVATE -fsanitize=fuzzer)
-        target_link_libraries(ucall_fuzz_${harness_} PRIVATE ucall_static ucall_sanitizers ucall_warnings fmt::fmt)
+        target_link_libraries(ucall_fuzz_${harness_} PRIVATE ucall_static ucall_header ucall_sanitizers ucall_warnings fmt::fmt)
     endforeach ()
 endif ()

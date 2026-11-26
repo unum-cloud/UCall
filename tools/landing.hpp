@@ -11,7 +11,7 @@
 #include <cstdio>  // `std::FILE`, `std::fflush`, `std::fclose`, `std::remove`
 #include <cstring> // `std::memcpy`, `std::strlen`, `std::strrchr`
 
-#include "ucall/utilities/types.hpp" // `UCALL_OS_WINDOWS_`
+#include "ucall/types.h" // `UCALL_OS_WINDOWS_`
 
 #if UCALL_OS_WINDOWS_
 #include <fcntl.h>    // `_O_CREAT`, `_O_EXCL`, `_O_WRONLY`, `_O_BINARY`

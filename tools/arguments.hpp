@@ -20,16 +20,16 @@
 #include <fmt/format.h> // `fmt::print`
 #include <fmt/ranges.h> // `fmt::join`
 
-#include "ucall/utilities/types.hpp" // `UCALL_OS_WINDOWS_`
-#include "ucall/ucall.h"             // `ucall_noise_key_t`, `ucall_status_t`
+#include "ucall/ucall.h" // `ucall_noise_key_t`, `ucall_status_t`, `UCALL_OS_WINDOWS_`
 
-#if !UCALL_OS_WINDOWS_
+#if UCALL_OS_WINDOWS_
+#include <winsock2.h> // ahead of <windows.h>, which would drag in Winsock 1.1
+#include <windows.h>  // `GetProcessTimes`
+#else
 #include <sys/resource.h> // `getrusage`
 #endif
 
 namespace unum::ucall::tools {
-
-using util::bytes_view;
 
 /** The exit status of a run a signal stopped, as shells report a command SIGINT ended. */
 inline constexpr int exit_stopped_k = 130;
@@ -93,12 +93,14 @@ inline void print_key(std::FILE* file, ucall_noise_key_t const& key) noexcept {
 
 /** A backend name as @c ucall_io_backend_name spells it, left untouched when it names none. */
 inline bool parse_backend(std::string_view text, ucall_io_backend_t& backend) noexcept {
-    return ucall_io_backend_from_name(bytes_view(text), &backend) == ucall_status_success_k;
+    ucall_bytes_view_t const name {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
+    return ucall_io_backend_from_name(name, &backend) == ucall_status_success_k;
 }
 
 /** A CPU class name as @c ucall_cpu_class_name spells it, left untouched when it names none. */
 inline bool parse_cpu_class(std::string_view text, ucall_cpu_class_t& cpu_class) noexcept {
-    return ucall_cpu_class_from_name(bytes_view(text), &cpu_class) == ucall_status_success_k;
+    ucall_bytes_view_t const name {reinterpret_cast<ucall_byte_t const*>(text.data()), text.size()};
+    return ucall_cpu_class_from_name(name, &cpu_class) == ucall_status_success_k;
 }
 
 /** User plus system seconds this process spent so far, read through the platform's accounting. */
