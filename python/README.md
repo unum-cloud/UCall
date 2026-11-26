@@ -43,7 +43,9 @@ assert bytes(response.body) == b"Hello, world"
 The ceiling caps the CPU class rather than demanding it: the newest compiled class fitting both it and the machine runs, and `server.cpu_class_ceiling` reports that class.
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 `server.memory_domains` reports the NUMA node the kernel ties each interface's device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
-It admits 1024 connections by default, evicting the idle keep-alive connection that progressed least recently for a new peer, and reads one request per connection at a time unless `pipelined_requests` allows more, while replies still leave in request order.
+It admits 1024 connections by default and reads one request per connection at a time unless `pipelined_requests` allows more, while replies still leave in request order.
+Once an interface holds its whole `connections=` budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
 `max_request_bytes=` answers 413 past its size, `reply_directories=` names the directories a `ucall.Path` part resolves beneath, and `descriptor=` takes a listening socket that systemd or a supervisor opened in place of an address, which the server never closes.
 Without interfaces the server answers on `ucall.DEFAULT_ADDRESS`, "127.0.0.1:8545", and port zero binds a free port, which `server.addresses` reports.
 

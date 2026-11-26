@@ -58,6 +58,8 @@ def main() raises:
 
 A server takes the interfaces it answers on and its `ServerOptions`; each `Interface` holds its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 `Server.memory_domain` reports the NUMA node the kernel ties an interface's device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
+Once an interface holds its whole `connections` budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
 
 ```mojo
 def listing(var request: Request) raises:

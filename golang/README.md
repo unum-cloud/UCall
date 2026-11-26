@@ -83,6 +83,8 @@ It fails rather than substituting when the backend is unavailable or the CPU doe
 An `Interface` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 `Server.MemoryDomain` reports the NUMA node the kernel ties an interface's device to, or -1, so the application inits and polls from goroutines locked to threads there; UCall places nothing by it.
 `NewInterface` admits 1024 connections, reads one request per connection at a time unless `PipelinedRequests` allows more, and replies still leave in request order.
+Once an interface holds its whole `Connections` budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
 `MaxRequestBytes` caps a request's head and buffered body, answering 413 past it, and `ReplyDirectories` names the directories path replies resolve beneath.
 `ListenDescriptor` accepts on a listener another owner opened instead of binding an address, and never closes it.
 Port zero binds a free port, which `Server.Address` reports.

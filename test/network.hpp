@@ -71,6 +71,9 @@ struct fixture_config_t {
     /** Open-connection budget of the server and the client alike. */
     std::size_t connections = 1;
 
+    /** Interfaces the server answers on, each on a port of its own with these same settings. */
+    std::size_t interfaces = 1;
+
     /** Requests the server reads ahead on one connection; zero means one. */
     std::size_t pipelined_requests = 0;
 
@@ -118,6 +121,9 @@ struct fixture_t {
     ucall_client_options_t resolved_client {};
     ucall_noise_key_t server_private {}, server_public {}, client_private {}, client_public {};
     std::string address {}, url {};
+
+    /** The address of every interface, the first being @c address. */
+    std::vector<std::string> addresses {};
 
     /** The first setup step that failed, which every case checks before it starts. */
     ucall_status_t status {ucall_status_success_k};
@@ -176,7 +182,7 @@ struct fixture_t {
         ucall_server_request_peer_t peer {server,           &outcome, request, &network_interface_index,
                                           &peer_static_key, &address};
         ucall_server_request_peer(&peer);
-        expect_true(outcome.status == ucall_status_success_k && network_interface_index == 0 &&
+        expect_true(outcome.status == ucall_status_success_k && network_interface_index < resolved.interfaces_count &&
                         std::memcmp(peer_static_key, expected_key, sizeof(expected_key)) == 0,
                     "peer: {} on interface {}", ucall_status_name(outcome.status), network_interface_index);
         ucall_byte_t const loopback[4] {127, 0, 0, 1};
@@ -329,9 +335,10 @@ struct fixture_t {
         network_interface.reply_directories = &directory;
         network_interface.reply_directories_count = settings.directory.empty() ? 0 : 1;
         network_interface.send_policy = settings.send_policy;
+        std::vector<ucall_network_interface_t> const network_interfaces(settings.interfaces, network_interface);
         ucall_server_options_t config {};
-        config.interfaces = &network_interface;
-        config.interfaces_count = 1;
+        config.interfaces = network_interfaces.data();
+        config.interfaces_count = network_interfaces.size();
         config.backend = cell.backend;
         config.cpu_class_ceiling = cell.cpu_class_ceiling;
         config.log = settings.log;
@@ -387,7 +394,9 @@ struct fixture_t {
         ucall_client_init_t client_init {&client, &outcome, &client_config, &resolved_client};
         ucall_client_init(&client_init);
         if ((status = outcome.status) != ucall_status_success_k) return;
-        address = text_view(resolved.interfaces[0].address);
+        for (std::size_t i = 0; i != resolved.interfaces_count; ++i)
+            addresses.emplace_back(text_view(resolved.interfaces[i].address));
+        address = addresses.front();
         url = fmt::format("{}{}", cell.security == ucall_security_none_k ? "http://" : "http+noise://", address);
     }
     ~fixture_t() {

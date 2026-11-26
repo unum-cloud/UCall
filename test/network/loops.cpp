@@ -439,6 +439,54 @@ static case_result_t test_unpolled_loop_strands_no_peers(sweep_cell_t const& cel
     return {};
 }
 
+/** A loop's records serve every interface it accepts for, so a peer whose record another
+ *  interface's accept took waits rather than losing its request. Of two loops only the first is
+ *  polled, so it takes every peer of both interfaces onto its four records; three requests on the
+ *  first interface hold three of them, and one more peer on each interface arrives while both
+ *  interfaces' accepts are armed for the last. Both are served once the held requests answer and
+ *  close their connections. */
+static case_result_t test_interfaces_share_loop_records(sweep_cell_t const& cell) {
+    split_mix_generator_t generator {case_stream_key()};
+    if (UCALL_OS_WINDOWS_) return case_result_t::skipped(loops_refused_k);
+    if (!UCALL_OS_LINUX_) return case_result_t::skipped(port_groups_refused_k);
+    // Declared before the fixture, whose pollers count into it until the fixture joins them.
+    std::atomic<std::size_t> opened {};
+    fixture_t fixture {cell, {.event_loops = 2, .connections = 4, .interfaces = 2}};
+    if (!expect_true(fixture.status == ucall_status_success_k, "setup: {}", ucall_status_name(fixture.status)))
+        return {};
+    serve_loops(fixture, 1, opened);
+    if (!expect_true(spin_until([&] { return opened.load(std::memory_order_acquire) == 1; }),
+                     "the first loop never opened"))
+        return {};
+    std::string_view const gate = "GET /gate HTTP/1.1\r\nHost: a\r\nConnection: close\r\n\r\n";
+    std::string_view const echo = "GET /echo/1 HTTP/1.1\r\nHost: a\r\n\r\n";
+    auto send = [&](raw_client_t& client, std::string const& address, std::string_view bytes) {
+        return expect_true(client.connect(address), "a peer of {} could not connect", address) &&
+               expect_true(client.write(byte_span(bytes), 0, generator, steady_clock::now() + wait_limit_k));
+    };
+    std::array<raw_client_t, 3> holding;
+    for (auto& client : holding)
+        if (!send(client, fixture.addresses[0], gate)) return {};
+    if (!expect_true(await_held_in_background(fixture, holding.size()), "the held requests never arrived")) return {};
+    // A late peer the server refused fails here, yet the held requests still answer, as a stop
+    // drains them before it returns.
+    std::array<raw_client_t, 2> late;
+    for (std::size_t i = 0; i != late.size(); ++i) send(late[i], fixture.addresses[i], echo);
+    for (std::size_t held = 0; held != holding.size(); ++held) {
+        ucall_outcome_t outcome {};
+        ucall_received_http_request_t taken = fixture.take_held();
+        ucall_server_reply_content_t reply {fixture.server,    &outcome, &taken, ucall_http_status_ok_k, nullptr, 0,
+                                            bytes_view("held")};
+        ucall_server_reply_content(&reply);
+        expect_true(outcome.status == ucall_status_success_k, "reply: {}", ucall_status_name(outcome.status));
+    }
+    for (auto& client : holding) expect_true(read_response(client, 0).status == 200, "a held request lost its reply");
+    for (std::size_t i = 0; i != late.size(); ++i)
+        expect_true(read_response(late[i], 0).status == 200, "the late peer of interface {} was not served", i);
+    fixture.stop();
+    return {};
+}
+
 /** Running out of descriptors sheds the peers queued behind the exhausted table rather than
  *  stalling them or cutting the server: each reads a 503 or a close within two seconds, or is
  *  served where descriptors came back first or a ring accepts into slots of its own, and a fresh
@@ -826,6 +874,7 @@ void run_loops_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
         run_cell_case(cell_label, "test_admission_across_loops", test_admission_across_loops, cell);
         run_cell_case(cell_label, "test_accepts_spread_across_loops", test_accepts_spread_across_loops, cell);
         run_cell_case(cell_label, "test_unpolled_loop_strands_no_peers", test_unpolled_loop_strands_no_peers, cell);
+        run_cell_case(cell_label, "test_interfaces_share_loop_records", test_interfaces_share_loop_records, cell);
     }
 #endif
     if (cell.security == ucall_security_none_k && cell.cpu_class_ceiling == ucall_cpu_class_unknown_k &&

@@ -47,7 +47,8 @@ An `Interface` is an address, optionally pinned to a Linux device, with its own 
 It admits 1024 connections by default, reads one request per connection at a time unless `pipelined_requests` allows more, and replies still leave in request order.
 `max_request_bytes` caps a request's head and buffered body, answering 413 past it, and `reply_directories` names the directories path replies resolve beneath.
 `Interface::listening` accepts on a listener another owner opened, a `TcpListener`, a `UnixListener` or one systemd passed in, instead of binding an address, and never closes it.
-At its connection budget an interface evicts the idle keep-alive connection that progressed least recently for a new peer.
+Once an interface holds its whole `connections` budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
 Port zero binds a free port, which `Server::address` reports.
 
 ```rust

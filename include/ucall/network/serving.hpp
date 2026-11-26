@@ -917,19 +917,39 @@ struct serving {
             connection.next = event_loop.idle;
             event_loop.idle = &connection;
             --event_loop.open_connections;
-            // Admission passes straight to a peer an eviction parked, on the record just freed.
-            auto& network_interface = *connection.network_interface;
-            if (auto& order = interface_order(server, event_loop, network_interface); order.parked >= 0) {
-                order.eviction = eviction_t::none_k;
-                admit(server, event_loop, network_interface, std::exchange(order.parked, -1), order.parked_peer);
-                if (order.queued >= 0) {
-                    park(event_loop, network_interface, order, std::exchange(order.queued, -1), order.queued_peer);
-                    evict(event_loop, network_interface, order);
-                }
-            }
-            else release_admission(server, network_interface);
+            pass_freed_record(server, event_loop, *connection.network_interface);
             // A drain no arrival paces asks at each close whether only stalled peers are left.
             if (event_loop.stage == event_loop_stage_t::draining_k) cut_stalled(event_loop);
+        }
+    }
+
+    /** Seats the peer parked on @p network_interface under an admission it already holds, on a
+     *  record just freed, and parks the one queued behind it in turn. */
+    static void seat_parked(server_t& server, event_loop_t& event_loop,
+                            network_interface_t& network_interface) noexcept {
+        auto& order = interface_order(server, event_loop, network_interface);
+        order.eviction = eviction_t::none_k;
+        admit(server, event_loop, network_interface, std::exchange(order.parked, -1), order.parked_peer);
+        if (order.queued < 0) return;
+        park(event_loop, network_interface, order, std::exchange(order.queued, -1), order.queued_peer);
+        evict(event_loop, network_interface, order);
+    }
+
+    /** Hands the record a connection of @p closed just freed to a parked peer: its admission
+     *  passes straight to a peer its own interface parked, or else is released, and a peer another
+     *  interface parked takes the record under an admission of its own, as the loop's interfaces
+     *  share its records. */
+    static void pass_freed_record(server_t& server, event_loop_t& event_loop, network_interface_t& closed) noexcept {
+        if (interface_order(server, event_loop, closed).parked >= 0) return seat_parked(server, event_loop, closed);
+        release_admission(server, closed);
+        for (auto& acceptor : event_loop.interface_acceptors) {
+            auto& network_interface = *acceptor.network_interface;
+            auto active = atomic_ref<std::size_t> {network_interface.active};
+            std::size_t const limit = network_interface.config->max_concurrent_connections;
+            if (interface_order(server, event_loop, network_interface).parked < 0 ||
+                active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) >= limit)
+                continue;
+            return seat_parked(server, event_loop, network_interface);
         }
     }
 
@@ -1094,17 +1114,34 @@ struct serving {
             for (auto* endpoint : server.batch_endpoints) endpoint->wake.notify();
     }
 
+    /** Records of @p event_loop that no connection holds and no accept but @p asking's may still
+     *  take: the loop's acceptors, one per interface, draw on the same records, so each accept
+     *  takes only as many peers as the others left seats for. */
+    static std::size_t unpromised_records(event_loop_t const& event_loop, interface_acceptor_t const& asking) noexcept {
+        std::size_t promised = 0;
+        for (auto const& acceptor : event_loop.interface_acceptors)
+            if (&acceptor != &asking && acceptor.stage == acceptor_stage_t::accepting_k)
+                promised += acceptor.request.length;
+        std::size_t const idle = event_loop.connections.size() - event_loop.open_connections;
+        return idle > promised ? idle - promised : 0;
+    }
+
     /** Points @p acceptor's accept at its first peer address, for as many connections as it may
      *  take at once: the admission a submitted accept holds, and what the interface's budget and
-     *  the loop's idle connections still admit beside it; a probe takes one. */
+     *  its share of the loop's unpromised records still admit beside it; a probe takes one. */
     static void aim_accept(event_loop_t const& event_loop, interface_acceptor_t& acceptor) noexcept {
         std::size_t headroom = 0;
         if (acceptor.stage == acceptor_stage_t::accepting_k) {
             std::size_t const limit = acceptor.network_interface->config->max_concurrent_connections;
             std::size_t const active = atomic_ref<std::size_t> {acceptor.network_interface->active}.load(
                 std::memory_order_relaxed);
-            std::size_t const idle = event_loop.connections.size() - event_loop.open_connections;
-            headroom = fu::min_of(fu::min_of(limit > active ? limit - active : 0, idle ? idle - 1 : 0),
+            // Each interface still accepting takes an even share of the records the others left,
+            // so one interface's accept cannot promise the seats another's peers need.
+            std::size_t accepting = 1;
+            for (auto const& other : event_loop.interface_acceptors)
+                accepting += &other != &acceptor && other.stage == acceptor_stage_t::accepting_k;
+            std::size_t const share = unpromised_records(event_loop, acceptor) / accepting;
+            headroom = fu::min_of(fu::min_of(limit > active ? limit - active : 0, share ? share - 1 : 0),
                                   acceptor.peer_addresses.size() - 1);
         }
         acceptor.request.data = bytes_of(acceptor.peer_addresses.data(), 1).data();
@@ -1196,14 +1233,20 @@ struct serving {
         auto active = atomic_ref<std::size_t> {network_interface.active};
         auto const limit = network_interface.config->max_concurrent_connections;
         if (stage == acceptor_stage_t::accepting_k) {
-            admit(server, event_loop, network_interface, descriptor, peer);
-            if (!pending) return;
-            // The accept still pending holds an admission of its own, or, saturated, ends.
-            if (event_loop.idle && active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit) return;
-            atomic_ref<std::size_t> {network_interface.accepting}.store_sub(1, std::memory_order_relaxed);
-            acceptor.stage = acceptor_stage_t::probing_k;
-            event_loop.queue.cancel(*completion.request);
-            return;
+            // The loop's other interfaces accept onto the same records, so the one this admission
+            // counted on may be taken; a peer finding none waits as a probed one does rather than
+            // losing the request it may have sent.
+            bool const seated = event_loop.idle;
+            if (seated) admit(server, event_loop, network_interface, descriptor, peer);
+            else release_admission(server, network_interface);
+            if (pending) {
+                // The accept still pending holds an admission of its own, or, saturated, ends.
+                if (event_loop.idle && active.fetch_add_if_at_most(1, limit, std::memory_order_relaxed) < limit) return;
+                atomic_ref<std::size_t> {network_interface.accepting}.store_sub(1, std::memory_order_relaxed);
+                acceptor.stage = acceptor_stage_t::probing_k;
+                event_loop.queue.cancel(*completion.request);
+            }
+            if (seated) return;
         }
         if (stage == acceptor_stage_t::shedding_accept_k)
             acceptor.reserve_descriptor = socket_open(network_interface.family);

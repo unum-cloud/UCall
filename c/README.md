@@ -122,7 +122,8 @@ An interface's `listen_descriptor` accepts on a listening socket the caller open
 The resolved options fill each interface's `memory_domain` with the NUMA node the kernel ties its device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
 Routing is exact: empty segments are segments and a trailing slash is significant.
 A path no route takes answers 404, other verbs' routes answer 405 with `allow`, GET routes serve HEAD, `OPTIONS` answers 204 with `allow`, and `Expect: 100-continue` gets its interim response once the request is next and its body is wanted.
-An interface at its connection budget evicts its least recently progressed idle keep-alive connection for a new peer.
+Once an interface holds its whole `max_concurrent_connections` budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
 A server interface's `max_pipelined_requests` bounds the requests one connection holds at once; zero means one, and replies leave in request order.
 Replies shorter than a page and ready together leave in one gathered send, up to what the socket's send buffer takes, on every POSIX backend; IOCP and Registered I/O send them one at a time.
 Servers support immutable routes, size and latency based application batching, retained request views, and content, error, vectored and streamed replies.

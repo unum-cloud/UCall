@@ -63,6 +63,8 @@ It fails rather than substituting when the backend is unavailable or the CPU doe
 An `interface_t` is an address, optionally pinned to a Linux device, with its own security and admission limits, so one server answers plaintext on loopback and Noise on the wire at once.
 `server_t::memory_domain` reports the NUMA node the kernel ties an interface's device to, or -1, so the application inits and polls from threads there; UCall places nothing by it.
 It admits 1024 connections by default, reads one request per connection at a time unless `max_pipelined_requests` allows more, and replies still leave in request order.
+Once an interface holds its whole `max_concurrent_connections` budget, a new peer evicts the idle keep-alive connection that progressed least recently.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
 `max_request_bytes` caps a request's head and buffered body, answering 413 past it, and `reply_directories` names the directories path replies resolve beneath.
 `listen_descriptor` accepts on a listener another owner opened instead of binding an address, and never closes it.
 Port zero binds a free port, which `server_t::address` reports.

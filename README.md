@@ -212,7 +212,8 @@ The first stop drains: listeners close, idle connections close, and every reques
 A second stop cuts the replies still in flight; there is no drain timeout.
 An interface takes a `listen_descriptor` in place of an address, accepting on a socket systemd or a supervisor passed in, TCP or AF_UNIX, and never closing it.
 Once an interface holds its whole connection budget, a new peer evicts the idle keep-alive connection that progressed least recently.
-With none idle, that peer parks, and a second arrival evicts a connection whose finished reply sent nothing since the parking; connections waiting on a handler are never cut, and nothing is cut by a deadline.
+A connection that has not yet carried a request is never idle in this sense, so it is never evicted: its peer may have sent that request already.
+With none idle, the new peer parks, and a second arrival evicts a connection whose finished reply sent nothing since the parking; connections waiting on a handler are never cut, and nothing is cut by a deadline.
 A server sets no deadlines on its peers; a client bounds its own calls with `timeout_microseconds`.
 
 `ucall_client_call()` submits an exchange and returns its acceptance result.
