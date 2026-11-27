@@ -69,8 +69,7 @@
 #include <fmt/base.h>   // `fmt::print`, `fmt::format_string`
 #include <fmt/format.h> // `fmt::formatter`, `fmt::format_to`
 
-#include <forkunion/types.hpp>         // `fu::max_of`
-#include <stringzilla/stringzilla.hpp> // `sz::string_t`
+#include <forkunion/types.hpp> // `fu::max_of`
 
 #include "ucall/ucall.h"             // `ucall_client_init`, `ucall_io_backend_name`
 #include "ucall/utilities/types.hpp" // `byte_t`, `span`
@@ -99,16 +98,7 @@
 #include <sys/vfs.h>     // `statfs`
 #endif
 
-namespace sz = ashvardanian::stringzilla;
 namespace uc = unum::ucall;
-
-/** Prints an owning StringZilla string as the text it holds, never as a range of characters. */
-template <>
-struct fmt::formatter<sz::string_t> : fmt::formatter<std::string_view> {
-    fmt::format_context::iterator format(sz::string_t const& text, fmt::format_context& context) const {
-        return fmt::formatter<std::string_view>::format(std::string_view {text}, context);
-    }
-};
 
 namespace unum::ucall::test {
 
@@ -1227,27 +1217,24 @@ struct loopback_pair_t {
 
 #pragma region Sweep
 
-/** @p format over @p arguments as an owning string, aborting when it cannot be allocated. */
+/** @p format over @p arguments as an owning string, terminating when it cannot be allocated. */
 template <typename... argument_types_>
-sz::string_t formatted(fmt::format_string<argument_types_ const&...> format,
-                       argument_types_ const&... arguments) noexcept {
-    sz::string_t text;
-    if (text.resize(fmt::formatted_size(format, arguments...)) != sz::status_t::success_k) std::abort();
-    fmt::format_to(text.data(), format, arguments...);
-    return text;
+std::string formatted(fmt::format_string<argument_types_ const&...> format,
+                      argument_types_ const&... arguments) noexcept {
+    return fmt::format(format, arguments...);
 }
 
 /** The case label for @p function called over @p arguments, like <tt>test_exchanges(posix_k)</tt>. */
-[[nodiscard]] inline sz::string_t called(char const* function, std::string_view arguments) noexcept {
+[[nodiscard]] inline std::string called(char const* function, std::string_view arguments) noexcept {
     return formatted("{}({})", function, arguments);
 }
 
 /** Runs @p test over @p arguments as the case <tt>stem(cell_arguments)</tt>, apart from its cell's
  *  case as it may skip, checking it leaves every descriptor as it found them. */
 template <typename test_type_, typename... argument_types_>
-void run_cell_case(sz::string_t const& cell_arguments, char const* stem, test_type_&& test,
+void run_cell_case(std::string const& cell_arguments, char const* stem, test_type_&& test,
                    argument_types_ const&... arguments) {
-    sz::string_t const label = called(stem, cell_arguments);
+    std::string const label = called(stem, cell_arguments);
     run_test_case(label.c_str(), [&] { return keeping_descriptors([&] { return test(arguments...); }); });
 }
 
@@ -1386,7 +1373,7 @@ struct sweep_cell_t {
 }
 
 /** The arguments of a call to the case of @p cell , like "posix_k, aws_g2_k". */
-[[nodiscard]] inline sz::string_t cell_arguments(sweep_cell_t const& cell) noexcept {
+[[nodiscard]] inline std::string cell_arguments(sweep_cell_t const& cell) noexcept {
     return formatted("{}, {}, {}", backend_constant(cell.backend), cpu_class_constant(cell.cpu_class_ceiling),
                      security_constant(cell.security));
 }

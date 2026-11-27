@@ -868,7 +868,7 @@ void test_loops_cell(sweep_cell_t const& cell, split_mix_generator_t& generator)
         test_cpu_class_ceiling();
 }
 
-void run_loops_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
+void run_loops_cases(sweep_cell_t const& cell, std::string const& cell_label) {
 #if UCALL_OS_POSIX_
     if (cell.security == ucall_security_none_k) {
         run_cell_case(cell_label, "test_admission_across_loops", test_admission_across_loops, cell);

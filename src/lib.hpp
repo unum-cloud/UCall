@@ -198,7 +198,7 @@ template <cpu_class_t cpu_class_>
 struct waiter_for_cpu_class {
     using type = fu::standard_yield_t;
 };
-#if FORKUNION_TARGET_X86_PAUSE
+#if FORKUNION_TARGET_X8664_PAUSE
 template <>
 struct waiter_for_cpu_class<cpu_class_t::intel_haswell_k> {
     using type = fu::x86_pause_t;

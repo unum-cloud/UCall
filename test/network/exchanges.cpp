@@ -2660,7 +2660,7 @@ void test_exchanges_cell(sweep_cell_t const& cell, split_mix_generator_t& genera
 #endif
 }
 
-void run_exchanges_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
+void run_exchanges_cases(sweep_cell_t const& cell, std::string const& cell_label) {
     if (cell.security != ucall_security_none_k) return;
     run_cell_case(cell_label, "test_multiloop_retention", test_multiloop_retention, cell);
 #if UCALL_OS_POSIX_

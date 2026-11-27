@@ -1695,7 +1695,7 @@ void test_replies_cell(sweep_cell_t const& cell, split_mix_generator_t& generato
     }
 }
 
-void run_replies_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
+void run_replies_cases(sweep_cell_t const& cell, std::string const& cell_label) {
     run_cell_case(cell_label, "test_file_parts_vectored", test_file_parts_vectored, cell);
     run_cell_case(cell_label, "test_misaligned_ranges", test_misaligned_ranges, cell);
     run_cell_case(cell_label, "test_path_refusals", test_path_refusals, cell);

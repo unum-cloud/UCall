@@ -16,7 +16,7 @@ static constexpr char const* cell_refused_k = "the backend or the CPU class is r
 
 void run_network_cases() {
     for (sweep_cell_t const& cell : diagonal_sweep()) {
-        sz::string_t const label = cell_arguments(cell);
+        std::string const label = cell_arguments(cell);
         bool const opened = opens(cell);
         run_test_case(called("test_network_cell", label).c_str(), [&] {
             if (!opened) return case_result_t::skipped(cell_refused_k);

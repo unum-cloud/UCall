@@ -54,7 +54,7 @@ backend = { name = "pixi-build-cmake", version = "0.*" }
 # The backend defaults to a C++-only toolchain, and the C interface's own units compile as C.
 [package.build.config]
 compilers = ["c", "cxx"]
-extra-args = ["-DBUILD_SHARED_LIBS=OFF", "-DUCALL_BUILD_SHARED=1"]
+extra-args = ["-DBUILD_SHARED_LIBS=OFF", "-DUCALL_BUILD_LIBRARIES=1"]
 
 [tasks]
 build = { cmd = "mkdir -p build_mojo && mojo build -I mojo mojo/test.mojo -o build_mojo/mojo_test" }

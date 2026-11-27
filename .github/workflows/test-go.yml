@@ -21,7 +21,7 @@ jobs:
       - name: Build the Static Library
         run: |
           sudo apt-get update && sudo apt-get install -y g++-16 ninja-build
-          cmake --preset relwithdebinfo -D CMAKE_C_COMPILER=gcc-16 -D CMAKE_CXX_COMPILER=g++-16 -D UCALL_BUILD_SHARED=1
+          cmake --preset relwithdebinfo -D CMAKE_C_COMPILER=gcc-16 -D CMAKE_CXX_COMPILER=g++-16 -D UCALL_BUILD_LIBRARIES=1
           cmake --build --preset relwithdebinfo --target ucall_static uring
       - name: Test Go
         env: { CGO_LDFLAGS: "-L${{ github.workspace }}/build_relwithdebinfo" }

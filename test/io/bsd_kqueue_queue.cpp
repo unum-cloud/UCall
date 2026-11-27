@@ -14,7 +14,7 @@ namespace unum::ucall::test::io {
 
 void run_bsd_kqueue_queue_cases() {
     run_queue_cases<bsd_kqueue_queue_t>(ucall_io_backend_bsd_kqueue_k,
-                                        []<typename queue_type_>(sz::string_t const& label) {
+                                        []<typename queue_type_>(std::string const& label) {
                                             run_test_case(called("test_queue_cell", label).c_str(), [] {
                                                 return keeping_descriptors([] {
                                                     split_mix_generator_t generator {case_stream_key()};

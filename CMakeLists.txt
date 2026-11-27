@@ -46,7 +46,7 @@ option(UCALL_BUILD_BENCH "Build HTTP client and server benchmarks" OFF)
 option(UCALL_BUILD_TOOLS "Build the `ucall` command-line client in tools/" OFF)
 option(UCALL_BUILD_TEST "Build C ABI and native correctness tests" OFF)
 option(UCALL_BUILD_FUZZ "Build libFuzzer harnesses for the parsers; needs Clang" OFF)
-option(UCALL_BUILD_SHARED "Compile ucall_shared in the default build and install both libraries" OFF)
+option(UCALL_BUILD_LIBRARIES "Compile ucall_static and ucall_shared in the default build and install them" OFF)
 option(UCALL_BUILD_STUB "Compile a stand-in for the C interface that serves no network" OFF)
 option(UCALL_INSTALL "Install the C headers, libraries and CMake package" ${PROJECT_IS_TOP_LEVEL})
 option(UCALL_WERROR "Treat compiler warnings as errors" OFF)
@@ -118,17 +118,17 @@ if (UCALL_BUILD_TEST
     OR UCALL_BUILD_BENCH
     OR UCALL_BUILD_EXAMPLES
     OR UCALL_BUILD_TOOLS
-    OR UCALL_INSTALL
+    OR (UCALL_INSTALL AND UCALL_BUILD_LIBRARIES)
 )
     include(cmake/fmt.cmake)
 endif ()
 
 # Both flavors compile the same units, and their C interface lives in `c/ucall`, which `ucall::abi` names alone.
-if (NOT UCALL_BUILD_SHARED)
+if (NOT UCALL_BUILD_LIBRARIES)
     set(ucall_library_exclusion_ EXCLUDE_FROM_ALL)
 endif ()
 set(ucall_sources_ src/lib.cpp src/types.cpp src/secure_tunnel.cpp)
-add_library(ucall_static STATIC ${ucall_sources_})
+add_library(ucall_static STATIC ${ucall_library_exclusion_} ${ucall_sources_})
 add_library(ucall_shared SHARED ${ucall_library_exclusion_} ${ucall_sources_})
 add_library(ucall::static ALIAS ucall_static)
 add_library(ucall::shared ALIAS ucall_shared)
@@ -330,12 +330,12 @@ if (UCALL_BUILD_EXAMPLES)
     endforeach ()
     target_link_libraries(ucall_example_echo PRIVATE stringzilla::cpp)
     target_link_libraries(ucall_example_redis PRIVATE stringzilla::cpp)
-    target_link_libraries(ucall_example_inference PRIVATE numkong::static)
+    target_link_libraries(ucall_example_inference PRIVATE numkong::cpp)
     add_executable(ucall_example_hello examples/hello.c)
     target_link_libraries(ucall_example_hello PRIVATE ucall_static ucall_warnings)
 endif ()
-# The command-line client builds on request and with anything installed, where it joins the SDK.
-if (UCALL_BUILD_TOOLS OR UCALL_INSTALL)
+# The command-line client builds on request and with the installed libraries, where it joins the SDK.
+if (UCALL_BUILD_TOOLS OR (UCALL_INSTALL AND UCALL_BUILD_LIBRARIES))
     add_executable(ucall_cli tools/ucall.cpp)
     set_target_properties(ucall_cli PROPERTIES OUTPUT_NAME ucall)
     target_include_directories(ucall_cli PRIVATE tools)
@@ -375,15 +375,16 @@ endif ()
 add_subdirectory(cpp)
 
 # `find_package(ucall)` names the C headers `ucall::abi`, the C++ SDK carrying them and the archive `ucall::cpp`, and
-# the libraries `ucall::static` and, when built, `ucall::shared`, all in the `sdk` component with the `ucall`
-# command-line client. The archive's consumers link the liburing it was built with, installed beside it as
-# `ucall::uring`.
+# the libraries `ucall::static` and `ucall::shared`, all in the `sdk` component with the `ucall` command-line client.
+# The archive's consumers link the liburing it was built with, installed beside it as `ucall::uring`. The SDK links the
+# archive, so it installs only beside the libraries.
 if (TARGET uring)
     set(ucall_installed_uring_ uring)
 endif ()
-if (UCALL_BUILD_SHARED)
-    set(ucall_installed_shared_ ucall_shared)
+if (UCALL_BUILD_LIBRARIES)
+    set(ucall_install_sdk_targets_ ucall_abi ucall_cpp ucall_static ucall_shared ${ucall_installed_uring_})
+    set(ucall_install_programs_ ucall_cli)
+else ()
+    set(ucall_install_sdk_targets_ ucall_abi)
 endif ()
-set(ucall_install_sdk_targets_ ucall_abi ucall_cpp ucall_static ${ucall_installed_uring_} ${ucall_installed_shared_})
-set(ucall_install_programs_ ucall_cli)
 include(cmake/ucall_install.cmake)

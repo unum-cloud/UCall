@@ -628,11 +628,11 @@ void test_metrics_cell(sweep_cell_t const& cell);
 void test_loops_cell(sweep_cell_t const& cell, split_mix_generator_t& generator);
 
 /** The cases each area runs apart from its cell's case, labelled @p cell_label then the case. */
-void run_exchanges_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
-void run_serving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
-void run_replies_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
-void run_resolving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
-void run_loops_cases(sweep_cell_t const& cell, sz::string_t const& cell_label);
+void run_exchanges_cases(sweep_cell_t const& cell, std::string const& cell_label);
+void run_serving_cases(sweep_cell_t const& cell, std::string const& cell_label);
+void run_replies_cases(sweep_cell_t const& cell, std::string const& cell_label);
+void run_resolving_cases(sweep_cell_t const& cell, std::string const& cell_label);
+void run_loops_cases(sweep_cell_t const& cell, std::string const& cell_label);
 } // namespace network
 
 } // namespace unum::ucall::test

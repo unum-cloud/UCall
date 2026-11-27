@@ -34,7 +34,7 @@ if (NOT EXISTS "${liburing_SOURCE_DIR}/config-host.h")
 endif ()
 
 add_library(
-    uring STATIC
+    uring STATIC EXCLUDE_FROM_ALL
     "${liburing_SOURCE_DIR}/src/setup.c" "${liburing_SOURCE_DIR}/src/queue.c" "${liburing_SOURCE_DIR}/src/register.c"
     "${liburing_SOURCE_DIR}/src/syscall.c" "${liburing_SOURCE_DIR}/src/version.c"
 )

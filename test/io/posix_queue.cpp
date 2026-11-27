@@ -18,7 +18,7 @@ namespace unum::ucall::test::io {
 
 void run_posix_queue_cases() {
 #if UCALL_WITH_POSIX
-    run_queue_cases<posix_queue_t>(ucall_io_backend_posix_k, []<typename queue_type_>(sz::string_t const& label) {
+    run_queue_cases<posix_queue_t>(ucall_io_backend_posix_k, []<typename queue_type_>(std::string const& label) {
         run_test_case(called("test_queue_cell", label).c_str(), [] {
             return keeping_descriptors([] {
                 split_mix_generator_t generator {case_stream_key()};

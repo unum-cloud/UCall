@@ -460,7 +460,7 @@ void test_resolving_cell(sweep_cell_t const& cell) {
     }
 }
 
-void run_resolving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
+void run_resolving_cases(sweep_cell_t const& cell, std::string const& cell_label) {
     if (cell.security == ucall_security_none_k) {
         run_cell_case(cell_label, "test_client_races_ipv4_after_silent_ipv6", test_client_races_ipv4_after_silent_ipv6,
                       cell);

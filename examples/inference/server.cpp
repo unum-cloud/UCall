@@ -25,7 +25,7 @@
 
 #include <forkunion/forkunion.h>       // `fu_pool_t`, `fu_pool_for_threads`
 #include <forkunion/types.hpp>         // `fu::split_mix`
-#include <numkong/dots.hpp>            // `nk::dots_packed`
+#include <numkong/dots.hpp>            // `nk::dots_pack`, `nk::dots_packed`
 #include <numkong/matrix.hpp>          // `nk::packed_matrix`, `nk::matrix_view`, `nk::matrix_span`
 #include <numkong/vector.hpp>          // `nk::vector_view`
 #include <smashtable/basic_vector.hpp> // `st::basic_vector`, `st::default_allocator`
@@ -112,8 +112,8 @@ static void pack_slices(void* context, std::size_t thread, std::size_t) {
         model_slice_t& slice = call.slices[index];
         slice.first_row = index * slice_rows_k;
         std::size_t const last_row = fu::min_of(slice.first_row + slice_rows_k, rows);
-        auto [packed,
-              packed_status] = packed_model_t::make(call.model(nk::range(slice.first_row, last_row), nk::slice));
+        auto [packed, packed_status] = nk::dots_pack<query_t, st::default_allocator<char>>(
+            call.model(nk::range(slice.first_row, last_row), nk::slice));
         own.status = packed_status;
         if (nk::failed(own.status)) return;
         slice.packed = std::move(packed);

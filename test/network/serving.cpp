@@ -1104,7 +1104,7 @@ void test_serving_cell(sweep_cell_t const& cell, split_mix_generator_t& generato
 #endif
 }
 
-void run_serving_cases(sweep_cell_t const& cell, sz::string_t const& cell_label) {
+void run_serving_cases(sweep_cell_t const& cell, std::string const& cell_label) {
     if (cell.security == ucall_security_none_k) {
         run_cell_case(cell_label, "test_batches_across_loops", test_batches_across_loops, cell);
         run_cell_case(cell_label, "test_setup_failure_ends_batch_polling", test_setup_failure_ends_batch_polling, cell);

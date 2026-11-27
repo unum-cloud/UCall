@@ -34,9 +34,9 @@ path = "rust/lib.rs"
 
 [dependencies]
 # CMake builds each crate's tree in place of downloading the revision the submodule pins.
-forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "94969cc654e6a8855dfb27f85e3c19a92ca85212", default-features = false }
+forkunion = { version = "4.0.0-rc.1", git = "https://github.com/ashvardanian/ForkUnion", rev = "2797304869337c41500e8e2d1ca9bbc278c351c5", default-features = false }
 smashtable = { version = "1.0.0-rc.1", git = "https://github.com/ashvardanian/SmashTable", rev = "36ec681da1874d63ef4b57114405df00e426728a" }
-stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", rev = "930a52c38505d37165194b72009da2df15a4dcfa", default-features = false }
+stringzilla = { version = "6.0.0-rc.1", git = "https://github.com/ashvardanian/StringZilla", rev = "e0bf6b066bd7f966e6eb302458c4f2d863e77f2b", default-features = false }
 
 [build-dependencies]
 # The library is CMake's to build, so `build.rs` drives it rather than restating its per-class flags.

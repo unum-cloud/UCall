@@ -744,7 +744,7 @@ A source build needs CMake 3.28 and a C++20 compiler, and pulls StringZilla, For
 
 ```sh
 git clone --recursive https://github.com/unum-cloud/UCall.git && cd UCall
-cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
+cmake -B build_release -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_LIBRARIES=ON
 cmake --build build_release --parallel
 cmake --install build_release --prefix ~/.local
 ```
@@ -753,7 +753,7 @@ cmake --install build_release --prefix ~/.local
 > It also holds `ucall`, a command-line client for one HTTP or Noise call, as in `ucall -d @body.json http://127.0.0.1:8080/echo`.
 > `-H` adds a header line, `-d @-` reads the body from standard input, `-i` prints the status line and every response field before the body, and `--server-key` pins the server for an `http+noise://` URL.
 > `ucall keygen FILE` writes a fresh Noise private key and prints its public half, and the exit code is 0 for a 2xx answer and the status's hundreds digit otherwise.
-> Leaving `UCALL_BUILD_SHARED` off installs the archive without the shared library and its `ucall.pc`.
+> Leaving `UCALL_BUILD_LIBRARIES` off still declares both libraries, but builds them only for a target that links them and installs neither.
 
 `pip install .` builds the Python bindings from the same checkout, and `cargo build` the Rust crate; the [contributing guide](https://github.com/unum-cloud/UCall/blob/main/CONTRIBUTING.md) lists the presets, tests and cross builds.
 

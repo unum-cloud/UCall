@@ -164,7 +164,7 @@ static case_result_t test_epollaio_zero_copy_sends() {
 
 void run_linux_epollaio_queue_cases() {
     run_queue_cases<linux_epollaio_queue_t>(
-        ucall_io_backend_linux_epollaio_k, []<typename queue_type_>(sz::string_t const& label) {
+        ucall_io_backend_linux_epollaio_k, []<typename queue_type_>(std::string const& label) {
             run_test_case(called("test_queue_cell", label).c_str(), [] {
                 return keeping_descriptors([] {
                     split_mix_generator_t generator {case_stream_key()};

@@ -364,7 +364,7 @@ jobs:
           sudo apt-get update && sudo apt-get install -y clang-23 pkg-config
       - name: Build and Install
         run: |
-          cmake -B build_install -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_SHARED=ON
+          cmake -B build_install -D CMAKE_BUILD_TYPE=Release -D UCALL_BUILD_LIBRARIES=ON
           cmake --build build_install --parallel 4
           cmake --install build_install --prefix "$RUNNER_TEMP/ucall"
       - name: Consume Through find_package
@@ -436,7 +436,7 @@ jobs:
           submodules: recursive
       - name: Build C Library
         run: |
-          cmake -B build_old_headers -D UCALL_BUILD_SHARED=ON -D UCALL_BUILD_TEST=ON -D CMAKE_BUILD_TYPE=Release
+          cmake -B build_old_headers -D UCALL_BUILD_LIBRARIES=ON -D UCALL_BUILD_TEST=ON -D CMAKE_BUILD_TYPE=Release
           cmake --build build_old_headers --parallel 4 --target ucall_shared ucall_test_c
       - name: Test C Library
         run: build_old_headers/ucall_test_c

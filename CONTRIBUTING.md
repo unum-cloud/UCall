@@ -57,7 +57,7 @@ Executables go directly into the preset's build directory, such as `build_releas
 `UCALL_BUILD_PYTHON=ON` builds the CPython extension that [Python builds](#python) package, and the root `Cargo.toml` builds the Rust crate, as [Rust builds](#rust) describe.
 
 `cmake --install` installs `ucall::abi`, `ucall::static`, `ucall::cpp`, the `ucall` command-line client, the C and C++ headers, a CMake package and the license.
-`UCALL_BUILD_SHARED=ON`, which the `release` preset sets, adds `ucall_shared` to the default build, and installs it beside the archive with a `ucall.pc`.
+`UCALL_BUILD_LIBRARIES=ON`, which the `release` preset sets, builds `ucall_static` and `ucall_shared` by default and installs them with a `ucall.pc`; off, both are still declared and build only for a target that links them.
 The shared library exports the `ucall_*` C interface alone, and the `release` preset remaps the source directory out of every binary.
 A C program links either library, as CI's install job does with `examples/hello.c` through `find_package(ucall)` and through `pkg-config`.
 CPack packs the `sdk` install component, which holds all of it, stripped, into `ucall-<version>-<platform>-sdk.tar.gz`:
@@ -135,6 +135,13 @@ Spell full sibling namespaces only when declaring those aliases.
 Each template in `include/` takes its kits and atomic reference as template arguments, and `src/` picks them per CPU class.
 No template in `include/` names a CPU class or a capability mask; classes, masks, and the ladder that chooses rungs stay in `src/`.
 A file never includes both a library's SDK umbrella `<X/X.hpp>` and its native umbrella `<X.hpp>`, for this library and every sibling, and nothing under `include/` includes a header that resolves under `cpp/`; C headers are the ABI every SDK sits on, so they are free everywhere. `.githooks/pre-commit` refuses both.
+
+Each library keeps its containers in `include/<lib>/*.hpp` behind its `::types` target, which links only the C ABI, carries no define, includes no kernel and calls nothing the library exports.
+ForkUnion and SmashTable define nothing for header-only builds, so their `::header` is also their container layer.
+Every operation one of a library's kernels backs is a verb under `cpp/`, which links the library, calls only `_best` exports and includes only C and `::types` headers.
+No relative header path sits in two of `c/`, `include/` and `cpp/`.
+A product's `include/` takes a sibling's `::types` and C headers, never its `cpp/` verbs, and no binding calls a `_serial` kernel.
+`.githooks/pre-commit` refuses each of these.
 
 Every mutable object has one owner and one authoritative state.
 Each server loop has one application polling owner; each client is initialized, submitted, polled, and freed by one owner thread.
@@ -333,6 +340,7 @@ A code comment explains a non-obvious reason rather than narrating an operation.
 Keep source headers, attribution, and original creation dates consistent with the file's history.
 
 Begin each Markdown sentence on a separate source line and align table columns.
+Markdown and Rust doc comments never set two code spans side by side; name one in prose and keep one span, as `.githooks/pre-commit` checks.
 Run `dprint fmt` for Markdown, `clang-format` for C and C++, Ruff for Python, and `cargo +stable fmt` for Rust.
 The staged-file hooks check these conventions and reject template suffixes even with brace initialization.
 
@@ -371,6 +379,7 @@ These rules are shared by every sibling library, and the pre-commit hook enforce
 ### Principles
 
 Tests call the public surface: the C interface and the C++ headers under `include/ucall/`, and each binding its own package; [Private Surface Waivers](#private-surface-waivers) lists the exceptions.
+Tests never read a library's internal layouts, and each family's oracle is the `<verb>_reference` beside it, never a serial kernel or a helper named `_oracle`, `_naive` or `_golden`.
 Oracles never compile out: every C and C++ test unit opens with `#undef NDEBUG // ! A test's oracle must stay live in every build`.
 The harness owns the output: a case only checks, and the run prints its verdict, every failed check, a `rerun:` line and the summary.
 Skips are honest: a case that cannot run says why, `UCALL_NO_SKIPS=1` turns any skip into a failing exit, and a filter that selects nothing fails the run.

@@ -14,7 +14,8 @@
 
 #include <smashtable/locked_store.hpp>   // `st::locked_store`
 #include <smashtable/snapshot_store.hpp> // `st::strict_serializable_hash_map`
-#include <stringzilla/stringzilla.hpp>   // `sz::string_t`, `sz::hash_t`, `sz::equal_to_t`
+#include <stringzilla/hash.hpp>          // `sz::hash_t`
+#include <stringzilla/string.hpp>        // `sz::string_t`, `sz::equal_to_t`
 
 #include "ucall/ucall.hpp" // `uc::request_t`, `uc::batch_t`, `uc::status_t`, `uc::bytes_view`
 #include "server.hpp"

@@ -1053,7 +1053,7 @@ void run_queue_cases(ucall_io_backend_t backend, cases_type_&& cases) {
     for (ucall_cpu_class_t const cpu_class : admitted_classes()) {
         if (settings.cpu_class_ceiling != ucall_cpu_class_unknown_k && settings.cpu_class_ceiling != cpu_class)
             continue;
-        sz::string_t const label = formatted("{}, {}", backend_constant(backend), cpu_class_constant(cpu_class));
+        std::string const label = formatted("{}, {}", backend_constant(backend), cpu_class_constant(cpu_class));
         if (queue_type_ {}.open(2, 2) != ucall_status_success_k) {
             run_test_case(called("test_queue_cell", label).c_str(),
                           [] { return case_result_t::skipped(queue_refused_k); });

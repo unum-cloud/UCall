@@ -16,7 +16,8 @@
 #include <utility>     // `std::move`
 
 #include <smashtable/basic_hash_table.hpp> // `st::hash_map`
-#include <stringzilla/stringzilla.hpp>     // `sz::string_view_t`, `sz::hash_t`, `sz::equal_to_t`
+#include <stringzilla/hash.hpp>            // `sz::hash_t`
+#include <stringzilla/string.hpp>          // `sz::string_view_t`, `sz::equal_to_t`
 
 #include "ucall/ucall.hpp" // `uc::request_t`, `uc::batch_t`, `uc::status_t`, `uc::bytes_view`
 #include "server.hpp"
